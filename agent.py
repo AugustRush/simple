@@ -784,11 +784,13 @@ class ConsolidationEngine:
         max_categories: int = MAX_CATEGORIES,
         decay_factor: float = DECAY_FACTOR,
         sleep_token_ratio: float = SLEEP_TOKEN_RATIO,
+        keep_last_messages: int = 6,
     ):
         self.store = store
         self.max_categories = max_categories
         self.decay_factor = decay_factor
         self.sleep_token_ratio = sleep_token_ratio
+        self.keep_last_messages = keep_last_messages
 
     # ── Trigger ───────────────────────────────────────────────────────────────
 
@@ -820,9 +822,11 @@ class ConsolidationEngine:
         client: Any,
         model: str,
         api_format: str = "anthropic",
-        keep_last: int = 6,
+        keep_last: Optional[int] = None,
     ) -> list[dict]:
         """One sleep cycle: extract → classify → store → decay → compress."""
+        if keep_last is None:
+            keep_last = self.keep_last_messages
         CONSOLE.print("[dim]💤 Context consolidation (sleep)...[/dim]")
         conv_text = self._format_messages_for_llm(messages)
         existing = [c.name for c in self.store.list_categories()]
@@ -2285,6 +2289,7 @@ def _build_components(cfg: dict):
             store=ctx_store,
             decay_factor=ctx_cfg.get("decay_factor", DECAY_FACTOR),
             sleep_token_ratio=ctx_cfg.get("sleep_token_ratio", SLEEP_TOKEN_RATIO),
+            keep_last_messages=ctx_cfg.get("keep_last_messages", 6),
         ),
     )
 

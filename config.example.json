@@ -58,6 +58,22 @@
     "tidy_file_threshold": 5
   },
 
+  "context": {
+    "_readme": [
+      "Context Manager settings for intelligent working-memory management.",
+      "max_categories: upper limit on dynamic LTM categories; when exceeded the agent merges two similar ones (default 15).",
+      "decay_factor: per-sleep importance multiplier applied to all LTM entries (0.0–1.0, default 0.95). Lower = faster forgetting.",
+      "sleep_token_ratio: fraction of the active provider's max_tokens at which a sleep cycle is triggered (default 0.70 = 70%).",
+      "  max_tokens is NOT set here — it is inherited from providers.<active_provider>.max_tokens.",
+      "  To change the absolute token budget, update max_tokens in the relevant provider block above.",
+      "keep_last_messages: number of recent messages to retain after sleep compression (default 6)."
+    ],
+    "max_categories": 15,
+    "decay_factor": 0.95,
+    "sleep_token_ratio": 0.70,
+    "keep_last_messages": 6
+  },
+
   "mcp_servers": [
     {
       "_readme": "Remove this object and add real MCP server entries. Each entry needs name, command, and args.",
