@@ -201,7 +201,13 @@ def test_sleep_clears_dirty_flag(tmp_path, monkeypatch):
 
     class FakeEngine(ConsolidationEngine):
         async def consolidate(
-            self, messages, client, model, api_format="anthropic", keep_last=None
+            self,
+            messages,
+            client,
+            model,
+            api_format="anthropic",
+            keep_last=None,
+            staging=None,
         ):
             return messages[-2:] if len(messages) > 2 else messages
 

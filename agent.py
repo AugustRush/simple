@@ -68,6 +68,7 @@ CHARS_PER_TOKEN = 4  # rough estimate: 4 chars ≈ 1 token
 SLEEP_TOKEN_RATIO = 0.70  # trigger sleep when working memory > 70% of max_tokens
 DECAY_FACTOR = 0.95  # per-sleep importance multiplier
 RETRIEVAL_TOP_K = 5  # top-K entries injected per turn
+STAGING_FILE = CONTEXT_DIR / "_staging.jsonl"  # raw conversation buffer
 
 CONSOLE = Console()
 
@@ -527,6 +528,60 @@ class MemoryPalace:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+class StagingBuffer:
+    """Append-only JSONL buffer that persists raw conversation turns to disk.
+
+    Stores only user/assistant plain-text messages (skips tool calls and
+    tool results to avoid noise and oversized entries).
+
+    Lifecycle:
+      append()        — called after each user input + assistant reply
+      read_all()      — returns all staged messages (for LLM extraction)
+      clear_all()     — called after successful consolidation
+      count()         — number of staged messages
+
+    File: ~/.agent/context/_staging.jsonl
+    """
+
+    def __init__(self, path: Path = STAGING_FILE):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, role: str, content: str) -> None:
+        """Append a plain-text turn (user or assistant only)."""
+        if not content or not content.strip():
+            return
+        entry = {
+            "role": role,
+            "content": content.strip(),
+            "ts": _now(),
+        }
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def read_all(self) -> list[dict]:
+        """Return all staged messages in order."""
+        if not self.path.exists():
+            return []
+        msgs = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msgs.append(json.loads(line))
+            except Exception:
+                continue
+        return msgs
+
+    def count(self) -> int:
+        return len(self.read_all())
+
+    def clear_all(self) -> None:
+        """Delete the staging file after successful consolidation."""
+        self.path.unlink(missing_ok=True)
+
+
 @dataclass
 class LTMEntry:
     """A single long-term memory entry with importance scoring."""
@@ -823,12 +878,29 @@ class ConsolidationEngine:
         model: str,
         api_format: str = "anthropic",
         keep_last: Optional[int] = None,
+        staging: Optional["StagingBuffer"] = None,
     ) -> list[dict]:
-        """One sleep cycle: extract → classify → store → decay → compress."""
+        """One sleep cycle: extract → classify → store → decay → compress.
+
+        Source priority for LLM extraction:
+          1. staging buffer (if non-empty) — full, clean conversation history
+          2. ctx.messages fallback          — used only when staging is absent
+        After extraction the staging buffer is cleared.
+        """
         if keep_last is None:
             keep_last = self.keep_last_messages
         CONSOLE.print("[dim]💤 Context consolidation (sleep)...[/dim]")
-        conv_text = self._format_messages_for_llm(messages)
+
+        # Choose extraction source
+        staged = staging.read_all() if (staging and staging.count() > 0) else []
+        source = staged if staged else messages
+        conv_text = self._format_messages_for_llm(source)
+        source_label = (
+            f"staging ({len(staged)} turns)"
+            if staged
+            else f"messages ({len(messages)})"
+        )
+
         existing = [c.name for c in self.store.list_categories()]
         cat_list = ", ".join(existing) if existing else "none yet"
 
@@ -841,7 +913,7 @@ class ConsolidationEngine:
             f"- importance: 1.0=critical decisions/preferences, 0.5=useful context, 0.1=minor\n"
             f"- Reuse existing categories when possible; create new ones only when necessary\n"
             f"- Be selective: max 10 items, 1-3 sentences each\n\n"
-            f"Conversation:\n{conv_text[:3000]}"
+            f"Conversation ({source_label}):\n{conv_text[:3000]}"
         )
 
         try:
@@ -868,8 +940,13 @@ class ConsolidationEngine:
                 self.store.add_entry(entry)
 
             self.store.apply_decay(self.decay_factor)
+
+            # Clear staging after successful extraction
+            if staging:
+                staging.clear_all()
+
             CONSOLE.print(
-                f"[dim]💤 Stored {len(entries)} entries. "
+                f"[dim]💤 Stored {len(entries)} entries from {source_label}. "
                 f"Categories: {self.store.category_count()}/{self.max_categories}[/dim]"
             )
         except Exception as e:
@@ -979,7 +1056,12 @@ class ContextManager:
     Trigger rules (all require _needs_consolidation == True):
       1. Token-ratio trigger  — working memory > token_ratio × max_tokens
       2. Idle trigger         — no activity for idle_seconds (background task)
+      3. Session-end trigger  — explicit call when the interactive loop exits
     After each sleep() the flag is cleared; mark_activity() re-arms it.
+
+    Staging buffer: every user/assistant turn is appended to _staging.jsonl.
+    This ensures consolidation always has a complete source even if the session
+    ends before the token threshold fires.  Buffer is cleared after each sleep.
     """
 
     def __init__(
@@ -989,12 +1071,14 @@ class ContextManager:
         consolidation: ConsolidationEngine,
         idle_seconds: int = 300,
         min_messages: int = 4,
+        staging: Optional[StagingBuffer] = None,
     ):
         self.store = store
         self.retriever = retriever
         self.consolidation = consolidation
         self.idle_seconds = idle_seconds
         self.min_messages = min_messages
+        self.staging: StagingBuffer = staging or StagingBuffer()
         self._needs_consolidation: bool = False
         self._last_activity: float = 0.0
 
@@ -1029,6 +1113,10 @@ class ContextManager:
             return False
         return self.idle_elapsed() >= self.idle_seconds
 
+    def should_session_end_sleep(self) -> bool:
+        """Session-end trigger: fires when staging has unprocessed content."""
+        return self._needs_consolidation and self.staging.count() > 0
+
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
     def retrieve_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
@@ -1053,9 +1141,9 @@ class ContextManager:
         model: str,
         api_format: str = "anthropic",
     ) -> list[dict]:
-        """Run one sleep cycle and clear the dirty flag."""
+        """Run one sleep cycle (uses staging as source), then clear dirty flag."""
         result = await self.consolidation.consolidate(
-            messages, client, model, api_format
+            messages, client, model, api_format, staging=self.staging
         )
         self._needs_consolidation = False
         return result
@@ -1070,6 +1158,7 @@ class ContextManager:
             "category_names": [c.name for c in cats],
             "max_categories": self.store.max_categories,
             "needs_consolidation": self._needs_consolidation,
+            "staged_turns": self.staging.count(),
             "idle_elapsed_s": round(self.idle_elapsed()),
             "idle_threshold_s": self.idle_seconds,
         }
@@ -2457,6 +2546,10 @@ async def _interactive_loop(components: dict, cfg: dict):
                             ", ".join(stats["category_names"]) or "—",
                         )
                         table.add_row(
+                            "Staged Turns",
+                            str(stats["staged_turns"]),
+                        )
+                        table.add_row(
                             "Needs Consolidation",
                             "yes" if stats["needs_consolidation"] else "no",
                         )
@@ -2542,6 +2635,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                     CONSOLE.print(f"[red]Error: {result.error}[/red]")
                 tools_used_session.extend(result.tool_calls_made)
 
+                # Stage this turn (user input + assistant reply) for consolidation
+                if ctx_mgr:
+                    ctx_mgr.staging.append("user", user_input)
+                    if result.content:
+                        ctx_mgr.staging.append("assistant", result.content)
+
                 # Token-ratio consolidation (dirty flag + min_messages already checked)
                 if ctx_mgr and ctx_mgr.should_sleep(ctx.messages, agent.max_tokens):
                     ctx.messages = await ctx_mgr.sleep(
@@ -2579,6 +2678,19 @@ async def _interactive_loop(components: dict, cfg: dict):
             await idle_task
         except asyncio.CancelledError:
             pass
+
+    # Session-end consolidation: digest any unprocessed staging content
+    if ctx_mgr and ctx_mgr.should_session_end_sleep():
+        CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
+        try:
+            await ctx_mgr.sleep(
+                ctx.messages,
+                components["client"],
+                components["model"],
+                api_format=agent.api_format,
+            )
+        except Exception as e:
+            CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
 
     # End of session scoring
     if len(ctx.messages) >= 2:
