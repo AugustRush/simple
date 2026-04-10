@@ -1,6 +1,7 @@
-"""Tests for ConsolidationEngine — sleep/decay/parse."""
+"""Tests for ConsolidationEngine and ContextManager — sleep/decay/parse/dirty-flag/idle."""
 
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,23 @@ def make_engine(tmp_path):
 
     store = LTMStore(context_dir=tmp_path / "context")
     return ConsolidationEngine(store=store)
+
+
+def make_ctx_manager(tmp_path, idle_seconds=300, min_messages=4):
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    engine = ConsolidationEngine(store=store)
+    return ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=engine,
+        idle_seconds=idle_seconds,
+        min_messages=min_messages,
+    )
+
+
+# ── ConsolidationEngine tests ─────────────────────────────────────────────────
 
 
 def test_estimate_tokens(tmp_path):
@@ -107,3 +125,94 @@ def test_format_messages_list_content(tmp_path):
     ]
     text = eng._format_messages_for_llm(messages)
     assert "file contents here" in text
+
+
+# ── ContextManager dirty flag tests ──────────────────────────────────────────
+
+
+def test_dirty_flag_initially_false(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    assert ctx_mgr._needs_consolidation is False
+
+
+def test_mark_activity_sets_dirty_flag(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.mark_activity()
+    assert ctx_mgr._needs_consolidation is True
+
+
+def test_should_sleep_requires_dirty_flag(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path, min_messages=1)
+    # Big message list but no activity marked → should NOT sleep
+    big_messages = [{"role": "user", "content": "x" * 2000}] * 5
+    assert ctx_mgr.should_sleep(big_messages, max_tokens=300) is False
+    # After mark_activity → should sleep
+    ctx_mgr.mark_activity()
+    assert ctx_mgr.should_sleep(big_messages, max_tokens=300) is True
+
+
+def test_should_sleep_respects_min_messages(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path, min_messages=4)
+    ctx_mgr.mark_activity()
+    # Only 2 messages → below min_messages threshold
+    small = [{"role": "user", "content": "x" * 2000}] * 2
+    assert ctx_mgr.should_sleep(small, max_tokens=300) is False
+    # 5 messages → above threshold
+    big = [{"role": "user", "content": "x" * 2000}] * 5
+    assert ctx_mgr.should_sleep(big, max_tokens=300) is True
+
+
+def test_idle_elapsed_zero_before_activity(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    assert ctx_mgr.idle_elapsed() == 0.0
+
+
+def test_idle_elapsed_increases_after_activity(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.mark_activity()
+    time.sleep(0.05)
+    assert ctx_mgr.idle_elapsed() >= 0.05
+
+
+def test_should_idle_sleep_requires_dirty_and_elapsed(tmp_path):
+    # idle_seconds=0 means any elapsed time qualifies
+    ctx_mgr = make_ctx_manager(tmp_path, idle_seconds=0, min_messages=1)
+    messages = [{"role": "user", "content": "hello"}]
+    # Not dirty → False
+    assert ctx_mgr.should_idle_sleep(messages) is False
+    ctx_mgr.mark_activity()
+    # Dirty + idle=0 + 1 message ≥ min_messages=1 → True
+    assert ctx_mgr.should_idle_sleep(messages) is True
+
+
+def test_should_idle_sleep_respects_min_messages(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path, idle_seconds=0, min_messages=4)
+    ctx_mgr.mark_activity()
+    few = [{"role": "user", "content": "hi"}] * 2
+    assert ctx_mgr.should_idle_sleep(few) is False
+
+
+def test_sleep_clears_dirty_flag(tmp_path, monkeypatch):
+    """sleep() must clear _needs_consolidation even if consolidation raises."""
+    import asyncio
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager
+
+    store = LTMStore(context_dir=tmp_path / "context")
+
+    class FakeEngine(ConsolidationEngine):
+        async def consolidate(
+            self, messages, client, model, api_format="anthropic", keep_last=None
+        ):
+            return messages[-2:] if len(messages) > 2 else messages
+
+    engine = FakeEngine(store=store)
+    ctx_mgr = ContextManager(
+        store=store, retriever=LocalRetriever(), consolidation=engine
+    )
+    ctx_mgr.mark_activity()
+    assert ctx_mgr._needs_consolidation is True
+
+    messages = [{"role": "user", "content": "hello"}] * 4
+    result = asyncio.run(ctx_mgr.sleep(messages, client=None, model="x"))
+    assert ctx_mgr._needs_consolidation is False
+    assert len(result) <= 4

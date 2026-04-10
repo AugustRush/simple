@@ -976,10 +976,10 @@ class ConsolidationEngine:
 class ContextManager:
     """Orchestrates LTM storage, retrieval, and consolidation.
 
-    Usage:
-        retrieved_str = ctx_mgr.retrieve_context(user_message)
-        if ctx_mgr.should_sleep(ctx.messages, max_tokens):
-            ctx.messages = await ctx_mgr.sleep(ctx.messages, client, model)
+    Trigger rules (all require _needs_consolidation == True):
+      1. Token-ratio trigger  — working memory > token_ratio × max_tokens
+      2. Idle trigger         — no activity for idle_seconds (background task)
+    After each sleep() the flag is cleared; mark_activity() re-arms it.
     """
 
     def __init__(
@@ -987,10 +987,49 @@ class ContextManager:
         store: LTMStore,
         retriever: LocalRetriever,
         consolidation: ConsolidationEngine,
+        idle_seconds: int = 300,
+        min_messages: int = 4,
     ):
         self.store = store
         self.retriever = retriever
         self.consolidation = consolidation
+        self.idle_seconds = idle_seconds
+        self.min_messages = min_messages
+        self._needs_consolidation: bool = False
+        self._last_activity: float = 0.0
+
+    # ── Activity tracking ─────────────────────────────────────────────────────
+
+    def mark_activity(self) -> None:
+        """Call after each user message to arm consolidation and reset idle timer."""
+        self._last_activity = time.time()
+        self._needs_consolidation = True
+
+    def idle_elapsed(self) -> float:
+        """Seconds since last activity (0 if never active)."""
+        if self._last_activity == 0.0:
+            return 0.0
+        return time.time() - self._last_activity
+
+    # ── Trigger checks ────────────────────────────────────────────────────────
+
+    def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
+        """Token-ratio trigger: only fires when dirty and messages are sufficient."""
+        if not self._needs_consolidation:
+            return False
+        if len(messages) < self.min_messages:
+            return False
+        return self.consolidation.should_sleep(messages, max_tokens)
+
+    def should_idle_sleep(self, messages: list[dict]) -> bool:
+        """Idle trigger: fires when dirty, sufficient messages, and idle long enough."""
+        if not self._needs_consolidation:
+            return False
+        if len(messages) < self.min_messages:
+            return False
+        return self.idle_elapsed() >= self.idle_seconds
+
+    # ── Retrieval ─────────────────────────────────────────────────────────────
 
     def retrieve_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
         """Return top-K relevant LTM entries as an injectable string."""
@@ -1005,8 +1044,7 @@ class ContextManager:
             lines.append(f"- [{e.category}] {e.content}")
         return "\n".join(lines)
 
-    def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
-        return self.consolidation.should_sleep(messages, max_tokens)
+    # ── Consolidation ─────────────────────────────────────────────────────────
 
     async def sleep(
         self,
@@ -1015,7 +1053,14 @@ class ContextManager:
         model: str,
         api_format: str = "anthropic",
     ) -> list[dict]:
-        return await self.consolidation.consolidate(messages, client, model, api_format)
+        """Run one sleep cycle and clear the dirty flag."""
+        result = await self.consolidation.consolidate(
+            messages, client, model, api_format
+        )
+        self._needs_consolidation = False
+        return result
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
         cats = self.store.list_categories()
@@ -1024,6 +1069,9 @@ class ContextManager:
             "total_entries": sum(c.entry_count for c in cats),
             "category_names": [c.name for c in cats],
             "max_categories": self.store.max_categories,
+            "needs_consolidation": self._needs_consolidation,
+            "idle_elapsed_s": round(self.idle_elapsed()),
+            "idle_threshold_s": self.idle_seconds,
         }
 
 
@@ -2277,20 +2325,29 @@ def _build_components(cfg: dict):
     registry = ToolRegistry()
 
     # Context Manager — build first so BuiltinTools can reference it
+    # Config is split into two sub-sections:
+    #   context.storage       — LTM store settings (what to keep)
+    #   context.consolidation — trigger settings (when/how to consolidate)
     ctx_cfg = cfg.get("context", {})
+    storage_cfg = ctx_cfg.get("storage", ctx_cfg)  # fallback: flat cfg for compat
+    cons_cfg = ctx_cfg.get("consolidation", ctx_cfg)  # fallback: flat cfg for compat
+
     ctx_store = LTMStore(
         context_dir=CONTEXT_DIR,
-        max_categories=ctx_cfg.get("max_categories", MAX_CATEGORIES),
+        max_categories=storage_cfg.get("max_categories", MAX_CATEGORIES),
     )
     ctx_manager = ContextManager(
         store=ctx_store,
         retriever=LocalRetriever(),
         consolidation=ConsolidationEngine(
             store=ctx_store,
-            decay_factor=ctx_cfg.get("decay_factor", DECAY_FACTOR),
-            sleep_token_ratio=ctx_cfg.get("sleep_token_ratio", SLEEP_TOKEN_RATIO),
-            keep_last_messages=ctx_cfg.get("keep_last_messages", 6),
+            max_categories=storage_cfg.get("max_categories", MAX_CATEGORIES),
+            decay_factor=storage_cfg.get("decay_factor", DECAY_FACTOR),
+            sleep_token_ratio=cons_cfg.get("token_ratio", SLEEP_TOKEN_RATIO),
+            keep_last_messages=cons_cfg.get("keep_last_messages", 6),
         ),
+        idle_seconds=cons_cfg.get("idle_seconds", 300),
+        min_messages=cons_cfg.get("min_messages", 4),
     )
 
     BuiltinTools(memory, registry, context_manager=ctx_manager)
@@ -2326,6 +2383,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     memory: MemoryPalace = components["memory"]
     evolution: EvolutionEngine = components["evolution"]
     system_prompt = components["system_prompt"]
+    ctx_mgr: Optional[ContextManager] = components.get("context_manager")
 
     # Get prompt version
     prompt_files = sorted(PROMPTS_DIR.glob("system_v*.md"))
@@ -2333,6 +2391,22 @@ async def _interactive_loop(components: dict, cfg: dict):
 
     ctx = AgentContext(system_prompt=system_prompt)
     tools_used_session: list[str] = []
+
+    # ── Background idle consolidation task ────────────────────────────────────
+    async def _idle_consolidation_loop():
+        """Poll every 30 s; consolidate when dirty + idle threshold exceeded."""
+        while True:
+            await asyncio.sleep(30)
+            if ctx_mgr and ctx_mgr.should_idle_sleep(ctx.messages):
+                CONSOLE.print("\n[dim]💤 Idle consolidation triggered...[/dim]")
+                ctx.messages = await ctx_mgr.sleep(
+                    ctx.messages,
+                    components["client"],
+                    components["model"],
+                    api_format=agent.api_format,
+                )
+
+    idle_task = asyncio.create_task(_idle_consolidation_loop())
 
     CONSOLE.print(
         Panel(
@@ -2343,151 +2417,168 @@ async def _interactive_loop(components: dict, cfg: dict):
         )
     )
 
-    while True:
-        try:
-            user_input = Prompt.ask("\n[bold green]You[/bold green]")
-        except (EOFError, KeyboardInterrupt):
-            break
-
-        if not user_input.strip():
-            continue
-
-        # Handle slash commands
-        if user_input.startswith("/"):
-            cmd = user_input[1:].strip().lower()
-            if cmd in ("quit", "exit", "q"):
+    try:
+        while True:
+            try:
+                user_input = Prompt.ask("\n[bold green]You[/bold green]")
+            except (EOFError, KeyboardInterrupt):
                 break
-            elif cmd == "memory":
-                chapters = memory.list_chapters()
-                table = Table(title="Memory Palace")
-                table.add_column("Chapter")
-                table.add_column("Files")
-                for ch in chapters:
-                    table.add_row(ch["name"], str(len(ch["files"])))
-                CONSOLE.print(table)
+
+            if not user_input.strip():
                 continue
-            elif cmd == "context":
-                ctx_mgr: Optional[ContextManager] = components.get("context_manager")
-                if ctx_mgr:
-                    stats = ctx_mgr.stats()
-                    table = Table(title="Context Manager (LTM)")
-                    table.add_column("Metric")
-                    table.add_column("Value")
-                    table.add_row(
-                        "Categories",
-                        f"{stats['categories']}/{stats['max_categories']}",
-                    )
-                    table.add_row("Total Entries", str(stats["total_entries"]))
-                    table.add_row(
-                        "Category Names",
-                        ", ".join(stats["category_names"]) or "—",
-                    )
-                    table.add_row(
-                        "Sleep Threshold",
-                        f"{int(SLEEP_TOKEN_RATIO * 100)}% of max_tokens",
-                    )
+
+            # Handle slash commands
+            if user_input.startswith("/"):
+                cmd = user_input[1:].strip().lower()
+                if cmd in ("quit", "exit", "q"):
+                    break
+                elif cmd == "memory":
+                    chapters = memory.list_chapters()
+                    table = Table(title="Memory Palace")
+                    table.add_column("Chapter")
+                    table.add_column("Files")
+                    for ch in chapters:
+                        table.add_row(ch["name"], str(len(ch["files"])))
                     CONSOLE.print(table)
+                    continue
+                elif cmd == "context":
+                    if ctx_mgr:
+                        stats = ctx_mgr.stats()
+                        table = Table(title="Context Manager (LTM)")
+                        table.add_column("Metric")
+                        table.add_column("Value")
+                        table.add_row(
+                            "Categories",
+                            f"{stats['categories']}/{stats['max_categories']}",
+                        )
+                        table.add_row("Total Entries", str(stats["total_entries"]))
+                        table.add_row(
+                            "Category Names",
+                            ", ".join(stats["category_names"]) or "—",
+                        )
+                        table.add_row(
+                            "Needs Consolidation",
+                            "yes" if stats["needs_consolidation"] else "no",
+                        )
+                        table.add_row(
+                            "Idle",
+                            f"{stats['idle_elapsed_s']}s / {stats['idle_threshold_s']}s",
+                        )
+                        CONSOLE.print(table)
+                    else:
+                        CONSOLE.print("[yellow]Context manager not available.[/yellow]")
+                    continue
+                elif cmd == "evolve":
+                    CONSOLE.print("[yellow]Running evolution engine...[/yellow]")
+                    new_prompt = await evolution.rewrite_system_prompt()
+                    ctx.system_prompt = new_prompt
+                    CONSOLE.print("[green]System prompt updated.[/green]")
+                    continue
+                elif cmd == "tools":
+                    tools = components["registry"].list_tools()
+                    CONSOLE.print("Available tools: " + ", ".join(tools))
+                    continue
+                elif cmd.startswith("mode "):
+                    # Kept as a hidden override for debugging; not advertised
+                    CONSOLE.print(
+                        "[dim](manual mode override removed — routing is automatic)[/dim]"
+                    )
+                    continue
+                elif cmd == "model" or cmd.startswith("model "):
+                    parts = cmd.split(None, 1)
+                    provider_cfg = cfg.get("providers", {}).get(
+                        cfg.get("active_provider", ""), {}
+                    )
+                    available = provider_cfg.get(
+                        "models", [provider_cfg.get("default_model", agent.model)]
+                    )
+                    if len(parts) == 1:
+                        # List available models
+                        table = Table(title="Models")
+                        table.add_column("Model")
+                        table.add_column("Active")
+                        for m in available:
+                            mark = (
+                                "[bold green]✓[/bold green]" if m == agent.model else ""
+                            )
+                            table.add_row(m, mark)
+                        CONSOLE.print(table)
+                    else:
+                        new_model = parts[1].strip()
+                        agent.set_model(new_model)
+                        CONSOLE.print(f"[green]Switched to model: {new_model}[/green]")
+                    continue
+                elif cmd == "stats":
+                    stats = evolution.get_stats()
+                    CONSOLE.print(
+                        f"Sessions: {stats['total']}, Avg score: {stats['avg_score']}"
+                    )
+                    continue
                 else:
-                    CONSOLE.print("[yellow]Context manager not available.[/yellow]")
-                continue
-            elif cmd == "evolve":
-                CONSOLE.print("[yellow]Running evolution engine...[/yellow]")
-                new_prompt = await evolution.rewrite_system_prompt()
-                ctx.system_prompt = new_prompt
-                CONSOLE.print("[green]System prompt updated.[/green]")
-                continue
-            elif cmd == "tools":
-                tools = components["registry"].list_tools()
-                CONSOLE.print("Available tools: " + ", ".join(tools))
-                continue
-            elif cmd.startswith("mode "):
-                # Kept as a hidden override for debugging; not advertised
-                CONSOLE.print(
-                    "[dim](manual mode override removed — routing is automatic)[/dim]"
-                )
-                continue
-            elif cmd == "model" or cmd.startswith("model "):
-                parts = cmd.split(None, 1)
-                provider_cfg = cfg.get("providers", {}).get(
-                    cfg.get("active_provider", ""), {}
-                )
-                available = provider_cfg.get(
-                    "models", [provider_cfg.get("default_model", agent.model)]
-                )
-                if len(parts) == 1:
-                    # List available models
-                    table = Table(title="Models")
-                    table.add_column("Model")
-                    table.add_column("Active")
-                    for m in available:
-                        mark = "[bold green]✓[/bold green]" if m == agent.model else ""
-                        table.add_row(m, mark)
-                    CONSOLE.print(table)
-                else:
-                    new_model = parts[1].strip()
-                    agent.set_model(new_model)
-                    CONSOLE.print(f"[green]Switched to model: {new_model}[/green]")
-                continue
-            elif cmd == "stats":
-                stats = evolution.get_stats()
-                CONSOLE.print(
-                    f"Sessions: {stats['total']}, Avg score: {stats['avg_score']}"
-                )
-                continue
-            else:
-                CONSOLE.print(f"[yellow]Unknown command: {user_input}[/yellow]")
-                continue
+                    CONSOLE.print(f"[yellow]Unknown command: {user_input}[/yellow]")
+                    continue
 
-        # The agent decides how to handle the request (directly or via spawn_agent tool)
-        CONSOLE.print()
-        collected_text: list[str] = []
+            # Mark activity so idle timer resets and dirty flag is set
+            if ctx_mgr:
+                ctx_mgr.mark_activity()
 
-        def stream_cb(chunk: str):
-            CONSOLE.print(chunk, end="", markup=False)
-            collected_text.append(chunk)
-
-        try:
-            CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
-            result = await agent.send_message(
-                ctx, user_input, stream_callback=stream_cb
-            )
-            if not collected_text:
-                CONSOLE.print(Markdown(result.content))
+            # The agent decides how to handle the request
             CONSOLE.print()
-            if result.error:
-                CONSOLE.print(f"[red]Error: {result.error}[/red]")
-            tools_used_session.extend(result.tool_calls_made)
+            collected_text: list[str] = []
 
-            # Sleep consolidation: compress context when working memory is large
-            ctx_mgr: Optional[ContextManager] = components.get("context_manager")
-            if ctx_mgr and ctx_mgr.should_sleep(ctx.messages, agent.max_tokens):
-                ctx.messages = await ctx_mgr.sleep(
-                    ctx.messages,
-                    components["client"],
-                    components["model"],
-                    api_format=agent.api_format,
+            def stream_cb(chunk: str):
+                CONSOLE.print(chunk, end="", markup=False)
+                collected_text.append(chunk)
+
+            try:
+                CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+                result = await agent.send_message(
+                    ctx, user_input, stream_callback=stream_cb
                 )
+                if not collected_text:
+                    CONSOLE.print(Markdown(result.content))
+                CONSOLE.print()
+                if result.error:
+                    CONSOLE.print(f"[red]Error: {result.error}[/red]")
+                tools_used_session.extend(result.tool_calls_made)
 
-            # Check for tool generation request
-            if any(
-                kw in user_input.lower()
-                for kw in [
-                    "create a tool",
-                    "write a tool",
-                    "generate a tool",
-                    "帮我写一个工具",
-                ]
-            ):
-                CONSOLE.print("[dim]Generating tool...[/dim]")
-                await evolution.generate_tool(user_input, components["registry"])
-                components["skill_loader"].reload()
+                # Token-ratio consolidation (dirty flag + min_messages already checked)
+                if ctx_mgr and ctx_mgr.should_sleep(ctx.messages, agent.max_tokens):
+                    ctx.messages = await ctx_mgr.sleep(
+                        ctx.messages,
+                        components["client"],
+                        components["model"],
+                        api_format=agent.api_format,
+                    )
 
-        except Exception as e:
-            CONSOLE.print(f"\n[red]Error: {e}[/red]")
+                # Check for tool generation request
+                if any(
+                    kw in user_input.lower()
+                    for kw in [
+                        "create a tool",
+                        "write a tool",
+                        "generate a tool",
+                        "帮我写一个工具",
+                    ]
+                ):
+                    CONSOLE.print("[dim]Generating tool...[/dim]")
+                    await evolution.generate_tool(user_input, components["registry"])
+                    components["skill_loader"].reload()
 
-        # Idle memory tidy check
-        if memory.should_tidy():
-            await memory.tidy(components["client"], components["model"])
+            except Exception as e:
+                CONSOLE.print(f"\n[red]Error: {e}[/red]")
+
+            # Idle memory tidy check
+            if memory.should_tidy():
+                await memory.tidy(components["client"], components["model"])
+
+    finally:
+        # Cancel background idle consolidation task on exit
+        idle_task.cancel()
+        try:
+            await idle_task
+        except asyncio.CancelledError:
+            pass
 
     # End of session scoring
     if len(ctx.messages) >= 2:

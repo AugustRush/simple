@@ -59,19 +59,33 @@
   },
 
   "context": {
-    "_readme": [
-      "Context Manager settings for intelligent working-memory management.",
-      "max_categories: upper limit on dynamic LTM categories; when exceeded the agent merges two similar ones (default 15).",
-      "decay_factor: per-sleep importance multiplier applied to all LTM entries (0.0–1.0, default 0.95). Lower = faster forgetting.",
-      "sleep_token_ratio: fraction of the active provider's max_tokens at which a sleep cycle is triggered (default 0.70 = 70%).",
-      "  max_tokens is NOT set here — it is inherited from providers.<active_provider>.max_tokens.",
-      "  To change the absolute token budget, update max_tokens in the relevant provider block above.",
-      "keep_last_messages: number of recent messages to retain after sleep compression (default 6)."
-    ],
-    "max_categories": 15,
-    "decay_factor": 0.95,
-    "sleep_token_ratio": 0.70,
-    "keep_last_messages": 6
+    "_readme": "Intelligent context manager. Split into 'storage' (what to keep) and 'consolidation' (when/how to compress).",
+
+    "storage": {
+      "_readme": [
+        "max_categories: upper limit on dynamic LTM categories.",
+        "  When exceeded, the agent merges two similar ones via LLM (default 15).",
+        "decay_factor: per-sleep importance multiplier (0.0–1.0, default 0.95).",
+        "  Lower = faster forgetting. Entries below 0.05 are pruned automatically."
+      ],
+      "max_categories": 15,
+      "decay_factor": 0.95
+    },
+
+    "consolidation": {
+      "_readme": [
+        "token_ratio: fraction of the provider's max_tokens at which a sleep cycle fires (default 0.70).",
+        "  max_tokens itself is set in providers.<active_provider>.max_tokens — not here.",
+        "keep_last_messages: number of recent messages retained after sleep compression (default 6).",
+        "idle_seconds: seconds of inactivity before the background idle-consolidation task fires (default 300).",
+        "  The idle task polls every 30 s and only triggers when the dirty flag is set (i.e. new messages exist).",
+        "min_messages: minimum messages in working memory before any consolidation is attempted (default 4)."
+      ],
+      "token_ratio": 0.70,
+      "keep_last_messages": 6,
+      "idle_seconds": 300,
+      "min_messages": 4
+    }
   },
 
   "mcp_servers": [
