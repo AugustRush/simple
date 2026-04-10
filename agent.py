@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import math
 import inspect
 import json
 import os
@@ -58,6 +59,15 @@ DEFAULT_MAX_TOKENS = 8192
 MEMORY_TIDY_INTERVAL = 3600  # seconds
 MEMORY_TIDY_FILE_THRESHOLD = 5
 MAX_ORCHESTRATION_DEPTH = 3
+
+# ── Context Manager constants ──────────────────────────────────────────────────
+CONTEXT_DIR = AGENT_HOME / "context"
+MAX_CATEGORIES = 15  # upper limit on dynamic LTM categories
+MIN_IMPORTANCE = 0.05  # entries below this are pruned after decay
+CHARS_PER_TOKEN = 4  # rough estimate: 4 chars ≈ 1 token
+SLEEP_TOKEN_RATIO = 0.70  # trigger sleep when working memory > 70% of max_tokens
+DECAY_FACTOR = 0.95  # per-sleep importance multiplier
+RETRIEVAL_TOP_K = 5  # top-K entries injected per turn
 
 CONSOLE = Console()
 
@@ -513,6 +523,507 @@ class MemoryPalace:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 2.5. CONTEXT MANAGER — LTM + Retrieval + Consolidation
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class LTMEntry:
+    """A single long-term memory entry with importance scoring."""
+
+    id: str
+    content: str
+    importance: float  # 0.0 – 1.0
+    category: str
+    created_at: str
+    updated_at: str
+
+    def decay(self, factor: float = DECAY_FACTOR) -> None:
+        self.importance = max(0.0, self.importance * factor)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "content": self.content,
+            "importance": self.importance,
+            "category": self.category,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LTMEntry":
+        return cls(**d)
+
+
+@dataclass
+class LTMCategory:
+    """Metadata for a long-term memory category."""
+
+    name: str
+    entry_count: int = 0
+    avg_importance: float = 0.0
+    last_updated: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "entry_count": self.entry_count,
+            "avg_importance": self.avg_importance,
+            "last_updated": self.last_updated,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LTMCategory":
+        return cls(**d)
+
+
+class LTMStore:
+    """File-based long-term memory with dynamic categories and upper limit.
+
+    Storage layout: ~/.agent/context/
+        _meta.json          — category registry
+        <category>.json     — list of LTMEntry objects
+    """
+
+    def __init__(
+        self,
+        context_dir: Path = CONTEXT_DIR,
+        max_categories: int = MAX_CATEGORIES,
+    ):
+        self.dir = context_dir
+        self.max_categories = max_categories
+        self._meta_path = context_dir / "_meta.json"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._meta = self._load_meta()
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _load_meta(self) -> dict:
+        if self._meta_path.exists():
+            try:
+                return json.loads(self._meta_path.read_text())
+            except Exception:
+                pass
+        return {"categories": [], "total_entries": 0}
+
+    def _save_meta(self) -> None:
+        self._meta_path.write_text(json.dumps(self._meta, indent=2, ensure_ascii=False))
+
+    def _category_path(self, name: str) -> Path:
+        return self.dir / f"{name}.json"
+
+    # ── Category helpers ──────────────────────────────────────────────────────
+
+    def list_categories(self) -> list[LTMCategory]:
+        return [LTMCategory.from_dict(c) for c in self._meta.get("categories", [])]
+
+    def category_count(self) -> int:
+        return len(self._meta.get("categories", []))
+
+    # ── Entry CRUD ────────────────────────────────────────────────────────────
+
+    def read_entries(self, category: str) -> list[LTMEntry]:
+        path = self._category_path(category)
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text())
+            return [LTMEntry.from_dict(e) for e in data]
+        except Exception:
+            return []
+
+    def write_entries(self, category: str, entries: list[LTMEntry]) -> None:
+        path = self._category_path(category)
+        path.write_text(
+            json.dumps([e.to_dict() for e in entries], indent=2, ensure_ascii=False)
+        )
+        avg_imp = sum(e.importance for e in entries) / len(entries) if entries else 0.0
+        cats = self._meta.setdefault("categories", [])
+        for c in cats:
+            if c["name"] == category:
+                c["entry_count"] = len(entries)
+                c["avg_importance"] = avg_imp
+                c["last_updated"] = _now()
+                break
+        else:
+            cats.append(
+                {
+                    "name": category,
+                    "entry_count": len(entries),
+                    "avg_importance": avg_imp,
+                    "last_updated": _now(),
+                }
+            )
+        self._meta["total_entries"] = sum(c["entry_count"] for c in cats)
+        self._save_meta()
+
+    def add_entry(self, entry: LTMEntry) -> None:
+        entries = self.read_entries(entry.category)
+        entries.append(entry)
+        self.write_entries(entry.category, entries)
+
+    def all_entries(self) -> list[LTMEntry]:
+        result: list[LTMEntry] = []
+        for cat in self.list_categories():
+            result.extend(self.read_entries(cat.name))
+        return result
+
+    # ── Maintenance ───────────────────────────────────────────────────────────
+
+    def apply_decay(self, factor: float = DECAY_FACTOR) -> None:
+        """Decay importance of all entries; prune those below MIN_IMPORTANCE."""
+        for cat in self.list_categories():
+            entries = self.read_entries(cat.name)
+            for e in entries:
+                e.decay(factor)
+                e.updated_at = _now()
+            entries = [e for e in entries if e.importance >= MIN_IMPORTANCE]
+            self.write_entries(cat.name, entries)
+
+    def merge_categories(self, cat_a: str, cat_b: str, merged_name: str) -> None:
+        """Merge cat_a and cat_b into merged_name, delete originals."""
+        entries_a = self.read_entries(cat_a)
+        entries_b = self.read_entries(cat_b)
+        for e in entries_a + entries_b:
+            e.category = merged_name
+        self.write_entries(merged_name, entries_a + entries_b)
+        # Remove original files / meta rows if they differ from merged_name
+        for old in (cat_a, cat_b):
+            if old != merged_name:
+                self._category_path(old).unlink(missing_ok=True)
+                self._meta["categories"] = [
+                    c for c in self._meta["categories"] if c["name"] != old
+                ]
+        self._save_meta()
+
+
+class LocalRetriever:
+    """BM25-lite retrieval with importance boosting. Pure stdlib, no external deps."""
+
+    K1: float = 1.5
+    B: float = 0.75
+
+    @staticmethod
+    def tokenize(text: str) -> list[str]:
+        """Lowercase tokenizer: splits on non-alphanumeric, keeps CJK chars."""
+        return re.findall(
+            r"\b[a-zA-Z\u4e00-\u9fff][a-zA-Z0-9\u4e00-\u9fff]*\b", text.lower()
+        )
+
+    def score(
+        self, query: str, entries: list[LTMEntry]
+    ) -> list[tuple[LTMEntry, float]]:
+        """Score entries against query using BM25-lite + importance boost."""
+        if not entries:
+            return []
+        query_terms = self.tokenize(query)
+        if not query_terms:
+            return [(e, e.importance) for e in entries]
+
+        N = len(entries)
+        df: dict[str, int] = {}
+        tokenized: list[list[str]] = []
+
+        for entry in entries:
+            tokens = self.tokenize(entry.content)
+            tokenized.append(tokens)
+            for term in set(tokens):
+                df[term] = df.get(term, 0) + 1
+
+        avg_dl = sum(len(t) for t in tokenized) / N if N else 1.0
+
+        scored: list[tuple[LTMEntry, float]] = []
+        for i, entry in enumerate(entries):
+            tokens = tokenized[i]
+            dl = len(tokens)
+            tf_map: dict[str, int] = {}
+            for t in tokens:
+                tf_map[t] = tf_map.get(t, 0) + 1
+
+            bm25 = 0.0
+            for term in query_terms:
+                if term not in tf_map:
+                    continue
+                idf = math.log(
+                    (N - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5) + 1
+                )
+                tf = tf_map[term]
+                tf_norm = (
+                    tf
+                    * (self.K1 + 1)
+                    / (tf + self.K1 * (1 - self.B + self.B * dl / avg_dl))
+                )
+                bm25 += idf * tf_norm
+
+            # Importance acts as a multiplicative boost
+            scored.append((entry, bm25 * (1.0 + entry.importance)))
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored
+
+    def retrieve(
+        self, query: str, entries: list[LTMEntry], top_k: int = RETRIEVAL_TOP_K
+    ) -> list[LTMEntry]:
+        """Return top-K most relevant entries (score > 0 only)."""
+        scored = self.score(query, entries)
+        return [entry for entry, s in scored[:top_k] if s > 0]
+
+
+class ConsolidationEngine:
+    """LLM-driven context consolidation — the 'sleep' mechanism.
+
+    Triggered when working memory exceeds SLEEP_TOKEN_RATIO of max_tokens.
+    Extracts structured facts from conversation, stores in LTM, applies decay,
+    and compresses ctx.messages to the most recent entries.
+    """
+
+    def __init__(
+        self,
+        store: LTMStore,
+        max_categories: int = MAX_CATEGORIES,
+        decay_factor: float = DECAY_FACTOR,
+        sleep_token_ratio: float = SLEEP_TOKEN_RATIO,
+    ):
+        self.store = store
+        self.max_categories = max_categories
+        self.decay_factor = decay_factor
+        self.sleep_token_ratio = sleep_token_ratio
+
+    # ── Trigger ───────────────────────────────────────────────────────────────
+
+    def estimate_tokens(self, messages: list[dict]) -> int:
+        """Rough token estimate: total chars / CHARS_PER_TOKEN."""
+        total_chars = 0
+        for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        total_chars += len(
+                            str(block.get("text", "") or block.get("content", ""))
+                        )
+        return total_chars // CHARS_PER_TOKEN
+
+    def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
+        return self.estimate_tokens(messages) >= int(
+            max_tokens * self.sleep_token_ratio
+        )
+
+    # ── Main consolidation ────────────────────────────────────────────────────
+
+    async def consolidate(
+        self,
+        messages: list[dict],
+        client: Any,
+        model: str,
+        api_format: str = "anthropic",
+        keep_last: int = 6,
+    ) -> list[dict]:
+        """One sleep cycle: extract → classify → store → decay → compress."""
+        CONSOLE.print("[dim]💤 Context consolidation (sleep)...[/dim]")
+        conv_text = self._format_messages_for_llm(messages)
+        existing = [c.name for c in self.store.list_categories()]
+        cat_list = ", ".join(existing) if existing else "none yet"
+
+        prompt = (
+            f"Analyze this conversation and extract important facts worth remembering.\n"
+            f"Existing categories: {cat_list}\n\n"
+            f"For each item output JSON on its own line (no markdown fences):\n"
+            f'{{"category": "<name>", "content": "<fact>", "importance": <0.1-1.0>}}\n\n'
+            f"Rules:\n"
+            f"- importance: 1.0=critical decisions/preferences, 0.5=useful context, 0.1=minor\n"
+            f"- Reuse existing categories when possible; create new ones only when necessary\n"
+            f"- Be selective: max 10 items, 1-3 sentences each\n\n"
+            f"Conversation:\n{conv_text[:3000]}"
+        )
+
+        try:
+            if api_format == "anthropic":
+                resp = await client.messages.create(
+                    model=model,
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = resp.content[0].text
+            else:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    max_tokens=1024,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = resp.choices[0].message.content or ""
+
+            entries = self._parse_entries(raw)
+            for entry in entries:
+                await self._ensure_category_fits(
+                    entry.category, client, model, api_format
+                )
+                self.store.add_entry(entry)
+
+            self.store.apply_decay(self.decay_factor)
+            CONSOLE.print(
+                f"[dim]💤 Stored {len(entries)} entries. "
+                f"Categories: {self.store.category_count()}/{self.max_categories}[/dim]"
+            )
+        except Exception as e:
+            CONSOLE.print(f"[dim]Sleep extraction error: {e}[/dim]")
+
+        compressed = messages[-keep_last:] if len(messages) > keep_last else messages
+        CONSOLE.print(
+            f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
+        )
+        return compressed
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _format_messages_for_llm(self, messages: list[dict]) -> str:
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown").upper()
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = [
+                    block.get("text", "") or block.get("content", "")
+                    for block in content
+                    if isinstance(block, dict)
+                ]
+                content = " ".join(str(p) for p in parts)
+            lines.append(f"{role}: {content}")
+        return "\n\n".join(lines)
+
+    def _parse_entries(self, raw: str) -> list[LTMEntry]:
+        entries = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                data = json.loads(line)
+                content = data.get("content", "").strip()
+                if not content:
+                    continue
+                entries.append(
+                    LTMEntry(
+                        id=str(uuid.uuid4())[:8],
+                        content=content,
+                        importance=float(data.get("importance", 0.5)),
+                        category=data.get("category", "general").strip(),
+                        created_at=_now(),
+                        updated_at=_now(),
+                    )
+                )
+            except Exception:
+                continue
+        return entries
+
+    async def _ensure_category_fits(
+        self, category: str, client: Any, model: str, api_format: str
+    ) -> None:
+        """If adding new category exceeds limit, ask LLM to merge two existing."""
+        existing = [c.name for c in self.store.list_categories()]
+        if category in existing or self.store.category_count() < self.max_categories:
+            return
+
+        summaries = []
+        for c in self.store.list_categories():
+            entries = self.store.read_entries(c.name)
+            snippets = "; ".join(e.content[:50] for e in entries[:3])
+            summaries.append(f"- {c.name}: {snippets}")
+
+        merge_prompt = (
+            f"Memory has {len(existing)} categories (max {self.max_categories}). "
+            f"Need to add '{category}'. Choose two categories to merge.\n\n"
+            f"Categories:\n" + "\n".join(summaries) + "\n\n"
+            f'Respond with JSON only: {{"merge_a": "<cat1>", "merge_b": "<cat2>", "merged_name": "<name>"}}'
+        )
+        try:
+            if api_format == "anthropic":
+                resp = await client.messages.create(
+                    model=model,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": merge_prompt}],
+                )
+                raw = resp.content[0].text
+            else:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    max_tokens=256,
+                    messages=[{"role": "user", "content": merge_prompt}],
+                )
+                raw = resp.choices[0].message.content or ""
+
+            m = re.search(r"\{.*\}", raw, re.DOTALL)
+            if m:
+                data = json.loads(m.group())
+                self.store.merge_categories(
+                    data["merge_a"], data["merge_b"], data["merged_name"]
+                )
+                CONSOLE.print(
+                    f"[dim]Merged: {data['merge_a']} + {data['merge_b']} "
+                    f"→ {data['merged_name']}[/dim]"
+                )
+        except Exception as e:
+            CONSOLE.print(f"[dim]Category merge error: {e}[/dim]")
+
+
+class ContextManager:
+    """Orchestrates LTM storage, retrieval, and consolidation.
+
+    Usage:
+        retrieved_str = ctx_mgr.retrieve_context(user_message)
+        if ctx_mgr.should_sleep(ctx.messages, max_tokens):
+            ctx.messages = await ctx_mgr.sleep(ctx.messages, client, model)
+    """
+
+    def __init__(
+        self,
+        store: LTMStore,
+        retriever: LocalRetriever,
+        consolidation: ConsolidationEngine,
+    ):
+        self.store = store
+        self.retriever = retriever
+        self.consolidation = consolidation
+
+    def retrieve_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
+        """Return top-K relevant LTM entries as an injectable string."""
+        entries = self.store.all_entries()
+        if not entries:
+            return ""
+        top = self.retriever.retrieve(query, entries, top_k=top_k)
+        if not top:
+            return ""
+        lines = ["## Retrieved Context (from long-term memory)"]
+        for e in top:
+            lines.append(f"- [{e.category}] {e.content}")
+        return "\n".join(lines)
+
+    def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
+        return self.consolidation.should_sleep(messages, max_tokens)
+
+    async def sleep(
+        self,
+        messages: list[dict],
+        client: Any,
+        model: str,
+        api_format: str = "anthropic",
+    ) -> list[dict]:
+        return await self.consolidation.consolidate(messages, client, model, api_format)
+
+    def stats(self) -> dict:
+        cats = self.store.list_categories()
+        return {
+            "categories": len(cats),
+            "total_entries": sum(c.entry_count for c in cats),
+            "category_names": [c.name for c in cats],
+            "max_categories": self.store.max_categories,
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 3. TOOLS / SKILLS / MCP
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -579,11 +1090,17 @@ REGISTRY = ToolRegistry()
 
 
 class BuiltinTools:
-    """Built-in tools: shell, file, web, memory_write."""
+    """Built-in tools: shell, file, web, memory_write, context_retrieve."""
 
-    def __init__(self, memory: MemoryPalace, registry: ToolRegistry):
+    def __init__(
+        self,
+        memory: MemoryPalace,
+        registry: ToolRegistry,
+        context_manager: Optional["ContextManager"] = None,
+    ):
         self.memory = memory
         self.registry = registry
+        self.context_manager = context_manager
         self._register()
 
     def _register(self):
@@ -731,6 +1248,31 @@ class BuiltinTools:
             self._memory_index,
         )
 
+        r.register(
+            "context_retrieve",
+            (
+                "Search long-term context memory for relevant information. "
+                "Use to recall past facts, user preferences, project context, "
+                "or any information consolidated from previous sessions."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query to retrieve relevant context",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of results (default 5)",
+                        "default": 5,
+                    },
+                },
+                "required": ["query"],
+            },
+            self._context_retrieve,
+        )
+
     async def _shell(self, command: str, timeout: int = 30) -> str:
         try:
             proc = await asyncio.create_subprocess_shell(
@@ -798,6 +1340,12 @@ class BuiltinTools:
 
     def _memory_index(self) -> str:
         return self.memory.read_index()
+
+    def _context_retrieve(self, query: str, top_k: int = 5) -> str:
+        if self.context_manager is None:
+            return "Context manager not available."
+        result = self.context_manager.retrieve_context(query, top_k=top_k)
+        return result if result else "No relevant context found."
 
 
 class MCPClient:
@@ -908,6 +1456,7 @@ class BaseAgent:
         self.api_format = api_format
         self.model = model
         self.max_tokens = max_tokens
+        self.context_manager: Optional[ContextManager] = None
 
     def set_model(self, model: str) -> None:
         """Switch the model used for subsequent calls."""
@@ -1047,70 +1596,85 @@ class BaseAgent:
         user_message: str,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> "AgentResult":
+        # Inject relevant LTM context into system prompt for this turn
+        original_system = ctx.system_prompt
+        if self.context_manager:
+            retrieved = self.context_manager.retrieve_context(user_message)
+            if retrieved:
+                ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
+
         ctx.messages.append({"role": "user", "content": user_message})
         tool_calls_made = []
         result_text = ""
 
-        while True:
-            tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
+        try:
+            while True:
+                tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
 
-            try:
-                if stream_callback:
-                    # Stream for display; collect text but don't trust it for
-                    # tool-use detection — follow up with one non-stream call.
-                    result_text = await self._stream_response(
-                        ctx, tools, stream_callback
+                try:
+                    if stream_callback:
+                        # Stream for display; collect text but don't trust it for
+                        # tool-use detection — follow up with one non-stream call.
+                        result_text = await self._stream_response(
+                            ctx, tools, stream_callback
+                        )
+                        stream_callback = None  # don't double-print on next iter
+
+                    # Single authoritative non-streaming call (also handles post-tool turns)
+                    response = await self._create(ctx, tools)
+                    stop_reason, text, tool_uses = self._parse_response(response)
+
+                    if stop_reason == "tool_use" and tool_uses:
+                        result_text = text or result_text
+                        ctx.messages.append(self._assistant_message(response, text))
+
+                        spawn_calls = [
+                            tu for tu in tool_uses if tu["name"] == "spawn_agent"
+                        ]
+                        if len(spawn_calls) > 1:
+                            roles = ", ".join(
+                                tu["input"].get("role", "?") for tu in spawn_calls
+                            )
+                            CONSOLE.print(
+                                f"\n[bold magenta]⟳ Spawning {len(spawn_calls)} agents in parallel:[/bold magenta] {roles}"
+                            )
+
+                        async def _exec_tool(tu: dict) -> str:
+                            if tu["name"] == "spawn_agent":
+                                # spawn_agent handles its own rich output
+                                return await self.registry.call(tu["name"], tu["input"])
+                            CONSOLE.print(f"\n[cyan]→ {tu['name']}[/cyan]")
+                            res = await self.registry.call(tu["name"], tu["input"])
+                            CONSOLE.print(
+                                f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]"
+                            )
+                            return res
+
+                        tool_calls_made.extend(tu["name"] for tu in tool_uses)
+                        results = list(
+                            await asyncio.gather(*[_exec_tool(tu) for tu in tool_uses])
+                        )
+                        ctx.messages.extend(
+                            self._tool_result_messages(tool_uses, results)
+                        )
+                        continue
+                    else:
+                        result_text = text or result_text
+                        ctx.messages.append(
+                            {"role": "assistant", "content": result_text}
+                        )
+                        break
+
+                except Exception as e:
+                    return AgentResult(
+                        agent_id=ctx.agent_id,
+                        content="",
+                        tool_calls_made=tool_calls_made,
+                        error=str(e),
                     )
-                    stream_callback = None  # don't double-print on next iter
-
-                # Single authoritative non-streaming call (also handles post-tool turns)
-                response = await self._create(ctx, tools)
-                stop_reason, text, tool_uses = self._parse_response(response)
-
-                if stop_reason == "tool_use" and tool_uses:
-                    result_text = text or result_text
-                    ctx.messages.append(self._assistant_message(response, text))
-
-                    spawn_calls = [
-                        tu for tu in tool_uses if tu["name"] == "spawn_agent"
-                    ]
-                    if len(spawn_calls) > 1:
-                        roles = ", ".join(
-                            tu["input"].get("role", "?") for tu in spawn_calls
-                        )
-                        CONSOLE.print(
-                            f"\n[bold magenta]⟳ Spawning {len(spawn_calls)} agents in parallel:[/bold magenta] {roles}"
-                        )
-
-                    async def _exec_tool(tu: dict) -> str:
-                        if tu["name"] == "spawn_agent":
-                            # spawn_agent handles its own rich output
-                            return await self.registry.call(tu["name"], tu["input"])
-                        CONSOLE.print(f"\n[cyan]→ {tu['name']}[/cyan]")
-                        res = await self.registry.call(tu["name"], tu["input"])
-                        CONSOLE.print(
-                            f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]"
-                        )
-                        return res
-
-                    tool_calls_made.extend(tu["name"] for tu in tool_uses)
-                    results = list(
-                        await asyncio.gather(*[_exec_tool(tu) for tu in tool_uses])
-                    )
-                    ctx.messages.extend(self._tool_result_messages(tool_uses, results))
-                    continue
-                else:
-                    result_text = text or result_text
-                    ctx.messages.append({"role": "assistant", "content": result_text})
-                    break
-
-            except Exception as e:
-                return AgentResult(
-                    agent_id=ctx.agent_id,
-                    content="",
-                    tool_calls_made=tool_calls_made,
-                    error=str(e),
-                )
+        finally:
+            # Always restore the original system prompt
+            ctx.system_prompt = original_system
 
         return AgentResult(
             agent_id=ctx.agent_id,
@@ -1707,7 +2271,24 @@ def _build_components(cfg: dict):
         tidy_threshold=mem_cfg.get("tidy_file_threshold", MEMORY_TIDY_FILE_THRESHOLD),
     )
     registry = ToolRegistry()
-    BuiltinTools(memory, registry)
+
+    # Context Manager — build first so BuiltinTools can reference it
+    ctx_cfg = cfg.get("context", {})
+    ctx_store = LTMStore(
+        context_dir=CONTEXT_DIR,
+        max_categories=ctx_cfg.get("max_categories", MAX_CATEGORIES),
+    )
+    ctx_manager = ContextManager(
+        store=ctx_store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(
+            store=ctx_store,
+            decay_factor=ctx_cfg.get("decay_factor", DECAY_FACTOR),
+            sleep_token_ratio=ctx_cfg.get("sleep_token_ratio", SLEEP_TOKEN_RATIO),
+        ),
+    )
+
+    BuiltinTools(memory, registry, context_manager=ctx_manager)
 
     skill_loader = SkillLoader(registry)
     skill_loader.load_all()
@@ -1716,6 +2297,7 @@ def _build_components(cfg: dict):
         client, registry, model=model, max_tokens=max_tokens, api_format=api_format
     )
     agent.register_spawn_capability(system_prompt)
+    agent.context_manager = ctx_manager
     evolution = EvolutionEngine(client, model, memory, api_format=api_format)
 
     return {
@@ -1727,6 +2309,7 @@ def _build_components(cfg: dict):
         "registry": registry,
         "agent": agent,
         "evolution": evolution,
+        "context_manager": ctx_manager,
         "skill_loader": skill_loader,
         "cfg": cfg,
     }
@@ -1749,7 +2332,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     CONSOLE.print(
         Panel(
             "[bold cyan]Personal Agent[/bold cyan]\n"
-            "[dim]Commands: /memory, /evolve, /tools, /model [name], /quit[/dim]",
+            "[dim]Commands: /memory, /context, /evolve, /tools, /model [name], /quit[/dim]",
             title="Agent Ready",
             border_style="cyan",
         )
@@ -1777,6 +2360,30 @@ async def _interactive_loop(components: dict, cfg: dict):
                 for ch in chapters:
                     table.add_row(ch["name"], str(len(ch["files"])))
                 CONSOLE.print(table)
+                continue
+            elif cmd == "context":
+                ctx_mgr: Optional[ContextManager] = components.get("context_manager")
+                if ctx_mgr:
+                    stats = ctx_mgr.stats()
+                    table = Table(title="Context Manager (LTM)")
+                    table.add_column("Metric")
+                    table.add_column("Value")
+                    table.add_row(
+                        "Categories",
+                        f"{stats['categories']}/{stats['max_categories']}",
+                    )
+                    table.add_row("Total Entries", str(stats["total_entries"]))
+                    table.add_row(
+                        "Category Names",
+                        ", ".join(stats["category_names"]) or "—",
+                    )
+                    table.add_row(
+                        "Sleep Threshold",
+                        f"{int(SLEEP_TOKEN_RATIO * 100)}% of max_tokens",
+                    )
+                    CONSOLE.print(table)
+                else:
+                    CONSOLE.print("[yellow]Context manager not available.[/yellow]")
                 continue
             elif cmd == "evolve":
                 CONSOLE.print("[yellow]Running evolution engine...[/yellow]")
@@ -1845,6 +2452,16 @@ async def _interactive_loop(components: dict, cfg: dict):
             if result.error:
                 CONSOLE.print(f"[red]Error: {result.error}[/red]")
             tools_used_session.extend(result.tool_calls_made)
+
+            # Sleep consolidation: compress context when working memory is large
+            ctx_mgr: Optional[ContextManager] = components.get("context_manager")
+            if ctx_mgr and ctx_mgr.should_sleep(ctx.messages, agent.max_tokens):
+                ctx.messages = await ctx_mgr.sleep(
+                    ctx.messages,
+                    components["client"],
+                    components["model"],
+                    api_format=agent.api_format,
+                )
 
             # Check for tool generation request
             if any(
