@@ -139,7 +139,7 @@ DEFAULT_CONFIG: dict = {
     "active_provider": "anthropic",
     # ── Provider definitions ──────────────────────────────────────────────
     # api_format: "anthropic" | "openai"
-    # models: optional list of available model names (used by /model command)
+    # models: optional list for /model command; falls back to [default_model]
     "providers": {
         "anthropic": {
             "api_format": "anthropic",
@@ -176,32 +176,11 @@ DEFAULT_CONFIG: dict = {
     "memory": {
         "tidy_interval_seconds": MEMORY_TIDY_INTERVAL,
         "tidy_file_threshold": MEMORY_TIDY_FILE_THRESHOLD,
-        "auto_tidy": True,
-    },
-    # ── Orchestration settings ────────────────────────────────────────────
-    "orchestration": {
-        "max_depth": MAX_ORCHESTRATION_DEPTH,
-        "default_mode": "auto",  # auto | serial | parallel | debate | hybrid | team
-        # team: list of {"role": str, "system": str, "instruction": str (optional)}
-        # If omitted, a default 3-member team (analyst/critic/implementer) is used.
-        "team": [],
-    },
-    # ── Evolution / RL settings ───────────────────────────────────────────
-    "evolution": {
-        "score_on_exit": True,
-        "auto_rewrite_threshold": 6.0,  # avg score below this triggers rewrite
-        "rewrite_after_n_sessions": 10,
     },
     # ── MCP servers ───────────────────────────────────────────────────────
-    "mcp_servers": [
-        # {
-        #   "name": "filesystem",
-        #   "command": "npx",
-        #   "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-        # }
-    ],
+    "mcp_servers": [],
     # ── System prompt ─────────────────────────────────────────────────────
-    "system_prompt_file": None,  # null = use built-in / best.md
+    "system_prompt_file": None,  # null = use built-in prompt
 }
 
 

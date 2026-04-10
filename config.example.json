@@ -1,0 +1,73 @@
+{
+  "_readme": "Copy this file to ~/.agent/config.json and fill in your API keys.",
+
+  "active_provider": "anthropic",
+
+  "providers": {
+    "_readme": "api_format must be 'anthropic' or 'openai'. api_key can be a literal value or '$ENV_VAR' to read from environment.",
+
+    "anthropic": {
+      "api_format": "anthropic",
+      "api_key": "$ANTHROPIC_API_KEY",
+      "default_model": "claude-opus-4-5",
+      "models": ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-3-5"],
+      "max_tokens": 8192
+    },
+
+    "openai": {
+      "api_format": "openai",
+      "api_key": "$OPENAI_API_KEY",
+      "default_model": "gpt-4o",
+      "models": ["gpt-4o", "gpt-4o-mini", "o1-preview"],
+      "max_tokens": 4096
+    },
+
+    "deepseek": {
+      "api_format": "openai",
+      "api_key": "$DEEPSEEK_API_KEY",
+      "base_url": "https://api.deepseek.com/v1",
+      "default_model": "deepseek-chat",
+      "models": ["deepseek-chat", "deepseek-reasoner"],
+      "max_tokens": 8192
+    },
+
+    "qwen": {
+      "_readme": "Any OpenAI-compatible endpoint works — Qwen, Groq, Together, local vLLM, etc.",
+      "api_format": "openai",
+      "api_key": "$DASHSCOPE_API_KEY",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "default_model": "qwen-max",
+      "models": ["qwen-max", "qwen-plus", "qwen-turbo"],
+      "max_tokens": 8192
+    },
+
+    "ollama": {
+      "_readme": "Local Ollama — set api_key to any non-empty string (auth not required).",
+      "api_format": "openai",
+      "api_key": "ollama",
+      "base_url": "http://localhost:11434/v1",
+      "default_model": "qwen2.5:14b",
+      "models": ["qwen2.5:14b", "qwen2.5:7b", "llama3.2", "mistral"],
+      "max_tokens": 4096
+    }
+  },
+
+  "memory": {
+    "_readme": "tidy_interval_seconds: how often (in seconds) the agent auto-reorganises memory. tidy_file_threshold: minimum number of new memory files before a tidy is triggered.",
+    "tidy_interval_seconds": 3600,
+    "tidy_file_threshold": 5
+  },
+
+  "mcp_servers": [
+    {
+      "_readme": "Remove this object and add real MCP server entries. Each entry needs name, command, and args.",
+      "_example": true,
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    }
+  ],
+
+  "system_prompt_file": null,
+  "_system_prompt_file_readme": "null = use the built-in prompt. Set to an absolute path to load a custom system prompt from a .md or .txt file, e.g. '/Users/you/.agent/my_prompt.md'."
+}
