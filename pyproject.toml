@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple"
+version = "0.1.0"
+description = "Single-file personal AI agent with a memory palace and provider abstraction."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "anthropic",
+  "openai",
+  "typer",
+  "rich",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp"]
+
+[project.scripts]
+simple = "agent:app"
+
+[dependency-groups]
+dev = [
+  "pytest",
+]
+
+[tool.setuptools]
+py-modules = ["agent"]

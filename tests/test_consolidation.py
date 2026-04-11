@@ -81,9 +81,26 @@ def test_parse_entries(tmp_path):
     )
     entries = eng._parse_entries(raw)
     assert len(entries) == 3
-    assert entries[0].category == "code_context"
+    assert entries[0].category == "concepts"
+    assert entries[0].entity == "code_context"
     assert entries[1].importance == pytest.approx(0.7)
     assert entries[2].content == "Fix the auth bug"
+
+
+def test_parse_entries_supports_fixed_loci_fields(tmp_path):
+    eng = make_engine(tmp_path)
+    raw = (
+        '{"locus": "identity", "entity": "user", "memory_type": "preference", '
+        '"content": "Prefers concise responses", "importance": 0.8, "confidence": 0.9}\n'
+    )
+
+    entries = eng._parse_entries(raw)
+
+    assert len(entries) == 1
+    assert entries[0].category == "identity"
+    assert entries[0].entity == "user"
+    assert entries[0].memory_type == "preference"
+    assert entries[0].confidence == pytest.approx(0.9)
 
 
 def test_parse_entries_skips_empty_content(tmp_path):
@@ -222,3 +239,34 @@ def test_sleep_clears_dirty_flag(tmp_path, monkeypatch):
     result = asyncio.run(ctx_mgr.sleep(messages, client=None, model="x"))
     assert ctx_mgr._needs_consolidation is False
     assert len(result) <= 4
+
+
+def test_sleep_clears_dirty_flag_when_consolidation_raises(tmp_path):
+    import asyncio
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager
+
+    store = LTMStore(context_dir=tmp_path / "context")
+
+    class FailingEngine(ConsolidationEngine):
+        async def consolidate(
+            self,
+            messages,
+            client,
+            model,
+            api_format="anthropic",
+            keep_last=None,
+            staging=None,
+        ):
+            raise RuntimeError("boom")
+
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=FailingEngine(store=store),
+    )
+    ctx_mgr.mark_activity()
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(ctx_mgr.sleep([{"role": "user", "content": "hello"}], None, "x"))
+
+    assert ctx_mgr._needs_consolidation is False

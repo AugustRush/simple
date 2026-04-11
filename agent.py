@@ -17,11 +17,14 @@ import inspect
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
@@ -68,7 +71,34 @@ CHARS_PER_TOKEN = 4  # rough estimate: 4 chars ≈ 1 token
 SLEEP_TOKEN_RATIO = 0.70  # trigger sleep when working memory > 70% of max_tokens
 DECAY_FACTOR = 0.95  # per-sleep importance multiplier
 RETRIEVAL_TOP_K = 5  # top-K entries injected per turn
-STAGING_FILE = CONTEXT_DIR / "_staging.jsonl"  # raw conversation buffer
+STAGING_DIR = CONTEXT_DIR / "_staging"  # per-session raw conversation buffers
+RECENT_SESSION_TURNS = 6  # recent staged turns exposed to explicit context lookup
+PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
+STAGING_TURN_THRESHOLD = 6
+STAGING_TOKEN_THRESHOLD = 300
+PALACE_LOCI = (
+    "identity",
+    "projects",
+    "people",
+    "concepts",
+    "episodes",
+    "tasks",
+    "procedures",
+    "archive",
+)
+LEGACY_MEMORY_ALIASES = {
+    "knowledge": "concepts",
+}
+PALACE_LOCUS_SUMMARIES = {
+    "identity": "User identity, preferences, communication style, and durable constraints",
+    "projects": "Project background, decisions, risks, and current state",
+    "people": "People-specific facts, relationships, and collaboration context",
+    "concepts": "Stable concepts, definitions, and domain knowledge",
+    "episodes": "Session and event summaries",
+    "tasks": "Open loops, commitments, and next actions",
+    "procedures": "Reusable workflows and preferred methods",
+    "archive": "Superseded or historical memory items",
+}
 
 CONSOLE = Console()
 
@@ -311,15 +341,21 @@ class ModelClientFactory:
 class MemoryIndex:
     """Manages the INDEX.md directory tree."""
 
-    def __init__(self):
-        self.path = INDEX_FILE
+    def __init__(self, base_dir: Path = MEMORY_DIR):
+        self.base_dir = base_dir
+        self.path = self.base_dir / "INDEX.md"
         self._ensure_dirs()
 
+    @staticmethod
+    def normalize_chapter(chapter: str) -> str:
+        chapter = str(chapter).strip().lower()
+        return LEGACY_MEMORY_ALIASES.get(chapter, chapter)
+
     def _ensure_dirs(self):
-        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-        for chapter in ["projects", "knowledge", "people", "tasks", "archive"]:
-            (MEMORY_DIR / chapter).mkdir(exist_ok=True)
-            idx = MEMORY_DIR / chapter / "_index.md"
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+        for chapter in PALACE_LOCI:
+            (self.base_dir / chapter).mkdir(exist_ok=True)
+            idx = self.base_dir / chapter / "_index.md"
             if not idx.exists():
                 idx.write_text(
                     f"# {chapter.capitalize()} Index\n\n_updated: {_now()}_\n\n"
@@ -334,11 +370,14 @@ _updated: {_now()}_
 ## Chapters
 | Chapter | Files | Last Updated | Summary |
 |---------|-------|--------------|---------|
-| projects | 0 | {_now()} | Current projects |
-| knowledge | 0 | {_now()} | Technical/conceptual notes |
-| people | 0 | {_now()} | People and contacts |
-| tasks | 0 | {_now()} | Tasks and todos |
-| archive | 0 | {_now()} | Archived old content |
+| identity | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['identity']} |
+| projects | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['projects']} |
+| people | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['people']} |
+| concepts | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['concepts']} |
+| episodes | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['episodes']} |
+| tasks | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['tasks']} |
+| procedures | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['procedures']} |
+| archive | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['archive']} |
 """
         self.path.write_text(content)
 
@@ -350,8 +389,8 @@ _updated: {_now()}_
     def update(self):
         """Rewrite INDEX.md by scanning chapters."""
         rows = []
-        for chapter in ["projects", "knowledge", "people", "tasks", "archive"]:
-            chapter_dir = MEMORY_DIR / chapter
+        for chapter in PALACE_LOCI:
+            chapter_dir = self.base_dir / chapter
             files = [f for f in chapter_dir.glob("*.md") if f.name != "_index.md"]
             last_updated = max((f.stat().st_mtime for f in files), default=0)
             last_str = (
@@ -368,6 +407,8 @@ _updated: {_now()}_
                     if line.strip() and not line.startswith("_"):
                         summary = line.strip()[:60]
                         break
+            if not summary:
+                summary = PALACE_LOCUS_SUMMARIES.get(chapter, "")
             rows.append(f"| {chapter} | {len(files)} | {last_str} | {summary} |")
 
         content = f"""# Memory Palace Index
@@ -382,8 +423,8 @@ _updated: {_now()}_
 
     def list_chapters(self) -> list[dict]:
         chapters = []
-        for chapter in ["projects", "knowledge", "people", "tasks", "archive"]:
-            chapter_dir = MEMORY_DIR / chapter
+        for chapter in PALACE_LOCI:
+            chapter_dir = self.base_dir / chapter
             files = [f for f in chapter_dir.glob("*.md") if f.name != "_index.md"]
             chapters.append({"name": chapter, "files": [f.name for f in files]})
         return chapters
@@ -392,10 +433,11 @@ _updated: {_now()}_
 class MemoryChapter:
     """Read/write a single .md chapter file."""
 
-    def __init__(self, chapter: str, name: str):
-        self.chapter = chapter
+    def __init__(self, chapter: str, name: str, base_dir: Path = MEMORY_DIR):
+        self.chapter = MemoryIndex.normalize_chapter(chapter)
         self.name = name
-        self.path = MEMORY_DIR / chapter / f"{name}.md"
+        self.base_dir = base_dir
+        self.path = self.base_dir / self.chapter / f"{name}.md"
 
     def exists(self) -> bool:
         return self.path.exists()
@@ -436,87 +478,74 @@ class MemoryPalace:
         self,
         tidy_interval: int = MEMORY_TIDY_INTERVAL,
         tidy_threshold: int = MEMORY_TIDY_FILE_THRESHOLD,
+        base_dir: Path = MEMORY_DIR,
+        context_dir: Path = CONTEXT_DIR,
+        store: Optional["LTMStore"] = None,
     ):
-        self.index = MemoryIndex()
+        self.store = store or LTMStore(context_dir=context_dir, memory_dir=base_dir)
+        self.base_dir = self.store.memory_dir
+        self.index = MemoryIndex(base_dir=self.base_dir)
         self._last_tidy: float = 0
         self._files_since_tidy: int = 0
         self._tidy_interval = tidy_interval
         self._tidy_threshold = tidy_threshold
 
     def write(self, chapter: str, name: str, content: str, append: bool = False):
-        ch = MemoryChapter(chapter, name)
-        if append:
-            ch.append(content)
-        else:
-            ch.write(content)
+        chapter = MemoryIndex.normalize_chapter(chapter)
+        self.store.upsert_manual_note(chapter, name, content, append=append)
         self._files_since_tidy += 1
         self.index.update()
 
     def read(self, chapter: str, name: str) -> str:
-        return MemoryChapter(chapter, name).read()
+        chapter = MemoryIndex.normalize_chapter(chapter)
+        note = self.store.read_manual_note(chapter, name)
+        if note:
+            return note.content
+        entries = self.store.read_entries_for_entity(chapter, name)
+        if not entries:
+            return ""
+        lines = [f"# {chapter}/{name}", ""]
+        for entry in entries:
+            lines.append(f"- ({entry.memory_type}) {entry.content}")
+        return "\n".join(lines)
 
     def search(self, query: str) -> list[dict]:
         results = []
-        query_lower = query.lower()
-        for md_file in MEMORY_DIR.rglob("*.md"):
-            if md_file.name in ("INDEX.md", "_index.md"):
-                continue
-            text = md_file.read_text()
-            if query_lower in text.lower():
-                # Get first matching line
-                for line in text.splitlines():
-                    if query_lower in line.lower():
-                        snippet = line.strip()[:120]
-                        break
-                else:
-                    snippet = text[:120]
-                rel = md_file.relative_to(MEMORY_DIR)
-                results.append({"path": str(rel), "snippet": snippet})
+        for entry in self.store.search_entries(query, limit=20):
+            anchor = f"{entry.category}/{entry.entity}" if entry.entity else entry.category
+            results.append({"path": anchor, "snippet": entry.content[:120]})
         return results
 
     def list_chapters(self) -> list[dict]:
         return self.index.list_chapters()
 
     def read_index(self) -> str:
+        self.index.update()
         return self.index.read()
 
     def should_tidy(self) -> bool:
-        now = time.time()
-        return (
-            now - self._last_tidy
-        ) > self._tidy_interval and self._files_since_tidy >= self._tidy_threshold
+        return False
 
     async def tidy(self, client: anthropic.AsyncAnthropic, model: str):
-        """AI-assisted memory reorganization."""
+        """Local maintenance pass: apply retention and rebuild projections."""
         CONSOLE.print("[dim]Tidying memory palace...[/dim]")
-        # Collect all memory summaries
-        summaries = []
-        for md_file in MEMORY_DIR.rglob("*.md"):
-            if md_file.name in ("INDEX.md", "_index.md"):
-                continue
-            text = md_file.read_text()
-            rel = str(md_file.relative_to(MEMORY_DIR))
-            summaries.append(f"## {rel}\n{text[:300]}\n")
-
-        if not summaries:
-            return
-
-        prompt = (
-            "Review these memory files and suggest:\n"
-            "1. Files to merge (too similar)\n"
-            "2. Files to archive (outdated)\n"
-            "3. Reclassification suggestions\n\n"
-            + "\n".join(summaries[:20])  # limit context
-        )
-
-        response = await client.messages.create(
-            model=model,
-            max_tokens=1024,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        suggestion = response.content[0].text
-        # Save tidy report to archive
-        self.write("archive", f"tidy_{_datestamp()}", suggestion)
+        self.store.apply_retention()
+        snapshot = self.store.maintenance_snapshot(limit=20)
+        if snapshot:
+            self.store.add_entry(
+                LTMEntry(
+                    id=str(uuid.uuid4())[:8],
+                    content=snapshot,
+                    importance=0.4,
+                    category="archive",
+                    entity="maintenance",
+                    memory_type="maintenance_report",
+                    source_session="manual_tidy",
+                    confidence=1.0,
+                    created_at=_now(),
+                    updated_at=_now(),
+                )
+            )
         self.index.update()
         self._last_tidy = time.time()
         self._files_since_tidy = 0
@@ -540,12 +569,25 @@ class StagingBuffer:
       clear_all()     — called after successful consolidation
       count()         — number of staged messages
 
-    File: ~/.agent/context/_staging.jsonl
+    File: ~/.agent/context/_staging/<session>.jsonl
     """
 
-    def __init__(self, path: Path = STAGING_FILE):
-        self.path = path
+    def __init__(
+        self,
+        path: Optional[Path] = None,
+        context_dir: Path = CONTEXT_DIR,
+        session_id: Optional[str] = None,
+    ):
+        self.session_id = session_id or str(uuid.uuid4())[:8]
+        self.path = path or (context_dir / "_staging" / f"{self.session_id}.jsonl")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._count = self._load_count()
+
+    def _load_count(self) -> int:
+        if not self.path.exists():
+            return 0
+        with open(self.path, encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
 
     def append(self, role: str, content: str) -> None:
         """Append a plain-text turn (user or assistant only)."""
@@ -558,6 +600,7 @@ class StagingBuffer:
         }
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._count += 1
 
     def read_all(self) -> list[dict]:
         """Return all staged messages in order."""
@@ -575,11 +618,12 @@ class StagingBuffer:
         return msgs
 
     def count(self) -> int:
-        return len(self.read_all())
+        return self._count
 
     def clear_all(self) -> None:
         """Delete the staging file after successful consolidation."""
         self.path.unlink(missing_ok=True)
+        self._count = 0
 
 
 @dataclass
@@ -592,6 +636,12 @@ class LTMEntry:
     category: str
     created_at: str
     updated_at: str
+    entity: str = ""
+    memory_type: str = "fact"
+    scope: str = "global"
+    status: str = "active"
+    source_session: str = ""
+    confidence: float = 1.0
 
     def decay(self, factor: float = DECAY_FACTOR) -> None:
         self.importance = max(0.0, self.importance * factor)
@@ -634,39 +684,276 @@ class LTMCategory:
 
 
 class LTMStore:
-    """File-based long-term memory with dynamic categories and upper limit.
-
-    Storage layout: ~/.agent/context/
-        _meta.json          — category registry
-        <category>.json     — list of LTMEntry objects
-    """
+    """SQLite-backed long-term memory with JSON and markdown projections."""
 
     def __init__(
         self,
         context_dir: Path = CONTEXT_DIR,
         max_categories: int = MAX_CATEGORIES,
+        memory_dir: Path = MEMORY_DIR,
     ):
         self.dir = context_dir
         self.max_categories = max_categories
+        self.memory_dir = memory_dir
         self._meta_path = context_dir / "_meta.json"
+        self._db_path = context_dir / "palace.db"
         self.dir.mkdir(parents=True, exist_ok=True)
-        self._meta = self._load_meta()
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
+        self._meta = {"categories": [], "total_entries": 0}
+        self._refresh_indexes()
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
-    def _load_meta(self) -> dict:
-        if self._meta_path.exists():
-            try:
-                return json.loads(self._meta_path.read_text())
-            except Exception:
-                pass
-        return {"categories": [], "total_entries": 0}
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_schema(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS memory_items (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    importance REAL NOT NULL,
+                    category TEXT NOT NULL,
+                    entity TEXT NOT NULL DEFAULT '',
+                    memory_type TEXT NOT NULL DEFAULT 'fact',
+                    scope TEXT NOT NULL DEFAULT 'global',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    source_session TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_category_status
+                    ON memory_items(category, status);
+                CREATE INDEX IF NOT EXISTS idx_memory_entity_status
+                    ON memory_items(entity, status);
+                """
+            )
 
     def _save_meta(self) -> None:
         self._meta_path.write_text(json.dumps(self._meta, indent=2, ensure_ascii=False))
 
+    @staticmethod
+    def normalize_category_name(name: str) -> str:
+        """Collapse external category input into a safe, stable storage key."""
+        normalized = re.sub(r"[\\/]+", " ", str(name).strip().lower())
+        normalized = normalized.replace("..", " ")
+        normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "_", normalized)
+        normalized = re.sub(r"_+", "_", normalized).strip("._")
+        return normalized or "general"
+
     def _category_path(self, name: str) -> Path:
-        return self.dir / f"{name}.json"
+        safe_name = self.normalize_category_name(name)
+        path = (self.dir / f"{safe_name}.json").resolve()
+        root = self.dir.resolve()
+        if root not in path.parents:
+            raise ValueError(f"Category path escaped context dir: {name}")
+        return path
+
+    def _is_palace_locus(self, category: str) -> bool:
+        return self.normalize_category_name(category) in PALACE_LOCI
+
+    def _normalize_entity(self, entity: str, category: str) -> str:
+        entity = self.normalize_category_name(entity)
+        if entity:
+            return entity
+        if self._is_palace_locus(category):
+            return "user" if self.normalize_category_name(category) == "identity" else "general"
+        return self.normalize_category_name(category)
+
+    def _projection_path(self, category: str, entity: str) -> Path:
+        category = self.normalize_category_name(category)
+        entity = self._normalize_entity(entity, category)
+        return self.memory_dir / category / f"{entity}.md"
+
+    def _row_to_entry(self, row: sqlite3.Row) -> LTMEntry:
+        return LTMEntry(
+            id=row["id"],
+            content=row["content"],
+            importance=row["importance"],
+            category=row["category"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            entity=row["entity"],
+            memory_type=row["memory_type"],
+            scope=row["scope"],
+            status=row["status"],
+            source_session=row["source_session"],
+            confidence=row["confidence"],
+        )
+
+    @staticmethod
+    def _normalize_content_key(content: str) -> str:
+        normalized = re.sub(r"\s+", " ", content.strip().lower())
+        return normalized
+
+    def _stable_merge_key(self, entry: LTMEntry) -> Optional[str]:
+        category = self.normalize_category_name(entry.category)
+        entity = self._normalize_entity(entry.entity, category)
+        memory_type = (entry.memory_type or "fact").strip().lower()
+
+        if category in {"episodes", "archive", "concepts"}:
+            return None
+        if category == "tasks":
+            return f"{category}|{entity}|{memory_type}"
+        if category not in {"identity", "projects", "people", "procedures"}:
+            return None
+
+        normalized_content = self._normalize_content_key(entry.content)
+        return f"{category}|{entity}|{memory_type}|{normalized_content}"
+
+    def _match_existing_entry_id(
+        self, conn: sqlite3.Connection, entry: LTMEntry
+    ) -> Optional[str]:
+        merge_key = self._stable_merge_key(entry)
+        if not merge_key:
+            return None
+
+        category = self.normalize_category_name(entry.category)
+        entity = self._normalize_entity(entry.entity, category)
+        memory_type = (entry.memory_type or "fact").strip().lower()
+
+        if category == "tasks":
+            row = conn.execute(
+                """
+                SELECT id FROM memory_items
+                WHERE category = ? AND entity = ? AND memory_type = ?
+                  AND status NOT IN ('archived', 'superseded')
+                ORDER BY updated_at DESC, id ASC
+                LIMIT 1
+                """,
+                (category, entity, memory_type),
+            ).fetchone()
+            return row["id"] if row else None
+
+        normalized_content = self._normalize_content_key(entry.content)
+        rows = conn.execute(
+            """
+            SELECT * FROM memory_items
+            WHERE category = ? AND entity = ? AND memory_type = ?
+              AND status NOT IN ('archived', 'superseded')
+            ORDER BY updated_at DESC, id ASC
+            """,
+            (category, entity, memory_type),
+        ).fetchall()
+        for row in rows:
+            if self._normalize_content_key(row["content"]) == normalized_content:
+                return row["id"]
+        return None
+
+    def _write_entry_row(self, conn: sqlite3.Connection, entry: LTMEntry) -> None:
+        entry.category = self.normalize_category_name(entry.category)
+        entry.entity = self._normalize_entity(entry.entity, entry.category)
+        entry.memory_type = entry.memory_type or "fact"
+        entry.scope = entry.scope or "global"
+        entry.status = entry.status or "active"
+        entry.source_session = entry.source_session or ""
+        entry.confidence = float(entry.confidence or 1.0)
+        existing_id = self._match_existing_entry_id(conn, entry)
+        if existing_id:
+            entry.id = existing_id
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO memory_items (
+                id, content, importance, category, entity, memory_type, scope,
+                status, source_session, confidence, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry.id,
+                entry.content,
+                float(entry.importance),
+                entry.category,
+                entry.entity,
+                entry.memory_type,
+                entry.scope,
+                entry.status,
+                entry.source_session,
+                float(entry.confidence),
+                entry.created_at,
+                entry.updated_at,
+            ),
+        )
+
+    def _refresh_indexes(self) -> None:
+        previous = {c["name"] for c in self._meta.get("categories", [])}
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT category, COUNT(*) AS entry_count,
+                       AVG(importance) AS avg_importance,
+                       MAX(updated_at) AS last_updated
+                FROM memory_items
+                WHERE status = 'active'
+                GROUP BY category
+                ORDER BY category
+                """
+            ).fetchall()
+        self._meta = {
+            "categories": [
+                {
+                    "name": row["category"],
+                    "entry_count": int(row["entry_count"]),
+                    "avg_importance": float(row["avg_importance"] or 0.0),
+                    "last_updated": row["last_updated"] or "",
+                }
+                for row in rows
+            ],
+            "total_entries": sum(int(row["entry_count"]) for row in rows),
+        }
+        self._save_meta()
+        current = {c["name"] for c in self._meta.get("categories", [])}
+        for category in previous | current:
+            self._sync_category_snapshot(category)
+            if self._is_palace_locus(category):
+                self._sync_projection(category)
+
+    def _sync_category_snapshot(self, category: str) -> None:
+        category = self.normalize_category_name(category)
+        entries = self.read_entries(category)
+        path = self._category_path(category)
+        if not entries:
+            path.unlink(missing_ok=True)
+            return
+        path.write_text(
+            json.dumps([e.to_dict() for e in entries], indent=2, ensure_ascii=False)
+        )
+
+    def _sync_projection(self, category: str) -> None:
+        category = self.normalize_category_name(category)
+        if not self._is_palace_locus(category):
+            return
+        entries = self.read_entries(category)
+        grouped: dict[str, list[LTMEntry]] = {}
+        for entry in entries:
+            grouped.setdefault(entry.entity, []).append(entry)
+        for entity, entity_entries in grouped.items():
+            path = self._projection_path(category, entity)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lines = [
+                f"# {category}/{entity}",
+                f"_updated: {_now()}_",
+                "",
+            ]
+            for entry in sorted(
+                entity_entries, key=lambda e: (e.importance, e.updated_at), reverse=True
+            ):
+                lines.append(
+                    f"- ({entry.memory_type}) {entry.content} "
+                    f"[importance={entry.importance:.2f}, status={entry.status}]"
+                )
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _remove_category(self, category: str) -> None:
+        category = self.normalize_category_name(category)
+        with self._connect() as conn:
+            conn.execute("DELETE FROM memory_items WHERE category = ?", (category,))
+        self._refresh_indexes()
 
     # ── Category helpers ──────────────────────────────────────────────────────
 
@@ -679,78 +966,210 @@ class LTMStore:
     # ── Entry CRUD ────────────────────────────────────────────────────────────
 
     def read_entries(self, category: str) -> list[LTMEntry]:
-        path = self._category_path(category)
-        if not path.exists():
-            return []
-        try:
-            data = json.loads(path.read_text())
-            return [LTMEntry.from_dict(e) for e in data]
-        except Exception:
-            return []
+        category = self.normalize_category_name(category)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM memory_items
+                WHERE category = ? AND status NOT IN ('archived', 'superseded')
+                ORDER BY importance DESC, updated_at DESC, id ASC
+                """,
+                (category,),
+            ).fetchall()
+        return [self._row_to_entry(row) for row in rows]
+
+    def read_entries_for_entity(self, category: str, entity: str) -> list[LTMEntry]:
+        category = self.normalize_category_name(category)
+        entity = self._normalize_entity(entity, category)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM memory_items
+                WHERE category = ? AND entity = ?
+                  AND status NOT IN ('archived', 'superseded')
+                ORDER BY importance DESC, updated_at DESC, id ASC
+                """,
+                (category, entity),
+            ).fetchall()
+        return [self._row_to_entry(row) for row in rows]
+
+    def read_manual_note(self, category: str, entity: str) -> Optional[LTMEntry]:
+        category = self.normalize_category_name(category)
+        entity = self._normalize_entity(entity, category)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM memory_items
+                WHERE category = ? AND entity = ? AND memory_type = 'note'
+                  AND status NOT IN ('archived', 'superseded')
+                ORDER BY updated_at DESC, id ASC
+                LIMIT 1
+                """,
+                (category, entity),
+            ).fetchone()
+        return self._row_to_entry(row) if row else None
 
     def write_entries(self, category: str, entries: list[LTMEntry]) -> None:
-        path = self._category_path(category)
-        path.write_text(
-            json.dumps([e.to_dict() for e in entries], indent=2, ensure_ascii=False)
-        )
-        avg_imp = sum(e.importance for e in entries) / len(entries) if entries else 0.0
-        cats = self._meta.setdefault("categories", [])
-        for c in cats:
-            if c["name"] == category:
-                c["entry_count"] = len(entries)
-                c["avg_importance"] = avg_imp
-                c["last_updated"] = _now()
-                break
-        else:
-            cats.append(
-                {
-                    "name": category,
-                    "entry_count": len(entries),
-                    "avg_importance": avg_imp,
-                    "last_updated": _now(),
-                }
-            )
-        self._meta["total_entries"] = sum(c["entry_count"] for c in cats)
-        self._save_meta()
+        category = self.normalize_category_name(category)
+        if not entries:
+            self._remove_category(category)
+            return
+
+        with self._connect() as conn:
+            conn.execute("DELETE FROM memory_items WHERE category = ?", (category,))
+            for entry in entries:
+                entry.category = category
+                self._write_entry_row(conn, entry)
+        self._refresh_indexes()
 
     def add_entry(self, entry: LTMEntry) -> None:
-        entries = self.read_entries(entry.category)
-        entries.append(entry)
-        self.write_entries(entry.category, entries)
+        entry.category = self.normalize_category_name(entry.category)
+        entry.entity = self._normalize_entity(entry.entity, entry.category)
+        with self._connect() as conn:
+            self._write_entry_row(conn, entry)
+        self._refresh_indexes()
+
+    def upsert_manual_note(
+        self, category: str, entity: str, content: str, append: bool = False
+    ) -> LTMEntry:
+        category = self.normalize_category_name(category)
+        entity = self._normalize_entity(entity, category)
+        existing = self.read_manual_note(category, entity)
+        if existing:
+            existing.content = (
+                f"{existing.content.rstrip()}\n{content.strip()}" if append else content
+            ).strip()
+            existing.updated_at = _now()
+            entry = existing
+        else:
+            entry = LTMEntry(
+                id=str(uuid.uuid4())[:8],
+                content=content.strip(),
+                importance=0.8,
+                category=category,
+                entity=entity,
+                memory_type="note",
+                scope="global",
+                status="active",
+                source_session="manual_memory_write",
+                confidence=1.0,
+                created_at=_now(),
+                updated_at=_now(),
+            )
+        with self._connect() as conn:
+            self._write_entry_row(conn, entry)
+        self._refresh_indexes()
+        return entry
 
     def all_entries(self) -> list[LTMEntry]:
-        result: list[LTMEntry] = []
-        for cat in self.list_categories():
-            result.extend(self.read_entries(cat.name))
-        return result
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM memory_items
+                WHERE status NOT IN ('archived', 'superseded')
+                ORDER BY importance DESC, updated_at DESC, id ASC
+                """
+            ).fetchall()
+        return [self._row_to_entry(row) for row in rows]
+
+    def search_entries(
+        self,
+        query: str,
+        categories: Optional[list[str]] = None,
+        limit: int = RETRIEVAL_TOP_K,
+    ) -> list[LTMEntry]:
+        tokens = [
+            t
+            for t in re.findall(
+                r"\b[a-zA-Z\u4e00-\u9fff][a-zA-Z0-9\u4e00-\u9fff]*\b", query.lower()
+            )
+            if t
+        ]
+        with self._connect() as conn:
+            sql = "SELECT * FROM memory_items WHERE status NOT IN ('archived', 'superseded')"
+            params: list[Any] = []
+            if categories:
+                cats = [self.normalize_category_name(c) for c in categories]
+                sql += f" AND category IN ({','.join('?' for _ in cats)})"
+                params.extend(cats)
+            rows = conn.execute(sql, params).fetchall()
+
+        entries = [self._row_to_entry(row) for row in rows]
+        if not tokens:
+            return entries[:limit]
+
+        def score(entry: LTMEntry) -> float:
+            haystack = " ".join(
+                [entry.content.lower(), entry.entity.lower(), entry.category.lower()]
+            )
+            matches = sum(haystack.count(tok) for tok in tokens)
+            return matches * (1.0 + entry.importance)
+
+        ranked = [entry for entry in sorted(entries, key=score, reverse=True) if score(entry) > 0]
+        return ranked[:limit]
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 
     def apply_decay(self, factor: float = DECAY_FACTOR) -> None:
         """Decay importance of all entries; prune those below MIN_IMPORTANCE."""
-        for cat in self.list_categories():
-            entries = self.read_entries(cat.name)
-            for e in entries:
-                e.decay(factor)
-                e.updated_at = _now()
-            entries = [e for e in entries if e.importance >= MIN_IMPORTANCE]
-            self.write_entries(cat.name, entries)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memory_items WHERE status NOT IN ('archived', 'superseded')"
+            ).fetchall()
+            for row in rows:
+                entry = self._row_to_entry(row)
+                entry.decay(factor)
+                entry.updated_at = _now()
+                if entry.importance < MIN_IMPORTANCE:
+                    conn.execute("DELETE FROM memory_items WHERE id = ?", (entry.id,))
+                else:
+                    self._write_entry_row(conn, entry)
+        self._refresh_indexes()
+
+    def apply_retention(self) -> None:
+        """Apply locus-aware retention instead of globally decaying all memory equally."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memory_items WHERE status NOT IN ('archived', 'superseded')"
+            ).fetchall()
+            for row in rows:
+                entry = self._row_to_entry(row)
+                if entry.category in {"episodes"}:
+                    entry.decay(DECAY_FACTOR)
+                    entry.updated_at = _now()
+                    if entry.importance < MIN_IMPORTANCE:
+                        conn.execute(
+                            "UPDATE memory_items SET status = 'archived', updated_at = ? WHERE id = ?",
+                            (_now(), entry.id),
+                        )
+                    else:
+                        self._write_entry_row(conn, entry)
+                elif entry.category in {"identity", "projects", "procedures", "people", "concepts"}:
+                    continue
+                elif entry.category == "tasks":
+                    continue
+        self._refresh_indexes()
+
+    def maintenance_snapshot(self, limit: int = 20) -> str:
+        """Return a text summary derived from the structured store, not markdown projections."""
+        entries = self.all_entries()[:limit]
+        lines = []
+        for entry in entries:
+            anchor = f"{entry.category}/{entry.entity}" if entry.entity else entry.category
+            lines.append(f"- [{anchor}] ({entry.memory_type}) {entry.content}")
+        return "\n".join(lines)
 
     def merge_categories(self, cat_a: str, cat_b: str, merged_name: str) -> None:
         """Merge cat_a and cat_b into merged_name, delete originals."""
-        entries_a = self.read_entries(cat_a)
-        entries_b = self.read_entries(cat_b)
-        for e in entries_a + entries_b:
-            e.category = merged_name
-        self.write_entries(merged_name, entries_a + entries_b)
-        # Remove original files / meta rows if they differ from merged_name
-        for old in (cat_a, cat_b):
-            if old != merged_name:
-                self._category_path(old).unlink(missing_ok=True)
-                self._meta["categories"] = [
-                    c for c in self._meta["categories"] if c["name"] != old
-                ]
-        self._save_meta()
+        cat_a = self.normalize_category_name(cat_a)
+        cat_b = self.normalize_category_name(cat_b)
+        merged_name = self.normalize_category_name(merged_name)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE memory_items SET category = ?, updated_at = ? WHERE category IN (?, ?)",
+                (merged_name, _now(), cat_a, cat_b),
+            )
+        self._refresh_indexes()
 
 
 class LocalRetriever:
@@ -892,7 +1311,7 @@ class ConsolidationEngine:
         CONSOLE.print("[dim]💤 Context consolidation (sleep)...[/dim]")
 
         # Choose extraction source
-        staged = staging.read_all() if (staging and staging.count() > 0) else []
+        staged = staging.read_all() if staging else []
         source = staged if staged else messages
         conv_text = self._format_messages_for_llm(source)
         source_label = (
@@ -901,22 +1320,29 @@ class ConsolidationEngine:
             else f"messages ({len(messages)})"
         )
 
-        existing = [c.name for c in self.store.list_categories()]
-        cat_list = ", ".join(existing) if existing else "none yet"
-
         prompt = (
             f"Analyze this conversation and extract important facts worth remembering.\n"
-            f"Existing categories: {cat_list}\n\n"
             f"For each item output JSON on its own line (no markdown fences):\n"
-            f'{{"category": "<name>", "content": "<fact>", "importance": <0.1-1.0>}}\n\n'
+            f'{{"locus": "<one of {", ".join(PALACE_LOCI)}>", "entity": "<anchor>", '
+            f'"memory_type": "<type>", "content": "<fact>", "importance": <0.1-1.0>, "confidence": <0.1-1.0>}}\n\n'
             f"Rules:\n"
-            f"- importance: 1.0=critical decisions/preferences, 0.5=useful context, 0.1=minor\n"
-            f"- Reuse existing categories when possible; create new ones only when necessary\n"
-            f"- Be selective: max 10 items, 1-3 sentences each\n\n"
+            f"- Use only the fixed loci listed above; never invent new top-level loci\n"
+            f"- identity: user preferences/style/constraints\n"
+            f"- projects: project decisions/state/risks\n"
+            f"- people: person-specific facts\n"
+            f"- concepts: durable domain knowledge\n"
+            f"- tasks: commitments, next steps, open loops\n"
+            f"- procedures: repeatable workflows and preferred methods\n"
+            f"- archive: only if the memory is historical or superseded\n"
+            f"- Do not output episodes; session summary is generated separately\n"
+            f"- Be selective: max 8 items, 1-2 sentences each\n\n"
             f"Conversation ({source_label}):\n{conv_text[:3000]}"
         )
 
         try:
+            entries = [
+                self._build_episode_entry(source, staging.session_id if staging else "")
+            ]
             if api_format == "anthropic":
                 resp = await client.messages.create(
                     model=model,
@@ -932,14 +1358,12 @@ class ConsolidationEngine:
                 )
                 raw = resp.choices[0].message.content or ""
 
-            entries = self._parse_entries(raw)
+            entries.extend(self._parse_entries(raw))
             for entry in entries:
-                await self._ensure_category_fits(
-                    entry.category, client, model, api_format
-                )
+                await self._ensure_category_fits(entry.category, client, model, api_format)
                 self.store.add_entry(entry)
 
-            self.store.apply_decay(self.decay_factor)
+            self.store.apply_retention()
 
             # Clear staging after successful extraction
             if staging:
@@ -986,68 +1410,71 @@ class ConsolidationEngine:
                 content = data.get("content", "").strip()
                 if not content:
                     continue
+                category = (
+                    data.get("locus")
+                    or data.get("category")
+                    or "concepts"
+                )
+                normalized_category = self.store.normalize_category_name(category)
+                entity = str(data.get("entity", "")).strip()
+                if normalized_category not in PALACE_LOCI:
+                    entity = entity or normalized_category
+                    normalized_category = "concepts"
                 entries.append(
                     LTMEntry(
                         id=str(uuid.uuid4())[:8],
                         content=content,
                         importance=float(data.get("importance", 0.5)),
-                        category=data.get("category", "general").strip(),
+                        category=normalized_category,
                         created_at=_now(),
                         updated_at=_now(),
+                        entity=entity,
+                        memory_type=str(data.get("memory_type", "fact")).strip() or "fact",
+                        source_session=str(data.get("source_session", "")).strip(),
+                        confidence=float(data.get("confidence", 1.0)),
                     )
                 )
             except Exception:
                 continue
         return entries
 
+    def _build_episode_entry(
+        self, messages: list[dict], session_id: str = ""
+    ) -> LTMEntry:
+        snippets = []
+        for msg in messages[-6:]:
+            role = str(msg.get("role", "unknown")).upper()
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(block.get("text", "") or block.get("content", ""))
+                    for block in content
+                    if isinstance(block, dict)
+                )
+            content = str(content).strip()
+            if content:
+                snippets.append(f"{role}: {content[:180]}")
+        summary = " | ".join(snippets)[:1200] or "Session summary unavailable."
+        return LTMEntry(
+            id=str(uuid.uuid4())[:8],
+            content=summary,
+            importance=0.7,
+            category="episodes",
+            entity=session_id or "session",
+            memory_type="session_summary",
+            source_session=session_id,
+            confidence=1.0,
+            created_at=_now(),
+            updated_at=_now(),
+        )
+
     async def _ensure_category_fits(
         self, category: str, client: Any, model: str, api_format: str
     ) -> None:
-        """If adding new category exceeds limit, ask LLM to merge two existing."""
-        existing = [c.name for c in self.store.list_categories()]
-        if category in existing or self.store.category_count() < self.max_categories:
+        """Normalize free-form categories into the fixed palace loci."""
+        normalized = self.store.normalize_category_name(category)
+        if normalized in PALACE_LOCI:
             return
-
-        summaries = []
-        for c in self.store.list_categories():
-            entries = self.store.read_entries(c.name)
-            snippets = "; ".join(e.content[:50] for e in entries[:3])
-            summaries.append(f"- {c.name}: {snippets}")
-
-        merge_prompt = (
-            f"Memory has {len(existing)} categories (max {self.max_categories}). "
-            f"Need to add '{category}'. Choose two categories to merge.\n\n"
-            f"Categories:\n" + "\n".join(summaries) + "\n\n"
-            f'Respond with JSON only: {{"merge_a": "<cat1>", "merge_b": "<cat2>", "merged_name": "<name>"}}'
-        )
-        try:
-            if api_format == "anthropic":
-                resp = await client.messages.create(
-                    model=model,
-                    max_tokens=256,
-                    messages=[{"role": "user", "content": merge_prompt}],
-                )
-                raw = resp.content[0].text
-            else:
-                resp = await client.chat.completions.create(
-                    model=model,
-                    max_tokens=256,
-                    messages=[{"role": "user", "content": merge_prompt}],
-                )
-                raw = resp.choices[0].message.content or ""
-
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            if m:
-                data = json.loads(m.group())
-                self.store.merge_categories(
-                    data["merge_a"], data["merge_b"], data["merged_name"]
-                )
-                CONSOLE.print(
-                    f"[dim]Merged: {data['merge_a']} + {data['merge_b']} "
-                    f"→ {data['merged_name']}[/dim]"
-                )
-        except Exception as e:
-            CONSOLE.print(f"[dim]Category merge error: {e}[/dim]")
 
 
 class ContextManager:
@@ -1059,9 +1486,11 @@ class ContextManager:
       3. Session-end trigger  — explicit call when the interactive loop exits
     After each sleep() the flag is cleared; mark_activity() re-arms it.
 
-    Staging buffer: every user/assistant turn is appended to _staging.jsonl.
-    This ensures consolidation always has a complete source even if the session
-    ends before the token threshold fires.  Buffer is cleared after each sleep.
+    Staging buffer: every user/assistant turn is appended to a per-session
+    JSONL file under _staging/. This ensures consolidation always has a
+    complete source even if the session ends before the token threshold fires,
+    without mixing raw turns across unrelated sessions. Buffer is cleared after
+    each sleep.
     """
 
     def __init__(
@@ -1072,15 +1501,22 @@ class ContextManager:
         idle_seconds: int = 300,
         min_messages: int = 4,
         staging: Optional[StagingBuffer] = None,
+        staging_turn_threshold: int = STAGING_TURN_THRESHOLD,
+        staging_token_threshold: int = STAGING_TOKEN_THRESHOLD,
     ):
         self.store = store
         self.retriever = retriever
         self.consolidation = consolidation
         self.idle_seconds = idle_seconds
         self.min_messages = min_messages
+        self.staging_turn_threshold = staging_turn_threshold
+        self.staging_token_threshold = staging_token_threshold
         self.staging: StagingBuffer = staging or StagingBuffer()
         self._needs_consolidation: bool = False
         self._last_activity: float = 0.0
+        self._job_lock = threading.Lock()
+        self._jobs: deque[dict[str, Any]] = deque()
+        self._processing_job = False
 
     # ── Activity tracking ─────────────────────────────────────────────────────
 
@@ -1117,20 +1553,127 @@ class ContextManager:
         """Session-end trigger: fires when staging has unprocessed content."""
         return self._needs_consolidation and self.staging.count() > 0
 
+    def should_enqueue_consolidation(self) -> bool:
+        """Queue consolidation based on staged content volume, not working-memory size."""
+        if not self._needs_consolidation:
+            return False
+        staged = self.staging.read_all()
+        if not staged:
+            return False
+        if len(staged) >= self.staging_turn_threshold:
+            return True
+        return self.consolidation.estimate_tokens(staged) >= self.staging_token_threshold
+
+    def enqueue_consolidation(self, reason: str) -> None:
+        """Queue one consolidation job if there is staged work pending."""
+        if self.staging.count() == 0:
+            return
+        with self._job_lock:
+            if self._jobs:
+                return
+            self._jobs.append(
+                {
+                    "reason": reason,
+                    "session_id": self.staging.session_id,
+                    "queued_at": _now(),
+                }
+            )
+
+    def next_job(self, pop: bool = False) -> Optional[dict]:
+        with self._job_lock:
+            if not self._jobs:
+                if self._needs_consolidation and self.staging.count() > 0:
+                    self._jobs.append(
+                        {
+                            "reason": "idle",
+                            "session_id": self.staging.session_id,
+                            "queued_at": _now(),
+                        }
+                    )
+                else:
+                    return None
+            return self._jobs.popleft() if pop else dict(self._jobs[0])
+
+    def pending_jobs(self) -> int:
+        with self._job_lock:
+            return len(self._jobs)
+
+    def should_process_jobs(self) -> bool:
+        return self.pending_jobs() > 0 and self.idle_elapsed() >= self.idle_seconds
+
+    def should_compact_messages(self, messages: list[dict], max_tokens: int) -> bool:
+        """Front-end compaction keeps working memory bounded without network calls."""
+        if len(messages) < self.min_messages:
+            return False
+        return self.consolidation.should_sleep(messages, max_tokens)
+
+    def compact_messages(self, messages: list[dict]) -> list[dict]:
+        keep_last = self.consolidation.keep_last_messages
+        return messages[-keep_last:] if len(messages) > keep_last else messages
+
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
-    def retrieve_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
+    @staticmethod
+    def _route_categories(query: str) -> list[str]:
+        q = query.lower()
+        routes: list[str] = []
+        if any(tok in q for tok in ["刚才", "刚刚", "上次", "之前", "recent", "earlier"]):
+            routes.append("episodes")
+        if any(tok in q for tok in ["偏好", "喜欢", "风格", "prefer", "preference"]):
+            routes.append("identity")
+        if any(tok in q for tok in ["项目", "project", "repo", "仓库"]):
+            routes.extend(["projects", "tasks"])
+        if any(tok in q for tok in ["任务", "todo", "待办", "next step", "open loop"]):
+            routes.append("tasks")
+        if any(tok in q for tok in ["流程", "通常怎么", "workflow", "procedure"]):
+            routes.append("procedures")
+        if any(tok in q for tok in ["人", "person", "people", "同事"]):
+            routes.append("people")
+        if any(tok in q for tok in ["概念", "是什么", "what is", "define", "知识"]):
+            routes.append("concepts")
+        seen = []
+        for cat in routes:
+            if cat not in seen:
+                seen.append(cat)
+        return seen
+
+    def retrieve_ltm_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
         """Return top-K relevant LTM entries as an injectable string."""
-        entries = self.store.all_entries()
-        if not entries:
-            return ""
-        top = self.retriever.retrieve(query, entries, top_k=top_k)
+        categories = self._route_categories(query)
+        top = self.store.search_entries(query, categories=categories or None, limit=top_k)
+        if not top and categories:
+            top = self.store.search_entries(query, categories=None, limit=top_k)
         if not top:
             return ""
         lines = ["## Retrieved Context (from long-term memory)"]
         for e in top:
-            lines.append(f"- [{e.category}] {e.content}")
+            anchor = f"{e.category}/{e.entity}" if e.entity else e.category
+            lines.append(f"- [{anchor}] {e.content}")
         return "\n".join(lines)
+
+    def _recent_session_context(self, limit: int = RECENT_SESSION_TURNS) -> str:
+        """Return the most recent staged turns for explicit current-session recall."""
+        staged = self.staging.read_all()
+        if not staged:
+            return ""
+        lines = ["## Current Session (not yet consolidated)"]
+        for msg in staged[-limit:]:
+            role = str(msg.get("role", "unknown")).upper()
+            content = str(msg.get("content", "")).strip()
+            if content:
+                lines.append(f"- {role}: {content}")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    def retrieve_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
+        """Return explicit context lookup results across active session and LTM."""
+        sections = []
+        recent = self._recent_session_context()
+        if recent:
+            sections.append(recent)
+        ltm = self.retrieve_ltm_context(query, top_k=top_k)
+        if ltm:
+            sections.append(ltm)
+        return "\n\n".join(sections)
 
     # ── Consolidation ─────────────────────────────────────────────────────────
 
@@ -1142,11 +1685,65 @@ class ContextManager:
         api_format: str = "anthropic",
     ) -> list[dict]:
         """Run one sleep cycle (uses staging as source), then clear dirty flag."""
-        result = await self.consolidation.consolidate(
-            messages, client, model, api_format, staging=self.staging
-        )
-        self._needs_consolidation = False
-        return result
+        try:
+            return await self.consolidation.consolidate(
+                messages, client, model, api_format, staging=self.staging
+            )
+        finally:
+            self._needs_consolidation = False
+
+    async def process_one_job(
+        self,
+        client: Any,
+        model: str,
+        api_format: str = "anthropic",
+        extractor: Optional[Callable[..., list[Any]]] = None,
+    ) -> bool:
+        """Process one queued consolidation job without mutating working memory."""
+        if self._processing_job:
+            return False
+        job = self.next_job(pop=True)
+        if job is None:
+            return False
+
+        self._processing_job = True
+        try:
+            staged = self.staging.read_all()
+            if not staged:
+                self._needs_consolidation = False
+                return False
+
+            if extractor is not None:
+                entries = [
+                    self.consolidation._build_episode_entry(
+                        staged, self.staging.session_id
+                    )
+                ]
+                extracted = extractor(staged, job)
+                for item in extracted or []:
+                    if isinstance(item, LTMEntry):
+                        entries.append(item)
+                    elif isinstance(item, dict):
+                        lines = json.dumps(item, ensure_ascii=False)
+                        entries.extend(self.consolidation._parse_entries(lines))
+                for entry in entries:
+                    self.store.add_entry(entry)
+                self.store.apply_retention()
+                self.staging.clear_all()
+                self._needs_consolidation = False
+                return True
+
+            await self.consolidation.consolidate(
+                [],
+                client,
+                model,
+                api_format,
+                staging=self.staging,
+            )
+            self._needs_consolidation = False
+            return True
+        finally:
+            self._processing_job = False
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 
@@ -1158,10 +1755,53 @@ class ContextManager:
             "category_names": [c.name for c in cats],
             "max_categories": self.store.max_categories,
             "needs_consolidation": self._needs_consolidation,
+            "queued_jobs": self.pending_jobs(),
             "staged_turns": self.staging.count(),
             "idle_elapsed_s": round(self.idle_elapsed()),
             "idle_threshold_s": self.idle_seconds,
         }
+
+
+class BackgroundMemoryWorker:
+    """Threaded worker that processes queued memory jobs off the interactive path."""
+
+    def __init__(
+        self,
+        ctx_mgr: ContextManager,
+        client: Any,
+        model: str,
+        api_format: str,
+        poll_seconds: float = 1.0,
+    ):
+        self.ctx_mgr = ctx_mgr
+        self.client = client
+        self.model = model
+        self.api_format = api_format
+        self.poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self.ctx_mgr.should_process_jobs():
+                    asyncio.run(
+                        self.ctx_mgr.process_one_job(
+                            self.client,
+                            self.model,
+                            api_format=self.api_format,
+                        )
+                    )
+            except Exception as e:
+                CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
+            self._stop.wait(self.poll_seconds)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1326,8 +1966,8 @@ class BuiltinTools:
                 "properties": {
                     "chapter": {
                         "type": "string",
-                        "description": "Chapter name: projects|knowledge|people|tasks|archive",
-                        "enum": ["projects", "knowledge", "people", "tasks", "archive"],
+                        "description": "Palace locus or legacy alias",
+                        "enum": sorted(set(PALACE_LOCI) | set(LEGACY_MEMORY_ALIASES)),
                     },
                     "name": {
                         "type": "string",
@@ -1353,7 +1993,7 @@ class BuiltinTools:
                 "properties": {
                     "chapter": {
                         "type": "string",
-                        "description": "Chapter: projects|knowledge|people|tasks|archive",
+                        "description": "Palace locus or legacy alias",
                     },
                     "name": {
                         "type": "string",
@@ -1740,7 +2380,7 @@ class BaseAgent:
         # Inject relevant LTM context into system prompt for this turn
         original_system = ctx.system_prompt
         if self.context_manager:
-            retrieved = self.context_manager.retrieve_context(user_message)
+            retrieved = self.context_manager.retrieve_ltm_context(user_message)
             if retrieved:
                 ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
 
@@ -1965,10 +2605,25 @@ class EvolutionEngine:
         RL_DIR.mkdir(parents=True, exist_ok=True)
         PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    async def _generate_text(self, prompt: str, max_tokens: int) -> str:
+        if self.api_format == "anthropic":
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.content[0].text
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content or ""
+
     async def score_session(
         self, messages: list[dict], prompt_version: str, tools_used: list[str]
     ) -> dict:
-        """Let Claude score the session quality."""
+        """Let the active provider score the session quality."""
         if len(messages) < 2:
             return {"score": 5, "critique": "Session too short to evaluate"}
 
@@ -1988,12 +2643,7 @@ class EvolutionEngine:
         )
 
         try:
-            response = await self.client.messages.create(
-                model=self.model,
-                max_tokens=512,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            text = response.content[0].text
+            text = await self._generate_text(prompt, max_tokens=512)
             json_match = re.search(r"\{.*\}", text, re.DOTALL)
             if json_match:
                 result = json.loads(json_match.group())
@@ -2071,12 +2721,7 @@ class EvolutionEngine:
             "Make it more effective while keeping it concise."
         )
 
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        new_prompt = response.content[0].text
+        new_prompt = await self._generate_text(prompt, max_tokens=2048)
 
         # Save new version
         existing = list(PROMPTS_DIR.glob("system_v*.md"))
@@ -2118,12 +2763,7 @@ class EvolutionEngine:
             "Output ONLY the Python code, no explanation."
         )
 
-        response = await self.client.messages.create(
-            model=self.model,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        code = response.content[0].text
+        code = await self._generate_text(prompt, max_tokens=2048)
 
         # Extract code from markdown code block if present
         code_match = re.search(r"```python\n(.*?)```", code, re.DOTALL)
@@ -2407,10 +3047,6 @@ def _build_components(cfg: dict):
         cfg.get("providers", {}).get(active_provider, {}).get("api_format", "anthropic")
     )
 
-    memory = MemoryPalace(
-        tidy_interval=mem_cfg.get("tidy_interval_seconds", MEMORY_TIDY_INTERVAL),
-        tidy_threshold=mem_cfg.get("tidy_file_threshold", MEMORY_TIDY_FILE_THRESHOLD),
-    )
     registry = ToolRegistry()
 
     # Context Manager — build first so BuiltinTools can reference it
@@ -2424,6 +3060,14 @@ def _build_components(cfg: dict):
     ctx_store = LTMStore(
         context_dir=CONTEXT_DIR,
         max_categories=storage_cfg.get("max_categories", MAX_CATEGORIES),
+        memory_dir=MEMORY_DIR,
+    )
+    memory = MemoryPalace(
+        tidy_interval=mem_cfg.get("tidy_interval_seconds", MEMORY_TIDY_INTERVAL),
+        tidy_threshold=mem_cfg.get("tidy_file_threshold", MEMORY_TIDY_FILE_THRESHOLD),
+        base_dir=MEMORY_DIR,
+        context_dir=CONTEXT_DIR,
+        store=ctx_store,
     )
     ctx_manager = ContextManager(
         store=ctx_store,
@@ -2480,22 +3124,18 @@ async def _interactive_loop(components: dict, cfg: dict):
 
     ctx = AgentContext(system_prompt=system_prompt)
     tools_used_session: list[str] = []
-
-    # ── Background idle consolidation task ────────────────────────────────────
-    async def _idle_consolidation_loop():
-        """Poll every 30 s; consolidate when dirty + idle threshold exceeded."""
-        while True:
-            await asyncio.sleep(30)
-            if ctx_mgr and ctx_mgr.should_idle_sleep(ctx.messages):
-                CONSOLE.print("\n[dim]💤 Idle consolidation triggered...[/dim]")
-                ctx.messages = await ctx_mgr.sleep(
-                    ctx.messages,
-                    components["client"],
-                    components["model"],
-                    api_format=agent.api_format,
-                )
-
-    idle_task = asyncio.create_task(_idle_consolidation_loop())
+    memory_worker = (
+        BackgroundMemoryWorker(
+            ctx_mgr,
+            components["client"],
+            components["model"],
+            agent.api_format,
+        )
+        if ctx_mgr
+        else None
+    )
+    if memory_worker:
+        memory_worker.start()
 
     CONSOLE.print(
         Panel(
@@ -2640,15 +3280,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                     ctx_mgr.staging.append("user", user_input)
                     if result.content:
                         ctx_mgr.staging.append("assistant", result.content)
+                    if ctx_mgr.should_enqueue_consolidation():
+                        ctx_mgr.enqueue_consolidation("staged_turns")
 
-                # Token-ratio consolidation (dirty flag + min_messages already checked)
-                if ctx_mgr and ctx_mgr.should_sleep(ctx.messages, agent.max_tokens):
-                    ctx.messages = await ctx_mgr.sleep(
-                        ctx.messages,
-                        components["client"],
-                        components["model"],
-                        api_format=agent.api_format,
-                    )
+                # Keep working memory bounded without blocking on LLM consolidation.
+                if ctx_mgr and ctx_mgr.should_compact_messages(ctx.messages, agent.max_tokens):
+                    ctx.messages = ctx_mgr.compact_messages(ctx.messages)
 
                 # Check for tool generation request
                 if any(
@@ -2667,28 +3304,22 @@ async def _interactive_loop(components: dict, cfg: dict):
             except Exception as e:
                 CONSOLE.print(f"\n[red]Error: {e}[/red]")
 
-            # Idle memory tidy check
-            if memory.should_tidy():
-                await memory.tidy(components["client"], components["model"])
-
     finally:
-        # Cancel background idle consolidation task on exit
-        idle_task.cancel()
-        try:
-            await idle_task
-        except asyncio.CancelledError:
-            pass
+        if memory_worker:
+            memory_worker.stop()
 
     # Session-end consolidation: digest any unprocessed staging content
     if ctx_mgr and ctx_mgr.should_session_end_sleep():
         CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
         try:
-            await ctx_mgr.sleep(
-                ctx.messages,
-                components["client"],
-                components["model"],
-                api_format=agent.api_format,
-            )
+            ctx_mgr.enqueue_consolidation("session_end")
+            while ctx_mgr.pending_jobs():
+                await ctx_mgr.process_one_job(
+                    components["client"],
+                    components["model"],
+                    api_format=agent.api_format,
+                )
+            ctx.messages = ctx_mgr.compact_messages(ctx.messages)
         except Exception as e:
             CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
 

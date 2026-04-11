@@ -91,6 +91,17 @@ def test_decay_prunes_low_importance(tmp_path):
     assert len(entries) == 0  # pruned below MIN_IMPORTANCE (0.05)
 
 
+def test_decay_removes_empty_category_metadata_and_file(tmp_path):
+    store = make_store(tmp_path)
+    store.add_entry(make_entry(importance=0.06))
+
+    store.apply_decay(factor=0.5)
+
+    assert store.category_count() == 0
+    assert store.list_categories() == []
+    assert not (tmp_path / "context" / "code_context.json").exists()
+
+
 def test_merge_categories(tmp_path):
     store = make_store(tmp_path)
     store.add_entry(make_entry(cid="1", category="cat_a"))
@@ -121,3 +132,92 @@ def test_meta_persists_across_instances(tmp_path):
     store2 = LTMStore(context_dir=tmp_path / "context")
     assert store2.category_count() == 1
     assert store2.read_entries("persistent")[0].id == "1"
+
+
+def test_category_names_are_normalized_inside_context_dir(tmp_path):
+    store = make_store(tmp_path)
+    entry = make_entry(cid="1", category="../../Tmp Dir/Unsafe Name")
+
+    store.add_entry(entry)
+
+    categories = store.list_categories()
+    assert len(categories) == 1
+    assert categories[0].name == "tmp_dir_unsafe_name"
+    assert store.read_entries("tmp_dir_unsafe_name")[0].category == "tmp_dir_unsafe_name"
+    assert not (tmp_path / "Tmp Dir").exists()
+
+
+def test_add_entry_upserts_identity_preference(tmp_path):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    first = LTMEntry(
+        id="pref-a",
+        category="identity",
+        entity="user",
+        memory_type="preference",
+        content="Prefers concise responses",
+        importance=0.8,
+        status="active",
+        created_at="2026-04-11",
+        updated_at="2026-04-11",
+    )
+    second = LTMEntry(
+        id="pref-b",
+        category="identity",
+        entity="user",
+        memory_type="preference",
+        content="Prefers concise responses",
+        importance=0.9,
+        status="active",
+        created_at="2026-04-11",
+        updated_at="2026-04-11",
+    )
+
+    store.add_entry(first)
+    store.add_entry(second)
+
+    entries = store.read_entries("identity")
+    assert len([e for e in entries if e.content == "Prefers concise responses"]) == 1
+    assert entries[0].importance == 0.9
+
+
+def test_add_entry_upserts_task_status(tmp_path):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    open_task = LTMEntry(
+        id="task-open",
+        category="tasks",
+        entity="fix_auth_bug",
+        memory_type="task",
+        content="Fix the auth bug",
+        importance=0.9,
+        status="open",
+        created_at="2026-04-11",
+        updated_at="2026-04-11",
+    )
+    done_task = LTMEntry(
+        id="task-done",
+        category="tasks",
+        entity="fix_auth_bug",
+        memory_type="task",
+        content="Fix the auth bug",
+        importance=0.9,
+        status="done",
+        created_at="2026-04-11",
+        updated_at="2026-04-11",
+    )
+
+    store.add_entry(open_task)
+    store.add_entry(done_task)
+
+    entries = store.read_entries("tasks")
+    assert len([e for e in entries if e.entity == "fix_auth_bug"]) == 1
+    assert entries[0].status == "done"
