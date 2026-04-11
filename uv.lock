@@ -863,14 +863,10 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
+    { name = "mcp" },
     { name = "openai" },
     { name = "rich" },
     { name = "typer" },
-]
-
-[package.optional-dependencies]
-mcp = [
-    { name = "mcp" },
 ]
 
 [package.dev-dependencies]
@@ -881,12 +877,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anthropic" },
-    { name = "mcp", marker = "extra == 'mcp'" },
+    { name = "mcp" },
     { name = "openai" },
     { name = "rich" },
     { name = "typer" },
 ]
-provides-extras = ["mcp"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest" }]

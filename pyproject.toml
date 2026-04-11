@@ -13,10 +13,8 @@ dependencies = [
   "openai",
   "typer",
   "rich",
+  "mcp",
 ]
-
-[project.optional-dependencies]
-mcp = ["mcp"]
 
 [project.scripts]
 simple = "agent:app"
