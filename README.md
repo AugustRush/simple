@@ -34,7 +34,7 @@ Required runtime dependencies:
 Optional dependencies:
 
 - `mcp`
-  Enables MCP client integration hooks. The current code keeps MCP optional.
+  Enables MCP client integration. The dependency is optional, but configured MCP servers can be connected and their tools registered at startup.
 
 Development dependencies:
 
@@ -147,7 +147,12 @@ The runtime registers these built-in tools:
 - `context_retrieve`
 - `spawn_agent`
 
-Additional tools may be loaded from `~/.agent/skills/*.py`.
+Skills are loaded as bundles from:
+
+- user skills: `~/.agent/skills/**/SKILL.md`
+- built-in skills: `<repo>/skills/**/SKILL.md`
+
+Skill bundles use `SKILL.md` as the entrypoint and may include supporting files such as templates, examples, and scripts. The runtime exposes progressive-disclosure helpers so the model can activate a skill and inspect bundle files on demand.
 
 Built-in tool behavior:
 
@@ -242,4 +247,4 @@ Current status in this workspace:
 - SQLite is now the source of truth for long-term context memory.
 - Markdown memory files are currently a projection layer, not the authoritative store.
 - `memory tidy` now performs local retention/projection maintenance instead of a foreground LLM reclassification pass.
-- MCP integration points exist, but the connection implementation is still a placeholder.
+- MCP client wiring is implemented for stdio servers. Real MCP smoke coverage is opt-in because it depends on external tools such as `npx` and a configured server.

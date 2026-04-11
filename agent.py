@@ -10,11 +10,9 @@ Architecture: Memory Palace + Multi-Agent Orchestration + MCP + Self-Evolution
 from __future__ import annotations
 
 import asyncio
+import ast
 from contextlib import AsyncExitStack
-import importlib
-import importlib.util
 import math
-import inspect
 import json
 import os
 import re
@@ -48,11 +46,13 @@ import mcp
 AGENT_HOME = Path.home() / ".agent"
 MEMORY_DIR = AGENT_HOME / "memory"
 SKILLS_DIR = AGENT_HOME / "skills"
+BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 PROMPTS_DIR = AGENT_HOME / "prompts"
 RL_DIR = AGENT_HOME / "rl"
 CONFIG_FILE = AGENT_HOME / "config.json"
 INDEX_FILE = MEMORY_DIR / "INDEX.md"
 SESSIONS_FILE = RL_DIR / "sessions.jsonl"
+DEFAULT_OUTPUT_DIR = AGENT_HOME / "output"
 
 DEFAULT_MODEL = "claude-opus-4-5"
 DEFAULT_MAX_TOKENS = 8192
@@ -206,6 +206,8 @@ DEFAULT_CONFIG: dict = {
     },
     # ── System prompt ─────────────────────────────────────────────────────
     "system_prompt_file": None,  # null = use built-in prompt
+    # ── Output directory ──────────────────────────────────────────────────
+    "output_dir": None,  # null = ~/.agent/output
 }
 
 
@@ -1713,7 +1715,8 @@ class MCPClient:
         name = re.sub(r"[^0-9a-zA-Z_]+", "_", value.strip().lower())
         return name.strip("_") or "mcp"
 
-    async def connect_from_config(self, config: dict):
+    async def connect_from_config(self, config: dict, extra_env: dict[str, str] | None = None):
+        self._extra_env = extra_env or {}
         self._configured_servers = len(config.get("mcp_servers", []) or [])
         mcp_servers = config.get("mcp_servers", [])
         for server_cfg in mcp_servers:
@@ -1734,10 +1737,13 @@ class MCPClient:
         server_name = self._safe_name(
             str(cfg.get("name") or Path(command).name or "mcp")
         )
+        # Merge: agent-level env < server-specific env (server wins)
+        server_env = dict(cfg.get("env", {}) or {})
+        merged_env = {**self._extra_env, **server_env} if self._extra_env or server_env else None
         params = mcp.StdioServerParameters(
             command=command,
             args=list(cfg.get("args", []) or []),
-            env=dict(cfg.get("env", {}) or {}) or None,
+            env=merged_env or None,
             cwd=cfg.get("cwd"),
         )
         read_stream, write_stream = await self._stack.enter_async_context(
@@ -1803,51 +1809,368 @@ class MCPClient:
         await self._stack.aclose()
 
 
-class SkillLoader:
-    """Dynamically load skills from ~/.agent/skills/*.py"""
+@dataclass
+class SkillBundle:
+    id: str
+    name: str
+    description: str
+    path: Path
+    source: str
+    body: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+    supporting_files: list[str] = field(default_factory=list)
+    user_invocable: bool = True
+    disable_model_invocation: bool = False
 
-    def __init__(self, registry: ToolRegistry):
-        self.registry = registry
-        self._loaded: set[str] = set()
 
-    def load_all(self):
-        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-        for skill_file in SKILLS_DIR.glob("*.py"):
-            if skill_file.name not in self._loaded:
-                self._load_skill(skill_file)
+@dataclass
+class ExplicitSkillRequest:
+    skill_ref: str
+    remaining_text: str = ""
 
-    def _load_skill(self, path: Path):
+
+def _parse_frontmatter_value(raw: str) -> Any:
+    value = raw.strip()
+    if not value:
+        return ""
+    low = value.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if value[0] in ('"', "'"):
         try:
-            spec = importlib.util.spec_from_file_location(path.stem, path)
-            if spec is None or spec.loader is None:
-                return
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            return ast.literal_eval(value)
+        except Exception:
+            return value.strip("'\"")
+    if value[0] in "[{(":
+        try:
+            return ast.literal_eval(value)
+        except Exception:
+            return value
+    return value
 
-            # Look for functions decorated with @register_tool or having _tool_meta attribute
-            for name, obj in inspect.getmembers(module, inspect.isfunction):
-                if hasattr(obj, "_tool_meta"):
-                    meta = obj._tool_meta
-                    self.registry.register(
-                        meta["name"],
-                        meta["description"],
-                        meta["parameters"],
-                        obj,
-                        replace=True,
-                        source=f"skill:{path.name}",
-                    )
-                    CONSOLE.print(
-                        f"[dim]Loaded skill: {meta['name']} from {path.name}[/dim]"
-                    )
 
-            self._loaded.add(path.name)
+def parse_skill_markdown(text: str) -> tuple[dict[str, Any], str]:
+    if not text.startswith("---\n"):
+        return {}, text.strip()
+
+    lines = text.splitlines()
+    try:
+        closing_index = lines[1:].index("---") + 1
+    except ValueError:
+        return {}, text.strip()
+
+    metadata: dict[str, Any] = {}
+    for line in lines[1:closing_index]:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, raw_value = stripped.split(":", 1)
+        metadata[key.strip()] = _parse_frontmatter_value(raw_value)
+    body = "\n".join(lines[closing_index + 1 :]).strip()
+    return metadata, body
+
+
+def parse_explicit_skill_request(text: str) -> Optional[ExplicitSkillRequest]:
+    stripped = text.strip()
+    if not stripped:
+        return None
+
+    slash_match = re.match(r"^/skill\s+([^\s]+)(?:\s+(.*))?$", stripped, re.IGNORECASE)
+    if slash_match:
+        return ExplicitSkillRequest(
+            skill_ref=slash_match.group(1),
+            remaining_text=(slash_match.group(2) or "").strip(),
+        )
+
+    slash_direct = re.match(r"^/([^\s/][^\s]*)(?:\s+(.*))?$", stripped)
+    if slash_direct:
+        return ExplicitSkillRequest(
+            skill_ref=slash_direct.group(1),
+            remaining_text=(slash_direct.group(2) or "").strip(),
+        )
+
+    natural_match = re.match(
+        r"^(?:please\s+)?(?:use|activate|run)\s+([^\s,.:：，]+)(?:\s+(.*))?$",
+        stripped,
+        re.IGNORECASE,
+    )
+    if natural_match:
+        return ExplicitSkillRequest(
+            skill_ref=natural_match.group(1),
+            remaining_text=(natural_match.group(2) or "").strip(),
+        )
+
+    chinese_match = re.match(
+        r"^(?:请)?(?:使用|启用)\s*([^\s,.:：，]+)(?:\s+(.*))?$",
+        stripped,
+    )
+    if chinese_match:
+        return ExplicitSkillRequest(
+            skill_ref=chinese_match.group(1),
+            remaining_text=(chinese_match.group(2) or "").strip(),
+        )
+
+    return None
+
+
+def prepare_user_message_for_skills(
+    user_message: str, skill_catalog: SkillCatalog
+) -> tuple[str, list[str]]:
+    parsed = parse_explicit_skill_request(user_message)
+    if parsed is None:
+        return user_message, []
+    bundle = skill_catalog.get(parsed.skill_ref)
+    if bundle is None or not bundle.user_invocable:
+        return user_message, []
+    normalized = parsed.remaining_text.strip()
+    if not normalized:
+        normalized = (
+            f"The user explicitly requested the skill '{bundle.id}'. "
+            "Activate it and briefly explain how you will apply it."
+        )
+    return normalized, [bundle.id]
+
+
+class SkillCatalog:
+    """Load skill bundles from user and built-in skill directories."""
+
+    def __init__(self, user_root: Optional[Path] = None, builtin_root: Optional[Path] = None):
+        self.user_root = user_root or SKILLS_DIR
+        self.builtin_root = builtin_root or BUILTIN_SKILLS_DIR
+        self._skills: dict[str, SkillBundle] = {}
+        self._aliases: dict[str, str] = {}
+
+    def load_all(self) -> None:
+        self.user_root.mkdir(parents=True, exist_ok=True)
+        self._skills.clear()
+        self._aliases.clear()
+        self._load_root(self.builtin_root, source="builtin")
+        self._load_root(self.user_root, source="user")
+
+    def _load_root(self, root: Path, *, source: str) -> None:
+        if not root.exists():
+            return
+        for skill_file in sorted(root.rglob("SKILL.md")):
+            bundle = self._read_bundle(skill_file, root=root, source=source)
+            if bundle is None:
+                continue
+            self._skills[bundle.id] = bundle
+        self._rebuild_aliases()
+
+    def _read_bundle(self, skill_file: Path, *, root: Path, source: str) -> Optional[SkillBundle]:
+        try:
+            raw_text = skill_file.read_text(encoding="utf-8")
         except Exception as e:
-            CONSOLE.print(f"[yellow]Failed to load skill {path.name}: {e}[/yellow]")
+            CONSOLE.print(f"[yellow]Failed to read skill {skill_file}: {e}[/yellow]")
+            return None
 
-    def reload(self):
-        self.registry.unregister_by_source_prefix("skill:")
-        self._loaded.clear()
+        metadata, body = parse_skill_markdown(raw_text)
+        bundle_dir = skill_file.parent
+        bundle_id = bundle_dir.relative_to(root).as_posix()
+        if not bundle_id or bundle_id == ".":
+            bundle_id = bundle_dir.name
+        supporting_files = sorted(
+            p.relative_to(bundle_dir).as_posix()
+            for p in bundle_dir.rglob("*")
+            if p.is_file() and p.name != "SKILL.md"
+        )
+        return SkillBundle(
+            id=bundle_id,
+            name=str(metadata.get("name") or bundle_dir.name),
+            description=str(metadata.get("description") or ""),
+            path=bundle_dir,
+            source=source,
+            body=body,
+            metadata=metadata,
+            supporting_files=supporting_files,
+            user_invocable=bool(metadata.get("user-invocable", True)),
+            disable_model_invocation=bool(metadata.get("disable-model-invocation", False)),
+        )
+
+    def _rebuild_aliases(self) -> None:
+        self._aliases.clear()
+        counts: dict[str, int] = {}
+        for skill_id in self._skills:
+            leaf = skill_id.rsplit("/", 1)[-1]
+            counts[leaf] = counts.get(leaf, 0) + 1
+        for skill_id, bundle in self._skills.items():
+            self._aliases[skill_id] = skill_id
+            leaf = skill_id.rsplit("/", 1)[-1]
+            if counts.get(leaf, 0) == 1:
+                self._aliases[leaf] = skill_id
+            self._aliases[bundle.name] = skill_id
+
+    def reload(self) -> None:
         self.load_all()
+
+    def get(self, skill_ref: str) -> Optional[SkillBundle]:
+        resolved = self.resolve_ref(skill_ref)
+        if resolved is None:
+            return None
+        return self._skills.get(resolved)
+
+    def resolve_ref(self, skill_ref: str) -> Optional[str]:
+        ref = skill_ref.strip()
+        if not ref:
+            return None
+        if ref in self._skills:
+            return ref
+        return self._aliases.get(ref)
+
+    def list_skills(self) -> list[SkillBundle]:
+        return [self._skills[key] for key in sorted(self._skills)]
+
+    def summary_lines(self) -> list[str]:
+        if not self._skills:
+            return []
+        lines = [
+            "## Available Skills",
+            "Available skills:",
+            "Skills are instruction bundles loaded on demand. Use activate_skill only when a skill is relevant.",
+        ]
+        for bundle in self.list_skills():
+            lines.append(
+                "- "
+                f"{bundle.id} ({bundle.source}; user-invocable={'yes' if bundle.user_invocable else 'no'}; "
+                f"model-invocable={'no' if bundle.disable_model_invocation else 'yes'}): "
+                f"{bundle.description or 'No description'}"
+            )
+        return lines
+
+    def register_tools(self, registry: ToolRegistry) -> None:
+        async def activate_skill(skill_name: str) -> dict[str, Any]:
+            bundle = self.get(skill_name)
+            if bundle is None:
+                return {"ok": False, "error": f"Skill '{skill_name}' not found"}
+            if bundle.disable_model_invocation:
+                return {
+                    "ok": False,
+                    "error": f"Skill '{bundle.id}' cannot be activated by the model",
+                }
+            return self._activation_payload(bundle)
+
+        def list_skill_files(skill_name: str) -> dict[str, Any]:
+            bundle = self.get(skill_name)
+            if bundle is None:
+                return {"ok": False, "error": f"Skill '{skill_name}' not found"}
+            return {
+                "ok": True,
+                "skill": bundle.id,
+                "bundle_root": str(bundle.path),
+                "files": bundle.supporting_files,
+            }
+
+        def read_skill_file(skill_name: str, path: str) -> dict[str, Any]:
+            bundle = self.get(skill_name)
+            if bundle is None:
+                return {"ok": False, "error": f"Skill '{skill_name}' not found"}
+            rel_path = Path(path)
+            if rel_path.is_absolute():
+                return {"ok": False, "error": "Skill file paths must be relative to the skill bundle"}
+            target = (bundle.path / rel_path).resolve(strict=False)
+            if target != bundle.path and bundle.path not in target.parents:
+                return {"ok": False, "error": "Requested path escapes the skill bundle"}
+            if not target.exists() or not target.is_file():
+                return {"ok": False, "error": f"Skill file '{path}' not found"}
+            return {
+                "ok": True,
+                "skill": bundle.id,
+                "path": rel_path.as_posix(),
+                "bundle_root": str(bundle.path),
+                "content": target.read_text(encoding="utf-8"),
+            }
+
+        registry.register(
+            "activate_skill",
+            "Load a skill bundle's full instructions and supporting-file index.",
+            {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Skill id, unique leaf name, or display name",
+                    }
+                },
+                "required": ["skill_name"],
+            },
+            activate_skill,
+            replace=True,
+            source="runtime:skill",
+        )
+        registry.register(
+            "list_skill_files",
+            "List supporting files inside a skill bundle.",
+            {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Skill id, unique leaf name, or display name",
+                    }
+                },
+                "required": ["skill_name"],
+            },
+            list_skill_files,
+            replace=True,
+            source="runtime:skill",
+        )
+        registry.register(
+            "read_skill_file",
+            "Read a supporting file from a skill bundle.",
+            {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Skill id, unique leaf name, or display name",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path inside the skill bundle",
+                    },
+                },
+                "required": ["skill_name", "path"],
+            },
+            read_skill_file,
+            replace=True,
+            source="runtime:skill",
+        )
+
+    def _activation_payload(self, bundle: SkillBundle) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "skill": {
+                "id": bundle.id,
+                "name": bundle.name,
+                "description": bundle.description,
+                "source": bundle.source,
+                "bundle_root": str(bundle.path),
+                "instructions": bundle.body,
+                "supporting_files": bundle.supporting_files,
+                "metadata": bundle.metadata,
+            },
+        }
+
+    def activation_text(self, skill_ref: str, *, explicit: bool = False) -> Optional[str]:
+        bundle = self.get(skill_ref)
+        if bundle is None:
+            return None
+        lines = [f"Skill `{bundle.id}` ({bundle.name}) is active for this turn."]
+        if explicit:
+            lines.append("This skill was explicitly requested by the user and must be followed.")
+        if bundle.description:
+            lines.append(f"Description: {bundle.description}")
+        lines.append(f"Bundle root: {bundle.path}")
+        if bundle.supporting_files:
+            lines.append("Supporting files available on demand:")
+            lines.extend(f"- {path}" for path in bundle.supporting_files)
+        else:
+            lines.append("Supporting files available on demand: none")
+        lines.append("")
+        lines.append(bundle.body or "(No instructions in SKILL.md body)")
+        return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2036,6 +2359,20 @@ class BaseAgent:
             retrieved = self.context_manager.retrieve_ltm_context(user_message)
             if retrieved:
                 ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
+        skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
+        required_skills: list[str] = list(ctx.metadata.get("required_skills", []))
+        if skill_catalog and required_skills:
+            active_blocks = []
+            for skill_ref in required_skills:
+                activation = skill_catalog.activation_text(skill_ref, explicit=True)
+                if activation:
+                    active_blocks.append(activation)
+            if active_blocks:
+                ctx.system_prompt = (
+                    ctx.system_prompt
+                    + "\n\n## Active Skills\n"
+                    + "\n\n".join(active_blocks)
+                )
 
         ctx.messages.append({"role": "user", "content": user_message})
         tool_calls_made = []
@@ -2737,6 +3074,17 @@ def _datestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
+def _resolve_output_dir(cfg: dict) -> Path:
+    """Resolve output directory from config, creating it if needed."""
+    raw = cfg.get("output_dir")
+    if raw:
+        p = Path(os.path.expandvars(str(raw))).expanduser().resolve()
+    else:
+        p = DEFAULT_OUTPUT_DIR
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
 def _load_system_prompt(cfg: dict) -> str:
     best = PROMPTS_DIR / "best.md"
     if best.exists():
@@ -2758,10 +3106,11 @@ def _compose_system_prompt(
     base_prompt: str,
     registry: ToolRegistry,
     workspace_root: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    skill_catalog: Optional[SkillCatalog] = None,
 ) -> str:
     groups: dict[str, list[tuple[str, str]]] = {
         "builtin": [],
-        "skill": [],
         "mcp": [],
         "runtime": [],
     }
@@ -2769,8 +3118,6 @@ def _compose_system_prompt(
         source = tool.source
         if source == "builtin":
             groups["builtin"].append((name, tool.description))
-        elif source.startswith("skill:"):
-            groups["skill"].append((name, tool.description))
         elif source.startswith("mcp:"):
             groups["mcp"].append((name, tool.description))
         else:
@@ -2786,16 +3133,18 @@ def _compose_system_prompt(
     ]
     if groups["builtin"]:
         lines.append("Built-in tools: " + _format_group(groups["builtin"]))
-    if groups["skill"]:
-        lines.append("Loaded skill tools: " + _format_group(groups["skill"]))
     if groups["mcp"]:
         lines.append("Connected MCP tools: " + _format_group(groups["mcp"]))
     if groups["runtime"]:
         lines.append("Runtime tools: " + _format_group(groups["runtime"]))
+    if skill_catalog:
+        lines.extend(skill_catalog.summary_lines())
     if workspace_root:
         builtin_names = {n for n, _ in groups["builtin"]}
         if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
             lines.append(f"Workspace root for file tools: {workspace_root}")
+    if output_dir:
+        lines.append(f"Output directory for generated files (screenshots, exports, temp): {output_dir}")
     return base_prompt.rstrip() + "\n\n" + "\n".join(lines)
 
 
@@ -2828,6 +3177,7 @@ async def _build_components_async(cfg: dict):
     orch_cfg = cfg.get("orchestration", {})
 
     workspace_root = Path.cwd().resolve()
+    output_dir = _resolve_output_dir(cfg)
 
     # Resolve active provider format for format-aware classes
     active_provider = cfg.get("active_provider", "anthropic")
@@ -2879,10 +3229,15 @@ async def _build_components_async(cfg: dict):
         chapter_normalizer=lambda chapter: normalize_memory_chapter(
             chapter, LEGACY_MEMORY_ALIASES
         ),
+        output_dir=output_dir,
     )
 
-    skill_loader = SkillLoader(registry)
-    skill_loader.load_all()
+    # Share output_dir with skills via registry context
+    registry.set_context("output_dir", str(output_dir))
+
+    skill_catalog = SkillCatalog()
+    skill_catalog.load_all()
+    skill_catalog.register_tools(registry)
 
     mcp_client = None
     mcp_status = {
@@ -2893,7 +3248,8 @@ async def _build_components_async(cfg: dict):
     }
     if cfg.get("mcp_servers"):
         mcp_client = MCPClient(registry)
-        await mcp_client.connect_from_config(cfg)
+        mcp_extra_env = {"AGENT_OUTPUT_DIR": str(output_dir)}
+        await mcp_client.connect_from_config(cfg, extra_env=mcp_extra_env)
         mcp_status = mcp_client.status_summary()
         if mcp_status["connected_servers"]:
             CONSOLE.print(
@@ -2910,7 +3266,13 @@ async def _build_components_async(cfg: dict):
         client, registry, model=model, max_tokens=max_tokens, api_format=api_format
     )
     agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
-    system_prompt = _compose_system_prompt(system_prompt, registry, workspace_root)
+    system_prompt = _compose_system_prompt(
+        system_prompt,
+        registry,
+        workspace_root,
+        output_dir,
+        skill_catalog=skill_catalog,
+    )
     agent.context_manager = ctx_manager
     evolution = EvolutionEngine(client, model, memory, api_format=api_format)
 
@@ -2924,9 +3286,10 @@ async def _build_components_async(cfg: dict):
         "agent": agent,
         "evolution": evolution,
         "context_manager": ctx_manager,
-        "skill_loader": skill_loader,
+        "skill_catalog": skill_catalog,
         "mcp_client": mcp_client,
         "mcp_status": mcp_status,
+        "output_dir": output_dir,
         "cfg": cfg,
     }
 
@@ -2943,6 +3306,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     evolution: EvolutionEngine = components["evolution"]
     system_prompt = components["system_prompt"]
     ctx_mgr: Optional[ContextManager] = components.get("context_manager")
+    skill_catalog: SkillCatalog = components["skill_catalog"]
 
     # Get prompt version
     prompt_files = sorted(PROMPTS_DIR.glob("system_v*.md"))
@@ -3037,6 +3401,23 @@ async def _interactive_loop(components: dict, cfg: dict):
                     tools = components["registry"].list_tools()
                     CONSOLE.print("Available tools: " + ", ".join(tools))
                     continue
+                elif cmd == "skills":
+                    skills = skill_catalog.list_skills()
+                    if not skills:
+                        CONSOLE.print("[yellow]No skills found.[/yellow]")
+                    else:
+                        table = Table(title="Available Skills")
+                        table.add_column("ID")
+                        table.add_column("Source")
+                        table.add_column("Description")
+                        for bundle in skills:
+                            table.add_row(
+                                bundle.id,
+                                bundle.source,
+                                bundle.description or "—",
+                            )
+                        CONSOLE.print(table)
+                    continue
                 elif cmd.startswith("mode "):
                     # Kept as a hidden override for debugging; not advertised
                     CONSOLE.print(
@@ -3074,8 +3455,24 @@ async def _interactive_loop(components: dict, cfg: dict):
                     )
                     continue
                 else:
-                    CONSOLE.print(f"[yellow]Unknown command: {user_input}[/yellow]")
-                    continue
+                    normalized_input, required_skills = prepare_user_message_for_skills(
+                        user_input, skill_catalog
+                    )
+                    if required_skills:
+                        user_input = normalized_input
+                        ctx.metadata["required_skills"] = required_skills
+                    else:
+                        CONSOLE.print(f"[yellow]Unknown command: {user_input}[/yellow]")
+                        continue
+            else:
+                normalized_input, required_skills = prepare_user_message_for_skills(
+                    user_input, skill_catalog
+                )
+                if required_skills:
+                    user_input = normalized_input
+                    ctx.metadata["required_skills"] = required_skills
+                else:
+                    ctx.metadata.pop("required_skills", None)
 
             # Mark activity so idle timer resets and dirty flag is set
             if ctx_mgr:
@@ -3091,6 +3488,7 @@ async def _interactive_loop(components: dict, cfg: dict):
 
             try:
                 CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+                ctx.metadata["skill_catalog"] = skill_catalog
                 result = await agent.send_message(
                     ctx, user_input, stream_callback=stream_cb
                 )
@@ -3125,7 +3523,16 @@ async def _interactive_loop(components: dict, cfg: dict):
                 ):
                     CONSOLE.print("[dim]Generating tool...[/dim]")
                     await evolution.generate_tool(user_input, components["registry"])
-                    components["skill_loader"].reload()
+                    components["skill_catalog"].reload()
+                    components["skill_catalog"].register_tools(components["registry"])
+                    components["system_prompt"] = _compose_system_prompt(
+                        system_prompt,
+                        components["registry"],
+                        Path.cwd().resolve(),
+                        components["output_dir"],
+                        skill_catalog=components["skill_catalog"],
+                    )
+                    ctx.system_prompt = components["system_prompt"]
 
             except Exception as e:
                 CONSOLE.print(f"\n[red]Error: {e}[/red]")
@@ -3197,11 +3604,18 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
         components = await _build_components_async(cfg)
         agent: BaseAgent = components["agent"]
         ctx = AgentContext(system_prompt=components["system_prompt"])
+        skill_catalog: SkillCatalog = components["skill_catalog"]
+        normalized_question, required_skills = prepare_user_message_for_skills(
+            question, skill_catalog
+        )
+        if required_skills:
+            ctx.metadata["required_skills"] = required_skills
+        ctx.metadata["skill_catalog"] = skill_catalog
         CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
         try:
             result = await agent.send_message(
                 ctx,
-                question,
+                normalized_question,
                 stream_callback=lambda chunk: CONSOLE.print(chunk, end="", markup=False),
             )
             CONSOLE.print()

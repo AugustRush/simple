@@ -1,5 +1,7 @@
 """Tests for MCP/skill wiring and capability-aware prompts."""
 
+import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -18,8 +20,9 @@ class _FakeMCPClient:
         self.closed = False
         type(self).instances.append(self)
 
-    async def connect_from_config(self, config):
+    async def connect_from_config(self, config, extra_env=None):
         self.connected = True
+        self.extra_env = extra_env
         self.registry.register(
             "mcp_demo_echo",
             "Echo from MCP",
@@ -52,10 +55,11 @@ class _LoopBoundMCPClient:
         self.registered = False
         type(self).instances.append(self)
 
-    async def connect_from_config(self, config):
+    async def connect_from_config(self, config, extra_env=None):
         import asyncio
 
         self.connected_loop = id(asyncio.get_running_loop())
+        self.extra_env = extra_env
 
         async def mcp_ping():
             current_loop = id(asyncio.get_running_loop())
@@ -103,38 +107,158 @@ def _minimal_cfg():
     }
 
 
-def test_skill_loader_reload_removes_deleted_tools(tmp_path, monkeypatch):
-    from agent import SkillLoader, ToolRegistry
+def _write_skill_bundle(root: Path, relative_dir: str, skill_text: str, extra_files: dict[str, str] | None = None):
+    bundle_dir = root / relative_dir
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    (bundle_dir / "SKILL.md").write_text(skill_text, encoding="utf-8")
+    for rel_path, content in (extra_files or {}).items():
+        file_path = bundle_dir / rel_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+    return bundle_dir
 
-    skill_dir = tmp_path / "skills"
-    skill_dir.mkdir()
-    skill_file = skill_dir / "demo.py"
-    skill_file.write_text(
-        """
-def register_tool(name, description, parameters):
-    def decorator(fn):
-        fn._tool_meta = {"name": name, "description": description, "parameters": parameters}
-        return fn
-    return decorator
 
-@register_tool("demo_tool", "demo", {"type": "object", "properties": {}, "required": []})
-def demo_tool():
-    return "ok"
+def test_skill_catalog_discovers_bundles_and_user_overrides_builtin(tmp_path, monkeypatch):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+
+    _write_skill_bundle(
+        builtin_root,
+        "quality/review",
+        """---
+name: Built-in Review
+description: Built-in reviewer
+user-invocable: true
+---
+Built-in instructions.
 """,
-        encoding="utf-8",
     )
-    monkeypatch.setattr("agent.SKILLS_DIR", skill_dir)
+    _write_skill_bundle(
+        user_root,
+        "quality/review",
+        """---
+name: User Review
+description: User override
+user-invocable: true
+---
+User instructions.
+""",
+        {"examples/sample.md": "example"},
+    )
 
-    registry = ToolRegistry()
-    loader = SkillLoader(registry)
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", user_root)
+    monkeypatch.setattr(agent_module, "BUILTIN_SKILLS_DIR", builtin_root)
 
-    loader.load_all()
-    assert "demo_tool" in registry.list_tools()
+    catalog = agent_module.SkillCatalog()
+    catalog.load_all()
 
-    skill_file.unlink()
-    loader.reload()
+    review = catalog.get("quality/review")
+    assert review is not None
+    assert review.name == "User Review"
+    assert review.description == "User override"
+    assert review.source == "user"
+    assert "examples/sample.md" in review.supporting_files
 
-    assert "demo_tool" not in registry.list_tools()
+
+def test_parse_explicit_skill_request_supports_slash_and_natural_language():
+    from agent import parse_explicit_skill_request
+
+    parsed = parse_explicit_skill_request("/quality/review tighten the output")
+    assert parsed is not None
+    assert parsed.skill_ref == "quality/review"
+    assert parsed.remaining_text == "tighten the output"
+
+    parsed = parse_explicit_skill_request("/skill quality/review tighten the output")
+    assert parsed is not None
+    assert parsed.skill_ref == "quality/review"
+    assert parsed.remaining_text == "tighten the output"
+
+    parsed = parse_explicit_skill_request("use quality/review tighten the output")
+    assert parsed is not None
+    assert parsed.skill_ref == "quality/review"
+    assert parsed.remaining_text == "tighten the output"
+
+    parsed = parse_explicit_skill_request("使用 quality/review 优化输出")
+    assert parsed is not None
+    assert parsed.skill_ref == "quality/review"
+    assert parsed.remaining_text == "优化输出"
+
+
+def test_build_components_registers_skill_runtime_tools_and_uses_progressive_disclosure(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+    skill_body = "Follow the exact review checklist."
+    _write_skill_bundle(
+        builtin_root,
+        "quality/review",
+        f"""---
+name: Review
+description: Review code changes
+user-invocable: true
+---
+{skill_body}
+""",
+        {
+            "template.md": "Checklist template",
+            "examples/sample.md": "Example output",
+        },
+    )
+
+    cfg = _minimal_cfg()
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024)
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", user_root)
+    monkeypatch.setattr(agent_module, "BUILTIN_SKILLS_DIR", builtin_root)
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+    registry = components["registry"]
+    prompt = components["system_prompt"]
+
+    assert "activate_skill" in registry.list_tools()
+    assert "list_skill_files" in registry.list_tools()
+    assert "read_skill_file" in registry.list_tools()
+    assert "Available skills:" in prompt
+    assert "quality/review" in prompt
+    assert "Review code changes" in prompt
+    assert skill_body not in prompt
+    assert "Loaded skill tools" not in prompt
+
+    payload = json.loads(
+        asyncio.run(registry.call("activate_skill", {"skill_name": "quality/review"}))
+    )
+    assert payload["ok"] is True
+    assert payload["skill"]["id"] == "quality/review"
+    assert payload["skill"]["instructions"] == skill_body
+    assert "template.md" in payload["skill"]["supporting_files"]
+
+    files_payload = json.loads(
+        asyncio.run(registry.call("list_skill_files", {"skill_name": "quality/review"}))
+    )
+    assert files_payload["ok"] is True
+    assert "template.md" in files_payload["files"]
+
+    file_payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "read_skill_file",
+                {"skill_name": "quality/review", "path": "template.md"},
+            )
+        )
+    )
+    assert file_payload["ok"] is True
+    assert file_payload["content"] == "Checklist template"
 
 
 def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path):
@@ -149,6 +273,7 @@ def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
     monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
     components = agent_module._build_components(cfg)
 
@@ -174,6 +299,7 @@ def test_build_components_exposes_mcp_status_and_prints_summary(monkeypatch, tmp
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
     monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(
         agent_module.CONSOLE,
         "print",
@@ -203,6 +329,7 @@ def test_system_prompt_reflects_registered_capabilities(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
     monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
     components = agent_module._build_components(cfg)
     prompt = components["system_prompt"]
@@ -230,6 +357,7 @@ def test_async_component_lifecycle_keeps_mcp_on_one_event_loop(monkeypatch, tmp_
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
     monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
     async def run():
         components = await agent_module._build_components_async(cfg)
