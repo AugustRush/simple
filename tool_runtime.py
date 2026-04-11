@@ -95,6 +95,10 @@ class ToolRegistry:
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())
 
+    def unregister_by_source_prefix(self, prefix: str) -> None:
+        for name in [n for n, tool in self._tools.items() if tool.source.startswith(prefix)]:
+            self._tools.pop(name, None)
+
 
 class BuiltinTools:
     """Built-in tools with bounded file access and structured responses."""

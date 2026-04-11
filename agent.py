@@ -10,6 +10,7 @@ Architecture: Memory Palace + Multi-Agent Orchestration + MCP + Self-Evolution
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import importlib
 import importlib.util
 import math
@@ -107,7 +108,7 @@ CONSOLE = Console()
 DEFAULT_SYSTEM_PROMPT = """You are a powerful personal AI agent with tools, memory, and the ability to spawn sub-agents.
 
 ## Tools
-You have access to shell, file, web, and memory tools. Use them proactively.
+Your exact tool capabilities are appended later in this prompt. Use only the tools explicitly listed for this agent instance.
 
 ## spawn_agent — multi-agent orchestration
 
@@ -1692,6 +1693,12 @@ class MCPClient:
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
         self._sessions = []
+        self._stack = AsyncExitStack()
+
+    @staticmethod
+    def _safe_name(value: str) -> str:
+        name = re.sub(r"[^0-9a-zA-Z_]+", "_", value.strip().lower())
+        return name.strip("_") or "mcp"
 
     async def connect_from_config(self, config: dict):
         if not HAS_MCP:
@@ -1706,9 +1713,71 @@ class MCPClient:
                 )
 
     async def _connect_server(self, cfg: dict):
-        # Placeholder for actual MCP SDK integration
-        # When mcp package is available, implement proper connection
-        pass
+        command = str(cfg.get("command", "")).strip()
+        if not command:
+            raise ValueError("MCP server config requires 'command'")
+
+        server_name = self._safe_name(
+            str(cfg.get("name") or Path(command).name or "mcp")
+        )
+        params = mcp.StdioServerParameters(
+            command=command,
+            args=list(cfg.get("args", []) or []),
+            env=dict(cfg.get("env", {}) or {}) or None,
+            cwd=cfg.get("cwd"),
+        )
+        read_stream, write_stream = await self._stack.enter_async_context(
+            mcp.stdio_client(params)
+        )
+        session = await self._stack.enter_async_context(
+            mcp.ClientSession(read_stream, write_stream)
+        )
+        await session.initialize()
+        self._sessions.append({"name": server_name, "session": session})
+
+        tools_result = await session.list_tools()
+        for tool in getattr(tools_result, "tools", []):
+            self._register_tool(server_name, session, tool)
+
+    def _register_tool(self, server_name: str, session: Any, tool: Any) -> None:
+        original_name = str(getattr(tool, "name", "")).strip()
+        if not original_name:
+            return
+        registered_name = f"mcp_{server_name}_{self._safe_name(original_name)}"
+        description = getattr(tool, "description", None) or f"MCP tool {original_name}"
+        parameters = getattr(tool, "inputSchema", None) or {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        }
+
+        async def _call_mcp_tool(**kwargs):
+            result = await session.call_tool(original_name, arguments=kwargs or None)
+            text_blocks = []
+            for block in getattr(result, "content", []) or []:
+                block_type = getattr(block, "type", "")
+                if block_type == "text":
+                    text_blocks.append(getattr(block, "text", ""))
+                else:
+                    text_blocks.append(str(block))
+            return {
+                "ok": not bool(getattr(result, "isError", False)),
+                "server": server_name,
+                "tool": original_name,
+                "text": "\n".join(b for b in text_blocks if b).strip(),
+                "structured": getattr(result, "structuredContent", None),
+            }
+
+        self.registry.register(
+            registered_name,
+            description,
+            parameters,
+            _call_mcp_tool,
+            source=f"mcp:{server_name}",
+        )
+
+    async def close(self) -> None:
+        await self._stack.aclose()
 
 
 class SkillLoader:
@@ -1753,6 +1822,7 @@ class SkillLoader:
             CONSOLE.print(f"[yellow]Failed to load skill {path.name}: {e}[/yellow]")
 
     def reload(self):
+        self.registry.unregister_by_source_prefix("skill:")
         self._loaded.clear()
         self.load_all()
 
@@ -2067,7 +2137,9 @@ class BaseAgent:
             traceback.print_exc()
         return "".join(collected)
 
-    def register_spawn_capability(self, base_system_prompt: str) -> None:
+    def register_spawn_capability(
+        self, base_system_prompt: str, workspace_root: Optional[Path] = None
+    ) -> None:
         """Register the spawn_agent tool.
 
         The main agent can call spawn_agent one or more times in a single turn.
@@ -2093,6 +2165,7 @@ class BaseAgent:
             sys_prompt = base_system_prompt
             if system_suffix:
                 sys_prompt += f"\n\n{system_suffix}"
+            sys_prompt = _compose_system_prompt(sys_prompt, sub_registry, workspace_root)
             sub_ctx = AgentContext(role=role, system_prompt=sys_prompt)
             CONSOLE.print(f"\n[bold magenta]▶ [{role}][/bold magenta] {task[:120]}")
             result = await sub_agent.send_message(sub_ctx, task)
@@ -2138,6 +2211,7 @@ class BaseAgent:
                 "required": ["role", "task"],
             },
             spawn_agent,
+            source="runtime:spawn",
         )
 
 
@@ -2581,6 +2655,58 @@ def _load_system_prompt(cfg: dict) -> str:
     return DEFAULT_SYSTEM_PROMPT
 
 
+def _compose_system_prompt(
+    base_prompt: str,
+    registry: ToolRegistry,
+    workspace_root: Optional[Path] = None,
+) -> str:
+    groups: dict[str, list[tuple[str, str]]] = {
+        "builtin": [],
+        "skill": [],
+        "mcp": [],
+        "runtime": [],
+    }
+    for name, tool in sorted(registry._tools.items()):
+        source = tool.source
+        if source == "builtin":
+            groups["builtin"].append((name, tool.description))
+        elif source.startswith("skill:"):
+            groups["skill"].append((name, tool.description))
+        elif source.startswith("mcp:"):
+            groups["mcp"].append((name, tool.description))
+        else:
+            groups["runtime"].append((name, tool.description))
+
+    def _format_group(items: list[tuple[str, str]]) -> str:
+        return "; ".join(f"{name}: {description}" for name, description in items)
+
+    lines = [
+        "## Active Capabilities",
+        "Use only tools that are actually listed for this agent instance.",
+        "When the user asks what you can do, what tools you have, or what capabilities are available, explicitly summarize the active tools below by name and purpose. Mention MCP tools when present.",
+    ]
+    if groups["builtin"]:
+        lines.append("Built-in tools: " + _format_group(groups["builtin"]))
+    if groups["skill"]:
+        lines.append("Loaded skill tools: " + _format_group(groups["skill"]))
+    if groups["mcp"]:
+        lines.append("Connected MCP tools: " + _format_group(groups["mcp"]))
+    if groups["runtime"]:
+        lines.append("Runtime tools: " + _format_group(groups["runtime"]))
+    if workspace_root and any(
+        name in {name for name, _ in groups["builtin"]}
+        for name in ("read_file", "write_file", "list_files")
+    ):
+        lines.append(f"Workspace root for file tools: {workspace_root}")
+    return base_prompt.rstrip() + "\n\n" + "\n".join(lines)
+
+
+async def _close_components(components: dict) -> None:
+    mcp_client = components.get("mcp_client")
+    if mcp_client is not None:
+        await mcp_client.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2594,7 +2720,7 @@ memory_app = typer.Typer(help="Memory palace commands")
 app.add_typer(memory_app, name="memory")
 
 
-def _build_components(cfg: dict):
+async def _build_components_async(cfg: dict):
     """Build all components from config using ModelClientFactory."""
     client, model, max_tokens = ModelClientFactory.from_config(cfg)
     system_prompt = _load_system_prompt(cfg)
@@ -2602,6 +2728,8 @@ def _build_components(cfg: dict):
     # Sub-config sections
     mem_cfg = cfg.get("memory", {})
     orch_cfg = cfg.get("orchestration", {})
+
+    workspace_root = Path.cwd().resolve()
 
     # Resolve active provider format for format-aware classes
     active_provider = cfg.get("active_provider", "anthropic")
@@ -2649,7 +2777,7 @@ def _build_components(cfg: dict):
         memory,
         registry,
         context_manager=ctx_manager,
-        workspace_root=Path.cwd(),
+        workspace_root=workspace_root,
         chapter_normalizer=lambda chapter: normalize_memory_chapter(
             chapter, LEGACY_MEMORY_ALIASES
         ),
@@ -2658,10 +2786,16 @@ def _build_components(cfg: dict):
     skill_loader = SkillLoader(registry)
     skill_loader.load_all()
 
+    mcp_client = None
+    if cfg.get("mcp_servers"):
+        mcp_client = MCPClient(registry)
+        await mcp_client.connect_from_config(cfg)
+
     agent = BaseAgent(
         client, registry, model=model, max_tokens=max_tokens, api_format=api_format
     )
-    agent.register_spawn_capability(system_prompt)
+    agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
+    system_prompt = _compose_system_prompt(system_prompt, registry, workspace_root)
     agent.context_manager = ctx_manager
     evolution = EvolutionEngine(client, model, memory, api_format=api_format)
 
@@ -2676,8 +2810,14 @@ def _build_components(cfg: dict):
         "evolution": evolution,
         "context_manager": ctx_manager,
         "skill_loader": skill_loader,
+        "mcp_client": mcp_client,
         "cfg": cfg,
     }
+
+
+def _build_components(cfg: dict):
+    """Synchronous compatibility wrapper for commands that do not need async setup."""
+    return asyncio.run(_build_components_async(cfg))
 
 
 async def _interactive_loop(components: dict, cfg: dict):
@@ -2919,8 +3059,14 @@ def main_callback(ctx: typer.Context):
                 raise typer.Exit(0)
             # Reload after potential edits
             cfg, _ = load_config()
-        components = _build_components(cfg)
-        asyncio.run(_interactive_loop(components, cfg))
+        async def _run():
+            components = await _build_components_async(cfg)
+            try:
+                await _interactive_loop(components, cfg)
+            finally:
+                await _close_components(components)
+
+        asyncio.run(_run())
 
 
 @app.command()
@@ -2931,20 +3077,22 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
         if not _first_run_setup():
             raise typer.Exit(0)
         cfg, _ = load_config()
-    components = _build_components(cfg)
-    agent: BaseAgent = components["agent"]
-    ctx = AgentContext(system_prompt=components["system_prompt"])
-
     async def _run():
+        components = await _build_components_async(cfg)
+        agent: BaseAgent = components["agent"]
+        ctx = AgentContext(system_prompt=components["system_prompt"])
         CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
-        result = await agent.send_message(
-            ctx,
-            question,
-            stream_callback=lambda chunk: CONSOLE.print(chunk, end="", markup=False),
-        )
-        CONSOLE.print()
-        if result.error:
-            CONSOLE.print(f"[red]Error: {result.error}[/red]")
+        try:
+            result = await agent.send_message(
+                ctx,
+                question,
+                stream_callback=lambda chunk: CONSOLE.print(chunk, end="", markup=False),
+            )
+            CONSOLE.print()
+            if result.error:
+                CONSOLE.print(f"[red]Error: {result.error}[/red]")
+        finally:
+            await _close_components(components)
 
     asyncio.run(_run())
 
@@ -2961,27 +3109,29 @@ def evolve(
 ):
     """Self-evolution: analyze history and optimize the agent."""
     cfg, _ = load_config()
-    components = _build_components(cfg)
-    evolution: EvolutionEngine = components["evolution"]
-
     async def _run():
-        if stats:
-            s = evolution.get_stats()
-            table = Table(title="RL Statistics")
-            table.add_column("Metric")
-            table.add_column("Value")
-            for k, v in s.items():
-                table.add_row(k, str(v))
-            CONSOLE.print(table)
-        elif apply_best:
-            prompt = evolution.apply_best_prompt()
-            CONSOLE.print("[green]Applied best prompt.[/green]")
-            CONSOLE.print(f"[dim]{prompt[:200]}...[/dim]")
-        else:
-            CONSOLE.print("[yellow]Rewriting system prompt...[/yellow]")
-            new_prompt = await evolution.rewrite_system_prompt()
-            CONSOLE.print("[green]Done. New prompt:[/green]")
-            CONSOLE.print(Markdown(new_prompt[:500]))
+        components = await _build_components_async(cfg)
+        evolution: EvolutionEngine = components["evolution"]
+        try:
+            if stats:
+                s = evolution.get_stats()
+                table = Table(title="RL Statistics")
+                table.add_column("Metric")
+                table.add_column("Value")
+                for k, v in s.items():
+                    table.add_row(k, str(v))
+                CONSOLE.print(table)
+            elif apply_best:
+                prompt = evolution.apply_best_prompt()
+                CONSOLE.print("[green]Applied best prompt.[/green]")
+                CONSOLE.print(f"[dim]{prompt[:200]}...[/dim]")
+            else:
+                CONSOLE.print("[yellow]Rewriting system prompt...[/yellow]")
+                new_prompt = await evolution.rewrite_system_prompt()
+                CONSOLE.print("[green]Done. New prompt:[/green]")
+                CONSOLE.print(Markdown(new_prompt[:500]))
+        finally:
+            await _close_components(components)
 
     asyncio.run(_run())
 
@@ -3098,14 +3248,16 @@ def memory_search(query: str = typer.Argument(..., help="Search query")):
 def memory_tidy():
     """Manually trigger AI-assisted memory reorganization."""
     cfg, _ = load_config()
-    components = _build_components(cfg)
-
     async def _run():
+        components = await _build_components_async(cfg)
         mem: MemoryPalace = components["memory"]
         # Force tidy by resetting timer
         mem._last_tidy = 0
         mem._files_since_tidy = MEMORY_TIDY_FILE_THRESHOLD
-        await mem.tidy(components["client"], components["model"])
+        try:
+            await mem.tidy(components["client"], components["model"])
+        finally:
+            await _close_components(components)
 
     asyncio.run(_run())
 
