@@ -14,12 +14,14 @@ def make_builtin_tools(tmp_path):
     from agent import BuiltinTools, MemoryPalace, ToolRegistry
 
     registry = ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     memory = MemoryPalace(
         base_dir=tmp_path / "memory",
         context_dir=tmp_path / "context",
     )
-    tools = BuiltinTools(memory=memory, registry=registry)
-    return tools, registry
+    tools = BuiltinTools(memory=memory, registry=registry, workspace_root=workspace)
+    return tools, registry, workspace
 
 
 def test_registry_rejects_duplicate_tool_names():
@@ -66,29 +68,31 @@ def test_registry_call_json_encodes_structured_results():
 
 
 def test_read_file_truncates_large_content(tmp_path):
-    tools, _ = make_builtin_tools(tmp_path)
-    path = tmp_path / "large.txt"
+    tools, _, workspace = make_builtin_tools(tmp_path)
+    path = workspace / "large.txt"
     path.write_text("abcdefghij", encoding="utf-8")
 
     result = tools._read_file(str(path), max_bytes=4)
 
-    assert "abcd" in result
-    assert "truncated" in result.lower()
+    assert result["ok"] is True
+    assert result["content"] == "abcd"
+    assert result["truncated"] is True
 
 
 def test_read_file_rejects_binary_content(tmp_path):
-    tools, _ = make_builtin_tools(tmp_path)
-    path = tmp_path / "binary.bin"
+    tools, _, workspace = make_builtin_tools(tmp_path)
+    path = workspace / "binary.bin"
     path.write_bytes(b"\x00\x01\x02abc")
 
     result = tools._read_file(str(path))
 
-    assert "binary" in result.lower()
+    assert result["ok"] is False
+    assert "binary" in result["error"].lower()
 
 
 def test_list_files_respects_recursive_and_max_results(tmp_path):
-    tools, _ = make_builtin_tools(tmp_path)
-    root = tmp_path / "files"
+    tools, _, workspace = make_builtin_tools(tmp_path)
+    root = workspace / "files"
     root.mkdir()
     (root / "a.txt").write_text("a", encoding="utf-8")
     (root / "b.txt").write_text("b", encoding="utf-8")
@@ -100,18 +104,65 @@ def test_list_files_respects_recursive_and_max_results(tmp_path):
     recursive = tools._list_files(
         str(root), pattern="*.txt", recursive=True, max_results=2
     )
-    recursive_lines = recursive.splitlines()
-    listed = [line for line in recursive_lines if not line.startswith("...")]
 
-    assert "nested/c.txt" not in flat
-    assert len(listed) == 2
-    assert "truncated" in recursive.lower()
+    assert flat["ok"] is True
+    assert all("nested/c.txt" not in item for item in flat["items"])
+    assert recursive["ok"] is True
+    assert len(recursive["items"]) == 2
+    assert recursive["truncated"] is True
+
+
+def test_read_file_rejects_paths_outside_workspace(tmp_path):
+    tools, _, workspace = make_builtin_tools(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    result = tools._read_file(str(outside))
+
+    assert result["ok"] is False
+    assert "outside the workspace" in result["error"].lower()
+
+
+def test_write_file_rejects_paths_outside_workspace(tmp_path):
+    tools, _, workspace = make_builtin_tools(tmp_path)
+    outside = tmp_path / "outside.txt"
+
+    result = tools._write_file(str(outside), "secret")
+
+    assert result["ok"] is False
+    assert "outside the workspace" in result["error"].lower()
+
+
+def test_registry_call_returns_structured_builtin_payloads(tmp_path):
+    tools, registry, workspace = make_builtin_tools(tmp_path)
+    path = workspace / "note.txt"
+    path.write_text("hello", encoding="utf-8")
+
+    result = asyncio.run(registry.call("read_file", {"path": str(path)}))
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["path"] == str(path.resolve())
+    assert payload["content"] == "hello"
+
+
+def test_memory_search_returns_structured_results(tmp_path):
+    tools, registry, workspace = make_builtin_tools(tmp_path)
+    tools.memory.write("identity", "user", "Prefers concise responses")
+
+    result = asyncio.run(registry.call("memory_search", {"query": "concise", "top_k": 3}))
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["query"] == "concise"
+    assert payload["count"] >= 1
+    assert payload["items"][0]["path"] == "identity/user"
 
 
 def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
     from agent import BuiltinTools
 
-    tools, _ = make_builtin_tools(tmp_path)
+    tools, _, _ = make_builtin_tools(tmp_path)
     called = {"terminated": False}
 
     class FakeProc:
@@ -138,4 +189,5 @@ def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
     result = asyncio.run(tools._shell("sleep 10", timeout=1))
 
     assert called["terminated"] is True
-    assert "timed out" in result.lower()
+    assert result["ok"] is False
+    assert "timed out" in result["error"].lower()

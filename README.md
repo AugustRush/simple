@@ -149,6 +149,12 @@ The runtime registers these built-in tools:
 
 Additional tools may be loaded from `~/.agent/skills/*.py`.
 
+Built-in tool behavior:
+
+- file tools are bounded to the current workspace root
+- file and memory tools return structured JSON payloads to the model
+- shell commands are still powerful, but timeouts now terminate the spawned process group
+
 ## Memory Architecture
 
 The current memory system has four layers:
@@ -201,12 +207,15 @@ There are two retrieval paths:
 ```text
 .
 ├── agent.py
+├── memory_projection.py
+├── tool_runtime.py
 ├── config.example.json
 ├── docs/
 │   └── superpowers/
 │       ├── plans/
 │       └── specs/
 └── tests/
+    ├── test_builtin_tools.py
     ├── test_consolidation.py
     ├── test_evolution.py
     ├── test_ltm_store.py
@@ -225,11 +234,11 @@ uv run pytest -q
 
 Current status in this workspace:
 
-- `68` tests passing
+- `79` tests passing
 
 ## Notes
 
-- The codebase is still centered around a large single file, `agent.py`.
+- `agent.py` is still the main entrypoint, but tool runtime and memory projection code have been extracted into separate modules.
 - SQLite is now the source of truth for long-term context memory.
 - Markdown memory files are currently a projection layer, not the authoritative store.
 - `memory tidy` now performs local retention/projection maintenance instead of a foreground LLM reclassification pass.

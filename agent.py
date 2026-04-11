@@ -17,7 +17,6 @@ import inspect
 import json
 import os
 import re
-import signal
 import sqlite3
 import subprocess
 import sys
@@ -34,11 +33,13 @@ from typing import Any, Callable, Optional
 
 import anthropic
 import typer
+from memory_projection import MemoryIndex, normalize_memory_chapter
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
+from tool_runtime import BuiltinTools, ToolDef, ToolRegistry
 
 # Optional MCP import
 try:
@@ -77,9 +78,6 @@ RECENT_SESSION_TURNS = 6  # recent staged turns exposed to explicit context look
 PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
 STAGING_TURN_THRESHOLD = 6
 STAGING_TOKEN_THRESHOLD = 300
-TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
-TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
-TOOL_DEFAULT_MAX_LIST_RESULTS = 100
 PALACE_LOCI = (
     "identity",
     "projects",
@@ -342,139 +340,6 @@ class ModelClientFactory:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-class MemoryIndex:
-    """Manages the INDEX.md directory tree."""
-
-    def __init__(self, base_dir: Path = MEMORY_DIR):
-        self.base_dir = base_dir
-        self.path = self.base_dir / "INDEX.md"
-        self._ensure_dirs()
-
-    @staticmethod
-    def normalize_chapter(chapter: str) -> str:
-        chapter = str(chapter).strip().lower()
-        return LEGACY_MEMORY_ALIASES.get(chapter, chapter)
-
-    def _ensure_dirs(self):
-        self.base_dir.mkdir(parents=True, exist_ok=True)
-        for chapter in PALACE_LOCI:
-            (self.base_dir / chapter).mkdir(exist_ok=True)
-            idx = self.base_dir / chapter / "_index.md"
-            if not idx.exists():
-                idx.write_text(
-                    f"# {chapter.capitalize()} Index\n\n_updated: {_now()}_\n\n"
-                )
-        if not self.path.exists():
-            self._write_default_index()
-
-    def _write_default_index(self):
-        content = f"""# Memory Palace Index
-_updated: {_now()}_
-
-## Chapters
-| Chapter | Files | Last Updated | Summary |
-|---------|-------|--------------|---------|
-| identity | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['identity']} |
-| projects | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['projects']} |
-| people | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['people']} |
-| concepts | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['concepts']} |
-| episodes | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['episodes']} |
-| tasks | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['tasks']} |
-| procedures | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['procedures']} |
-| archive | 0 | {_now()} | {PALACE_LOCUS_SUMMARIES['archive']} |
-"""
-        self.path.write_text(content)
-
-    def read(self) -> str:
-        if self.path.exists():
-            return self.path.read_text()
-        return ""
-
-    def update(self):
-        """Rewrite INDEX.md by scanning chapters."""
-        rows = []
-        for chapter in PALACE_LOCI:
-            chapter_dir = self.base_dir / chapter
-            files = [f for f in chapter_dir.glob("*.md") if f.name != "_index.md"]
-            last_updated = max((f.stat().st_mtime for f in files), default=0)
-            last_str = (
-                datetime.fromtimestamp(last_updated).strftime("%Y-%m-%d")
-                if last_updated
-                else "—"
-            )
-            # Read summary from _index.md first line after heading
-            idx_file = chapter_dir / "_index.md"
-            summary = ""
-            if idx_file.exists():
-                lines = idx_file.read_text().splitlines()
-                for line in lines[2:]:
-                    if line.strip() and not line.startswith("_"):
-                        summary = line.strip()[:60]
-                        break
-            if not summary:
-                summary = PALACE_LOCUS_SUMMARIES.get(chapter, "")
-            rows.append(f"| {chapter} | {len(files)} | {last_str} | {summary} |")
-
-        content = f"""# Memory Palace Index
-_updated: {_now()}_
-
-## Chapters
-| Chapter | Files | Last Updated | Summary |
-|---------|-------|--------------|---------|
-{chr(10).join(rows)}
-"""
-        self.path.write_text(content)
-
-    def list_chapters(self) -> list[dict]:
-        chapters = []
-        for chapter in PALACE_LOCI:
-            chapter_dir = self.base_dir / chapter
-            files = [f for f in chapter_dir.glob("*.md") if f.name != "_index.md"]
-            chapters.append({"name": chapter, "files": [f.name for f in files]})
-        return chapters
-
-
-class MemoryChapter:
-    """Read/write a single .md chapter file."""
-
-    def __init__(self, chapter: str, name: str, base_dir: Path = MEMORY_DIR):
-        self.chapter = MemoryIndex.normalize_chapter(chapter)
-        self.name = name
-        self.base_dir = base_dir
-        self.path = self.base_dir / self.chapter / f"{name}.md"
-
-    def exists(self) -> bool:
-        return self.path.exists()
-
-    def read(self) -> str:
-        if self.path.exists():
-            return self.path.read_text()
-        return ""
-
-    def write(self, content: str):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(content)
-        # Update chapter index
-        idx_file = self.path.parent / "_index.md"
-        self._update_chapter_index(idx_file)
-
-    def append(self, content: str):
-        existing = self.read()
-        if existing:
-            self.write(existing + "\n" + content)
-        else:
-            self.write(f"# {self.name}\n_created: {_now()}_\n\n" + content)
-
-    def _update_chapter_index(self, idx_file: Path):
-        files = [f for f in self.path.parent.glob("*.md") if f.name != "_index.md"]
-        lines = [f"- [{f.stem}]({f.name})" for f in sorted(files)]
-        idx_file.write_text(
-            f"# {self.chapter.capitalize()} Index\n\n_updated: {_now()}_\n\n"
-            + "\n".join(lines)
-            + "\n"
-        )
-
-
 class MemoryPalace:
     """Facade for all memory operations."""
 
@@ -488,20 +353,26 @@ class MemoryPalace:
     ):
         self.store = store or LTMStore(context_dir=context_dir, memory_dir=base_dir)
         self.base_dir = self.store.memory_dir
-        self.index = MemoryIndex(base_dir=self.base_dir)
+        self.index = MemoryIndex(
+            base_dir=self.base_dir,
+            loci=PALACE_LOCI,
+            aliases=LEGACY_MEMORY_ALIASES,
+            summaries=PALACE_LOCUS_SUMMARIES,
+            now_fn=_now,
+        )
         self._last_tidy: float = 0
         self._files_since_tidy: int = 0
         self._tidy_interval = tidy_interval
         self._tidy_threshold = tidy_threshold
 
     def write(self, chapter: str, name: str, content: str, append: bool = False):
-        chapter = MemoryIndex.normalize_chapter(chapter)
+        chapter = normalize_memory_chapter(chapter, LEGACY_MEMORY_ALIASES)
         self.store.upsert_manual_note(chapter, name, content, append=append)
         self._files_since_tidy += 1
         self.index.update()
 
     def read(self, chapter: str, name: str) -> str:
-        chapter = MemoryIndex.normalize_chapter(chapter)
+        chapter = normalize_memory_chapter(chapter, LEGACY_MEMORY_ALIASES)
         note = self.store.read_manual_note(chapter, name)
         if note:
             return note.content
@@ -1812,461 +1683,7 @@ class BackgroundMemoryWorker:
 # 3. TOOLS / SKILLS / MCP
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-@dataclass
-class ToolDef:
-    name: str
-    description: str
-    parameters: dict
-    fn: Callable
-    source: str = "runtime"
-
-
-class ToolRegistry:
-    """Central registry for all tools."""
-
-    def __init__(self):
-        self._tools: dict[str, ToolDef] = {}
-
-    def register(
-        self,
-        name: str,
-        description: str,
-        parameters: dict,
-        fn: Callable,
-        *,
-        replace: bool = False,
-        source: str = "runtime",
-    ):
-        if name in self._tools:
-            existing = self._tools[name]
-            if not replace or existing.source != source:
-                raise ValueError(
-                    f"Tool '{name}' is already registered by source '{existing.source}'"
-                )
-        self._tools[name] = ToolDef(
-            name=name,
-            description=description,
-            parameters=parameters,
-            fn=fn,
-            source=source,
-        )
-
-    def tool(self, name: str, description: str, parameters: dict):
-        """Decorator for registering tools."""
-
-        def decorator(fn: Callable):
-            self.register(name, description, parameters, fn)
-            return fn
-
-        return decorator
-
-    def to_anthropic_format(self) -> list[dict]:
-        result = []
-        for t in self._tools.values():
-            result.append(
-                {
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.parameters,
-                }
-            )
-        return result
-
-    async def call(self, tool_name: str, tool_input: dict) -> str:
-        if tool_name not in self._tools:
-            return f"Error: tool '{tool_name}' not found"
-        try:
-            fn = self._tools[tool_name].fn
-            if asyncio.iscoroutinefunction(fn):
-                result = await fn(**tool_input)
-            else:
-                result = fn(**tool_input)
-            if isinstance(result, (dict, list)):
-                return json.dumps(result, ensure_ascii=False)
-            return "" if result is None else str(result)
-        except Exception as e:
-            CONSOLE.print(
-                f"[yellow]Tool '{tool_name}' failed: {e}\n{traceback.format_exc()}[/yellow]"
-            )
-            return f"Error calling tool '{tool_name}': {e}"
-
-    def list_tools(self) -> list[str]:
-        return list(self._tools.keys())
-
-
-# Global registry
-REGISTRY = ToolRegistry()
-
-
-class BuiltinTools:
-    """Built-in tools: shell, file, web, memory_write, context_retrieve."""
-
-    def __init__(
-        self,
-        memory: MemoryPalace,
-        registry: ToolRegistry,
-        context_manager: Optional["ContextManager"] = None,
-    ):
-        self.memory = memory
-        self.registry = registry
-        self.context_manager = context_manager
-        self._register()
-
-    def _register(self):
-        r = self.registry
-
-        r.register(
-            "shell",
-            "Execute a shell command and return stdout/stderr. Use for system operations, running scripts, etc.",
-            {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "The shell command to execute",
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Timeout in seconds (default 30)",
-                        "default": 30,
-                    },
-                },
-                "required": ["command"],
-            },
-            self._shell,
-            source="builtin",
-        )
-
-        r.register(
-            "read_file",
-            "Read the contents of a file.",
-            {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute or relative file path",
-                    },
-                    "max_bytes": {
-                        "type": "integer",
-                        "description": "Maximum bytes to read before truncating",
-                        "default": TOOL_DEFAULT_MAX_READ_BYTES,
-                    },
-                },
-                "required": ["path"],
-            },
-            self._read_file,
-            source="builtin",
-        )
-
-        r.register(
-            "write_file",
-            "Write content to a file (creates or overwrites).",
-            {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "File path"},
-                    "content": {"type": "string", "description": "Content to write"},
-                    "max_bytes": {
-                        "type": "integer",
-                        "description": "Maximum payload size accepted by the tool",
-                        "default": TOOL_DEFAULT_MAX_WRITE_BYTES,
-                    },
-                },
-                "required": ["path", "content"],
-            },
-            self._write_file,
-            source="builtin",
-        )
-
-        r.register(
-            "list_files",
-            "List files in a directory.",
-            {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Directory path (default: current dir)",
-                    },
-                    "pattern": {
-                        "type": "string",
-                        "description": "Glob pattern (default: *)",
-                    },
-                    "recursive": {
-                        "type": "boolean",
-                        "description": "Whether to recurse into subdirectories",
-                        "default": False,
-                    },
-                    "max_results": {
-                        "type": "integer",
-                        "description": "Maximum number of paths to return",
-                        "default": TOOL_DEFAULT_MAX_LIST_RESULTS,
-                    },
-                },
-                "required": [],
-            },
-            self._list_files,
-            source="builtin",
-        )
-
-        r.register(
-            "memory_write",
-            "Write or append content to the memory palace.",
-            {
-                "type": "object",
-                "properties": {
-                    "chapter": {
-                        "type": "string",
-                        "description": "Palace locus or legacy alias",
-                        "enum": sorted(set(PALACE_LOCI) | set(LEGACY_MEMORY_ALIASES)),
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "File name (without .md)",
-                    },
-                    "content": {"type": "string", "description": "Content to write"},
-                    "append": {
-                        "type": "boolean",
-                        "description": "Append instead of overwrite",
-                        "default": False,
-                    },
-                },
-                "required": ["chapter", "name", "content"],
-            },
-            self._memory_write,
-            source="builtin",
-        )
-
-        r.register(
-            "memory_read",
-            "Read a memory chapter file.",
-            {
-                "type": "object",
-                "properties": {
-                    "chapter": {
-                        "type": "string",
-                        "description": "Palace locus or legacy alias",
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "File name (without .md)",
-                    },
-                },
-                "required": ["chapter", "name"],
-            },
-            self._memory_read,
-            source="builtin",
-        )
-
-        r.register(
-            "memory_search",
-            "Search across all memory files.",
-            {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Maximum number of results",
-                        "default": 10,
-                    },
-                },
-                "required": ["query"],
-            },
-            self._memory_search,
-            source="builtin",
-        )
-
-        r.register(
-            "memory_index",
-            "Show the memory palace index.",
-            {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-            self._memory_index,
-            source="builtin",
-        )
-
-        r.register(
-            "context_retrieve",
-            (
-                "Search long-term context memory for relevant information. "
-                "Use to recall past facts, user preferences, project context, "
-                "or any information consolidated from previous sessions."
-            ),
-            {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query to retrieve relevant context",
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Maximum number of results (default 5)",
-                        "default": 5,
-                    },
-                },
-                "required": ["query"],
-            },
-            self._context_retrieve,
-            source="builtin",
-        )
-
-    async def _shell(self, command: str, timeout: int = 30) -> str:
-        proc = None
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            out = stdout.decode(errors="replace")
-            err = stderr.decode(errors="replace")
-            result = ""
-            if out:
-                result += f"STDOUT:\n{out}"
-            if err:
-                result += f"STDERR:\n{err}"
-            result += f"\nExit code: {proc.returncode}"
-            return result or "(no output)"
-        except asyncio.TimeoutError:
-            await self._terminate_process(proc)
-            return f"Error: command timed out after {timeout}s"
-        except Exception as e:
-            return f"Error: {e}"
-
-    async def _terminate_process(self, proc: Any) -> None:
-        if proc is None:
-            return
-        try:
-            if hasattr(os, "killpg") and getattr(proc, "pid", None):
-                os.killpg(proc.pid, signal.SIGTERM)
-            elif hasattr(proc, "terminate"):
-                proc.terminate()
-        except ProcessLookupError:
-            return
-        except Exception:
-            if hasattr(proc, "kill"):
-                try:
-                    proc.kill()
-                except Exception:
-                    return
-        try:
-            await asyncio.wait_for(proc.communicate(), timeout=1)
-        except Exception:
-            return
-
-    @staticmethod
-    def _is_binary_bytes(chunk: bytes) -> bool:
-        return b"\x00" in chunk
-
-    def _read_file(self, path: str, max_bytes: int = TOOL_DEFAULT_MAX_READ_BYTES) -> str:
-        try:
-            p = Path(path)
-            if not p.exists():
-                return f"Error reading file: '{path}' does not exist"
-            if not p.is_file():
-                return f"Error reading file: '{path}' is not a regular file"
-            max_bytes = max(1, min(int(max_bytes), TOOL_DEFAULT_MAX_READ_BYTES))
-            with open(p, "rb") as f:
-                chunk = f.read(max_bytes + 1)
-            if self._is_binary_bytes(chunk):
-                return f"Error reading file: '{path}' appears to be binary"
-            text = chunk[:max_bytes].decode("utf-8", errors="replace")
-            if len(chunk) > max_bytes:
-                return f"{text}\n\n[truncated to {max_bytes} bytes]"
-            return text
-        except Exception as e:
-            return f"Error reading file: {e}"
-
-    def _write_file(
-        self,
-        path: str,
-        content: str,
-        max_bytes: int = TOOL_DEFAULT_MAX_WRITE_BYTES,
-    ) -> str:
-        try:
-            p = Path(path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            payload = content.encode("utf-8")
-            max_bytes = max(1, min(int(max_bytes), TOOL_DEFAULT_MAX_WRITE_BYTES))
-            if len(payload) > max_bytes:
-                return (
-                    f"Error writing file: content size {len(payload)} exceeds limit "
-                    f"{max_bytes} bytes"
-                )
-            tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(p)
-            return f"Written {len(content)} bytes to {path}"
-        except Exception as e:
-            return f"Error writing file: {e}"
-
-    def _list_files(
-        self,
-        path: str = ".",
-        pattern: str = "*",
-        recursive: bool = False,
-        max_results: int = TOOL_DEFAULT_MAX_LIST_RESULTS,
-    ) -> str:
-        try:
-            p = Path(path)
-            if not p.exists():
-                return f"Error listing files: '{path}' does not exist"
-            if not p.is_dir():
-                return f"Error listing files: '{path}' is not a directory"
-            max_results = max(1, min(int(max_results), TOOL_DEFAULT_MAX_LIST_RESULTS))
-            iterator = p.rglob(pattern) if recursive else p.glob(pattern)
-            results = []
-            truncated = False
-            for candidate in iterator:
-                if len(results) >= max_results:
-                    truncated = True
-                    break
-                results.append(str(candidate))
-            if not results:
-                return f"No files matching '{pattern}' in {path}"
-            output = "\n".join(sorted(results))
-            if truncated:
-                output += f"\n... truncated to {max_results} results"
-            return output
-        except Exception as e:
-            return f"Error listing files: {e}"
-
-    def _memory_write(
-        self, chapter: str, name: str, content: str, append: bool = False
-    ) -> str:
-        self.memory.write(chapter, name, content, append=append)
-        action = "Appended to" if append else "Wrote"
-        return f"{action} memory: {chapter}/{name}.md"
-
-    def _memory_read(self, chapter: str, name: str) -> str:
-        content = self.memory.read(chapter, name)
-        return content if content else f"No memory file: {chapter}/{name}.md"
-
-    def _memory_search(self, query: str, top_k: int = 10) -> str:
-        results = self.memory.search(query)
-        if not results:
-            return f"No memory found for query: '{query}'"
-        top_k = max(1, min(int(top_k), 20))
-        lines = [f"- **{r['path']}**: {r['snippet']}" for r in results[:top_k]]
-        return "\n".join(lines)
-
-    def _memory_index(self) -> str:
-        return self.memory.read_index()
-
-    def _context_retrieve(self, query: str, top_k: int = 5) -> str:
-        if self.context_manager is None:
-            return "Context manager not available."
-        result = self.context_manager.retrieve_context(query, top_k=top_k)
-        return result if result else "No relevant context found."
+REGISTRY = ToolRegistry(console=CONSOLE)
 
 
 class MCPClient:
@@ -2661,7 +2078,7 @@ class BaseAgent:
 
         async def spawn_agent(role: str, task: str, system_suffix: str = "") -> str:
             # Build a leaf registry: all tools except spawn_agent itself
-            sub_registry = ToolRegistry()
+            sub_registry = ToolRegistry(console=CONSOLE)
             for name, tool_def in parent.registry._tools.items():
                 if name != "spawn_agent":
                     sub_registry._tools[name] = tool_def
@@ -3192,7 +2609,7 @@ def _build_components(cfg: dict):
         cfg.get("providers", {}).get(active_provider, {}).get("api_format", "anthropic")
     )
 
-    registry = ToolRegistry()
+    registry = ToolRegistry(console=CONSOLE)
 
     # Context Manager — build first so BuiltinTools can reference it
     # Config is split into two sub-sections:
@@ -3228,7 +2645,15 @@ def _build_components(cfg: dict):
         min_messages=cons_cfg.get("min_messages", 4),
     )
 
-    BuiltinTools(memory, registry, context_manager=ctx_manager)
+    BuiltinTools(
+        memory,
+        registry,
+        context_manager=ctx_manager,
+        workspace_root=Path.cwd(),
+        chapter_normalizer=lambda chapter: normalize_memory_chapter(
+            chapter, LEGACY_MEMORY_ALIASES
+        ),
+    )
 
     skill_loader = SkillLoader(registry)
     skill_loader.load_all()
