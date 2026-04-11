@@ -42,13 +42,7 @@ from rich.prompt import Prompt
 from rich.table import Table
 from tool_runtime import BuiltinTools, ToolDef, ToolRegistry
 
-# Optional MCP import
-try:
-    import mcp
-
-    HAS_MCP = True
-except ImportError:
-    HAS_MCP = False
+import mcp
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 AGENT_HOME = Path.home() / ".agent"
@@ -151,32 +145,6 @@ Save important facts, decisions, and learnings to memory so they persist across 
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-@dataclass
-class ProviderConfig:
-    """Configuration for a single model provider."""
-
-    name: str  # arbitrary label, e.g. "anthropic", "openai", "deepseek"
-    api_format: str  # "anthropic" | "openai"
-    api_key: str  # or env-var name if starts with "$"
-    base_url: Optional[str] = None  # custom endpoint (OpenAI-compat)
-    default_model: str = DEFAULT_MODEL
-    max_tokens: int = DEFAULT_MAX_TOKENS
-    extra: dict = field(default_factory=dict)  # future: timeout, headers, etc.
-
-    def resolve_api_key(self) -> str:
-        """Resolve key value: literal string or $ENV_VAR reference."""
-        k = self.api_key
-        if k.startswith("$"):
-            env_val = os.environ.get(k[1:], "")
-            if not env_val:
-                CONSOLE.print(
-                    f"[red]Env var {k[1:]} not set for provider '{self.name}'[/red]"
-                )
-                raise typer.Exit(1)
-            return env_val
-        return k
-
-
 # ── Default config.json template ─────────────────────────────────────────────
 DEFAULT_CONFIG: dict = {
     # ── Active provider ───────────────────────────────────────────────────
@@ -223,6 +191,19 @@ DEFAULT_CONFIG: dict = {
     },
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
+    # ── Context manager ──────────────────────────────────────────────────
+    "context": {
+        "storage": {
+            "max_categories": 15,
+            "decay_factor": 0.95,
+        },
+        "consolidation": {
+            "token_ratio": 0.70,
+            "keep_last_messages": 6,
+            "idle_seconds": 300,
+            "min_messages": 4,
+        },
+    },
     # ── System prompt ─────────────────────────────────────────────────────
     "system_prompt_file": None,  # null = use built-in prompt
 }
@@ -400,6 +381,11 @@ class MemoryPalace:
         return self.index.read()
 
     def should_tidy(self) -> bool:
+        if self._files_since_tidy >= self._tidy_threshold:
+            return True
+        if self._tidy_interval > 0 and self._last_tidy > 0:
+            if time.time() - self._last_tidy >= self._tidy_interval:
+                return True
         return False
 
     async def tidy(self, client: anthropic.AsyncAnthropic, model: str):
@@ -530,6 +516,12 @@ class LTMEntry:
             "category": self.category,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "entity": self.entity,
+            "memory_type": self.memory_type,
+            "scope": self.scope,
+            "status": self.status,
+            "source_session": self.source_session,
+            "confidence": self.confidence,
         }
 
     @classmethod
@@ -1390,7 +1382,7 @@ class ContextManager:
         self.staging: StagingBuffer = staging or StagingBuffer()
         self._needs_consolidation: bool = False
         self._last_activity: float = 0.0
-        self._job_lock = threading.Lock()
+        self._lock = threading.RLock()
         self._jobs: deque[dict[str, Any]] = deque()
         self._processing_job = False
 
@@ -1398,42 +1390,48 @@ class ContextManager:
 
     def mark_activity(self) -> None:
         """Call after each user message to arm consolidation and reset idle timer."""
-        self._last_activity = time.time()
-        self._needs_consolidation = True
+        with self._lock:
+            self._last_activity = time.time()
+            self._needs_consolidation = True
 
     def idle_elapsed(self) -> float:
         """Seconds since last activity (0 if never active)."""
-        if self._last_activity == 0.0:
-            return 0.0
-        return time.time() - self._last_activity
+        with self._lock:
+            if self._last_activity == 0.0:
+                return 0.0
+            return time.time() - self._last_activity
 
     # ── Trigger checks ────────────────────────────────────────────────────────
 
     def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
         """Token-ratio trigger: only fires when dirty and messages are sufficient."""
-        if not self._needs_consolidation:
-            return False
+        with self._lock:
+            if not self._needs_consolidation:
+                return False
         if len(messages) < self.min_messages:
             return False
         return self.consolidation.should_sleep(messages, max_tokens)
 
     def should_idle_sleep(self, messages: list[dict]) -> bool:
         """Idle trigger: fires when dirty, sufficient messages, and idle long enough."""
-        if not self._needs_consolidation:
-            return False
+        with self._lock:
+            if not self._needs_consolidation:
+                return False
         if len(messages) < self.min_messages:
             return False
         return self.idle_elapsed() >= self.idle_seconds
 
     def should_session_end_sleep(self) -> bool:
         """Session-end trigger: fires when staging has unprocessed content."""
-        return self._needs_consolidation and self.staging.count() > 0
+        with self._lock:
+            return self._needs_consolidation and self.staging.count() > 0
 
     def should_enqueue_consolidation(self) -> bool:
         """Queue consolidation based on staged content volume, not working-memory size."""
-        if not self._needs_consolidation:
-            return False
-        staged = self.staging.read_all()
+        with self._lock:
+            if not self._needs_consolidation:
+                return False
+            staged = self.staging.read_all()
         if not staged:
             return False
         if len(staged) >= self.staging_turn_threshold:
@@ -1442,9 +1440,9 @@ class ContextManager:
 
     def enqueue_consolidation(self, reason: str) -> None:
         """Queue one consolidation job if there is staged work pending."""
-        if self.staging.count() == 0:
-            return
-        with self._job_lock:
+        with self._lock:
+            if self.staging.count() == 0:
+                return
             if self._jobs:
                 return
             self._jobs.append(
@@ -1456,7 +1454,7 @@ class ContextManager:
             )
 
     def next_job(self, pop: bool = False) -> Optional[dict]:
-        with self._job_lock:
+        with self._lock:
             if not self._jobs:
                 if self._needs_consolidation and self.staging.count() > 0:
                     self._jobs.append(
@@ -1471,7 +1469,7 @@ class ContextManager:
             return self._jobs.popleft() if pop else dict(self._jobs[0])
 
     def pending_jobs(self) -> int:
-        with self._job_lock:
+        with self._lock:
             return len(self._jobs)
 
     def should_process_jobs(self) -> bool:
@@ -1566,7 +1564,8 @@ class ContextManager:
                 messages, client, model, api_format, staging=self.staging
             )
         finally:
-            self._needs_consolidation = False
+            with self._lock:
+                self._needs_consolidation = False
 
     async def process_one_job(
         self,
@@ -1576,17 +1575,22 @@ class ContextManager:
         extractor: Optional[Callable[..., list[Any]]] = None,
     ) -> bool:
         """Process one queued consolidation job without mutating working memory."""
-        if self._processing_job:
-            return False
+        with self._lock:
+            if self._processing_job:
+                return False
+            self._processing_job = True
         job = self.next_job(pop=True)
         if job is None:
+            with self._lock:
+                self._processing_job = False
             return False
 
-        self._processing_job = True
         try:
-            staged = self.staging.read_all()
+            with self._lock:
+                staged = self.staging.read_all()
             if not staged:
-                self._needs_consolidation = False
+                with self._lock:
+                    self._needs_consolidation = False
                 return False
 
             if extractor is not None:
@@ -1605,8 +1609,9 @@ class ContextManager:
                 for entry in entries:
                     self.store.add_entry(entry)
                 self.store.apply_retention()
-                self.staging.clear_all()
-                self._needs_consolidation = False
+                with self._lock:
+                    self.staging.clear_all()
+                    self._needs_consolidation = False
                 return True
 
             await self.consolidation.consolidate(
@@ -1616,10 +1621,12 @@ class ContextManager:
                 api_format,
                 staging=self.staging,
             )
-            self._needs_consolidation = False
+            with self._lock:
+                self._needs_consolidation = False
             return True
         finally:
-            self._processing_job = False
+            with self._lock:
+                self._processing_job = False
 
     # ── Stats ─────────────────────────────────────────────────────────────────
 
@@ -1665,26 +1672,28 @@ class BackgroundMemoryWorker:
         self._thread.join(timeout=5)
 
     def _run(self) -> None:
-        while not self._stop.is_set():
-            try:
-                if self.ctx_mgr.should_process_jobs():
-                    asyncio.run(
-                        self.ctx_mgr.process_one_job(
-                            self.client,
-                            self.model,
-                            api_format=self.api_format,
+        loop = asyncio.new_event_loop()
+        try:
+            while not self._stop.is_set():
+                try:
+                    if self.ctx_mgr.should_process_jobs():
+                        loop.run_until_complete(
+                            self.ctx_mgr.process_one_job(
+                                self.client,
+                                self.model,
+                                api_format=self.api_format,
+                            )
                         )
-                    )
-            except Exception as e:
-                CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
-            self._stop.wait(self.poll_seconds)
+                except Exception as e:
+                    CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
+                self._stop.wait(self.poll_seconds)
+        finally:
+            loop.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. TOOLS / SKILLS / MCP
 # ─────────────────────────────────────────────────────────────────────────────
-
-REGISTRY = ToolRegistry(console=CONSOLE)
 
 
 class MCPClient:
@@ -1694,6 +1703,10 @@ class MCPClient:
         self.registry = registry
         self._sessions = []
         self._stack = AsyncExitStack()
+        self._configured_servers = 0
+        self._connected_servers = 0
+        self._failed_servers = 0
+        self._registered_tools = 0
 
     @staticmethod
     def _safe_name(value: str) -> str:
@@ -1701,13 +1714,14 @@ class MCPClient:
         return name.strip("_") or "mcp"
 
     async def connect_from_config(self, config: dict):
-        if not HAS_MCP:
-            return
+        self._configured_servers = len(config.get("mcp_servers", []) or [])
         mcp_servers = config.get("mcp_servers", [])
         for server_cfg in mcp_servers:
             try:
                 await self._connect_server(server_cfg)
+                self._connected_servers += 1
             except Exception as e:
+                self._failed_servers += 1
                 CONSOLE.print(
                     f"[yellow]MCP server connect failed ({server_cfg.get('name', '?')}): {e}[/yellow]"
                 )
@@ -1775,6 +1789,15 @@ class MCPClient:
             _call_mcp_tool,
             source=f"mcp:{server_name}",
         )
+        self._registered_tools += 1
+
+    def status_summary(self) -> dict[str, Any]:
+        return {
+            "configured_servers": self._configured_servers,
+            "connected_servers": self._connected_servers,
+            "failed_servers": self._failed_servers,
+            "registered_tools": self._registered_tools,
+        }
 
     async def close(self) -> None:
         await self._stack.aclose()
@@ -1946,12 +1969,10 @@ class BaseAgent:
             msg = choice.message
             text = msg.content or ""
             if finish == "tool_calls" and msg.tool_calls:
-                import json as _json
-
                 tool_calls = []
                 for tc in msg.tool_calls:
                     try:
-                        inp = _json.loads(tc.function.arguments)
+                        inp = json.loads(tc.function.arguments)
                     except Exception:
                         inp = {}
                     tool_calls.append(
@@ -2026,15 +2047,13 @@ class BaseAgent:
 
                 try:
                     if stream_callback:
-                        # Stream for display; collect text but don't trust it for
-                        # tool-use detection — follow up with one non-stream call.
-                        result_text = await self._stream_response(
+                        # Stream for display AND use the full response for tool detection.
+                        response, result_text = await self._stream_response(
                             ctx, tools, stream_callback
                         )
                         stream_callback = None  # don't double-print on next iter
-
-                    # Single authoritative non-streaming call (also handles post-tool turns)
-                    response = await self._create(ctx, tools)
+                    else:
+                        response = await self._create(ctx, tools)
                     stop_reason, text, tool_uses = self._parse_response(response)
 
                     if stop_reason == "tool_use" and tool_uses:
@@ -2100,9 +2119,14 @@ class BaseAgent:
         ctx: "AgentContext",
         tools: list[dict],
         callback: Callable[[str], None],
-    ) -> str:
-        """Stream response text chunk-by-chunk, calling callback per chunk."""
+    ) -> tuple[Any, str]:
+        """Stream response text chunk-by-chunk and return (full_response, collected_text).
+
+        For Anthropic: uses stream.get_final_message() to obtain the complete response.
+        For OpenAI: accumulates tool_call deltas and rebuilds a synthetic response.
+        """
         collected: list[str] = []
+        response = None
         try:
             if self.api_format == "anthropic":
                 async with self.client.messages.stream(
@@ -2115,8 +2139,9 @@ class BaseAgent:
                     async for text in stream.text_stream:
                         collected.append(text)
                         callback(text)
+                    response = await stream.get_final_message()
             else:
-                # OpenAI streaming
+                # OpenAI streaming — accumulate tool_call deltas as well
                 kwargs: dict = dict(
                     model=self.model,
                     max_tokens=self.max_tokens,
@@ -2126,16 +2151,102 @@ class BaseAgent:
                 api_tools = self._tools_for_api(tools)
                 if api_tools:
                     kwargs["tools"] = api_tools
+                finish_reason = "stop"
+                tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
                 async for chunk in await self.client.chat.completions.create(**kwargs):
-                    delta = chunk.choices[0].delta.content if chunk.choices else None
-                    if delta:
-                        collected.append(delta)
-                        callback(delta)
-        except Exception as e:
-            import traceback
+                    if not chunk.choices:
+                        continue
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    if delta.content:
+                        collected.append(delta.content)
+                        callback(delta.content)
+                    if delta.tool_calls:
+                        for tc_delta in delta.tool_calls:
+                            idx = tc_delta.index
+                            if idx not in tool_calls_acc:
+                                tool_calls_acc[idx] = {
+                                    "id": tc_delta.id or "",
+                                    "name": (tc_delta.function.name if tc_delta.function else "") or "",
+                                    "arguments": "",
+                                }
+                            acc = tool_calls_acc[idx]
+                            if tc_delta.id:
+                                acc["id"] = tc_delta.id
+                            if tc_delta.function:
+                                if tc_delta.function.name:
+                                    acc["name"] = tc_delta.function.name
+                                if tc_delta.function.arguments:
+                                    acc["arguments"] += tc_delta.function.arguments
+                    if choice.finish_reason:
+                        finish_reason = choice.finish_reason
 
+                # Build a synthetic response object matching _parse_response expectations
+                class _Func:
+                    def __init__(self, name, arguments):
+                        self.name = name
+                        self.arguments = arguments
+
+                class _TC:
+                    def __init__(self, id, function):
+                        self.id = id
+                        self.function = function
+
+                class _Msg:
+                    def __init__(self, content, tool_calls):
+                        self.content = content
+                        self.tool_calls = tool_calls
+
+                class _Choice:
+                    def __init__(self, finish_reason, message):
+                        self.finish_reason = finish_reason
+                        self.message = message
+
+                class _Response:
+                    def __init__(self, choices):
+                        self.choices = choices
+
+                oi_tool_calls = [
+                    _TC(v["id"], _Func(v["name"], v["arguments"]))
+                    for _, v in sorted(tool_calls_acc.items())
+                ] if tool_calls_acc else None
+
+                response = _Response([
+                    _Choice(
+                        finish_reason,
+                        _Msg("".join(collected), oi_tool_calls),
+                    )
+                ])
+        except Exception as e:
             traceback.print_exc()
-        return "".join(collected)
+            # Return a minimal end_turn response on error
+            if self.api_format == "anthropic":
+                # Return a fake minimal response
+                class _FakeBlock:
+                    def __init__(self, text):
+                        self.text = text
+                        self.type = "text"
+                class _FakeResp:
+                    def __init__(self, text):
+                        self.stop_reason = "end_turn"
+                        self.content = [_FakeBlock(text)]
+                response = _FakeResp("".join(collected))
+            else:
+                class _Func2:
+                    pass
+                class _Msg2:
+                    def __init__(self, content):
+                        self.content = content
+                        self.tool_calls = None
+                class _Choice2:
+                    def __init__(self, msg):
+                        self.finish_reason = "stop"
+                        self.message = msg
+                class _Response2:
+                    def __init__(self, choices):
+                        self.choices = choices
+                response = _Response2([_Choice2(_Msg2("".join(collected)))])
+        return response, "".join(collected)
 
     def register_spawn_capability(
         self, base_system_prompt: str, workspace_root: Optional[Path] = None
@@ -2217,10 +2328,6 @@ class BaseAgent:
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. SELF-EVOLUTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-# 6. SELF-EVOLUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -2477,7 +2584,7 @@ def load_config() -> tuple[dict, bool]:
         raw = json.loads(CONFIG_FILE.read_text())
         # Only backfill structural sections the user hasn't touched;
         # never overwrite top-level identity keys.
-        for section in ("memory", "orchestration", "evolution", "mcp_servers"):
+        for section in ("memory", "orchestration", "evolution", "mcp_servers", "context"):
             if section not in raw and section in DEFAULT_CONFIG:
                 raw[section] = DEFAULT_CONFIG[section]
         return raw, first_run
@@ -2486,15 +2593,6 @@ def load_config() -> tuple[dict, bool]:
         return dict(DEFAULT_CONFIG), first_run
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge override into base (override wins)."""
-    result = dict(base)
-    for k, v in override.items():
-        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
-            result[k] = _deep_merge(result[k], v)
-        else:
-            result[k] = v
-    return result
 
 
 def save_config(cfg: dict):
@@ -2631,16 +2729,12 @@ def _first_run_setup() -> bool:
     return Confirm.ask("Start agent now?", default=True)
 
 
-def get_config_value(cfg: dict, key: str, default: Any = None) -> Any:
-    return cfg.get(key, default)
-
-
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _datestamp() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
 
 def _load_system_prompt(cfg: dict) -> str:
@@ -2650,8 +2744,13 @@ def _load_system_prompt(cfg: dict) -> str:
         content = re.sub(r"^<!--.*?-->\n", "", content, flags=re.DOTALL)
         return content
     prompt_file = cfg.get("system_prompt_file")
-    if prompt_file and Path(prompt_file).exists():
-        return Path(prompt_file).read_text()
+    if prompt_file:
+        p = Path(prompt_file)
+        if p.exists():
+            return p.read_text()
+        CONSOLE.print(
+            f"[yellow]system_prompt_file '{prompt_file}' not found — using default[/yellow]"
+        )
     return DEFAULT_SYSTEM_PROMPT
 
 
@@ -2693,11 +2792,10 @@ def _compose_system_prompt(
         lines.append("Connected MCP tools: " + _format_group(groups["mcp"]))
     if groups["runtime"]:
         lines.append("Runtime tools: " + _format_group(groups["runtime"]))
-    if workspace_root and any(
-        name in {name for name, _ in groups["builtin"]}
-        for name in ("read_file", "write_file", "list_files")
-    ):
-        lines.append(f"Workspace root for file tools: {workspace_root}")
+    if workspace_root:
+        builtin_names = {n for n, _ in groups["builtin"]}
+        if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
+            lines.append(f"Workspace root for file tools: {workspace_root}")
     return base_prompt.rstrip() + "\n\n" + "\n".join(lines)
 
 
@@ -2787,9 +2885,26 @@ async def _build_components_async(cfg: dict):
     skill_loader.load_all()
 
     mcp_client = None
+    mcp_status = {
+        "configured_servers": 0,
+        "connected_servers": 0,
+        "failed_servers": 0,
+        "registered_tools": 0,
+    }
     if cfg.get("mcp_servers"):
         mcp_client = MCPClient(registry)
         await mcp_client.connect_from_config(cfg)
+        mcp_status = mcp_client.status_summary()
+        if mcp_status["connected_servers"]:
+            CONSOLE.print(
+                "[green]MCP active:[/green] "
+                f"{mcp_status['connected_servers']} server(s), "
+                f"{mcp_status['registered_tools']} tool(s) registered"
+            )
+        else:
+            CONSOLE.print(
+                "[yellow]MCP configured, but no servers connected successfully.[/yellow]"
+            )
 
     agent = BaseAgent(
         client, registry, model=model, max_tokens=max_tokens, api_format=api_format
@@ -2811,6 +2926,7 @@ async def _build_components_async(cfg: dict):
         "context_manager": ctx_manager,
         "skill_loader": skill_loader,
         "mcp_client": mcp_client,
+        "mcp_status": mcp_status,
         "cfg": cfg,
     }
 
@@ -3154,10 +3270,8 @@ def config(
     cfg, _ = load_config()
 
     if action == "list":
-        import json as _json
-
         CONSOLE.print(
-            Markdown(f"```json\n{_json.dumps(cfg, indent=2, ensure_ascii=False)}\n```")
+            Markdown(f"```json\n{json.dumps(cfg, indent=2, ensure_ascii=False)}\n```")
         )
 
     elif action == "models":

@@ -1,7 +1,10 @@
 """Tests for MCP/skill wiring and capability-aware prompts."""
 
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -27,6 +30,14 @@ class _FakeMCPClient:
 
     async def close(self):
         self.closed = True
+
+    def status_summary(self):
+        return {
+            "configured_servers": 1,
+            "connected_servers": 1,
+            "failed_servers": 0,
+            "registered_tools": 1,
+        }
 
 
 class _LoopBoundMCPClient:
@@ -65,6 +76,14 @@ class _LoopBoundMCPClient:
         import asyncio
 
         self.closed_loop = id(asyncio.get_running_loop())
+
+    def status_summary(self):
+        return {
+            "configured_servers": 1,
+            "connected_servers": 1,
+            "failed_servers": 0,
+            "registered_tools": 1,
+        }
 
 
 def _minimal_cfg():
@@ -138,6 +157,40 @@ def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path
     assert components["mcp_client"] is _FakeMCPClient.instances[-1]
 
 
+def test_build_components_exposes_mcp_status_and_prints_summary(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["mcp_servers"] = [{"name": "demo", "command": "fake"}]
+    console_messages = []
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "MCPClient", _FakeMCPClient)
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(
+        agent_module.CONSOLE,
+        "print",
+        lambda *args, **kwargs: console_messages.append(" ".join(str(arg) for arg in args)),
+    )
+
+    components = agent_module._build_components(cfg)
+
+    assert components["mcp_status"] == {
+        "configured_servers": 1,
+        "connected_servers": 1,
+        "failed_servers": 0,
+        "registered_tools": 1,
+    }
+    assert any("MCP active" in message for message in console_messages)
+
+
 def test_system_prompt_reflects_registered_capabilities(monkeypatch, tmp_path):
     import agent as agent_module
 
@@ -191,3 +244,40 @@ def test_async_component_lifecycle_keeps_mcp_on_one_event_loop(monkeypatch, tmp_
     assert payload["ok"] is True
     assert payload["loop"] == client.connected_loop
     assert client.closed_loop == client.connected_loop
+
+
+@pytest.mark.skipif(
+    os.environ.get("SIMPLE_RUN_REAL_MCP_TEST") != "1",
+    reason="set SIMPLE_RUN_REAL_MCP_TEST=1 to run the real MCP smoke test",
+)
+def test_real_mcp_smoke_registers_tools_from_config():
+    import asyncio
+    import agent as agent_module
+
+    cfg, _ = agent_module.load_config()
+    if not cfg.get("mcp_servers"):
+        pytest.skip("no MCP servers configured in ~/.agent/config.json")
+
+    original_factory = agent_module.ModelClientFactory.from_config
+    agent_module.ModelClientFactory.from_config = staticmethod(
+        lambda cfg: (object(), "fake-model", 1024)
+    )
+
+    async def run():
+        components = await agent_module._build_components_async(cfg)
+        try:
+            mcp_tools = [
+                name
+                for name in components["registry"].list_tools()
+                if name.startswith("mcp_")
+            ]
+            assert components["mcp_status"]["connected_servers"] >= 1
+            assert components["mcp_status"]["registered_tools"] >= 1
+            assert mcp_tools
+        finally:
+            await agent_module._close_components(components)
+
+    try:
+        asyncio.run(run())
+    finally:
+        agent_module.ModelClientFactory.from_config = original_factory

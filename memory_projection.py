@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -69,7 +69,7 @@ class MemoryIndex:
             files = [f for f in chapter_dir.glob("*.md") if f.name != "_index.md"]
             last_updated = max((f.stat().st_mtime for f in files), default=0)
             last_str = (
-                datetime.fromtimestamp(last_updated).strftime("%Y-%m-%d")
+                datetime.fromtimestamp(last_updated, tz=timezone.utc).strftime("%Y-%m-%d")
                 if last_updated
                 else "—"
             )
