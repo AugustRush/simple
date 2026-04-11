@@ -17,6 +17,7 @@ import inspect
 import json
 import os
 import re
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -76,6 +77,9 @@ RECENT_SESSION_TURNS = 6  # recent staged turns exposed to explicit context look
 PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
 STAGING_TURN_THRESHOLD = 6
 STAGING_TOKEN_THRESHOLD = 300
+TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
+TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
+TOOL_DEFAULT_MAX_LIST_RESULTS = 100
 PALACE_LOCI = (
     "identity",
     "projects",
@@ -1815,6 +1819,7 @@ class ToolDef:
     description: str
     parameters: dict
     fn: Callable
+    source: str = "runtime"
 
 
 class ToolRegistry:
@@ -1823,9 +1828,28 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, ToolDef] = {}
 
-    def register(self, name: str, description: str, parameters: dict, fn: Callable):
+    def register(
+        self,
+        name: str,
+        description: str,
+        parameters: dict,
+        fn: Callable,
+        *,
+        replace: bool = False,
+        source: str = "runtime",
+    ):
+        if name in self._tools:
+            existing = self._tools[name]
+            if not replace or existing.source != source:
+                raise ValueError(
+                    f"Tool '{name}' is already registered by source '{existing.source}'"
+                )
         self._tools[name] = ToolDef(
-            name=name, description=description, parameters=parameters, fn=fn
+            name=name,
+            description=description,
+            parameters=parameters,
+            fn=fn,
+            source=source,
         )
 
     def tool(self, name: str, description: str, parameters: dict):
@@ -1858,9 +1882,14 @@ class ToolRegistry:
                 result = await fn(**tool_input)
             else:
                 result = fn(**tool_input)
-            return str(result)
+            if isinstance(result, (dict, list)):
+                return json.dumps(result, ensure_ascii=False)
+            return "" if result is None else str(result)
         except Exception as e:
-            return f"Error calling tool '{tool_name}': {e}\n{traceback.format_exc()}"
+            CONSOLE.print(
+                f"[yellow]Tool '{tool_name}' failed: {e}\n{traceback.format_exc()}[/yellow]"
+            )
+            return f"Error calling tool '{tool_name}': {e}"
 
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())
@@ -1906,6 +1935,7 @@ class BuiltinTools:
                 "required": ["command"],
             },
             self._shell,
+            source="builtin",
         )
 
         r.register(
@@ -1918,10 +1948,16 @@ class BuiltinTools:
                         "type": "string",
                         "description": "Absolute or relative file path",
                     },
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Maximum bytes to read before truncating",
+                        "default": TOOL_DEFAULT_MAX_READ_BYTES,
+                    },
                 },
                 "required": ["path"],
             },
             self._read_file,
+            source="builtin",
         )
 
         r.register(
@@ -1932,10 +1968,16 @@ class BuiltinTools:
                 "properties": {
                     "path": {"type": "string", "description": "File path"},
                     "content": {"type": "string", "description": "Content to write"},
+                    "max_bytes": {
+                        "type": "integer",
+                        "description": "Maximum payload size accepted by the tool",
+                        "default": TOOL_DEFAULT_MAX_WRITE_BYTES,
+                    },
                 },
                 "required": ["path", "content"],
             },
             self._write_file,
+            source="builtin",
         )
 
         r.register(
@@ -1952,10 +1994,21 @@ class BuiltinTools:
                         "type": "string",
                         "description": "Glob pattern (default: *)",
                     },
+                    "recursive": {
+                        "type": "boolean",
+                        "description": "Whether to recurse into subdirectories",
+                        "default": False,
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Maximum number of paths to return",
+                        "default": TOOL_DEFAULT_MAX_LIST_RESULTS,
+                    },
                 },
                 "required": [],
             },
             self._list_files,
+            source="builtin",
         )
 
         r.register(
@@ -1983,6 +2036,7 @@ class BuiltinTools:
                 "required": ["chapter", "name", "content"],
             },
             self._memory_write,
+            source="builtin",
         )
 
         r.register(
@@ -2003,6 +2057,7 @@ class BuiltinTools:
                 "required": ["chapter", "name"],
             },
             self._memory_read,
+            source="builtin",
         )
 
         r.register(
@@ -2012,10 +2067,16 @@ class BuiltinTools:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Maximum number of results",
+                        "default": 10,
+                    },
                 },
                 "required": ["query"],
             },
             self._memory_search,
+            source="builtin",
         )
 
         r.register(
@@ -2027,6 +2088,7 @@ class BuiltinTools:
                 "required": [],
             },
             self._memory_index,
+            source="builtin",
         )
 
         r.register(
@@ -2052,14 +2114,17 @@ class BuiltinTools:
                 "required": ["query"],
             },
             self._context_retrieve,
+            source="builtin",
         )
 
     async def _shell(self, command: str, timeout: int = 30) -> str:
+        proc = None
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             out = stdout.decode(errors="replace")
@@ -2072,32 +2137,106 @@ class BuiltinTools:
             result += f"\nExit code: {proc.returncode}"
             return result or "(no output)"
         except asyncio.TimeoutError:
+            await self._terminate_process(proc)
             return f"Error: command timed out after {timeout}s"
         except Exception as e:
             return f"Error: {e}"
 
-    def _read_file(self, path: str) -> str:
+    async def _terminate_process(self, proc: Any) -> None:
+        if proc is None:
+            return
         try:
-            return Path(path).read_text()
+            if hasattr(os, "killpg") and getattr(proc, "pid", None):
+                os.killpg(proc.pid, signal.SIGTERM)
+            elif hasattr(proc, "terminate"):
+                proc.terminate()
+        except ProcessLookupError:
+            return
+        except Exception:
+            if hasattr(proc, "kill"):
+                try:
+                    proc.kill()
+                except Exception:
+                    return
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=1)
+        except Exception:
+            return
+
+    @staticmethod
+    def _is_binary_bytes(chunk: bytes) -> bool:
+        return b"\x00" in chunk
+
+    def _read_file(self, path: str, max_bytes: int = TOOL_DEFAULT_MAX_READ_BYTES) -> str:
+        try:
+            p = Path(path)
+            if not p.exists():
+                return f"Error reading file: '{path}' does not exist"
+            if not p.is_file():
+                return f"Error reading file: '{path}' is not a regular file"
+            max_bytes = max(1, min(int(max_bytes), TOOL_DEFAULT_MAX_READ_BYTES))
+            with open(p, "rb") as f:
+                chunk = f.read(max_bytes + 1)
+            if self._is_binary_bytes(chunk):
+                return f"Error reading file: '{path}' appears to be binary"
+            text = chunk[:max_bytes].decode("utf-8", errors="replace")
+            if len(chunk) > max_bytes:
+                return f"{text}\n\n[truncated to {max_bytes} bytes]"
+            return text
         except Exception as e:
             return f"Error reading file: {e}"
 
-    def _write_file(self, path: str, content: str) -> str:
+    def _write_file(
+        self,
+        path: str,
+        content: str,
+        max_bytes: int = TOOL_DEFAULT_MAX_WRITE_BYTES,
+    ) -> str:
         try:
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content)
+            payload = content.encode("utf-8")
+            max_bytes = max(1, min(int(max_bytes), TOOL_DEFAULT_MAX_WRITE_BYTES))
+            if len(payload) > max_bytes:
+                return (
+                    f"Error writing file: content size {len(payload)} exceeds limit "
+                    f"{max_bytes} bytes"
+                )
+            tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(p)
             return f"Written {len(content)} bytes to {path}"
         except Exception as e:
             return f"Error writing file: {e}"
 
-    def _list_files(self, path: str = ".", pattern: str = "*") -> str:
+    def _list_files(
+        self,
+        path: str = ".",
+        pattern: str = "*",
+        recursive: bool = False,
+        max_results: int = TOOL_DEFAULT_MAX_LIST_RESULTS,
+    ) -> str:
         try:
             p = Path(path)
-            files = list(p.glob(pattern))
-            if not files:
+            if not p.exists():
+                return f"Error listing files: '{path}' does not exist"
+            if not p.is_dir():
+                return f"Error listing files: '{path}' is not a directory"
+            max_results = max(1, min(int(max_results), TOOL_DEFAULT_MAX_LIST_RESULTS))
+            iterator = p.rglob(pattern) if recursive else p.glob(pattern)
+            results = []
+            truncated = False
+            for candidate in iterator:
+                if len(results) >= max_results:
+                    truncated = True
+                    break
+                results.append(str(candidate))
+            if not results:
                 return f"No files matching '{pattern}' in {path}"
-            return "\n".join(str(f) for f in sorted(files)[:100])
+            output = "\n".join(sorted(results))
+            if truncated:
+                output += f"\n... truncated to {max_results} results"
+            return output
         except Exception as e:
             return f"Error listing files: {e}"
 
@@ -2112,11 +2251,12 @@ class BuiltinTools:
         content = self.memory.read(chapter, name)
         return content if content else f"No memory file: {chapter}/{name}.md"
 
-    def _memory_search(self, query: str) -> str:
+    def _memory_search(self, query: str, top_k: int = 10) -> str:
         results = self.memory.search(query)
         if not results:
             return f"No memory found for query: '{query}'"
-        lines = [f"- **{r['path']}**: {r['snippet']}" for r in results[:10]]
+        top_k = max(1, min(int(top_k), 20))
+        lines = [f"- **{r['path']}**: {r['snippet']}" for r in results[:top_k]]
         return "\n".join(lines)
 
     def _memory_index(self) -> str:
@@ -2180,7 +2320,12 @@ class SkillLoader:
                 if hasattr(obj, "_tool_meta"):
                     meta = obj._tool_meta
                     self.registry.register(
-                        meta["name"], meta["description"], meta["parameters"], obj
+                        meta["name"],
+                        meta["description"],
+                        meta["parameters"],
+                        obj,
+                        replace=True,
+                        source=f"skill:{path.name}",
                     )
                     CONSOLE.print(
                         f"[dim]Loaded skill: {meta['name']} from {path.name}[/dim]"
