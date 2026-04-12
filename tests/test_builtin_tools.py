@@ -169,6 +169,19 @@ def test_registry_call_returns_structured_builtin_payloads(tmp_path):
     assert payload["content"] == "hello"
 
 
+def test_current_time_returns_structured_timestamps(tmp_path):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(registry.call("current_time", {}))
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["timezone"] == "local"
+    assert "local_time" in payload
+    assert "utc_time" in payload
+    assert "unix_timestamp" in payload
+
+
 def test_memory_search_returns_structured_results(tmp_path):
     tools, registry, workspace = make_builtin_tools(tmp_path)
     tools.memory.write("identity", "user", "Prefers concise responses")
@@ -254,3 +267,66 @@ def test_shell_blocks_wrapped_dangerous_commands(tmp_path, command):
 
     assert result["ok"] is False
     assert "rejected" in result["error"].lower()
+
+
+def test_tavily_search_requires_api_key(tmp_path):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(registry.call("tavily_search", {"query": "latest ai news"}))
+    payload = json.loads(result)
+
+    assert payload["ok"] is False
+    assert "tavily api key" in payload["error"].lower()
+
+
+def test_tavily_search_returns_normalized_results(tmp_path, monkeypatch):
+    from agent import BuiltinTools
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("tavily_api_key", "test-key")
+
+    def fake_request(api_key, query, max_results, search_depth, include_answer):
+        assert api_key == "test-key"
+        assert query == "latest ai news"
+        assert max_results == 3
+        assert search_depth == "advanced"
+        assert include_answer is True
+        return {
+            "answer": "A concise answer",
+            "results": [
+                {
+                    "title": "Example result",
+                    "url": "https://example.com/news",
+                    "content": "Example snippet",
+                    "score": 0.91,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(BuiltinTools, "_make_tavily_request", staticmethod(fake_request))
+
+    result = asyncio.run(
+        registry.call(
+            "tavily_search",
+            {
+                "query": "latest ai news",
+                "max_results": 3,
+                "search_depth": "advanced",
+                "include_answer": True,
+            },
+        )
+    )
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["query"] == "latest ai news"
+    assert payload["count"] == 1
+    assert payload["answer"] == "A concise answer"
+    assert payload["results"] == [
+        {
+            "title": "Example result",
+            "url": "https://example.com/news",
+            "snippet": "Example snippet",
+            "score": 0.91,
+        }
+    ]

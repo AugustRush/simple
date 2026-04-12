@@ -34,6 +34,7 @@ from typing import Any, Callable, Optional
 import urllib.parse
 import urllib.request
 import html
+from zoneinfo import ZoneInfo
 
 import anthropic
 import typer
@@ -511,6 +512,8 @@ class ToolRegistry:
 WEB_FETCH_MAX_BYTES = 512 * 1024          # 512 KB response cap
 WEB_FETCH_TIMEOUT   = 20                  # seconds
 WEB_SEARCH_MAX_RESULTS = 10
+TAVILY_SEARCH_MAX_RESULTS = 10
+TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 # User-Agent sent with every request – identifies the agent honestly.
 WEB_USER_AGENT = (
     "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
@@ -539,6 +542,24 @@ class BuiltinTools:
 
     def _register(self):
         r = self.registry
+
+        r.register(
+            "current_time",
+            "Get the current local or requested timezone time as structured data. Use when the user asks about now, today, current date, or current time.",
+            {
+                "type": "object",
+                "properties": {
+                    "timezone_name": {
+                        "type": "string",
+                        "description": "IANA timezone name like 'Asia/Shanghai'. Default: local system timezone.",
+                        "default": "local",
+                    },
+                },
+                "required": [],
+            },
+            self._current_time,
+            source="builtin",
+        )
 
         r.register(
             "shell",
@@ -792,6 +813,41 @@ class BuiltinTools:
             source="builtin",
         )
 
+        r.register(
+            "tavily_search",
+            (
+                "Search the web with Tavily and return normalized results. "
+                "Useful for current events, news, and broader live-web research when a Tavily API key is configured."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": f"Maximum number of results to return (1-{TAVILY_SEARCH_MAX_RESULTS})",
+                        "default": 5,
+                    },
+                    "search_depth": {
+                        "type": "string",
+                        "description": "Tavily search depth: 'basic' or 'advanced'",
+                        "default": "basic",
+                    },
+                    "include_answer": {
+                        "type": "boolean",
+                        "description": "Whether Tavily should include a synthesized short answer",
+                        "default": False,
+                    },
+                },
+                "required": ["query"],
+            },
+            self._tavily_search,
+            source="builtin",
+        )
+
         if self._output_dir is not None:
             r.register(
                 "clean_output",
@@ -846,6 +902,67 @@ class BuiltinTools:
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read(WEB_FETCH_MAX_BYTES)
+
+    @staticmethod
+    def _make_tavily_request(
+        api_key: str,
+        query: str,
+        max_results: int,
+        search_depth: str,
+        include_answer: bool,
+    ) -> dict[str, Any]:
+        payload = json.dumps(
+            {
+                "api_key": api_key,
+                "query": query,
+                "max_results": max_results,
+                "search_depth": search_depth,
+                "include_answer": include_answer,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            TAVILY_SEARCH_URL,
+            data=payload,
+            method="POST",
+            headers={
+                "User-Agent": WEB_USER_AGENT,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=WEB_FETCH_TIMEOUT) as resp:
+            raw = resp.read(WEB_FETCH_MAX_BYTES)
+        return json.loads(raw.decode("utf-8"))
+
+    def _resolve_tavily_api_key(self) -> str:
+        raw = self.registry.get_context("tavily_api_key", "")
+        if isinstance(raw, str) and raw.startswith("$"):
+            return os.environ.get(raw[1:], "")
+        if raw:
+            return str(raw)
+        return os.environ.get("TAVILY_API_KEY", "")
+
+    def _current_time(self, timezone_name: str = "local") -> dict[str, Any]:
+        try:
+            if timezone_name == "local":
+                local_now = datetime.now().astimezone()
+                label = "local"
+            else:
+                local_now = datetime.now(ZoneInfo(timezone_name))
+                label = timezone_name
+        except Exception:
+            return self._error(
+                f"Unknown timezone '{timezone_name}'",
+                timezone=timezone_name,
+            )
+
+        utc_now = datetime.now(timezone.utc)
+        return self._ok(
+            timezone=label,
+            local_time=local_now.isoformat(),
+            utc_time=utc_now.isoformat(),
+            unix_timestamp=int(local_now.timestamp()),
+        )
 
     async def _web_fetch(
         self,
@@ -979,6 +1096,63 @@ class BuiltinTools:
                 note="No results found or DDG HTML format changed.",
             )
         return self._ok(query=query, count=len(results), results=results)
+
+    async def _tavily_search(
+        self,
+        query: str,
+        max_results: int = 5,
+        search_depth: str = "basic",
+        include_answer: bool = False,
+    ) -> dict[str, Any]:
+        api_key = self._resolve_tavily_api_key()
+        if not api_key:
+            return self._error(
+                "Tavily API key not configured. Set TAVILY_API_KEY or registry context 'tavily_api_key'.",
+                query=query,
+            )
+
+        max_results = max(1, min(int(max_results), TAVILY_SEARCH_MAX_RESULTS))
+        search_depth = str(search_depth).strip().lower() or "basic"
+        if search_depth not in {"basic", "advanced"}:
+            return self._error(
+                "search_depth must be 'basic' or 'advanced'",
+                query=query,
+                search_depth=search_depth,
+            )
+
+        try:
+            loop = asyncio.get_event_loop()
+            payload = await loop.run_in_executor(
+                None,
+                self._make_tavily_request,
+                api_key,
+                query.strip(),
+                max_results,
+                search_depth,
+                include_answer,
+            )
+        except Exception as exc:
+            return self._error(f"Tavily search failed: {exc}", query=query)
+
+        items = []
+        for result in payload.get("results", [])[:max_results]:
+            items.append(
+                {
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "snippet": result.get("content", ""),
+                    "score": result.get("score"),
+                }
+            )
+
+        response = self._ok(
+            query=query,
+            count=len(items),
+            results=items,
+        )
+        if payload.get("answer"):
+            response["answer"] = payload["answer"]
+        return response
 
     def _ok(self, **payload: Any) -> dict[str, Any]:
         return {"ok": True, **payload}
@@ -4428,6 +4602,13 @@ async def _build_components_async(cfg: dict):
         "shell_blocked_commands",
         list(cfg.get("shell_blocked_commands", [])),
     )
+    tavily_api_key = cfg.get("tavily_api_key", "")
+    if isinstance(tavily_api_key, str) and tavily_api_key.startswith("$"):
+        tavily_api_key = os.environ.get(tavily_api_key[1:], "")
+    if not tavily_api_key:
+        tavily_api_key = os.environ.get("TAVILY_API_KEY", "")
+    if tavily_api_key:
+        registry.set_context("tavily_api_key", tavily_api_key)
 
     skill_catalog = SkillCatalog()
     skill_catalog.load_all()
