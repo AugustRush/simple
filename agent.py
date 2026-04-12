@@ -31,6 +31,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
+import urllib.parse
+import urllib.request
+import html
 
 import anthropic
 import typer
@@ -100,6 +103,45 @@ PALACE_LOCUS_SUMMARIES = {
 
 CONSOLE = Console()
 
+# ── OpenAI streaming synthetic response types ─────────────────────────────────
+# These replace the inline anonymous classes that were previously defined inside
+# _stream_response(), making the code testable and eliminating duplication.
+
+@dataclass
+class _OAIFunc:
+    name: str
+    arguments: str
+
+@dataclass
+class _OAITC:
+    id: str
+    function: _OAIFunc
+
+@dataclass
+class _OAIMsg:
+    content: str
+    tool_calls: Optional[list]
+
+@dataclass
+class _OAIChoice:
+    finish_reason: str
+    message: _OAIMsg
+
+@dataclass
+class _OAIResponse:
+    choices: list
+
+@dataclass
+class _AnthropicTextBlock:
+    text: str
+    type: str = "text"
+
+@dataclass
+class _AnthropicFallbackResponse:
+    stop_reason: str
+    content: list
+
+
 DEFAULT_SYSTEM_PROMPT = """You are a powerful personal AI agent with tools, memory, and the ability to spawn sub-agents.
 
 ## Tools
@@ -144,6 +186,131 @@ Save important facts, decisions, and learnings to memory so they persist across 
 TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
 TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
 TOOL_DEFAULT_MAX_LIST_RESULTS = 100
+
+# ── Shell tool security ────────────────────────────────────────────────────────
+# Commands listed here are blocked unconditionally, regardless of arguments.
+# Operators can extend this list via config key "shell_blocked_commands".
+_SHELL_BLOCKED_COMMANDS: frozenset[str] = frozenset({
+    "rm",
+    "rmdir",
+    "mkfs",
+    "dd",
+    "shred",
+    "fdisk",
+    "parted",
+})
+
+# Dangerous pipe-idiom substrings – checked as literal substring of the command.
+_SHELL_BLOCKED_PATTERNS: tuple[str, ...] = (
+    "curl | sh",
+    "wget | sh",
+    "wget -O- |",
+    "curl -s |",
+)
+
+
+def _shell_command_is_blocked(
+    command: str, extra_blocked: Optional[list[str]] = None
+) -> Optional[str]:
+    """Return a human-readable reason if *command* is blocked, or None.
+
+    Two checks are performed:
+      1. Dangerous pipe patterns (substring match against the full command).
+      2. The effective executable basename, after skipping wrappers such as
+         env-var prefixes, ``env``, and ``sudo``, against the built-in and
+         caller-supplied blocklists.
+    """
+    import shlex as _shlex
+    import os as _os
+
+    def _is_env_assignment(token: str) -> bool:
+        return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", token))
+
+    def _resolve_effective_command(tokens: list[str]) -> Optional[str]:
+        idx = 0
+        while idx < len(tokens):
+            token = tokens[idx]
+            if _is_env_assignment(token):
+                idx += 1
+                continue
+
+            cmd = _os.path.basename(token.strip().lstrip("./"))
+            if cmd == "env":
+                idx += 1
+                while idx < len(tokens):
+                    token = tokens[idx]
+                    if token == "--":
+                        idx += 1
+                        break
+                    if _is_env_assignment(token):
+                        idx += 1
+                        continue
+                    if token.startswith("-"):
+                        idx += 1
+                        if token in {
+                            "-C",
+                            "--chdir",
+                            "-S",
+                            "--split-string",
+                            "-u",
+                            "--unset",
+                        } and idx < len(tokens):
+                            idx += 1
+                        continue
+                    break
+                continue
+
+            if cmd == "sudo":
+                idx += 1
+                while idx < len(tokens):
+                    token = tokens[idx]
+                    if token == "--":
+                        idx += 1
+                        break
+                    if token.startswith("-"):
+                        idx += 1
+                        if token in {
+                            "-g",
+                            "--group",
+                            "-h",
+                            "--host",
+                            "-p",
+                            "--prompt",
+                            "-R",
+                            "--chroot",
+                            "-r",
+                            "--role",
+                            "-t",
+                            "--type",
+                            "-u",
+                            "--user",
+                        } and idx < len(tokens):
+                            idx += 1
+                        continue
+                    break
+                continue
+
+            return cmd
+        return None
+
+    blocked = _SHELL_BLOCKED_COMMANDS | frozenset(extra_blocked or [])
+    for pattern in _SHELL_BLOCKED_PATTERNS:
+        if pattern in command:
+            return f"command pattern '{pattern}' is blocked for safety"
+    try:
+        tokens = _shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if not tokens:
+        return None
+    argv0 = _resolve_effective_command(tokens)
+    if not argv0:
+        return None
+    if argv0 in blocked:
+        return f"command '{argv0}' is blocked for safety"
+    return None
+
+
 
 
 def normalize_memory_chapter(chapter: str, aliases: dict[str, str]) -> str:
@@ -272,9 +439,15 @@ class ToolRegistry:
     ):
         if name in self._tools:
             existing = self._tools[name]
-            if not replace or existing.source != source:
+            if not replace:
                 raise ValueError(
-                    f"Tool '{name}' is already registered by source '{existing.source}'"
+                    f"Tool '{name}' is already registered by source '{existing.source}'. "
+                    "Pass replace=True to overwrite it."
+                )
+            if existing.source != source:
+                raise ValueError(
+                    f"Tool '{name}' is already registered by source '{existing.source}'. "
+                    f"Only the same source may replace it; got '{source}'."
                 )
         self._tools[name] = ToolDef(
             name=name,
@@ -332,6 +505,16 @@ class ToolRegistry:
     def unregister_by_source_prefix(self, prefix: str) -> None:
         for name in [n for n, tool in self._tools.items() if tool.source.startswith(prefix)]:
             self._tools.pop(name, None)
+
+
+# ── Web tool constants ─────────────────────────────────────────────────────────
+WEB_FETCH_MAX_BYTES = 512 * 1024          # 512 KB response cap
+WEB_FETCH_TIMEOUT   = 20                  # seconds
+WEB_SEARCH_MAX_RESULTS = 10
+# User-Agent sent with every request – identifies the agent honestly.
+WEB_USER_AGENT = (
+    "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
+)
 
 
 class BuiltinTools:
@@ -547,6 +730,68 @@ class BuiltinTools:
             source="builtin",
         )
 
+        r.register(
+            "web_search",
+            (
+                "Search the web using DuckDuckGo and return a list of results (title, url, snippet). "
+                "Use for current events, facts that may have changed, or anything requiring live data. "
+                "No API key required."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query",
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": f"Maximum number of results to return (1-{WEB_SEARCH_MAX_RESULTS})",
+                        "default": 5,
+                    },
+                    "region": {
+                        "type": "string",
+                        "description": "DuckDuckGo region code, e.g. 'wt-wt' (worldwide), 'us-en', 'cn-zh'. Default: 'wt-wt'",
+                        "default": "wt-wt",
+                    },
+                },
+                "required": ["query"],
+            },
+            self._web_search,
+            source="builtin",
+        )
+
+        r.register(
+            "web_fetch",
+            (
+                "Fetch the content of a URL and return it as plain text (HTML tags stripped). "
+                "Use to read articles, documentation, or any web page whose URL you already know. "
+                "Respects robots.txt is not checked; use responsibly."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Full URL to fetch (must start with http:// or https://)",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": "Maximum characters of body text to return (default 8000)",
+                        "default": 8000,
+                    },
+                    "raw_html": {
+                        "type": "boolean",
+                        "description": "Return raw HTML instead of extracted text (default false)",
+                        "default": False,
+                    },
+                },
+                "required": ["url"],
+            },
+            self._web_fetch,
+            source="builtin",
+        )
+
         if self._output_dir is not None:
             r.register(
                 "clean_output",
@@ -571,6 +816,170 @@ class BuiltinTools:
                 source="builtin",
             )
 
+    # ── Web tools ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _strip_html(raw: str) -> str:
+        """Very lightweight HTML → plain-text: remove tags, decode entities."""
+        # Remove <script> and <style> blocks entirely
+        raw = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", raw,
+                     flags=re.DOTALL | re.IGNORECASE)
+        # Remove all remaining tags
+        raw = re.sub(r"<[^>]+>", " ", raw)
+        # Decode HTML entities (e.g. &amp; &lt; &#39;)
+        raw = html.unescape(raw)
+        # Collapse whitespace
+        raw = re.sub(r"[ \t]+", " ", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw)
+        return raw.strip()
+
+    @staticmethod
+    def _make_urllib_request(url: str, timeout: int = WEB_FETCH_TIMEOUT) -> bytes:
+        """Open *url* with a browser-like User-Agent; return raw bytes."""
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": WEB_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read(WEB_FETCH_MAX_BYTES)
+
+    async def _web_fetch(
+        self,
+        url: str,
+        max_chars: int = 8000,
+        raw_html: bool = False,
+    ) -> dict[str, Any]:
+        """Fetch a single URL and return its text content."""
+        url = url.strip()
+        if not url.startswith(("http://", "https://")):
+            return self._error(
+                "URL must start with http:// or https://", url=url
+            )
+        max_chars = max(100, min(int(max_chars), WEB_FETCH_MAX_BYTES))
+        try:
+            loop = asyncio.get_event_loop()
+            raw_bytes = await loop.run_in_executor(
+                None, self._make_urllib_request, url
+            )
+            # Decode – try UTF-8, fall back to latin-1
+            try:
+                raw_text = raw_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                raw_text = raw_bytes.decode("latin-1", errors="replace")
+
+            if raw_html:
+                body = raw_text[:max_chars]
+                truncated = len(raw_text) > max_chars
+            else:
+                body = self._strip_html(raw_text)
+                truncated = len(body) > max_chars
+                body = body[:max_chars]
+
+            return self._ok(
+                url=url,
+                content=body,
+                truncated=truncated,
+                chars=len(body),
+            )
+        except Exception as exc:
+            return self._error(f"Fetch failed: {exc}", url=url)
+
+    async def _web_search(
+        self,
+        query: str,
+        max_results: int = 5,
+        region: str = "wt-wt",
+    ) -> dict[str, Any]:
+        """Search DuckDuckGo HTML endpoint and parse result cards.
+
+        Uses the public HTML interface (no API key required).
+        Parses the result list with regex to avoid adding an HTML-parser dep.
+        """
+        max_results = max(1, min(int(max_results), WEB_SEARCH_MAX_RESULTS))
+        # DuckDuckGo HTML search URL
+        params = urllib.parse.urlencode({
+            "q": query.strip(),
+            "kl": region,
+            "ia": "web",
+        })
+        search_url = f"https://html.duckduckgo.com/html/?{params}"
+        try:
+            loop = asyncio.get_event_loop()
+            raw_bytes = await loop.run_in_executor(
+                None, self._make_urllib_request, search_url
+            )
+            html_text = raw_bytes.decode("utf-8", errors="replace")
+        except Exception as exc:
+            return self._error(f"Search request failed: {exc}", query=query)
+
+        results: list[dict] = []
+
+        # Each result in DDG HTML looks like:
+        #   <div class="result results_links ...">
+        #     <a class="result__a" href="URL">TITLE</a>
+        #     <a class="result__snippet">SNIPPET</a>
+        #   </div>
+        # We parse with targeted regexes to avoid needing beautifulsoup.
+        result_blocks = re.findall(
+            r'<div[^>]+class="[^"]*result[^"]*results_links[^"]*"[^>]*>(.*?)</div>\s*</div>',
+            html_text,
+            re.DOTALL,
+        )
+        # Fallback: grab all result__a links if block parsing yields nothing
+        if not result_blocks:
+            links = re.findall(
+                r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                html_text,
+                re.DOTALL,
+            )
+            for href, title in links[:max_results]:
+                href = html.unescape(href.strip())
+                title = html.unescape(re.sub(r"<[^>]+>", "", title)).strip()
+                if href.startswith("//"):
+                    href = "https:" + href
+                if not href.startswith("http"):
+                    continue
+                results.append({"title": title, "url": href, "snippet": ""})
+        else:
+            for block in result_blocks[:max_results]:
+                link_m = re.search(
+                    r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                    block,
+                    re.DOTALL,
+                )
+                snippet_m = re.search(
+                    r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</a>',
+                    block,
+                    re.DOTALL,
+                )
+                if not link_m:
+                    continue
+                href  = html.unescape(link_m.group(1).strip())
+                title = html.unescape(re.sub(r"<[^>]+>", "", link_m.group(2))).strip()
+                snippet = ""
+                if snippet_m:
+                    snippet = html.unescape(
+                        re.sub(r"<[^>]+>", "", snippet_m.group(1))
+                    ).strip()
+                if href.startswith("//"):
+                    href = "https:" + href
+                if not href.startswith("http"):
+                    continue
+                results.append({"title": title, "url": href, "snippet": snippet})
+
+        if not results:
+            return self._ok(
+                query=query,
+                count=0,
+                results=[],
+                note="No results found or DDG HTML format changed.",
+            )
+        return self._ok(query=query, count=len(results), results=results)
+
     def _ok(self, **payload: Any) -> dict[str, Any]:
         return {"ok": True, **payload}
 
@@ -589,6 +998,12 @@ class BuiltinTools:
         return resolved
 
     async def _shell(self, command: str, timeout: int = 30) -> dict[str, Any]:
+        # Security: block dangerous commands before spawning any subprocess.
+        extra_blocked: list[str] = self.registry.get_context("shell_blocked_commands") or []
+        block_reason = _shell_command_is_blocked(command, extra_blocked)
+        if block_reason:
+            return self._error(f"Shell command rejected: {block_reason}", command=command)
+
         proc = None
         try:
             env = os.environ.copy()
@@ -1223,6 +1638,7 @@ class LTMStore:
         self.memory_dir = memory_dir
         self._meta_path = context_dir / "_meta.json"
         self._db_path = context_dir / "palace.db"
+        self._local = threading.local()  # thread-local connection storage
         self.dir.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
@@ -1232,9 +1648,22 @@ class LTMStore:
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        """Return a thread-local singleton connection with WAL mode enabled.
+
+        SQLite connections are not safe to share across threads, so we keep one
+        per thread. WAL mode allows concurrent readers alongside a single writer,
+        which is critical when the background memory worker reads while the main
+        loop writes.
+        """
+        # Thread-local storage ensures each thread gets its own connection.
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            self._local.conn = conn
+        return self._local.conn
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
@@ -2375,7 +2804,7 @@ class ContextManager:
 
 
 class BackgroundMemoryWorker:
-    """Threaded worker that processes queued memory jobs off the interactive path."""
+    """Background thread that processes queued memory jobs during prompt idle time."""
 
     def __init__(
         self,
@@ -2384,40 +2813,61 @@ class BackgroundMemoryWorker:
         model: str,
         api_format: str,
         poll_seconds: float = 1.0,
+        client_factory: Optional[Callable[[], Any]] = None,
     ):
         self.ctx_mgr = ctx_mgr
         self.client = client
         self.model = model
         self.api_format = api_format
         self.poll_seconds = poll_seconds
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self.client_factory = client_factory
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
+        """Start the worker thread once."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="background-memory-worker",
+            daemon=True,
+        )
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=5)
+        """Signal the worker thread to stop."""
+        self._stop_event.set()
+
+    async def wait(self) -> None:
+        """Wait for the worker thread to exit in async call sites."""
+        if self._thread:
+            await asyncio.to_thread(self._thread.join)
 
     def _run(self) -> None:
-        loop = asyncio.new_event_loop()
+        client = self.client_factory() if self.client_factory else self.client
         try:
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 try:
                     if self.ctx_mgr.should_process_jobs():
-                        loop.run_until_complete(
+                        asyncio.run(
                             self.ctx_mgr.process_one_job(
-                                self.client,
+                                client,
                                 self.model,
                                 api_format=self.api_format,
                             )
                         )
                 except Exception as e:
                     CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
-                self._stop.wait(self.poll_seconds)
+                self._stop_event.wait(self.poll_seconds)
         finally:
-            loop.close()
+            aclose = getattr(client, "aclose", None)
+            if self.client_factory and callable(aclose):
+                try:
+                    asyncio.run(aclose())
+                except Exception:
+                    pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3301,71 +3751,31 @@ class BaseAgent:
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
 
-                # Build a synthetic response object matching _parse_response expectations
-                class _Func:
-                    def __init__(self, name, arguments):
-                        self.name = name
-                        self.arguments = arguments
-
-                class _TC:
-                    def __init__(self, id, function):
-                        self.id = id
-                        self.function = function
-
-                class _Msg:
-                    def __init__(self, content, tool_calls):
-                        self.content = content
-                        self.tool_calls = tool_calls
-
-                class _Choice:
-                    def __init__(self, finish_reason, message):
-                        self.finish_reason = finish_reason
-                        self.message = message
-
-                class _Response:
-                    def __init__(self, choices):
-                        self.choices = choices
-
+                # Build a synthetic response object using module-level dataclasses
                 oi_tool_calls = [
-                    _TC(v["id"], _Func(v["name"], v["arguments"]))
+                    _OAITC(v["id"], _OAIFunc(v["name"], v["arguments"]))
                     for _, v in sorted(tool_calls_acc.items())
                 ] if tool_calls_acc else None
 
-                response = _Response([
-                    _Choice(
+                response = _OAIResponse([
+                    _OAIChoice(
                         finish_reason,
-                        _Msg("".join(collected), oi_tool_calls),
+                        _OAIMsg("".join(collected), oi_tool_calls),
                     )
                 ])
         except Exception as e:
             traceback.print_exc()
-            # Return a minimal end_turn response on error
+            # Return a minimal end_turn response on error using module-level dataclasses
+            collected_text = "".join(collected)
             if self.api_format == "anthropic":
-                # Return a fake minimal response
-                class _FakeBlock:
-                    def __init__(self, text):
-                        self.text = text
-                        self.type = "text"
-                class _FakeResp:
-                    def __init__(self, text):
-                        self.stop_reason = "end_turn"
-                        self.content = [_FakeBlock(text)]
-                response = _FakeResp("".join(collected))
+                response = _AnthropicFallbackResponse(
+                    stop_reason="end_turn",
+                    content=[_AnthropicTextBlock(text=collected_text)],
+                )
             else:
-                class _Func2:
-                    pass
-                class _Msg2:
-                    def __init__(self, content):
-                        self.content = content
-                        self.tool_calls = None
-                class _Choice2:
-                    def __init__(self, msg):
-                        self.finish_reason = "stop"
-                        self.message = msg
-                class _Response2:
-                    def __init__(self, choices):
-                        self.choices = choices
-                response = _Response2([_Choice2(_Msg2("".join(collected)))])
+                response = _OAIResponse([
+                    _OAIChoice("stop", _OAIMsg(collected_text, None))
+                ])
         return response, "".join(collected)
 
     def register_spawn_capability(
@@ -4014,6 +4424,10 @@ async def _build_components_async(cfg: dict):
 
     # Share output_dir with skills via registry context
     registry.set_context("output_dir", str(output_dir))
+    registry.set_context(
+        "shell_blocked_commands",
+        list(cfg.get("shell_blocked_commands", [])),
+    )
 
     skill_catalog = SkillCatalog()
     skill_catalog.load_all()
@@ -4106,6 +4520,7 @@ async def _interactive_loop(components: dict, cfg: dict):
             components["client"],
             components["model"],
             agent.api_format,
+            client_factory=lambda: ModelClientFactory.from_config(cfg)[0],
         )
         if ctx_mgr
         else None
@@ -4326,6 +4741,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     finally:
         if memory_worker:
             memory_worker.stop()
+            await memory_worker.wait()
 
     # Session-end consolidation: digest any unprocessed staging content
     if ctx_mgr and ctx_mgr.should_session_end_sleep():

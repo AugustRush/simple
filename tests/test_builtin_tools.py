@@ -34,6 +34,29 @@ def test_registry_rejects_duplicate_tool_names():
         registry.register("dup", "second", {"type": "object"}, lambda: "nope")
 
 
+def test_registry_rejects_cross_source_replace():
+    from agent import ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(
+        "dup",
+        "first",
+        {"type": "object"},
+        lambda: "ok",
+        source="builtin",
+    )
+
+    with pytest.raises(ValueError):
+        registry.register(
+            "dup",
+            "second",
+            {"type": "object"},
+            lambda: "nope",
+            replace=True,
+            source="user_tool:demo",
+        )
+
+
 def test_registry_call_sanitizes_exceptions():
     from agent import ToolRegistry
 
@@ -214,3 +237,20 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
 
     assert result["ok"] is True
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo rm -rf tmp",
+        "FOO=1 rm -rf tmp",
+        "env rm -rf tmp",
+    ],
+)
+def test_shell_blocks_wrapped_dangerous_commands(tmp_path, command):
+    tools, _, _ = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(tools._shell(command, timeout=1))
+
+    assert result["ok"] is False
+    assert "rejected" in result["error"].lower()

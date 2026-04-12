@@ -1,6 +1,7 @@
-"""Red-phase tests modeling the planned background memory queue/worker APIs."""
+"""Tests for background memory queue/worker APIs."""
 
 import asyncio
+import time
 import sys
 from pathlib import Path
 
@@ -75,3 +76,34 @@ def test_background_worker_processes_queued_consolidation(tmp_path):
     asyncio.run(run_once())
 
     assert ctx_mgr.staging.count() == 0
+
+
+def test_background_worker_polls_while_main_thread_is_blocked(tmp_path):
+    from agent import BackgroundMemoryWorker
+
+    class _FakeContextManager:
+        def __init__(self):
+            self.polls = 0
+
+        def should_process_jobs(self):
+            self.polls += 1
+            return False
+
+    ctx_mgr = _FakeContextManager()
+    worker = BackgroundMemoryWorker(
+        ctx_mgr=ctx_mgr,
+        client=None,
+        model="x",
+        api_format="openai",
+        poll_seconds=0.01,
+    )
+
+    async def run():
+        worker.start()
+        time.sleep(0.05)
+        worker.stop()
+        await worker.wait()
+
+    asyncio.run(run())
+
+    assert ctx_mgr.polls > 0
