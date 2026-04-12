@@ -51,7 +51,7 @@ def test_resolve_output_dir_expands_env_var(monkeypatch, tmp_path):
 # ── ToolRegistry context ────────────────────────────────────────────────────
 
 def test_registry_set_and_get_context():
-    from tool_runtime import ToolRegistry
+    from agent import ToolRegistry
 
     reg = ToolRegistry()
     reg.set_context("output_dir", "/tmp/test")
@@ -63,7 +63,7 @@ def test_registry_set_and_get_context():
 # ── clean_output tool ───────────────────────────────────────────────────────
 
 def test_clean_output_deletes_all_files(tmp_path):
-    from tool_runtime import ToolRegistry, BuiltinTools
+    from agent import ToolRegistry, BuiltinTools
 
     output = tmp_path / "output"
     output.mkdir()
@@ -86,7 +86,7 @@ def test_clean_output_deletes_all_files(tmp_path):
 
 
 def test_clean_output_respects_max_age(tmp_path):
-    from tool_runtime import ToolRegistry, BuiltinTools
+    from agent import ToolRegistry, BuiltinTools
 
     output = tmp_path / "output"
     output.mkdir()
@@ -111,7 +111,7 @@ def test_clean_output_respects_max_age(tmp_path):
 
 
 def test_clean_output_subdir_only(tmp_path):
-    from tool_runtime import ToolRegistry, BuiltinTools
+    from agent import ToolRegistry, BuiltinTools
 
     output = tmp_path / "output"
     output.mkdir()
@@ -130,7 +130,7 @@ def test_clean_output_subdir_only(tmp_path):
 
 
 def test_clean_output_nonexistent_dir(tmp_path):
-    from tool_runtime import ToolRegistry, BuiltinTools
+    from agent import ToolRegistry, BuiltinTools
 
     output = tmp_path / "output"
     output.mkdir()
@@ -144,7 +144,7 @@ def test_clean_output_nonexistent_dir(tmp_path):
 
 
 def test_clean_output_not_registered_when_no_output_dir():
-    from tool_runtime import ToolRegistry, BuiltinTools
+    from agent import ToolRegistry, BuiltinTools
 
     reg = ToolRegistry()
     BuiltinTools(_StubMemory(), reg, output_dir=None)
