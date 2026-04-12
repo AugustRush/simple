@@ -282,6 +282,53 @@ def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path
     assert components["mcp_client"] is _FakeMCPClient.instances[-1]
 
 
+def test_build_components_loads_user_tool_plugins(monkeypatch, tmp_path):
+    import asyncio
+    import json
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    user_tools_root = tmp_path / "tools"
+    user_tools_root.mkdir()
+    (user_tools_root / "demo_tool.py").write_text(
+        """
+def register(registry):
+    async def demo_tool(name: str = "world"):
+        return {"ok": True, "message": f"hello {name}"}
+
+    registry.register(
+        "demo_tool",
+        "Say hello from a user plugin",
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": [],
+        },
+        demo_tool,
+    )
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024)
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "TOOLS_DIR", user_tools_root)
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert "demo_tool" in components["registry"].list_tools()
+    payload = json.loads(
+        asyncio.run(components["registry"].call("demo_tool", {"name": "codex"}))
+    )
+    assert payload == {"ok": True, "message": "hello codex"}
+
+
 def test_build_components_exposes_mcp_status_and_prints_summary(monkeypatch, tmp_path):
     import agent as agent_module
 

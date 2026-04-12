@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import ast
 from contextlib import AsyncExitStack
+import importlib.util
 import math
 import json
 import os
@@ -46,6 +47,7 @@ import mcp
 AGENT_HOME = Path.home() / ".agent"
 MEMORY_DIR = AGENT_HOME / "memory"
 SKILLS_DIR = AGENT_HOME / "skills"
+TOOLS_DIR = AGENT_HOME / "tools"
 BUILTIN_SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 PROMPTS_DIR = AGENT_HOME / "prompts"
 RL_DIR = AGENT_HOME / "rl"
@@ -629,9 +631,9 @@ class LTMStore:
         return self.normalize_category_name(category) in PALACE_LOCI
 
     def _normalize_entity(self, entity: str, category: str) -> str:
-        entity = self.normalize_category_name(entity)
-        if entity:
-            return entity
+        raw = str(entity).strip()
+        if raw:
+            return self.normalize_category_name(raw)
         if self._is_palace_locus(category):
             return "user" if self.normalize_category_name(category) == "identity" else "general"
         return self.normalize_category_name(category)
@@ -717,6 +719,15 @@ class LTMStore:
         return None
 
     def _write_entry_row(self, conn: sqlite3.Connection, entry: LTMEntry) -> None:
+        original_category = self.normalize_category_name(entry.category)
+        original_entity = str(entry.entity or "")
+        entry.category = self._coerce_category_for_storage(conn, original_category)
+        if entry.category == "concepts" and original_category not in PALACE_LOCI:
+            entry.entity = (
+                self.normalize_category_name(original_entity)
+                if original_entity.strip()
+                else original_category
+            )
         entry.category = self.normalize_category_name(entry.category)
         entry.entity = self._normalize_entity(entry.entity, entry.category)
         entry.memory_type = entry.memory_type or "fact"
@@ -724,9 +735,10 @@ class LTMStore:
         entry.status = entry.status or "active"
         entry.source_session = entry.source_session or ""
         entry.confidence = float(entry.confidence or 1.0)
-        existing_id = self._match_existing_entry_id(conn, entry)
-        if existing_id:
-            entry.id = existing_id
+        existing_row = self._find_existing_entry_row(conn, entry)
+        if existing_row:
+            entry.id = existing_row["id"]
+            entry.created_at = existing_row["created_at"]
         conn.execute(
             """
             INSERT OR REPLACE INTO memory_items (
@@ -749,6 +761,49 @@ class LTMStore:
                 entry.updated_at,
             ),
         )
+
+    def _find_existing_entry_row(
+        self, conn: sqlite3.Connection, entry: LTMEntry
+    ) -> Optional[sqlite3.Row]:
+        row = conn.execute(
+            "SELECT * FROM memory_items WHERE id = ? LIMIT 1",
+            (entry.id,),
+        ).fetchone()
+        if row:
+            return row
+        existing_id = self._match_existing_entry_id(conn, entry)
+        if not existing_id:
+            return None
+        return conn.execute(
+            "SELECT * FROM memory_items WHERE id = ? LIMIT 1",
+            (existing_id,),
+        ).fetchone()
+
+    def _coerce_category_for_storage(
+        self, conn: sqlite3.Connection, category: str
+    ) -> str:
+        normalized = self.normalize_category_name(category)
+        if normalized in PALACE_LOCI:
+            return normalized
+        dynamic_categories = self._dynamic_category_names(conn)
+        if normalized in dynamic_categories:
+            return normalized
+        if len(dynamic_categories) < self.max_categories:
+            return normalized
+        return "concepts"
+
+    def _dynamic_category_names(self, conn: sqlite3.Connection) -> set[str]:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT category FROM memory_items
+            WHERE status = 'active'
+            """
+        ).fetchall()
+        return {
+            row["category"]
+            for row in rows
+            if row["category"] not in PALACE_LOCI
+        }
 
     def _refresh_indexes(self) -> None:
         previous = {c["name"] for c in self._meta.get("categories", [])}
@@ -799,9 +854,17 @@ class LTMStore:
         if not self._is_palace_locus(category):
             return
         entries = self.read_entries(category)
+        category_dir = self.memory_dir / category
+        category_dir.mkdir(parents=True, exist_ok=True)
         grouped: dict[str, list[LTMEntry]] = {}
         for entry in entries:
             grouped.setdefault(entry.entity, []).append(entry)
+        expected_files = {f"{entity}.md" for entity in grouped}
+        for existing in category_dir.glob("*.md"):
+            if existing.name == "_index.md":
+                continue
+            if existing.name not in expected_files:
+                existing.unlink(missing_ok=True)
         for entity, entity_entries in grouped.items():
             path = self._projection_path(category, entity)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -832,6 +895,15 @@ class LTMStore:
 
     def category_count(self) -> int:
         return len(self._meta.get("categories", []))
+
+    def dynamic_category_count(self) -> int:
+        return len(
+            [
+                category
+                for category in self._meta.get("categories", [])
+                if category["name"] not in PALACE_LOCI
+            ]
+        )
 
     # ── Entry CRUD ────────────────────────────────────────────────────────────
 
@@ -1230,7 +1302,6 @@ class ConsolidationEngine:
 
             entries.extend(self._parse_entries(raw))
             for entry in entries:
-                await self._ensure_category_fits(entry.category, client, model, api_format)
                 self.store.add_entry(entry)
 
             self.store.apply_retention()
@@ -1241,7 +1312,7 @@ class ConsolidationEngine:
 
             CONSOLE.print(
                 f"[dim]💤 Stored {len(entries)} entries from {source_label}. "
-                f"Categories: {self.store.category_count()}/{self.max_categories}[/dim]"
+                f"Dynamic categories: {self.store.dynamic_category_count()}/{self.max_categories}[/dim]"
             )
         except Exception as e:
             CONSOLE.print(f"[dim]Sleep extraction error: {e}[/dim]")
@@ -1635,7 +1706,9 @@ class ContextManager:
     def stats(self) -> dict:
         cats = self.store.list_categories()
         return {
-            "categories": len(cats),
+            "categories": self.store.dynamic_category_count(),
+            "dynamic_categories": self.store.dynamic_category_count(),
+            "total_categories": len(cats),
             "total_entries": sum(c.entry_count for c in cats),
             "category_names": [c.name for c in cats],
             "max_categories": self.store.max_categories,
@@ -1827,6 +1900,62 @@ class SkillBundle:
 class ExplicitSkillRequest:
     skill_ref: str
     remaining_text: str = ""
+
+
+class _UserToolRegistryFacade:
+    def __init__(self, registry: ToolRegistry, source: str):
+        self._registry = registry
+        self._source = source
+
+    def register(
+        self,
+        name: str,
+        description: str,
+        parameters: dict,
+        fn: Callable,
+        *,
+        replace: bool = False,
+    ) -> None:
+        self._registry.register(
+            name,
+            description,
+            parameters,
+            fn,
+            replace=replace,
+            source=self._source,
+        )
+
+
+class UserToolCatalog:
+    """Discover and load user-authored Python tool plugins."""
+
+    def __init__(self, root: Optional[Path] = None):
+        self.root = root or TOOLS_DIR
+
+    def load_into_registry(self, registry: ToolRegistry) -> list[str]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        registry.unregister_by_source_prefix("user_tool:")
+        loaded: list[str] = []
+        for tool_file in sorted(self.root.rglob("*.py")):
+            plugin_id = tool_file.relative_to(self.root).with_suffix("").as_posix()
+            source = f"user_tool:{plugin_id}"
+            try:
+                module_name = f"agent_user_tool_{uuid.uuid4().hex}"
+                spec = importlib.util.spec_from_file_location(module_name, tool_file)
+                if spec is None or spec.loader is None:
+                    raise ValueError("unable to create import spec")
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                register = getattr(module, "register", None)
+                if not callable(register):
+                    raise ValueError("tool plugin must define callable register(registry)")
+                register(_UserToolRegistryFacade(registry, source))
+                loaded.append(plugin_id)
+            except Exception as e:
+                CONSOLE.print(
+                    f"[yellow]Failed to load user tool plugin {tool_file}: {e}[/yellow]"
+                )
+        return loaded
 
 
 def _parse_frontmatter_value(raw: str) -> Any:
@@ -2815,31 +2944,28 @@ class EvolutionEngine:
         return new_prompt
 
     async def generate_tool(self, description: str, registry: ToolRegistry) -> str:
-        """Let Claude generate a new tool and save it as a skill."""
+        """Let Claude generate a new tool plugin and save it to the user tool dir."""
         prompt = (
-            f"Generate a Python tool function for: {description}\n\n"
+            f"Generate a Python tool plugin for: {description}\n\n"
             "Requirements:\n"
-            "1. Use this decorator pattern:\n"
+            "1. Output a complete Python module with a callable register(registry) entrypoint\n"
+            "2. register(registry) must register exactly one async tool function\n"
+            "3. Use this pattern:\n"
             "```python\n"
-            "def register_tool(name, description, parameters):\n"
-            "    def decorator(fn):\n"
-            "        fn._tool_meta = {'name': name, 'description': description, 'parameters': parameters}\n"
-            "        return fn\n"
-            "    return decorator\n"
+            "def register(registry):\n"
+            "    async def tool_function(**kwargs):\n"
+            "        return 'result'\n"
             "\n"
-            "@register_tool(\n"
-            "    name='tool_name',\n"
-            "    description='What this tool does',\n"
-            "    parameters={'type': 'object', 'properties': {...}, 'required': [...]}\n"
-            ")\n"
-            "async def tool_function(**kwargs):\n"
-            "    # implementation\n"
-            "    return result\n"
+            "    registry.register(\n"
+            "        'tool_name',\n"
+            "        'What this tool does',\n"
+            "        {'type': 'object', 'properties': {...}, 'required': [...]},\n"
+            "        tool_function,\n"
+            "    )\n"
             "```\n"
-            "2. The function must be async\n"
-            "3. Include the register_tool helper at the top\n"
-            "4. Add proper error handling\n"
-            "5. Return a string result\n\n"
+            "4. The tool function must be async\n"
+            "5. Add proper error handling\n"
+            "6. Return either a string or a JSON-serializable dict\n\n"
             "Output ONLY the Python code, no explanation."
         )
 
@@ -2852,12 +2978,12 @@ class EvolutionEngine:
 
         # Generate safe filename
         safe_name = re.sub(r"[^a-z0-9_]", "_", description.lower()[:30])
-        skill_path = SKILLS_DIR / f"auto_{safe_name}.py"
-        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-        skill_path.write_text(code)
+        tool_path = TOOLS_DIR / f"auto_{safe_name}.py"
+        TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        tool_path.write_text(code)
 
-        CONSOLE.print(f"[green]Tool saved to {skill_path}[/green]")
-        return f"Tool generated and saved to {skill_path}"
+        CONSOLE.print(f"[green]Tool saved to {tool_path}[/green]")
+        return f"Tool generated and saved to {tool_path}"
 
     def apply_best_prompt(self) -> str:
         """Load the best prompt from history."""
@@ -3238,6 +3364,7 @@ async def _build_components_async(cfg: dict):
     skill_catalog = SkillCatalog()
     skill_catalog.load_all()
     skill_catalog.register_tools(registry)
+    user_tool_catalog = UserToolCatalog()
 
     mcp_client = None
     mcp_status = {
@@ -3265,6 +3392,9 @@ async def _build_components_async(cfg: dict):
     agent = BaseAgent(
         client, registry, model=model, max_tokens=max_tokens, api_format=api_format
     )
+    loaded_user_tools = user_tool_catalog.load_into_registry(registry)
+    if loaded_user_tools:
+        CONSOLE.print("[green]User tools loaded:[/green] " + ", ".join(loaded_user_tools))
     agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
     system_prompt = _compose_system_prompt(
         system_prompt,
@@ -3287,6 +3417,7 @@ async def _build_components_async(cfg: dict):
         "evolution": evolution,
         "context_manager": ctx_manager,
         "skill_catalog": skill_catalog,
+        "user_tool_catalog": user_tool_catalog,
         "mcp_client": mcp_client,
         "mcp_status": mcp_status,
         "output_dir": output_dir,
@@ -3307,6 +3438,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     system_prompt = components["system_prompt"]
     ctx_mgr: Optional[ContextManager] = components.get("context_manager")
     skill_catalog: SkillCatalog = components["skill_catalog"]
+    user_tool_catalog: UserToolCatalog = components["user_tool_catalog"]
 
     # Get prompt version
     prompt_files = sorted(PROMPTS_DIR.glob("system_v*.md"))
@@ -3367,9 +3499,10 @@ async def _interactive_loop(components: dict, cfg: dict):
                         table.add_column("Metric")
                         table.add_column("Value")
                         table.add_row(
-                            "Categories",
+                            "Dynamic Categories",
                             f"{stats['categories']}/{stats['max_categories']}",
                         )
+                        table.add_row("Total Categories", str(stats["total_categories"]))
                         table.add_row("Total Entries", str(stats["total_entries"]))
                         table.add_row(
                             "Category Names",
@@ -3523,8 +3656,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                 ):
                     CONSOLE.print("[dim]Generating tool...[/dim]")
                     await evolution.generate_tool(user_input, components["registry"])
-                    components["skill_catalog"].reload()
-                    components["skill_catalog"].register_tools(components["registry"])
+                    user_tool_catalog.load_into_registry(components["registry"])
                     components["system_prompt"] = _compose_system_prompt(
                         system_prompt,
                         components["registry"],

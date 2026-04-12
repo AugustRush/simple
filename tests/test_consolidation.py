@@ -270,3 +270,36 @@ def test_sleep_clears_dirty_flag_when_consolidation_raises(tmp_path):
         asyncio.run(ctx_mgr.sleep([{"role": "user", "content": "hello"}], None, "x"))
 
     assert ctx_mgr._needs_consolidation is False
+
+
+def test_stats_report_dynamic_category_count_against_limit(tmp_path):
+    from agent import LTMEntry
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.store.max_categories = 1
+    ctx_mgr.store.add_entry(
+        LTMEntry(
+            id="alpha",
+            category="alpha",
+            content="First dynamic category",
+            importance=0.5,
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+    ctx_mgr.store.add_entry(
+        LTMEntry(
+            id="identity",
+            category="identity",
+            entity="user",
+            content="Prefers concise responses",
+            importance=0.8,
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+
+    stats = ctx_mgr.stats()
+
+    assert stats["dynamic_categories"] == 1
+    assert stats["max_categories"] == 1

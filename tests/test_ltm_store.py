@@ -221,3 +221,126 @@ def test_add_entry_upserts_task_status(tmp_path):
     entries = store.read_entries("tasks")
     assert len([e for e in entries if e.entity == "fix_auth_bug"]) == 1
     assert entries[0].status == "done"
+
+
+def test_add_entry_preserves_created_at_when_upserting(tmp_path):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    first = LTMEntry(
+        id="pref-a",
+        category="identity",
+        entity="user",
+        memory_type="preference",
+        content="Prefers concise responses",
+        importance=0.8,
+        status="active",
+        created_at="2026-04-10",
+        updated_at="2026-04-10",
+    )
+    second = LTMEntry(
+        id="pref-b",
+        category="identity",
+        entity="user",
+        memory_type="preference",
+        content="Prefers concise responses",
+        importance=0.9,
+        status="active",
+        created_at="2026-04-12",
+        updated_at="2026-04-12",
+    )
+
+    store.add_entry(first)
+    store.add_entry(second)
+
+    entry = store.read_entries("identity")[0]
+    assert entry.id == "pref-a"
+    assert entry.created_at == "2026-04-10"
+    assert entry.updated_at == "2026-04-12"
+
+
+def test_projection_sync_removes_stale_entity_files(tmp_path):
+    from agent import LTMEntry, LTMStore
+
+    memory_dir = tmp_path / "memory"
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=memory_dir,
+    )
+    store.add_entry(
+        LTMEntry(
+            id="user-note",
+            category="identity",
+            entity="user",
+            memory_type="preference",
+            content="Prefers concise responses",
+            importance=0.8,
+            status="active",
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+
+    assert (memory_dir / "identity" / "user.md").exists()
+
+    store.write_entries(
+        "identity",
+        [
+            LTMEntry(
+                id="admin-note",
+                category="identity",
+                entity="admin",
+                memory_type="preference",
+                content="Needs detailed traces",
+                importance=0.7,
+                status="active",
+                created_at="2026-04-12",
+                updated_at="2026-04-12",
+            )
+        ],
+    )
+
+    assert not (memory_dir / "identity" / "user.md").exists()
+    assert (memory_dir / "identity" / "admin.md").exists()
+
+
+def test_add_entry_maps_overflow_dynamic_categories_to_concepts(tmp_path):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+        max_categories=1,
+    )
+    store.add_entry(
+        LTMEntry(
+            id="alpha",
+            category="alpha",
+            content="First dynamic category",
+            importance=0.5,
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+    store.add_entry(
+        LTMEntry(
+            id="beta",
+            category="beta",
+            content="Second dynamic category",
+            importance=0.6,
+            created_at="2026-04-12",
+            updated_at="2026-04-12",
+        )
+    )
+
+    dynamic_categories = [
+        category.name for category in store.list_categories() if category.name not in {"concepts"}
+    ]
+    assert dynamic_categories == ["alpha"]
+    concepts_entries = store.read_entries("concepts")
+    assert len(concepts_entries) == 1
+    assert concepts_entries[0].entity == "beta"
+    assert concepts_entries[0].content == "Second dynamic category"

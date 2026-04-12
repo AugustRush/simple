@@ -95,8 +95,8 @@ def test_generate_tool_uses_openai_chat_api(tmp_path, monkeypatch):
     import agent as agent_module
     from agent import EvolutionEngine, MemoryPalace, ToolRegistry
 
-    skills_dir = tmp_path / "skills"
-    monkeypatch.setattr(agent_module, "SKILLS_DIR", skills_dir)
+    tools_dir = tmp_path / "tools"
+    monkeypatch.setattr(agent_module, "TOOLS_DIR", tools_dir)
 
     client = _FakeOpenAIClient()
     engine = EvolutionEngine(
@@ -113,4 +113,4 @@ def test_generate_tool_uses_openai_chat_api(tmp_path, monkeypatch):
 
     assert "Tool generated and saved" in result
     assert client.chat.completions.calls
-    assert list(skills_dir.glob("auto_*.py"))
+    assert list(tools_dir.glob("auto_*.py"))
