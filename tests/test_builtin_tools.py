@@ -191,3 +191,26 @@ def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
     assert called["terminated"] is True
     assert result["ok"] is False
     assert "timed out" in result["error"].lower()
+
+
+def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
+    tools, reg, _ = make_builtin_tools(tmp_path)
+    reg.set_context("output_dir", str(tmp_path / "output"))
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_shell(*args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+
+    result = asyncio.run(tools._shell("echo ok", timeout=1))
+
+    assert result["ok"] is True
+    assert captured["env"]["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")

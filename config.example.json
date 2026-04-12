@@ -99,5 +99,8 @@
   ],
 
   "system_prompt_file": null,
-  "_system_prompt_file_readme": "null = use the built-in prompt. Set to an absolute path to load a custom system prompt from a .md or .txt file, e.g. '/Users/you/.agent/my_prompt.md'."
+  "_system_prompt_file_readme": "null = use the built-in prompt. Set to an absolute path to load a custom system prompt from a .md or .txt file, e.g. '/Users/you/.agent/my_prompt.md'.",
+
+  "output_dir": null,
+  "_output_dir_readme": "null = use default ~/.agent/output. Set to an absolute path to override. Supports ~ and $ENV expansion. All tool/MCP/skill outputs (screenshots, exports, temp files) go here. Subdirectories are created on demand."
 }

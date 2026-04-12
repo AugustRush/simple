@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import signal
+import time as _time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ class ToolRegistry:
 
     def __init__(self, console: Optional[Any] = None):
         self._tools: dict[str, ToolDef] = {}
+        self._context: dict[str, Any] = {}
         self.console = console
 
     def register(
@@ -95,6 +97,14 @@ class ToolRegistry:
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())
 
+    def set_context(self, key: str, value: Any) -> None:
+        """Store a shared context value accessible by all tools."""
+        self._context[key] = value
+
+    def get_context(self, key: str, default: Any = None) -> Any:
+        """Retrieve a shared context value."""
+        return self._context.get(key, default)
+
     def unregister_by_source_prefix(self, prefix: str) -> None:
         for name in [n for n, tool in self._tools.items() if tool.source.startswith(prefix)]:
             self._tools.pop(name, None)
@@ -110,12 +120,14 @@ class BuiltinTools:
         context_manager: Optional[Any] = None,
         workspace_root: Optional[Path] = None,
         chapter_normalizer: Optional[Callable[[str], str]] = None,
+        output_dir: Optional[Path] = None,
     ):
         self.memory = memory
         self.registry = registry
         self.context_manager = context_manager
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.chapter_normalizer = chapter_normalizer or (lambda chapter: str(chapter))
+        self._output_dir = output_dir
         self._register()
 
     def _register(self):
@@ -311,6 +323,30 @@ class BuiltinTools:
             source="builtin",
         )
 
+        if self._output_dir is not None:
+            r.register(
+                "clean_output",
+                "Clean files from the output directory. Use max_age_hours=0 to remove all files.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "max_age_hours": {
+                            "type": "number",
+                            "description": "Delete files older than N hours. 0 = delete all.",
+                            "default": 0,
+                        },
+                        "subdir": {
+                            "type": "string",
+                            "description": "Only clean this subdirectory (e.g. 'screenshots'). Empty = entire output dir.",
+                            "default": "",
+                        },
+                    },
+                    "required": [],
+                },
+                self._clean_output,
+                source="builtin",
+            )
+
     def _ok(self, **payload: Any) -> dict[str, Any]:
         return {"ok": True, **payload}
 
@@ -331,11 +367,16 @@ class BuiltinTools:
     async def _shell(self, command: str, timeout: int = 30) -> dict[str, Any]:
         proc = None
         try:
+            env = os.environ.copy()
+            output_dir = self.registry.get_context("output_dir")
+            if output_dir:
+                env["AGENT_OUTPUT_DIR"] = str(output_dir)
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
+                env=env,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             out = stdout.decode(errors="replace")
@@ -501,3 +542,33 @@ class BuiltinTools:
         result = self.context_manager.retrieve_context(query, top_k=top_k)
         sections = [s for s in result.split("\n\n") if s.strip()] if result else []
         return self._ok(query=query, count=len(sections), content=result, sections=sections)
+
+    def _clean_output(self, max_age_hours: float = 0, subdir: str = "") -> dict[str, Any]:
+        if self._output_dir is None:
+            return self._error("Output directory not configured")
+        target = self._output_dir / subdir if subdir else self._output_dir
+        if not target.is_dir():
+            return self._ok(deleted=0, message=f"Directory does not exist: {target}")
+        now = _time.time()
+        deleted = 0
+        errors: list[str] = []
+        for f in target.rglob("*"):
+            if not f.is_file():
+                continue
+            if max_age_hours > 0 and (now - f.stat().st_mtime) < max_age_hours * 3600:
+                continue
+            try:
+                f.unlink()
+                deleted += 1
+            except Exception as e:
+                errors.append(f"{f.name}: {e}")
+        # Remove empty subdirectories bottom-up
+        for d in sorted((d for d in target.rglob("*") if d.is_dir()), reverse=True):
+            try:
+                d.rmdir()  # only succeeds if empty
+            except OSError:
+                pass
+        result = self._ok(deleted=deleted, target=str(target))
+        if errors:
+            result["errors"] = errors[:10]
+        return result
