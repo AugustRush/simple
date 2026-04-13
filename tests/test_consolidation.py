@@ -140,6 +140,54 @@ def test_format_messages_list_content(tmp_path):
     assert "file contents here" in text
 
 
+def test_consolidate_includes_full_staging_text_before_clearing(tmp_path):
+    import asyncio
+    from agent import LTMStore, ConsolidationEngine, StagingBuffer
+
+    class _FakeClient:
+        def __init__(self):
+            self.prompts = []
+
+            class _Chat:
+                def __init__(self, outer):
+                    self.completions = self
+                    self.outer = outer
+
+                async def create(self, **kwargs):
+                    self.outer.prompts.append(kwargs["messages"][0]["content"])
+
+                    class _Msg:
+                        content = ""
+
+                    class _Choice:
+                        message = _Msg()
+
+                    class _Resp:
+                        choices = [_Choice()]
+
+                    return _Resp()
+
+            self.chat = _Chat(self)
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    engine = ConsolidationEngine(store=store, max_source_tokens=700)
+    staging = StagingBuffer(path=tmp_path / "staging.jsonl", session_id="session-1")
+    staging.append("user", ("A" * 2500) + "FIRST_TAIL")
+    staging.append("assistant", "reply one")
+    staging.append("user", ("B" * 2500) + "SECOND_TAIL")
+    staging.append("assistant", "reply two")
+
+    client = _FakeClient()
+    asyncio.run(
+        engine.consolidate([], client, "fake-model", api_format="openai", staging=staging)
+    )
+
+    assert len(client.prompts) >= 2
+    assert any("FIRST_TAIL" in prompt for prompt in client.prompts)
+    assert any("SECOND_TAIL" in prompt for prompt in client.prompts)
+    assert staging.count() == 0
+
+
 # ── ContextManager dirty flag tests ──────────────────────────────────────────
 
 
@@ -322,3 +370,98 @@ def test_route_categories_uses_configurable_keyword_map(tmp_path):
         "projects",
         "tasks",
     ]
+
+
+def test_route_categories_treats_conversation_history_as_episode_recall(tmp_path):
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+    )
+
+    assert "episodes" in ctx_mgr._route_categories("对话历史 聊天内容")
+
+
+def test_route_categories_does_not_treat_generic_history_queries_as_episode_recall(tmp_path):
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+    )
+
+    assert "episodes" not in ctx_mgr._route_categories("git history")
+    assert "episodes" not in ctx_mgr._route_categories("浏览器 history 怎么看")
+    assert "episodes" not in ctx_mgr._route_categories("Python 历史是什么")
+
+
+def test_retrieve_ltm_context_falls_back_to_recent_episodes_for_recall_queries(tmp_path):
+    from agent import (
+        LTMEntry,
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+    )
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    store.add_entry(
+        LTMEntry(
+            id="episode-1",
+            category="episodes",
+            entity="session-1",
+            memory_type="session_summary",
+            content="USER: hi | USER: 你可以做什么 | USER: 写首诗",
+            importance=0.7,
+            created_at="2026-04-13 08:50 UTC",
+            updated_at="2026-04-13 08:50 UTC",
+        )
+    )
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+    )
+
+    result = ctx_mgr.retrieve_ltm_context("我们刚刚才聊了什么", top_k=3)
+
+    assert "episodes/session_1" in result
+    assert "写首诗" in result
+
+
+def test_retrieve_ltm_context_does_not_fallback_episode_for_generic_history_queries(tmp_path):
+    from agent import (
+        LTMEntry,
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+    )
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    store.add_entry(
+        LTMEntry(
+            id="episode-1",
+            category="episodes",
+            entity="session-1",
+            memory_type="session_summary",
+            content="USER: hi | USER: 写首诗",
+            importance=0.7,
+            created_at="2026-04-13 08:50 UTC",
+            updated_at="2026-04-13 08:50 UTC",
+        )
+    )
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+    )
+
+    result = ctx_mgr.retrieve_ltm_context("git history", top_k=3)
+
+    assert result == ""

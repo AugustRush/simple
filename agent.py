@@ -81,6 +81,7 @@ STAGING_DIR = CONTEXT_DIR / "_staging"  # per-session raw conversation buffers
 RECENT_SESSION_TURNS = 6  # recent staged turns exposed to explicit context lookup
 PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
 STAGING_TURN_THRESHOLD = 6
+CONSOLIDATION_MAX_SOURCE_TOKENS = 1200
 # Align with the actual compact_messages cycle (~5 tool-calling turns × ~350 staging
 # tokens/turn). The old value of 300 was smaller than a single turn's staging content,
 # causing consolidation jobs to enqueue on the very first turn (though the background
@@ -110,7 +111,7 @@ PALACE_LOCUS_SUMMARIES = {
     "archive": "Superseded or historical memory items",
 }
 DEFAULT_ROUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "episodes": ("刚才", "刚刚", "上次", "之前", "recent", "earlier"),
+    "episodes": (),
     "identity": ("偏好", "喜欢", "风格", "prefer", "preference"),
     "projects": ("项目", "project", "repo", "仓库"),
     "tasks": ("任务", "todo", "待办", "next step", "open loop"),
@@ -185,6 +186,17 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> Non
 
 def _is_safe_prompt_version(version: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_-]+", version))
+
+
+def _with_task_context(system_prompt: str, task_context: str) -> str:
+    task_context = str(task_context or "").strip()
+    if not task_context:
+        return system_prompt
+    return (
+        system_prompt
+        + "\n\n## Current Task Context (original request)\n"
+        + task_context
+    )
 
 
 # ── OpenAI streaming synthetic response types ─────────────────────────────────
@@ -1542,7 +1554,7 @@ class ModelClientFactory:
     """Build the right async API client from provider config."""
 
     @staticmethod
-    def from_config(cfg: dict) -> tuple[Any, str, int]:
+    def from_config(cfg: dict, announce: bool = True) -> tuple[Any, str, int]:
         """
         Returns (client, active_model, max_tokens).
 
@@ -1611,9 +1623,10 @@ class ModelClientFactory:
             )
             raise typer.Exit(1)
 
-        CONSOLE.print(
-            f"[dim]Provider: {active_name} | format: {api_format} | model: {model}[/dim]"
-        )
+        if announce:
+            CONSOLE.print(
+                f"[dim]Provider: {active_name} | format: {api_format} | model: {model}[/dim]"
+            )
         return client, model, int(max_tokens)
 
     @staticmethod
@@ -1767,6 +1780,7 @@ class StagingBuffer:
         self.session_id = session_id or _new_id()
         self.path = path or (context_dir / "_staging" / f"{self.session_id}.jsonl")
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._count = self._load_count()
 
     def _load_count(self) -> int:
@@ -1784,32 +1798,53 @@ class StagingBuffer:
             "content": content.strip(),
             "ts": _now(),
         }
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        self._count += 1
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._count += 1
 
     def read_all(self) -> list[dict]:
         """Return all staged messages in order."""
-        if not self.path.exists():
-            return []
-        msgs = []
-        for line in self.path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msgs.append(json.loads(line))
-            except Exception:
-                continue
-        return msgs
+        with self._lock:
+            if not self.path.exists():
+                return []
+            msgs = []
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msgs.append(json.loads(line))
+                except Exception:
+                    continue
+            return msgs
 
     def count(self) -> int:
-        return self._count
+        with self._lock:
+            return self._count
 
     def clear_all(self) -> None:
         """Delete the staging file after successful consolidation."""
-        self.path.unlink(missing_ok=True)
-        self._count = 0
+        with self._lock:
+            self.path.unlink(missing_ok=True)
+            self._count = 0
+
+    def drop_prefix(self, count: int) -> None:
+        """Remove the first ``count`` staged turns, preserving newer appends."""
+        if count <= 0:
+            return
+        with self._lock:
+            if not self.path.exists():
+                self._count = 0
+                return
+            lines = [line for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if count >= len(lines):
+                self.path.unlink(missing_ok=True)
+                self._count = 0
+                return
+            remaining = lines[count:]
+            _atomic_write_text(self.path, "\n".join(remaining) + "\n", encoding="utf-8")
+            self._count = len(remaining)
 
 
 @dataclass
@@ -2482,6 +2517,23 @@ class LTMStore:
             affected_categories = self._write_entry_row(conn, entry)
         self._sync_after_mutation(affected_categories)
 
+    def add_entries(self, entries: list[LTMEntry]) -> None:
+        """Batch-insert multiple entries in a single transaction and one sync pass.
+
+        Preferred over calling add_entry() in a loop: consolidation writes all
+        extracted facts at once, avoiding N separate SQL transactions and N
+        rounds of _meta + snapshot + projection file I/O.
+        """
+        if not entries:
+            return
+        affected_categories: set[str] = set()
+        with self._connect() as conn:
+            for entry in entries:
+                entry.category = self.normalize_category_name(entry.category)
+                entry.entity = self._normalize_entity(entry.entity, entry.category)
+                affected_categories.update(self._write_entry_row(conn, entry))
+        self._sync_after_mutation(affected_categories)
+
     def upsert_manual_note(
         self, category: str, entity: str, content: str, append: bool = False
     ) -> LTMEntry:
@@ -2601,39 +2653,50 @@ class LTMStore:
         self._sync_after_mutation(affected_categories)
 
     def apply_retention(self) -> None:
-        """Apply locus-aware retention instead of globally decaying all memory equally."""
-        affected_categories: set[str] = set()
+        """Apply locus-aware retention: decay episodes in-database, leave others untouched.
+
+        Previous implementation fetched ALL active rows into Python just to
+        skip ~90% of them.  This version pushes the work into SQL, touching
+        only the rows that need to change.
+        """
+        now = _now()
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM memory_items WHERE status NOT IN ('archived', 'superseded')"
-            ).fetchall()
-            for row in rows:
-                entry = self._row_to_entry(row)
-                if entry.category in {"episodes"}:
-                    affected_categories.add(
-                        self.normalize_category_name(entry.category)
-                    )
-                    entry.decay(DECAY_FACTOR)
-                    entry.updated_at = _now()
-                    if entry.importance < MIN_IMPORTANCE:
-                        conn.execute(
-                            "UPDATE memory_items SET status = 'archived', updated_at = ? WHERE id = ?",
-                            (_now(), entry.id),
-                        )
-                        self._delete_fts_rows(conn, [entry.id])
-                    else:
-                        affected_categories.update(self._write_entry_row(conn, entry))
-                elif entry.category in {
-                    "identity",
-                    "projects",
-                    "procedures",
-                    "people",
-                    "concepts",
-                }:
-                    continue
-                elif entry.category == "tasks":
-                    continue
-        self._sync_after_mutation(affected_categories)
+            # Step 1: decay importance for all active episodes in a single UPDATE.
+            conn.execute(
+                """
+                UPDATE memory_items
+                SET importance = importance * ?,
+                    updated_at  = ?
+                WHERE category = 'episodes'
+                  AND status NOT IN ('archived', 'superseded')
+                """,
+                (DECAY_FACTOR, now),
+            )
+            # Step 2: archive episodes that fell below the importance floor.
+            archived_ids = [
+                row["id"]
+                for row in conn.execute(
+                    """
+                    SELECT id FROM memory_items
+                    WHERE category = 'episodes'
+                      AND importance < ?
+                      AND status NOT IN ('archived', 'superseded')
+                    """,
+                    (MIN_IMPORTANCE,),
+                ).fetchall()
+            ]
+            if archived_ids:
+                conn.execute(
+                    f"""
+                    UPDATE memory_items
+                    SET status     = 'archived',
+                        updated_at = ?
+                    WHERE id IN ({",".join("?" for _ in archived_ids)})
+                    """,
+                    (now, *archived_ids),
+                )
+                self._delete_fts_rows(conn, archived_ids)
+        self._sync_after_mutation({"episodes"})
 
     def maintenance_snapshot(self, limit: int = 20) -> str:
         """Return a text summary derived from the structured store, not markdown projections."""
@@ -2755,33 +2818,131 @@ class ConsolidationEngine:
         decay_factor: float = DECAY_FACTOR,
         sleep_token_ratio: float = SLEEP_TOKEN_RATIO,
         keep_last_messages: int = 6,
+        max_source_tokens: int = CONSOLIDATION_MAX_SOURCE_TOKENS,
     ):
         self.store = store
         self.max_categories = max_categories
         self.decay_factor = decay_factor
         self.sleep_token_ratio = sleep_token_ratio
         self.keep_last_messages = keep_last_messages
+        self.max_source_tokens = max(1, int(max_source_tokens))
 
     # ── Trigger ───────────────────────────────────────────────────────────────
 
     def estimate_tokens(self, messages: list[dict]) -> int:
-        """Rough token estimate: total chars / CHARS_PER_TOKEN."""
-        total_chars = 0
+        """Token estimate with CJK-awareness.
+
+        English/Latin text:  ~4 chars per token  (unchanged)
+        CJK characters:      ~1 char per token   (each hanzi/kanji is 1-2 tokens)
+
+        Without this distinction the estimate for Chinese conversations is ~4x
+        too low, causing the compact trigger to fire far later than intended.
+        Also counts tool_use `input` payloads which the previous implementation
+        silently ignored.
+        """
+        _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+
+        def _count(text: str) -> int:
+            cjk = len(_CJK_RE.findall(text))
+            non_cjk = len(text) - cjk
+            return cjk + non_cjk // CHARS_PER_TOKEN
+
+        total = 0
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                total_chars += len(content)
+                total += _count(content)
             elif isinstance(content, list):
                 for block in content:
-                    if isinstance(block, dict):
-                        total_chars += len(
-                            str(block.get("text", "") or block.get("content", ""))
-                        )
-        return total_chars // CHARS_PER_TOKEN
+                    if not isinstance(block, dict):
+                        continue
+                    # text / tool_result content
+                    text_val = block.get("text", "") or block.get("content", "")
+                    total += _count(str(text_val))
+                    # tool_use input JSON (was previously ignored)
+                    inp = block.get("input")
+                    if inp is not None:
+                        total += _count(json.dumps(inp, ensure_ascii=False))
+        return total
 
     def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
         return self.estimate_tokens(messages) >= int(
             max_tokens * self.sleep_token_ratio
+        )
+
+    def _message_lines_for_llm(self, messages: list[dict]) -> list[str]:
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown").upper()
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = [
+                    block.get("text", "") or block.get("content", "")
+                    for block in content
+                    if isinstance(block, dict)
+                ]
+                content = " ".join(str(p) for p in parts)
+            lines.append(f"{role}: {content}")
+        return lines
+
+    def _chunk_messages_for_llm(self, messages: list[dict]) -> list[str]:
+        """Return bounded conversation chunks for extraction prompts.
+
+        We use a conservative one-char-per-token upper bound so no chunk can
+        exceed the configured budget, even for CJK-heavy inputs.
+        """
+        max_chars = self.max_source_tokens
+        chunks: list[str] = []
+        current_lines: list[str] = []
+        current_len = 0
+
+        for line in self._message_lines_for_llm(messages):
+            segments = [line[i : i + max_chars] for i in range(0, len(line), max_chars)]
+            if not segments:
+                segments = [line]
+            for segment in segments:
+                extra_len = len(segment) if not current_lines else len(segment) + 2
+                if current_lines and current_len + extra_len > max_chars:
+                    chunks.append("\n\n".join(current_lines))
+                    current_lines = [segment]
+                    current_len = len(segment)
+                else:
+                    current_lines.append(segment)
+                    current_len += extra_len
+
+        if current_lines:
+            chunks.append("\n\n".join(current_lines))
+        return chunks
+
+    def _build_consolidation_prompt(
+        self,
+        conversation_text: str,
+        source_label: str,
+        chunk_index: int,
+        chunk_count: int,
+    ) -> str:
+        chunk_label = (
+            f"{source_label}, chunk {chunk_index}/{chunk_count}"
+            if chunk_count > 1
+            else source_label
+        )
+        return (
+            f"Analyze this conversation and extract important facts worth remembering.\n"
+            f"For each item output JSON on its own line (no markdown fences):\n"
+            f'{{"locus": "<one of {", ".join(PALACE_LOCI)}>", "entity": "<anchor>", '
+            f'"memory_type": "<type>", "content": "<fact>", "importance": <0.1-1.0>, "confidence": <0.1-1.0>}}\n\n'
+            f"Rules:\n"
+            f"- Use only the fixed loci listed above; never invent new top-level loci\n"
+            f"- identity: user preferences/style/constraints\n"
+            f"- projects: project decisions/state/risks\n"
+            f"- people: person-specific facts\n"
+            f"- concepts: durable domain knowledge\n"
+            f"- tasks: commitments, next steps, open loops\n"
+            f"- procedures: repeatable workflows and preferred methods\n"
+            f"- archive: only if the memory is historical or superseded\n"
+            f"- Do not output episodes; session summary is generated separately\n"
+            f"- Be selective: max 8 items, 1-2 sentences each\n\n"
+            f"Conversation ({chunk_label}):\n{conversation_text}"
         )
 
     # ── Main consolidation ────────────────────────────────────────────────────
@@ -2809,63 +2970,56 @@ class ConsolidationEngine:
         # Choose extraction source
         staged = staging.read_all() if staging else []
         source = staged if staged else messages
-        conv_text = self._format_messages_for_llm(source)
+        if not source:
+            compressed = messages[-keep_last:] if len(messages) > keep_last else messages
+            CONSOLE.print(
+                f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
+            )
+            return compressed
         source_label = (
             f"staging ({len(staged)} turns)"
             if staged
             else f"messages ({len(messages)})"
         )
-
-        prompt = (
-            f"Analyze this conversation and extract important facts worth remembering.\n"
-            f"For each item output JSON on its own line (no markdown fences):\n"
-            f'{{"locus": "<one of {", ".join(PALACE_LOCI)}>", "entity": "<anchor>", '
-            f'"memory_type": "<type>", "content": "<fact>", "importance": <0.1-1.0>, "confidence": <0.1-1.0>}}\n\n'
-            f"Rules:\n"
-            f"- Use only the fixed loci listed above; never invent new top-level loci\n"
-            f"- identity: user preferences/style/constraints\n"
-            f"- projects: project decisions/state/risks\n"
-            f"- people: person-specific facts\n"
-            f"- concepts: durable domain knowledge\n"
-            f"- tasks: commitments, next steps, open loops\n"
-            f"- procedures: repeatable workflows and preferred methods\n"
-            f"- archive: only if the memory is historical or superseded\n"
-            f"- Do not output episodes; session summary is generated separately\n"
-            f"- Be selective: max 8 items, 1-2 sentences each\n\n"
-            f"Conversation ({source_label}):\n{conv_text[:3000]}"
-        )
+        conversation_chunks = self._chunk_messages_for_llm(source)
 
         try:
+            raw_responses: list[str] = []
+            for idx, chunk_text in enumerate(conversation_chunks, start=1):
+                prompt = self._build_consolidation_prompt(
+                    chunk_text, source_label, idx, len(conversation_chunks)
+                )
+                if api_format == "anthropic":
+                    resp = await client.messages.create(
+                        model=model,
+                        max_tokens=1024,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    raw_responses.append(resp.content[0].text)
+                else:
+                    resp = await client.chat.completions.create(
+                        model=model,
+                        max_tokens=1024,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    raw_responses.append(resp.choices[0].message.content or "")
+
             entries = [
                 self._build_episode_entry(source, staging.session_id if staging else "")
             ]
-            if api_format == "anthropic":
-                resp = await client.messages.create(
-                    model=model,
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                raw = resp.content[0].text
-            else:
-                resp = await client.chat.completions.create(
-                    model=model,
-                    max_tokens=1024,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                raw = resp.choices[0].message.content or ""
-
-            entries.extend(self._parse_entries(raw))
-            for entry in entries:
-                self.store.add_entry(entry)
+            for raw in raw_responses:
+                entries.extend(self._parse_entries(raw))
+            self.store.add_entries(entries)
 
             self.store.apply_retention()
 
             # Clear staging after successful extraction
-            if staging:
-                staging.clear_all()
+            if staging and staged:
+                staging.drop_prefix(len(staged))
 
             CONSOLE.print(
-                f"[dim]💤 Stored {len(entries)} entries from {source_label}. "
+                f"[dim]💤 Stored {len(entries)} entries from {source_label} "
+                f"across {len(conversation_chunks)} chunk(s). "
                 f"Dynamic categories: {self.store.dynamic_category_count()}/{self.max_categories}[/dim]"
             )
         except Exception as e:
@@ -2880,19 +3034,7 @@ class ConsolidationEngine:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _format_messages_for_llm(self, messages: list[dict]) -> str:
-        lines = []
-        for msg in messages:
-            role = msg.get("role", "unknown").upper()
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                parts = [
-                    block.get("text", "") or block.get("content", "")
-                    for block in content
-                    if isinstance(block, dict)
-                ]
-                content = " ".join(str(p) for p in parts)
-            lines.append(f"{role}: {content}")
-        return "\n\n".join(lines)
+        return "\n\n".join(self._message_lines_for_llm(messages))
 
     def _parse_entries(self, raw: str) -> list[LTMEntry]:
         entries = []
@@ -3053,26 +3195,39 @@ class ContextManager:
         with self._lock:
             if not self._needs_consolidation:
                 return False
+            # Fast path: count() is an in-memory counter; no file I/O needed.
+            if self.staging.count() >= self.staging_turn_threshold:
+                return True
+            # Slow path: only read the file to check the token threshold.
             staged = self.staging.read_all()
         if not staged:
             return False
-        if len(staged) >= self.staging_turn_threshold:
-            return True
         return (
             self.consolidation.estimate_tokens(staged) >= self.staging_token_threshold
         )
 
     def enqueue_consolidation(self, reason: str) -> None:
         """Queue one consolidation job if there is staged work pending."""
+        self.enqueue_staging_job(reason, self.staging)
+
+    def enqueue_staging_job(self, reason: str, staging: "StagingBuffer") -> None:
+        """Queue consolidation for an explicit staging buffer."""
         with self._lock:
-            if self.staging.count() == 0:
+            if staging.count() == 0:
                 return
-            if self._jobs:
+            staging_path = str(staging.path.resolve())
+            session_id = staging.session_id
+            if any(
+                job.get("staging_path", str(self.staging.path.resolve())) == staging_path
+                and job.get("session_id", self.staging.session_id) == session_id
+                for job in self._jobs
+            ):
                 return
             self._jobs.append(
                 {
                     "reason": reason,
-                    "session_id": self.staging.session_id,
+                    "session_id": session_id,
+                    "staging_path": staging_path,
                     "queued_at": _now(),
                 }
             )
@@ -3096,8 +3251,21 @@ class ContextManager:
         with self._lock:
             return len(self._jobs)
 
+    def _job_staging(self, job: dict) -> tuple["StagingBuffer", bool]:
+        path_value = job.get("staging_path")
+        session_id = str(job.get("session_id", self.staging.session_id))
+        if not path_value:
+            return self.staging, True
+        path = Path(path_value).resolve()
+        if path == self.staging.path.resolve() and session_id == self.staging.session_id:
+            return self.staging, True
+        return StagingBuffer(path=path, session_id=session_id), False
+
     def should_process_jobs(self) -> bool:
-        return self.pending_jobs() > 0 and self.idle_elapsed() >= self.idle_seconds
+        with self._lock:
+            has_pending = bool(self._jobs)
+            has_staged_work = self._needs_consolidation and self.staging.count() > 0
+        return (has_pending or has_staged_work) and self.idle_elapsed() >= self.idle_seconds
 
     def should_compact_messages(self, messages: list[dict], max_tokens: int) -> bool:
         """Front-end compaction keeps working memory bounded without network calls."""
@@ -3128,10 +3296,59 @@ class ContextManager:
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
+    def _is_episode_recall_query(self, query: str) -> bool:
+        q = query.lower()
+
+        explicit_keywords = self.route_keywords.get("episodes", ())
+        if any(keyword in q for keyword in explicit_keywords):
+            return True
+
+        zh_phrases = (
+            "对话历史",
+            "聊天内容",
+            "聊天记录",
+            "刚才的对话",
+            "刚刚的对话",
+            "本次会话",
+            "这次会话",
+        )
+        if any(phrase in q for phrase in zh_phrases):
+            return True
+
+        zh_recent = ("刚才", "刚刚", "上次", "之前")
+        zh_conversation = ("聊", "说", "提", "问", "讨论", "对话", "聊天")
+        if any(marker in q for marker in zh_recent) and any(
+            marker in q for marker in zh_conversation
+        ):
+            return True
+
+        en_phrases = (
+            "conversation history",
+            "chat history",
+            "recent conversation",
+            "earlier conversation",
+            "previous conversation",
+            "current conversation",
+        )
+        if any(phrase in q for phrase in en_phrases):
+            return True
+
+        en_recent = ("just", "earlier", "recently", "previously", "last time")
+        en_conversation = ("talk", "chat", "discuss", "say", "ask", "conversation")
+        if any(marker in q for marker in en_recent) and any(
+            marker in q for marker in en_conversation
+        ):
+            return True
+        return False
+
     def _route_categories(self, query: str) -> list[str]:
         q = query.lower()
         routes: list[str] = []
+        if self._is_episode_recall_query(query):
+            routes.append("episodes")
         for category, keywords in self.route_keywords.items():
+            if category == "episodes":
+                continue
             if any(keyword in q for keyword in keywords):
                 if category == "projects":
                     routes.extend(["projects", "tasks"])
@@ -3144,15 +3361,33 @@ class ContextManager:
         return seen
 
     def retrieve_ltm_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
-        """Return top-K relevant LTM entries as an injectable string."""
+        """Return top-K relevant LTM entries as an injectable string.
+
+        Two-stage retrieval:
+          1. SQLite FTS5 fetches a broad candidate set (top_k * 3) via BM25.
+          2. LocalRetriever re-ranks candidates with importance-boosted BM25
+             (score = fts_bm25 × (1 + importance)) and returns the final top_k.
+
+        Using only FTS5 misses the importance boost; using only LocalRetriever
+        on all rows would be O(n) in Python. Two-stage gives the best of both.
+        """
         categories = self._route_categories(query)
-        top = self.store.search_entries(
-            query, categories=categories or None, limit=top_k
+        # Fetch a wider candidate pool so the re-ranker has good material.
+        candidates = self.store.search_entries(
+            query, categories=categories or None, limit=top_k * 3
         )
-        if not top and categories:
-            top = self.store.search_entries(query, categories=None, limit=top_k)
-        if not top:
+        if not candidates and categories:
+            candidates = self.store.search_entries(
+                query, categories=None, limit=top_k * 3
+            )
+        if not candidates and self._is_episode_recall_query(query):
+            candidates = self.store.read_entries("episodes")[: top_k * 3]
+        if not candidates:
             return ""
+        # Re-rank with importance-boosted BM25 and take the final top_k.
+        top = self.retriever.retrieve(query, candidates, top_k=top_k)
+        if not top:
+            top = candidates[:top_k]
         lines = ["## Retrieved Context (from long-term memory)"]
         for e in top:
             anchor = f"{e.category}/{e.entity}" if e.entity else e.category
@@ -3178,6 +3413,25 @@ class ContextManager:
         recent = self._recent_session_context()
         if recent:
             sections.append(recent)
+        ltm = self.retrieve_ltm_context(query, top_k=top_k)
+        if ltm:
+            sections.append(ltm)
+        return "\n\n".join(sections)
+
+    def retrieve_implicit_context(
+        self, query: str, top_k: int = RETRIEVAL_TOP_K
+    ) -> str:
+        """Return context for automatic prompt injection.
+
+        Keep routine prompt augmentation focused on LTM, and only include the
+        in-session staging buffer when the user is explicitly asking to recall
+        recent conversation.
+        """
+        sections = []
+        if "episodes" in self._route_categories(query):
+            recent = self._recent_session_context()
+            if recent:
+                sections.append(recent)
         ltm = self.retrieve_ltm_context(query, top_k=top_k)
         if ltm:
             sections.append(ltm)
@@ -3220,17 +3474,19 @@ class ContextManager:
             return False
 
         try:
+            staging_buffer, is_primary_staging = self._job_staging(job)
             with self._lock:
-                staged = self.staging.read_all()
+                staged = staging_buffer.read_all()
             if not staged:
-                with self._lock:
-                    self._needs_consolidation = False
+                if is_primary_staging:
+                    with self._lock:
+                        self._needs_consolidation = False
                 return False
 
             if extractor is not None:
                 entries = [
                     self.consolidation._build_episode_entry(
-                        staged, self.staging.session_id
+                        staged, staging_buffer.session_id
                     )
                 ]
                 extracted = extractor(staged, job)
@@ -3240,12 +3496,12 @@ class ContextManager:
                     elif isinstance(item, dict):
                         lines = json.dumps(item, ensure_ascii=False)
                         entries.extend(self.consolidation._parse_entries(lines))
-                for entry in entries:
-                    self.store.add_entry(entry)
+                self.store.add_entries(entries)
                 self.store.apply_retention()
-                with self._lock:
-                    self.staging.clear_all()
-                    self._needs_consolidation = False
+                staging_buffer.drop_prefix(len(staged))
+                if is_primary_staging:
+                    with self._lock:
+                        self._needs_consolidation = False
                 return True
 
             await self.consolidation.consolidate(
@@ -3253,10 +3509,11 @@ class ContextManager:
                 client,
                 model,
                 api_format,
-                staging=self.staging,
+                staging=staging_buffer,
             )
-            with self._lock:
-                self._needs_consolidation = False
+            if is_primary_staging:
+                with self._lock:
+                    self._needs_consolidation = False
             return True
         finally:
             with self._lock:
@@ -3267,7 +3524,6 @@ class ContextManager:
     def stats(self) -> dict:
         cats = self.store.list_categories()
         return {
-            "categories": self.store.dynamic_category_count(),
             "dynamic_categories": self.store.dynamic_category_count(),
             "total_categories": len(cats),
             "total_entries": sum(c.entry_count for c in cats),
@@ -4246,9 +4502,16 @@ class BaseAgent:
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
         try:
-            # Inject relevant LTM context into system prompt for this turn
+            # Inject relevant context into system prompt for this turn.
+            # retrieve_context() includes both:
+            #   1. Recent staging buffer turns (current session, not yet consolidated)
+            #   2. LTM search results (historical sessions)
+            # Using retrieve_ltm_context() alone would miss any conversation from
+            # the current session that has been compacted out of ctx.messages but
+            # not yet consolidated into LTM, causing the agent to "forget" recent
+            # turns when asked about them.
             if self.context_manager:
-                retrieved = self.context_manager.retrieve_ltm_context(user_message)
+                retrieved = self.context_manager.retrieve_implicit_context(user_message)
                 if retrieved:
                     ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
             skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
@@ -5501,13 +5764,35 @@ async def _interactive_loop(components: dict, cfg: dict):
             components["client"],
             components["model"],
             agent.api_format,
-            client_factory=lambda: ModelClientFactory.from_config(cfg)[0],
+            client_factory=lambda: ModelClientFactory.from_config(cfg, announce=False)[0],
         )
         if ctx_mgr
         else None
     )
     if memory_worker:
         memory_worker.start()
+
+    # Queue orphaned staging files from previous sessions for background
+    # recovery. Doing this synchronously would block startup on a network model
+    # call before the user even sees the prompt.
+    if ctx_mgr:
+        staging_dir = STAGING_DIR
+        current_sid = ctx_mgr.staging.session_id
+        orphans = [
+            p for p in staging_dir.glob("*.jsonl")
+            if p.stem != current_sid and p.stat().st_size > 0
+        ]
+        if orphans:
+            CONSOLE.print(
+                f"[dim]💤 Queueing recovery for {len(orphans)} orphaned session(s)...[/dim]"
+            )
+            for orphan_path in orphans:
+                ctx_mgr.enqueue_staging_job(
+                    "orphan_recovery",
+                    StagingBuffer(path=orphan_path, session_id=orphan_path.stem),
+                )
+            if memory_worker:
+                memory_worker.wake()
 
     CONSOLE.print(
         Panel(
@@ -5551,7 +5836,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                         table.add_column("Value")
                         table.add_row(
                             "Dynamic Categories",
-                            f"{stats['categories']}/{stats['max_categories']}",
+                            f"{stats['dynamic_categories']}/{stats['max_categories']}",
                         )
                         table.add_row(
                             "Total Categories", str(stats["total_categories"])
@@ -5796,14 +6081,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                     ctx.messages, agent.max_tokens
                 ):
                     ctx.messages = ctx_mgr.compact_messages(ctx.messages)
-                    # Re-inject the original task context into the system prompt so
-                    # it remains visible to the LLM even after early messages are
-                    # dropped.  Reset on the next user turn via _task_context.
-                    if _task_context and _task_context not in ctx.system_prompt:
-                        ctx.system_prompt = (
-                            system_prompt
-                            + f"\n\n## Current Task Context (original request)\n{_task_context}"
-                        )
+                    # Rebuild from the latest composed system prompt so prompt
+                    # updates from /evolve or /generate-tool are preserved even
+                    # after message compaction drops earlier turns.
+                    ctx.system_prompt = _with_task_context(
+                        components["system_prompt"], _task_context
+                    )
                     # Trigger background consolidation of the staging buffer so
                     # facts from the dropped messages land in LTM and become
                     # available via retrieve_ltm_context() on the next turn.
@@ -5822,20 +6105,24 @@ async def _interactive_loop(components: dict, cfg: dict):
             memory_worker.stop()
             await memory_worker.wait()
 
-    # Session-end consolidation: digest any unprocessed staging content
-    if ctx_mgr and ctx_mgr.should_session_end_sleep():
-        CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
-        try:
-            ctx_mgr.enqueue_consolidation("session_end")
-            while ctx_mgr.pending_jobs():
-                await ctx_mgr.process_one_job(
-                    components["client"],
-                    components["model"],
-                    api_format=agent.api_format,
-                )
-            ctx.messages = ctx_mgr.compact_messages(ctx.messages)
-        except Exception as e:
-            CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
+        # Session-end consolidation runs inside the finally block so it is
+        # protected against KeyboardInterrupt during the input loop.  A single
+        # ^C is caught by the inner except and causes a normal break; the
+        # finally block then runs this code before the process exits.
+        # (A ^C^C that arrives *here* can still abort — that is user intent.)
+        if ctx_mgr and ctx_mgr.should_session_end_sleep():
+            CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
+            try:
+                ctx_mgr.enqueue_consolidation("session_end")
+                while ctx_mgr.pending_jobs():
+                    await ctx_mgr.process_one_job(
+                        components["client"],
+                        components["model"],
+                        api_format=agent.api_format,
+                    )
+                ctx.messages = ctx_mgr.compact_messages(ctx.messages)
+            except Exception as e:
+                CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
 
     # End of session scoring
     if len(ctx.messages) >= 2:

@@ -905,6 +905,330 @@ def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
     assert evolution.calls == 0
 
 
+def test_interactive_loop_context_command_uses_dynamic_category_stats(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    class _FakeAgent:
+        api_format = "openai"
+        max_tokens = 1024
+        model = "fake-model"
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            return agent_module.AgentResult(agent_id="agent", content="unused")
+
+    class _FakeMemory:
+        def list_chapters(self):
+            return []
+
+    class _FakeEvolution:
+        async def rewrite_system_prompt(self):
+            return "unused"
+
+        def get_stats(self):
+            return {"total": 0, "avg_score": 0}
+
+    class _FakeSkillCatalog:
+        def list_skills(self):
+            return []
+
+    class _FakeUserToolCatalog:
+        def load_into_registry(self, registry):
+            return []
+
+    class _FakeContextManager:
+        class staging:
+            session_id = "session-1"
+
+        def stats(self):
+            return {
+                "dynamic_categories": 2,
+                "total_categories": 8,
+                "total_entries": 14,
+                "category_names": ["identity", "projects"],
+                "max_categories": 15,
+                "needs_consolidation": False,
+                "queued_jobs": 0,
+                "staged_turns": 0,
+                "idle_elapsed_s": 0,
+                "idle_threshold_s": 300,
+            }
+
+        def should_session_end_sleep(self):
+            return False
+
+    class _FakeBackgroundMemoryWorker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        async def wait(self):
+            return None
+
+    monkeypatch.setattr(
+        agent_module, "BackgroundMemoryWorker", _FakeBackgroundMemoryWorker
+    )
+    monkeypatch.setattr(agent_module, "STAGING_DIR", tmp_path / "staging")
+
+    answers = iter(["/context", "/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    components = {
+        "agent": _FakeAgent(),
+        "memory": _FakeMemory(),
+        "evolution": _FakeEvolution(),
+        "system_prompt": "system-v1",
+        "base_system_prompt": "system-v1",
+        "skill_catalog": _FakeSkillCatalog(),
+        "user_tool_catalog": _FakeUserToolCatalog(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path / "output",
+        "context_manager": _FakeContextManager(),
+        "client": object(),
+        "model": "fake-model",
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+
+def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    class _FakeAgent:
+        api_format = "openai"
+        max_tokens = 1024
+        model = "fake-model"
+
+        def __init__(self):
+            self.ctx = None
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            self.ctx = ctx
+            return agent_module.AgentResult(agent_id="agent", content="reply")
+
+    class _FakeMemory:
+        def list_chapters(self):
+            return []
+
+    class _FakeEvolution:
+        async def rewrite_system_prompt(self):
+            return "system-v2"
+
+        def get_stats(self):
+            return {"total": 0, "avg_score": 0}
+
+    class _FakeSkillCatalog:
+        def list_skills(self):
+            return []
+
+    class _FakeUserToolCatalog:
+        def load_into_registry(self, registry):
+            return []
+
+    class _FakeStaging:
+        session_id = "session-1"
+
+        def append(self, role, content):
+            return None
+
+        def count(self):
+            return 0
+
+    class _FakeContextManager:
+        def __init__(self):
+            self.staging = _FakeStaging()
+
+        def mark_activity(self):
+            pass
+
+        def should_enqueue_consolidation(self):
+            return False
+
+        def enqueue_consolidation(self, reason):
+            pass
+
+        def should_compact_messages(self, messages, max_tokens):
+            return True
+
+        def compact_messages(self, messages):
+            return messages
+
+        def should_session_end_sleep(self):
+            return False
+
+    class _FakeBackgroundMemoryWorker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        async def wait(self):
+            return None
+
+        def wake(self):
+            pass
+
+    monkeypatch.setattr(
+        agent_module, "BackgroundMemoryWorker", _FakeBackgroundMemoryWorker
+    )
+    monkeypatch.setattr(agent_module, "STAGING_DIR", tmp_path / "staging")
+    monkeypatch.setattr(
+        agent_module,
+        "_compose_system_prompt",
+        lambda base_prompt, registry, workspace_root, output_dir, skill_catalog=None: f"COMPOSED::{base_prompt}",
+    )
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
+
+    answers = iter(["first task", "/evolve", "second task", "/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    fake_agent = _FakeAgent()
+    components = {
+        "agent": fake_agent,
+        "memory": _FakeMemory(),
+        "evolution": _FakeEvolution(),
+        "system_prompt": "COMPOSED::system-v1",
+        "base_system_prompt": "system-v1",
+        "skill_catalog": _FakeSkillCatalog(),
+        "user_tool_catalog": _FakeUserToolCatalog(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path / "output",
+        "context_manager": _FakeContextManager(),
+        "client": object(),
+        "model": "fake-model",
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    assert fake_agent.ctx.system_prompt.startswith("COMPOSED::system-v2")
+
+
+def test_interactive_loop_queues_orphan_recovery_in_background(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    orphan_dir = tmp_path / "staging"
+    orphan_dir.mkdir()
+    orphan_path = orphan_dir / "orphan-session.jsonl"
+    orphan_path.write_text(
+        '{"role":"user","content":"old turn","ts":"2026-04-13 00:00 UTC"}\n',
+        encoding="utf-8",
+    )
+
+    class _FakeAgent:
+        api_format = "openai"
+        max_tokens = 1024
+        model = "fake-model"
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            return agent_module.AgentResult(agent_id="agent", content="unused")
+
+    class _FakeMemory:
+        def list_chapters(self):
+            return []
+
+    class _FakeEvolution:
+        def get_stats(self):
+            return {"total": 0, "avg_score": 0}
+
+    class _FakeSkillCatalog:
+        def list_skills(self):
+            return []
+
+    class _FakeUserToolCatalog:
+        def load_into_registry(self, registry):
+            return []
+
+    class _FakeStaging:
+        session_id = "current-session"
+
+        def count(self):
+            return 0
+
+    class _FakeContextManager:
+        def __init__(self):
+            self.staging = _FakeStaging()
+            self.queued = []
+
+        def enqueue_staging_job(self, reason, staging):
+            self.queued.append((reason, staging.path.name, staging.session_id))
+
+        def should_session_end_sleep(self):
+            return False
+
+    wakes = []
+
+    class _FakeBackgroundMemoryWorker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        async def wait(self):
+            return None
+
+        def wake(self):
+            wakes.append("wake")
+
+    monkeypatch.setattr(
+        agent_module, "BackgroundMemoryWorker", _FakeBackgroundMemoryWorker
+    )
+    monkeypatch.setattr(agent_module, "STAGING_DIR", orphan_dir)
+
+    answers = iter(["/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    fake_ctx_mgr = _FakeContextManager()
+    components = {
+        "agent": _FakeAgent(),
+        "memory": _FakeMemory(),
+        "evolution": _FakeEvolution(),
+        "system_prompt": "system-v1",
+        "base_system_prompt": "system-v1",
+        "skill_catalog": _FakeSkillCatalog(),
+        "user_tool_catalog": _FakeUserToolCatalog(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path / "output",
+        "context_manager": fake_ctx_mgr,
+        "client": object(),
+        "model": "fake-model",
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    assert fake_ctx_mgr.queued == [
+        ("orphan_recovery", "orphan-session.jsonl", "orphan-session")
+    ]
+    assert wakes == ["wake"]
+
+
 def test_save_config_uses_atomic_replace(monkeypatch, tmp_path):
     import agent as agent_module
 

@@ -145,6 +145,28 @@ def test_clear_all_then_append(tmp_path):
     assert msgs[0]["content"] == "after clear"
 
 
+def test_drop_prefix_uses_atomic_write(tmp_path, monkeypatch):
+    import agent as agent_module
+
+    buf = make_staging(tmp_path)
+    buf.append("user", "first")
+    buf.append("assistant", "second")
+
+    calls = []
+    real_atomic_write = agent_module._atomic_write_text
+
+    def recording_atomic_write(path, content, encoding="utf-8"):
+        calls.append((path, content))
+        real_atomic_write(path, content, encoding=encoding)
+
+    monkeypatch.setattr(agent_module, "_atomic_write_text", recording_atomic_write)
+
+    buf.drop_prefix(1)
+
+    assert calls
+    assert [msg["content"] for msg in buf.read_all()] == ["second"]
+
+
 def test_should_session_end_sleep_uses_staging(tmp_path):
     """ContextManager.should_session_end_sleep fires when staging has content."""
     from agent import (
@@ -200,6 +222,46 @@ def test_retrieve_context_includes_current_session_staging(tmp_path):
     assert "Current Session" in result
     assert "Explain decorators in Python" in result
     assert "Python decorators and wrappers" in result
+
+
+def test_retrieve_implicit_context_skips_current_session_for_non_recall_queries(tmp_path):
+    from agent import (
+        LTMEntry,
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    store.add_entry(
+        LTMEntry(
+            id="pref-1",
+            category="identity",
+            entity="user",
+            content="Prefers concise responses",
+            importance=0.8,
+            memory_type="preference",
+            created_at="2026-04-13",
+            updated_at="2026-04-13",
+        )
+    )
+    staging = StagingBuffer(path=tmp_path / "staging.jsonl")
+    staging.append("user", "We just talked about decorators.")
+    staging.append("assistant", "Right, and wrappers too.")
+
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=staging,
+    )
+
+    result = ctx_mgr.retrieve_implicit_context("concise responses")
+
+    assert "Prefers concise responses" in result
+    assert "Current Session" not in result
 
 
 def test_sleep_clears_staging(tmp_path):
