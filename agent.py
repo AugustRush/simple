@@ -486,9 +486,16 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
+    @staticmethod
+    def _error_payload(tool_name: str, message: str) -> str:
+        return json.dumps(
+            {"ok": False, "tool": tool_name, "error": message},
+            ensure_ascii=False,
+        )
+
     async def call(self, tool_name: str, tool_input: dict) -> str:
         if tool_name not in self._tools:
-            return f"Error: tool '{tool_name}' not found"
+            return self._error_payload(tool_name, f"tool '{tool_name}' not found")
         try:
             fn = self._tools[tool_name].fn
             if asyncio.iscoroutinefunction(fn):
@@ -499,15 +506,15 @@ class ToolRegistry:
                 return json.dumps(result, ensure_ascii=False)
             return "" if result is None else str(result)
         except (asyncio.TimeoutError, TimeoutError):
-            return f"Timeout calling tool '{tool_name}'"
+            return self._error_payload(tool_name, f"Timeout calling tool '{tool_name}'")
         except ValueError as e:
-            return f"Invalid input for tool '{tool_name}': {e}"
+            return self._error_payload(tool_name, f"Invalid input for tool '{tool_name}': {e}")
         except Exception as e:
             if self.console is not None:
                 self.console.print(
                     f"[yellow]Tool '{tool_name}' failed: {e}\n{traceback.format_exc()}[/yellow]"
                 )
-            return f"Error calling tool '{tool_name}': {e}"
+            return self._error_payload(tool_name, f"Error calling tool '{tool_name}': {e}")
 
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())

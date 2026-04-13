@@ -68,10 +68,13 @@ def test_registry_call_sanitizes_exceptions():
     registry.register("explode", "fails", {"type": "object"}, boom)
 
     result = asyncio.run(registry.call("explode", {}))
+    payload = json.loads(result)
 
-    assert "boom" in result
-    assert "Traceback" not in result
-    assert "tests/test_builtin_tools.py" not in result
+    assert payload["ok"] is False
+    assert payload["tool"] == "explode"
+    assert "boom" in payload["error"]
+    assert "Traceback" not in payload["error"]
+    assert "tests/test_builtin_tools.py" not in payload["error"]
 
 
 def test_registry_call_json_encodes_structured_results():
@@ -412,5 +415,43 @@ def test_registry_call_classifies_value_errors():
     registry.register("explode", "fails", {"type": "object"}, bad_input)
 
     result = asyncio.run(registry.call("explode", {}))
+    payload = json.loads(result)
 
-    assert "Invalid input for tool 'explode'" in result
+    assert payload == {
+        "ok": False,
+        "tool": "explode",
+        "error": "Invalid input for tool 'explode': invalid input",
+    }
+
+
+def test_registry_call_returns_structured_error_for_missing_tool():
+    from agent import ToolRegistry
+
+    registry = ToolRegistry()
+
+    result = asyncio.run(registry.call("missing", {}))
+
+    assert json.loads(result) == {
+        "ok": False,
+        "tool": "missing",
+        "error": "tool 'missing' not found",
+    }
+
+
+def test_registry_call_returns_structured_error_for_timeout():
+    from agent import ToolRegistry
+
+    registry = ToolRegistry()
+
+    async def slow():
+        raise asyncio.TimeoutError()
+
+    registry.register("slow", "slow", {"type": "object"}, slow)
+
+    result = asyncio.run(registry.call("slow", {}))
+
+    assert json.loads(result) == {
+        "ok": False,
+        "tool": "slow",
+        "error": "Timeout calling tool 'slow'",
+    }
