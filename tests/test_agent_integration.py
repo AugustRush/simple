@@ -562,7 +562,13 @@ def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
     assert observed["context_manager"] is sentinel_context_manager
     assert observed["required_skills"] == ["quality/review"]
     assert observed["skill_catalog"] == "catalog"
-    assert observed["system_prompt"] == "augmented prompt"
+    # B3 fix: sub-agent must be built from base_system_prompt + sub-registry
+    # capabilities, NOT from the parent's LTM-mutated active context prompt.
+    # The composed prompt starts with the base and appends "## Active Capabilities".
+    assert observed["system_prompt"].startswith("base system prompt")
+    assert "## Active Capabilities" in observed["system_prompt"]
+    # spawn_agent must NOT be listed in sub-agent capabilities (it was excluded).
+    assert "spawn_agent" not in observed["system_prompt"]
     assert observed["user_message"] == "inspect the output"
     assert payload["ok"] is False
     assert payload["role"] == "critic"

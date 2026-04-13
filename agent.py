@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import copy
 from contextlib import AsyncExitStack
 import importlib.util
 import math
@@ -64,7 +65,9 @@ DEFAULT_MAX_TOKENS = 8192
 MEMORY_TIDY_INTERVAL = 3600  # seconds
 MEMORY_TIDY_FILE_THRESHOLD = 5
 DEFAULT_MAX_PARALLEL_AGENTS = 3
-DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 60
+DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 120
+MAX_TOOL_CALL_ITERATIONS = 40  # hard ceiling on tool-call rounds per send_message call
+REGULAR_TOOL_TIMEOUT = 120  # wall-clock timeout (s) for any single non-spawn tool call
 
 # ── Context Manager constants ──────────────────────────────────────────────────
 CONTEXT_DIR = AGENT_HOME / "context"
@@ -1200,6 +1203,12 @@ class BuiltinTools:
                 command=command,
                 timed_out=True,
             )
+        except asyncio.CancelledError:
+            # B6: when the outer coroutine is cancelled (e.g. sub-agent timeout via
+            # asyncio.wait_for), ensure the subprocess is killed so it doesn't linger
+            # as a zombie process running under a detached session.
+            await self._terminate_process(proc)
+            raise
         except ValueError as e:
             return self._error(f"Invalid shell input: {e}", command=command)
         except Exception as e:
@@ -4038,24 +4047,47 @@ class BaseAgent:
         return str(exc) or exc.__class__.__name__
 
     async def _run_tool_uses(self, tool_uses: list[dict]) -> list[str]:
-        async def _exec_tool(tu: dict) -> str:
-            if tu["name"] == "spawn_agent":
-                return await self.registry.call(tu["name"], tu["input"])
-            CONSOLE.print(f"\n[cyan]→ {tu['name']}[/cyan]")
-            res = await self.registry.call(tu["name"], tu["input"])
+        # D3: wrap each regular tool call with a wall-clock timeout so a hung
+        # user-generated tool cannot block the loop indefinitely.
+        async def _exec_regular(tu: dict) -> str:
+            name = tu["name"]
+            try:
+                res = await asyncio.wait_for(
+                    self.registry.call(name, tu["input"]),
+                    timeout=REGULAR_TOOL_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                res = json.dumps(
+                    {
+                        "ok": False,
+                        "error": f"tool '{name}' timed out after {REGULAR_TOOL_TIMEOUT}s",
+                    }
+                )
+            # M3: print name and result together atomically after the call
+            CONSOLE.print(f"\n[cyan]→ {name}[/cyan]")
             CONSOLE.print(f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]")
             return res
 
-        results: list[Optional[str]] = [None] * len(tool_uses)
+        # M2: use a sentinel so we can distinguish "tool not run" from "tool returned empty"
+        _MISSING = object()
+        results: list[Any] = [_MISSING] * len(tool_uses)
+
         regular_calls = [
             (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] != "spawn_agent"
         ]
         if regular_calls:
-            regular_results = await asyncio.gather(
-                *[_exec_tool(tu) for _, tu in regular_calls]
+            # D2: return_exceptions=True preserves successes when one tool errors
+            raw = await asyncio.gather(
+                *[_exec_regular(tu) for _, tu in regular_calls],
+                return_exceptions=True,
             )
-            for (idx, _), result in zip(regular_calls, regular_results):
-                results[idx] = result
+            for (idx, tu), outcome in zip(regular_calls, raw):
+                if isinstance(outcome, BaseException):
+                    results[idx] = json.dumps(
+                        {"ok": False, "error": f"tool '{tu['name']}' raised: {outcome}"}
+                    )
+                else:
+                    results[idx] = outcome
 
         spawn_calls = [
             (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] == "spawn_agent"
@@ -4071,15 +4103,38 @@ class BaseAgent:
                 CONSOLE.print(
                     f"\n[bold magenta]⟳ Spawning {len(spawn_calls)} agents in parallel:[/bold magenta] {roles}"
                 )
-            for start in range(0, len(spawn_calls), self.max_parallel_agents):
-                batch = spawn_calls[start : start + self.max_parallel_agents]
-                batch_results = await asyncio.gather(
-                    *[_exec_tool(tu) for _, tu in batch]
-                )
-                for (idx, _), result in zip(batch, batch_results):
-                    results[idx] = result
+            # D4: semaphore-based dispatch lets faster agents in later batches start
+            # as soon as a slot frees, rather than waiting for an entire batch to finish.
+            sem = asyncio.Semaphore(self.max_parallel_agents)
 
-        return [result or "" for result in results]
+            async def _exec_spawn_with_sem(tu: dict) -> str:
+                async with sem:
+                    return await self.registry.call(tu["name"], tu["input"])
+
+            # D5: return_exceptions=True prevents one failing spawn from cancelling others
+            raw_spawn = await asyncio.gather(
+                *[_exec_spawn_with_sem(tu) for _, tu in spawn_calls],
+                return_exceptions=True,
+            )
+            for (idx, tu), outcome in zip(spawn_calls, raw_spawn):
+                if isinstance(outcome, BaseException):
+                    results[idx] = json.dumps(
+                        {
+                            "ok": False,
+                            "role": tu["input"].get("role", "?"),
+                            "error": f"spawn failed: {outcome}",
+                        }
+                    )
+                else:
+                    results[idx] = outcome
+
+        # M2: replace any slot that was never assigned (programming error guard)
+        return [
+            r
+            if r is not _MISSING
+            else json.dumps({"ok": False, "error": "tool result missing"})
+            for r in results
+        ]
 
     async def send_message(
         self,
@@ -4087,48 +4142,67 @@ class BaseAgent:
         user_message: str,
         stream_callback: Optional[Callable[[str], None]] = None,
     ) -> "AgentResult":
-        # Inject relevant LTM context into system prompt for this turn
+        # Capture original system prompt before any per-turn injections.
         original_system = ctx.system_prompt
-        if self.context_manager:
-            retrieved = self.context_manager.retrieve_ltm_context(user_message)
-            if retrieved:
-                ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
-        skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
-        required_skills: list[str] = list(ctx.metadata.get("required_skills", []))
-        if skill_catalog and required_skills:
-            active_blocks = []
-            for skill_ref in required_skills:
-                activation = skill_catalog.activation_text(skill_ref, explicit=True)
-                if activation:
-                    active_blocks.append(activation)
-            if active_blocks:
-                ctx.system_prompt = (
-                    ctx.system_prompt
-                    + "\n\n## Active Skills\n"
-                    + "\n\n".join(active_blocks)
-                )
-
-        ctx.messages.append({"role": "user", "content": user_message})
-        tool_calls_made = []
+        tool_calls_made: list[str] = []
         result_text = ""
-        self._context_stack.append(ctx)
 
+        # B1: wrap ALL mutations (prompt injection, messages append, stack push)
+        # inside the try/finally so they are always cleaned up on error.
         try:
-            while True:
+            # Inject relevant LTM context into system prompt for this turn
+            if self.context_manager:
+                retrieved = self.context_manager.retrieve_ltm_context(user_message)
+                if retrieved:
+                    ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
+            skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
+            required_skills: list[str] = list(ctx.metadata.get("required_skills", []))
+            if skill_catalog and required_skills:
+                active_blocks = []
+                for skill_ref in required_skills:
+                    activation = skill_catalog.activation_text(skill_ref, explicit=True)
+                    if activation:
+                        active_blocks.append(activation)
+                if active_blocks:
+                    ctx.system_prompt = (
+                        ctx.system_prompt
+                        + "\n\n## Active Skills\n"
+                        + "\n\n".join(active_blocks)
+                    )
+
+            ctx.messages.append({"role": "user", "content": user_message})
+            self._context_stack.append(ctx)
+
+            # D1: bounded tool-call loop — prevents infinite model loops
+            for _iteration in range(MAX_TOOL_CALL_ITERATIONS + 1):
+                if _iteration == MAX_TOOL_CALL_ITERATIONS:
+                    return AgentResult(
+                        agent_id=ctx.agent_id,
+                        content=result_text,
+                        tool_calls_made=tool_calls_made,
+                        error=(
+                            f"Tool-call loop exceeded {MAX_TOOL_CALL_ITERATIONS} "
+                            "iterations; possible model loop detected."
+                        ),
+                    )
                 tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
 
                 try:
                     if stream_callback:
                         # Stream for display AND use the full response for tool detection.
-                        response, result_text = await self._stream_response(
+                        response, streamed_text = await self._stream_response(
                             ctx, tools, stream_callback
                         )
                     else:
                         response = await self._create(ctx, tools)
+                        streamed_text = ""
                     stop_reason, text, tool_uses = self._parse_response(response)
 
                     if stop_reason == "tool_use" and tool_uses:
-                        result_text = text or result_text
+                        # M4: only update result_text from the parsed text field;
+                        # do not allow streamed_text from a prior iteration to bleed in.
+                        if text:
+                            result_text = text
                         ctx.messages.append(self._assistant_message(response, text))
 
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
@@ -4138,7 +4212,9 @@ class BaseAgent:
                         )
                         continue
                     else:
-                        result_text = text or result_text
+                        # Prefer the parsed text; fall back to streamed text for
+                        # the final turn (streaming accumulates what the user saw).
+                        result_text = text or streamed_text or result_text
                         ctx.messages.append(
                             {"role": "assistant", "content": result_text}
                         )
@@ -4152,9 +4228,10 @@ class BaseAgent:
                         error=self._format_agent_error(e),
                     )
         finally:
-            # Always restore the original system prompt
+            # Always restore the original system prompt and pop the context stack.
             ctx.system_prompt = original_system
-            self._context_stack.pop()
+            if self._context_stack and self._context_stack[-1] is ctx:
+                self._context_stack.pop()
 
         return AgentResult(
             agent_id=ctx.agent_id,
@@ -4200,7 +4277,9 @@ class BaseAgent:
             kwargs["tools"] = api_tools
         finish_reason = "stop"
         tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
-        async for chunk in await self.client.chat.completions.create(**kwargs):
+        # B5: do NOT `await` the create() call before iterating — the async
+        # generator must be iterated directly for true streaming semantics.
+        async for chunk in self.client.chat.completions.create(**kwargs):
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -4262,13 +4341,17 @@ class BaseAgent:
         """
         parent = self  # captured reference to the parent agent
 
-        async def spawn_agent(role: str, task: str, system_suffix: str = "") -> str:
-            # Build a leaf registry: all tools except spawn_agent itself
+        async def spawn_agent(role: str, task: str, system_suffix: str = "") -> dict:
+            # B2: snapshot the registry to avoid RuntimeError if tools are added
+            # concurrently (e.g. via /generate-tool while a spawn batch runs).
+            tools_snapshot = dict(parent.registry._tools)
             sub_registry = ToolRegistry(console=CONSOLE)
-            for name, tool_def in parent.registry._tools.items():
+            for name, tool_def in tools_snapshot.items():
                 if name != "spawn_agent":
                     sub_registry._tools[name] = tool_def
-            sub_registry._context = dict(parent.registry._context)
+            # D7: deep-copy the context dict so sub-agents cannot mutate parent's
+            # mutable values (e.g. shell_blocked_commands list).
+            sub_registry._context = copy.deepcopy(parent.registry._context)
 
             sub_agent = BaseAgent(
                 parent.client,
@@ -4281,11 +4364,19 @@ class BaseAgent:
             sub_agent.max_parallel_agents = parent.max_parallel_agents
             sub_agent.sub_agent_timeout_seconds = parent.sub_agent_timeout_seconds
 
-            active_ctx = parent.current_context()
-            sys_prompt = active_ctx.system_prompt if active_ctx else base_system_prompt
+            # B3: always build system prompt from base_system_prompt + sub_registry
+            # so it reflects only the tools the sub-agent actually has, and does NOT
+            # include transient per-turn LTM injections from the parent's active context.
+            sys_prompt = _compose_system_prompt(
+                base_system_prompt,
+                sub_registry,
+                workspace_root,
+            )
             if system_suffix:
                 sys_prompt += f"\n\n{system_suffix}"
             sub_ctx = AgentContext(role=role, system_prompt=sys_prompt)
+            # Propagate skill metadata so sub-agents can also activate skills.
+            active_ctx = parent.current_context()
             if active_ctx:
                 if "skill_catalog" in active_ctx.metadata:
                     sub_ctx.metadata["skill_catalog"] = active_ctx.metadata[
@@ -4295,12 +4386,6 @@ class BaseAgent:
                     sub_ctx.metadata["required_skills"] = list(
                         active_ctx.metadata["required_skills"]
                     )
-            else:
-                sub_ctx.system_prompt = _compose_system_prompt(
-                    sub_ctx.system_prompt,
-                    sub_registry,
-                    workspace_root,
-                )
             CONSOLE.print(f"\n[bold magenta]▶ [{role}][/bold magenta] {task[:120]}")
             try:
                 result = await asyncio.wait_for(
@@ -4308,7 +4393,14 @@ class BaseAgent:
                     timeout=self.sub_agent_timeout_seconds,
                 )
             except asyncio.TimeoutError:
-                payload = {
+                # D6: include the last partial content from sub_ctx messages so the
+                # parent has some information about what was completed before the timeout.
+                partial = ""
+                for msg in reversed(sub_ctx.messages):
+                    if msg.get("role") == "assistant" and msg.get("content"):
+                        partial = str(msg["content"])[:500]
+                        break
+                payload: dict = {
                     "ok": False,
                     "role": role,
                     "task": task,
@@ -4316,6 +4408,26 @@ class BaseAgent:
                     "error": (
                         f"sub-agent timed out after {self.sub_agent_timeout_seconds}s"
                     ),
+                }
+                if partial:
+                    payload["partial_content"] = partial
+                CONSOLE.print(
+                    Panel(
+                        payload["error"],
+                        title=f"[magenta]{role}[/magenta]",
+                        border_style="red",
+                        padding=(0, 1),
+                    )
+                )
+                return payload
+            except Exception as e:
+                # B4: catch all exceptions so one failing spawn cannot cancel its
+                # sibling agents in the same asyncio.gather batch.
+                payload = {
+                    "ok": False,
+                    "role": role,
+                    "task": task,
+                    "error": f"sub-agent failed: {self._format_agent_error(e)}",
                 }
                 CONSOLE.print(
                     Panel(
@@ -4331,14 +4443,14 @@ class BaseAgent:
                 "ok": result.error is None,
                 "role": role,
                 "task": task,
-                "content": result.content,
+                "content": result.content or "(no output)",
                 "tool_calls_made": result.tool_calls_made,
             }
             if result.error:
                 payload["error"] = result.error
             CONSOLE.print(
                 Panel(
-                    result.error or result.content,
+                    result.error or result.content or "(no output)",
                     title=f"[magenta]{role}[/magenta]",
                     border_style="magenta" if result.error is None else "red",
                     padding=(0, 1),
