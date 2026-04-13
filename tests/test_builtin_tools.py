@@ -330,3 +330,87 @@ def test_tavily_search_returns_normalized_results(tmp_path, monkeypatch):
             "score": 0.91,
         }
     ]
+
+
+def test_web_search_delegates_to_tavily_backend(tmp_path, monkeypatch):
+    from agent import BuiltinTools
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+
+    async def fake_tavily(self, query, max_results=5, search_depth="basic", include_answer=False):
+        assert query == "latest ai news"
+        assert max_results == 3
+        return {
+            "ok": True,
+            "query": query,
+            "count": 1,
+            "results": [{"title": "Example", "url": "https://example.com", "snippet": "news"}],
+        }
+
+    monkeypatch.setattr(BuiltinTools, "_tavily_search", fake_tavily)
+
+    result = asyncio.run(
+        registry.call("web_search", {"query": "latest ai news", "max_results": 3})
+    )
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["count"] == 1
+    assert payload["results"][0]["title"] == "Example"
+
+
+def test_web_fetch_uses_asyncio_to_thread(tmp_path, monkeypatch):
+    from agent import BuiltinTools
+
+    tools, _, _ = make_builtin_tools(tmp_path)
+    called = {}
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        called["fn"] = fn
+        called["args"] = args
+        return b"<html><body>hello</body></html>"
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+
+    result = asyncio.run(tools._web_fetch("https://example.com"))
+
+    assert result["ok"] is True
+    assert called["fn"] == tools._make_urllib_request
+    assert called["args"] == ("https://example.com",)
+
+
+def test_tavily_search_uses_asyncio_to_thread(tmp_path, monkeypatch):
+    from agent import BuiltinTools
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("tavily_api_key", "test-key")
+    called = {}
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        called["fn"] = fn
+        called["args"] = args
+        return {"results": []}
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+
+    result = asyncio.run(registry.call("tavily_search", {"query": "latest ai news"}))
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert called["fn"] == tools._make_tavily_request
+    assert called["args"] == ("test-key", "latest ai news", 5, "basic", False)
+
+
+def test_registry_call_classifies_value_errors():
+    from agent import ToolRegistry
+
+    registry = ToolRegistry()
+
+    def bad_input():
+        raise ValueError("invalid input")
+
+    registry.register("explode", "fails", {"type": "object"}, bad_input)
+
+    result = asyncio.run(registry.call("explode", {}))
+
+    assert "Invalid input for tool 'explode'" in result

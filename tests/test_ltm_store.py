@@ -344,3 +344,110 @@ def test_add_entry_maps_overflow_dynamic_categories_to_concepts(tmp_path):
     assert len(concepts_entries) == 1
     assert concepts_entries[0].entity == "beta"
     assert concepts_entries[0].content == "Second dynamic category"
+
+
+def test_search_entries_queries_fts_index(tmp_path, monkeypatch):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    store.add_entry(
+        LTMEntry(
+            id="identity-1",
+            category="identity",
+            entity="user",
+            memory_type="preference",
+            content="Prefers concise responses",
+            importance=0.8,
+            status="active",
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+
+    real_connect = store._connect
+    seen_sql: list[str] = []
+
+    class _ObservedConn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            self._conn.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._conn.__exit__(exc_type, exc, tb)
+
+        def execute(self, sql, params=()):
+            seen_sql.append(" ".join(str(sql).split()))
+            return self._conn.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(store, "_connect", lambda: _ObservedConn(real_connect()))
+
+    results = store.search_entries("concise responses")
+
+    assert [entry.id for entry in results] == ["identity-1"]
+    assert any("memory_items_fts" in sql for sql in seen_sql)
+
+
+def test_add_entry_only_syncs_affected_categories(tmp_path, monkeypatch):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    store.add_entry(
+        LTMEntry(
+            id="alpha",
+            category="projects",
+            entity="demo",
+            content="Project alpha",
+            importance=0.5,
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+    store.add_entry(
+        LTMEntry(
+            id="beta",
+            category="identity",
+            entity="user",
+            content="Prefers concise responses",
+            importance=0.8,
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+
+    synced_categories: list[str] = []
+    monkeypatch.setattr(
+        store,
+        "_sync_category_snapshot",
+        lambda category: synced_categories.append(f"snapshot:{category}"),
+    )
+    monkeypatch.setattr(
+        store,
+        "_sync_projection",
+        lambda category: synced_categories.append(f"projection:{category}"),
+    )
+
+    store.add_entry(
+        LTMEntry(
+            id="task-1",
+            category="tasks",
+            entity="fix_auth_bug",
+            content="Fix the auth bug",
+            importance=0.9,
+            created_at="2026-04-12",
+            updated_at="2026-04-12",
+        )
+    )
+
+    assert synced_categories == ["snapshot:tasks", "projection:tasks"]

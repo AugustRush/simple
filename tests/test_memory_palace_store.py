@@ -1,5 +1,6 @@
 """Tests for the fixed-loci memory palace store and markdown projection."""
 
+import inspect
 import sys
 from pathlib import Path
 
@@ -125,3 +126,29 @@ def test_memory_palace_search_uses_structured_store_as_source_of_truth(tmp_path)
     assert results
     assert results[0]["path"] == "identity/user"
     assert "Prefers concise responses" in results[0]["snippet"]
+
+
+def test_memory_palace_tidy_accepts_generic_client_annotation():
+    from agent import MemoryPalace
+
+    annotation = inspect.signature(MemoryPalace.tidy).parameters["client"].annotation
+
+    assert annotation is not inspect._empty
+    assert "anthropic.AsyncAnthropic" not in str(annotation)
+
+
+def test_memory_palace_force_tidy_marks_state_dirty(tmp_path):
+    from agent import MemoryPalace
+
+    palace = MemoryPalace(
+        tidy_interval=3600,
+        tidy_threshold=5,
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+
+    assert palace.should_tidy() is False
+
+    palace.force_tidy()
+
+    assert palace.should_tidy() is True

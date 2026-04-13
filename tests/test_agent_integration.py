@@ -456,3 +456,290 @@ def test_real_mcp_smoke_registers_tools_from_config():
         asyncio.run(run())
     finally:
         agent_module.ModelClientFactory.from_config = original_factory
+
+
+def test_build_components_applies_orchestration_limits(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["orchestration"] = {
+        "max_parallel_agents": 2,
+        "sub_agent_timeout_seconds": 9,
+    }
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024)
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert components["agent"].max_parallel_agents == 2
+    assert components["agent"].sub_agent_timeout_seconds == 9
+
+
+def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    sentinel_context_manager = object()
+    parent.context_manager = sentinel_context_manager
+    parent.register_spawn_capability("base system prompt")
+
+    parent_ctx = agent_module.AgentContext(system_prompt="augmented prompt")
+    parent_ctx.metadata["skill_catalog"] = "catalog"
+    parent_ctx.metadata["required_skills"] = ["quality/review"]
+    parent._context_stack.append(parent_ctx)
+
+    observed = {}
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        observed["context_manager"] = self.context_manager
+        observed["required_skills"] = ctx.metadata.get("required_skills")
+        observed["skill_catalog"] = ctx.metadata.get("skill_catalog")
+        observed["system_prompt"] = ctx.system_prompt
+        observed["user_message"] = user_message
+        return agent_module.AgentResult(
+            agent_id="sub",
+            content="partial output",
+            error="sub-agent failed",
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {"role": "critic", "task": "inspect the output"},
+            )
+        )
+    )
+
+    parent._context_stack.pop()
+
+    assert observed["context_manager"] is sentinel_context_manager
+    assert observed["required_skills"] == ["quality/review"]
+    assert observed["skill_catalog"] == "catalog"
+    assert observed["system_prompt"] == "augmented prompt"
+    assert observed["user_message"] == "inspect the output"
+    assert payload["ok"] is False
+    assert payload["role"] == "critic"
+    assert payload["error"] == "sub-agent failed"
+    assert payload["content"] == "partial output"
+
+
+def test_spawn_agent_enforces_timeout(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    parent.sub_agent_timeout_seconds = 0.01
+    parent.register_spawn_capability("base system prompt")
+
+    async def slow_send_message(self, ctx, user_message, stream_callback=None):
+        await asyncio.sleep(0.05)
+        return agent_module.AgentResult(agent_id="sub", content="late")
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", slow_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {"role": "researcher", "task": "look it up"},
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert payload["timed_out"] is True
+    assert payload["role"] == "researcher"
+
+
+def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    agent.max_parallel_agents = 1
+
+    spawn_tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "researcher", "task": "first"}),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-2",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "critic", "task": "second"}),
+            ),
+        ),
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("tool_calls", agent_module._OAIMsg("", spawn_tool_calls))]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final answer", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    calls = []
+
+    async def fake_call(tool_name, tool_input):
+        calls.append((tool_name, tool_input))
+        return json.dumps({"ok": True})
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "run parallel agents"))
+
+    tool_messages = [msg for msg in ctx.messages if msg["role"] == "tool"]
+
+    assert result.error is None
+    assert result.content == "final answer"
+    assert calls == [
+        ("spawn_agent", {"role": "researcher", "task": "first"}),
+        ("spawn_agent", {"role": "critic", "task": "second"}),
+    ]
+    assert len(tool_messages) == 2
+    assert all("max_parallel_agents" not in msg["content"] for msg in tool_messages)
+
+
+def test_send_message_batches_excess_parallel_spawn_calls(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    agent.max_parallel_agents = 2
+
+    spawn_tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "researcher", "task": "first"}),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-2",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "critic", "task": "second"}),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-3",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "judge", "task": "third"}),
+            ),
+        ),
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("tool_calls", agent_module._OAIMsg("", spawn_tool_calls))]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final answer", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    call_order = []
+    concurrent = 0
+    max_concurrent = 0
+
+    async def fake_call(tool_name, tool_input):
+        nonlocal concurrent, max_concurrent
+        call_order.append(tool_input["role"])
+        concurrent += 1
+        max_concurrent = max(max_concurrent, concurrent)
+        await asyncio.sleep(0)
+        concurrent -= 1
+        return json.dumps({"ok": True, "role": tool_input["role"]})
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "run parallel agents"))
+
+    tool_messages = [msg for msg in ctx.messages if msg["role"] == "tool"]
+
+    assert result.error is None
+    assert result.content == "final answer"
+    assert call_order == ["researcher", "critic", "judge"]
+    assert max_concurrent == 2
+    assert len(tool_messages) == 3
+    assert all("max_parallel_agents" not in msg["content"] for msg in tool_messages)
+
+
+def test_send_message_classifies_request_timeout(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+
+    async def fake_create(ctx, tools):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "hello"))
+
+    assert result.content == ""
+    assert result.error == "Model request timed out"
+
+
+def test_memory_tidy_uses_force_tidy(monkeypatch):
+    import agent as agent_module
+
+    calls = {"force_tidy": 0, "tidy": 0, "closed": 0}
+
+    class _FakeMemory:
+        def force_tidy(self):
+            calls["force_tidy"] += 1
+
+        async def tidy(self, client, model):
+            calls["tidy"] += 1
+
+    async def fake_build_components_async(cfg):
+        return {
+            "memory": _FakeMemory(),
+            "client": object(),
+            "model": "fake-model",
+        }
+
+    async def fake_close_components(components):
+        calls["closed"] += 1
+
+    monkeypatch.setattr(agent_module, "load_config", lambda: ({}, False))
+    monkeypatch.setattr(agent_module, "_build_components_async", fake_build_components_async)
+    monkeypatch.setattr(agent_module, "_close_components", fake_close_components)
+
+    agent_module.memory_tidy()
+
+    assert calls == {"force_tidy": 1, "tidy": 1, "closed": 1}

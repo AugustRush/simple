@@ -303,3 +303,26 @@ def test_stats_report_dynamic_category_count_against_limit(tmp_path):
 
     assert stats["dynamic_categories"] == 1
     assert stats["max_categories"] == 1
+
+
+def test_route_categories_uses_configurable_keyword_map(tmp_path):
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        route_keywords={
+            "episodes": ["recent"],
+            "identity": ["style"],
+            "projects": ["workspace"],
+        },
+    )
+
+    assert ctx_mgr._route_categories("recent style workspace") == [
+        "episodes",
+        "identity",
+        "projects",
+        "tasks",
+    ]

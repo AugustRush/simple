@@ -237,6 +237,23 @@ Run the full test suite:
 uv run pytest -q
 ```
 
+Run the memory benchmark script:
+
+```bash
+python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10 --write-runs 10
+```
+
+The script prints JSON with per-size search and write latency metrics so you can compare performance before and after storage changes.
+
+Save benchmark output for later comparison:
+
+```bash
+python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.json
+python scripts/benchmark_memory.py --sizes 1000 10000 --compare bench.json
+python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.csv
+python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.jsonl
+```
+
 Current status in this workspace:
 
 - `79` tests passing
