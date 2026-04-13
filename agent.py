@@ -4094,14 +4094,10 @@ class BaseAgent:
         ]
         if spawn_calls:
             roles = ", ".join(tu["input"].get("role", "?") for _, tu in spawn_calls)
-            if len(spawn_calls) > self.max_parallel_agents:
-                batch_count = math.ceil(len(spawn_calls) / self.max_parallel_agents)
+            if len(spawn_calls) > 1:
                 CONSOLE.print(
-                    f"\n[bold magenta]⟳ Scheduling {len(spawn_calls)} agents in {batch_count} batches:[/bold magenta] {roles}"
-                )
-            elif len(spawn_calls) > 1:
-                CONSOLE.print(
-                    f"\n[bold magenta]⟳ Spawning {len(spawn_calls)} agents in parallel:[/bold magenta] {roles}"
+                    f"\n[bold magenta]⟳ Spawning {len(spawn_calls)} agents "
+                    f"(concurrency limit: {self.max_parallel_agents}):[/bold magenta] {roles}"
                 )
             # D4: semaphore-based dispatch lets faster agents in later batches start
             # as soon as a slot frees, rather than waiting for an entire batch to finish.
@@ -4277,9 +4273,11 @@ class BaseAgent:
             kwargs["tools"] = api_tools
         finish_reason = "stop"
         tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
-        # B5: do NOT `await` the create() call before iterating — the async
-        # generator must be iterated directly for true streaming semantics.
-        async for chunk in self.client.chat.completions.create(**kwargs):
+        # AsyncOpenAI.chat.completions.create() is a coroutine; await it to get
+        # the AsyncStream object, then iterate the stream chunk by chunk.
+        # Do NOT remove the `await` — create() returns a coroutine, not an
+        # async iterable, so `async for chunk in create(...)` raises TypeError.
+        async for chunk in await self.client.chat.completions.create(**kwargs):
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -4367,16 +4365,29 @@ class BaseAgent:
             # B3: always build system prompt from base_system_prompt + sub_registry
             # so it reflects only the tools the sub-agent actually has, and does NOT
             # include transient per-turn LTM injections from the parent's active context.
+            # Pass output_dir (from registry context) and skill_catalog so the
+            # capabilities section in the sub-agent prompt is complete.
+            output_dir_str = sub_registry._context.get("output_dir")
+            output_dir_path = Path(output_dir_str) if output_dir_str else None
+            active_ctx = parent.current_context()
+            # Only pass a real SkillCatalog instance — metadata may contain test
+            # stubs or other objects that lack the summary_lines() method.
+            skill_catalog_for_prompt: Optional[SkillCatalog] = None
+            if active_ctx:
+                sc = active_ctx.metadata.get("skill_catalog")
+                if isinstance(sc, SkillCatalog):
+                    skill_catalog_for_prompt = sc
             sys_prompt = _compose_system_prompt(
                 base_system_prompt,
                 sub_registry,
                 workspace_root,
+                output_dir=output_dir_path,
+                skill_catalog=skill_catalog_for_prompt,
             )
             if system_suffix:
                 sys_prompt += f"\n\n{system_suffix}"
             sub_ctx = AgentContext(role=role, system_prompt=sys_prompt)
             # Propagate skill metadata so sub-agents can also activate skills.
-            active_ctx = parent.current_context()
             if active_ctx:
                 if "skill_catalog" in active_ctx.metadata:
                     sub_ctx.metadata["skill_catalog"] = active_ctx.metadata[
