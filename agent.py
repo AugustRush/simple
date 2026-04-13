@@ -27,7 +27,7 @@ import time
 import traceback
 import uuid
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -81,7 +81,11 @@ STAGING_DIR = CONTEXT_DIR / "_staging"  # per-session raw conversation buffers
 RECENT_SESSION_TURNS = 6  # recent staged turns exposed to explicit context lookup
 PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
 STAGING_TURN_THRESHOLD = 6
-STAGING_TOKEN_THRESHOLD = 300
+# Align with the actual compact_messages cycle (~5 tool-calling turns × ~350 staging
+# tokens/turn). The old value of 300 was smaller than a single turn's staging content,
+# causing consolidation jobs to enqueue on the very first turn (though the background
+# worker's idle_seconds gate meant they rarely executed during active sessions).
+STAGING_TOKEN_THRESHOLD = 2100
 PALACE_LOCI = (
     "identity",
     "projects",
@@ -116,6 +120,56 @@ DEFAULT_ROUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 CONSOLE = Console()
+
+# ── Ralph Loop ────────────────────────────────────────────────────────────────
+TASKS_DIR = AGENT_HOME / "tasks"
+RALPH_COMPLETION_PROMISE = "<promise>COMPLETE</promise>"
+RALPH_DEFAULT_MAX_ITERATIONS = 10
+
+
+@dataclass
+class RalphTask:
+    """State for a Ralph-mode autonomous task iteration loop.
+
+    Persisted to ~/.agent/tasks/<id>.json after every iteration so the task
+    survives process restarts and provides an audit trail.
+    """
+
+    id: str
+    goal: str
+    completion_criteria: list
+    verify_command: Optional[str]
+    completion_promise: str
+    max_iterations: int
+    current_iteration: int = 0
+    status: str = "running"  # running | complete | max_iterations_reached
+    progress: list = field(default_factory=list)  # append-only per-iteration log
+    created_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.created_at:
+            self.created_at = datetime.now(timezone.utc).isoformat()
+
+
+def _save_ralph_task(task: RalphTask) -> None:
+    """Atomically persist task state to disk."""
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(
+        TASKS_DIR / f"{task.id}.json",
+        json.dumps(asdict(task), indent=2, ensure_ascii=False),
+    )
+
+
+def _load_ralph_task(task_id: str) -> Optional[RalphTask]:
+    """Load a previously persisted task, or None if not found."""
+    path = TASKS_DIR / f"{task_id}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return RalphTask(**data)
+    except Exception:
+        return None
 
 
 def _new_id() -> str:
@@ -3053,7 +3107,24 @@ class ContextManager:
 
     def compact_messages(self, messages: list[dict]) -> list[dict]:
         keep_last = self.consolidation.keep_last_messages
-        return messages[-keep_last:] if len(messages) > keep_last else messages
+        if len(messages) <= keep_last:
+            return messages
+        # Find the latest "natural" user message (plain string content, not a
+        # tool_result block) at or after position (len - keep_last).  Starting
+        # the retained window at such a boundary guarantees:
+        #   1. The sequence never begins mid-tool-use-sequence (no orphaned
+        #      tool_use blocks missing their tool_result pair).
+        #   2. Roles always alternate correctly for the Anthropic / OpenAI APIs.
+        # Preserving original task context is intentionally handled at the
+        # _interactive_loop level via _task_context injection into the system
+        # prompt, keeping that concern separate from API message formatting.
+        ideal = len(messages) - keep_last
+        for i in range(ideal, -1, -1):
+            msg = messages[i]
+            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+                ideal = i
+                break
+        return messages[ideal:]
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
@@ -3229,6 +3300,10 @@ class BackgroundMemoryWorker:
         self.poll_seconds = poll_seconds
         self.client_factory = client_factory
         self._stop_event = threading.Event()
+        # _wake_event lets callers interrupt the poll sleep and trigger an
+        # immediate (idle-gate-bypassing) consolidation run without blocking
+        # the main asyncio event loop.
+        self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
@@ -3246,6 +3321,17 @@ class BackgroundMemoryWorker:
     def stop(self) -> None:
         """Signal the worker thread to stop."""
         self._stop_event.set()
+        self._wake_event.set()  # unblock any ongoing wait() immediately
+
+    def wake(self) -> None:
+        """Interrupt the poll sleep so the worker runs its next job immediately.
+
+        Safe to call from any thread or coroutine.  Does not block.
+        When woken the worker bypasses the idle-seconds gate so consolidation
+        happens right away rather than waiting up to idle_seconds for the next
+        natural trigger.
+        """
+        self._wake_event.set()
 
     async def wait(self) -> None:
         """Wait for the worker thread to exit in async call sites."""
@@ -3256,8 +3342,19 @@ class BackgroundMemoryWorker:
         client = self.client_factory() if self.client_factory else self.client
         try:
             while not self._stop_event.is_set():
+                # Consume the wake signal before deciding whether to run, so a
+                # signal arriving while a job is already running is not lost.
+                on_demand = self._wake_event.is_set()
+                self._wake_event.clear()
                 try:
-                    if self.ctx_mgr.should_process_jobs():
+                    # on_demand bypasses the idle gate: run immediately when the
+                    # caller explicitly requested consolidation (e.g. after a
+                    # compact_messages truncation).  Normal polling still
+                    # requires the idle threshold to be satisfied.
+                    should_run = (
+                        on_demand and self.ctx_mgr.pending_jobs() > 0
+                    ) or self.ctx_mgr.should_process_jobs()
+                    if should_run:
                         asyncio.run(
                             self.ctx_mgr.process_one_job(
                                 client,
@@ -3267,7 +3364,10 @@ class BackgroundMemoryWorker:
                         )
                 except Exception as e:
                     CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
-                self._stop_event.wait(self.poll_seconds)
+                # Sleep for poll_seconds OR until wake()/stop() interrupts,
+                # whichever comes first.  This replaces the old _stop_event.wait()
+                # so that wake() can also cut the sleep short.
+                self._wake_event.wait(timeout=self.poll_seconds)
         finally:
             aclose = getattr(client, "aclose", None)
             if self.client_factory and callable(aclose):
@@ -5206,6 +5306,174 @@ def _build_components(cfg: dict):
     return asyncio.run(_build_components_async(cfg))
 
 
+async def _ralph_task_loop(
+    agent: "BaseAgent",
+    task: RalphTask,
+    system_prompt: str,
+    skill_catalog: "SkillCatalog",
+    ctx_mgr: Optional["ContextManager"],
+) -> RalphTask:
+    """Ralph-mode autonomous task loop.
+
+    Runs up to task.max_iterations iterations. Each iteration gets a fresh
+    AgentContext (preventing context rot) but receives the full task state and
+    recent progress summary. Completion is determined externally — either by a
+    promise token in the output or by a verify_command exit code — not by LLM
+    self-assessment.
+
+    Context handling contract:
+    - No mark_activity() / staging during iterations → background consolidation
+      does not fire mid-task, keeping iterations uninterrupted.
+    - After the task ends (any status), all iterations are staged as a single
+      summary entry and consolidation is enqueued once. This ensures LTM learns
+      from the Ralph session without fragmenting it into mid-task chunks.
+    """
+    all_summaries: list[str] = []
+
+    def _build_iter_prompt(t: RalphTask) -> str:
+        criteria_text = "\n".join(f"- {c}" for c in t.completion_criteria)
+        progress_text = ""
+        if t.progress:
+            recent = t.progress[-3:]  # only last 3 to keep token cost bounded
+            progress_text = "\n\n## 历史进度（最近迭代）\n" + "\n".join(
+                f"- 迭代 {p['iteration']}: {p['summary']}" for p in recent
+            )
+        return (
+            f"## 当前任务\n{t.goal}\n\n"
+            f"## 验收标准\n{criteria_text}\n\n"
+            f"所有标准满足后，在回复末尾输出：`{t.completion_promise}`\n"
+            f"{progress_text}\n\n"
+            f"这是第 {t.current_iteration}/{t.max_iterations} 次迭代。"
+        )
+
+    for i in range(task.max_iterations):
+        task.current_iteration = i + 1
+        CONSOLE.print(
+            f"\n[dim]── Ralph 迭代 {task.current_iteration}/{task.max_iterations} ──[/dim]"
+        )
+
+        # Fresh AgentContext per iteration — prevents context rot across iterations.
+        iter_ctx = AgentContext(system_prompt=system_prompt)
+        iter_ctx.metadata["skill_catalog"] = skill_catalog
+
+        collected: list[str] = []
+
+        def _stream_cb(chunk: str, _col: list = collected) -> None:
+            CONSOLE.print(chunk, end="", markup=False)
+            _col.append(chunk)
+
+        CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+        result = await agent.send_message(
+            iter_ctx, _build_iter_prompt(task), _stream_cb
+        )
+        CONSOLE.print()
+
+        if result.error:
+            CONSOLE.print(f"[red]Error: {result.error}[/red]")
+
+        iter_summary = result.content[:300] if result.content else "(no output)"
+        all_summaries.append(f"Iter {task.current_iteration}: {iter_summary}")
+
+        # ── External completion check 1: promise token ────────────────────────
+        if task.completion_promise in result.content:
+            task.status = "complete"
+            task.progress.append(
+                {
+                    "iteration": task.current_iteration,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "tool_calls": result.tool_calls_made,
+                    "summary": iter_summary,
+                    "completed_by": "promise",
+                }
+            )
+            _save_ralph_task(task)
+            break
+
+        # ── External completion check 2: verify command ───────────────────────
+        if task.verify_command:
+            v_out: bytes = b""
+            v_err: bytes = b""
+            try:
+                verify_proc = await asyncio.create_subprocess_shell(
+                    task.verify_command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                v_out, v_err = await asyncio.wait_for(
+                    verify_proc.communicate(), timeout=60
+                )
+                v_exit = verify_proc.returncode
+            except asyncio.TimeoutError:
+                v_exit = -1
+                CONSOLE.print("[yellow]验证命令超时 (60s)[/yellow]")
+            except Exception as ve:
+                v_exit = -1
+                CONSOLE.print(f"[yellow]验证命令异常: {ve}[/yellow]")
+
+            if v_exit == 0:
+                CONSOLE.print("[green]验证通过 (exit 0)[/green]")
+                task.status = "complete"
+                task.progress.append(
+                    {
+                        "iteration": task.current_iteration,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "tool_calls": result.tool_calls_made,
+                        "summary": iter_summary,
+                        "completed_by": "verify_command",
+                    }
+                )
+                _save_ralph_task(task)
+                break
+            else:
+                # Capture verification output and append to iter_summary so it
+                # flows into task.progress and becomes visible in the next
+                # iteration's prompt via _build_iter_prompt(recent[-3:]).
+                # Without this, the agent knows verification failed but not why,
+                # making subsequent iterations effectively blind retries.
+                verify_output = (v_err or v_out).decode("utf-8", errors="replace")
+                verify_snippet = verify_output[-600:].strip()
+                if verify_snippet:
+                    iter_summary += (
+                        f"\n\nverify_failed (exit {v_exit}):\n{verify_snippet}"
+                    )
+                    CONSOLE.print(
+                        f"[yellow]验证失败 (exit {v_exit})，继续迭代[/yellow]\n"
+                        f"[dim]{verify_snippet[:200]}[/dim]"
+                    )
+                else:
+                    CONSOLE.print(
+                        f"[yellow]验证失败 (exit {v_exit})，继续迭代[/yellow]"
+                    )
+
+        task.progress.append(
+            {
+                "iteration": task.current_iteration,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "tool_calls": result.tool_calls_made,
+                "summary": iter_summary,
+            }
+        )
+        _save_ralph_task(task)
+
+    if task.status == "running":
+        task.status = "max_iterations_reached"
+        _save_ralph_task(task)
+
+    # ── Post-task: stage the full run and enqueue one consolidation job ───────
+    # Done once after the loop ends (not per-iteration) to avoid fragmenting the
+    # task narrative in LTM and to prevent background consolidation from firing
+    # mid-task (which would use a separate API call on incomplete context).
+    if ctx_mgr and all_summaries:
+        goal_line = f"[Ralph/{task.id}] goal: {task.goal} | status: {task.status} | iters: {task.current_iteration}/{task.max_iterations}"
+        ctx_mgr.staging.append("user", goal_line)
+        ctx_mgr.staging.append("assistant", "\n".join(all_summaries[-5:]))
+        ctx_mgr.mark_activity()
+        if ctx_mgr.should_enqueue_consolidation():
+            ctx_mgr.enqueue_consolidation("ralph_task_end")
+
+    return task
+
+
 async def _interactive_loop(components: dict, cfg: dict):
     """Main interactive chat loop."""
     agent: BaseAgent = components["agent"]
@@ -5222,6 +5490,11 @@ async def _interactive_loop(components: dict, cfg: dict):
 
     ctx = AgentContext(system_prompt=system_prompt)
     tools_used_session: list[str] = []
+    # Track the user's first non-command message so it can be re-injected into
+    # the system prompt after compaction (compact_messages drops early messages
+    # to keep working memory bounded; this preserves the original task intent
+    # without coupling task context to API message-list formatting rules).
+    _task_context: str = ""
     memory_worker = (
         BackgroundMemoryWorker(
             ctx_mgr,
@@ -5239,7 +5512,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     CONSOLE.print(
         Panel(
             "[bold cyan]Personal Agent[/bold cyan]\n"
-            "[dim]Commands: /memory, /context, /evolve, /generate-tool <desc>, /tools, /model [name], /quit[/dim]",
+            "[dim]Commands: /memory, /context, /evolve, /generate-tool <desc>, /tools, /model [name], /ralph <goal>, /quit[/dim]",
             title="Agent Ready",
             border_style="cyan",
         )
@@ -5395,6 +5668,71 @@ async def _interactive_loop(components: dict, cfg: dict):
                         f"Sessions: {stats['total']}, Avg score: {stats['avg_score']}"
                     )
                     continue
+                elif cmd == "ralph" or cmd.startswith("ralph "):
+                    # /ralph <goal> [--max N] [--verify <shell_cmd>]
+                    # Example: /ralph "make all tests pass" --max 15 --verify "pytest tests/"
+                    parts = raw_cmd.split(None, 1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        CONSOLE.print(
+                            "[yellow]Usage: /ralph <goal> [--max N] [--verify <cmd>][/yellow]\n"
+                            "[dim]Example: /ralph 'make all tests pass' --max 10 --verify 'pytest tests/'[/dim]"
+                        )
+                        continue
+
+                    goal_str = parts[1].strip()
+                    max_iters = RALPH_DEFAULT_MAX_ITERATIONS
+                    verify_cmd: Optional[str] = None
+
+                    # Parse --max N
+                    max_match = re.search(r"--max\s+(\d+)", goal_str)
+                    if max_match:
+                        max_iters = int(max_match.group(1))
+                        goal_str = (
+                            goal_str[: max_match.start()].rstrip()
+                            + goal_str[max_match.end() :]
+                        )
+
+                    # Parse --verify <cmd> (everything after --verify to end of string)
+                    verify_match = re.search(r"--verify\s+(.+)$", goal_str)
+                    if verify_match:
+                        verify_cmd = verify_match.group(1).strip().strip("'\"")
+                        goal_str = goal_str[: verify_match.start()].rstrip()
+
+                    goal_str = goal_str.strip().strip("'\"")
+                    if not goal_str:
+                        CONSOLE.print("[yellow]Goal cannot be empty.[/yellow]")
+                        continue
+
+                    task = RalphTask(
+                        id=_new_id(),
+                        goal=goal_str,
+                        completion_criteria=[
+                            f"Goal achieved: {goal_str}",
+                            "Output contains the completion promise token",
+                        ],
+                        verify_command=verify_cmd,
+                        completion_promise=RALPH_COMPLETION_PROMISE,
+                        max_iterations=max_iters,
+                    )
+                    _save_ralph_task(task)
+                    CONSOLE.print(
+                        f"[cyan]Ralph 模式启动 | id: {task.id} | max_iters: {max_iters}"
+                        + (f" | verify: {verify_cmd}" if verify_cmd else "")
+                        + "[/cyan]"
+                    )
+                    task = await _ralph_task_loop(
+                        agent,
+                        task,
+                        system_prompt,
+                        skill_catalog,
+                        ctx_mgr,
+                    )
+                    status_color = "green" if task.status == "complete" else "yellow"
+                    CONSOLE.print(
+                        f"[{status_color}]Ralph 完成 | status: {task.status} | "
+                        f"迭代: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
+                    )
+                    continue
                 else:
                     normalized_input, required_skills = prepare_user_message_for_skills(
                         user_input, skill_catalog
@@ -5418,6 +5756,11 @@ async def _interactive_loop(components: dict, cfg: dict):
             # Mark activity so idle timer resets and dirty flag is set
             if ctx_mgr:
                 ctx_mgr.mark_activity()
+
+            # Record the first non-command user message as the task context so it
+            # can be re-injected into the system prompt after compaction occurs.
+            if not _task_context:
+                _task_context = user_input[:300]
 
             # The agent decides how to handle the request
             CONSOLE.print()
@@ -5453,6 +5796,23 @@ async def _interactive_loop(components: dict, cfg: dict):
                     ctx.messages, agent.max_tokens
                 ):
                     ctx.messages = ctx_mgr.compact_messages(ctx.messages)
+                    # Re-inject the original task context into the system prompt so
+                    # it remains visible to the LLM even after early messages are
+                    # dropped.  Reset on the next user turn via _task_context.
+                    if _task_context and _task_context not in ctx.system_prompt:
+                        ctx.system_prompt = (
+                            system_prompt
+                            + f"\n\n## Current Task Context (original request)\n{_task_context}"
+                        )
+                    # Trigger background consolidation of the staging buffer so
+                    # facts from the dropped messages land in LTM and become
+                    # available via retrieve_ltm_context() on the next turn.
+                    # wake() is non-blocking: the background worker thread runs
+                    # the consolidation job while the user reads this response
+                    # and types their next message.
+                    if memory_worker and ctx_mgr.staging.count() > 0:
+                        ctx_mgr.enqueue_consolidation("compact_triggered")
+                        memory_worker.wake()
 
             except Exception as e:
                 CONSOLE.print(f"\n[red]Error: {e}[/red]")
