@@ -743,3 +743,117 @@ def test_memory_tidy_uses_force_tidy(monkeypatch):
     agent_module.memory_tidy()
 
     assert calls == {"force_tidy": 1, "tidy": 1, "closed": 1}
+
+
+def test_stream_response_propagates_stream_failures():
+    import agent as agent_module
+
+    class _BrokenAnthropicClient:
+        class messages:
+            @staticmethod
+            def stream(**kwargs):
+                class _BrokenStream:
+                    async def __aenter__(self):
+                        raise RuntimeError("stream exploded")
+
+                    async def __aexit__(self, exc_type, exc, tb):
+                        return False
+
+                return _BrokenStream()
+
+    agent = agent_module.BaseAgent(
+        _BrokenAnthropicClient(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="anthropic",
+    )
+    ctx = agent_module.AgentContext(system_prompt="system")
+
+    with pytest.raises(RuntimeError, match="stream exploded"):
+        asyncio.run(agent._stream_response(ctx, [], lambda chunk: None))
+
+
+def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    class _FakeAgent:
+        api_format = "openai"
+        max_tokens = 1024
+        model = "fake-model"
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            return agent_module.AgentResult(agent_id="agent", content="explained only")
+
+    class _FakeMemory:
+        def list_chapters(self):
+            return []
+
+    class _FakeEvolution:
+        def __init__(self):
+            self.calls = 0
+
+        async def generate_tool(self, description, registry):
+            self.calls += 1
+            return "generated"
+
+        def get_stats(self):
+            return {"total": 0, "avg_score": 0}
+
+    class _FakeSkillCatalog:
+        def list_skills(self):
+            return []
+
+    class _FakeUserToolCatalog:
+        def load_into_registry(self, registry):
+            raise AssertionError("tool reload should not run")
+
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
+
+    answers = iter(["Please explain how to generate a tool safely", "/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    evolution = _FakeEvolution()
+    components = {
+        "agent": _FakeAgent(),
+        "memory": _FakeMemory(),
+        "evolution": evolution,
+        "system_prompt": "system",
+        "skill_catalog": _FakeSkillCatalog(),
+        "user_tool_catalog": _FakeUserToolCatalog(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path / "output",
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    assert evolution.calls == 0
+
+
+def test_save_config_uses_atomic_replace(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    config_file = tmp_path / "config.json"
+    monkeypatch.setattr(agent_module, "AGENT_HOME", tmp_path)
+    monkeypatch.setattr(agent_module, "CONFIG_FILE", config_file)
+
+    replace_calls: list[tuple[str, str]] = []
+    real_replace = Path.replace
+
+    def recording_replace(self, target):
+        replace_calls.append((str(self), str(target)))
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", recording_replace)
+
+    agent_module.save_config({"active_provider": "fake"})
+
+    assert json.loads(config_file.read_text(encoding="utf-8")) == {
+        "active_provider": "fake"
+    }
+    assert replace_calls

@@ -191,3 +191,37 @@ def test_generate_tool_uses_openai_chat_api(tmp_path, monkeypatch):
     assert "Tool generated and saved" in result
     assert client.chat.completions.calls
     assert list(tools_dir.glob("auto_*.py"))
+
+
+def test_apply_best_prompt_rejects_path_traversal_versions(tmp_path, monkeypatch):
+    import agent as agent_module
+    from agent import EvolutionEngine, MemoryPalace
+
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    sessions_file = tmp_path / "sessions.jsonl"
+    sessions_file.write_text(
+        json.dumps({"prompt_version": "../etc/passwd", "score": 10}) + "\n",
+        encoding="utf-8",
+    )
+    outside_file = tmp_path / "etc" / "passwd.md"
+    outside_file.parent.mkdir(parents=True)
+    outside_file.write_text("owned", encoding="utf-8")
+
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
+    monkeypatch.setattr(agent_module, "SESSIONS_FILE", sessions_file)
+
+    engine = EvolutionEngine(
+        client=_FakeOpenAIClient(),
+        model="qwen",
+        memory=MemoryPalace(
+            base_dir=tmp_path / "memory",
+            context_dir=tmp_path / "context",
+        ),
+        api_format="openai",
+    )
+
+    prompt = engine.apply_best_prompt()
+
+    assert prompt == agent_module.DEFAULT_SYSTEM_PROMPT
+    assert not (prompts_dir / "best.md").exists()

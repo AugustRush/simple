@@ -115,6 +115,21 @@ DEFAULT_ROUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 CONSOLE = Console()
 
+
+def _new_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    tmp.write_text(content, encoding=encoding)
+    tmp.replace(path)
+
+
+def _is_safe_prompt_version(version: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", version))
+
 # ── OpenAI streaming synthetic response types ─────────────────────────────────
 # These replace the inline anonymous classes that were previously defined inside
 # _stream_response(), making the code testable and eliminating duplication.
@@ -1418,7 +1433,10 @@ def _ensure_config_file() -> bool:
     """
     AGENT_HOME.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
-        CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False))
+        _atomic_write_text(
+            CONFIG_FILE,
+            json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False),
+        )
         return True  # first run
     return False
 
@@ -1603,7 +1621,7 @@ class MemoryPalace:
         if snapshot:
             self.store.add_entry(
                 LTMEntry(
-                    id=str(uuid.uuid4())[:8],
+                    id=_new_id(),
                     content=snapshot,
                     importance=0.4,
                     category="archive",
@@ -1647,7 +1665,7 @@ class StagingBuffer:
         context_dir: Path = CONTEXT_DIR,
         session_id: Optional[str] = None,
     ):
-        self.session_id = session_id or str(uuid.uuid4())[:8]
+        self.session_id = session_id or _new_id()
         self.path = path or (context_dir / "_staging" / f"{self.session_id}.jsonl")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._count = self._load_count()
@@ -1835,16 +1853,31 @@ class LTMStore:
 
     def _ensure_fts_index(self) -> None:
         with self._connect() as conn:
-            active_count = int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*) FROM memory_items
-                    WHERE status NOT IN ('archived', 'superseded')
-                    """
-                ).fetchone()[0]
-            )
-            fts_count = int(conn.execute("SELECT COUNT(*) FROM memory_items_fts").fetchone()[0])
-            if fts_count == active_count:
+            mismatch = conn.execute(
+                """
+                SELECT 1
+                FROM (
+                    SELECT m.id AS memory_id
+                    FROM memory_items m
+                    WHERE m.status NOT IN ('archived', 'superseded')
+                    EXCEPT
+                    SELECT f.memory_id
+                    FROM memory_items_fts f
+                )
+                UNION ALL
+                SELECT 1
+                FROM (
+                    SELECT f.memory_id
+                    FROM memory_items_fts f
+                    EXCEPT
+                    SELECT m.id
+                    FROM memory_items m
+                    WHERE m.status NOT IN ('archived', 'superseded')
+                )
+                LIMIT 1
+                """
+            ).fetchone()
+            if mismatch is None:
                 return
             conn.execute("DELETE FROM memory_items_fts")
             rows = conn.execute(
@@ -2344,7 +2377,7 @@ class LTMStore:
             entry = existing
         else:
             entry = LTMEntry(
-                id=str(uuid.uuid4())[:8],
+                id=_new_id(),
                 content=content.strip(),
                 importance=0.8,
                 category=category,
@@ -2755,7 +2788,7 @@ class ConsolidationEngine:
                     normalized_category = "concepts"
                 entries.append(
                     LTMEntry(
-                        id=str(uuid.uuid4())[:8],
+                        id=_new_id(),
                         content=content,
                         importance=float(data.get("importance", 0.5)),
                         category=normalized_category,
@@ -2789,7 +2822,7 @@ class ConsolidationEngine:
                 snippets.append(f"{role}: {content[:180]}")
         summary = " | ".join(snippets)[:1200] or "Session summary unavailable."
         return LTMEntry(
-            id=str(uuid.uuid4())[:8],
+            id=_new_id(),
             content=summary,
             importance=0.7,
             category="episodes",
@@ -3721,7 +3754,7 @@ class SkillCatalog:
 class AgentContext:
     """State for a single agent instance."""
 
-    agent_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    agent_id: str = field(default_factory=_new_id)
     role: str = "assistant"
     messages: list[dict] = field(default_factory=list)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
@@ -3987,7 +4020,6 @@ class BaseAgent:
                         response, result_text = await self._stream_response(
                             ctx, tools, stream_callback
                         )
-                        stream_callback = None  # don't double-print on next iter
                     else:
                         response = await self._create(ctx, tools)
                     stop_reason, text, tool_uses = self._parse_response(response)
@@ -4039,86 +4071,72 @@ class BaseAgent:
         For OpenAI: accumulates tool_call deltas and rebuilds a synthetic response.
         """
         collected: list[str] = []
-        response = None
-        try:
-            if self.api_format == "anthropic":
-                async with self.client.messages.stream(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    system=ctx.system_prompt,
-                    messages=ctx.messages,
-                    tools=self._tools_for_api(tools),
-                ) as stream:
-                    async for text in stream.text_stream:
-                        collected.append(text)
-                        callback(text)
-                    response = await stream.get_final_message()
-            else:
-                # OpenAI streaming — accumulate tool_call deltas as well
-                kwargs: dict = dict(
-                    model=self.model,
-                    max_tokens=self.max_tokens,
-                    messages=self._inject_system(ctx.messages, ctx.system_prompt),
-                    stream=True,
-                )
-                api_tools = self._tools_for_api(tools)
-                if api_tools:
-                    kwargs["tools"] = api_tools
-                finish_reason = "stop"
-                tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
-                async for chunk in await self.client.chat.completions.create(**kwargs):
-                    if not chunk.choices:
-                        continue
-                    choice = chunk.choices[0]
-                    delta = choice.delta
-                    if delta.content:
-                        collected.append(delta.content)
-                        callback(delta.content)
-                    if delta.tool_calls:
-                        for tc_delta in delta.tool_calls:
-                            idx = tc_delta.index
-                            if idx not in tool_calls_acc:
-                                tool_calls_acc[idx] = {
-                                    "id": tc_delta.id or "",
-                                    "name": (tc_delta.function.name if tc_delta.function else "") or "",
-                                    "arguments": "",
-                                }
-                            acc = tool_calls_acc[idx]
-                            if tc_delta.id:
-                                acc["id"] = tc_delta.id
-                            if tc_delta.function:
-                                if tc_delta.function.name:
-                                    acc["name"] = tc_delta.function.name
-                                if tc_delta.function.arguments:
-                                    acc["arguments"] += tc_delta.function.arguments
-                    if choice.finish_reason:
-                        finish_reason = choice.finish_reason
+        if self.api_format == "anthropic":
+            async with self.client.messages.stream(
+                model=self.model,
+                max_tokens=self.max_tokens,
+                system=ctx.system_prompt,
+                messages=ctx.messages,
+                tools=self._tools_for_api(tools),
+            ) as stream:
+                async for text in stream.text_stream:
+                    collected.append(text)
+                    callback(text)
+                response = await stream.get_final_message()
+            return response, "".join(collected)
 
-                # Build a synthetic response object using module-level dataclasses
-                oi_tool_calls = [
-                    _OAITC(v["id"], _OAIFunc(v["name"], v["arguments"]))
-                    for _, v in sorted(tool_calls_acc.items())
-                ] if tool_calls_acc else None
+        # OpenAI streaming — accumulate tool_call deltas as well
+        kwargs: dict = dict(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            messages=self._inject_system(ctx.messages, ctx.system_prompt),
+            stream=True,
+        )
+        api_tools = self._tools_for_api(tools)
+        if api_tools:
+            kwargs["tools"] = api_tools
+        finish_reason = "stop"
+        tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
+        async for chunk in await self.client.chat.completions.create(**kwargs):
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            delta = choice.delta
+            if delta.content:
+                collected.append(delta.content)
+                callback(delta.content)
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_calls_acc:
+                        tool_calls_acc[idx] = {
+                            "id": tc_delta.id or "",
+                            "name": (tc_delta.function.name if tc_delta.function else "") or "",
+                            "arguments": "",
+                        }
+                    acc = tool_calls_acc[idx]
+                    if tc_delta.id:
+                        acc["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            acc["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            acc["arguments"] += tc_delta.function.arguments
+            if choice.finish_reason:
+                finish_reason = choice.finish_reason
 
-                response = _OAIResponse([
-                    _OAIChoice(
-                        finish_reason,
-                        _OAIMsg("".join(collected), oi_tool_calls),
-                    )
-                ])
-        except Exception as e:
-            traceback.print_exc()
-            # Return a minimal end_turn response on error using module-level dataclasses
-            collected_text = "".join(collected)
-            if self.api_format == "anthropic":
-                response = _AnthropicFallbackResponse(
-                    stop_reason="end_turn",
-                    content=[_AnthropicTextBlock(text=collected_text)],
-                )
-            else:
-                response = _OAIResponse([
-                    _OAIChoice("stop", _OAIMsg(collected_text, None))
-                ])
+        # Build a synthetic response object using module-level dataclasses
+        oi_tool_calls = [
+            _OAITC(v["id"], _OAIFunc(v["name"], v["arguments"]))
+            for _, v in sorted(tool_calls_acc.items())
+        ] if tool_calls_acc else None
+
+        response = _OAIResponse([
+            _OAIChoice(
+                finish_reason,
+                _OAIMsg("".join(collected), oi_tool_calls),
+            )
+        ])
         return response, "".join(collected)
 
     def register_spawn_capability(
@@ -4346,7 +4364,7 @@ class EvolutionEngine:
 
         # Save to RL log
         record = {
-            "session_id": str(uuid.uuid4())[:8],
+            "session_id": _new_id(),
             "timestamp": _now(),
             "score": result.get("score", 5),
             "prompt_version": prompt_version,
@@ -4477,8 +4495,12 @@ class EvolutionEngine:
         # Find best performing prompt version
         version_scores: dict[str, list[float]] = {}
         for s in sessions:
-            v = s.get("prompt_version", "default")
+            v = str(s.get("prompt_version", "default")).strip()
+            if not _is_safe_prompt_version(v):
+                continue
             version_scores.setdefault(v, []).append(s.get("score", 5))
+        if not version_scores:
+            return DEFAULT_SYSTEM_PROMPT
 
         best_version = max(
             version_scores,
@@ -4491,7 +4513,7 @@ class EvolutionEngine:
             content = prompt_file.read_text()
             # Strip version comment
             content = re.sub(r"^<!--.*?-->\n", "", content, flags=re.DOTALL)
-            (PROMPTS_DIR / "best.md").write_text(content)
+            _atomic_write_text(PROMPTS_DIR / "best.md", content)
             return content
 
         return DEFAULT_SYSTEM_PROMPT
@@ -4543,7 +4565,7 @@ def load_config() -> tuple[dict, bool]:
 
 def save_config(cfg: dict):
     AGENT_HOME.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    _atomic_write_text(CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False))
 
 
 def _first_run_setup() -> bool:
@@ -4966,7 +4988,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     CONSOLE.print(
         Panel(
             "[bold cyan]Personal Agent[/bold cyan]\n"
-            "[dim]Commands: /memory, /context, /evolve, /tools, /model [name], /quit[/dim]",
+            "[dim]Commands: /memory, /context, /evolve, /generate-tool <desc>, /tools, /model [name], /quit[/dim]",
             title="Agent Ready",
             border_style="cyan",
         )
@@ -4984,7 +5006,8 @@ async def _interactive_loop(components: dict, cfg: dict):
 
             # Handle slash commands
             if user_input.startswith("/"):
-                cmd = user_input[1:].strip().lower()
+                raw_cmd = user_input[1:].strip()
+                cmd = raw_cmd.lower()
                 if cmd in ("quit", "exit", "q"):
                     break
                 elif cmd == "memory":
@@ -5031,8 +5054,29 @@ async def _interactive_loop(components: dict, cfg: dict):
                 elif cmd == "evolve":
                     CONSOLE.print("[yellow]Running evolution engine...[/yellow]")
                     new_prompt = await evolution.rewrite_system_prompt()
+                    components["system_prompt"] = new_prompt
                     ctx.system_prompt = new_prompt
                     CONSOLE.print("[green]System prompt updated.[/green]")
+                    continue
+                elif cmd == "generate-tool" or cmd.startswith("generate-tool "):
+                    parts = raw_cmd.split(None, 1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        CONSOLE.print(
+                            "[yellow]Usage: /generate-tool <description>[/yellow]"
+                        )
+                        continue
+                    description = parts[1].strip()
+                    CONSOLE.print("[dim]Generating tool...[/dim]")
+                    await evolution.generate_tool(description, components["registry"])
+                    user_tool_catalog.load_into_registry(components["registry"])
+                    components["system_prompt"] = _compose_system_prompt(
+                        components["system_prompt"],
+                        components["registry"],
+                        Path.cwd().resolve(),
+                        components["output_dir"],
+                        skill_catalog=components["skill_catalog"],
+                    )
+                    ctx.system_prompt = components["system_prompt"]
                     continue
                 elif cmd == "tools":
                     tools = components["registry"].list_tools()
@@ -5147,28 +5191,6 @@ async def _interactive_loop(components: dict, cfg: dict):
                 # Keep working memory bounded without blocking on LLM consolidation.
                 if ctx_mgr and ctx_mgr.should_compact_messages(ctx.messages, agent.max_tokens):
                     ctx.messages = ctx_mgr.compact_messages(ctx.messages)
-
-                # Check for tool generation request
-                if any(
-                    kw in user_input.lower()
-                    for kw in [
-                        "create a tool",
-                        "write a tool",
-                        "generate a tool",
-                        "帮我写一个工具",
-                    ]
-                ):
-                    CONSOLE.print("[dim]Generating tool...[/dim]")
-                    await evolution.generate_tool(user_input, components["registry"])
-                    user_tool_catalog.load_into_registry(components["registry"])
-                    components["system_prompt"] = _compose_system_prompt(
-                        system_prompt,
-                        components["registry"],
-                        Path.cwd().resolve(),
-                        components["output_dir"],
-                        skill_catalog=components["skill_catalog"],
-                    )
-                    ctx.system_prompt = components["system_prompt"]
 
             except Exception as e:
                 CONSOLE.print(f"\n[red]Error: {e}[/red]")

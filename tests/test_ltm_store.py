@@ -451,3 +451,48 @@ def test_add_entry_only_syncs_affected_categories(tmp_path, monkeypatch):
     )
 
     assert synced_categories == ["snapshot:tasks", "projection:tasks"]
+
+
+def test_ensure_fts_index_repairs_mismatched_rows_even_when_counts_match(tmp_path):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    store.add_entry(
+        LTMEntry(
+            id="identity-1",
+            category="identity",
+            entity="user",
+            memory_type="preference",
+            content="Prefers concise responses",
+            importance=0.8,
+            status="active",
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+
+    with store._connect() as conn:
+        conn.execute("DELETE FROM memory_items_fts")
+        conn.execute(
+            """
+            INSERT INTO memory_items_fts (memory_id, content, entity, category)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("wrong-id", "unrelated text", "other", "concepts"),
+        )
+
+    store._ensure_fts_index()
+
+    results = store.search_entries("concise responses")
+    assert [entry.id for entry in results] == ["identity-1"]
+
+
+def test_upsert_manual_note_uses_non_truncated_generated_ids(tmp_path):
+    store = make_store(tmp_path)
+
+    entry = store.upsert_manual_note("identity", "user", "Prefers concise responses")
+
+    assert len(entry.id) > 8
