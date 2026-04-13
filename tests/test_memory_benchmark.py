@@ -13,7 +13,6 @@ def test_benchmark_script_exists():
 
 
 def test_run_benchmarks_returns_metrics_for_requested_sizes():
-    sys.path.insert(0, str(ROOT))
     from scripts.benchmark_memory import run_benchmarks
 
     results = run_benchmarks(sizes=[10], search_runs=2, write_runs=2)
@@ -26,7 +25,6 @@ def test_run_benchmarks_returns_metrics_for_requested_sizes():
 
 
 def test_seed_store_bypasses_per_entry_add_entry(monkeypatch, tmp_path):
-    sys.path.insert(0, str(ROOT))
     from agent import LTMStore
     from scripts.benchmark_memory import _seed_store
 
@@ -46,7 +44,6 @@ def test_seed_store_bypasses_per_entry_add_entry(monkeypatch, tmp_path):
 
 
 def test_seed_store_bypasses_per_entry_write_entry_row(monkeypatch, tmp_path):
-    sys.path.insert(0, str(ROOT))
     from agent import LTMStore
     from scripts.benchmark_memory import _seed_store
 
@@ -56,7 +53,9 @@ def test_seed_store_bypasses_per_entry_write_entry_row(monkeypatch, tmp_path):
     )
 
     def fail_write_entry_row(conn, entry):
-        raise AssertionError("_seed_store should bulk insert instead of calling _write_entry_row")
+        raise AssertionError(
+            "_seed_store should bulk insert instead of calling _write_entry_row"
+        )
 
     monkeypatch.setattr(store, "_write_entry_row", fail_write_entry_row)
 

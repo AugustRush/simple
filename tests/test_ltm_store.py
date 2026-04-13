@@ -1,11 +1,6 @@
 """Tests for LTMEntry, LTMCategory, LTMStore."""
 
-import sys
-from pathlib import Path
-
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def make_store(tmp_path):
@@ -143,7 +138,9 @@ def test_category_names_are_normalized_inside_context_dir(tmp_path):
     categories = store.list_categories()
     assert len(categories) == 1
     assert categories[0].name == "tmp_dir_unsafe_name"
-    assert store.read_entries("tmp_dir_unsafe_name")[0].category == "tmp_dir_unsafe_name"
+    assert (
+        store.read_entries("tmp_dir_unsafe_name")[0].category == "tmp_dir_unsafe_name"
+    )
     assert not (tmp_path / "Tmp Dir").exists()
 
 
@@ -337,7 +334,9 @@ def test_add_entry_maps_overflow_dynamic_categories_to_concepts(tmp_path):
     )
 
     dynamic_categories = [
-        category.name for category in store.list_categories() if category.name not in {"concepts"}
+        category.name
+        for category in store.list_categories()
+        if category.name not in {"concepts"}
     ]
     assert dynamic_categories == ["alpha"]
     concepts_entries = store.read_entries("concepts")

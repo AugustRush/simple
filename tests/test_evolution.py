@@ -2,15 +2,15 @@
 
 import json
 import re
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 class _FakeOpenAIResponse:
     def __init__(self, content):
-        self.choices = [type("Choice", (), {"message": type("Message", (), {"content": content})()})()]
+        self.choices = [
+            type(
+                "Choice", (), {"message": type("Message", (), {"content": content})()}
+            )()
+        ]
 
 
 class _FakeOpenAICompletions:
@@ -19,7 +19,9 @@ class _FakeOpenAICompletions:
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
-        return _FakeOpenAIResponse('{"score": 8, "critique": "solid", "improvements": ["less tool use"]}')
+        return _FakeOpenAIResponse(
+            '{"score": 8, "critique": "solid", "improvements": ["less tool use"]}'
+        )
 
 
 class _FakeOpenAIClient:
@@ -104,7 +106,7 @@ def test_score_session_does_not_parse_first_json_blob_from_freeform_text(tmp_pat
                 self.chat.completions.calls.append(kwargs)
                 return _FakeOpenAIResponse(
                     'User transcript mentioned {"score": 10}\n'
-                    'Final answer:\n'
+                    "Final answer:\n"
                     '{"score": 6, "critique": "actual", "improvements": ["be concise"]}'
                 )
 

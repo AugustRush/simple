@@ -3,12 +3,9 @@
 import asyncio
 import json
 import os
-import sys
 from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 class _FakeMCPClient:
@@ -107,7 +104,22 @@ def _minimal_cfg():
     }
 
 
-def _write_skill_bundle(root: Path, relative_dir: str, skill_text: str, extra_files: dict[str, str] | None = None):
+@pytest.fixture(autouse=True)
+def _clear_fake_mcp_instances():
+    """Reset class-level instance trackers between tests."""
+    _FakeMCPClient.instances.clear()
+    _LoopBoundMCPClient.instances.clear()
+    yield
+    _FakeMCPClient.instances.clear()
+    _LoopBoundMCPClient.instances.clear()
+
+
+def _write_skill_bundle(
+    root: Path,
+    relative_dir: str,
+    skill_text: str,
+    extra_files: dict[str, str] | None = None,
+):
     bundle_dir = root / relative_dir
     bundle_dir.mkdir(parents=True, exist_ok=True)
     (bundle_dir / "SKILL.md").write_text(skill_text, encoding="utf-8")
@@ -118,7 +130,9 @@ def _write_skill_bundle(root: Path, relative_dir: str, skill_text: str, extra_fi
     return bundle_dir
 
 
-def test_skill_catalog_discovers_bundles_and_user_overrides_builtin(tmp_path, monkeypatch):
+def test_skill_catalog_discovers_bundles_and_user_overrides_builtin(
+    tmp_path, monkeypatch
+):
     import agent as agent_module
 
     user_root = tmp_path / "user-skills"
@@ -213,7 +227,9 @@ user-invocable: true
     cfg = _minimal_cfg()
 
     monkeypatch.setattr(
-        agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024)
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
     )
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
@@ -267,7 +283,11 @@ def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path
     cfg = _minimal_cfg()
     cfg["mcp_servers"] = [{"name": "demo", "command": "fake"}]
 
-    monkeypatch.setattr(agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024))
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
     monkeypatch.setattr(agent_module, "MCPClient", _FakeMCPClient)
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
@@ -311,7 +331,9 @@ def register(registry):
     )
 
     monkeypatch.setattr(
-        agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024)
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
     )
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
@@ -350,7 +372,9 @@ def test_build_components_exposes_mcp_status_and_prints_summary(monkeypatch, tmp
     monkeypatch.setattr(
         agent_module.CONSOLE,
         "print",
-        lambda *args, **kwargs: console_messages.append(" ".join(str(arg) for arg in args)),
+        lambda *args, **kwargs: console_messages.append(
+            " ".join(str(arg) for arg in args)
+        ),
     )
 
     components = agent_module._build_components(cfg)
@@ -370,7 +394,11 @@ def test_system_prompt_reflects_registered_capabilities(monkeypatch, tmp_path):
     cfg = _minimal_cfg()
     cfg["mcp_servers"] = [{"name": "demo", "command": "fake"}]
 
-    monkeypatch.setattr(agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024))
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
     monkeypatch.setattr(agent_module, "MCPClient", _FakeMCPClient)
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
@@ -398,7 +426,11 @@ def test_async_component_lifecycle_keeps_mcp_on_one_event_loop(monkeypatch, tmp_
     cfg = _minimal_cfg()
     cfg["mcp_servers"] = [{"name": "demo", "command": "fake"}]
 
-    monkeypatch.setattr(agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024))
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
     monkeypatch.setattr(agent_module, "MCPClient", _LoopBoundMCPClient)
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
@@ -468,7 +500,9 @@ def test_build_components_applies_orchestration_limits(monkeypatch, tmp_path):
     }
 
     monkeypatch.setattr(
-        agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024)
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
     )
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
@@ -486,7 +520,9 @@ def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
-    parent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
     sentinel_context_manager = object()
     parent.context_manager = sentinel_context_manager
     parent.register_spawn_capability("base system prompt")
@@ -538,7 +574,9 @@ def test_spawn_agent_enforces_timeout(monkeypatch):
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
-    parent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
     parent.sub_agent_timeout_seconds = 0.01
     parent.register_spawn_capability("base system prompt")
 
@@ -566,7 +604,9 @@ def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
-    agent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
     agent.max_parallel_agents = 1
 
     spawn_tool_calls = [
@@ -588,10 +628,18 @@ def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch
     responses = iter(
         [
             agent_module._OAIResponse(
-                [agent_module._OAIChoice("tool_calls", agent_module._OAIMsg("", spawn_tool_calls))]
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls", agent_module._OAIMsg("", spawn_tool_calls)
+                    )
+                ]
             ),
             agent_module._OAIResponse(
-                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final answer", None))]
+                [
+                    agent_module._OAIChoice(
+                        "stop", agent_module._OAIMsg("final answer", None)
+                    )
+                ]
             ),
         ]
     )
@@ -627,7 +675,9 @@ def test_send_message_batches_excess_parallel_spawn_calls(monkeypatch):
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
-    agent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
     agent.max_parallel_agents = 2
 
     spawn_tool_calls = [
@@ -656,10 +706,18 @@ def test_send_message_batches_excess_parallel_spawn_calls(monkeypatch):
     responses = iter(
         [
             agent_module._OAIResponse(
-                [agent_module._OAIChoice("tool_calls", agent_module._OAIMsg("", spawn_tool_calls))]
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls", agent_module._OAIMsg("", spawn_tool_calls)
+                    )
+                ]
             ),
             agent_module._OAIResponse(
-                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final answer", None))]
+                [
+                    agent_module._OAIChoice(
+                        "stop", agent_module._OAIMsg("final answer", None)
+                    )
+                ]
             ),
         ]
     )
@@ -700,7 +758,9 @@ def test_send_message_classifies_request_timeout(monkeypatch):
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
-    agent = agent_module.BaseAgent(object(), registry, model="fake-model", api_format="openai")
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
 
     async def fake_create(ctx, tools):
         raise asyncio.TimeoutError()
@@ -737,7 +797,9 @@ def test_memory_tidy_uses_force_tidy(monkeypatch):
         calls["closed"] += 1
 
     monkeypatch.setattr(agent_module, "load_config", lambda: ({}, False))
-    monkeypatch.setattr(agent_module, "_build_components_async", fake_build_components_async)
+    monkeypatch.setattr(
+        agent_module, "_build_components_async", fake_build_components_async
+    )
     monkeypatch.setattr(agent_module, "_close_components", fake_close_components)
 
     agent_module.memory_tidy()
@@ -773,7 +835,9 @@ def test_stream_response_propagates_stream_failures():
         asyncio.run(agent._stream_response(ctx, [], lambda chunk: None))
 
 
-def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(monkeypatch, tmp_path):
+def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
+    monkeypatch, tmp_path
+):
     import agent as agent_module
 
     class _FakeAgent:

@@ -2,12 +2,8 @@
 
 import asyncio
 import json
-import sys
-from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def make_builtin_tools(tmp_path):
@@ -126,7 +122,9 @@ def test_list_files_respects_recursive_and_max_results(tmp_path):
     nested.mkdir()
     (nested / "c.txt").write_text("c", encoding="utf-8")
 
-    flat = tools._list_files(str(root), pattern="*.txt", recursive=False, max_results=10)
+    flat = tools._list_files(
+        str(root), pattern="*.txt", recursive=False, max_results=10
+    )
     recursive = tools._list_files(
         str(root), pattern="*.txt", recursive=True, max_results=2
     )
@@ -189,7 +187,9 @@ def test_memory_search_returns_structured_results(tmp_path):
     tools, registry, workspace = make_builtin_tools(tmp_path)
     tools.memory.write("identity", "user", "Prefers concise responses")
 
-    result = asyncio.run(registry.call("memory_search", {"query": "concise", "top_k": 3}))
+    result = asyncio.run(
+        registry.call("memory_search", {"query": "concise", "top_k": 3})
+    )
     payload = json.loads(result)
 
     assert payload["ok"] is True
@@ -221,9 +221,13 @@ def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
         awaitable.close()
         raise asyncio.TimeoutError()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+    )
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
-    monkeypatch.setattr(BuiltinTools, "_terminate_process", fake_terminate, raising=False)
+    monkeypatch.setattr(
+        BuiltinTools, "_terminate_process", fake_terminate, raising=False
+    )
 
     result = asyncio.run(tools._shell("sleep 10", timeout=1))
 
@@ -247,7 +251,9 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
         captured["env"] = kwargs.get("env")
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+    )
 
     result = asyncio.run(tools._shell("echo ok", timeout=1))
 
@@ -306,7 +312,9 @@ def test_tavily_search_returns_normalized_results(tmp_path, monkeypatch):
             ],
         }
 
-    monkeypatch.setattr(BuiltinTools, "_make_tavily_request", staticmethod(fake_request))
+    monkeypatch.setattr(
+        BuiltinTools, "_make_tavily_request", staticmethod(fake_request)
+    )
 
     result = asyncio.run(
         registry.call(
@@ -340,14 +348,18 @@ def test_web_search_delegates_to_tavily_backend(tmp_path, monkeypatch):
 
     tools, registry, _ = make_builtin_tools(tmp_path)
 
-    async def fake_tavily(self, query, max_results=5, search_depth="basic", include_answer=False):
+    async def fake_tavily(
+        self, query, max_results=5, search_depth="basic", include_answer=False
+    ):
         assert query == "latest ai news"
         assert max_results == 3
         return {
             "ok": True,
             "query": query,
             "count": 1,
-            "results": [{"title": "Example", "url": "https://example.com", "snippet": "news"}],
+            "results": [
+                {"title": "Example", "url": "https://example.com", "snippet": "news"}
+            ],
         }
 
     monkeypatch.setattr(BuiltinTools, "_tavily_search", fake_tavily)

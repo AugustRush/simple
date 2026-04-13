@@ -1,12 +1,8 @@
 """Tests for ConsolidationEngine and ContextManager — sleep/decay/parse/dirty-flag/idle."""
 
-import sys
 import time
-from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def make_engine(tmp_path):

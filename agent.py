@@ -63,7 +63,6 @@ DEFAULT_MODEL = "claude-opus-4-5"
 DEFAULT_MAX_TOKENS = 8192
 MEMORY_TIDY_INTERVAL = 3600  # seconds
 MEMORY_TIDY_FILE_THRESHOLD = 5
-MAX_ORCHESTRATION_DEPTH = 3
 DEFAULT_MAX_PARALLEL_AGENTS = 3
 DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 60
 
@@ -130,38 +129,46 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> Non
 def _is_safe_prompt_version(version: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_-]+", version))
 
+
 # ── OpenAI streaming synthetic response types ─────────────────────────────────
 # These replace the inline anonymous classes that were previously defined inside
 # _stream_response(), making the code testable and eliminating duplication.
+
 
 @dataclass
 class _OAIFunc:
     name: str
     arguments: str
 
+
 @dataclass
 class _OAITC:
     id: str
     function: _OAIFunc
+
 
 @dataclass
 class _OAIMsg:
     content: str
     tool_calls: Optional[list]
 
+
 @dataclass
 class _OAIChoice:
     finish_reason: str
     message: _OAIMsg
 
+
 @dataclass
 class _OAIResponse:
     choices: list
+
 
 @dataclass
 class _AnthropicTextBlock:
     text: str
     type: str = "text"
+
 
 @dataclass
 class _AnthropicFallbackResponse:
@@ -217,15 +224,17 @@ TOOL_DEFAULT_MAX_LIST_RESULTS = 100
 # ── Shell tool security ────────────────────────────────────────────────────────
 # Commands listed here are blocked unconditionally, regardless of arguments.
 # Operators can extend this list via config key "shell_blocked_commands".
-_SHELL_BLOCKED_COMMANDS: frozenset[str] = frozenset({
-    "rm",
-    "rmdir",
-    "mkfs",
-    "dd",
-    "shred",
-    "fdisk",
-    "parted",
-})
+_SHELL_BLOCKED_COMMANDS: frozenset[str] = frozenset(
+    {
+        "rm",
+        "rmdir",
+        "mkfs",
+        "dd",
+        "shred",
+        "fdisk",
+        "parted",
+    }
+)
 
 # Dangerous pipe-idiom substrings – checked as literal substring of the command.
 _SHELL_BLOCKED_PATTERNS: tuple[str, ...] = (
@@ -338,8 +347,6 @@ def _shell_command_is_blocked(
     return None
 
 
-
-
 def normalize_memory_chapter(chapter: str, aliases: dict[str, str]) -> str:
     chapter = str(chapter).strip().lower()
     return aliases.get(chapter, chapter)
@@ -404,7 +411,9 @@ class MemoryIndex:
             files = [f for f in chapter_dir.glob("*.md") if f.name != "_index.md"]
             last_updated = max((f.stat().st_mtime for f in files), default=0)
             last_str = (
-                datetime.fromtimestamp(last_updated, tz=timezone.utc).strftime("%Y-%m-%d")
+                datetime.fromtimestamp(last_updated, tz=timezone.utc).strftime(
+                    "%Y-%m-%d"
+                )
                 if last_updated
                 else "—"
             )
@@ -523,13 +532,17 @@ class ToolRegistry:
         except (asyncio.TimeoutError, TimeoutError):
             return self._error_payload(tool_name, f"Timeout calling tool '{tool_name}'")
         except ValueError as e:
-            return self._error_payload(tool_name, f"Invalid input for tool '{tool_name}': {e}")
+            return self._error_payload(
+                tool_name, f"Invalid input for tool '{tool_name}': {e}"
+            )
         except Exception as e:
             if self.console is not None:
                 self.console.print(
                     f"[yellow]Tool '{tool_name}' failed: {e}\n{traceback.format_exc()}[/yellow]"
                 )
-            return self._error_payload(tool_name, f"Error calling tool '{tool_name}': {e}")
+            return self._error_payload(
+                tool_name, f"Error calling tool '{tool_name}': {e}"
+            )
 
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())
@@ -541,13 +554,15 @@ class ToolRegistry:
         return self._context.get(key, default)
 
     def unregister_by_source_prefix(self, prefix: str) -> None:
-        for name in [n for n, tool in self._tools.items() if tool.source.startswith(prefix)]:
+        for name in [
+            n for n, tool in self._tools.items() if tool.source.startswith(prefix)
+        ]:
             self._tools.pop(name, None)
 
 
 # ── Web tool constants ─────────────────────────────────────────────────────────
-WEB_FETCH_MAX_BYTES = 512 * 1024          # 512 KB response cap
-WEB_FETCH_TIMEOUT   = 20                  # seconds
+WEB_FETCH_MAX_BYTES = 512 * 1024  # 512 KB response cap
+WEB_FETCH_TIMEOUT = 20  # seconds
 WEB_SEARCH_MAX_RESULTS = 10
 TAVILY_SEARCH_MAX_RESULTS = 10
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -699,7 +714,10 @@ class BuiltinTools:
             {
                 "type": "object",
                 "properties": {
-                    "chapter": {"type": "string", "description": "Palace locus or legacy alias"},
+                    "chapter": {
+                        "type": "string",
+                        "description": "Palace locus or legacy alias",
+                    },
                     "name": {
                         "type": "string",
                         "description": "File name (without .md)",
@@ -723,7 +741,10 @@ class BuiltinTools:
             {
                 "type": "object",
                 "properties": {
-                    "chapter": {"type": "string", "description": "Palace locus or legacy alias"},
+                    "chapter": {
+                        "type": "string",
+                        "description": "Palace locus or legacy alias",
+                    },
                     "name": {
                         "type": "string",
                         "description": "File name (without .md)",
@@ -824,7 +845,7 @@ class BuiltinTools:
             (
                 "Fetch the content of a URL and return it as plain text (HTML tags stripped). "
                 "Use to read articles, documentation, or any web page whose URL you already know. "
-                "Respects robots.txt is not checked; use responsibly."
+                "Note: robots.txt is not checked; use responsibly."
             ),
             {
                 "type": "object",
@@ -915,8 +936,12 @@ class BuiltinTools:
     def _strip_html(raw: str) -> str:
         """Very lightweight HTML → plain-text: remove tags, decode entities."""
         # Remove <script> and <style> blocks entirely
-        raw = re.sub(r"<(script|style)[^>]*>.*?</(script|style)>", " ", raw,
-                     flags=re.DOTALL | re.IGNORECASE)
+        raw = re.sub(
+            r"<(script|style)[^>]*>.*?</(script|style)>",
+            " ",
+            raw,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
         # Remove all remaining tags
         raw = re.sub(r"<[^>]+>", " ", raw)
         # Decode HTML entities (e.g. &amp; &lt; &#39;)
@@ -1010,19 +1035,12 @@ class BuiltinTools:
         """Fetch a single URL and return its text content."""
         url = url.strip()
         if not url.startswith(("http://", "https://")):
-            return self._error(
-                "URL must start with http:// or https://", url=url
-            )
+            return self._error("URL must start with http:// or https://", url=url)
         max_chars = max(100, min(int(max_chars), WEB_FETCH_MAX_BYTES))
         try:
-            raw_bytes = await asyncio.to_thread(
-                self._make_urllib_request, url
-            )
-            # Decode – try UTF-8, fall back to latin-1
-            try:
-                raw_text = raw_bytes.decode("utf-8", errors="replace")
-            except Exception:
-                raw_text = raw_bytes.decode("latin-1", errors="replace")
+            raw_bytes = await asyncio.to_thread(self._make_urllib_request, url)
+            # Decode – UTF-8 with replacement (never raises)
+            raw_text = raw_bytes.decode("utf-8", errors="replace")
 
             if raw_html:
                 body = raw_text[:max_chars]
@@ -1128,7 +1146,10 @@ class BuiltinTools:
         if not candidate.is_absolute():
             candidate = self.workspace_root / candidate
         resolved = candidate.resolve(strict=False)
-        if resolved != self.workspace_root and self.workspace_root not in resolved.parents:
+        if (
+            resolved != self.workspace_root
+            and self.workspace_root not in resolved.parents
+        ):
             raise ValueError(
                 f"Path '{path}' is outside the workspace root '{self.workspace_root}'"
             )
@@ -1136,10 +1157,14 @@ class BuiltinTools:
 
     async def _shell(self, command: str, timeout: int = 30) -> dict[str, Any]:
         # Security: block dangerous commands before spawning any subprocess.
-        extra_blocked: list[str] = self.registry.get_context("shell_blocked_commands") or []
+        extra_blocked: list[str] = (
+            self.registry.get_context("shell_blocked_commands") or []
+        )
         block_reason = _shell_command_is_blocked(command, extra_blocked)
         if block_reason:
-            return self._error(f"Shell command rejected: {block_reason}", command=command)
+            return self._error(
+                f"Shell command rejected: {block_reason}", command=command
+            )
 
         proc = None
         try:
@@ -1164,7 +1189,9 @@ class BuiltinTools:
                 result += f"STDERR:\n{err}"
             result += f"\nExit code: {proc.returncode}"
             return self._ok(
-                command=command, output=result or "(no output)", exit_code=proc.returncode
+                command=command,
+                output=result or "(no output)",
+                exit_code=proc.returncode,
             )
         except asyncio.TimeoutError:
             await self._terminate_process(proc)
@@ -1203,7 +1230,9 @@ class BuiltinTools:
     def _is_binary_bytes(chunk: bytes) -> bool:
         return b"\x00" in chunk
 
-    def _read_file(self, path: str, max_bytes: int = TOOL_DEFAULT_MAX_READ_BYTES) -> dict[str, Any]:
+    def _read_file(
+        self, path: str, max_bytes: int = TOOL_DEFAULT_MAX_READ_BYTES
+    ) -> dict[str, Any]:
         try:
             p = self._resolve_workspace_path(path)
             if not p.exists():
@@ -1319,9 +1348,13 @@ class BuiltinTools:
             return self._error("Context manager not available.")
         result = self.context_manager.retrieve_context(query, top_k=top_k)
         sections = [s for s in result.split("\n\n") if s.strip()] if result else []
-        return self._ok(query=query, count=len(sections), content=result, sections=sections)
+        return self._ok(
+            query=query, count=len(sections), content=result, sections=sections
+        )
 
-    def _clean_output(self, max_age_hours: float = 0, subdir: str = "") -> dict[str, Any]:
+    def _clean_output(
+        self, max_age_hours: float = 0, subdir: str = ""
+    ) -> dict[str, Any]:
         if self._output_dir is None:
             return self._error("Output directory not configured")
         target = self._output_dir / subdir if subdir else self._output_dir
@@ -1349,6 +1382,7 @@ class BuiltinTools:
         if errors:
             result["errors"] = errors[:10]
         return result
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.5 MODEL CONFIG — provider abstraction (Claude / OpenAI-compatible)
@@ -1589,7 +1623,9 @@ class MemoryPalace:
     def search(self, query: str) -> list[dict]:
         results = []
         for entry in self.store.search_entries(query, limit=20):
-            anchor = f"{entry.category}/{entry.entity}" if entry.entity else entry.category
+            anchor = (
+                f"{entry.category}/{entry.entity}" if entry.entity else entry.category
+            )
             results.append({"path": anchor, "snippet": entry.content[:120]})
         return results
 
@@ -1791,6 +1827,9 @@ class LTMStore:
         self._meta_path = context_dir / "_meta.json"
         self._db_path = context_dir / "palace.db"
         self._local = threading.local()  # thread-local connection storage
+        self._all_connections: list[
+            sqlite3.Connection
+        ] = []  # track for explicit cleanup
         self.dir.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
@@ -1816,7 +1855,18 @@ class LTMStore:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
             self._local.conn = conn
+            self._all_connections.append(conn)
         return self._local.conn
+
+    def close(self) -> None:
+        """Close all thread-local SQLite connections explicitly."""
+        for conn in getattr(self, "_all_connections", []):
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self._all_connections = []
+        self._local = threading.local()
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
@@ -1926,7 +1976,11 @@ class LTMStore:
         if raw:
             return self.normalize_category_name(raw)
         if self._is_palace_locus(category):
-            return "user" if self.normalize_category_name(category) == "identity" else "general"
+            return (
+                "user"
+                if self.normalize_category_name(category) == "identity"
+                else "general"
+            )
         return self.normalize_category_name(category)
 
     def _projection_path(self, category: str, entity: str) -> Path:
@@ -2010,7 +2064,9 @@ class LTMStore:
         return None
 
     def _delete_fts_rows(
-        self, conn: sqlite3.Connection, entry_ids: list[str] | set[str] | tuple[str, ...]
+        self,
+        conn: sqlite3.Connection,
+        entry_ids: list[str] | set[str] | tuple[str, ...],
     ) -> None:
         ids = [entry_id for entry_id in entry_ids if entry_id]
         if not ids:
@@ -2063,7 +2119,9 @@ class LTMStore:
         if existing_row:
             entry.id = existing_row["id"]
             entry.created_at = existing_row["created_at"]
-            affected_categories.add(self.normalize_category_name(existing_row["category"]))
+            affected_categories.add(
+                self.normalize_category_name(existing_row["category"])
+            )
         conn.execute(
             """
             INSERT OR REPLACE INTO memory_items (
@@ -2087,7 +2145,9 @@ class LTMStore:
             ),
         )
         self._sync_fts_row(conn, entry.id)
-        return {self.normalize_category_name(category) for category in affected_categories}
+        return {
+            self.normalize_category_name(category) for category in affected_categories
+        }
 
     def _find_existing_entry_row(
         self, conn: sqlite3.Connection, entry: LTMEntry
@@ -2126,11 +2186,7 @@ class LTMStore:
             WHERE status = 'active'
             """
         ).fetchall()
-        return {
-            row["category"]
-            for row in rows
-            if row["category"] not in PALACE_LOCI
-        }
+        return {row["category"] for row in rows if row["category"] not in PALACE_LOCI}
 
     def _refresh_indexes(self) -> None:
         previous = {c["name"] for c in self._meta.get("categories", [])}
@@ -2181,7 +2237,7 @@ class LTMStore:
                        MAX(updated_at) AS last_updated
                 FROM memory_items
                 WHERE status = 'active'
-                  AND category IN ({','.join('?' for _ in normalized)})
+                  AND category IN ({",".join("?" for _ in normalized)})
                 GROUP BY category
                 ORDER BY category
                 """,
@@ -2491,7 +2547,9 @@ class LTMStore:
             for row in rows:
                 entry = self._row_to_entry(row)
                 if entry.category in {"episodes"}:
-                    affected_categories.add(self.normalize_category_name(entry.category))
+                    affected_categories.add(
+                        self.normalize_category_name(entry.category)
+                    )
                     entry.decay(DECAY_FACTOR)
                     entry.updated_at = _now()
                     if entry.importance < MIN_IMPORTANCE:
@@ -2502,7 +2560,13 @@ class LTMStore:
                         self._delete_fts_rows(conn, [entry.id])
                     else:
                         affected_categories.update(self._write_entry_row(conn, entry))
-                elif entry.category in {"identity", "projects", "procedures", "people", "concepts"}:
+                elif entry.category in {
+                    "identity",
+                    "projects",
+                    "procedures",
+                    "people",
+                    "concepts",
+                }:
                     continue
                 elif entry.category == "tasks":
                     continue
@@ -2513,7 +2577,9 @@ class LTMStore:
         entries = self.all_entries()[:limit]
         lines = []
         for entry in entries:
-            anchor = f"{entry.category}/{entry.entity}" if entry.entity else entry.category
+            anchor = (
+                f"{entry.category}/{entry.entity}" if entry.entity else entry.category
+            )
             lines.append(f"- [{anchor}] ({entry.memory_type}) {entry.content}")
         return "\n".join(lines)
 
@@ -2776,11 +2842,7 @@ class ConsolidationEngine:
                 content = data.get("content", "").strip()
                 if not content:
                     continue
-                category = (
-                    data.get("locus")
-                    or data.get("category")
-                    or "concepts"
-                )
+                category = data.get("locus") or data.get("category") or "concepts"
                 normalized_category = self.store.normalize_category_name(category)
                 entity = str(data.get("entity", "")).strip()
                 if normalized_category not in PALACE_LOCI:
@@ -2795,7 +2857,8 @@ class ConsolidationEngine:
                         created_at=_now(),
                         updated_at=_now(),
                         entity=entity,
-                        memory_type=str(data.get("memory_type", "fact")).strip() or "fact",
+                        memory_type=str(data.get("memory_type", "fact")).strip()
+                        or "fact",
                         source_session=str(data.get("source_session", "")).strip(),
                         confidence=float(data.get("confidence", 1.0)),
                     )
@@ -2833,14 +2896,6 @@ class ConsolidationEngine:
             created_at=_now(),
             updated_at=_now(),
         )
-
-    async def _ensure_category_fits(
-        self, category: str, client: Any, model: str, api_format: str
-    ) -> None:
-        """Normalize free-form categories into the fixed palace loci."""
-        normalized = self.store.normalize_category_name(category)
-        if normalized in PALACE_LOCI:
-            return
 
 
 class ContextManager:
@@ -2940,7 +2995,9 @@ class ContextManager:
             return False
         if len(staged) >= self.staging_turn_threshold:
             return True
-        return self.consolidation.estimate_tokens(staged) >= self.staging_token_threshold
+        return (
+            self.consolidation.estimate_tokens(staged) >= self.staging_token_threshold
+        )
 
     def enqueue_consolidation(self, reason: str) -> None:
         """Queue one consolidation job if there is staged work pending."""
@@ -3009,7 +3066,9 @@ class ContextManager:
     def retrieve_ltm_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
         """Return top-K relevant LTM entries as an injectable string."""
         categories = self._route_categories(query)
-        top = self.store.search_entries(query, categories=categories or None, limit=top_k)
+        top = self.store.search_entries(
+            query, categories=categories or None, limit=top_k
+        )
         if not top and categories:
             top = self.store.search_entries(query, categories=None, limit=top_k)
         if not top:
@@ -3231,7 +3290,9 @@ class MCPClient:
         name = re.sub(r"[^0-9a-zA-Z_]+", "_", value.strip().lower())
         return name.strip("_") or "mcp"
 
-    async def connect_from_config(self, config: dict, extra_env: dict[str, str] | None = None):
+    async def connect_from_config(
+        self, config: dict, extra_env: dict[str, str] | None = None
+    ):
         self._extra_env = extra_env or {}
         self._configured_servers = len(config.get("mcp_servers", []) or [])
         mcp_servers = config.get("mcp_servers", [])
@@ -3255,7 +3316,9 @@ class MCPClient:
         )
         # Merge: agent-level env < server-specific env (server wins)
         server_env = dict(cfg.get("env", {}) or {})
-        merged_env = {**self._extra_env, **server_env} if self._extra_env or server_env else None
+        merged_env = (
+            {**self._extra_env, **server_env} if self._extra_env or server_env else None
+        )
         params = mcp.StdioServerParameters(
             command=command,
             args=list(cfg.get("args", []) or []),
@@ -3391,7 +3454,9 @@ class UserToolCatalog:
                 spec.loader.exec_module(module)
                 register = getattr(module, "register", None)
                 if not callable(register):
-                    raise ValueError("tool plugin must define callable register(registry)")
+                    raise ValueError(
+                        "tool plugin must define callable register(registry)"
+                    )
                 register(_UserToolRegistryFacade(registry, source))
                 loaded.append(plugin_id)
             except Exception as e:
@@ -3508,11 +3573,14 @@ def prepare_user_message_for_skills(
 class SkillCatalog:
     """Load skill bundles from user and built-in skill directories."""
 
-    def __init__(self, user_root: Optional[Path] = None, builtin_root: Optional[Path] = None):
+    def __init__(
+        self, user_root: Optional[Path] = None, builtin_root: Optional[Path] = None
+    ):
         self.user_root = user_root or SKILLS_DIR
         self.builtin_root = builtin_root or BUILTIN_SKILLS_DIR
         self._skills: dict[str, SkillBundle] = {}
         self._aliases: dict[str, str] = {}
+        self._registry: Optional[ToolRegistry] = None
 
     def load_all(self) -> None:
         self.user_root.mkdir(parents=True, exist_ok=True)
@@ -3531,7 +3599,9 @@ class SkillCatalog:
             self._skills[bundle.id] = bundle
         self._rebuild_aliases()
 
-    def _read_bundle(self, skill_file: Path, *, root: Path, source: str) -> Optional[SkillBundle]:
+    def _read_bundle(
+        self, skill_file: Path, *, root: Path, source: str
+    ) -> Optional[SkillBundle]:
         try:
             raw_text = skill_file.read_text(encoding="utf-8")
         except Exception as e:
@@ -3558,7 +3628,9 @@ class SkillCatalog:
             metadata=metadata,
             supporting_files=supporting_files,
             user_invocable=bool(metadata.get("user-invocable", True)),
-            disable_model_invocation=bool(metadata.get("disable-model-invocation", False)),
+            disable_model_invocation=bool(
+                metadata.get("disable-model-invocation", False)
+            ),
         )
 
     def _rebuild_aliases(self) -> None:
@@ -3612,6 +3684,8 @@ class SkillCatalog:
         return lines
 
     def register_tools(self, registry: ToolRegistry) -> None:
+        self._registry = registry
+
         async def activate_skill(skill_name: str) -> dict[str, Any]:
             bundle = self.get(skill_name)
             if bundle is None:
@@ -3621,7 +3695,7 @@ class SkillCatalog:
                     "ok": False,
                     "error": f"Skill '{bundle.id}' cannot be activated by the model",
                 }
-            return self._activation_payload(bundle)
+            return self._activation_payload(bundle, registry=registry)
 
         def list_skill_files(skill_name: str) -> dict[str, Any]:
             bundle = self.get(skill_name)
@@ -3640,7 +3714,10 @@ class SkillCatalog:
                 return {"ok": False, "error": f"Skill '{skill_name}' not found"}
             rel_path = Path(path)
             if rel_path.is_absolute():
-                return {"ok": False, "error": "Skill file paths must be relative to the skill bundle"}
+                return {
+                    "ok": False,
+                    "error": "Skill file paths must be relative to the skill bundle",
+                }
             target = (bundle.path / rel_path).resolve(strict=False)
             if target != bundle.path and bundle.path not in target.parents:
                 return {"ok": False, "error": "Requested path escapes the skill bundle"}
@@ -3710,8 +3787,10 @@ class SkillCatalog:
             source="runtime:skill",
         )
 
-    def _activation_payload(self, bundle: SkillBundle) -> dict[str, Any]:
-        return {
+    def _activation_payload(
+        self, bundle: SkillBundle, registry: Optional[ToolRegistry] = None
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "ok": True,
             "skill": {
                 "id": bundle.id,
@@ -3723,23 +3802,50 @@ class SkillCatalog:
                 "supporting_files": bundle.supporting_files,
                 "metadata": bundle.metadata,
             },
+            "hints": {
+                "file_access": (
+                    "Use `read_skill_file` (not `read_file`) to read files inside "
+                    "the skill bundle. `read_file` is restricted to the workspace root."
+                ),
+            },
         }
+        output_dir = registry.get_context("output_dir") if registry else None
+        if output_dir:
+            payload["hints"]["output_dir"] = (
+                f"Save generated files to: {output_dir} "
+                f"(also available as $AGENT_OUTPUT_DIR in shell commands)"
+            )
+        return payload
 
-    def activation_text(self, skill_ref: str, *, explicit: bool = False) -> Optional[str]:
+    def activation_text(
+        self, skill_ref: str, *, explicit: bool = False
+    ) -> Optional[str]:
         bundle = self.get(skill_ref)
         if bundle is None:
             return None
         lines = [f"Skill `{bundle.id}` ({bundle.name}) is active for this turn."]
         if explicit:
-            lines.append("This skill was explicitly requested by the user and must be followed.")
+            lines.append(
+                "This skill was explicitly requested by the user and must be followed."
+            )
         if bundle.description:
             lines.append(f"Description: {bundle.description}")
         lines.append(f"Bundle root: {bundle.path}")
         if bundle.supporting_files:
-            lines.append("Supporting files available on demand:")
+            lines.append(
+                "Supporting files (use `read_skill_file` to read, NOT `read_file`):"
+            )
             lines.extend(f"- {path}" for path in bundle.supporting_files)
         else:
             lines.append("Supporting files available on demand: none")
+        output_dir = (
+            self._registry.get_context("output_dir") if self._registry else None
+        )
+        if output_dir:
+            lines.append(
+                f"Output directory for generated files: {output_dir} "
+                f"(also available as $AGENT_OUTPUT_DIR in shell)"
+            )
         lines.append("")
         lines.append(bundle.body or "(No instructions in SKILL.md body)")
         return "\n".join(lines)
@@ -3759,7 +3865,6 @@ class AgentContext:
     messages: list[dict] = field(default_factory=list)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     tools_enabled: bool = True
-    depth: int = 0
     metadata: dict = field(default_factory=dict)
 
 
@@ -3938,9 +4043,7 @@ class BaseAgent:
                 return await self.registry.call(tu["name"], tu["input"])
             CONSOLE.print(f"\n[cyan]→ {tu['name']}[/cyan]")
             res = await self.registry.call(tu["name"], tu["input"])
-            CONSOLE.print(
-                f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]"
-            )
+            CONSOLE.print(f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]")
             return res
 
         results: list[Optional[str]] = [None] * len(tool_uses)
@@ -3969,7 +4072,7 @@ class BaseAgent:
                     f"\n[bold magenta]⟳ Spawning {len(spawn_calls)} agents in parallel:[/bold magenta] {roles}"
                 )
             for start in range(0, len(spawn_calls), self.max_parallel_agents):
-                batch = spawn_calls[start:start + self.max_parallel_agents]
+                batch = spawn_calls[start : start + self.max_parallel_agents]
                 batch_results = await asyncio.gather(
                     *[_exec_tool(tu) for _, tu in batch]
                 )
@@ -4111,7 +4214,10 @@ class BaseAgent:
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {
                             "id": tc_delta.id or "",
-                            "name": (tc_delta.function.name if tc_delta.function else "") or "",
+                            "name": (
+                                tc_delta.function.name if tc_delta.function else ""
+                            )
+                            or "",
                             "arguments": "",
                         }
                     acc = tool_calls_acc[idx]
@@ -4126,17 +4232,23 @@ class BaseAgent:
                 finish_reason = choice.finish_reason
 
         # Build a synthetic response object using module-level dataclasses
-        oi_tool_calls = [
-            _OAITC(v["id"], _OAIFunc(v["name"], v["arguments"]))
-            for _, v in sorted(tool_calls_acc.items())
-        ] if tool_calls_acc else None
+        oi_tool_calls = (
+            [
+                _OAITC(v["id"], _OAIFunc(v["name"], v["arguments"]))
+                for _, v in sorted(tool_calls_acc.items())
+            ]
+            if tool_calls_acc
+            else None
+        )
 
-        response = _OAIResponse([
-            _OAIChoice(
-                finish_reason,
-                _OAIMsg("".join(collected), oi_tool_calls),
-            )
-        ])
+        response = _OAIResponse(
+            [
+                _OAIChoice(
+                    finish_reason,
+                    _OAIMsg("".join(collected), oi_tool_calls),
+                )
+            ]
+        )
         return response, "".join(collected)
 
     def register_spawn_capability(
@@ -4176,7 +4288,9 @@ class BaseAgent:
             sub_ctx = AgentContext(role=role, system_prompt=sys_prompt)
             if active_ctx:
                 if "skill_catalog" in active_ctx.metadata:
-                    sub_ctx.metadata["skill_catalog"] = active_ctx.metadata["skill_catalog"]
+                    sub_ctx.metadata["skill_catalog"] = active_ctx.metadata[
+                        "skill_catalog"
+                    ]
                 if "required_skills" in active_ctx.metadata:
                     sub_ctx.metadata["required_skills"] = list(
                         active_ctx.metadata["required_skills"]
@@ -4200,8 +4314,7 @@ class BaseAgent:
                     "task": task,
                     "timed_out": True,
                     "error": (
-                        "sub-agent timed out after "
-                        f"{self.sub_agent_timeout_seconds}s"
+                        f"sub-agent timed out after {self.sub_agent_timeout_seconds}s"
                     ),
                 }
                 CONSOLE.print(
@@ -4552,15 +4665,19 @@ def load_config() -> tuple[dict, bool]:
         raw = json.loads(CONFIG_FILE.read_text())
         # Only backfill structural sections the user hasn't touched;
         # never overwrite top-level identity keys.
-        for section in ("memory", "orchestration", "evolution", "mcp_servers", "context"):
+        for section in (
+            "memory",
+            "orchestration",
+            "evolution",
+            "mcp_servers",
+            "context",
+        ):
             if section not in raw and section in DEFAULT_CONFIG:
                 raw[section] = DEFAULT_CONFIG[section]
         return raw, first_run
     except Exception as e:
         CONSOLE.print(f"[yellow]Config parse error: {e} — using defaults[/yellow]")
         return dict(DEFAULT_CONFIG), first_run
-
-
 
 
 def save_config(cfg: dict):
@@ -4775,7 +4892,9 @@ def _compose_system_prompt(
         if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
             lines.append(f"Workspace root for file tools: {workspace_root}")
     if output_dir:
-        lines.append(f"Output directory for generated files (screenshots, exports, temp): {output_dir}")
+        lines.append(
+            f"Output directory for generated files (screenshots, exports, temp): {output_dir}"
+        )
     return base_prompt.rstrip() + "\n\n" + "\n".join(lines)
 
 
@@ -4783,6 +4902,9 @@ async def _close_components(components: dict) -> None:
     mcp_client = components.get("mcp_client")
     if mcp_client is not None:
         await mcp_client.close()
+    ctx_mgr = components.get("context_manager")
+    if ctx_mgr is not None and hasattr(ctx_mgr, "store"):
+        ctx_mgr.store.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4915,12 +5037,17 @@ async def _build_components_async(cfg: dict):
     )
     agent.sub_agent_timeout_seconds = max(
         1,
-        int(orch_cfg.get("sub_agent_timeout_seconds", DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)),
+        int(
+            orch_cfg.get("sub_agent_timeout_seconds", DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
+        ),
     )
     loaded_user_tools = user_tool_catalog.load_into_registry(registry)
     if loaded_user_tools:
-        CONSOLE.print("[green]User tools loaded:[/green] " + ", ".join(loaded_user_tools))
+        CONSOLE.print(
+            "[green]User tools loaded:[/green] " + ", ".join(loaded_user_tools)
+        )
     agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
+    base_system_prompt = system_prompt
     system_prompt = _compose_system_prompt(
         system_prompt,
         registry,
@@ -4935,6 +5062,7 @@ async def _build_components_async(cfg: dict):
         "client": client,
         "model": model,
         "max_tokens": max_tokens,
+        "base_system_prompt": base_system_prompt,
         "system_prompt": system_prompt,
         "memory": memory,
         "registry": registry,
@@ -5029,7 +5157,9 @@ async def _interactive_loop(components: dict, cfg: dict):
                             "Dynamic Categories",
                             f"{stats['categories']}/{stats['max_categories']}",
                         )
-                        table.add_row("Total Categories", str(stats["total_categories"]))
+                        table.add_row(
+                            "Total Categories", str(stats["total_categories"])
+                        )
                         table.add_row("Total Entries", str(stats["total_entries"]))
                         table.add_row(
                             "Category Names",
@@ -5054,8 +5184,15 @@ async def _interactive_loop(components: dict, cfg: dict):
                 elif cmd == "evolve":
                     CONSOLE.print("[yellow]Running evolution engine...[/yellow]")
                     new_prompt = await evolution.rewrite_system_prompt()
-                    components["system_prompt"] = new_prompt
-                    ctx.system_prompt = new_prompt
+                    components["base_system_prompt"] = new_prompt
+                    components["system_prompt"] = _compose_system_prompt(
+                        new_prompt,
+                        components["registry"],
+                        Path.cwd().resolve(),
+                        components["output_dir"],
+                        skill_catalog=components["skill_catalog"],
+                    )
+                    ctx.system_prompt = components["system_prompt"]
                     CONSOLE.print("[green]System prompt updated.[/green]")
                     continue
                 elif cmd == "generate-tool" or cmd.startswith("generate-tool "):
@@ -5070,7 +5207,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                     await evolution.generate_tool(description, components["registry"])
                     user_tool_catalog.load_into_registry(components["registry"])
                     components["system_prompt"] = _compose_system_prompt(
-                        components["system_prompt"],
+                        components["base_system_prompt"],
                         components["registry"],
                         Path.cwd().resolve(),
                         components["output_dir"],
@@ -5189,7 +5326,9 @@ async def _interactive_loop(components: dict, cfg: dict):
                         ctx_mgr.enqueue_consolidation("staged_turns")
 
                 # Keep working memory bounded without blocking on LLM consolidation.
-                if ctx_mgr and ctx_mgr.should_compact_messages(ctx.messages, agent.max_tokens):
+                if ctx_mgr and ctx_mgr.should_compact_messages(
+                    ctx.messages, agent.max_tokens
+                ):
                     ctx.messages = ctx_mgr.compact_messages(ctx.messages)
 
             except Exception as e:
@@ -5241,6 +5380,7 @@ def main_callback(ctx: typer.Context):
                 raise typer.Exit(0)
             # Reload after potential edits
             cfg, _ = load_config()
+
         async def _run():
             components = await _build_components_async(cfg)
             try:
@@ -5259,6 +5399,7 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
         if not _first_run_setup():
             raise typer.Exit(0)
         cfg, _ = load_config()
+
     async def _run():
         components = await _build_components_async(cfg)
         agent: BaseAgent = components["agent"]
@@ -5275,7 +5416,9 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
             result = await agent.send_message(
                 ctx,
                 normalized_question,
-                stream_callback=lambda chunk: CONSOLE.print(chunk, end="", markup=False),
+                stream_callback=lambda chunk: CONSOLE.print(
+                    chunk, end="", markup=False
+                ),
             )
             CONSOLE.print()
             if result.error:
@@ -5298,6 +5441,7 @@ def evolve(
 ):
     """Self-evolution: analyze history and optimize the agent."""
     cfg, _ = load_config()
+
     async def _run():
         components = await _build_components_async(cfg)
         evolution: EvolutionEngine = components["evolution"]
@@ -5331,7 +5475,6 @@ def config(
     key: Optional[str] = typer.Argument(
         None, help="Config key (dot-notation supported, e.g. providers.qwen.base_url)"
     ),
-    value: Optional[str] = typer.Argument(None, help="(unused)"),
 ):
     """View agent configuration (read-only).
 
@@ -5435,6 +5578,7 @@ def memory_search(query: str = typer.Argument(..., help="Search query")):
 def memory_tidy():
     """Manually trigger AI-assisted memory reorganization."""
     cfg, _ = load_config()
+
     async def _run():
         components = await _build_components_async(cfg)
         mem: MemoryPalace = components["memory"]

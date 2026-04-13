@@ -2,15 +2,13 @@
 
 import os
 import time
-import sys
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
 
 # ── _resolve_output_dir ─────────────────────────────────────────────────────
+
 
 def test_resolve_output_dir_uses_default_when_not_configured(monkeypatch, tmp_path):
     import agent as agent_module
@@ -50,6 +48,7 @@ def test_resolve_output_dir_expands_env_var(monkeypatch, tmp_path):
 
 # ── ToolRegistry context ────────────────────────────────────────────────────
 
+
 def test_registry_set_and_get_context():
     from agent import ToolRegistry
 
@@ -61,6 +60,7 @@ def test_registry_set_and_get_context():
 
 
 # ── clean_output tool ───────────────────────────────────────────────────────
+
 
 def test_clean_output_deletes_all_files(tmp_path):
     from agent import ToolRegistry, BuiltinTools
@@ -153,11 +153,16 @@ def test_clean_output_not_registered_when_no_output_dir():
 
 # ── Build components integration ────────────────────────────────────────────
 
+
 def test_build_components_wires_output_dir(monkeypatch, tmp_path):
     import agent as agent_module
 
     cfg = _minimal_cfg()
-    monkeypatch.setattr(agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024))
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
@@ -186,7 +191,9 @@ def test_build_components_wires_shell_blocked_commands(monkeypatch, tmp_path):
     cfg = _minimal_cfg()
     cfg["shell_blocked_commands"] = ["python"]
     monkeypatch.setattr(
-        agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024)
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
     )
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
@@ -226,7 +233,11 @@ def test_build_components_passes_output_dir_to_mcp_env(monkeypatch, tmp_path):
 
     cfg = _minimal_cfg()
     cfg["mcp_servers"] = [{"name": "demo", "command": "fake"}]
-    monkeypatch.setattr(agent_module.ModelClientFactory, "from_config", lambda cfg: (object(), "fake-model", 1024))
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
     monkeypatch.setattr(agent_module, "MCPClient", _CaptureMCPClient)
     monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
     monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
@@ -241,6 +252,7 @@ def test_build_components_passes_output_dir_to_mcp_env(monkeypatch, tmp_path):
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 
 class _StubMemory:
     """Minimal memory stub for BuiltinTools initialization."""

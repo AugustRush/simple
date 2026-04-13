@@ -1,7 +1,4 @@
 from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def test_agent_is_self_contained_single_file():

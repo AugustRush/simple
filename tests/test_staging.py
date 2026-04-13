@@ -1,11 +1,6 @@
 """Tests for StagingBuffer — append/read/clear/persistence."""
 
-import sys
-from pathlib import Path
-
 import pytest
-
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 def make_staging(tmp_path):
@@ -130,7 +125,9 @@ def test_count_uses_cached_value_without_reopening_file(tmp_path, monkeypatch):
         path = str(args[0]) if args else ""
         mode = kwargs.get("mode") or (args[1] if len(args) > 1 else "r")
         if path.endswith("staging.jsonl") and "r" in mode:
-            raise AssertionError("count should use cached state instead of reopening staging")
+            raise AssertionError(
+                "count should use cached state instead of reopening staging"
+            )
         return original_open(*args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", guarded_open)

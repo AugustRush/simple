@@ -25,4 +25,4 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["agent", "tool_runtime", "memory_projection"]
+py-modules = ["agent"]
