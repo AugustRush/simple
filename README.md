@@ -3,75 +3,71 @@
 Single-file personal AI agent with:
 
 - provider abstraction for Anthropic and OpenAI-compatible APIs
-- interactive chat and single-turn CLI modes
-- tool calling (`shell`, file I/O, memory, context retrieval, sub-agents)
-- fixed-loci memory palace with SQLite-backed long-term memory
-- per-session staging and consolidation
-- self-evolution utilities for session scoring and prompt rewriting
+- interactive chat plus single-turn CLI mode
+- tool calling for shell, files, memory, web access, and sub-agents
+- fixed-loci memory palace backed by SQLite
+- staged conversation buffering, background consolidation, and orphan-session recovery
+- skills, MCP tool ingestion, user tool plugins, and prompt-evolution utilities
 
 ## Requirements
 
 - Python `3.11+`
-- One model provider credential:
-  - `ANTHROPIC_API_KEY`, or
-  - `OPENAI_API_KEY`, or
-  - `DEEPSEEK_API_KEY`, or
-  - `DASHSCOPE_API_KEY`, or
-  - a local OpenAI-compatible endpoint such as Ollama
+- `uv`
+- At least one configured model provider
 
-## Dependencies
-
-Required runtime dependencies:
-
-- managed by `uv` from `pyproject.toml`
-- runtime packages:
-  - `anthropic`
-  - `openai`
-  - `typer`
-  - `rich`
-  - `sqlite3` is used from the Python standard library, so no extra install is needed
-
-Optional dependencies:
-
-- `mcp`
-  Enables MCP client integration. The dependency is optional, but configured MCP servers can be connected and their tools registered at startup.
-
-Development dependencies:
-
-- `pytest` via the `dev` dependency group
-
-Install with `uv`:
-
-```bash
-uv sync --group dev
-```
-
-If you want MCP support:
-
-```bash
-uv sync --group dev --extra mcp
-```
-
-## Configuration
-
-The agent reads config from `~/.agent/config.json`.
-
-Bootstrap from the example file:
-
-```bash
-mkdir -p ~/.agent
-cp config.example.json ~/.agent/config.json
-```
-
-Then edit provider settings and API keys. The config supports:
+Supported provider patterns in the current config/runtime:
 
 - `anthropic`
 - `openai`
 - `deepseek`
 - `qwen`
 - `ollama`
+- any other OpenAI-compatible endpoint via `base_url`
 
-You can also point any OpenAI-compatible provider at a custom `base_url`.
+## Install
+
+Install runtime and development dependencies:
+
+```bash
+uv sync --group dev
+```
+
+The current project dependencies are:
+
+- `anthropic`
+- `openai`
+- `typer`
+- `rich`
+- `mcp`
+- `pytest` in the `dev` dependency group
+
+## Configuration
+
+The agent reads config from `~/.agent/config.json`.
+
+You can either let first run scaffold the file, or copy the example manually:
+
+```bash
+mkdir -p ~/.agent
+cp config.example.json ~/.agent/config.json
+```
+
+Key config areas in the current project:
+
+- `active_provider`
+- `providers.<name>.api_format`
+- `providers.<name>.api_key`
+- `providers.<name>.base_url`
+- `providers.<name>.default_model`
+- `providers.<name>.max_tokens`
+- `context.storage`
+- `context.consolidation`
+- `mcp_servers`
+- `tavily_api_key`
+- `output_dir`
+- `system_prompt_file`
+
+`config.example.json` shows the full shape used by the current runtime.
 
 ## Usage
 
@@ -87,16 +83,20 @@ Single-turn chat:
 uv run simple chat "Summarize this repository"
 ```
 
-Show configured providers/models:
-
-```bash
-uv run simple config models
-```
-
-Show current config:
+Read-only config commands:
 
 ```bash
 uv run simple config list
+uv run simple config models
+uv run simple config get providers.qwen.base_url
+```
+
+Evolution commands:
+
+```bash
+uv run simple evolve --stats
+uv run simple evolve --rewrite
+uv run simple evolve --apply-best
 ```
 
 Memory commands:
@@ -109,74 +109,71 @@ uv run simple memory search "preferences"
 uv run simple memory tidy
 ```
 
-Evolution commands:
-
-```bash
-uv run simple evolve --stats
-uv run simple evolve --rewrite
-uv run simple evolve --apply-best
-```
-
-### Direct `simple` Command
-
-If you want to run `simple` directly instead of `uv run simple`, install the project tool once from this directory:
+Install the CLI as a tool if you want `simple` directly on your `PATH`:
 
 ```bash
 uv tool install --editable .
 ```
 
-After that, the command is available as:
+## Interactive Commands
 
-```bash
-simple
-simple chat "Summarize this repository"
-```
+In interactive mode, the current runtime exposes these slash commands:
 
-## Built-in Tools
+- `/memory`
+- `/context`
+- `/evolve`
+- `/generate-tool <description>`
+- `/tools`
+- `/model [name]`
+- `/ralph <goal>`
+- `/quit`
 
-The runtime registers these built-in tools:
+There is also a `/skills` command in the current CLI implementation.
 
-- `shell`
-- `read_file`
-- `write_file`
-- `list_files`
-- `memory_write`
-- `memory_read`
-- `memory_search`
-- `memory_index`
-- `context_retrieve`
-- `spawn_agent`
+## Runtime Tools
 
-Skills are loaded as bundles from:
+The built-in runtime currently registers tools in these groups:
 
-- user skills: `~/.agent/skills/**/SKILL.md`
-- built-in skills: `<repo>/skills/**/SKILL.md`
+- Time: `current_time`
+- Shell: `shell`
+- Files: `read_file`, `write_file`, `list_files`
+- Memory palace: `memory_write`, `memory_read`, `memory_search`, `memory_index`
+- Context retrieval: `context_retrieve`
+- Web: `web_search`, `web_fetch`, `tavily_search`
+- Output cleanup: `clean_output` when an output directory is configured
+- Multi-agent orchestration: `spawn_agent`
 
-Skill bundles use `SKILL.md` as the entrypoint and may include supporting files such as templates, examples, and scripts. The runtime exposes progressive-disclosure helpers so the model can activate a skill and inspect bundle files on demand.
+The runtime may also add:
 
-Built-in tool behavior:
+- skill runtime helpers such as `activate_skill`, `list_skill_files`, and `read_skill_file`
+- MCP tools from configured `mcp_servers`
+- user tools loaded from `~/.agent/tools`
+- auto-generated tools created from `/generate-tool`
+
+Current built-in behavior guarantees:
 
 - file tools are bounded to the current workspace root
-- file and memory tools return structured JSON payloads to the model
-- shell commands are still powerful, but timeouts now terminate the spawned process group
+- tool payloads are structured JSON where possible
+- shell calls are timeout-bounded
+- sub-agents inherit the parent context manager but do not recursively receive `spawn_agent`
 
-## Memory Architecture
+## Memory And Context Architecture
 
-The current memory system has four layers:
+The current context system has four layers:
 
 1. `Working memory`
-   Current `ctx.messages` and active tool results.
+   Active `ctx.messages` kept in RAM for the current interaction loop.
 
 2. `Staging`
-   Raw user/assistant turns are written to a per-session JSONL buffer under `~/.agent/context/_staging/`.
+   Raw user/assistant turns are appended to per-session JSONL buffers in `~/.agent/context/_staging/`.
 
 3. `Long-term memory`
-   Structured memory is stored in `~/.agent/context/palace.db` and projected into JSON snapshots and markdown views.
+   Structured memories are stored in `~/.agent/context/palace.db`, with JSON snapshots in `~/.agent/context/` and markdown projections in `~/.agent/memory/`.
 
 4. `Memory palace projection`
-   Human-readable markdown files are written under `~/.agent/memory/`.
+   Human-readable markdown views are written per locus/entity for inspection and manual edits.
 
-Fixed top-level palace loci:
+Fixed palace loci:
 
 - `identity`
 - `projects`
@@ -193,59 +190,76 @@ Legacy alias:
 
 ### Consolidation
 
-When enough conversation has accumulated, the context manager can:
+The current consolidation pipeline is:
 
-- summarize the current session into `episodes`
-- extract durable facts into fixed loci
-- decay low-value memory
-- compress recent working memory
+- stage raw turns per session
+- queue background jobs when staged volume or idle time warrants it
+- recover orphaned staging files from interrupted sessions on next startup
+- summarize the session into `episodes`
+- extract durable memories into fixed loci
+- apply retention/decay policies
+- compact working memory while preserving task context
+
+Consolidation is currently bounded and chunked: long staged conversations are split into manageable prompt chunks before extraction, rather than being sent as one unbounded request.
 
 ### Retrieval
 
 There are two retrieval paths:
 
-- implicit prompt injection: long-term memory only
-- explicit context retrieval: current session + long-term memory
+- implicit prompt injection
+  - long-term memory by default
+  - current-session staging only when the query is clearly asking to recall recent conversation
+- explicit context retrieval
+  - current-session staging plus long-term memory
+
+For recall-style queries such as "what did we just discuss", the runtime can fall back to recent `episodes` summaries when keyword search alone would miss the latest session summary.
+
+## Skills, MCP, And User Tools
+
+Skills are loaded from:
+
+- user skills: `~/.agent/skills/**/SKILL.md`
+- built-in skills: `<repo>/skills/**/SKILL.md`
+
+Each bundle uses `SKILL.md` as the entrypoint and can ship templates, examples, scripts, or other support files.
+
+MCP servers are configured in `~/.agent/config.json` under `mcp_servers`. Connected MCP tools are injected into the same runtime tool registry and surfaced in the composed system prompt.
+
+User tool plugins are loaded from `~/.agent/tools`. The interactive `/generate-tool` flow writes generated tools into that same location and reloads them into the live registry.
 
 ## Project Layout
 
 ```text
 .
 ├── agent.py
-├── memory_projection.py
-├── tool_runtime.py
 ├── config.example.json
 ├── docs/
 │   └── superpowers/
 │       ├── plans/
 │       └── specs/
-└── tests/
-    ├── test_builtin_tools.py
-    ├── test_consolidation.py
-    ├── test_evolution.py
-    ├── test_ltm_store.py
-    ├── test_memory_palace_store.py
-    ├── test_retriever.py
-    └── test_staging.py
+├── scripts/
+│   └── benchmark_memory.py
+├── skills/
+├── tests/
+├── pyproject.toml
+└── uv.lock
 ```
 
 ## Testing
 
-Run the full test suite:
+Run the full suite:
 
 ```bash
 uv run pytest -q
 ```
 
-Run the memory benchmark script:
+Run the memory benchmark:
 
 ```bash
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10 --write-runs 10
 ```
 
-The script prints JSON with per-size search and write latency metrics so you can compare performance before and after storage changes.
-
-Save benchmark output for later comparison:
+Save or compare benchmark output:
 
 ```bash
 python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.json
@@ -254,14 +268,6 @@ python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.csv
 python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.jsonl
 ```
 
-Current status in this workspace:
+Latest local verification in this workspace:
 
-- `79` tests passing
-
-## Notes
-
-- `agent.py` is still the main entrypoint, but tool runtime and memory projection code have been extracted into separate modules.
-- SQLite is now the source of truth for long-term context memory.
-- Markdown memory files are currently a projection layer, not the authoritative store.
-- `memory tidy` now performs local retention/projection maintenance instead of a foreground LLM reclassification pass.
-- MCP client wiring is implemented for stdio servers. Real MCP smoke coverage is opt-in because it depends on external tools such as `npx` and a configured server.
+- `uv run pytest -q` -> `160 passed, 1 skipped`
