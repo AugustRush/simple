@@ -3041,9 +3041,13 @@ class ConsolidationEngine:
             CONSOLE.print(f"[dim]Sleep extraction error: {e}[/dim]")
 
         compressed = messages[-keep_last:] if len(messages) > keep_last else messages
-        CONSOLE.print(
-            f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
-        )
+        if messages:
+            # Only print when there is actual working memory to compress; skip the
+            # "0 → 0" line that appears when consolidate() is called from the
+            # background job path (which passes messages=[]).
+            CONSOLE.print(
+                f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
+            )
         return compressed
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -3210,11 +3214,19 @@ class ContextManager:
         with self._lock:
             if not self._needs_consolidation:
                 return False
-            # Fast path: count() is an in-memory counter; no file I/O needed.
-            if self.staging.count() >= self.staging_turn_threshold:
-                return True
-            # Slow path: only read the file to check the token threshold.
-            staged = self.staging.read_all()
+            count = self.staging.count()
+        # Fast path: count() is an in-memory counter; no file I/O needed.
+        if count >= self.staging_turn_threshold:
+            return True
+        # Slow path: require at least min_messages staged entries before checking
+        # tokens.  Without this guard a single verbose response (common with CJK
+        # text, where ~1 char ≈ 1 estimated token) crosses the 2100-token threshold
+        # on every turn, causing consolidation to fire every turn even though only
+        # two entries have accumulated since the last job ran.
+        if count < self.min_messages:
+            return False
+        # Only read the file once we know there are enough entries to warrant it.
+        staged = self.staging.read_all()
         if not staged:
             return False
         return (

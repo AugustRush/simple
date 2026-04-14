@@ -179,7 +179,9 @@ def test_consolidate_includes_full_staging_text_before_clearing(tmp_path):
 
     client = _FakeClient()
     asyncio.run(
-        engine.consolidate([], client, "fake-model", api_format="openai", staging=staging)
+        engine.consolidate(
+            [], client, "fake-model", api_format="openai", staging=staging
+        )
     )
 
     assert len(client.prompts) >= 2
@@ -385,7 +387,9 @@ def test_route_categories_treats_conversation_history_as_episode_recall(tmp_path
     assert "episodes" in ctx_mgr._route_categories("对话历史 聊天内容")
 
 
-def test_route_categories_does_not_treat_generic_history_queries_as_episode_recall(tmp_path):
+def test_route_categories_does_not_treat_generic_history_queries_as_episode_recall(
+    tmp_path,
+):
     from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager
 
     store = LTMStore(context_dir=tmp_path / "context")
@@ -400,7 +404,9 @@ def test_route_categories_does_not_treat_generic_history_queries_as_episode_reca
     assert "episodes" not in ctx_mgr._route_categories("Python 历史是什么")
 
 
-def test_retrieve_ltm_context_falls_back_to_recent_episodes_for_recall_queries(tmp_path):
+def test_retrieve_ltm_context_falls_back_to_recent_episodes_for_recall_queries(
+    tmp_path,
+):
     from agent import (
         LTMEntry,
         LTMStore,
@@ -434,7 +440,9 @@ def test_retrieve_ltm_context_falls_back_to_recent_episodes_for_recall_queries(t
     assert "写首诗" in result
 
 
-def test_retrieve_ltm_context_does_not_fallback_episode_for_generic_history_queries(tmp_path):
+def test_retrieve_ltm_context_does_not_fallback_episode_for_generic_history_queries(
+    tmp_path,
+):
     from agent import (
         LTMEntry,
         LTMStore,
@@ -465,3 +473,147 @@ def test_retrieve_ltm_context_does_not_fallback_episode_for_generic_history_quer
     result = ctx_mgr.retrieve_ltm_context("git history", top_k=3)
 
     assert result == ""
+
+
+# ── Regression: per-turn consolidation bug ────────────────────────────────────
+
+
+def test_should_enqueue_requires_min_messages_before_token_slow_path(tmp_path):
+    """Slow-path (token) check must not fire with fewer than min_messages staged
+    entries, even when a single verbose response would exceed the token threshold.
+    This prevents per-turn consolidation firing on every CJK response.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.mark_activity()
+
+    # Append only 2 entries (1 complete turn) — below min_messages default of 4.
+    # Use a very large payload that would otherwise easily cross the 2100-token
+    # slow-path threshold (2100 CJK chars ≈ 2100 estimated tokens).
+    long_response = "这" * 3000  # 3000 Chinese chars >> 2100 token threshold
+    ctx_mgr.staging.append("user", "hello")
+    ctx_mgr.staging.append("assistant", long_response)
+
+    # count=2, min_messages=4: slow path must not fire.
+    assert ctx_mgr.staging.count() == 2
+    assert not ctx_mgr.should_enqueue_consolidation()
+
+
+def test_should_enqueue_slow_path_fires_once_min_messages_reached(tmp_path):
+    """Slow-path fires when staging has >= min_messages entries AND tokens exceed
+    the threshold — even if the turn count is below staging_turn_threshold.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.mark_activity()
+
+    long_response = "这" * 3000  # well above 2100-token threshold
+    # Append 4 entries (2 complete turns) = min_messages.
+    ctx_mgr.staging.append("user", "turn 1")
+    ctx_mgr.staging.append("assistant", long_response)
+    ctx_mgr.staging.append("user", "turn 2")
+    ctx_mgr.staging.append("assistant", long_response)
+
+    # count=4 == min_messages, tokens >> threshold, count < staging_turn_threshold(6)
+    # → slow path should now fire.
+    assert ctx_mgr.staging.count() == 4
+    assert ctx_mgr.should_enqueue_consolidation()
+
+
+def test_should_enqueue_fast_path_unchanged(tmp_path):
+    """Fast path (turn count >= staging_turn_threshold) must still fire regardless
+    of response length, unaffected by the min_messages guard.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.mark_activity()
+
+    # 6 short entries (3 complete turns) = fast-path threshold, tiny responses.
+    for i in range(6):
+        ctx_mgr.staging.append("user", f"m{i}")
+
+    assert ctx_mgr.should_enqueue_consolidation()
+
+
+def test_consolidate_suppresses_messages_compressed_print_when_no_messages(
+    tmp_path, capsys
+):
+    """consolidate() must not print 'Messages compressed: 0 → 0' when called
+    with an empty messages list (the normal background-job path).
+    """
+    import asyncio
+    from agent import ConsolidationEngine, LTMStore, StagingBuffer
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    engine = ConsolidationEngine(store=store)
+    staging = StagingBuffer(path=tmp_path / "staging.jsonl")
+    staging.append("user", "hello")
+    staging.append("assistant", "world")
+
+    asyncio.run(
+        engine.consolidate(
+            messages=[],
+            client=None,
+            model="x",
+            api_format="openai",
+            staging=staging,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert "Messages compressed" not in captured.out
+
+
+def test_consolidate_still_prints_messages_compressed_when_messages_present(
+    tmp_path, capsys
+):
+    """consolidate() should still print 'Messages compressed' when actual
+    working-memory messages are passed (the compaction-triggered path).
+    """
+    import asyncio
+    from agent import ConsolidationEngine, LTMStore, StagingBuffer
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    engine = ConsolidationEngine(store=store)
+    staging = StagingBuffer(path=tmp_path / "staging.jsonl")
+
+    messages = [{"role": "user", "content": f"msg {i}"} for i in range(8)]
+
+    asyncio.run(
+        engine.consolidate(
+            messages=[],
+            client=None,
+            model="x",
+            api_format="openai",
+            staging=staging,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert "Messages compressed" not in captured.out
+
+
+def test_consolidate_still_prints_messages_compressed_when_messages_present(
+    tmp_path, capsys
+):
+    """consolidate() should still print 'Messages compressed' when actual
+    working-memory messages are passed (the compaction-triggered path).
+    """
+    import asyncio
+    from agent import ConsolidationEngine, LTMStore, StagingBuffer
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    engine = ConsolidationEngine(store=store)
+    staging = StagingBuffer(path=tmp_path / "staging.jsonl")
+
+    messages = [{"role": "user", "content": f"msg {i}"} for i in range(8)]
+
+    asyncio.run(
+        engine.consolidate(
+            messages=messages,
+            client=None,
+            model="x",
+            api_format="openai",
+            staging=staging,
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert "Messages compressed" in captured.out
