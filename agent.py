@@ -1537,6 +1537,10 @@ DEFAULT_CONFIG: dict = {
             "keep_last_messages": 6,
             "idle_seconds": 300,
             "min_messages": 4,
+            "token_estimation": {
+                "chars_per_token": 4,
+                "cjk_chars_per_token": 1,
+            },
         },
     },
     # ── System prompt ─────────────────────────────────────────────────────
@@ -2834,6 +2838,8 @@ class ConsolidationEngine:
         sleep_token_ratio: float = SLEEP_TOKEN_RATIO,
         keep_last_messages: int = 6,
         max_source_tokens: int = CONSOLIDATION_MAX_SOURCE_TOKENS,
+        chars_per_token: float = float(CHARS_PER_TOKEN),
+        cjk_chars_per_token: float = 1.0,
     ):
         self.store = store
         self.max_categories = max_categories
@@ -2841,26 +2847,35 @@ class ConsolidationEngine:
         self.sleep_token_ratio = sleep_token_ratio
         self.keep_last_messages = keep_last_messages
         self.max_source_tokens = max(1, int(max_source_tokens))
+        # Token estimation ratios — configurable for different script systems.
+        # chars_per_token:     non-CJK chars per token (Latin/ASCII, default 4)
+        # cjk_chars_per_token: CJK chars per token (Hanzi/Kana/Hangul, default 1)
+        self.chars_per_token: float = max(0.1, float(chars_per_token))
+        self.cjk_chars_per_token: float = max(0.1, float(cjk_chars_per_token))
 
     # ── Trigger ───────────────────────────────────────────────────────────────
 
     def estimate_tokens(self, messages: list[dict]) -> int:
         """Token estimate with CJK-awareness.
 
-        English/Latin text:  ~4 chars per token  (unchanged)
-        CJK characters:      ~1 char per token   (each hanzi/kanji is 1-2 tokens)
+        Non-CJK text:    ``len(text) / chars_per_token``   (default 4 chars/token)
+        CJK characters:  ``len(cjk) / cjk_chars_per_token`` (default 1 char/token)
 
-        Without this distinction the estimate for Chinese conversations is ~4x
-        too low, causing the compact trigger to fire far later than intended.
-        Also counts tool_use `input` payloads which the previous implementation
-        silently ignored.
+        Both ratios are configurable via ``context.consolidation.token_estimation``
+        in config.json so they can be tuned for different languages and model
+        tokenisers.  Without the CJK distinction the estimate for Chinese
+        conversations is ~4x too low, causing the compact trigger to fire far
+        later than intended.  Also counts tool_use ``input`` payloads which the
+        previous implementation silently ignored.
         """
         _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 
         def _count(text: str) -> int:
             cjk = len(_CJK_RE.findall(text))
             non_cjk = len(text) - cjk
-            return cjk + non_cjk // CHARS_PER_TOKEN
+            return int(cjk / self.cjk_chars_per_token) + int(
+                non_cjk / self.chars_per_token
+            )
 
         total = 0
         for msg in messages:
@@ -6256,6 +6271,12 @@ async def _build_components_async(cfg: dict):
             decay_factor=storage_cfg.get("decay_factor", DECAY_FACTOR),
             sleep_token_ratio=cons_cfg.get("token_ratio", SLEEP_TOKEN_RATIO),
             keep_last_messages=cons_cfg.get("keep_last_messages", 6),
+            chars_per_token=cons_cfg.get("token_estimation", {}).get(
+                "chars_per_token", float(CHARS_PER_TOKEN)
+            ),
+            cjk_chars_per_token=cons_cfg.get("token_estimation", {}).get(
+                "cjk_chars_per_token", 1.0
+            ),
         ),
         idle_seconds=cons_cfg.get("idle_seconds", 300),
         min_messages=cons_cfg.get("min_messages", 4),

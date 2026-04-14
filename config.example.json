@@ -79,12 +79,21 @@
         "keep_last_messages: number of recent messages retained after sleep compression (default 6).",
         "idle_seconds: seconds of inactivity before the background idle-consolidation task fires (default 300).",
         "  The idle task polls every 30 s and only triggers when the dirty flag is set (i.e. new messages exist).",
-        "min_messages: minimum messages in working memory before any consolidation is attempted (default 4)."
+        "min_messages: minimum messages in working memory before any consolidation is attempted (default 4).",
+        "token_estimation: ratios used to estimate token counts from character counts.",
+        "  chars_per_token: non-CJK characters per token (Latin/ASCII, default 4).",
+        "  cjk_chars_per_token: CJK characters per token (Hanzi/Kana/Hangul, default 1).",
+        "  Increase chars_per_token for shorter English text or code-heavy sessions.",
+        "  Increase cjk_chars_per_token if consolidation triggers too aggressively for Chinese/Japanese."
       ],
       "token_ratio": 0.70,
       "keep_last_messages": 6,
       "idle_seconds": 300,
-      "min_messages": 4
+      "min_messages": 4,
+      "token_estimation": {
+        "chars_per_token": 4,
+        "cjk_chars_per_token": 1
+      }
     }
   },
 

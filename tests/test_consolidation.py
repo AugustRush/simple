@@ -36,7 +36,42 @@ def test_estimate_tokens(tmp_path):
         {"role": "assistant", "content": "Hi there"},  # 8 chars
     ]
     tokens = eng.estimate_tokens(messages)
+    # Default chars_per_token=4: (11+8) // 4 = 4
     assert tokens == (11 + 8) // 4
+
+
+def test_estimate_tokens_respects_chars_per_token(tmp_path):
+    from agent import ConsolidationEngine, LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    eng = ConsolidationEngine(store=store, chars_per_token=2.0)
+    messages = [{"role": "user", "content": "abcdefgh"}]  # 8 non-CJK chars
+    # 8 chars / 2.0 = 4 tokens
+    assert eng.estimate_tokens(messages) == 4
+
+
+def test_estimate_tokens_respects_cjk_chars_per_token(tmp_path):
+    from agent import ConsolidationEngine, LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    eng_default = ConsolidationEngine(store=store, cjk_chars_per_token=1.0)
+    eng_relaxed = ConsolidationEngine(store=store, cjk_chars_per_token=2.0)
+    messages = [{"role": "user", "content": "你好世界"}]  # 4 CJK chars
+    # default (1.0): 4 / 1.0 = 4 tokens
+    assert eng_default.estimate_tokens(messages) == 4
+    # relaxed (2.0): 4 / 2.0 = 2 tokens
+    assert eng_relaxed.estimate_tokens(messages) == 2
+
+
+def test_estimate_tokens_mixed_cjk_and_latin(tmp_path):
+    from agent import ConsolidationEngine, LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    eng = ConsolidationEngine(store=store, chars_per_token=4.0, cjk_chars_per_token=1.0)
+    # 4 CJK + 8 Latin chars
+    messages = [{"role": "user", "content": "你好world!!!"}]
+    # CJK: 2 chars / 1.0 = 2 tokens; Latin: 8 chars / 4.0 = 2 tokens → 4 total
+    assert eng.estimate_tokens(messages) == 4
 
 
 def test_estimate_tokens_list_content(tmp_path):
