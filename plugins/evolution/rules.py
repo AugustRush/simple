@@ -81,7 +81,7 @@ class RuleStore:
 
     def _save(self, rules: list[BehaviorRule]) -> None:
         self._path.write_text(
-            "\n".join(json.dumps(asdict(r), ensure_ascii=False) for r in rules),
+            "\n".join(json.dumps(asdict(r), ensure_ascii=False) for r in rules) + "\n",
             encoding="utf-8",
         )
 

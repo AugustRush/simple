@@ -53,16 +53,15 @@ class EvolutionPlugin:
         self._engine: Any = None
         self._components: dict = {}
         self._prev_response: str = ""
+        self._rule_store: Any = (
+            None  # initialised in on_session_start when engine is active
+        )
+        self._pending_failures: list[dict] = []
 
         # Lazy-imported to avoid circular deps at module load time.
         from .detector import CorrectionDetector
-        from .rules import RuleStore
 
         self._detector = CorrectionDetector()
-        self._rule_store = RuleStore()
-        self._pending_failures: list[dict] = []
-
-        _RL_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -88,17 +87,25 @@ class EvolutionPlugin:
                     f"[dim]Evolution plugin: engine init failed: {exc}[/dim]"
                 )
 
+        # Initialise RuleStore lazily here so that ~/.agent/rl/ is only created
+        # when the plugin is actually active (not at plugin-discovery time).
+        if self._rule_store is None:
+            from .rules import RuleStore
+
+            self._rule_store = RuleStore()
+
     async def on_turn_end(self, event: Any) -> None:  # event: TurnEvent
         """Detect corrections; record rule applications; trigger extraction."""
         signal = self._detector.detect(event.user_input, self._prev_response)
 
         # P1-2: record every turn as an application for all active rules so
         # the promotion/retirement lifecycle actually runs.
-        active_rule_ids = self._rule_store.get_active_rule_ids()
-        for rule_id in active_rule_ids:
-            self._rule_store.record_application(
-                rule_id, was_corrected=signal.is_correction
-            )
+        if self._rule_store is not None:
+            active_rule_ids = self._rule_store.get_active_rule_ids()
+            for rule_id in active_rule_ids:
+                self._rule_store.record_application(
+                    rule_id, was_corrected=signal.is_correction
+                )
 
         if signal.is_correction:
             failure = {
@@ -235,10 +242,11 @@ class EvolutionPlugin:
             rl_stats = self._engine.get_stats()
             for k, v in rl_stats.items():
                 table.add_row(k, str(v))
-        rule_stats = self._rule_store.get_stats()
-        table.add_row("rules_total", str(rule_stats["total"]))
-        for status, count in rule_stats.get("by_status", {}).items():
-            table.add_row(f"rules_{status}", str(count))
+        if self._rule_store is not None:
+            rule_stats = self._rule_store.get_stats()
+            table.add_row("rules_total", str(rule_stats["total"]))
+            for status, count in rule_stats.get("by_status", {}).items():
+                table.add_row(f"rules_{status}", str(count))
         _console().print(table)
 
     # ── Internal helpers ──────────────────────────────────────────────────────

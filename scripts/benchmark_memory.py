@@ -20,7 +20,9 @@ if str(ROOT) not in sys.path:
 from agent import LTMEntry, LTMStore  # noqa: E402
 
 
-def _build_entry(index: int, *, category: str = "identity", entity: str = "user") -> LTMEntry:
+def _build_entry(
+    index: int, *, category: str = "identity", entity: str = "user"
+) -> LTMEntry:
     return LTMEntry(
         id=f"entry-{index}",
         category=category,
@@ -99,7 +101,9 @@ def _seed_store(store: LTMStore, count: int) -> None:
     store._sync_after_mutation(affected_categories)
 
 
-def benchmark_search(entry_count: int, runs: int, query: str = "concise responses") -> dict:
+def benchmark_search(
+    entry_count: int, runs: int, query: str = "concise responses"
+) -> dict:
     with tempfile.TemporaryDirectory(prefix="memory-bench-search-") as tmp:
         base = Path(tmp)
         store = LTMStore(
@@ -125,7 +129,9 @@ def benchmark_write(entry_count: int, runs: int) -> dict:
         next_index = entry_count
         samples_ms: list[float] = []
         for _ in range(runs):
-            entry = _build_entry(next_index, category="tasks", entity=f"task_{next_index}")
+            entry = _build_entry(
+                next_index, category="tasks", entity=f"task_{next_index}"
+            )
             samples_ms.append(_measure_ms(lambda e=entry: store.add_entry(e)))
             next_index += 1
     return _summarize(samples_ms)
@@ -217,8 +223,7 @@ def _load_payload(path: Path) -> dict:
 
 def compare_payloads(current: dict, baseline: dict) -> dict:
     baseline_by_size = {
-        int(item["entries"]): item
-        for item in baseline.get("sizes", [])
+        int(item["entries"]): item for item in baseline.get("sizes", [])
     }
     comparison_sizes = []
     for current_item in current.get("sizes", []):
@@ -226,7 +231,6 @@ def compare_payloads(current: dict, baseline: dict) -> dict:
         baseline_item = baseline_by_size.get(entries)
         if baseline_item is None:
             continue
-        metrics: dict[str, dict[str, float | int]] = {"entries": entries}  # type: ignore[assignment]
         comparison_row: dict[str, object] = {"entries": entries}
         for metric_name in ("search", "write"):
             current_metric = current_item[metric_name]

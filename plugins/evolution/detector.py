@@ -12,7 +12,7 @@ reduce false positives (e.g. "actually" alone is ambiguous).
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 # ── HIGH confidence: a single match is strong enough ──────────────────────────
@@ -55,11 +55,7 @@ class CorrectionSignal:
 
     is_correction: bool
     confidence: float = 0.0  # 0.0 … 1.0
-    matched_patterns: list[str] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.matched_patterns is None:
-            self.matched_patterns = []
+    matched_patterns: list[str] = field(default_factory=list)
 
 
 class CorrectionDetector:

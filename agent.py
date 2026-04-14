@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import ast
+from abc import ABC, abstractmethod
+import contextvars
 import copy
 from contextlib import AsyncExitStack
 import importlib.util
+import inspect
 import math
 import json
 import os
@@ -42,6 +45,7 @@ import anthropic
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape as _markup_escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -128,6 +132,127 @@ DEFAULT_ROUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 CONSOLE = Console()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b. OUTPUT SINK — decouple I/O output from agent core
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TOOL_KEY_PRIORITY: dict[str, list[str]] = {
+    "bash": ["command"],
+    "write_file": ["path"],
+    "read_file": ["path"],
+    "search": ["query"],
+    "web_search": ["query"],
+    "grep": ["pattern", "path"],
+    "python": ["code"],
+}
+
+
+def _fmt_tool_inputs(name: str, inputs: dict) -> str:
+    """Return a terse, single-line hint of the most useful input fields.
+
+    The returned string is safe to embed in Rich markup: bracket characters
+    from LLM-generated tool input values are escaped via rich.markup.escape().
+    """
+    keys = _TOOL_KEY_PRIORITY.get(name, list(inputs.keys())[:2])
+    parts = []
+    for k in keys:
+        v = inputs.get(k)
+        if v is not None:
+            snippet = str(v)[:80].replace("\n", "↵")
+            parts.append(f"{k}={snippet!r}" if " " in snippet else f"{k}={snippet}")
+    raw = "  " + "  ".join(parts) if parts else ""
+    return _markup_escape(raw)
+
+
+class OutputSink(ABC):
+    """Abstract output contract for one channel session.
+
+    Implementations route agent output to the appropriate channel: Rich CLI,
+    Telegram, Feishu, test buffer, etc.  All methods are synchronous so the
+    ABC stays simple; async channels should schedule their I/O internally.
+    """
+
+    streaming: bool = True
+
+    def on_stream_chunk(self, chunk: str) -> None:
+        """Called for each streamed text token."""
+
+    def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
+        """Called once the model turn is fully resolved."""
+
+    def on_tool_start(self, name: str, inputs: dict) -> None:
+        """Called immediately *before* a tool is executed."""
+
+    def on_tool_end(self, name: str, result: str) -> None:
+        """Called immediately *after* a tool returns its result."""
+
+    def on_tool_blocked(self, name: str, reason: str) -> None:
+        """Called when a plugin vetoes a tool call before execution."""
+
+    def on_info(self, content: Any) -> None:
+        """Display an informational Rich renderable (Table, Markdown, Panel, …)."""
+
+    def on_status(self, text: str, *, level: str = "info") -> None:
+        """Display a status message.  level: 'info' | 'warning' | 'success' | 'error'."""
+
+    def on_error(self, error: str) -> None:
+        """Display an error message."""
+
+    def sync_stream_cb(self, chunk: str) -> None:
+        """Synchronous callback adapter for BaseAgent.send_message."""
+        self.on_stream_chunk(chunk)
+
+
+class CliOutputSink(OutputSink):
+    """Rich-console implementation of OutputSink for the CLI channel."""
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._streamed: list[str] = []
+
+    def on_stream_chunk(self, chunk: str) -> None:
+        self._console.print(chunk, end="", markup=False)
+        self._streamed.append(chunk)
+
+    def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
+        if not self._streamed and full_text:
+            # Non-streaming fallback: render markdown properly
+            self._console.print(Markdown(full_text))
+        self._console.print()  # trailing newline after each turn
+        self._streamed.clear()
+
+    def on_tool_start(self, name: str, inputs: dict) -> None:
+        hint = _fmt_tool_inputs(name, inputs)
+        self._console.print(f"\n[cyan]→ {name}[/cyan]{hint}")
+
+    def on_tool_end(self, name: str, result: str) -> None:
+        self._console.print(
+            f"[dim]{result[:200]}{'...' if len(result) > 200 else ''}[/dim]"
+        )
+
+    def on_tool_blocked(self, name: str, reason: str) -> None:
+        self._console.print(
+            f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {reason})[/yellow]"
+        )
+
+    def on_info(self, content: Any) -> None:
+        self._console.print(content)
+
+    def on_status(self, text: str, *, level: str = "info") -> None:
+        _CLR = {"info": "dim", "warning": "yellow", "success": "green", "error": "red"}
+        c = _CLR.get(level, "dim")
+        self._console.print(f"[{c}]{text}[/{c}]")
+
+    def on_error(self, error: str) -> None:
+        self._console.print(f"[red]{error}[/red]")
+
+
+# Per-turn ContextVar so tool helpers can find the active sink without
+# threading it through every call frame.
+_active_sink: contextvars.ContextVar[Optional[OutputSink]] = contextvars.ContextVar(
+    "_active_sink", default=None
+)
 
 # ── Ralph Loop ────────────────────────────────────────────────────────────────
 TASKS_DIR = AGENT_HOME / "tasks"
@@ -888,9 +1013,9 @@ class BuiltinTools:
         r.register(
             "web_search",
             (
-                "Search the web using DuckDuckGo and return a list of results (title, url, snippet). "
+                "Search the web using Tavily and return a list of results (title, url, snippet). "
                 "Use for current events, facts that may have changed, or anything requiring live data. "
-                "No API key required."
+                "Requires a Tavily API key (set TAVILY_API_KEY or tavily_api_key in config)."
             ),
             {
                 "type": "object",
@@ -1584,12 +1709,11 @@ class ModelClientFactory:
         # Validate provider exists
         if not provider_cfg:
             available = ", ".join(providers.keys()) or "(none)"
-            CONSOLE.print(
-                f"[red]Provider '{active_name}' not found in config.json.\n"
-                f"Available providers: {available}\n"
-                f"Run: python agent.py config models[/red]"
+            raise RuntimeError(
+                f"Provider '{active_name}' not found in config.json. "
+                f"Available providers: {available}. "
+                f"Run: python agent.py config models"
             )
-            raise typer.Exit(1)
 
         api_format = provider_cfg.get("api_format", "openai")
         raw_key = provider_cfg.get("api_key", "")
@@ -1606,12 +1730,11 @@ class ModelClientFactory:
             env_name = raw_key[1:]
             api_key = os.environ.get(env_name, "")
             if not api_key:
-                CONSOLE.print(
-                    f"[red]API key env var '{env_name}' not set "
+                raise RuntimeError(
+                    f"API key env var '{env_name}' not set "
                     f"(provider: {active_name}). "
-                    f"Run: export {env_name}=...[/red]"
+                    f"Run: export {env_name}=..."
                 )
-                raise typer.Exit(1)
         else:
             api_key = raw_key
 
@@ -1624,19 +1747,17 @@ class ModelClientFactory:
             try:
                 import openai as openai_lib
             except ImportError:
-                CONSOLE.print(
-                    "[red]openai package not installed. Run: pip install openai[/red]"
+                raise RuntimeError(
+                    "openai package not installed. Run: pip install openai"
                 )
-                raise typer.Exit(1)
             kwargs = {"api_key": api_key}
             if base_url:
                 kwargs["base_url"] = base_url
             client = openai_lib.AsyncOpenAI(**kwargs)
         else:
-            CONSOLE.print(
-                f"[red]Unknown api_format '{api_format}' for provider '{active_name}'[/red]"
+            raise RuntimeError(
+                f"Unknown api_format '{api_format}' for provider '{active_name}'"
             )
-            raise typer.Exit(1)
 
         if announce:
             CONSOLE.print(
@@ -1944,9 +2065,9 @@ class LTMStore:
         self._meta_path = context_dir / "_meta.json"
         self._db_path = context_dir / "palace.db"
         self._local = threading.local()  # thread-local connection storage
-        self._all_connections: list[
-            sqlite3.Connection
-        ] = []  # track for explicit cleanup
+        self._thread_connections: dict[
+            int, sqlite3.Connection
+        ] = {}  # thread-id → connection; bounded by concurrent thread count
         self.dir.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
@@ -1972,17 +2093,25 @@ class LTMStore:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
             self._local.conn = conn
-            self._all_connections.append(conn)
+            tid = threading.get_ident()
+            # If thread ID was reused, close the stale connection first.
+            old = self._thread_connections.get(tid)
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            self._thread_connections[tid] = conn
         return self._local.conn
 
     def close(self) -> None:
         """Close all thread-local SQLite connections explicitly."""
-        for conn in getattr(self, "_all_connections", []):
+        for conn in self._thread_connections.values():
             try:
                 conn.close()
             except Exception:
                 pass
-        self._all_connections = []
+        self._thread_connections = {}
         self._local = threading.local()
 
     def _ensure_schema(self) -> None:
@@ -3004,9 +3133,10 @@ class ConsolidationEngine:
             compressed = (
                 messages[-keep_last:] if len(messages) > keep_last else messages
             )
-            CONSOLE.print(
-                f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
-            )
+            if messages:  # only print if there was something to compress
+                CONSOLE.print(
+                    f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
+                )
             return compressed
         source_label = (
             f"staging ({len(staged)} turns)"
@@ -4808,18 +4938,30 @@ class BaseAgent:
         # user-generated tool cannot block the loop indefinitely.
         async def _exec_regular(tu: dict) -> str:
             name = tu["name"]
+            sink = _active_sink.get()
             # pre_tool hook — a blocking result short-circuits execution
             if self.plugin_catalog:
                 pre = await self.plugin_catalog.fire_pre_tool(
                     PreToolEvent(tool_name=name, tool_kwargs=tu["input"])
                 )
                 if pre.action == "block":
-                    CONSOLE.print(
-                        f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {pre.message})[/yellow]"
-                    )
+                    if sink:
+                        sink.on_tool_blocked(name, pre.message)
+                    else:
+                        CONSOLE.print(
+                            f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {pre.message})[/yellow]"
+                        )
                     return json.dumps(
                         {"ok": False, "blocked": True, "reason": pre.message}
                     )
+            # Announce the tool call *before* execution so the user sees
+            # what is happening while they wait (UX fix #2).
+            if sink:
+                sink.on_tool_start(name, tu["input"])
+            else:
+                CONSOLE.print(
+                    f"\n[cyan]→ {name}[/cyan]{_fmt_tool_inputs(name, tu['input'])}"
+                )
             try:
                 res = await asyncio.wait_for(
                     self.registry.call(name, tu["input"]),
@@ -4832,9 +4974,13 @@ class BaseAgent:
                         "error": f"tool '{name}' timed out after {REGULAR_TOOL_TIMEOUT}s",
                     }
                 )
-            # M3: print name and result together atomically after the call
-            CONSOLE.print(f"\n[cyan]→ {name}[/cyan]")
-            CONSOLE.print(f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]")
+            # Display result after call completes
+            if sink:
+                sink.on_tool_end(name, res)
+            else:
+                CONSOLE.print(
+                    f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]"
+                )
             # post_tool hook — observational, does not alter the result
             if self.plugin_catalog:
                 await self.plugin_catalog.fire_post_tool(
@@ -5020,9 +5166,12 @@ class BaseAgent:
         self,
         ctx: "AgentContext",
         tools: list[dict],
-        callback: Callable[[str], None],
+        callback: Callable[[str], Any],
     ) -> tuple[Any, str]:
         """Stream response text chunk-by-chunk and return (full_response, collected_text).
+
+        ``callback`` may be a plain sync function or an async coroutine function;
+        both are handled transparently.
 
         For Anthropic: uses stream.get_final_message() to obtain the complete response.
         For OpenAI: accumulates tool_call deltas and rebuilds a synthetic response.
@@ -5038,7 +5187,9 @@ class BaseAgent:
             ) as stream:
                 async for text in stream.text_stream:
                     collected.append(text)
-                    callback(text)
+                    _r = callback(text)
+                    if inspect.isawaitable(_r):
+                        await _r
                 response = await stream.get_final_message()
             return response, "".join(collected)
 
@@ -5065,7 +5216,9 @@ class BaseAgent:
             delta = choice.delta
             if delta.content:
                 collected.append(delta.content)
-                callback(delta.content)
+                _r = callback(delta.content)
+                if inspect.isawaitable(_r):
+                    await _r
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
                     idx = tc_delta.index
@@ -5390,7 +5543,7 @@ class EvolutionEngine:
             "critique": result.get("critique", ""),
             "improvements": result.get("improvements", []),
         }
-        with open(SESSIONS_FILE, "a") as f:
+        with open(SESSIONS_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
         return result
@@ -5399,7 +5552,7 @@ class EvolutionEngine:
         if not SESSIONS_FILE.exists():
             return []
         sessions = []
-        with open(SESSIONS_FILE) as f:
+        with open(SESSIONS_FILE, encoding="utf-8") as f:
             for line in f:
                 try:
                     sessions.append(json.loads(line.strip()))
@@ -5428,8 +5581,7 @@ class EvolutionEngine:
         if not sessions:
             return "No sessions to analyze"
 
-        # Get low-score sessions
-        low_sessions = [s for s in sessions if s.get("score", 10) < 6]
+        # Get low-score sessions for potential filtering (currently using all recent)
         critiques = "\n".join(
             f"- Score {s['score']}: {s['critique']}" for s in sessions[-20:]
         )
@@ -5455,7 +5607,9 @@ class EvolutionEngine:
         existing = list(PROMPTS_DIR.glob("system_v*.md"))
         new_version_num = len(existing) + 1
         new_path = PROMPTS_DIR / f"system_v{new_version_num}.md"
-        new_path.write_text(f"<!-- version: v{new_version_num} -->\n{new_prompt}")
+        new_path.write_text(
+            f"<!-- version: v{new_version_num} -->\n{new_prompt}", encoding="utf-8"
+        )
 
         CONSOLE.print(
             f"[green]New prompt version saved: system_v{new_version_num}.md[/green]"
@@ -5499,7 +5653,7 @@ class EvolutionEngine:
         safe_name = re.sub(r"[^a-z0-9_]", "_", description.lower()[:30])
         tool_path = TOOLS_DIR / f"auto_{safe_name}.py"
         TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-        tool_path.write_text(code)
+        tool_path.write_text(code, encoding="utf-8")
 
         CONSOLE.print(f"[green]Tool saved to {tool_path}[/green]")
         return f"Tool generated and saved to {tool_path}"
@@ -5752,6 +5906,7 @@ class PluginCatalog:
         self._slash_commands.clear()
         self._bundled_skills.clear()
         self._bundled_mcp.clear()
+        _slash_command_owners: dict[str, str] = {}  # cmd_key → owning plugin name
 
         # Auto-create user plugins directory
         if self._user_dir:
@@ -5820,19 +5975,14 @@ class PluginCatalog:
                             plugin.register_slash_commands() or {}
                         ).items():
                             if cmd_key in self._slash_commands:
-                                existing_owner = None
-                                for pn, (_, pm) in self._plugins.items():
-                                    if hasattr(_, "register_slash_commands"):
-                                        cmds = _.register_slash_commands() or {}
-                                        if cmd_key in cmds:
-                                            existing_owner = pn
-                                            break
+                                existing_owner = _slash_command_owners.get(cmd_key, "?")
                                 CONSOLE.print(
                                     f"[yellow]Plugin '{plugin_name}': slash command "
                                     f"'/{cmd_key}' conflicts with plugin "
-                                    f"'{existing_owner or '?'}' — overriding[/yellow]"
+                                    f"'{existing_owner}' — overriding[/yellow]"
                                 )
                             self._slash_commands[cmd_key] = handler
+                            _slash_command_owners[cmd_key] = plugin_name
 
                     # Store (user overrides builtin with same name)
                     self._plugins[plugin_name] = (plugin, meta)
@@ -6481,21 +6631,21 @@ async def _ralph_task_loop(
         progress_text = ""
         if t.progress:
             recent = t.progress[-3:]  # only last 3 to keep token cost bounded
-            progress_text = "\n\n## 历史进度（最近迭代）\n" + "\n".join(
-                f"- 迭代 {p['iteration']}: {p['summary']}" for p in recent
+            progress_text = "\n\n## Recent Progress\n" + "\n".join(
+                f"- Iteration {p['iteration']}: {p['summary']}" for p in recent
             )
         return (
-            f"## 当前任务\n{t.goal}\n\n"
-            f"## 验收标准\n{criteria_text}\n\n"
-            f"所有标准满足后，在回复末尾输出：`{t.completion_promise}`\n"
+            f"## Current Task\n{t.goal}\n\n"
+            f"## Acceptance Criteria\n{criteria_text}\n\n"
+            f"Once all criteria are satisfied, output at the end of your reply: `{t.completion_promise}`\n"
             f"{progress_text}\n\n"
-            f"这是第 {t.current_iteration}/{t.max_iterations} 次迭代。"
+            f"This is iteration {t.current_iteration} of {t.max_iterations}."
         )
 
     for i in range(task.max_iterations):
         task.current_iteration = i + 1
         CONSOLE.print(
-            f"\n[dim]── Ralph 迭代 {task.current_iteration}/{task.max_iterations} ──[/dim]"
+            f"\n[dim]── Ralph iteration {task.current_iteration}/{task.max_iterations} ──[/dim]"
         )
 
         # Fresh AgentContext per iteration — prevents context rot across iterations.
@@ -6566,13 +6716,13 @@ async def _ralph_task_loop(
                 v_exit = verify_proc.returncode
             except asyncio.TimeoutError:
                 v_exit = -1
-                CONSOLE.print("[yellow]验证命令超时 (60s)[/yellow]")
+                CONSOLE.print("[yellow]Verify command timed out (60s)[/yellow]")
             except Exception as ve:
                 v_exit = -1
-                CONSOLE.print(f"[yellow]验证命令异常: {ve}[/yellow]")
+                CONSOLE.print(f"[yellow]Verify command error: {ve}[/yellow]")
 
             if v_exit == 0:
-                CONSOLE.print("[green]验证通过 (exit 0)[/green]")
+                CONSOLE.print("[green]Verify passed (exit 0)[/green]")
                 task.status = "complete"
                 task.progress.append(
                     {
@@ -6598,12 +6748,12 @@ async def _ralph_task_loop(
                         f"\n\nverify_failed (exit {v_exit}):\n{verify_snippet}"
                     )
                     CONSOLE.print(
-                        f"[yellow]验证失败 (exit {v_exit})，继续迭代[/yellow]\n"
+                        f"[yellow]Verify failed (exit {v_exit}), continuing[/yellow]\n"
                         f"[dim]{verify_snippet[:200]}[/dim]"
                     )
                 else:
                     CONSOLE.print(
-                        f"[yellow]验证失败 (exit {v_exit})，继续迭代[/yellow]"
+                        f"[yellow]Verify failed (exit {v_exit}), continuing[/yellow]"
                     )
 
         task.progress.append(
@@ -6633,6 +6783,137 @@ async def _ralph_task_loop(
             ctx_mgr.enqueue_consolidation("ralph_task_end")
 
     return task
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.5  CHANNEL LAYER
+#
+# Abstracts transport (CLI stdin, Telegram, Feishu, …) from the agent core.
+# New channels: subclass Channel, implement start() / stop() / create_sink().
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class IncomingMessage:
+    """Normalised message arriving on any channel."""
+
+    text: str
+    session_id: str = field(default_factory=_new_id)
+    channel_name: str = "cli"
+    metadata: dict = field(default_factory=dict)
+
+
+class Channel(ABC):
+    """Transport abstraction for one conversation pathway.
+
+    ``start()`` drives the channel until it is closed.  For each incoming
+    message it calls ``handler(msg, sink) -> bool``; returning *False* stops
+    the channel.
+    """
+
+    @abstractmethod
+    async def start(
+        self,
+        handler: Callable[["IncomingMessage", OutputSink], Any],
+    ) -> None: ...
+
+    @abstractmethod
+    async def stop(self) -> None: ...
+
+    @abstractmethod
+    def create_sink(self, msg: "IncomingMessage") -> OutputSink: ...
+
+
+class CliChannel(Channel):
+    """CLI stdin/stdout channel (Rich Prompt + Console).
+
+    ``create_sink()`` is used by external code that needs a ``CliOutputSink``
+    without owning the input loop.
+
+    ``start()`` is the future API for ``ChannelRunner``: once
+    ``_interactive_loop`` is refactored into a stateless ``AgentCore`` message
+    handler, ``ChannelRunner`` will call ``channel.start(core.handle_message)``
+    uniformly for every channel type.  Today, ``ChannelRunner._run_channel``
+    routes CLI traffic through ``_interactive_loop`` directly and never calls
+    ``start()``.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+
+    async def start(
+        self,
+        handler: Callable[["IncomingMessage", OutputSink], Any],
+    ) -> None:
+        """Not yet wired — see class docstring.
+
+        ``ChannelRunner`` bypasses this method and calls ``_interactive_loop``
+        directly.  This stub prevents silent no-ops if ``start()`` is called
+        by mistake.
+        """
+        raise NotImplementedError(
+            "CliChannel.start() is not yet wired into ChannelRunner. "
+            "ChannelRunner routes the CLI channel through _interactive_loop "
+            "directly.  Refactor _interactive_loop into a stateless AgentCore "
+            "handler to complete this abstraction."
+        )
+
+    async def stop(self) -> None:
+        pass  # no persistent state to tear down
+
+    def create_sink(self, msg: "IncomingMessage") -> CliOutputSink:
+        return CliOutputSink(self._console)
+
+
+class ChannelRunner:
+    """Manages concurrent startup/teardown of one or more channels.
+
+    Usage::
+
+        runner = ChannelRunner(
+            channels=[CliChannel(CONSOLE)],
+            components=components,
+            cfg=cfg,
+        )
+        await runner.run()
+
+    The runner wires each channel to a shared ``_interactive_loop``-compatible
+    handler.  Today that handler IS ``_interactive_loop``; when a second channel
+    is added a stateless ``AgentCore`` class will replace it.
+    """
+
+    def __init__(
+        self,
+        channels: list[Channel],
+        components: dict,
+        cfg: dict,
+    ) -> None:
+        self._channels = channels
+        self._components = components
+        self._cfg = cfg
+
+    async def run(self) -> None:
+        """Run all registered channels concurrently."""
+        tasks = [asyncio.create_task(self._run_channel(ch)) for ch in self._channels]
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            for t in tasks:
+                t.cancel()
+            raise
+
+    async def _run_channel(self, channel: Channel) -> None:
+        """Run a single channel inside _interactive_loop."""
+        # For now, the CLI channel drives _interactive_loop directly
+        # (which manages its own input loop).  Future non-CLI channels will
+        # call channel.start(handler) with a stateless handler instead.
+        if isinstance(channel, CliChannel):
+            await _interactive_loop(self._components, self._cfg)
+        else:
+            raise NotImplementedError(
+                f"ChannelRunner does not yet support {type(channel).__name__}. "
+                "Implement a per-message AgentCore handler and wire it here."
+            )
 
 
 async def _interactive_loop(components: dict, cfg: dict):
@@ -6705,8 +6986,7 @@ async def _interactive_loop(components: dict, cfg: dict):
 
     CONSOLE.print(
         Panel(
-            "[bold cyan]Personal Agent[/bold cyan]\n"
-            "[dim]Commands: /memory, /context, /evolve, /generate-tool <desc>, /tools, /skills, /plugins, /model [name], /ralph <goal>, /quit[/dim]",
+            "[bold cyan]Personal Agent[/bold cyan]\n[dim]Type /help for commands[/dim]",
             title="Agent Ready",
             border_style="cyan",
         )
@@ -6717,7 +6997,12 @@ async def _interactive_loop(components: dict, cfg: dict):
     try:
         while True:
             try:
-                user_input = Prompt.ask("\n[bold green]You[/bold green]")
+                # Use asyncio.to_thread so the event loop stays alive (non-blocking
+                # input). This is required for future multi-channel concurrency where
+                # a second channel (Telegram, Feishu, …) runs in the same loop.
+                user_input = await asyncio.to_thread(
+                    Prompt.ask, "\n[bold green]You[/bold green]"
+                )
             except (EOFError, KeyboardInterrupt):
                 break
 
@@ -6730,6 +7015,28 @@ async def _interactive_loop(components: dict, cfg: dict):
                 cmd = raw_cmd.lower()
                 if cmd in ("quit", "exit", "q"):
                     break
+                elif cmd in ("help", "?"):
+                    _help_table = Table(title="Commands", show_header=False, box=None)
+                    _help_table.add_column("Command", style="cyan", no_wrap=True)
+                    _help_table.add_column("Description")
+                    for _hcmd, _hdesc in [
+                        ("/help", "Show this help"),
+                        ("/memory", "List memory palace chapters"),
+                        ("/context", "Show LTM context manager stats"),
+                        ("/tools", "List all available tools"),
+                        ("/skills", "List available skills"),
+                        ("/plugins", "List loaded plugins"),
+                        ("/model [name]", "Show or switch active model (session only)"),
+                        ("/ralph <goal>", "Run Ralph autonomous task loop"),
+                        ("  --max N", "  Max iterations (default 10)"),
+                        ("  --verify <cmd>", "  Shell command to verify completion"),
+                        ("/evolve", "Trigger system-prompt self-evolution"),
+                        ("/generate-tool <desc>", "Generate a new user tool"),
+                        ("/quit", "Exit the agent"),
+                    ]:
+                        _help_table.add_row(_hcmd, _hdesc)
+                    CONSOLE.print(_help_table)
+                    continue
                 elif cmd == "memory":
                     chapters = memory.list_chapters()
                     table = Table(title="Memory Palace")
@@ -6784,8 +7091,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                     await plugin_cmds[matched_plugin_key](raw_cmd, components)
                     continue
                 elif cmd == "tools":
-                    tools = components["registry"].list_tools()
-                    CONSOLE.print("Available tools: " + ", ".join(tools))
+                    _tool_list = components["registry"].list_tools()
+                    _tools_table = Table(title="Available Tools")
+                    _tools_table.add_column("Tool", style="cyan")
+                    for _t in _tool_list:
+                        _tools_table.add_row(_t)
+                    CONSOLE.print(_tools_table)
                     continue
                 elif cmd == "skills":
                     skills = skill_catalog.list_skills()
@@ -6855,7 +7166,10 @@ async def _interactive_loop(components: dict, cfg: dict):
                     else:
                         new_model = parts[1].strip()
                         agent.set_model(new_model)
-                        CONSOLE.print(f"[green]Switched to model: {new_model}[/green]")
+                        CONSOLE.print(
+                            f"[green]Switched to model: {new_model}[/green] "
+                            "[dim](session only — not persisted)[/dim]"
+                        )
                     continue
                 elif cmd == "ralph" or cmd.startswith("ralph "):
                     # /ralph <goal> [--max N] [--verify <shell_cmd>]
@@ -6905,21 +7219,26 @@ async def _interactive_loop(components: dict, cfg: dict):
                     )
                     _save_ralph_task(task)
                     CONSOLE.print(
-                        f"[cyan]Ralph 模式启动 | id: {task.id} | max_iters: {max_iters}"
+                        f"[cyan]Ralph mode started | id: {task.id} | max_iters: {max_iters}"
                         + (f" | verify: {verify_cmd}" if verify_cmd else "")
                         + "[/cyan]"
                     )
-                    task = await _ralph_task_loop(
-                        agent,
-                        task,
-                        system_prompt,
-                        skill_catalog,
-                        ctx_mgr,
-                    )
+                    _ralph_sink = CliOutputSink(CONSOLE)
+                    _ralph_token = _active_sink.set(_ralph_sink)
+                    try:
+                        task = await _ralph_task_loop(
+                            agent,
+                            task,
+                            system_prompt,
+                            skill_catalog,
+                            ctx_mgr,
+                        )
+                    finally:
+                        _active_sink.reset(_ralph_token)
                     status_color = "green" if task.status == "complete" else "yellow"
                     CONSOLE.print(
-                        f"[{status_color}]Ralph 完成 | status: {task.status} | "
-                        f"迭代: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
+                        f"[{status_color}]Ralph complete | status: {task.status} | "
+                        f"iterations: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
                     )
                     continue
                 else:
@@ -6951,13 +7270,10 @@ async def _interactive_loop(components: dict, cfg: dict):
             if not _task_context:
                 _task_context = user_input[:300]
 
-            # The agent decides how to handle the request
-            CONSOLE.print()
-            collected_text: list[str] = []
-
-            def stream_cb(chunk: str):
-                CONSOLE.print(chunk, end="", markup=False)
-                collected_text.append(chunk)
+            # Create a fresh per-turn sink and register it in the ContextVar so
+            # tool helpers (_run_tool_uses) can find it without param threading.
+            _turn_sink = CliOutputSink(CONSOLE)
+            _sink_token = _active_sink.set(_turn_sink)
 
             try:
                 CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
@@ -6977,11 +7293,13 @@ async def _interactive_loop(components: dict, cfg: dict):
                     ctx.system_prompt = _with_task_context(refreshed, _task_context)
 
                 result = await agent.send_message(
-                    ctx, user_input, stream_callback=stream_cb
+                    ctx, user_input, stream_callback=_turn_sink.sync_stream_cb
                 )
-                if not collected_text:
-                    CONSOLE.print(Markdown(result.content))
-                CONSOLE.print()
+                # on_turn_complete: renders markdown if no streaming happened,
+                # always prints trailing newline, and clears _streamed buffer.
+                _turn_sink.on_turn_complete(
+                    result.content or "", result.tool_calls_made
+                )
                 if result.error:
                     CONSOLE.print(f"[red]Error: {result.error}[/red]")
 
@@ -7036,6 +7354,10 @@ async def _interactive_loop(components: dict, cfg: dict):
 
             except Exception as e:
                 CONSOLE.print(f"\n[red]Error: {e}[/red]")
+            finally:
+                # Always reset the sink ContextVar after each turn so stale
+                # references cannot bleed into the next turn.
+                _active_sink.reset(_sink_token)
 
     finally:
         if memory_worker:
@@ -7091,7 +7413,11 @@ def main_callback(ctx: typer.Context):
             cfg, _ = load_config()
 
         async def _run():
-            components = await _build_components_async(cfg)
+            try:
+                components = await _build_components_async(cfg)
+            except RuntimeError as exc:
+                CONSOLE.print(f"[red]Error: {exc}[/red]")
+                raise typer.Exit(1)
             try:
                 await _interactive_loop(components, cfg)
             finally:
@@ -7153,7 +7479,13 @@ def evolve(
 
     async def _run():
         components = await _build_components_async(cfg)
-        evolution: EvolutionEngine = components["evolution"]
+        evolution: Optional[EvolutionEngine] = components["evolution"]
+        if evolution is None:
+            CONSOLE.print(
+                "[yellow]Evolution is disabled (set evolution.enabled=true in config to enable).[/yellow]"
+            )
+            await _close_components(components)
+            return
         try:
             if stats:
                 s = evolution.get_stats()

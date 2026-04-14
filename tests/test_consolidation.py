@@ -658,11 +658,11 @@ def test_consolidate_suppresses_messages_compressed_print_when_no_messages(
     assert "Messages compressed" not in captured.out
 
 
-def test_consolidate_still_prints_messages_compressed_when_messages_present(
+def test_consolidate_does_not_print_messages_compressed_when_messages_empty(
     tmp_path, capsys
 ):
-    """consolidate() should still print 'Messages compressed' when actual
-    working-memory messages are passed (the compaction-triggered path).
+    """consolidate() should NOT print 'Messages compressed' when messages=[] is passed
+    (no working-memory to compact).
     """
     import asyncio
     from agent import ConsolidationEngine, LTMStore, StagingBuffer
