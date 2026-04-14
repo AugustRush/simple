@@ -487,9 +487,9 @@ def test_should_enqueue_requires_min_messages_before_token_slow_path(tmp_path):
     ctx_mgr.mark_activity()
 
     # Append only 2 entries (1 complete turn) — below min_messages default of 4.
-    # Use a very large payload that would otherwise easily cross the 2100-token
-    # slow-path threshold (2100 CJK chars ≈ 2100 estimated tokens).
-    long_response = "这" * 3000  # 3000 Chinese chars >> 2100 token threshold
+    # Use a very large payload that would otherwise easily cross the token
+    # slow-path threshold (8000 estimated tokens).
+    long_response = "这" * 10000  # 10000 Chinese chars >> 8000 token threshold
     ctx_mgr.staging.append("user", "hello")
     ctx_mgr.staging.append("assistant", long_response)
 
@@ -505,7 +505,7 @@ def test_should_enqueue_slow_path_fires_once_min_messages_reached(tmp_path):
     ctx_mgr = make_ctx_manager(tmp_path)
     ctx_mgr.mark_activity()
 
-    long_response = "这" * 3000  # well above 2100-token threshold
+    long_response = "这" * 10000  # 10000 Chinese chars >> 8000 token threshold
     # Append 4 entries (2 complete turns) = min_messages.
     ctx_mgr.staging.append("user", "turn 1")
     ctx_mgr.staging.append("assistant", long_response)

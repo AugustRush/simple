@@ -87,11 +87,13 @@ RECENT_SESSION_TURNS = 6  # recent staged turns exposed to explicit context look
 PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
 STAGING_TURN_THRESHOLD = 6
 CONSOLIDATION_MAX_SOURCE_TOKENS = 1200
-# Align with the actual compact_messages cycle (~5 tool-calling turns × ~350 staging
-# tokens/turn). The old value of 300 was smaller than a single turn's staging content,
-# causing consolidation jobs to enqueue on the very first turn (though the background
-# worker's idle_seconds gate meant they rarely executed during active sessions).
-STAGING_TOKEN_THRESHOLD = 2100
+# Token threshold for the slow-path staging consolidation check.
+# Must be large enough to avoid firing on a single verbose turn.
+# CJK text costs ~1 estimated token/char, so 2100 fired on every response
+# over ~2100 chars. 8000 tokens ≈ 8 typical turns of mixed CJK/English
+# conversation, matching the intent of "consolidate after meaningful context
+# has accumulated" rather than "consolidate after one long reply".
+STAGING_TOKEN_THRESHOLD = 8000
 PALACE_LOCI = (
     "identity",
     "projects",
