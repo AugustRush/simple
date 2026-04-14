@@ -1089,7 +1089,12 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
     monkeypatch.setattr(
         agent_module,
         "_compose_system_prompt",
-        lambda base_prompt, registry, workspace_root, output_dir, skill_catalog=None: f"COMPOSED::{base_prompt}",
+        lambda base_prompt,
+        registry,
+        workspace_root,
+        output_dir,
+        skill_catalog=None,
+        plugin_catalog=None: f"COMPOSED::{base_prompt}",
     )
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()

@@ -98,6 +98,11 @@
     }
   ],
 
+  "evolution": {
+    "_readme": "Self-improvement plugin. Set enabled=false to disable session scoring and behavioral rule learning entirely.",
+    "enabled": true
+  },
+
   "system_prompt_file": null,
   "_system_prompt_file_readme": "null = use the built-in prompt. Set to an absolute path to load a custom system prompt from a .md or .txt file, e.g. '/Users/you/.agent/my_prompt.md'.",
 

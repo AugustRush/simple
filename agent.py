@@ -59,6 +59,8 @@ CONFIG_FILE = AGENT_HOME / "config.json"
 INDEX_FILE = MEMORY_DIR / "INDEX.md"
 SESSIONS_FILE = RL_DIR / "sessions.jsonl"
 DEFAULT_OUTPUT_DIR = AGENT_HOME / "output"
+PLUGINS_DIR = Path(__file__).resolve().parent / "plugins"
+USER_PLUGINS_DIR = AGENT_HOME / "plugins"
 
 DEFAULT_MODEL = "claude-opus-4-5"
 DEFAULT_MAX_TOKENS = 8192
@@ -1515,6 +1517,10 @@ DEFAULT_CONFIG: dict = {
     },
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
+    # ── Evolution / self-improvement ──────────────────────────────────────
+    "evolution": {
+        "enabled": True,  # set to false to disable session scoring and rule learning
+    },
     # ── Context manager ──────────────────────────────────────────────────
     "context": {
         "storage": {
@@ -1837,7 +1843,11 @@ class StagingBuffer:
             if not self.path.exists():
                 self._count = 0
                 return
-            lines = [line for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            lines = [
+                line
+                for line in self.path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
             if count >= len(lines):
                 self.path.unlink(missing_ok=True)
                 self._count = 0
@@ -2971,7 +2981,9 @@ class ConsolidationEngine:
         staged = staging.read_all() if staging else []
         source = staged if staged else messages
         if not source:
-            compressed = messages[-keep_last:] if len(messages) > keep_last else messages
+            compressed = (
+                messages[-keep_last:] if len(messages) > keep_last else messages
+            )
             CONSOLE.print(
                 f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
             )
@@ -3218,7 +3230,8 @@ class ContextManager:
             staging_path = str(staging.path.resolve())
             session_id = staging.session_id
             if any(
-                job.get("staging_path", str(self.staging.path.resolve())) == staging_path
+                job.get("staging_path", str(self.staging.path.resolve()))
+                == staging_path
                 and job.get("session_id", self.staging.session_id) == session_id
                 for job in self._jobs
             ):
@@ -3257,7 +3270,10 @@ class ContextManager:
         if not path_value:
             return self.staging, True
         path = Path(path_value).resolve()
-        if path == self.staging.path.resolve() and session_id == self.staging.session_id:
+        if (
+            path == self.staging.path.resolve()
+            and session_id == self.staging.session_id
+        ):
             return self.staging, True
         return StagingBuffer(path=path, session_id=session_id), False
 
@@ -3265,7 +3281,9 @@ class ContextManager:
         with self._lock:
             has_pending = bool(self._jobs)
             has_staged_work = self._needs_consolidation and self.staging.count() > 0
-        return (has_pending or has_staged_work) and self.idle_elapsed() >= self.idle_seconds
+        return (
+            has_pending or has_staged_work
+        ) and self.idle_elapsed() >= self.idle_seconds
 
     def should_compact_messages(self, messages: list[dict], max_tokens: int) -> bool:
         """Front-end compaction keeps working memory bounded without network calls."""
@@ -4258,6 +4276,7 @@ class BaseAgent:
         self.model = model
         self.max_tokens = max_tokens
         self.context_manager: Optional[ContextManager] = None
+        self.plugin_catalog: Optional["PluginCatalog"] = None
         self.max_parallel_agents = DEFAULT_MAX_PARALLEL_AGENTS
         self.sub_agent_timeout_seconds = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self._context_stack: list[AgentContext] = []
@@ -4407,6 +4426,18 @@ class BaseAgent:
         # user-generated tool cannot block the loop indefinitely.
         async def _exec_regular(tu: dict) -> str:
             name = tu["name"]
+            # pre_tool hook — a blocking result short-circuits execution
+            if self.plugin_catalog:
+                pre = await self.plugin_catalog.fire_pre_tool(
+                    PreToolEvent(tool_name=name, tool_kwargs=tu["input"])
+                )
+                if pre.action == "block":
+                    CONSOLE.print(
+                        f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {pre.message})[/yellow]"
+                    )
+                    return json.dumps(
+                        {"ok": False, "blocked": True, "reason": pre.message}
+                    )
             try:
                 res = await asyncio.wait_for(
                     self.registry.call(name, tu["input"]),
@@ -4422,6 +4453,11 @@ class BaseAgent:
             # M3: print name and result together atomically after the call
             CONSOLE.print(f"\n[cyan]→ {name}[/cyan]")
             CONSOLE.print(f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]")
+            # post_tool hook — observational, does not alter the result
+            if self.plugin_catalog:
+                await self.plugin_catalog.fire_post_tool(
+                    PostToolEvent(tool_name=name, tool_kwargs=tu["input"], result=res)
+                )
             return res
 
         # M2: use a sentinel so we can distinguish "tool not run" from "tool returned empty"
@@ -4890,7 +4926,8 @@ class EvolutionEngine:
         RL_DIR.mkdir(parents=True, exist_ok=True)
         PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    async def _generate_text(self, prompt: str, max_tokens: int) -> str:
+    async def generate_text(self, prompt: str, max_tokens: int) -> str:
+        """Generate text via the configured LLM provider (public API for plugins)."""
         if self.api_format == "anthropic":
             response = await self.client.messages.create(
                 model=self.model,
@@ -4954,7 +4991,7 @@ class EvolutionEngine:
         prompt = self._build_scoring_prompt(messages)
 
         try:
-            text = await self._generate_text(prompt, max_tokens=512)
+            text = await self.generate_text(prompt, max_tokens=512)
             result = self._parse_scoring_response(text)
             if not isinstance(result, dict):
                 raise ValueError("scorer returned non-object JSON")
@@ -5030,7 +5067,7 @@ class EvolutionEngine:
             "Make it more effective while keeping it concise."
         )
 
-        new_prompt = await self._generate_text(prompt, max_tokens=2048)
+        new_prompt = await self.generate_text(prompt, max_tokens=2048)
 
         # Save new version
         existing = list(PROMPTS_DIR.glob("system_v*.md"))
@@ -5069,7 +5106,7 @@ class EvolutionEngine:
             "Output ONLY the Python code, no explanation."
         )
 
-        code = await self._generate_text(prompt, max_tokens=2048)
+        code = await self.generate_text(prompt, max_tokens=2048)
 
         # Extract code from markdown code block if present
         code_match = re.search(r"```python\n(.*?)```", code, re.DOTALL)
@@ -5129,6 +5166,285 @@ class EvolutionEngine:
             "max_score": max(scores),
             "recent_score": scores[-1] if scores else 0,
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. PLUGIN SYSTEM
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class AgentPlugin:
+    """Protocol that plugin objects may implement (duck-typed).
+
+    All methods are optional — implement only the hooks you need.
+    ``PluginCatalog`` inspects each plugin with ``hasattr`` at dispatch time.
+
+    Attributes:
+        name:    Unique identifier for the plugin (used in log messages).
+        version: Semver string (informational only).
+
+    Lifecycle hooks:
+        on_session_start(components: dict) -> None
+            Synchronous.  Called once after all core components are built.
+            Use it to capture references to client, model, memory, etc.
+
+        on_turn_end(event: TurnEvent) -> Optional[HookResult]
+            Async-compatible.  Fired after every assistant turn.
+
+        on_session_end(event: SessionEvent) -> None
+            Async-compatible.  Fired when the interactive session ends.
+
+        on_pre_tool(event: PreToolEvent) -> Optional[HookResult]
+            Async-compatible.  Return HookResult(action="block") to prevent
+            the tool from executing.
+
+        on_post_tool(event: PostToolEvent) -> Optional[HookResult]
+            Async-compatible.  Purely observational.
+
+    Prompt contribution:
+        compose_system_prompt(current_prompt: str) -> str
+            Return a **suffix** to append to the system prompt, or ``""``
+            to contribute nothing.  The *current_prompt* argument is provided
+            for context only — do NOT return it back.
+
+    Slash commands:
+        register_slash_commands() -> dict[str, Callable]
+            Return {name: async handler(raw_cmd, components)}.
+    """
+
+    name: str = ""
+    version: str = ""
+
+
+@dataclass
+class TurnEvent:
+    """Emitted after each assistant turn completes."""
+
+    user_input: str
+    agent_response: str
+    tool_calls: list[str]
+    session_id: str = ""
+    timestamp: str = ""
+    turn_index: int = 0
+
+
+@dataclass
+class SessionEvent:
+    """Emitted when the interactive session ends."""
+
+    messages: list[dict]
+    tools_used: list[str]
+    session_id: str = ""
+    timestamp: str = ""
+    turn_count: int = 0
+
+
+@dataclass
+class PreToolEvent:
+    """Emitted before a tool call executes."""
+
+    tool_name: str
+    tool_kwargs: dict
+
+
+@dataclass
+class PostToolEvent:
+    """Emitted after a tool call completes."""
+
+    tool_name: str
+    tool_kwargs: dict
+    result: str
+
+
+@dataclass
+class HookResult:
+    """Return value from plugin hook methods."""
+
+    action: str = "noop"  # "noop" | "block" | "context" | "warning"
+    message: str = ""  # human-readable message / block reason
+    context: str = ""  # extra context to surface to the agent next turn
+
+
+# Valid characters for plugin directory names (P0-3 safety).
+_SAFE_PLUGIN_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await value if it is a coroutine, otherwise return it directly."""
+    if asyncio.iscoroutine(value):
+        return await value
+    return value
+
+
+class PluginCatalog:
+    """Discovers, loads, and orchestrates agent plugins from disk.
+
+    Built-in plugins are loaded from ``PLUGINS_DIR`` (project-root/plugins/).
+    User plugins are loaded from ``USER_PLUGINS_DIR`` (~/.agent/plugins/).
+
+    Each plugin directory must contain ``__init__.py`` with a top-level
+    ``register() -> plugin`` function that returns an object implementing
+    any subset of the AgentPlugin protocol (duck-typed, no base class needed).
+    """
+
+    def __init__(
+        self,
+        builtin_dir: Path,
+        user_dir: Optional[Path] = None,
+    ) -> None:
+        self._builtin_dir = builtin_dir
+        self._user_dir = user_dir
+        self._plugins: list[Any] = []
+        self._slash_commands: dict[str, Callable] = {}
+
+    # ── Discovery ─────────────────────────────────────────────────────────────
+
+    def discover_and_load(self) -> list[str]:
+        """Scan plugin directories and load all valid plugins.
+
+        Failures in individual plugins are reported but do not abort startup.
+        Returns a list of successfully loaded plugin names.
+        """
+        loaded: list[str] = []
+        search_dirs = [self._builtin_dir]
+        if self._user_dir:
+            search_dirs.append(self._user_dir)
+
+        for search_dir in search_dirs:
+            if not search_dir or not search_dir.is_dir():
+                continue
+            for plugin_dir in sorted(search_dir.iterdir()):
+                if not plugin_dir.is_dir():
+                    continue
+                # P0-3: reject directory names that could collide with real modules.
+                if not _SAFE_PLUGIN_NAME.match(plugin_dir.name):
+                    CONSOLE.print(
+                        f"[yellow]Plugin '{plugin_dir.name}': unsafe name — skipped[/yellow]"
+                    )
+                    continue
+                init_file = plugin_dir / "__init__.py"
+                if not init_file.exists():
+                    continue
+                mod_name = f"_agent_plugin_{plugin_dir.name}"
+                try:
+                    spec = importlib.util.spec_from_file_location(
+                        mod_name,
+                        init_file,
+                        submodule_search_locations=[str(plugin_dir)],
+                    )
+                    if spec is None or spec.loader is None:
+                        continue
+                    mod = importlib.util.module_from_spec(spec)
+                    sys.modules[mod_name] = mod
+                    spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                    if not hasattr(mod, "register"):
+                        CONSOLE.print(
+                            f"[yellow]Plugin '{plugin_dir.name}': no register() — skipped[/yellow]"
+                        )
+                        continue
+                    plugin = mod.register()
+                    self._plugins.append(plugin)
+                    if hasattr(plugin, "register_slash_commands"):
+                        for cmd_key, handler in (
+                            plugin.register_slash_commands() or {}
+                        ).items():
+                            self._slash_commands[cmd_key] = handler
+                    loaded.append(plugin_dir.name)
+                except Exception as exc:
+                    CONSOLE.print(
+                        f"[yellow]Plugin '{plugin_dir.name}' failed to load: {exc}[/yellow]"
+                    )
+        return loaded
+
+    # ── Prompt composition ─────────────────────────────────────────────────────
+
+    def compose_all_prompts(self, base: str) -> str:
+        """Let each loaded plugin append a suffix to the composed system prompt."""
+        result = base
+        for plugin in self._plugins:
+            if not hasattr(plugin, "compose_system_prompt"):
+                continue
+            try:
+                suffix = plugin.compose_system_prompt(result)
+                if suffix:
+                    result = result.rstrip() + "\n\n" + suffix.strip()
+            except Exception as exc:
+                _pname = getattr(plugin, "name", "?")
+                CONSOLE.print(
+                    f"[dim]Plugin '{_pname}' compose_system_prompt error: {exc}[/dim]"
+                )
+        return result
+
+    # ── Slash commands ─────────────────────────────────────────────────────────
+
+    def get_slash_commands(self) -> dict[str, Callable]:
+        """Return mapping of command name → async handler(raw_cmd, components)."""
+        return dict(self._slash_commands)
+
+    # ── Lifecycle event firing ─────────────────────────────────────────────────
+
+    def fire_session_start(self, components: dict) -> None:
+        """Synchronous session-start notification; called before the input loop."""
+        for plugin in self._plugins:
+            if not hasattr(plugin, "on_session_start"):
+                continue
+            try:
+                plugin.on_session_start(components)
+            except Exception as exc:
+                CONSOLE.print(f"[dim]Plugin session_start error: {exc}[/dim]")
+
+    async def fire_turn_end(self, event: TurnEvent) -> list[HookResult]:
+        """Notify all plugins after each assistant turn; collect HookResults."""
+        results: list[HookResult] = []
+        for plugin in self._plugins:
+            if not hasattr(plugin, "on_turn_end"):
+                continue
+            try:
+                r = await _maybe_await(plugin.on_turn_end(event))
+                if isinstance(r, HookResult):
+                    results.append(r)
+            except Exception as exc:
+                CONSOLE.print(f"[dim]Plugin turn_end error: {exc}[/dim]")
+        return results
+
+    async def fire_session_end(self, event: SessionEvent) -> None:
+        """Notify all plugins when the interactive session ends."""
+        for plugin in self._plugins:
+            if not hasattr(plugin, "on_session_end"):
+                continue
+            try:
+                await _maybe_await(plugin.on_session_end(event))
+            except Exception as exc:
+                CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
+
+    async def fire_pre_tool(self, event: PreToolEvent) -> HookResult:
+        """Fire before a tool call; first blocking result short-circuits the chain."""
+        for plugin in self._plugins:
+            if not hasattr(plugin, "on_pre_tool"):
+                continue
+            try:
+                r = await _maybe_await(plugin.on_pre_tool(event))
+                if isinstance(r, HookResult) and r.action == "block":
+                    return r
+            except Exception as exc:
+                _pname = getattr(plugin, "name", "?")
+                CONSOLE.print(f"[dim]Plugin '{_pname}' pre_tool error: {exc}[/dim]")
+        return HookResult()
+
+    async def fire_post_tool(self, event: PostToolEvent) -> HookResult:
+        """Fire after a tool call completes; last non-noop context wins."""
+        result = HookResult()
+        for plugin in self._plugins:
+            if not hasattr(plugin, "on_post_tool"):
+                continue
+            try:
+                r = await _maybe_await(plugin.on_post_tool(event))
+                if isinstance(r, HookResult) and r.context:
+                    result = r
+            except Exception as exc:
+                _pname = getattr(plugin, "name", "?")
+                CONSOLE.print(f"[dim]Plugin '{_pname}' post_tool error: {exc}[/dim]")
+        return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5342,6 +5658,7 @@ def _compose_system_prompt(
     workspace_root: Optional[Path] = None,
     output_dir: Optional[Path] = None,
     skill_catalog: Optional[SkillCatalog] = None,
+    plugin_catalog: Optional[PluginCatalog] = None,
 ) -> str:
     groups: dict[str, list[tuple[str, str]]] = {
         "builtin": [],
@@ -5381,7 +5698,10 @@ def _compose_system_prompt(
         lines.append(
             f"Output directory for generated files (screenshots, exports, temp): {output_dir}"
         )
-    return base_prompt.rstrip() + "\n\n" + "\n".join(lines)
+    composed = base_prompt.rstrip() + "\n\n" + "\n".join(lines)
+    if plugin_catalog:
+        composed = plugin_catalog.compose_all_prompts(composed)
+    return composed
 
 
 async def _close_components(components: dict) -> None:
@@ -5534,34 +5854,63 @@ async def _build_components_async(cfg: dict):
         )
     agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
     base_system_prompt = system_prompt
+
+    # EvolutionEngine is created only when evolution is enabled in config.
+    # The evolution plugin (and the `evolve` CLI command) both check for None.
+    evo_cfg = cfg.get("evolution", {})
+    evolution: Optional[EvolutionEngine] = (
+        EvolutionEngine(client, model, memory, api_format=api_format)
+        if evo_cfg.get("enabled", True)
+        else None
+    )
+
+    # ── Plugin Catalog ────────────────────────────────────────────────────────
+    plugin_catalog = PluginCatalog(
+        builtin_dir=PLUGINS_DIR,
+        user_dir=USER_PLUGINS_DIR,
+    )
+    # Build a partial components dict so plugins can self-initialize via
+    # on_session_start(); the dict is updated in-place after discover_and_load.
+    _partial_components: dict = {
+        "client": client,
+        "model": model,
+        "api_format": api_format,
+        "memory": memory,
+        "registry": registry,
+        "evolution": evolution,
+        "skill_catalog": skill_catalog,
+        "user_tool_catalog": user_tool_catalog,
+        "output_dir": output_dir,
+        "cfg": cfg,
+    }
+    loaded_plugins = plugin_catalog.discover_and_load()
+    if loaded_plugins:
+        CONSOLE.print("[green]Plugins loaded:[/green] " + ", ".join(loaded_plugins))
+    agent.plugin_catalog = plugin_catalog
+
+    # Compose system prompt now that plugins are loaded (they may append rules).
     system_prompt = _compose_system_prompt(
         system_prompt,
         registry,
         workspace_root,
         output_dir,
         skill_catalog=skill_catalog,
+        plugin_catalog=plugin_catalog,
     )
     agent.context_manager = ctx_manager
-    evolution = EvolutionEngine(client, model, memory, api_format=api_format)
 
-    return {
-        "client": client,
-        "model": model,
+    components = {
+        **_partial_components,
         "max_tokens": max_tokens,
         "base_system_prompt": base_system_prompt,
         "system_prompt": system_prompt,
-        "memory": memory,
-        "registry": registry,
         "agent": agent,
-        "evolution": evolution,
+        "plugin_catalog": plugin_catalog,
         "context_manager": ctx_manager,
-        "skill_catalog": skill_catalog,
-        "user_tool_catalog": user_tool_catalog,
         "mcp_client": mcp_client,
         "mcp_status": mcp_status,
-        "output_dir": output_dir,
-        "cfg": cfg,
     }
+    return components
 
 
 def _build_components(cfg: dict):
@@ -5741,18 +6090,24 @@ async def _interactive_loop(components: dict, cfg: dict):
     """Main interactive chat loop."""
     agent: BaseAgent = components["agent"]
     memory: MemoryPalace = components["memory"]
-    evolution: EvolutionEngine = components["evolution"]
+    evolution: Optional[EvolutionEngine] = components.get("evolution")
+    plugin_catalog: PluginCatalog = components.get("plugin_catalog")  # type: ignore[assignment]
+    if plugin_catalog is None:
+        plugin_catalog = PluginCatalog(
+            builtin_dir=PLUGINS_DIR, user_dir=USER_PLUGINS_DIR
+        )
+        plugin_catalog.discover_and_load()
+        components["plugin_catalog"] = plugin_catalog
     system_prompt = components["system_prompt"]
     ctx_mgr: Optional[ContextManager] = components.get("context_manager")
     skill_catalog: SkillCatalog = components["skill_catalog"]
     user_tool_catalog: UserToolCatalog = components["user_tool_catalog"]
 
-    # Get prompt version
-    prompt_files = sorted(PROMPTS_DIR.glob("system_v*.md"))
-    prompt_version = prompt_files[-1].stem if prompt_files else "default"
-
     ctx = AgentContext(system_prompt=system_prompt)
-    tools_used_session: list[str] = []
+    # Expose ctx in components so plugin slash-command handlers can update it.
+    components["ctx"] = ctx
+    _session_tools_used: list[str] = []  # accumulated for SessionEvent
+    _session_turn_count: int = 0
     # Track the user's first non-command message so it can be re-injected into
     # the system prompt after compaction (compact_messages drops early messages
     # to keep working memory bounded; this preserves the original task intent
@@ -5764,7 +6119,9 @@ async def _interactive_loop(components: dict, cfg: dict):
             components["client"],
             components["model"],
             agent.api_format,
-            client_factory=lambda: ModelClientFactory.from_config(cfg, announce=False)[0],
+            client_factory=lambda: ModelClientFactory.from_config(cfg, announce=False)[
+                0
+            ],
         )
         if ctx_mgr
         else None
@@ -5779,7 +6136,8 @@ async def _interactive_loop(components: dict, cfg: dict):
         staging_dir = STAGING_DIR
         current_sid = ctx_mgr.staging.session_id
         orphans = [
-            p for p in staging_dir.glob("*.jsonl")
+            p
+            for p in staging_dir.glob("*.jsonl")
             if p.stem != current_sid and p.stat().st_size > 0
         ]
         if orphans:
@@ -5802,6 +6160,8 @@ async def _interactive_loop(components: dict, cfg: dict):
             border_style="cyan",
         )
     )
+    # Notify all plugins that the session has started.
+    plugin_catalog.fire_session_start(components)
 
     try:
         while True:
@@ -5862,39 +6222,15 @@ async def _interactive_loop(components: dict, cfg: dict):
                     else:
                         CONSOLE.print("[yellow]Context manager not available.[/yellow]")
                     continue
-                elif cmd == "evolve":
-                    CONSOLE.print("[yellow]Running evolution engine...[/yellow]")
-                    new_prompt = await evolution.rewrite_system_prompt()
-                    components["base_system_prompt"] = new_prompt
-                    components["system_prompt"] = _compose_system_prompt(
-                        new_prompt,
-                        components["registry"],
-                        Path.cwd().resolve(),
-                        components["output_dir"],
-                        skill_catalog=components["skill_catalog"],
-                    )
-                    ctx.system_prompt = components["system_prompt"]
-                    CONSOLE.print("[green]System prompt updated.[/green]")
-                    continue
-                elif cmd == "generate-tool" or cmd.startswith("generate-tool "):
-                    parts = raw_cmd.split(None, 1)
-                    if len(parts) < 2 or not parts[1].strip():
-                        CONSOLE.print(
-                            "[yellow]Usage: /generate-tool <description>[/yellow]"
-                        )
-                        continue
-                    description = parts[1].strip()
-                    CONSOLE.print("[dim]Generating tool...[/dim]")
-                    await evolution.generate_tool(description, components["registry"])
-                    user_tool_catalog.load_into_registry(components["registry"])
-                    components["system_prompt"] = _compose_system_prompt(
-                        components["base_system_prompt"],
-                        components["registry"],
-                        Path.cwd().resolve(),
-                        components["output_dir"],
-                        skill_catalog=components["skill_catalog"],
-                    )
-                    ctx.system_prompt = components["system_prompt"]
+                # ── Plugin-contributed slash commands (checked before built-ins) ──
+                plugin_cmds = plugin_catalog.get_slash_commands()
+                matched_plugin_key: Optional[str] = None
+                for _key in plugin_cmds:
+                    if cmd == _key or cmd.startswith(_key + " "):
+                        matched_plugin_key = _key
+                        break
+                if matched_plugin_key is not None:
+                    await plugin_cmds[matched_plugin_key](raw_cmd, components)
                     continue
                 elif cmd == "tools":
                     tools = components["registry"].list_tools()
@@ -5946,12 +6282,6 @@ async def _interactive_loop(components: dict, cfg: dict):
                         new_model = parts[1].strip()
                         agent.set_model(new_model)
                         CONSOLE.print(f"[green]Switched to model: {new_model}[/green]")
-                    continue
-                elif cmd == "stats":
-                    stats = evolution.get_stats()
-                    CONSOLE.print(
-                        f"Sessions: {stats['total']}, Avg score: {stats['avg_score']}"
-                    )
                     continue
                 elif cmd == "ralph" or cmd.startswith("ralph "):
                     # /ralph <goal> [--max N] [--verify <shell_cmd>]
@@ -6066,7 +6396,19 @@ async def _interactive_loop(components: dict, cfg: dict):
                 CONSOLE.print()
                 if result.error:
                     CONSOLE.print(f"[red]Error: {result.error}[/red]")
-                tools_used_session.extend(result.tool_calls_made)
+
+                # Notify plugins of this completed turn (correction detection, etc.)
+                _session_tools_used.extend(result.tool_calls_made)
+                _session_turn_count += 1
+                await plugin_catalog.fire_turn_end(
+                    TurnEvent(
+                        user_input=user_input,
+                        agent_response=result.content or "",
+                        tool_calls=result.tool_calls_made,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        turn_index=_session_turn_count,
+                    )
+                )
 
                 # Stage this turn (user input + assistant reply) for consolidation
                 if ctx_mgr:
@@ -6124,18 +6466,20 @@ async def _interactive_loop(components: dict, cfg: dict):
             except Exception as e:
                 CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
 
-    # End of session scoring
-    if len(ctx.messages) >= 2:
-        CONSOLE.print("\n[dim]Scoring session...[/dim]")
-        try:
-            score_result = await evolution.score_session(
-                ctx.messages, prompt_version, tools_used_session
-            )
-            score = score_result.get("score", "?")
-            critique = score_result.get("critique", "")
-            CONSOLE.print(f"[dim]Session score: {score}/10 — {critique[:100]}[/dim]")
-        except Exception:
-            pass
+        # P0-1: session-end plugin notifications INSIDE finally so they fire
+        # even when KeyboardInterrupt breaks the input loop.
+        if len(ctx.messages) >= 2:
+            try:
+                await plugin_catalog.fire_session_end(
+                    SessionEvent(
+                        messages=ctx.messages,
+                        tools_used=_session_tools_used,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        turn_count=_session_turn_count,
+                    )
+                )
+            except Exception as exc:
+                CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
 
     CONSOLE.print("\n[dim]Goodbye.[/dim]")
 
