@@ -510,7 +510,69 @@ def test_retrieve_ltm_context_does_not_fallback_episode_for_generic_history_quer
     assert result == ""
 
 
-# ── Regression: per-turn consolidation bug ────────────────────────────────────
+# ── Regression: all consolidation trigger guards ──────────────────────────────
+
+
+def test_should_process_jobs_requires_staging_turn_threshold_for_unqueued_work(
+    tmp_path,
+):
+    """should_process_jobs() must not fire via has_staged_work unless staging
+    has at least staging_turn_threshold entries, preventing per-session
+    idle consolidation on tiny buffers."""
+    ctx_mgr = make_ctx_manager(tmp_path, idle_seconds=0)  # zero idle gate
+    ctx_mgr.mark_activity()
+
+    # Append fewer entries than staging_turn_threshold (default 6)
+    ctx_mgr.staging.append("user", "hi")
+    ctx_mgr.staging.append("assistant", "hello")
+    assert ctx_mgr.staging.count() == 2
+
+    # Even with idle gate open, has_staged_work must be False → no run
+    assert not ctx_mgr.should_process_jobs()
+
+
+def test_should_process_jobs_fires_when_threshold_reached(tmp_path):
+    """should_process_jobs() fires via has_staged_work once staging reaches
+    staging_turn_threshold and idle gate is open."""
+    ctx_mgr = make_ctx_manager(tmp_path, idle_seconds=0)
+    ctx_mgr.mark_activity()
+
+    for i in range(6):  # staging_turn_threshold = 6
+        ctx_mgr.staging.append("user", f"msg {i}")
+
+    assert ctx_mgr.should_process_jobs()
+
+
+def test_should_process_jobs_fires_with_pending_job_below_threshold(tmp_path):
+    """An explicitly queued job (has_pending=True) must still be processed by
+    the background worker even if staging count is below staging_turn_threshold."""
+    ctx_mgr = make_ctx_manager(tmp_path, idle_seconds=0)
+    ctx_mgr.mark_activity()
+
+    # Only 2 staging entries — below threshold
+    ctx_mgr.staging.append("user", "hi")
+    ctx_mgr.staging.append("assistant", "hello")
+
+    # Explicitly enqueue a job (simulates explicit enqueue path)
+    ctx_mgr._jobs.append({"reason": "test", "queued_at": "now"})
+
+    # has_pending=True → should_process_jobs fires regardless of count
+    assert ctx_mgr.should_process_jobs()
+
+
+def test_should_session_end_sleep_requires_complete_turn(tmp_path):
+    """should_session_end_sleep must require count >= 2 (complete user+assistant
+    pair) to avoid firing on a bare user message with no response."""
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.mark_activity()
+
+    # count == 1: only a user message, no assistant reply
+    ctx_mgr.staging.append("user", "incomplete turn")
+    assert not ctx_mgr.should_session_end_sleep()
+
+    # count == 2: complete turn → fires
+    ctx_mgr.staging.append("assistant", "reply")
+    assert ctx_mgr.should_session_end_sleep()
 
 
 def test_should_enqueue_requires_min_messages_before_token_slow_path(tmp_path):

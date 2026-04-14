@@ -3222,9 +3222,15 @@ class ContextManager:
         return self.idle_elapsed() >= self.idle_seconds
 
     def should_session_end_sleep(self) -> bool:
-        """Session-end trigger: fires when staging has unprocessed content."""
+        """Session-end trigger: fires when staging has at least one complete turn.
+
+        Requires count >= 2 (one user + one assistant message) to ensure
+        there is a complete exchange worth extracting.  count == 1 would mean
+        a bare user message with no response was staged, which is not worth
+        an LLM extraction call.
+        """
         with self._lock:
-            return self._needs_consolidation and self.staging.count() > 0
+            return self._needs_consolidation and self.staging.count() >= 2
 
     def should_enqueue_consolidation(self) -> bool:
         """Queue consolidation based on staged content volume, not working-memory size."""
@@ -3312,7 +3318,15 @@ class ContextManager:
     def should_process_jobs(self) -> bool:
         with self._lock:
             has_pending = bool(self._jobs)
-            has_staged_work = self._needs_consolidation and self.staging.count() > 0
+            # Require enough staged entries to be worth an LLM extraction call.
+            # count > 0 is not sufficient: the idle path would fire after any pause
+            # of idle_seconds even with a single staged turn.  Using
+            # staging_turn_threshold makes the implicit idle enqueue consistent
+            # with the explicit fast-path in should_enqueue_consolidation().
+            has_staged_work = (
+                self._needs_consolidation
+                and self.staging.count() >= self.staging_turn_threshold
+            )
         return (
             has_pending or has_staged_work
         ) and self.idle_elapsed() >= self.idle_seconds
@@ -7009,7 +7023,14 @@ async def _interactive_loop(components: dict, cfg: dict):
                     # wake() is non-blocking: the background worker thread runs
                     # the consolidation job while the user reads this response
                     # and types their next message.
-                    if memory_worker and ctx_mgr.staging.count() > 0:
+                    # Guard: require at least min_messages staged entries.
+                    # Without this, compact fires a consolidation job even with
+                    # a single staged turn, and wake() makes the background
+                    # worker bypass the idle gate, running immediately.
+                    if (
+                        memory_worker
+                        and ctx_mgr.staging.count() >= ctx_mgr.min_messages
+                    ):
                         ctx_mgr.enqueue_consolidation("compact_triggered")
                         memory_worker.wake()
 

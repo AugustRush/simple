@@ -168,7 +168,8 @@ def test_drop_prefix_uses_atomic_write(tmp_path, monkeypatch):
 
 
 def test_should_session_end_sleep_uses_staging(tmp_path):
-    """ContextManager.should_session_end_sleep fires when staging has content."""
+    """ContextManager.should_session_end_sleep fires when staging has at least
+    one complete user+assistant turn (count >= 2)."""
     from agent import (
         LTMStore,
         ConsolidationEngine,
@@ -190,9 +191,13 @@ def test_should_session_end_sleep_uses_staging(tmp_path):
     # Nothing staged, not dirty → False
     assert ctx_mgr.should_session_end_sleep() is False
 
-    # Mark activity + stage a turn → True
+    # Only one message staged (bare user message, no assistant reply) → still False.
     ctx_mgr.mark_activity()
     staging.append("user", "some conversation")
+    assert ctx_mgr.should_session_end_sleep() is False
+
+    # Complete user+assistant turn staged → True
+    staging.append("assistant", "some reply")
     assert ctx_mgr.should_session_end_sleep() is True
 
 
@@ -224,7 +229,9 @@ def test_retrieve_context_includes_current_session_staging(tmp_path):
     assert "Python decorators and wrappers" in result
 
 
-def test_retrieve_implicit_context_skips_current_session_for_non_recall_queries(tmp_path):
+def test_retrieve_implicit_context_skips_current_session_for_non_recall_queries(
+    tmp_path,
+):
     from agent import (
         LTMEntry,
         LTMStore,

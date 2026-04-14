@@ -115,16 +115,20 @@ def test_background_worker_processes_idle_staging_without_prequeued_job(tmp_path
 
     ctx_mgr, staging = _build_context_manager(tmp_path)
     ctx_mgr.idle_seconds = 0
-    ctx_mgr.min_messages = 1
-    ctx_mgr.staging_turn_threshold = 99
+    # Keep staging_token_threshold high to prevent the slow-path explicit enqueue
+    # from firing, ensuring no job is pre-queued in _jobs.
     ctx_mgr.staging_token_threshold = 999999
-    staging.append("user", "short turn")
-    staging.append("assistant", "short reply")
+    # Append exactly staging_turn_threshold entries so has_staged_work fires via
+    # the background idle path without an explicit enqueue.
+    for i in range(ctx_mgr.staging_turn_threshold):
+        staging.append("user", f"turn {i}")
     ctx_mgr.mark_activity()
 
     calls = []
 
-    async def fake_process_one_job(client, model, api_format="anthropic", extractor=None):
+    async def fake_process_one_job(
+        client, model, api_format="anthropic", extractor=None
+    ):
         calls.append((model, api_format))
         ctx_mgr.staging.clear_all()
         ctx_mgr._needs_consolidation = False
