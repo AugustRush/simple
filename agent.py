@@ -18,6 +18,7 @@ import math
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -67,7 +68,9 @@ DEFAULT_MAX_TOKENS = 8192
 MEMORY_TIDY_INTERVAL = 3600  # seconds
 MEMORY_TIDY_FILE_THRESHOLD = 5
 DEFAULT_MAX_PARALLEL_AGENTS = 3
-DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = 120
+DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = (
+    300  # must be > REGULAR_TOOL_TIMEOUT to allow multi-tool sub-agents
+)
 MAX_TOOL_CALL_ITERATIONS = 40  # hard ceiling on tool-call rounds per send_message call
 REGULAR_TOOL_TIMEOUT = 120  # wall-clock timeout (s) for any single non-spawn tool call
 
@@ -3964,6 +3967,7 @@ class SkillCatalog:
         self._skills: dict[str, SkillBundle] = {}
         self._aliases: dict[str, str] = {}
         self._registry: Optional[ToolRegistry] = None
+        self._dirty: bool = False
 
     def load_all(self) -> None:
         self.user_root.mkdir(parents=True, exist_ok=True)
@@ -4031,6 +4035,14 @@ class SkillCatalog:
 
     def reload(self) -> None:
         self.load_all()
+        self._dirty = True
+
+    def consume_dirty(self) -> bool:
+        """Return True and clear if the catalog was mutated since last check."""
+        if self._dirty:
+            self._dirty = False
+            return True
+        return False
 
     def get(self, skill_ref: str) -> Optional[SkillBundle]:
         resolved = self.resolve_ref(skill_ref)
@@ -4166,6 +4178,333 @@ class SkillCatalog:
                 "required": ["skill_name", "path"],
             },
             read_skill_file,
+            replace=True,
+            source="runtime:skill",
+        )
+
+        # ── Skill management tools ───────────────────────────────────────────
+
+        def _validate_skill_id(skill_id: str) -> Optional[str]:
+            """Return an error message if skill_id is invalid, else None."""
+            if not skill_id or not skill_id.strip():
+                return "Skill ID must not be empty"
+            if re.search(r"[^a-zA-Z0-9/_\-]", skill_id):
+                return "Skill ID may only contain alphanumerics, '/', '-', and '_'"
+            if skill_id.startswith("/") or skill_id.endswith("/"):
+                return "Skill ID must not start or end with '/'"
+            if ".." in skill_id:
+                return "Skill ID must not contain '..'"
+            return None
+
+        def _compose_skill_md(
+            name: str,
+            description: str,
+            instructions: str,
+            user_invocable: bool = True,
+            disable_model_invocation: bool = False,
+        ) -> str:
+            lines = ["---"]
+            lines.append(f"name: {name}")
+            if description:
+                lines.append(f"description: {description}")
+            lines.append(f"user-invocable: {'true' if user_invocable else 'false'}")
+            lines.append(
+                f"disable-model-invocation: {'true' if disable_model_invocation else 'false'}"
+            )
+            lines.append("---")
+            lines.append("")
+            lines.append(instructions)
+            return "\n".join(lines)
+
+        def create_skill(
+            skill_id: str,
+            name: str,
+            description: str = "",
+            instructions: str = "",
+            user_invocable: bool = True,
+            disable_model_invocation: bool = False,
+        ) -> dict[str, Any]:
+            err = _validate_skill_id(skill_id)
+            if err:
+                return {"ok": False, "error": err}
+            bundle_dir = self.user_root / skill_id
+            skill_file = bundle_dir / "SKILL.md"
+            if skill_file.exists():
+                return {
+                    "ok": False,
+                    "error": f"Skill '{skill_id}' already exists at {bundle_dir}. Use update_skill to modify it.",
+                }
+            try:
+                bundle_dir.mkdir(parents=True, exist_ok=True)
+                content = _compose_skill_md(
+                    name=name,
+                    description=description,
+                    instructions=instructions,
+                    user_invocable=user_invocable,
+                    disable_model_invocation=disable_model_invocation,
+                )
+                skill_file.write_text(content, encoding="utf-8")
+                self.reload()
+                bundle = self.get(skill_id)
+                return {
+                    "ok": True,
+                    "skill_id": skill_id,
+                    "path": str(bundle_dir),
+                    "message": f"Skill '{skill_id}' created successfully",
+                    "skill": {
+                        "id": bundle.id,
+                        "name": bundle.name,
+                        "description": bundle.description,
+                    }
+                    if bundle
+                    else None,
+                }
+            except Exception as e:
+                return {"ok": False, "error": f"Failed to create skill: {e}"}
+
+        def update_skill(
+            skill_id: str,
+            name: Optional[str] = None,
+            description: Optional[str] = None,
+            instructions: Optional[str] = None,
+            user_invocable: Optional[bool] = None,
+            disable_model_invocation: Optional[bool] = None,
+        ) -> dict[str, Any]:
+            bundle = self.get(skill_id)
+            if bundle is None:
+                return {"ok": False, "error": f"Skill '{skill_id}' not found"}
+            if bundle.source != "user":
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Skill '{bundle.id}' is a built-in skill and cannot be modified. "
+                        "Create a user skill with the same ID to override it."
+                    ),
+                }
+            skill_file = bundle.path / "SKILL.md"
+            if not skill_file.exists():
+                return {"ok": False, "error": f"SKILL.md not found at {skill_file}"}
+            try:
+                final_name = name if name is not None else bundle.name
+                final_desc = (
+                    description if description is not None else bundle.description
+                )
+                final_body = instructions if instructions is not None else bundle.body
+                final_user_inv = (
+                    user_invocable
+                    if user_invocable is not None
+                    else bundle.user_invocable
+                )
+                final_disable_model = (
+                    disable_model_invocation
+                    if disable_model_invocation is not None
+                    else bundle.disable_model_invocation
+                )
+                content = _compose_skill_md(
+                    name=final_name,
+                    description=final_desc,
+                    instructions=final_body,
+                    user_invocable=final_user_inv,
+                    disable_model_invocation=final_disable_model,
+                )
+                skill_file.write_text(content, encoding="utf-8")
+                self.reload()
+                updated = self.get(bundle.id)
+                return {
+                    "ok": True,
+                    "skill_id": bundle.id,
+                    "path": str(bundle.path),
+                    "message": f"Skill '{bundle.id}' updated successfully",
+                    "skill": {
+                        "id": updated.id,
+                        "name": updated.name,
+                        "description": updated.description,
+                    }
+                    if updated
+                    else None,
+                }
+            except Exception as e:
+                return {"ok": False, "error": f"Failed to update skill: {e}"}
+
+        def delete_skill(skill_id: str) -> dict[str, Any]:
+            bundle = self.get(skill_id)
+            if bundle is None:
+                return {"ok": False, "error": f"Skill '{skill_id}' not found"}
+            if bundle.source != "user":
+                return {
+                    "ok": False,
+                    "error": f"Skill '{bundle.id}' is a built-in skill and cannot be deleted",
+                }
+            try:
+                bundle_dir = bundle.path
+                shutil.rmtree(bundle_dir)
+                self.reload()
+                return {
+                    "ok": True,
+                    "skill_id": bundle.id,
+                    "path": str(bundle_dir),
+                    "message": f"Skill '{bundle.id}' deleted successfully",
+                }
+            except Exception as e:
+                return {"ok": False, "error": f"Failed to delete skill: {e}"}
+
+        def write_skill_file(
+            skill_name: str, path: str, content: str
+        ) -> dict[str, Any]:
+            bundle = self.get(skill_name)
+            if bundle is None:
+                return {"ok": False, "error": f"Skill '{skill_name}' not found"}
+            if bundle.source != "user":
+                return {
+                    "ok": False,
+                    "error": f"Skill '{bundle.id}' is a built-in skill and cannot be modified",
+                }
+            rel_path = Path(path)
+            if rel_path.is_absolute():
+                return {
+                    "ok": False,
+                    "error": "Skill file paths must be relative to the skill bundle",
+                }
+            target = (bundle.path / rel_path).resolve(strict=False)
+            if target != bundle.path and bundle.path not in target.parents:
+                return {"ok": False, "error": "Requested path escapes the skill bundle"}
+            if target.name == "SKILL.md":
+                return {
+                    "ok": False,
+                    "error": "Use update_skill to modify SKILL.md, not write_skill_file",
+                }
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+                self.reload()
+                return {
+                    "ok": True,
+                    "skill": bundle.id,
+                    "path": rel_path.as_posix(),
+                    "message": f"File '{rel_path.as_posix()}' written to skill '{bundle.id}'",
+                }
+            except Exception as e:
+                return {"ok": False, "error": f"Failed to write skill file: {e}"}
+
+        registry.register(
+            "create_skill",
+            "Create a new user skill bundle with SKILL.md entrypoint.",
+            {
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "description": (
+                            "Unique ID for the skill, using '/' for nesting "
+                            "(e.g., 'code-review', 'quality/lint')"
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Display name for the skill",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "One-line description of the skill",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "Instruction body for SKILL.md (the skill's behavior when activated)",
+                    },
+                    "user_invocable": {
+                        "type": "boolean",
+                        "description": "Whether the user can explicitly invoke this skill (default: true)",
+                    },
+                    "disable_model_invocation": {
+                        "type": "boolean",
+                        "description": "Whether to prevent the model from auto-activating (default: false)",
+                    },
+                },
+                "required": ["skill_id", "name"],
+            },
+            create_skill,
+            replace=True,
+            source="runtime:skill",
+        )
+
+        registry.register(
+            "update_skill",
+            "Update an existing user skill's metadata or instructions. Only user skills can be modified.",
+            {
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "description": "Skill ID, leaf name, or display name of the skill to update",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New display name (omit to keep current)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "New one-line description (omit to keep current)",
+                    },
+                    "instructions": {
+                        "type": "string",
+                        "description": "New instruction body for SKILL.md (omit to keep current)",
+                    },
+                    "user_invocable": {
+                        "type": "boolean",
+                        "description": "Whether the user can invoke this skill (omit to keep current)",
+                    },
+                    "disable_model_invocation": {
+                        "type": "boolean",
+                        "description": "Whether to prevent model auto-activation (omit to keep current)",
+                    },
+                },
+                "required": ["skill_id"],
+            },
+            update_skill,
+            replace=True,
+            source="runtime:skill",
+        )
+
+        registry.register(
+            "delete_skill",
+            "Delete a user skill bundle. Built-in skills cannot be deleted.",
+            {
+                "type": "object",
+                "properties": {
+                    "skill_id": {
+                        "type": "string",
+                        "description": "Skill ID, leaf name, or display name of the skill to delete",
+                    },
+                },
+                "required": ["skill_id"],
+            },
+            delete_skill,
+            replace=True,
+            source="runtime:skill",
+        )
+
+        registry.register(
+            "write_skill_file",
+            "Write or update a supporting file inside a user skill bundle.",
+            {
+                "type": "object",
+                "properties": {
+                    "skill_name": {
+                        "type": "string",
+                        "description": "Skill ID, leaf name, or display name",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path inside the skill bundle (e.g., 'templates/checklist.md')",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "File content to write",
+                    },
+                },
+                "required": ["skill_name", "path", "content"],
+            },
+            write_skill_file,
             replace=True,
             source="runtime:skill",
         )
@@ -4800,7 +5139,7 @@ class BaseAgent:
             try:
                 result = await asyncio.wait_for(
                     sub_agent.send_message(sub_ctx, task),
-                    timeout=self.sub_agent_timeout_seconds,
+                    timeout=parent.sub_agent_timeout_seconds,
                 )
             except asyncio.TimeoutError:
                 # D6: include the last partial content from sub_ctx messages so the
@@ -4816,7 +5155,7 @@ class BaseAgent:
                     "task": task,
                     "timed_out": True,
                     "error": (
-                        f"sub-agent timed out after {self.sub_agent_timeout_seconds}s"
+                        f"sub-agent timed out after {parent.sub_agent_timeout_seconds}s"
                     ),
                 }
                 if partial:
@@ -4837,7 +5176,7 @@ class BaseAgent:
                     "ok": False,
                     "role": role,
                     "task": task,
-                    "error": f"sub-agent failed: {self._format_agent_error(e)}",
+                    "error": f"sub-agent failed: {parent._format_agent_error(e)}",
                 }
                 CONSOLE.print(
                     Panel(
@@ -5269,6 +5608,47 @@ class HookResult:
 _SAFE_PLUGIN_NAME = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 
+@dataclass
+class PluginMeta:
+    """Structured metadata read from plugin.json (if present)."""
+
+    name: str
+    version: str = ""
+    description: str = ""
+    skills: str = ""  # relative path to skills dir
+    mcp_servers: list[dict] = field(default_factory=list)
+    source: str = ""  # "builtin" or "user"
+    enabled: bool = True
+
+
+def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
+    """Read plugin.json from a plugin directory. Returns None if absent."""
+    pj = plugin_dir / "plugin.json"
+    if not pj.exists():
+        return None
+    try:
+        data = json.loads(pj.read_text(encoding="utf-8"))
+        mcp = data.get("mcp_servers", [])
+        if isinstance(mcp, str):
+            # Path to .mcp.json file
+            mcp_path = plugin_dir / mcp
+            if mcp_path.exists():
+                mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
+                if isinstance(mcp, dict):
+                    mcp = [mcp]
+            else:
+                mcp = []
+        return PluginMeta(
+            name=data.get("name", plugin_dir.name),
+            version=data.get("version", ""),
+            description=data.get("description", ""),
+            skills=data.get("skills", ""),
+            mcp_servers=mcp if isinstance(mcp, list) else [],
+        )
+    except Exception:
+        return None
+
+
 async def _maybe_await(value: Any) -> Any:
     """Await value if it is a coroutine, otherwise return it directly."""
     if asyncio.iscoroutine(value):
@@ -5285,19 +5665,39 @@ class PluginCatalog:
     Each plugin directory must contain ``__init__.py`` with a top-level
     ``register() -> plugin`` function that returns an object implementing
     any subset of the AgentPlugin protocol (duck-typed, no base class needed).
+
+    An optional ``plugin.json`` in the directory provides structured metadata
+    (name, version, description, skills path, mcp_servers).
+
+    User plugins with the same name as a built-in plugin override the built-in.
+    Plugins can be disabled in config.json via ``plugins.<name>.enabled = false``.
     """
 
     def __init__(
         self,
         builtin_dir: Path,
         user_dir: Optional[Path] = None,
+        plugin_config: Optional[dict] = None,
     ) -> None:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
-        self._plugins: list[Any] = []
+        self._plugin_config = plugin_config or {}
+        # name → (plugin_object, PluginMeta)
+        self._plugins: dict[str, tuple[Any, PluginMeta]] = {}
         self._slash_commands: dict[str, Callable] = {}
+        # Skills bundled by plugins: list of (plugin_name, skills_root_path)
+        self._bundled_skills: list[tuple[str, Path]] = []
+        # MCP configs bundled by plugins: list of (plugin_name, server_config_dict)
+        self._bundled_mcp: list[tuple[str, dict]] = []
 
     # ── Discovery ─────────────────────────────────────────────────────────────
+
+    def _is_plugin_enabled(self, name: str) -> bool:
+        """Check config.json plugins section for enabled status."""
+        pcfg = self._plugin_config.get(name, {})
+        if isinstance(pcfg, dict):
+            return pcfg.get("enabled", True)
+        return True
 
     def discover_and_load(self) -> list[str]:
         """Scan plugin directories and load all valid plugins.
@@ -5305,12 +5705,21 @@ class PluginCatalog:
         Failures in individual plugins are reported but do not abort startup.
         Returns a list of successfully loaded plugin names.
         """
-        loaded: list[str] = []
-        search_dirs = [self._builtin_dir]
-        if self._user_dir:
-            search_dirs.append(self._user_dir)
+        self._plugins.clear()
+        self._slash_commands.clear()
+        self._bundled_skills.clear()
+        self._bundled_mcp.clear()
 
-        for search_dir in search_dirs:
+        # Auto-create user plugins directory
+        if self._user_dir:
+            self._user_dir.mkdir(parents=True, exist_ok=True)
+
+        # Load builtin first, then user (user overrides builtin)
+        search_dirs: list[tuple[Path, str]] = [(self._builtin_dir, "builtin")]
+        if self._user_dir:
+            search_dirs.append((self._user_dir, "user"))
+
+        for search_dir, source in search_dirs:
             if not search_dir or not search_dir.is_dir():
                 continue
             for plugin_dir in sorted(search_dir.iterdir()):
@@ -5325,6 +5734,15 @@ class PluginCatalog:
                 init_file = plugin_dir / "__init__.py"
                 if not init_file.exists():
                     continue
+
+                # Read plugin.json metadata (optional)
+                meta = _read_plugin_json(plugin_dir)
+                plugin_name = meta.name if meta else plugin_dir.name
+
+                # Check enable/disable in config
+                if not self._is_plugin_enabled(plugin_name):
+                    continue
+
                 mod_name = f"_agent_plugin_{plugin_dir.name}"
                 try:
                     spec = importlib.util.spec_from_file_location(
@@ -5343,25 +5761,74 @@ class PluginCatalog:
                         )
                         continue
                     plugin = mod.register()
-                    self._plugins.append(plugin)
+
+                    # Build meta from plugin attributes if no plugin.json
+                    if meta is None:
+                        meta = PluginMeta(
+                            name=getattr(plugin, "name", plugin_dir.name),
+                            version=getattr(plugin, "version", ""),
+                            description=getattr(plugin, "description", ""),
+                        )
+                    meta.source = source
+
+                    # Slash commands with conflict detection
                     if hasattr(plugin, "register_slash_commands"):
                         for cmd_key, handler in (
                             plugin.register_slash_commands() or {}
                         ).items():
+                            if cmd_key in self._slash_commands:
+                                existing_owner = None
+                                for pn, (_, pm) in self._plugins.items():
+                                    if hasattr(_, "register_slash_commands"):
+                                        cmds = _.register_slash_commands() or {}
+                                        if cmd_key in cmds:
+                                            existing_owner = pn
+                                            break
+                                CONSOLE.print(
+                                    f"[yellow]Plugin '{plugin_name}': slash command "
+                                    f"'/{cmd_key}' conflicts with plugin "
+                                    f"'{existing_owner or '?'}' — overriding[/yellow]"
+                                )
                             self._slash_commands[cmd_key] = handler
-                    loaded.append(plugin_dir.name)
+
+                    # Store (user overrides builtin with same name)
+                    self._plugins[plugin_name] = (plugin, meta)
+
+                    # Collect bundled skills
+                    if meta.skills:
+                        skills_path = (plugin_dir / meta.skills).resolve()
+                        if skills_path.is_dir():
+                            self._bundled_skills.append((plugin_name, skills_path))
+
+                    # Collect bundled MCP configs
+                    for mcp_cfg in meta.mcp_servers:
+                        if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
+                            self._bundled_mcp.append((plugin_name, mcp_cfg))
+
                 except Exception as exc:
                     CONSOLE.print(
                         f"[yellow]Plugin '{plugin_dir.name}' failed to load: {exc}[/yellow]"
                     )
-        return loaded
+        return [name for name in self._plugins]
+
+    def get_bundled_skills(self) -> list[tuple[str, Path]]:
+        """Return list of (plugin_name, skills_root_path) for bundled skills."""
+        return list(self._bundled_skills)
+
+    def get_bundled_mcp(self) -> list[tuple[str, dict]]:
+        """Return list of (plugin_name, mcp_server_config) for bundled MCP servers."""
+        return list(self._bundled_mcp)
+
+    def list_plugins(self) -> list[PluginMeta]:
+        """Return metadata for all loaded plugins."""
+        return [meta for _, meta in self._plugins.values()]
 
     # ── Prompt composition ─────────────────────────────────────────────────────
 
     def compose_all_prompts(self, base: str) -> str:
         """Let each loaded plugin append a suffix to the composed system prompt."""
         result = base
-        for plugin in self._plugins:
+        for plugin, _meta in self._plugins.values():
             if not hasattr(plugin, "compose_system_prompt"):
                 continue
             try:
@@ -5385,7 +5852,7 @@ class PluginCatalog:
 
     def fire_session_start(self, components: dict) -> None:
         """Synchronous session-start notification; called before the input loop."""
-        for plugin in self._plugins:
+        for plugin, _meta in self._plugins.values():
             if not hasattr(plugin, "on_session_start"):
                 continue
             try:
@@ -5396,7 +5863,7 @@ class PluginCatalog:
     async def fire_turn_end(self, event: TurnEvent) -> list[HookResult]:
         """Notify all plugins after each assistant turn; collect HookResults."""
         results: list[HookResult] = []
-        for plugin in self._plugins:
+        for plugin, _meta in self._plugins.values():
             if not hasattr(plugin, "on_turn_end"):
                 continue
             try:
@@ -5409,7 +5876,7 @@ class PluginCatalog:
 
     async def fire_session_end(self, event: SessionEvent) -> None:
         """Notify all plugins when the interactive session ends."""
-        for plugin in self._plugins:
+        for plugin, _meta in self._plugins.values():
             if not hasattr(plugin, "on_session_end"):
                 continue
             try:
@@ -5419,7 +5886,7 @@ class PluginCatalog:
 
     async def fire_pre_tool(self, event: PreToolEvent) -> HookResult:
         """Fire before a tool call; first blocking result short-circuits the chain."""
-        for plugin in self._plugins:
+        for plugin, _meta in self._plugins.values():
             if not hasattr(plugin, "on_pre_tool"):
                 continue
             try:
@@ -5434,7 +5901,7 @@ class PluginCatalog:
     async def fire_post_tool(self, event: PostToolEvent) -> HookResult:
         """Fire after a tool call completes; last non-noop context wins."""
         result = HookResult()
-        for plugin in self._plugins:
+        for plugin, _meta in self._plugins.values():
             if not hasattr(plugin, "on_post_tool"):
                 continue
             try:
@@ -5868,6 +6335,7 @@ async def _build_components_async(cfg: dict):
     plugin_catalog = PluginCatalog(
         builtin_dir=PLUGINS_DIR,
         user_dir=USER_PLUGINS_DIR,
+        plugin_config=cfg.get("plugins", {}),
     )
     # Build a partial components dict so plugins can self-initialize via
     # on_session_start(); the dict is updated in-place after discover_and_load.
@@ -5881,11 +6349,28 @@ async def _build_components_async(cfg: dict):
         "skill_catalog": skill_catalog,
         "user_tool_catalog": user_tool_catalog,
         "output_dir": output_dir,
+        "workspace_root": workspace_root,
         "cfg": cfg,
     }
     loaded_plugins = plugin_catalog.discover_and_load()
     if loaded_plugins:
         CONSOLE.print("[green]Plugins loaded:[/green] " + ", ".join(loaded_plugins))
+
+    # Load skills bundled by plugins into the skill catalog
+    for _pname, _skills_root in plugin_catalog.get_bundled_skills():
+        skill_catalog._load_root(_skills_root, source=f"plugin:{_pname}")
+    skill_catalog._rebuild_aliases()
+
+    # Connect MCP servers bundled by plugins
+    bundled_mcp = plugin_catalog.get_bundled_mcp()
+    if bundled_mcp and mcp_client is None:
+        mcp_client = MCPClient(registry)
+    if bundled_mcp and mcp_client is not None:
+        bundled_cfg = {"mcp_servers": [cfg for _, cfg in bundled_mcp]}
+        mcp_extra_env = {"AGENT_OUTPUT_DIR": str(output_dir)}
+        await mcp_client.connect_from_config(bundled_cfg, extra_env=mcp_extra_env)
+        mcp_status = mcp_client.status_summary()
+
     agent.plugin_catalog = plugin_catalog
 
     # Compose system prompt now that plugins are loaded (they may append rules).
@@ -5985,6 +6470,21 @@ async def _ralph_task_loop(
 
         iter_summary = result.content[:300] if result.content else "(no output)"
         all_summaries.append(f"Iter {task.current_iteration}: {iter_summary}")
+
+        # ── Notify plugins so evolution / correction detection works in Ralph ─
+        if agent.plugin_catalog:
+            try:
+                await agent.plugin_catalog.fire_turn_end(
+                    TurnEvent(
+                        user_input=_build_iter_prompt(task),
+                        agent_response=result.content or "",
+                        tool_calls=result.tool_calls_made,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        turn_index=task.current_iteration,
+                    )
+                )
+            except Exception:
+                pass  # plugin errors must not abort the task loop
 
         # ── External completion check 1: promise token ────────────────────────
         if task.completion_promise in result.content:
@@ -6094,7 +6594,9 @@ async def _interactive_loop(components: dict, cfg: dict):
     plugin_catalog: PluginCatalog = components.get("plugin_catalog")  # type: ignore[assignment]
     if plugin_catalog is None:
         plugin_catalog = PluginCatalog(
-            builtin_dir=PLUGINS_DIR, user_dir=USER_PLUGINS_DIR
+            builtin_dir=PLUGINS_DIR,
+            user_dir=USER_PLUGINS_DIR,
+            plugin_config=cfg.get("plugins", {}),
         )
         plugin_catalog.discover_and_load()
         components["plugin_catalog"] = plugin_catalog
@@ -6155,7 +6657,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     CONSOLE.print(
         Panel(
             "[bold cyan]Personal Agent[/bold cyan]\n"
-            "[dim]Commands: /memory, /context, /evolve, /generate-tool <desc>, /tools, /model [name], /ralph <goal>, /quit[/dim]",
+            "[dim]Commands: /memory, /context, /evolve, /generate-tool <desc>, /tools, /skills, /plugins, /model [name], /ralph <goal>, /quit[/dim]",
             title="Agent Ready",
             border_style="cyan",
         )
@@ -6252,6 +6754,29 @@ async def _interactive_loop(components: dict, cfg: dict):
                                 bundle.description or "—",
                             )
                         CONSOLE.print(table)
+                    continue
+                elif cmd == "plugins":
+                    plugins = plugin_catalog.list_plugins()
+                    if not plugins:
+                        CONSOLE.print("[yellow]No plugins loaded.[/yellow]")
+                    else:
+                        table = Table(title="Loaded Plugins")
+                        table.add_column("Name")
+                        table.add_column("Version")
+                        table.add_column("Source")
+                        table.add_column("Description")
+                        for pm in plugins:
+                            table.add_row(
+                                pm.name,
+                                pm.version or "—",
+                                pm.source,
+                                pm.description or "—",
+                            )
+                        CONSOLE.print(table)
+                        CONSOLE.print(
+                            "[dim]Tip: set plugins.<name>.enabled = false "
+                            "in config.json to disable a plugin[/dim]"
+                        )
                     continue
                 elif cmd.startswith("mode "):
                     # Kept as a hidden override for debugging; not advertised
@@ -6388,6 +6913,20 @@ async def _interactive_loop(components: dict, cfg: dict):
             try:
                 CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
                 ctx.metadata["skill_catalog"] = skill_catalog
+
+                # Hot-reload: recompose system prompt when skill catalog was mutated
+                if skill_catalog.consume_dirty():
+                    refreshed = _compose_system_prompt(
+                        components["base_system_prompt"],
+                        components["registry"],
+                        components.get("workspace_root"),
+                        components.get("output_dir"),
+                        skill_catalog=skill_catalog,
+                        plugin_catalog=plugin_catalog,
+                    )
+                    components["system_prompt"] = refreshed
+                    ctx.system_prompt = _with_task_context(refreshed, _task_context)
+
                 result = await agent.send_message(
                     ctx, user_input, stream_callback=stream_cb
                 )

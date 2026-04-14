@@ -277,6 +277,640 @@ user-invocable: true
     assert file_payload["content"] == "Checklist template"
 
 
+# ── Skill management tool tests ──────────────────────────────────────────────
+
+
+def test_create_skill_creates_bundle_in_user_root(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+
+    catalog = agent_module.SkillCatalog(user_root=user_root, builtin_root=builtin_root)
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "create_skill",
+                {
+                    "skill_id": "my-review",
+                    "name": "My Review",
+                    "description": "Custom review skill",
+                    "instructions": "Review all code carefully.",
+                },
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["skill_id"] == "my-review"
+    assert (user_root / "my-review" / "SKILL.md").exists()
+
+    # Verify the skill is discoverable after creation
+    bundle = catalog.get("my-review")
+    assert bundle is not None
+    assert bundle.name == "My Review"
+    assert bundle.description == "Custom review skill"
+    assert bundle.source == "user"
+    assert bundle.body == "Review all code carefully."
+
+
+def test_create_skill_rejects_duplicate_id(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+
+    _write_skill_bundle(
+        user_root,
+        "existing",
+        "---\nname: Existing\n---\nBody.",
+    )
+
+    catalog = agent_module.SkillCatalog(user_root=user_root, builtin_root=builtin_root)
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "create_skill",
+                {"skill_id": "existing", "name": "Duplicate"},
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert "already exists" in result["error"]
+
+
+def test_create_skill_validates_skill_id(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    # Empty ID
+    result = json.loads(
+        asyncio.run(registry.call("create_skill", {"skill_id": "", "name": "Bad"}))
+    )
+    assert result["ok"] is False
+
+    # ID with spaces
+    result = json.loads(
+        asyncio.run(
+            registry.call("create_skill", {"skill_id": "has space", "name": "Bad"})
+        )
+    )
+    assert result["ok"] is False
+
+    # ID with ..
+    result = json.loads(
+        asyncio.run(
+            registry.call("create_skill", {"skill_id": "../escape", "name": "Bad"})
+        )
+    )
+    assert result["ok"] is False
+
+
+def test_create_skill_with_nested_id(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "builtin"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "create_skill",
+                {
+                    "skill_id": "quality/lint",
+                    "name": "Lint",
+                    "description": "Run linters",
+                    "instructions": "Lint the code.",
+                },
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert (user_root / "quality" / "lint" / "SKILL.md").exists()
+    bundle = catalog.get("quality/lint")
+    assert bundle is not None
+    assert bundle.name == "Lint"
+
+
+def test_update_skill_modifies_user_skill(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+
+    _write_skill_bundle(
+        user_root,
+        "my-tool",
+        "---\nname: Old Name\ndescription: Old desc\n---\nOld body.",
+    )
+
+    catalog = agent_module.SkillCatalog(user_root=user_root, builtin_root=builtin_root)
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "update_skill",
+                {
+                    "skill_id": "my-tool",
+                    "name": "New Name",
+                    "description": "New desc",
+                    "instructions": "New body.",
+                },
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    bundle = catalog.get("my-tool")
+    assert bundle is not None
+    assert bundle.name == "New Name"
+    assert bundle.description == "New desc"
+    assert bundle.body == "New body."
+
+
+def test_update_skill_partial_update_preserves_unset_fields(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        user_root,
+        "partial",
+        "---\nname: Keep Me\ndescription: Also keep\n---\nOriginal body.",
+    )
+
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    # Only update description
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "update_skill",
+                {"skill_id": "partial", "description": "Updated desc only"},
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    bundle = catalog.get("partial")
+    assert bundle.name == "Keep Me"
+    assert bundle.description == "Updated desc only"
+    assert bundle.body == "Original body."
+
+
+def test_update_skill_rejects_builtin(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+
+    _write_skill_bundle(
+        builtin_root,
+        "builtin-only",
+        "---\nname: BuiltIn\n---\nBuilt-in body.",
+    )
+
+    catalog = agent_module.SkillCatalog(user_root=user_root, builtin_root=builtin_root)
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "update_skill",
+                {"skill_id": "builtin-only", "name": "Hacked"},
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert "built-in" in result["error"].lower()
+
+
+def test_delete_skill_removes_user_skill(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        user_root,
+        "to-delete",
+        "---\nname: Doomed\n---\nGoodbye.",
+        {"extra.txt": "extra content"},
+    )
+
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    assert catalog.get("to-delete") is not None
+
+    result = json.loads(
+        asyncio.run(registry.call("delete_skill", {"skill_id": "to-delete"}))
+    )
+
+    assert result["ok"] is True
+    assert not (user_root / "to-delete").exists()
+    assert catalog.get("to-delete") is None
+
+
+def test_delete_skill_rejects_builtin(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+
+    _write_skill_bundle(
+        builtin_root,
+        "protected",
+        "---\nname: Protected\n---\nDo not delete.",
+    )
+
+    catalog = agent_module.SkillCatalog(user_root=user_root, builtin_root=builtin_root)
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(registry.call("delete_skill", {"skill_id": "protected"}))
+    )
+
+    assert result["ok"] is False
+    assert "built-in" in result["error"].lower()
+    assert (builtin_root / "protected" / "SKILL.md").exists()
+
+
+def test_delete_skill_returns_error_for_unknown(tmp_path):
+    import agent as agent_module
+
+    catalog = agent_module.SkillCatalog(
+        user_root=tmp_path / "u", builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(registry.call("delete_skill", {"skill_id": "nonexistent"}))
+    )
+
+    assert result["ok"] is False
+    assert "not found" in result["error"].lower()
+
+
+def test_write_skill_file_creates_supporting_file(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        user_root,
+        "writable",
+        "---\nname: Writable\n---\nBody.",
+    )
+
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_skill_file",
+                {
+                    "skill_name": "writable",
+                    "path": "templates/checklist.md",
+                    "content": "# Checklist\n- [ ] Item 1",
+                },
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    written = (user_root / "writable" / "templates" / "checklist.md").read_text()
+    assert "# Checklist" in written
+
+    # Verify the file shows up in supporting files after reload
+    bundle = catalog.get("writable")
+    assert "templates/checklist.md" in bundle.supporting_files
+
+
+def test_write_skill_file_rejects_builtin_skill(tmp_path):
+    import agent as agent_module
+
+    builtin_root = tmp_path / "builtin-skills"
+    _write_skill_bundle(
+        builtin_root,
+        "locked",
+        "---\nname: Locked\n---\nDo not modify.",
+    )
+
+    catalog = agent_module.SkillCatalog(
+        user_root=tmp_path / "u", builtin_root=builtin_root
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_skill_file",
+                {
+                    "skill_name": "locked",
+                    "path": "hack.txt",
+                    "content": "pwned",
+                },
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert "built-in" in result["error"].lower()
+
+
+def test_write_skill_file_rejects_skill_md_override(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        user_root,
+        "guarded",
+        "---\nname: Guarded\n---\nOriginal.",
+    )
+
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_skill_file",
+                {
+                    "skill_name": "guarded",
+                    "path": "SKILL.md",
+                    "content": "Overwritten!",
+                },
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert "update_skill" in result["error"]
+
+
+def test_write_skill_file_rejects_path_escape(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        user_root,
+        "sandboxed",
+        "---\nname: Sandboxed\n---\nBody.",
+    )
+
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_skill_file",
+                {
+                    "skill_name": "sandboxed",
+                    "path": "../../etc/passwd",
+                    "content": "bad",
+                },
+            )
+        )
+    )
+
+    assert result["ok"] is False
+    assert "escape" in result["error"].lower()
+
+
+# ── Hot-reload tests ─────────────────────────────────────────────────────────
+
+
+def test_consume_dirty_returns_true_after_reload(tmp_path):
+    import agent as agent_module
+
+    catalog = agent_module.SkillCatalog(
+        user_root=tmp_path / "u", builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+
+    # Initial load_all does not set dirty (only reload does)
+    assert catalog.consume_dirty() is False
+
+    # reload() sets dirty
+    catalog.reload()
+    assert catalog.consume_dirty() is True
+    # consume clears the flag
+    assert catalog.consume_dirty() is False
+
+
+def test_create_skill_sets_dirty_flag(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    assert catalog.consume_dirty() is False
+
+    asyncio.run(
+        registry.call(
+            "create_skill",
+            {"skill_id": "hot-test", "name": "Hot Test", "instructions": "Test body."},
+        )
+    )
+
+    # create_skill calls reload() which sets dirty
+    assert catalog.consume_dirty() is True
+    assert catalog.get("hot-test") is not None
+
+
+def test_update_skill_sets_dirty_flag(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(user_root, "mutable", "---\nname: Mutable\n---\nBody.")
+
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    assert catalog.consume_dirty() is False
+
+    asyncio.run(
+        registry.call(
+            "update_skill",
+            {"skill_id": "mutable", "description": "Updated"},
+        )
+    )
+
+    assert catalog.consume_dirty() is True
+
+
+def test_delete_skill_sets_dirty_flag(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(user_root, "doomed", "---\nname: Doomed\n---\nGone.")
+
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    assert catalog.consume_dirty() is False
+
+    asyncio.run(registry.call("delete_skill", {"skill_id": "doomed"}))
+
+    assert catalog.consume_dirty() is True
+    assert catalog.get("doomed") is None
+
+
+def test_hot_reload_updates_summary_lines(tmp_path):
+    """After create_skill, summary_lines reflects the new skill."""
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    # No skills initially
+    assert catalog.summary_lines() == []
+
+    asyncio.run(
+        registry.call(
+            "create_skill",
+            {
+                "skill_id": "fresh",
+                "name": "Fresh",
+                "description": "A freshly created skill",
+            },
+        )
+    )
+
+    # summary_lines should now include the new skill
+    summary = "\n".join(catalog.summary_lines())
+    assert "fresh" in summary
+    assert "A freshly created skill" in summary
+
+
+def test_skill_manager_builtin_skill_is_discovered(tmp_path):
+    """The skill-manager built-in skill should be discovered from the repo's skills/ dir."""
+    import agent as agent_module
+
+    # Use the real builtin_root (the repo's skills/ directory)
+    real_builtin = Path(agent_module.__file__).resolve().parent / "skills"
+    catalog = agent_module.SkillCatalog(
+        user_root=tmp_path / "user-skills", builtin_root=real_builtin
+    )
+    catalog.load_all()
+
+    bundle = catalog.get("skill-manager")
+    assert bundle is not None
+    assert bundle.source == "builtin"
+    assert bundle.name == "Skill Manager"
+    assert (
+        "create" in bundle.description.lower() or "manage" in bundle.description.lower()
+    )
+    assert bundle.user_invocable is True
+    # Should discover bundled scripts as supporting files
+    assert any("scripts/init_skill.py" in f for f in bundle.supporting_files)
+    assert any("scripts/quick_validate.py" in f for f in bundle.supporting_files)
+
+
+def test_build_components_registers_skill_management_tools(monkeypatch, tmp_path):
+    """Verify skill management tools are registered alongside runtime tools."""
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+
+    cfg = _minimal_cfg()
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", user_root)
+    monkeypatch.setattr(agent_module, "BUILTIN_SKILLS_DIR", builtin_root)
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+    registry = components["registry"]
+
+    # All skill management tools should be registered
+    tool_names = registry.list_tools()
+    assert "create_skill" in tool_names
+    assert "update_skill" in tool_names
+    assert "delete_skill" in tool_names
+    assert "write_skill_file" in tool_names
+
+
 def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path):
     import agent as agent_module
 
@@ -873,6 +1507,9 @@ def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
         def list_skills(self):
             return []
 
+        def consume_dirty(self):
+            return False
+
     class _FakeUserToolCatalog:
         def load_into_registry(self, registry):
             raise AssertionError("tool reload should not run")
@@ -932,6 +1569,9 @@ def test_interactive_loop_context_command_uses_dynamic_category_stats(
     class _FakeSkillCatalog:
         def list_skills(self):
             return []
+
+        def consume_dirty(self):
+            return False
 
     class _FakeUserToolCatalog:
         def load_into_registry(self, registry):
@@ -1030,6 +1670,9 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
     class _FakeSkillCatalog:
         def list_skills(self):
             return []
+
+        def consume_dirty(self):
+            return False
 
     class _FakeUserToolCatalog:
         def load_into_registry(self, registry):
@@ -1158,6 +1801,9 @@ def test_interactive_loop_queues_orphan_recovery_in_background(monkeypatch, tmp_
     class _FakeSkillCatalog:
         def list_skills(self):
             return []
+
+        def consume_dirty(self):
+            return False
 
     class _FakeUserToolCatalog:
         def load_into_registry(self, registry):
