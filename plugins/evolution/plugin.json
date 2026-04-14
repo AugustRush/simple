@@ -1,0 +1,5 @@
+{
+  "name": "evolution",
+  "version": "2.0.0",
+  "description": "Self-evolution through behavioral rule learning. Detects user corrections, extracts behavioral rules, and scores sessions for continuous improvement."
+}

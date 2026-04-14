@@ -16,6 +16,7 @@ tests/test_ltm_store.py
 tests/test_memory_benchmark.py
 tests/test_memory_palace_store.py
 tests/test_output_dir.py
+tests/test_plugin_catalog.py
 tests/test_retriever.py
 tests/test_single_file_layout.py
 tests/test_staging.py

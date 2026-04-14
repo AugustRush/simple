@@ -194,7 +194,8 @@ def test_fire_session_start_called(tmp_path):
     catalog = PluginCatalog(builtin_dir=tmp_path)
     catalog.discover_and_load()
     catalog.fire_session_start({})
-    assert catalog._plugins[0].__class__.started is True
+    plugin_obj = catalog._plugins["starter"][0]
+    assert plugin_obj.__class__.started is True
 
 
 def test_fire_turn_end_async(tmp_path):
@@ -216,7 +217,8 @@ def test_fire_turn_end_async(tmp_path):
     catalog.discover_and_load()
     event = TurnEvent(user_input="hi", agent_response="hello", tool_calls=[])
     asyncio.run(catalog.fire_turn_end(event))
-    assert catalog._plugins[0].__class__.last_event is event
+    plugin_obj = catalog._plugins["listener"][0]
+    assert plugin_obj.__class__.last_event is event
 
 
 def test_fire_pre_tool_block(tmp_path):
@@ -271,7 +273,233 @@ def test_fire_session_end_async(tmp_path):
     catalog.discover_and_load()
     event = SessionEvent(messages=[], tools_used=[])
     asyncio.run(catalog.fire_session_end(event))
-    assert catalog._plugins[0].__class__.ended is True
+    plugin_obj = catalog._plugins["ender"][0]
+    assert plugin_obj.__class__.ended is True
+
+
+# ─── Plugin.json, enable/disable, dedup, skill bundling ──────────────────────
+
+
+def test_plugin_json_metadata_is_read(tmp_path):
+    """Plugin.json metadata should override plugin object attributes."""
+    import json
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "beta"
+    _write_plugin(
+        plugin_dir,
+        """
+        def register():
+            class P:
+                name = "beta-code"
+                version = "0.1.0"
+            return P()
+    """,
+    )
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "beta",
+                "version": "2.0.0",
+                "description": "Beta plugin from manifest",
+            }
+        )
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = catalog.discover_and_load()
+    assert "beta" in loaded
+
+    metas = catalog.list_plugins()
+    assert len(metas) == 1
+    assert metas[0].name == "beta"
+    assert metas[0].version == "2.0.0"
+    assert metas[0].description == "Beta plugin from manifest"
+
+
+def test_plugin_disabled_in_config_not_loaded(tmp_path):
+    """Plugins disabled in config should not be loaded."""
+    from agent import PluginCatalog
+
+    _write_plugin(
+        tmp_path / "disabled",
+        """
+        def register():
+            class P:
+                name = "disabled"
+            return P()
+    """,
+    )
+
+    catalog = PluginCatalog(
+        builtin_dir=tmp_path,
+        plugin_config={"disabled": {"enabled": False}},
+    )
+    loaded = catalog.discover_and_load()
+    assert "disabled" not in loaded
+    assert catalog.list_plugins() == []
+
+
+def test_user_plugin_overrides_builtin_same_name(tmp_path):
+    """User plugins should override built-in plugins with the same name."""
+    from agent import PluginCatalog
+
+    builtin_dir = tmp_path / "builtin"
+    user_dir = tmp_path / "user"
+
+    _write_plugin(
+        builtin_dir / "samename",
+        """
+        def register():
+            class P:
+                name = "samename"
+                version = "1.0"
+            return P()
+    """,
+    )
+    _write_plugin(
+        user_dir / "samename",
+        """
+        def register():
+            class P:
+                name = "samename"
+                version = "2.0"
+            return P()
+    """,
+    )
+
+    catalog = PluginCatalog(builtin_dir=builtin_dir, user_dir=user_dir)
+    catalog.discover_and_load()
+
+    metas = catalog.list_plugins()
+    assert len(metas) == 1
+    assert metas[0].version == "2.0"
+    assert metas[0].source == "user"
+
+
+def test_plugin_bundles_skills(tmp_path):
+    """Plugins with skills field in plugin.json should register bundled skills."""
+    import json
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "skill-bundler"
+    _write_plugin(
+        plugin_dir,
+        """
+        def register():
+            class P:
+                name = "skill-bundler"
+            return P()
+    """,
+    )
+    # Create a bundled skill
+    skills_dir = plugin_dir / "skills" / "bundled-review"
+    skills_dir.mkdir(parents=True)
+    (skills_dir / "SKILL.md").write_text(
+        "---\nname: Bundled Review\ndescription: A review skill\n---\nReview the code."
+    )
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({"name": "skill-bundler", "skills": "./skills/"})
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    bundled = catalog.get_bundled_skills()
+    assert len(bundled) == 1
+    assert bundled[0][0] == "skill-bundler"
+    assert bundled[0][1].is_dir()
+
+
+def test_plugin_bundles_mcp_config(tmp_path):
+    """Plugins with mcp_servers in plugin.json should expose bundled MCP configs."""
+    import json
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "mcp-bundler"
+    _write_plugin(
+        plugin_dir,
+        """
+        def register():
+            class P:
+                name = "mcp-bundler"
+            return P()
+    """,
+    )
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "mcp-bundler",
+                "mcp_servers": [
+                    {"name": "test-server", "command": "echo", "args": ["hello"]}
+                ],
+            }
+        )
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    bundled = catalog.get_bundled_mcp()
+    assert len(bundled) == 1
+    assert bundled[0][0] == "mcp-bundler"
+    assert bundled[0][1]["name"] == "test-server"
+
+
+def test_list_plugins_returns_all_loaded(tmp_path):
+    from agent import PluginCatalog
+
+    _write_plugin(
+        tmp_path / "p1",
+        """
+        def register():
+            class P:
+                name = "p1"
+            return P()
+    """,
+    )
+    _write_plugin(
+        tmp_path / "p2",
+        """
+        def register():
+            class P:
+                name = "p2"
+            return P()
+    """,
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    metas = catalog.list_plugins()
+    names = {m.name for m in metas}
+    assert "p1" in names
+    assert "p2" in names
+
+
+def test_auto_creates_user_plugins_dir(tmp_path):
+    from agent import PluginCatalog
+
+    user_dir = tmp_path / "new-user-plugins"
+    assert not user_dir.exists()
+
+    catalog = PluginCatalog(builtin_dir=tmp_path, user_dir=user_dir)
+    catalog.discover_and_load()
+
+    assert user_dir.exists()
+
+
+def test_evolution_plugin_has_plugin_json():
+    """Evolution plugin should have a valid plugin.json."""
+    import json
+    from agent import PLUGINS_DIR
+
+    pj = PLUGINS_DIR / "evolution" / "plugin.json"
+    assert pj.exists()
+    data = json.loads(pj.read_text())
+    assert data["name"] == "evolution"
+    assert "version" in data
+    assert "description" in data
 
 
 # ─── Built-in evolution plugin ────────────────────────────────────────────────
@@ -468,7 +696,9 @@ def test_evolution_plugin_on_turn_end_records_application(tmp_path):
     catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
     catalog.discover_and_load()
     evo_plugin = next(
-        p for p in catalog._plugins if getattr(p, "name", "") == "evolution"
+        p
+        for p, _meta in catalog._plugins.values()
+        if getattr(p, "name", "") == "evolution"
     )
     # Inject a test RuleStore.
     test_store = RuleStore(rules_file=tmp_path / "rules.jsonl")
@@ -500,7 +730,9 @@ def test_evolution_plugin_on_turn_end_records_correction(tmp_path):
     catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
     catalog.discover_and_load()
     evo_plugin = next(
-        p for p in catalog._plugins if getattr(p, "name", "") == "evolution"
+        p
+        for p, _meta in catalog._plugins.values()
+        if getattr(p, "name", "") == "evolution"
     )
     test_store = RuleStore(rules_file=tmp_path / "rules.jsonl")
     rule = test_store.add_rule("Test rule", [])
@@ -531,7 +763,9 @@ def test_evolution_plugin_compose_returns_rules(tmp_path):
     catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
     catalog.discover_and_load()
     evo_plugin = next(
-        p for p in catalog._plugins if getattr(p, "name", "") == "evolution"
+        p
+        for p, _meta in catalog._plugins.values()
+        if getattr(p, "name", "") == "evolution"
     )
     test_store = RuleStore(rules_file=tmp_path / "rules.jsonl")
     test_store.add_rule("Always be concise.", [])
@@ -549,7 +783,9 @@ def test_evolution_plugin_engine_none_is_safe():
     catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
     catalog.discover_and_load()
     evo_plugin = next(
-        p for p in catalog._plugins if getattr(p, "name", "") == "evolution"
+        p
+        for p, _meta in catalog._plugins.values()
+        if getattr(p, "name", "") == "evolution"
     )
     evo_plugin._engine = None
 

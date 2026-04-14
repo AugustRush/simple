@@ -103,6 +103,11 @@
     "enabled": true
   },
 
+  "plugins": {
+    "_readme": "Per-plugin enable/disable. Use the plugin name as key. Set enabled=false to disable a plugin without removing it.",
+    "_example_disabled": { "enabled": false }
+  },
+
   "system_prompt_file": null,
   "_system_prompt_file_readme": "null = use the built-in prompt. Set to an absolute path to load a custom system prompt from a .md or .txt file, e.g. '/Users/you/.agent/my_prompt.md'.",
 
