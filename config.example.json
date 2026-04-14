@@ -124,5 +124,32 @@
   "_tavily_api_key_readme": "Optional. Used by the built-in tavily_search tool. Can be a literal key or '$ENV_VAR'. Leave empty or null to disable Tavily-backed search.",
 
   "output_dir": null,
-  "_output_dir_readme": "null = use default ~/.agent/output. Set to an absolute path to override. Supports ~ and $ENV expansion. All tool/MCP/skill outputs (screenshots, exports, temp files) go here. Subdirectories are created on demand."
+  "_output_dir_readme": "null = use default ~/.agent/output. Set to an absolute path to override. Supports ~ and $ENV expansion. All tool/MCP/skill outputs (screenshots, exports, temp files) go here. Subdirectories are created on demand.",
+
+  "channels": {
+    "_readme": "External channel configuration. Only one channel may be active at a time. If no channel is enabled the CLI is used by default.",
+    "feishu": {
+      "_readme": [
+        "Feishu/Lark bot via WebSocket long connection (no public IP required).",
+        "Requires: pip install lark-oapi",
+        "1. Create a Feishu app at https://open.feishu.cn/app",
+        "2. Enable 'Bot' capability and subscribe to 'im.message.receive_v1' event",
+        "3. Copy App ID and App Secret below",
+        "app_id / app_secret  : from Feishu Open Platform > Credentials & Basic Info",
+        "encrypt_key          : optional; set if 'Encrypt Key' is enabled in event subscription",
+        "verification_token   : optional; set if 'Verification Token' is enabled",
+        "allow_from           : list of open_ids allowed to use the bot; empty = allow all",
+        "react_emoji          : emoji reaction added when a message is received (THUMBSUP, OK, EYES, DONE …)",
+        "group_policy         : 'mention' = only respond when @mentioned; 'open' = respond to all group messages"
+      ],
+      "enabled": false,
+      "app_id": "$FEISHU_APP_ID",
+      "app_secret": "$FEISHU_APP_SECRET",
+      "encrypt_key": "",
+      "verification_token": "",
+      "allow_from": [],
+      "react_emoji": "THUMBSUP",
+      "group_policy": "mention"
+    }
+  }
 }

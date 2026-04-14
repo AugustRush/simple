@@ -6903,17 +6903,216 @@ class ChannelRunner:
             raise
 
     async def _run_channel(self, channel: Channel) -> None:
-        """Run a single channel inside _interactive_loop."""
-        # For now, the CLI channel drives _interactive_loop directly
-        # (which manages its own input loop).  Future non-CLI channels will
-        # call channel.start(handler) with a stateless handler instead.
+        """Run a single channel to completion.
+
+        CLI channel: drives ``_interactive_loop`` directly (which manages its
+        own input loop, session state, memory worker, and plugin lifecycle).
+
+        All other channels (Feishu, Telegram, …): call
+        ``channel.start(handler)`` where *handler* is a stateful per-message
+        function that routes each incoming message through the agent and sends
+        the response back via the channel's ``OutputSink``.
+        """
         if isinstance(channel, CliChannel):
             await _interactive_loop(self._components, self._cfg)
-        else:
-            raise NotImplementedError(
-                f"ChannelRunner does not yet support {type(channel).__name__}. "
-                "Implement a per-message AgentCore handler and wire it here."
+            return
+
+        # ── Generic channel path ─────────────────────────────────────────────
+        components = self._components
+        cfg = self._cfg
+
+        # Start background memory worker (mirrors _interactive_loop behaviour)
+        ctx_mgr: Optional[ContextManager] = components.get("context_manager")
+        memory_worker = (
+            BackgroundMemoryWorker(
+                ctx_mgr,
+                components["client"],
+                components["model"],
+                components["agent"].api_format,
+                client_factory=lambda: ModelClientFactory.from_config(
+                    cfg, announce=False
+                )[0],
             )
+            if ctx_mgr
+            else None
+        )
+        if memory_worker:
+            memory_worker.start()
+
+        # Notify plugins that a session has started
+        plugin_catalog: Optional[PluginCatalog] = components.get("plugin_catalog")
+        if plugin_catalog:
+            plugin_catalog.fire_session_start(components)
+
+        # Per-chat session state (AgentContext + turn counter)
+        sessions: dict[str, dict] = {}
+
+        try:
+            await channel.start(self._make_message_handler(sessions))
+        finally:
+            if memory_worker:
+                memory_worker.stop()
+                await memory_worker.wait()
+            if plugin_catalog:
+                try:
+                    # Aggregate all sessions for the session-end event
+                    all_messages: list[dict] = []
+                    all_tools: list[str] = []
+                    total_turns = 0
+                    for s in sessions.values():
+                        all_messages.extend(s.get("ctx", AgentContext("")).messages)
+                        all_tools.extend(s.get("tools_used", []))
+                        total_turns += s.get("turn_count", 0)
+                    if total_turns > 0:
+                        await plugin_catalog.fire_session_end(
+                            SessionEvent(
+                                messages=all_messages,
+                                tools_used=all_tools,
+                                timestamp=datetime.now(timezone.utc).isoformat(),
+                                turn_count=total_turns,
+                            )
+                        )
+                except Exception as exc:
+                    CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
+
+    def _make_message_handler(
+        self, sessions: dict
+    ) -> Callable[["IncomingMessage", OutputSink], Any]:
+        """Return an async per-message handler for non-CLI channels.
+
+        Session state (``AgentContext``, tool history, turn counter) is keyed
+        by ``chat_id`` so concurrent conversations from different users never
+        share context.  Messages from the *same* chat are serialised by a per-
+        chat ``asyncio.Lock`` inside ``FeishuChannel`` (or equivalent), so
+        this handler does not need internal locking.
+        """
+        components = self._components
+
+        async def _handle(msg: IncomingMessage, sink: OutputSink) -> bool:
+            session_id = msg.metadata.get("chat_id") or msg.session_id
+            agent: BaseAgent = components["agent"]
+            skill_catalog: SkillCatalog = components["skill_catalog"]
+            plugin_catalog: Optional[PluginCatalog] = components.get("plugin_catalog")
+            ctx_mgr: Optional[ContextManager] = components.get("context_manager")
+
+            # First message from this chat: initialise session state
+            if session_id not in sessions:
+                sessions[session_id] = {
+                    "ctx": AgentContext(system_prompt=components["system_prompt"]),
+                    "tools_used": [],
+                    "turn_count": 0,
+                    "task_context": "",
+                }
+            state = sessions[session_id]
+            ctx: AgentContext = state["ctx"]
+            ctx.metadata["skill_catalog"] = skill_catalog
+
+            # Record the first message as task context for post-compaction
+            # system-prompt restoration (mirrors _interactive_loop behaviour)
+            if not state["task_context"]:
+                state["task_context"] = msg.text[:300]
+
+            if ctx_mgr:
+                ctx_mgr.mark_activity()
+
+            token = _active_sink.set(sink)
+            try:
+                result = await agent.send_message(
+                    ctx, msg.text, stream_callback=sink.sync_stream_cb
+                )
+                sink.on_turn_complete(result.content or "", result.tool_calls_made)
+                # Await all async sends queued by FeishuOutputSink (or similar)
+                if hasattr(sink, "drain"):
+                    await sink.drain()
+
+                if result.error:
+                    sink.on_error(result.error)
+                    if hasattr(sink, "drain"):
+                        await sink.drain()
+
+                # Accumulate session stats
+                state["tools_used"].extend(result.tool_calls_made)
+                state["turn_count"] += 1
+
+                # Plugin turn-end hook
+                if plugin_catalog:
+                    await plugin_catalog.fire_turn_end(
+                        TurnEvent(
+                            user_input=msg.text,
+                            agent_response=result.content or "",
+                            tool_calls=result.tool_calls_made,
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            turn_index=state["turn_count"],
+                        )
+                    )
+
+                # Stage for LTM consolidation
+                if ctx_mgr:
+                    ctx_mgr.staging.append("user", msg.text)
+                    if result.content:
+                        ctx_mgr.staging.append("assistant", result.content)
+                    if ctx_mgr.should_enqueue_consolidation():
+                        ctx_mgr.enqueue_consolidation("staged_turns")
+
+                # Compact working memory when it grows too large
+                if ctx_mgr and ctx_mgr.should_compact_messages(
+                    ctx.messages, agent.max_tokens
+                ):
+                    ctx.messages = ctx_mgr.compact_messages(ctx.messages)
+                    ctx.system_prompt = _with_task_context(
+                        components["system_prompt"], state["task_context"]
+                    )
+                    if ctx_mgr.staging.count() >= ctx_mgr.min_messages:
+                        ctx_mgr.enqueue_consolidation("compact_triggered")
+
+            except Exception as exc:
+                sink.on_error(str(exc))
+                if hasattr(sink, "drain"):
+                    await sink.drain()
+            finally:
+                _active_sink.reset(token)
+
+            return True  # keep channel running
+
+        return _handle
+
+
+def _build_channels(cfg: dict) -> list[Channel]:
+    """Build the channel list from ``cfg["channels"]``.
+
+    If ``channels.feishu.enabled`` is ``true`` the Feishu channel is started
+    exclusively (no CLI).  When no external channel is configured the CLI
+    channel is used as the default.
+
+    Adding a new channel type: install its package, subclass ``Channel`` in
+    ``channels/<name>.py``, and add an ``elif`` branch here.
+    """
+    channels: list[Channel] = []
+
+    feishu_cfg = cfg.get("channels", {}).get("feishu", {})
+    if feishu_cfg.get("enabled"):
+        try:
+            from channels.feishu import FeishuChannel, FeishuConfig  # noqa: PLC0415
+
+            known_fields = FeishuConfig.__dataclass_fields__
+            filtered = {k: v for k, v in feishu_cfg.items() if k in known_fields}
+            channels.append(FeishuChannel(FeishuConfig(**filtered)))
+            CONSOLE.print("[dim]Feishu channel enabled[/dim]")
+        except ImportError:
+            CONSOLE.print(
+                "[yellow]Warning: lark-oapi not installed — "
+                "Feishu channel disabled. Run: pip install lark-oapi[/yellow]"
+            )
+        except Exception as exc:
+            CONSOLE.print(
+                f"[yellow]Warning: Feishu channel init failed: {exc}[/yellow]"
+            )
+
+    # Fall back to CLI when no external channel was configured or all failed
+    if not channels:
+        channels.append(CliChannel(CONSOLE))
+
+    return channels
 
 
 async def _interactive_loop(components: dict, cfg: dict):
@@ -7419,7 +7618,9 @@ def main_callback(ctx: typer.Context):
                 CONSOLE.print(f"[red]Error: {exc}[/red]")
                 raise typer.Exit(1)
             try:
-                await _interactive_loop(components, cfg)
+                channels = _build_channels(cfg)
+                runner = ChannelRunner(channels, components, cfg)
+                await runner.run()
             finally:
                 await _close_components(components)
 
