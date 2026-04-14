@@ -16,13 +16,19 @@ dependencies = [
   "mcp",
 ]
 
+[project.optional-dependencies]
+# pip install simple[feishu]  /  uv sync --extra feishu
+feishu = ["lark-oapi"]
+
 [project.scripts]
 simple = "agent:app"
 
 [dependency-groups]
 dev = [
   "pytest",
+  "lark-oapi",   # needed by tests/test_feishu_channel.py
 ]
 
 [tool.setuptools]
 py-modules = ["agent"]
+packages   = ["channels"]

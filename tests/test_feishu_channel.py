@@ -1,5 +1,5 @@
 """Tests for channels/feishu.py — FeishuOutputSink, FeishuConfig, helpers,
-and the _build_channels factory function in agent.py.
+and the _build_gateway_channels factory function in agent.py.
 
 lark-oapi is available in the test environment (verified at collection time).
 All Feishu API calls are patched with unittest.mock so no real credentials
@@ -23,7 +23,7 @@ from channels.feishu import (
     _clean_at_mentions,
     _extract_post_content,
 )
-from agent import _build_channels, _active_sink
+from agent import _build_gateway_channels, _active_sink
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -503,27 +503,23 @@ def test_feishu_channel_start_raises_missing_credentials():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _build_channels factory
+# _build_gateway_channels factory
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_build_channels_default_is_cli():
-    from agent import CliChannel
-
-    channels = _build_channels({})
-    assert len(channels) == 1
-    assert isinstance(channels[0], CliChannel)
+def test_build_gateway_channels_empty_config_returns_no_channels():
+    """No channels configured → empty list (gateway should warn and exit)."""
+    channels = _build_gateway_channels({})
+    assert channels == []
 
 
-def test_build_channels_feishu_disabled():
-    from agent import CliChannel
-
+def test_build_gateway_channels_feishu_disabled():
     cfg = {"channels": {"feishu": {"enabled": False}}}
-    channels = _build_channels(cfg)
-    assert isinstance(channels[0], CliChannel)
+    channels = _build_gateway_channels(cfg)
+    assert channels == []
 
 
-def test_build_channels_feishu_enabled():
+def test_build_gateway_channels_feishu_enabled():
     cfg = {
         "channels": {
             "feishu": {
@@ -533,13 +529,13 @@ def test_build_channels_feishu_enabled():
             }
         }
     }
-    channels = _build_channels(cfg)
+    channels = _build_gateway_channels(cfg)
     assert len(channels) == 1
     assert isinstance(channels[0], FeishuChannel)
     assert channels[0]._config.app_id == "cli_test"
 
 
-def test_build_channels_feishu_extra_keys_ignored():
+def test_build_gateway_channels_feishu_extra_keys_ignored():
     """Unknown keys in feishu config must not cause an error."""
     cfg = {
         "channels": {
@@ -551,14 +547,12 @@ def test_build_channels_feishu_extra_keys_ignored():
             }
         }
     }
-    channels = _build_channels(cfg)
+    channels = _build_gateway_channels(cfg)
     assert isinstance(channels[0], FeishuChannel)
 
 
-def test_build_channels_falls_back_to_cli_on_import_error():
-    """If FeishuChannel import fails, _build_channels must fall back to CLI."""
-    from agent import CliChannel
-
+def test_build_gateway_channels_falls_back_to_empty_on_import_error():
+    """If FeishuChannel import fails, returns empty list (no CLI fallback)."""
     cfg = {
         "channels": {
             "feishu": {
@@ -568,18 +562,14 @@ def test_build_channels_falls_back_to_cli_on_import_error():
             }
         }
     }
-    # Patch the import inside _build_channels by temporarily hiding channels.feishu
     import sys
-    import channels.feishu as _feishu_mod  # ensure it's loaded first
+    import channels.feishu as _feishu_mod  # ensure loaded
 
     saved = sys.modules.pop("channels.feishu")
     try:
-        # With channels.feishu removed from sys.modules and the import guarded
-        # by try/except ImportError, _build_channels must return CliChannel.
-        # We also need to block re-importing by marking it as None.
         sys.modules["channels.feishu"] = None  # type: ignore[assignment]
-        channels = _build_channels(cfg)
-        assert isinstance(channels[0], CliChannel)
+        channels = _build_gateway_channels(cfg)
+        assert channels == []  # no fallback to CLI
     finally:
         sys.modules["channels.feishu"] = saved
 
@@ -590,10 +580,3 @@ def _selective_import_error(name, *args, **kwargs):
     if "channels.feishu" in name:
         raise ImportError("mocked import error")
     return builtins.__import__(name, *args, **kwargs)
-
-
-def _build_channels_fallback(cfg):
-    """Used in the fallback test only."""
-    from agent import CliChannel, CONSOLE
-
-    return [CliChannel(CONSOLE)]

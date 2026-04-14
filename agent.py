@@ -7077,12 +7077,11 @@ class ChannelRunner:
         return _handle
 
 
-def _build_channels(cfg: dict) -> list[Channel]:
-    """Build the channel list from ``cfg["channels"]``.
+def _build_gateway_channels(cfg: dict) -> list[Channel]:
+    """Build the list of non-CLI channels for ``simple gateway``.
 
-    If ``channels.feishu.enabled`` is ``true`` the Feishu channel is started
-    exclusively (no CLI).  When no external channel is configured the CLI
-    channel is used as the default.
+    Returns an empty list when no channel is enabled so the caller can print
+    a helpful message instead of silently starting nothing.
 
     Adding a new channel type: install its package, subclass ``Channel`` in
     ``channels/<name>.py``, and add an ``elif`` branch here.
@@ -7100,17 +7099,10 @@ def _build_channels(cfg: dict) -> list[Channel]:
             CONSOLE.print("[dim]Feishu channel enabled[/dim]")
         except ImportError:
             CONSOLE.print(
-                "[yellow]Warning: lark-oapi not installed — "
-                "Feishu channel disabled. Run: pip install lark-oapi[/yellow]"
+                "[red]lark-oapi not installed. Run: uv sync --extra feishu[/red]"
             )
         except Exception as exc:
-            CONSOLE.print(
-                f"[yellow]Warning: Feishu channel init failed: {exc}[/yellow]"
-            )
-
-    # Fall back to CLI when no external channel was configured or all failed
-    if not channels:
-        channels.append(CliChannel(CONSOLE))
+            CONSOLE.print(f"[red]Feishu channel init failed: {exc}[/red]")
 
     return channels
 
@@ -7618,13 +7610,67 @@ def main_callback(ctx: typer.Context):
                 CONSOLE.print(f"[red]Error: {exc}[/red]")
                 raise typer.Exit(1)
             try:
-                channels = _build_channels(cfg)
-                runner = ChannelRunner(channels, components, cfg)
-                await runner.run()
+                await _interactive_loop(components, cfg)
             finally:
                 await _close_components(components)
 
         asyncio.run(_run())
+
+
+@app.command()
+def gateway():
+    """Start all configured external channels (Feishu, etc.).
+
+    Reads channel configuration from ``~/.agent/config.json`` under the
+    ``channels`` key.  Runs until interrupted (Ctrl-C) or all channels
+    disconnect.
+
+    Example config for Feishu::
+
+        {
+          "channels": {
+            "feishu": {
+              "enabled": true,
+              "app_id": "cli_xxxx",
+              "app_secret": "xxxx"
+            }
+          }
+        }
+
+    Install Feishu dependency::
+
+        uv sync --extra feishu
+    """
+    cfg, first_run = load_config()
+    if first_run:
+        if not _first_run_setup():
+            raise typer.Exit(0)
+        cfg, _ = load_config()
+
+    async def _run():
+        try:
+            components = await _build_components_async(cfg)
+        except RuntimeError as exc:
+            CONSOLE.print(f"[red]Error: {exc}[/red]")
+            raise typer.Exit(1)
+        try:
+            channels = _build_gateway_channels(cfg)
+            if not channels:
+                CONSOLE.print(
+                    "[yellow]No channels configured or none could be initialised.\n"
+                    "Add channels.feishu.enabled=true to ~/.agent/config.json[/yellow]"
+                )
+                return
+            CONSOLE.print(
+                f"[dim]Gateway starting {len(channels)} channel(s). "
+                "Press Ctrl-C to stop.[/dim]"
+            )
+            runner = ChannelRunner(channels, components, cfg)
+            await runner.run()
+        finally:
+            await _close_components(components)
+
+    asyncio.run(_run())
 
 
 @app.command()
