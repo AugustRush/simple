@@ -1210,6 +1210,54 @@ def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
     assert payload["content"] == "partial output"
 
 
+def test_spawn_agent_reports_events_to_active_sink(monkeypatch):
+    import agent as agent_module
+
+    class _Sink:
+        def __init__(self):
+            self.events = []
+
+        def on_subagent_event(self, event):
+            self.events.append(event)
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        return agent_module.AgentResult(
+            agent_id="sub",
+            content="done",
+            tool_calls_made=["bash"],
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    sink = _Sink()
+    token = agent_module._active_sink.set(sink)
+    try:
+        payload = json.loads(
+            asyncio.run(
+                registry.call(
+                    "spawn_agent",
+                    {"role": "researcher", "task": "inspect code"},
+                )
+            )
+        )
+    finally:
+        agent_module._active_sink.reset(token)
+
+    assert payload["ok"] is True
+    assert [event.kind for event in sink.events] == [
+        "agent_started",
+        "agent_finished",
+    ]
+    assert sink.events[0].role == "researcher"
+    assert sink.events[1].message
+
+
 def test_spawn_agent_enforces_timeout(monkeypatch):
     import agent as agent_module
 
@@ -1309,6 +1357,77 @@ def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch
     ]
     assert len(tool_messages) == 2
     assert all("max_parallel_agents" not in msg["content"] for msg in tool_messages)
+
+
+def test_send_message_emits_spawn_batch_events(monkeypatch):
+    import agent as agent_module
+
+    class _Sink:
+        def __init__(self):
+            self.events = []
+
+        def on_subagent_event(self, event):
+            self.events.append(event)
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.max_parallel_agents = 2
+
+    spawn_tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "researcher", "task": "first"}),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-2",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "critic", "task": "second"}),
+            ),
+        ),
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls", agent_module._OAIMsg("", spawn_tool_calls)
+                    )
+                ]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_call(tool_name, tool_input):
+        await asyncio.sleep(0)
+        return json.dumps({"ok": True, "role": tool_input["role"]})
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    sink = _Sink()
+    token = agent_module._active_sink.set(sink)
+    try:
+        ctx = agent_module.AgentContext(system_prompt="system")
+        result = asyncio.run(agent.send_message(ctx, "run parallel agents"))
+    finally:
+        agent_module._active_sink.reset(token)
+
+    assert result.error is None
+    kinds = [event.kind for event in sink.events]
+    assert "batch_started" in kinds
+    assert "batch_finished" in kinds
 
 
 def test_send_message_batches_excess_parallel_spawn_calls(monkeypatch):

@@ -9,6 +9,8 @@ Requires-Dist: openai
 Requires-Dist: typer
 Requires-Dist: rich
 Requires-Dist: mcp
+Provides-Extra: feishu
+Requires-Dist: lark-oapi; extra == "feishu"
 
 # Personal Agent
 
@@ -19,7 +21,9 @@ Single-file personal AI agent with:
 - tool calling for shell, files, memory, web access, and sub-agents
 - fixed-loci memory palace backed by SQLite
 - staged conversation buffering, background consolidation, and orphan-session recovery
-- skills, MCP tool ingestion, user tool plugins, and prompt-evolution utilities
+- skills system with hot-reload, built-in skill-manager, and progressive-disclosure design
+- plugin system with `plugin.json` manifests, skill/MCP bundling, per-plugin enable/disable, and user-override semantics
+- MCP tool ingestion, user tool plugins, and prompt-evolution utilities
 
 ## Requirements
 
@@ -27,7 +31,7 @@ Single-file personal AI agent with:
 - `uv`
 - At least one configured model provider
 
-Supported provider patterns in the current config/runtime:
+Supported providers:
 
 - `anthropic`
 - `openai`
@@ -38,46 +42,44 @@ Supported provider patterns in the current config/runtime:
 
 ## Install
 
-Install runtime and development dependencies:
-
 ```bash
 uv sync --group dev
 ```
 
-The current project dependencies are:
+Dependencies:
 
 - `anthropic`
 - `openai`
 - `typer`
 - `rich`
 - `mcp`
-- `pytest` in the `dev` dependency group
+- `pytest` (dev group)
 
 ## Configuration
 
 The agent reads config from `~/.agent/config.json`.
 
-You can either let first run scaffold the file, or copy the example manually:
+Let first run scaffold it interactively, or copy the example manually:
 
 ```bash
 mkdir -p ~/.agent
 cp config.example.json ~/.agent/config.json
 ```
 
-Key config areas in the current project:
+Key config sections:
 
-- `active_provider`
-- `providers.<name>.api_format`
-- `providers.<name>.api_key`
-- `providers.<name>.base_url`
-- `providers.<name>.default_model`
-- `providers.<name>.max_tokens`
-- `context.storage`
-- `context.consolidation`
-- `mcp_servers`
-- `tavily_api_key`
-- `output_dir`
-- `system_prompt_file`
+| Section | Purpose |
+|---|---|
+| `active_provider` | Which provider to use |
+| `providers.<name>.*` | API key, format, base URL, model list, max tokens |
+| `context.storage` | LTM category cap, decay factor |
+| `context.consolidation` | Token ratio, keep-last-N, idle seconds, min messages |
+| `mcp_servers` | MCP server definitions (name, command, args) |
+| `plugins` | Per-plugin enable/disable (`{"evolution": {"enabled": false}}`) |
+| `evolution` | Enable/disable session scoring and rule learning |
+| `tavily_api_key` | Optional Tavily search key |
+| `output_dir` | Override default `~/.agent/output` |
+| `system_prompt_file` | Load a custom system prompt from a `.md` or `.txt` file |
 
 `config.example.json` shows the full shape used by the current runtime.
 
@@ -95,7 +97,7 @@ Single-turn chat:
 uv run simple chat "Summarize this repository"
 ```
 
-Read-only config commands:
+Config commands:
 
 ```bash
 uv run simple config list
@@ -121,7 +123,7 @@ uv run simple memory search "preferences"
 uv run simple memory tidy
 ```
 
-Install the CLI as a tool if you want `simple` directly on your `PATH`:
+Install as a tool to get `simple` directly on `PATH`:
 
 ```bash
 uv tool install --editable .
@@ -129,129 +131,242 @@ uv tool install --editable .
 
 ## Interactive Commands
 
-In interactive mode, the current runtime exposes these slash commands:
+| Command | Description |
+|---|---|
+| `/memory` | Browse and manage the memory palace |
+| `/context` | Show context manager statistics |
+| `/evolve` | Rewrite system prompt from session history |
+| `/generate-tool <description>` | Generate and hot-load a new tool |
+| `/tools` | List all registered tools |
+| `/skills` | List available skills |
+| `/plugins` | List loaded plugins and their sources |
+| `/model [name]` | Show current model or switch to a different one |
+| `/ralph <goal>` | Launch an autonomous multi-iteration task loop |
+| `/quit` | End the session |
 
-- `/memory`
-- `/context`
-- `/evolve`
-- `/generate-tool <description>`
-- `/tools`
-- `/model [name]`
-- `/ralph <goal>`
-- `/quit`
+Invoke a skill explicitly with a slash prefix matching its ID:
 
-There is also a `/skills` command in the current CLI implementation.
+```
+/<skill-id> <request>
+```
 
 ## Runtime Tools
 
-The built-in runtime currently registers tools in these groups:
+Built-in tools registered at startup:
 
-- Time: `current_time`
-- Shell: `shell`
-- Files: `read_file`, `write_file`, `list_files`
-- Memory palace: `memory_write`, `memory_read`, `memory_search`, `memory_index`
-- Context retrieval: `context_retrieve`
-- Web: `web_search`, `web_fetch`, `tavily_search`
-- Output cleanup: `clean_output` when an output directory is configured
-- Multi-agent orchestration: `spawn_agent`
+| Group | Tools |
+|---|---|
+| Time | `current_time` |
+| Shell | `shell` |
+| Files | `read_file`, `write_file`, `list_files` |
+| Memory palace | `memory_write`, `memory_read`, `memory_search`, `memory_index` |
+| Context retrieval | `context_retrieve` |
+| Web | `web_search`, `web_fetch`, `tavily_search` |
+| Output cleanup | `clean_output` (when output dir is configured) |
+| Multi-agent orchestration | `spawn_agent` |
+| Skill runtime | `activate_skill`, `list_skill_files`, `read_skill_file` |
+| Skill management | `create_skill`, `update_skill`, `delete_skill`, `write_skill_file` |
 
-The runtime may also add:
+Also registered at runtime:
 
-- skill runtime helpers such as `activate_skill`, `list_skill_files`, and `read_skill_file`
-- MCP tools from configured `mcp_servers`
-- user tools loaded from `~/.agent/tools`
-- auto-generated tools created from `/generate-tool`
+- MCP tools from configured `mcp_servers` and plugin-bundled MCP servers
+- User tools loaded from `~/.agent/tools`
+- Auto-generated tools created via `/generate-tool`
 
-Current built-in behavior guarantees:
+Behaviour guarantees:
 
 - file tools are bounded to the current workspace root
 - tool payloads are structured JSON where possible
 - shell calls are timeout-bounded
 - sub-agents inherit the parent context manager but do not recursively receive `spawn_agent`
 
+## Skills
+
+Skills are instruction bundles that extend the agent with specialized workflows. Each skill is a directory containing `SKILL.md` (required) and optional supporting files.
+
+### Discovery order
+
+1. Built-in skills: `<repo>/skills/**/SKILL.md`
+2. Plugin-bundled skills: loaded when a plugin's `plugin.json` declares a `"skills"` path
+3. User skills: `~/.agent/skills/**/SKILL.md`
+
+User skills with the same ID override built-in or plugin-bundled skills.
+
+### SKILL.md format
+
+```markdown
+---
+name: My Skill
+description: What this skill does and when to use it (used for triggering)
+user-invocable: true
+disable-model-invocation: false
+---
+
+Instructions for the agent when this skill is activated.
+```
+
+### Resource directories
+
+| Directory | Purpose | Loaded into context |
+|---|---|---|
+| `scripts/` | Executable code for deterministic operations | Can execute without reading |
+| `references/` | Documentation, schemas, API docs | On demand |
+| `assets/` | Templates, images, boilerplate | Not loaded; used in output |
+
+### Built-in skills
+
+| Skill | Description |
+|---|---|
+| `skill-manager` | Create, update, delete, and manage user skill bundles in the current session |
+
+### Hot-reload
+
+After `create_skill`, `update_skill`, `delete_skill`, or `write_skill_file`, the catalog reloads automatically. The interactive loop detects the dirty flag before the next turn and recomposes the system prompt so the model sees the updated skill list immediately—no restart required.
+
+### Managing skills at runtime
+
+The `skill-manager` built-in skill exposes four tools:
+
+- **`create_skill`** — create a new skill bundle under `~/.agent/skills/`
+- **`update_skill`** — update metadata or instructions of an existing user skill
+- **`delete_skill`** — remove a user skill bundle
+- **`write_skill_file`** — write or update a supporting file inside a skill bundle
+
+The skill-manager bundle also includes `scripts/init_skill.py` and `scripts/quick_validate.py` for scaffolding and validating skill directories from the shell.
+
+## Plugins
+
+Plugins extend the agent with lifecycle hooks, system prompt contributions, and slash commands. Each plugin is a directory under `plugins/` (built-in) or `~/.agent/plugins/` (user).
+
+### Plugin structure
+
+```
+my-plugin/
+├── plugin.json          # Structured manifest (optional but recommended)
+├── __init__.py          # register() entry point (required)
+├── skills/              # Bundled skills (declared in plugin.json)
+└── .mcp.json            # Bundled MCP servers (or inline in plugin.json)
+```
+
+### plugin.json
+
+```json
+{
+  "name": "my-plugin",
+  "version": "1.0.0",
+  "description": "What this plugin does",
+  "skills": "./skills/",
+  "mcp_servers": [
+    {"name": "my-server", "command": "npx", "args": ["my-mcp-server"]}
+  ]
+}
+```
+
+If `plugin.json` is absent, the runtime falls back to `name`/`version` attributes on the plugin object.
+
+### Plugin interface (duck-typed)
+
+A plugin object can implement any subset of:
+
+| Method | When called |
+|---|---|
+| `on_session_start(components)` | Once before the interactive loop |
+| `on_turn_end(event: TurnEvent) -> HookResult` | After each assistant turn |
+| `on_session_end(event: SessionEvent)` | When the session ends |
+| `on_pre_tool(event: PreToolEvent) -> HookResult` | Before each tool call (returning `action="block"` prevents execution) |
+| `on_post_tool(event: PostToolEvent) -> HookResult` | After each tool call |
+| `compose_system_prompt(current: str) -> str` | Return a suffix to append to the composed system prompt |
+| `register_slash_commands() -> dict[str, handler]` | Expose slash commands to the interactive loop |
+
+### Built-in plugins
+
+| Plugin | Description |
+|---|---|
+| `evolution` | Detects user corrections, extracts behavioral rules, and scores sessions for continuous improvement |
+
+### User plugins
+
+Place a plugin directory under `~/.agent/plugins/`. User plugins with the same name as a built-in plugin override the built-in.
+
+### Enable / disable
+
+In `~/.agent/config.json`:
+
+```json
+{
+  "plugins": {
+    "evolution": {"enabled": false}
+  }
+}
+```
+
+## MCP
+
+MCP servers are configured in two ways:
+
+1. **Config-level** — under `mcp_servers` in `~/.agent/config.json`
+2. **Plugin-bundled** — via `mcp_servers` in a plugin's `plugin.json`
+
+Connected MCP tools are injected into the runtime tool registry and appear in the composed system prompt alongside built-in tools.
+
 ## Memory And Context Architecture
 
-The current context system has four layers:
+The context system has four layers:
 
-1. `Working memory`
-   Active `ctx.messages` kept in RAM for the current interaction loop.
-
-2. `Staging`
-   Raw user/assistant turns are appended to per-session JSONL buffers in `~/.agent/context/_staging/`.
-
-3. `Long-term memory`
-   Structured memories are stored in `~/.agent/context/palace.db`, with JSON snapshots in `~/.agent/context/` and markdown projections in `~/.agent/memory/`.
-
-4. `Memory palace projection`
-   Human-readable markdown views are written per locus/entity for inspection and manual edits.
+1. **Working memory** — active `ctx.messages` kept in RAM for the current interaction loop
+2. **Staging** — raw user/assistant turns appended to per-session JSONL buffers in `~/.agent/context/_staging/`
+3. **Long-term memory** — structured memories stored in `~/.agent/context/palace.db`, with JSON snapshots and markdown projections in `~/.agent/memory/`
+4. **Memory palace projection** — human-readable markdown views written per locus for inspection and manual edits
 
 Fixed palace loci:
 
-- `identity`
-- `projects`
-- `people`
-- `concepts`
-- `episodes`
-- `tasks`
-- `procedures`
-- `archive`
+- `identity`, `projects`, `people`, `concepts`, `episodes`, `tasks`, `procedures`, `archive`
 
-Legacy alias:
-
-- `knowledge` -> `concepts`
+Legacy alias: `knowledge` → `concepts`
 
 ### Consolidation
 
-The current consolidation pipeline is:
+- Stage raw turns per session
+- Queue background jobs when staged volume or idle time warrants it
+- Recover orphaned staging files from interrupted sessions on next startup
+- Summarize the session into `episodes`
+- Extract durable memories into fixed loci
+- Apply retention/decay policies
+- Compact working memory while preserving task context
 
-- stage raw turns per session
-- queue background jobs when staged volume or idle time warrants it
-- recover orphaned staging files from interrupted sessions on next startup
-- summarize the session into `episodes`
-- extract durable memories into fixed loci
-- apply retention/decay policies
-- compact working memory while preserving task context
-
-Consolidation is currently bounded and chunked: long staged conversations are split into manageable prompt chunks before extraction, rather than being sent as one unbounded request.
+Consolidation is chunked: long staged conversations are split into manageable prompt chunks before extraction.
 
 ### Retrieval
 
-There are two retrieval paths:
+- **Implicit prompt injection** — long-term memory by default; current-session staging only for clear recall queries
+- **Explicit tool retrieval** — `context_retrieve` searches current-session staging plus long-term memory
 
-- implicit prompt injection
-  - long-term memory by default
-  - current-session staging only when the query is clearly asking to recall recent conversation
-- explicit context retrieval
-  - current-session staging plus long-term memory
+For recall-style queries such as "what did we just discuss", the runtime falls back to recent `episodes` summaries when keyword search alone would miss the latest session.
 
-For recall-style queries such as "what did we just discuss", the runtime can fall back to recent `episodes` summaries when keyword search alone would miss the latest session summary.
+## User Tool Plugins
 
-## Skills, MCP, And User Tools
-
-Skills are loaded from:
-
-- user skills: `~/.agent/skills/**/SKILL.md`
-- built-in skills: `<repo>/skills/**/SKILL.md`
-
-Each bundle uses `SKILL.md` as the entrypoint and can ship templates, examples, scripts, or other support files.
-
-MCP servers are configured in `~/.agent/config.json` under `mcp_servers`. Connected MCP tools are injected into the same runtime tool registry and surfaced in the composed system prompt.
-
-User tool plugins are loaded from `~/.agent/tools`. The interactive `/generate-tool` flow writes generated tools into that same location and reloads them into the live registry.
+User tool plugins are loaded from `~/.agent/tools`. Each plugin is a Python file exporting a `register(registry)` function. The interactive `/generate-tool` flow writes generated tools to this location and reloads them into the live registry automatically.
 
 ## Project Layout
 
-```text
+```
 .
-├── agent.py
-├── config.example.json
-├── docs/
-│   └── superpowers/
-│       ├── plans/
-│       └── specs/
+├── agent.py                        # Single-file runtime
+├── config.example.json             # Full config reference
+├── plugins/
+│   └── evolution/
+│       ├── __init__.py             # EvolutionPlugin
+│       ├── plugin.json             # Plugin manifest
+│       ├── detector.py             # CorrectionDetector
+│       └── rules.py                # RuleStore + BehaviorRule
+├── skills/
+│   └── skill-manager/
+│       ├── SKILL.md                # Skill management instructions
+│       └── scripts/
+│           ├── init_skill.py       # Scaffold new skill bundles
+│           └── quick_validate.py   # Validate skill structure
 ├── scripts/
 │   └── benchmark_memory.py
-├── skills/
 ├── tests/
 ├── pyproject.toml
 └── uv.lock
@@ -280,6 +395,4 @@ python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.csv
 python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.jsonl
 ```
 
-Latest local verification in this workspace:
-
-- `uv run pytest -q` -> `160 passed, 1 skipped`
+Latest local verification: `uv run pytest -q` → `217 passed, 1 skipped`

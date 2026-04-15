@@ -39,10 +39,14 @@ import asyncio
 import importlib.util
 import json
 import logging
+import os
 import re
 import threading
+import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
 # Import base abstractions from agent.  These are always available because
@@ -51,6 +55,7 @@ from agent import (
     Channel,
     IncomingMessage,
     OutputSink,
+    SubAgentProgressEvent,
     _active_sink,
     _fmt_tool_inputs,
 )
@@ -81,7 +86,21 @@ class FeishuConfig:
     react_emoji: str = "THUMBSUP"
     # "mention": only respond in groups when @mentioned; "open": respond to all
     group_policy: Literal["open", "mention"] = "mention"
+    streaming: bool = True
     enabled: bool = False
+
+
+_STREAM_ELEMENT_ID = "streaming_md"
+
+
+@dataclass
+class _FeishuStreamBuf:
+    """State for one streaming Feishu response."""
+
+    text: str = ""
+    card_id: str | None = None
+    sequence: int = 0
+    last_edit: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,13 +187,14 @@ def _extract_post_content(content_json: dict) -> tuple[str, list[str]]:
 class FeishuOutputSink(OutputSink):
     """OutputSink implementation that sends responses to a Feishu chat.
 
-    Streaming chunks are accumulated silently (Feishu does not support
-    real-time message editing via the basic API).  After
-    ``on_turn_complete()`` is called the full response is sent using the
-    optimal message format selected by ``_detect_msg_format()``.
+    When CardKit streaming is enabled, streamed chunks are rendered into a
+    single live-updating card.  If CardKit is unavailable, the sink falls
+    back to the existing send-on-complete behavior.
 
-    Tool-start events are surfaced as small "Tool Call" code-block cards so
-    the user sees progress while the agent works.
+    Tool-start events are shown inline when a streaming card is active,
+    otherwise they are surfaced as small "Tool Call" code-block cards.
+
+    Generated files can also be uploaded and sent back to the chat.
 
     All Feishu API calls are synchronous (lark-oapi's sync client).  They are
     run in a thread-pool executor so the asyncio event loop is never blocked.
@@ -217,6 +237,27 @@ class FeishuOutputSink(OutputSink):
     _MD_BOLD_US_RE = re.compile(r"__(.+?)__")
     _MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
     _MD_STRIKE_RE = re.compile(r"~~(.+?)~~")
+    _IMAGE_EXTS = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".webp",
+        ".ico",
+        ".tiff",
+        ".tif",
+    }
+    _FILE_TYPE_MAP = {
+        ".pdf": "pdf",
+        ".doc": "doc",
+        ".docx": "doc",
+        ".xls": "xls",
+        ".xlsx": "xls",
+        ".ppt": "ppt",
+        ".pptx": "ppt",
+    }
+    _STREAM_EDIT_INTERVAL = 0.5
 
     _TEXT_MAX_LEN = 200  # plain-text ceiling; longer → post
     _POST_MAX_LEN = 2000  # post ceiling; longer → interactive card
@@ -227,39 +268,86 @@ class FeishuOutputSink(OutputSink):
         receive_id_type: str,
         receive_id: str,
         reply_message_id: Optional[str] = None,
+        output_dir: Optional[Path] = None,
+        streaming: bool = True,
     ) -> None:
         self._client = client
         self._receive_id_type = receive_id_type
         self._receive_id = receive_id
         self._reply_message_id = reply_message_id
+        self._output_dir = output_dir
+        self.streaming = streaming
         self._chunks: list[str] = []
         self._pending: list[asyncio.Task] = []
         self._first_reply = True  # first send of this response uses Reply API
+        self._turn_start = time.time()
+        self._stream_buf = _FeishuStreamBuf()
+        self._stream_flush_pending = False
+        self._progress_buf = _FeishuStreamBuf()
+        self._progress_flush_pending = False
 
     # ── OutputSink interface ──────────────────────────────────────────────────
 
     def on_stream_chunk(self, chunk: str) -> None:
-        """Accumulate chunks; send everything at once in on_turn_complete."""
+        """Accumulate chunks and progressively update a streaming card."""
         self._chunks.append(chunk)
+        if not self.streaming or not chunk:
+            return
+        self._stream_buf.text += chunk
+        if self._stream_buf.text.strip() and not self._stream_flush_pending:
+            self._stream_flush_pending = True
+            self._schedule(self._flush_stream_async())
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
         text = full_text or "".join(self._chunks)
         self._chunks.clear()
-        if text.strip():
-            self._schedule(self._send_response_async(text))
+        if text.strip() or self._output_dir is not None or self._stream_buf.card_id:
+            self._schedule(self._finish_turn_async(text))
 
     def on_tool_start(self, name: str, inputs: dict) -> None:
         hint = f"{name}{_fmt_tool_inputs(name, inputs)}"
+        if self.streaming and (
+            self._progress_buf.card_id is not None or self._progress_buf.text.strip()
+        ):
+            self._append_progress_text(f"**Tool Call**\n\n```text\n{hint}\n```")
+            if not self._progress_flush_pending:
+                self._progress_flush_pending = True
+                self._schedule(self._flush_progress_async(force=True))
+            return
+        if self.streaming and (
+            self._stream_buf.card_id is not None or self._stream_buf.text.strip()
+        ):
+            self._stream_buf.text += f"\n\n**Tool Call**\n\n```text\n{hint}\n```"
+            if not self._stream_flush_pending:
+                self._stream_flush_pending = True
+                self._schedule(self._flush_stream_async(force=True))
+            return
         self._schedule(self._send_tool_hint_async(hint))
 
     def on_tool_end(self, name: str, result: str) -> None:
-        pass  # result is internal; don't surface on Feishu
+        if name != "write_file":
+            return
+        path = self._extract_written_path(result)
+        if path is not None:
+            self._schedule(self._send_file_async(path))
 
     def on_tool_blocked(self, name: str, reason: str) -> None:
         self._schedule(self._send_plain_async(f"🚫 Tool `{name}` blocked: {reason}"))
 
     def on_error(self, error: str) -> None:
         self._schedule(self._send_plain_async(f"❌ {error}"))
+
+    def on_subagent_event(self, event: SubAgentProgressEvent) -> None:
+        line = self._format_subagent_event(event)
+        if not line:
+            return
+        if not self.streaming:
+            self._schedule(self._send_plain_async(line))
+            return
+        self._append_progress_text(line)
+        if not self._progress_flush_pending:
+            self._progress_flush_pending = True
+            self._schedule(self._flush_progress_async())
 
     def on_info(self, content: Any) -> None:
         if isinstance(content, str):
@@ -286,6 +374,181 @@ class FeishuOutputSink(OutputSink):
             logger.warning("FeishuOutputSink: no running event loop to schedule send")
 
     # ── Async send helpers ────────────────────────────────────────────────────
+
+    async def _finish_turn_async(self, text: str) -> None:
+        if self._progress_buf.card_id or self._progress_buf.text.strip():
+            await self._finalize_progress_async()
+        if self._stream_buf.card_id:
+            await self._finalize_stream_async(text)
+        elif text.strip():
+            await self._send_response_async(text)
+        await self._send_output_dir_files_async()
+
+    async def _flush_stream_async(self, force: bool = False) -> None:
+        """Create/update the CardKit streaming card when possible."""
+        try:
+            if not self.streaming or not self._stream_buf.text.strip():
+                return
+
+            loop = asyncio.get_running_loop()
+            now = time.monotonic()
+
+            if self._stream_buf.card_id is None:
+                card_id = await loop.run_in_executor(
+                    None,
+                    self._create_streaming_card_sync,
+                )
+                if not card_id:
+                    return
+                self._stream_buf.card_id = card_id
+                self._stream_buf.sequence = 1
+                ok = await loop.run_in_executor(
+                    None,
+                    self._stream_update_text_sync,
+                    card_id,
+                    self._stream_buf.text,
+                    self._stream_buf.sequence,
+                )
+                if ok:
+                    self._stream_buf.last_edit = now
+                return
+
+            if not force and (
+                now - self._stream_buf.last_edit
+            ) < self._STREAM_EDIT_INTERVAL:
+                return
+
+            self._stream_buf.sequence += 1
+            ok = await loop.run_in_executor(
+                None,
+                self._stream_update_text_sync,
+                self._stream_buf.card_id,
+                self._stream_buf.text,
+                self._stream_buf.sequence,
+            )
+            if ok:
+                self._stream_buf.last_edit = now
+        finally:
+            self._stream_flush_pending = False
+
+    async def _flush_progress_async(self, force: bool = False) -> None:
+        try:
+            if not self.streaming or not self._progress_buf.text.strip():
+                return
+
+            loop = asyncio.get_running_loop()
+            now = time.monotonic()
+
+            if self._progress_buf.card_id is None:
+                card_id = await loop.run_in_executor(None, self._create_streaming_card_sync)
+                if not card_id:
+                    return
+                self._progress_buf.card_id = card_id
+                self._progress_buf.sequence = 1
+                ok = await loop.run_in_executor(
+                    None,
+                    self._stream_update_text_sync,
+                    card_id,
+                    self._progress_buf.text,
+                    self._progress_buf.sequence,
+                )
+                if ok:
+                    self._progress_buf.last_edit = now
+                return
+
+            if not force and (
+                now - self._progress_buf.last_edit
+            ) < self._STREAM_EDIT_INTERVAL:
+                return
+
+            self._progress_buf.sequence += 1
+            ok = await loop.run_in_executor(
+                None,
+                self._stream_update_text_sync,
+                self._progress_buf.card_id,
+                self._progress_buf.text,
+                self._progress_buf.sequence,
+            )
+            if ok:
+                self._progress_buf.last_edit = now
+        finally:
+            self._progress_flush_pending = False
+
+    async def _finalize_stream_async(self, text: str) -> None:
+        """Send the final streamed text, with fallback to regular response."""
+        loop = asyncio.get_running_loop()
+        final_text = text or self._stream_buf.text or "".join(self._chunks)
+        card_id = self._stream_buf.card_id
+
+        try:
+            if not card_id:
+                if final_text.strip():
+                    await self._send_response_async(final_text)
+                return
+
+            self._stream_buf.text = final_text
+            self._stream_buf.sequence += 1
+            ok = await loop.run_in_executor(
+                None,
+                self._stream_update_text_sync,
+                card_id,
+                final_text,
+                self._stream_buf.sequence,
+            )
+            if not ok:
+                if final_text.strip():
+                    await self._send_response_async(final_text)
+                return
+
+            self._stream_buf.sequence += 1
+            await loop.run_in_executor(
+                None,
+                self._close_streaming_mode_sync,
+                card_id,
+                self._stream_buf.sequence,
+            )
+        finally:
+            self._stream_buf = _FeishuStreamBuf()
+            self._stream_flush_pending = False
+
+    async def _finalize_progress_async(self) -> None:
+        loop = asyncio.get_running_loop()
+        final_text = self._progress_buf.text
+        card_id = self._progress_buf.card_id
+
+        try:
+            if not final_text.strip():
+                return
+            if not card_id:
+                await self._send_response_async(final_text)
+                return
+
+            self._progress_buf.sequence += 1
+            ok = await loop.run_in_executor(
+                None,
+                self._stream_update_text_sync,
+                card_id,
+                final_text,
+                self._progress_buf.sequence,
+            )
+            if not ok:
+                await self._send_response_async(final_text)
+                return
+
+            self._progress_buf.sequence += 1
+            await loop.run_in_executor(
+                None,
+                self._close_streaming_mode_sync,
+                card_id,
+                self._progress_buf.sequence,
+            )
+        finally:
+            self._progress_buf = _FeishuStreamBuf()
+            self._progress_flush_pending = False
+
+    async def _send_output_dir_files_async(self) -> None:
+        for path in self._collect_output_dir_files():
+            await self._send_file_async(path)
 
     async def _send_response_async(self, text: str) -> None:
         """Send the final response using the optimal Feishu message format."""
@@ -335,7 +598,278 @@ class FeishuOutputSink(OutputSink):
         body = json.dumps({"text": text}, ensure_ascii=False)
         await loop.run_in_executor(None, self._do_send, "text", body)
 
+    async def _send_file_async(self, file_path: Path) -> None:
+        path = Path(file_path)
+        if not path.is_file():
+            logger.warning("Feishu file send skipped, file not found: %s", path)
+            return
+
+        loop = asyncio.get_running_loop()
+        ext = path.suffix.lower()
+        if ext in self._IMAGE_EXTS:
+            key = await loop.run_in_executor(None, self._upload_image_sync, path)
+            if key:
+                await loop.run_in_executor(
+                    None,
+                    self._do_send,
+                    "image",
+                    json.dumps({"image_key": key}, ensure_ascii=False),
+                )
+            return
+
+        key = await loop.run_in_executor(None, self._upload_file_sync, path)
+        if key:
+            await loop.run_in_executor(
+                None,
+                self._do_send,
+                "file",
+                json.dumps({"file_key": key}, ensure_ascii=False),
+            )
+
     # ── Synchronous Feishu API calls (run in thread-pool) ─────────────────────
+
+    def _create_streaming_card_sync(self) -> str | None:
+        """Create and send a CardKit streaming card, returning the card id."""
+        from lark_oapi.api.cardkit.v1 import (  # type: ignore[import]
+            CreateCardRequest,
+            CreateCardRequestBody,
+        )
+
+        card_json = {
+            "schema": "2.0",
+            "config": {
+                "wide_screen_mode": True,
+                "update_multi": True,
+                "streaming_mode": True,
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": "",
+                        "element_id": _STREAM_ELEMENT_ID,
+                    }
+                ]
+            },
+        }
+        try:
+            req = (
+                CreateCardRequest.builder()
+                .request_body(
+                    CreateCardRequestBody.builder()
+                    .type("card_json")
+                    .data(json.dumps(card_json, ensure_ascii=False))
+                    .build()
+                )
+                .build()
+            )
+            resp = self._client.cardkit.v1.card.create(req)
+            if not resp.success():
+                logger.warning(
+                    "Feishu streaming card create failed: code=%s msg=%s",
+                    resp.code,
+                    resp.msg,
+                )
+                return None
+
+            card_id = getattr(resp.data, "card_id", None)
+            if not card_id:
+                return None
+
+            self._do_send(
+                "interactive",
+                json.dumps({"type": "card", "data": {"card_id": card_id}}),
+            )
+            return card_id
+        except Exception as exc:
+            logger.warning("Feishu streaming card create error: %s", exc)
+            return None
+
+    def _stream_update_text_sync(
+        self, card_id: str, content: str, sequence: int
+    ) -> bool:
+        from lark_oapi.api.cardkit.v1 import (  # type: ignore[import]
+            ContentCardElementRequest,
+            ContentCardElementRequestBody,
+        )
+
+        try:
+            req = (
+                ContentCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(_STREAM_ELEMENT_ID)
+                .request_body(
+                    ContentCardElementRequestBody.builder()
+                    .content(content)
+                    .sequence(sequence)
+                    .build()
+                )
+                .build()
+            )
+            resp = self._client.cardkit.v1.card_element.content(req)
+            if not resp.success():
+                logger.warning(
+                    "Feishu stream update failed: card_id=%s code=%s msg=%s",
+                    card_id,
+                    resp.code,
+                    resp.msg,
+                )
+                return False
+            return True
+        except Exception as exc:
+            logger.warning("Feishu stream update error: %s", exc)
+            return False
+
+    def _close_streaming_mode_sync(self, card_id: str, sequence: int) -> bool:
+        from lark_oapi.api.cardkit.v1 import (  # type: ignore[import]
+            SettingsCardRequest,
+            SettingsCardRequestBody,
+        )
+
+        settings_payload = json.dumps({"config": {"streaming_mode": False}})
+        try:
+            req = (
+                SettingsCardRequest.builder()
+                .card_id(card_id)
+                .request_body(
+                    SettingsCardRequestBody.builder()
+                    .settings(settings_payload)
+                    .sequence(sequence)
+                    .uuid(str(uuid.uuid4()))
+                    .build()
+                )
+                .build()
+            )
+            resp = self._client.cardkit.v1.card.settings(req)
+            if not resp.success():
+                logger.warning(
+                    "Feishu close streaming failed: card_id=%s code=%s msg=%s",
+                    card_id,
+                    resp.code,
+                    resp.msg,
+                )
+                return False
+            return True
+        except Exception as exc:
+            logger.warning("Feishu close streaming error: %s", exc)
+            return False
+
+    def _upload_image_sync(self, file_path: Path) -> str | None:
+        from lark_oapi.api.im.v1 import (  # type: ignore[import]
+            CreateImageRequest,
+            CreateImageRequestBody,
+        )
+
+        try:
+            with Path(file_path).open("rb") as handle:
+                req = (
+                    CreateImageRequest.builder()
+                    .request_body(
+                        CreateImageRequestBody.builder()
+                        .image_type("message")
+                        .image(handle)
+                        .build()
+                    )
+                    .build()
+                )
+                resp = self._client.im.v1.image.create(req)
+                if resp.success():
+                    return resp.data.image_key
+                logger.error(
+                    "Feishu image upload failed: code=%s msg=%s",
+                    resp.code,
+                    resp.msg,
+                )
+        except Exception as exc:
+            logger.error("Feishu image upload error: %s", exc)
+        return None
+
+    def _upload_file_sync(self, file_path: Path) -> str | None:
+        from lark_oapi.api.im.v1 import (  # type: ignore[import]
+            CreateFileRequest,
+            CreateFileRequestBody,
+        )
+
+        path = Path(file_path)
+        file_type = self._FILE_TYPE_MAP.get(path.suffix.lower(), "stream")
+        try:
+            with path.open("rb") as handle:
+                req = (
+                    CreateFileRequest.builder()
+                    .request_body(
+                        CreateFileRequestBody.builder()
+                        .file_type(file_type)
+                        .file_name(path.name)
+                        .file(handle)
+                        .build()
+                    )
+                    .build()
+                )
+                resp = self._client.im.v1.file.create(req)
+                if resp.success():
+                    return resp.data.file_key
+                logger.error(
+                    "Feishu file upload failed: code=%s msg=%s",
+                    resp.code,
+                    resp.msg,
+                )
+        except Exception as exc:
+            logger.error("Feishu file upload error: %s", exc)
+        return None
+
+    def _extract_written_path(self, result: str) -> Optional[Path]:
+        try:
+            payload = json.loads(result)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            return None
+        path = payload.get("path")
+        if isinstance(path, str) and path:
+            return Path(path)
+        return None
+
+    def _collect_output_dir_files(self) -> list[Path]:
+        if self._output_dir is None or not self._output_dir.exists():
+            return []
+
+        files: list[Path] = []
+        for candidate in self._output_dir.rglob("*"):
+            if not candidate.is_file():
+                continue
+            try:
+                if candidate.stat().st_mtime >= self._turn_start:
+                    files.append(candidate)
+            except OSError:
+                continue
+        return sorted(files)
+
+    def _append_progress_text(self, line: str) -> None:
+        if not line.strip():
+            return
+        if not self._progress_buf.text:
+            self._progress_buf.text = "## Multi-Agent Progress\n\n" + line
+            return
+        self._progress_buf.text += "\n\n" + line
+
+    @staticmethod
+    def _format_subagent_event(event: SubAgentProgressEvent) -> str:
+        if event.message:
+            return event.message
+        role = event.role or "agent"
+        if event.kind == "batch_started":
+            return f"Starting {event.total} sub-agents"
+        if event.kind == "batch_progress":
+            return f"Sub-agents running: {event.completed}/{event.total} completed"
+        if event.kind == "batch_finished":
+            return f"Sub-agent batch finished: {event.completed}/{event.total}"
+        if event.kind == "agent_started":
+            return f"{role} started"
+        if event.kind == "agent_finished":
+            return f"{role} finished"
+        if event.kind == "agent_failed":
+            return f"{role} failed"
+        return ""
 
     def _do_send(self, msg_type: str, content: str) -> None:
         """Send one message, using Reply API for the first message of a response."""
@@ -582,6 +1116,7 @@ class FeishuChannel(Channel):
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._handler: Optional[Callable] = None
+        self._output_dir: Optional[Path] = None
         # Per-chat lock: ensures messages from the same chat are processed
         # one at a time even if they arrive in rapid succession.
         self._chat_locks: dict[str, asyncio.Lock] = {}
@@ -671,6 +1206,9 @@ class FeishuChannel(Channel):
         self._running = False
         logger.info("Feishu bot stopped")
 
+    def set_output_dir(self, output_dir: Optional[Path]) -> None:
+        self._output_dir = output_dir
+
     def create_sink(self, msg: IncomingMessage) -> FeishuOutputSink:
         assert self._client is not None, "FeishuChannel.start() not called"
         chat_id = msg.metadata["chat_id"]
@@ -681,6 +1219,8 @@ class FeishuChannel(Channel):
             receive_id_type=receive_id_type,
             receive_id=chat_id,
             reply_message_id=msg.metadata.get("message_id"),
+            output_dir=self._output_dir,
+            streaming=self._config.streaming,
         )
 
     # ── WebSocket event handlers ──────────────────────────────────────────────
@@ -774,6 +1314,18 @@ class FeishuChannel(Channel):
                 },
             )
 
+            if content.startswith("/send "):
+                requested = content[len("/send ") :].strip()
+                sink = self.create_sink(msg_obj)
+                path = self._resolve_send_path(requested)
+                if path is None or not path.is_file():
+                    await sink._send_plain_async(f"File not found: {requested}")
+                    await sink.drain()
+                    return
+                await sink._send_file_async(path)
+                await sink.drain()
+                return
+
             if self._handler:
                 lock = self._chat_locks.setdefault(reply_to, asyncio.Lock())
                 async with lock:
@@ -800,6 +1352,14 @@ class FeishuChannel(Channel):
             ).startswith("ou_"):
                 return True
         return False
+
+    def _resolve_send_path(self, raw_path: str) -> Optional[Path]:
+        candidate = Path(os.path.expandvars(raw_path)).expanduser()
+        if candidate.is_absolute():
+            return candidate.resolve()
+        if self._output_dir is not None:
+            return (self._output_dir / candidate).resolve()
+        return candidate.resolve()
 
     async def _add_reaction(self, message_id: str, emoji_type: str) -> None:
         loop = asyncio.get_running_loop()

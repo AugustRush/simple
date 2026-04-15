@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from dataclasses import asdict
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -23,7 +24,12 @@ from channels.feishu import (
     _clean_at_mentions,
     _extract_post_content,
 )
-from agent import _build_gateway_channels, _active_sink
+from agent import (
+    IncomingMessage,
+    SubAgentProgressEvent,
+    _active_sink,
+    _build_gateway_channels,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,6 +45,7 @@ def test_feishu_config_defaults():
     assert cfg.group_policy == "mention"
     assert cfg.react_emoji == "THUMBSUP"
     assert cfg.allow_from == []
+    assert cfg.streaming is True
 
 
 def test_feishu_config_custom():
@@ -287,6 +294,7 @@ def _make_feishu_sink() -> FeishuOutputSink:
         receive_id_type="open_id",
         receive_id="ou_test",
         reply_message_id="msg_001",
+        streaming=False,
     )
 
 
@@ -308,9 +316,16 @@ def test_feishu_sink_on_turn_complete_schedules_send():
     try:
 
         async def _run():
-            sink.on_turn_complete("hi", [])
-            assert len(sink._pending) == 1
-            assert sink._chunks == []  # cleared
+            with patch.object(
+                sink,
+                "_finish_turn_async",
+                new=AsyncMock(),
+            ) as mock_finish:
+                sink.on_turn_complete("hi", [])
+                assert len(sink._pending) == 1
+                assert sink._chunks == []  # cleared
+                await sink.drain()
+                mock_finish.assert_awaited_once_with("hi")
 
         loop.run_until_complete(_run())
     finally:
@@ -338,8 +353,15 @@ def test_feishu_sink_on_tool_start_schedules_hint():
     try:
 
         async def _run():
-            sink.on_tool_start("bash", {"command": "ls"})
-            assert len(sink._pending) == 1
+            with patch.object(
+                sink,
+                "_send_tool_hint_async",
+                new=AsyncMock(),
+            ) as mock_hint:
+                sink.on_tool_start("bash", {"command": "ls"})
+                assert len(sink._pending) == 1
+                await sink.drain()
+                mock_hint.assert_awaited_once()
 
         loop.run_until_complete(_run())
     finally:
@@ -360,14 +382,188 @@ def test_feishu_sink_on_tool_end_is_noop():
         loop.close()
 
 
+def test_feishu_sink_stream_chunk_schedules_streaming_update():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_stream_async",
+                new=AsyncMock(),
+            ) as mock_flush:
+                sink.on_stream_chunk("hello")
+                assert sink._chunks == ["hello"]
+                assert len(sink._pending) == 1
+                await sink.drain()
+                mock_flush.assert_awaited_once()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_write_file_tool_end_schedules_file_send(tmp_path):
+    sink = _make_feishu_sink()
+    target = tmp_path / "report.txt"
+    target.write_text("hello", encoding="utf-8")
+    result = json.dumps({"ok": True, "path": str(target)})
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_send_file_async",
+                new=AsyncMock(),
+            ) as mock_send:
+                sink.on_tool_end("write_file", result)
+                assert len(sink._pending) == 1
+                await sink.drain()
+                mock_send.assert_awaited_once_with(target)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_turn_complete_sends_new_output_dir_files(tmp_path):
+    sink = FeishuOutputSink(
+        client=MagicMock(),
+        receive_id_type="open_id",
+        receive_id="ou_test",
+        reply_message_id="msg_001",
+        output_dir=tmp_path,
+    )
+    generated = tmp_path / "artifact.txt"
+    generated.write_text("artifact", encoding="utf-8")
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_send_response_async",
+                new=AsyncMock(),
+            ) as mock_send_response, patch.object(
+                sink,
+                "_send_file_async",
+                new=AsyncMock(),
+            ) as mock_send_file:
+                sink.on_turn_complete("done", [])
+                await sink.drain()
+                mock_send_response.assert_awaited_once_with("done")
+                mock_send_file.assert_awaited_once_with(generated)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_subagent_event_schedules_process_card_update():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ) as mock_flush:
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="agent_started",
+                        role="researcher",
+                        task="inspect code",
+                        message="researcher started",
+                    )
+                )
+                assert len(sink._pending) == 1
+                await sink.drain()
+                mock_flush.assert_awaited_once()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_tool_start_uses_process_card_when_progress_active():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    sink._progress_buf.text = "Progress"
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ) as mock_flush, patch.object(
+                sink,
+                "_send_tool_hint_async",
+                new=AsyncMock(),
+            ) as mock_hint:
+                sink.on_tool_start("bash", {"command": "ls"})
+                await sink.drain()
+                mock_flush.assert_awaited_once()
+                mock_hint.assert_not_called()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_turn_complete_finalizes_process_card_before_final_answer():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    sink._progress_buf.card_id = "card_progress"
+    sink._progress_buf.text = "Running"
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_finalize_progress_async",
+                new=AsyncMock(),
+            ) as mock_finalize, patch.object(
+                sink,
+                "_send_response_async",
+                new=AsyncMock(),
+            ) as mock_send_response:
+                sink.on_turn_complete("final answer", [])
+                await sink.drain()
+                mock_finalize.assert_awaited_once()
+                mock_send_response.assert_awaited_once_with("final answer")
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
 def test_feishu_sink_on_tool_blocked_schedules_notice():
     sink = _make_feishu_sink()
     loop = asyncio.new_event_loop()
     try:
 
         async def _run():
-            sink.on_tool_blocked("bash", "policy violation")
-            assert len(sink._pending) == 1
+            with patch.object(
+                sink,
+                "_send_plain_async",
+                new=AsyncMock(),
+            ) as mock_plain:
+                sink.on_tool_blocked("bash", "policy violation")
+                assert len(sink._pending) == 1
+                await sink.drain()
+                mock_plain.assert_awaited_once()
 
         loop.run_until_complete(_run())
     finally:
@@ -380,8 +576,15 @@ def test_feishu_sink_on_error_schedules_message():
     try:
 
         async def _run():
-            sink.on_error("something broke")
-            assert len(sink._pending) == 1
+            with patch.object(
+                sink,
+                "_send_plain_async",
+                new=AsyncMock(),
+            ) as mock_plain:
+                sink.on_error("something broke")
+                assert len(sink._pending) == 1
+                await sink.drain()
+                mock_plain.assert_awaited_once()
 
         loop.run_until_complete(_run())
     finally:
@@ -500,6 +703,68 @@ def test_feishu_channel_start_raises_missing_credentials():
     channel = FeishuChannel(FeishuConfig())  # app_id/app_secret empty
     with pytest.raises(RuntimeError, match="app_id"):
         asyncio.run(channel.start(lambda msg, sink: True))
+
+
+def test_feishu_channel_create_sink_passes_output_dir():
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y", streaming=False))
+    channel._client = MagicMock()
+    channel._output_dir = Path("/tmp/feishu-output")
+
+    msg = IncomingMessage(
+        text="hi",
+        channel_name="feishu",
+        metadata={"chat_id": "ou_test", "chat_type": "p2p", "message_id": "msg_1"},
+    )
+    sink = channel.create_sink(msg)
+    assert sink._output_dir == Path("/tmp/feishu-output")
+    assert sink.streaming is False
+
+
+def test_feishu_channel_send_command_uses_output_dir(tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._handler = AsyncMock()
+    channel._output_dir = tmp_path
+    target = tmp_path / "note.txt"
+    target.write_text("hello", encoding="utf-8")
+
+    mock_sink = MagicMock()
+    mock_sink._send_file_async = AsyncMock()
+    mock_sink.drain = AsyncMock()
+
+    message = MagicMock()
+    message.message_id = "msg_123"
+    message.chat_id = "ou_sender"
+    message.chat_type = "p2p"
+    message.message_type = "text"
+    message.content = json.dumps({"text": "/send note.txt"})
+    message.mentions = []
+
+    sender = MagicMock()
+    sender.sender_type = "user"
+    sender.sender_id.open_id = "ou_sender"
+
+    data = MagicMock()
+    data.event.message = message
+    data.event.sender = sender
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+                channel,
+                "create_sink",
+                return_value=mock_sink,
+            ):
+                await channel._on_message(data)
+                mock_sink._send_file_async.assert_awaited_once_with(target)
+                mock_sink.drain.assert_awaited_once()
+                channel._handler.assert_not_called()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -18,6 +18,7 @@ from agent import (
     ChannelRunner,
     IncomingMessage,
     OutputSink,
+    SubAgentProgressEvent,
     _active_sink,
     _fmt_tool_inputs,
 )
@@ -301,4 +302,41 @@ def test_output_sink_base_methods_are_noop():
     sink.on_info("info")
     sink.on_status("status")
     sink.on_error("error")
+    sink.on_subagent_event(SubAgentProgressEvent(kind="agent_started", role="r"))
     sink.sync_stream_cb("chunk")
+
+
+class _DummySettableChannel(agent_module.Channel):
+    def __init__(self):
+        self.output_dir = None
+        self.started = False
+
+    async def start(self, handler):
+        self.started = True
+
+    async def stop(self):
+        return None
+
+    def create_sink(self, msg):
+        raise NotImplementedError
+
+    def set_output_dir(self, path):
+        self.output_dir = path
+
+
+def test_channel_runner_sets_output_dir_on_channels_with_setter(tmp_path):
+    channel = _DummySettableChannel()
+    runner = ChannelRunner(
+        channels=[channel],
+        components={
+            "context_manager": None,
+            "plugin_catalog": None,
+            "output_dir": tmp_path / "output",
+        },
+        cfg={},
+    )
+
+    asyncio.run(runner._run_channel(channel))
+
+    assert channel.started is True
+    assert channel.output_dir == tmp_path / "output"

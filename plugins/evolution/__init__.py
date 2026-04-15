@@ -166,6 +166,8 @@ class EvolutionPlugin:
         is appended by PluginCatalog, NOT used as a replacement.
         Returns ``""`` when there are no active rules.
         """
+        if self._rule_store is None:
+            return ""
         rules = self._rule_store.get_active_rules()
         if not rules:
             return ""

@@ -1,6 +1,8 @@
 README.md
 agent.py
 pyproject.toml
+channels/__init__.py
+channels/feishu.py
 simple.egg-info/PKG-INFO
 simple.egg-info/SOURCES.txt
 simple.egg-info/dependency_links.txt
@@ -10,8 +12,10 @@ simple.egg-info/top_level.txt
 tests/test_agent_integration.py
 tests/test_background_memory.py
 tests/test_builtin_tools.py
+tests/test_channel_layer.py
 tests/test_consolidation.py
 tests/test_evolution.py
+tests/test_feishu_channel.py
 tests/test_ltm_store.py
 tests/test_memory_benchmark.py
 tests/test_memory_palace_store.py

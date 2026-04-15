@@ -199,6 +199,9 @@ class OutputSink(ABC):
     def on_error(self, error: str) -> None:
         """Display an error message."""
 
+    def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
+        """Display structured multi-agent progress."""
+
     def sync_stream_cb(self, chunk: str) -> None:
         """Synchronous callback adapter for BaseAgent.send_message."""
         self.on_stream_chunk(chunk)
@@ -246,6 +249,34 @@ class CliOutputSink(OutputSink):
 
     def on_error(self, error: str) -> None:
         self._console.print(f"[red]{error}[/red]")
+
+    def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
+        msg = event.message or self._format_subagent_event(event)
+        if not msg:
+            return
+        color = "magenta"
+        if event.kind == "agent_failed":
+            color = "red"
+        elif event.kind in ("batch_progress", "batch_finished"):
+            color = "dim"
+        self._console.print(f"[{color}]{msg}[/{color}]")
+
+    @staticmethod
+    def _format_subagent_event(event: "SubAgentProgressEvent") -> str:
+        role = event.role or "agent"
+        if event.kind == "batch_started":
+            return event.message or f"Starting {event.total} sub-agents"
+        if event.kind == "batch_progress":
+            return event.message or f"Sub-agents running: {event.completed}/{event.total} completed"
+        if event.kind == "batch_finished":
+            return event.message or f"Sub-agents finished: {event.completed}/{event.total}"
+        if event.kind == "agent_started":
+            return event.message or f"{role} started"
+        if event.kind == "agent_finished":
+            return event.message or f"{role} finished"
+        if event.kind == "agent_failed":
+            return event.message or f"{role} failed"
+        return event.message
 
 
 # Per-turn ContextVar so tool helpers can find the active sink without
@@ -4771,6 +4802,16 @@ class AgentResult:
     error: Optional[str] = None
 
 
+@dataclass
+class SubAgentProgressEvent:
+    kind: str
+    role: Optional[str] = None
+    task: Optional[str] = None
+    message: str = ""
+    completed: int = 0
+    total: int = 0
+
+
 class BaseAgent:
     """Core agent: streams Claude, handles tool_use loop."""
 
@@ -4792,6 +4833,13 @@ class BaseAgent:
         self.max_parallel_agents = DEFAULT_MAX_PARALLEL_AGENTS
         self.sub_agent_timeout_seconds = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self._context_stack: list[AgentContext] = []
+
+    def _emit_subagent_event(self, event: SubAgentProgressEvent) -> None:
+        sink = _active_sink.get()
+        if sink is not None:
+            sink.on_subagent_event(event)
+            return
+        CliOutputSink(CONSOLE).on_subagent_event(event)
 
     def set_model(self, model: str) -> None:
         """Switch the model used for subsequent calls."""
@@ -5014,24 +5062,75 @@ class BaseAgent:
         ]
         if spawn_calls:
             roles = ", ".join(tu["input"].get("role", "?") for _, tu in spawn_calls)
-            if len(spawn_calls) > 1:
-                CONSOLE.print(
-                    f"\n[bold magenta]⟳ Spawning {len(spawn_calls)} agents "
-                    f"(concurrency limit: {self.max_parallel_agents}):[/bold magenta] {roles}"
+            total_spawns = len(spawn_calls)
+            progress_state = {"completed": 0}
+            self._emit_subagent_event(
+                SubAgentProgressEvent(
+                    kind="batch_started",
+                    total=total_spawns,
+                    message=(
+                        f"Starting {total_spawns} sub-agents "
+                        f"(limit {self.max_parallel_agents}): {roles}"
+                    ),
                 )
+            )
             # D4: semaphore-based dispatch lets faster agents in later batches start
             # as soon as a slot frees, rather than waiting for an entire batch to finish.
             sem = asyncio.Semaphore(self.max_parallel_agents)
+            heartbeat_stop = asyncio.Event()
+
+            async def _heartbeat() -> None:
+                while not heartbeat_stop.is_set():
+                    try:
+                        await asyncio.wait_for(heartbeat_stop.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pass
+                    if heartbeat_stop.is_set():
+                        break
+                    self._emit_subagent_event(
+                        SubAgentProgressEvent(
+                            kind="batch_progress",
+                            completed=progress_state["completed"],
+                            total=total_spawns,
+                            message=(
+                                "Sub-agents running: "
+                                f"{progress_state['completed']}/{total_spawns} completed"
+                            ),
+                        )
+                    )
 
             async def _exec_spawn_with_sem(tu: dict) -> str:
                 async with sem:
-                    return await self.registry.call(tu["name"], tu["input"])
+                    try:
+                        outcome = await self.registry.call(tu["name"], tu["input"])
+                    except Exception as exc:
+                        progress_state["completed"] += 1
+                        raise
+
+                    progress_state["completed"] += 1
+                    return outcome
 
             # D5: return_exceptions=True prevents one failing spawn from cancelling others
-            raw_spawn = await asyncio.gather(
-                *[_exec_spawn_with_sem(tu) for _, tu in spawn_calls],
-                return_exceptions=True,
-            )
+            heartbeat_task = asyncio.create_task(_heartbeat())
+            try:
+                raw_spawn = await asyncio.gather(
+                    *[_exec_spawn_with_sem(tu) for _, tu in spawn_calls],
+                    return_exceptions=True,
+                )
+            finally:
+                heartbeat_stop.set()
+                await heartbeat_task
+                self._emit_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="batch_finished",
+                        completed=progress_state["completed"],
+                        total=total_spawns,
+                        message=(
+                            "Sub-agent batch finished: "
+                            f"{progress_state['completed']}/{total_spawns} completed"
+                        ),
+                    )
+                )
             for (idx, tu), outcome in zip(spawn_calls, raw_spawn):
                 if isinstance(outcome, BaseException):
                     results[idx] = json.dumps(
@@ -5331,7 +5430,15 @@ class BaseAgent:
                     sub_ctx.metadata["required_skills"] = list(
                         active_ctx.metadata["required_skills"]
                     )
-            CONSOLE.print(f"\n[bold magenta]▶ [{role}][/bold magenta] {task[:120]}")
+            parent._emit_subagent_event(
+                SubAgentProgressEvent(
+                    kind="agent_started",
+                    role=role,
+                    task=task,
+                    message=f"{role} started: {task[:120]}",
+                )
+            )
+            started_at = time.monotonic()
             try:
                 result = await asyncio.wait_for(
                     sub_agent.send_message(sub_ctx, task),
@@ -5356,12 +5463,12 @@ class BaseAgent:
                 }
                 if partial:
                     payload["partial_content"] = partial
-                CONSOLE.print(
-                    Panel(
-                        payload["error"],
-                        title=f"[magenta]{role}[/magenta]",
-                        border_style="red",
-                        padding=(0, 1),
+                parent._emit_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="agent_failed",
+                        role=role,
+                        task=task,
+                        message=payload["error"],
                     )
                 )
                 return payload
@@ -5374,12 +5481,12 @@ class BaseAgent:
                     "task": task,
                     "error": f"sub-agent failed: {parent._format_agent_error(e)}",
                 }
-                CONSOLE.print(
-                    Panel(
-                        payload["error"],
-                        title=f"[magenta]{role}[/magenta]",
-                        border_style="red",
-                        padding=(0, 1),
+                parent._emit_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="agent_failed",
+                        role=role,
+                        task=task,
+                        message=payload["error"],
                     )
                 )
                 return payload
@@ -5393,12 +5500,17 @@ class BaseAgent:
             }
             if result.error:
                 payload["error"] = result.error
-            CONSOLE.print(
-                Panel(
-                    result.error or result.content or "(no output)",
-                    title=f"[magenta]{role}[/magenta]",
-                    border_style="magenta" if result.error is None else "red",
-                    padding=(0, 1),
+            elapsed = time.monotonic() - started_at
+            parent._emit_subagent_event(
+                SubAgentProgressEvent(
+                    kind="agent_finished" if result.error is None else "agent_failed",
+                    role=role,
+                    task=task,
+                    message=(
+                        f"{role} finished in {elapsed:.1f}s"
+                        if result.error is None
+                        else f"{role} failed in {elapsed:.1f}s: {result.error}"
+                    ),
                 )
             )
             return payload
@@ -6943,6 +7055,10 @@ class ChannelRunner:
         plugin_catalog: Optional[PluginCatalog] = components.get("plugin_catalog")
         if plugin_catalog:
             plugin_catalog.fire_session_start(components)
+
+        set_output_dir = getattr(channel, "set_output_dir", None)
+        if callable(set_output_dir):
+            set_output_dir(components.get("output_dir"))
 
         # Per-chat session state (AgentContext + turn counter)
         sessions: dict[str, dict] = {}

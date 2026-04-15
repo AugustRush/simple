@@ -3,3 +3,6 @@ openai
 typer
 rich
 mcp
+
+[feishu]
+lark-oapi
