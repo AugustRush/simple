@@ -50,16 +50,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
-# Import base abstractions from agent.  These are always available because
-# agent.py is the entry point and channels/ is only imported after it loads.
-from agent import (
-    Channel,
-    IncomingMessage,
-    OutputSink,
-    SubAgentProgressEvent,
-    _active_sink,
-    _fmt_tool_inputs,
-)
+from agent import _active_sink, _fmt_tool_inputs
+from agent.channels import Channel, IncomingMessage
+from agent.core import OutputSink, SubAgentProgressEvent
 
 if TYPE_CHECKING:
     pass
@@ -293,6 +286,9 @@ class FeishuOutputSink(OutputSink):
         """Accumulate final summary text; progress updates use a separate card."""
         self._chunks.append(chunk)
         self._stream_buf.text += chunk
+        if self.streaming and not self._stream_flush_pending:
+            self._stream_flush_pending = True
+            self._schedule(self._flush_stream_async())
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
         text = full_text or "".join(self._chunks)
@@ -362,6 +358,8 @@ class FeishuOutputSink(OutputSink):
             task = asyncio.ensure_future(coro)
             self._pending.append(task)
         except RuntimeError:
+            if inspect.iscoroutine(coro):
+                coro.close()
             logger.warning("FeishuOutputSink: no running event loop to schedule send")
 
     # ── Async send helpers ────────────────────────────────────────────────────

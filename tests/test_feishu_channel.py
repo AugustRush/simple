@@ -1,5 +1,5 @@
 """Tests for channels/feishu.py — FeishuOutputSink, FeishuConfig, helpers,
-and the _build_gateway_channels factory function in agent.py.
+and the package-backed gateway channel factory.
 
 lark-oapi is available in the test environment (verified at collection time).
 All Feishu API calls are patched with unittest.mock so no real credentials
@@ -307,6 +307,28 @@ def test_feishu_sink_stream_chunk_accumulation():
     assert sink._pending == []
 
 
+def test_feishu_sink_stream_chunk_schedules_stream_flush_when_streaming_enabled():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            sink.on_stream_chunk("hello")
+            assert sink._stream_buf.text == "hello"
+            assert sink._stream_flush_pending is True
+            assert len(sink._pending) == 1
+
+            for task in sink._pending:
+                task.cancel()
+            await asyncio.gather(*sink._pending, return_exceptions=True)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
 def test_feishu_sink_on_turn_complete_schedules_send():
     sink = _make_feishu_sink()
     sink.on_stream_chunk("hi")
@@ -385,9 +407,21 @@ def test_feishu_sink_on_tool_end_is_noop():
 def test_feishu_sink_stream_chunk_does_not_emit_summary_before_turn_complete():
     sink = _make_feishu_sink()
     sink.streaming = True
-    sink.on_stream_chunk("hello")
-    assert sink._chunks == ["hello"]
-    assert sink._pending == []
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            sink.on_stream_chunk("hello")
+            assert sink._chunks == ["hello"]
+            assert len(sink._pending) == 1
+
+            for task in sink._pending:
+                task.cancel()
+            await asyncio.gather(*sink._pending, return_exceptions=True)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
 
 
 def test_feishu_sink_write_file_tool_end_schedules_file_send(tmp_path):

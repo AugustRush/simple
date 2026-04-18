@@ -1,6 +1,6 @@
 # Personal Agent
 
-Single-file personal AI agent with:
+Personal AI agent package with:
 
 - provider abstraction for Anthropic and OpenAI-compatible APIs
 - interactive chat plus single-turn CLI mode
@@ -367,7 +367,7 @@ User tool plugins are loaded from `~/.agent/tools`. Each plugin is a Python file
 
 ```
 .
-├── agent.py                        # Single-file runtime
+├── agent/                          # Package runtime and public entrypoints
 ├── config.example.json             # Full config reference
 ├── plugins/
 │   └── evolution/

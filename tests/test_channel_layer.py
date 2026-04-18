@@ -12,13 +12,9 @@ from unittest.mock import MagicMock
 import pytest
 
 import agent as agent_module
+from agent.channels import Channel, ChannelRunner, CliChannel, IncomingMessage
+from agent.core import CliOutputSink, OutputSink, SubAgentProgressEvent
 from agent import (
-    CliChannel,
-    CliOutputSink,
-    ChannelRunner,
-    IncomingMessage,
-    OutputSink,
-    SubAgentProgressEvent,
     _active_sink,
     _fmt_tool_inputs,
 )

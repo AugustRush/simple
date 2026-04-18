@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "simple"
 version = "0.1.0"
-description = "Single-file personal AI agent with a memory palace and provider abstraction."
+description = "Personal AI agent package with a memory palace and provider abstraction."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -21,7 +21,7 @@ dependencies = [
 feishu = ["lark-oapi"]
 
 [project.scripts]
-simple = "agent:app"
+simple = "agent.cli:app"
 
 [dependency-groups]
 dev = [
@@ -29,6 +29,5 @@ dev = [
   "lark-oapi",   # needed by tests/test_feishu_channel.py
 ]
 
-[tool.setuptools]
-py-modules = ["agent"]
-packages   = ["channels"]
+[tool.setuptools.packages.find]
+include = ["agent*", "channels*"]

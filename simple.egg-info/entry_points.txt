@@ -1,2 +1,2 @@
 [console_scripts]
-simple = agent:app
+simple = agent.cli:app

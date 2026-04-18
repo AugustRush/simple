@@ -256,6 +256,7 @@ user-invocable: true
     )
     assert payload["ok"] is True
     assert payload["skill"]["id"] == "quality/review"
+    assert payload["skill"]["bundle_root"] == "builtin://quality/review"
     assert payload["skill"]["instructions"] == skill_body
     assert "template.md" in payload["skill"]["supporting_files"]
 
@@ -263,6 +264,7 @@ user-invocable: true
         asyncio.run(registry.call("list_skill_files", {"skill_name": "quality/review"}))
     )
     assert files_payload["ok"] is True
+    assert files_payload["bundle_root"] == "builtin://quality/review"
     assert "template.md" in files_payload["files"]
 
     file_payload = json.loads(
@@ -274,7 +276,43 @@ user-invocable: true
         )
     )
     assert file_payload["ok"] is True
+    assert file_payload["bundle_root"] == "builtin://quality/review"
     assert file_payload["content"] == "Checklist template"
+    assert "user tools live in" in prompt
+    assert str(agent_module.SKILLS_DIR) in prompt
+    assert "Workspace root for read_file/write_file/list_files only:" in prompt
+
+
+def test_builtin_skill_activation_text_uses_logical_bundle_root(tmp_path):
+    import agent as agent_module
+
+    builtin_root = tmp_path / "builtin-skills"
+    _write_skill_bundle(
+        builtin_root,
+        "quality/review",
+        """---
+name: Review
+description: Review code changes
+user-invocable: true
+---
+Follow the review checklist.
+""",
+        {"template.md": "Checklist template"},
+    )
+
+    catalog = agent_module.SkillCatalog(
+        user_root=tmp_path / "user-skills", builtin_root=builtin_root
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    registry.set_context("output_dir", str(tmp_path / "output"))
+    catalog.register_tools(registry)
+
+    text = catalog.activation_text("quality/review", explicit=True)
+
+    assert text is not None
+    assert "Bundle root: builtin://quality/review" in text
+    assert str(builtin_root) not in text
 
 
 # ── Skill management tool tests ──────────────────────────────────────────────
@@ -859,8 +897,8 @@ def test_skill_manager_builtin_skill_is_discovered(tmp_path):
     """The skill-manager built-in skill should be discovered from the repo's skills/ dir."""
     import agent as agent_module
 
-    # Use the real builtin_root (the repo's skills/ directory)
-    real_builtin = Path(agent_module.__file__).resolve().parent / "skills"
+    # Use the package-exported builtin skill root instead of the old single-file path.
+    real_builtin = agent_module.BUILTIN_SKILLS_DIR
     catalog = agent_module.SkillCatalog(
         user_root=tmp_path / "user-skills", builtin_root=real_builtin
     )
@@ -1592,6 +1630,62 @@ def test_stream_response_propagates_stream_failures():
 
     with pytest.raises(RuntimeError, match="stream exploded"):
         asyncio.run(agent._stream_response(ctx, [], lambda chunk: None))
+
+
+def test_stream_response_supports_async_stream_callback():
+    import agent as agent_module
+
+    class _FakeFinalMessage:
+        stop_reason = "end_turn"
+        content = []
+
+    class _FakeAnthropicStream:
+        def __init__(self):
+            self.text_stream = self
+            self._chunks = iter(["hello", " world"])
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._chunks)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def get_final_message(self):
+            return _FakeFinalMessage()
+
+    class _FakeAnthropicClient:
+        class messages:
+            @staticmethod
+            def stream(**kwargs):
+                return _FakeAnthropicStream()
+
+    seen = []
+
+    async def _async_callback(chunk: str):
+        seen.append(chunk)
+
+    agent = agent_module.BaseAgent(
+        _FakeAnthropicClient(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="anthropic",
+    )
+    ctx = agent_module.AgentContext(system_prompt="system")
+
+    response, text = asyncio.run(agent._stream_response(ctx, [], _async_callback))
+
+    assert isinstance(response, _FakeFinalMessage)
+    assert text == "hello world"
+    assert seen == ["hello", " world"]
 
 
 def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(

@@ -1,0 +1,1043 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+import json
+from pathlib import Path
+import re
+import sys
+from typing import Any, Optional
+
+import typer
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.prompt import Prompt
+from rich.table import Table
+
+import agent as agent_module
+from agent.core.output import CliOutputSink, _active_sink
+
+AgentContext = agent_module.AgentContext
+BaseAgent = agent_module.BaseAgent
+ChannelRunner = agent_module.ChannelRunner
+CliOutputSink = CliOutputSink
+CONSOLE = agent_module.CONSOLE
+ContextManager = agent_module.ContextManager
+EvolutionEngine = agent_module.EvolutionEngine
+MemoryPalace = agent_module.MemoryPalace
+PluginCatalog = agent_module.PluginCatalog
+RalphTask = agent_module.RalphTask
+RALPH_COMPLETION_PROMISE = agent_module.RALPH_COMPLETION_PROMISE
+RALPH_DEFAULT_MAX_ITERATIONS = agent_module.RALPH_DEFAULT_MAX_ITERATIONS
+SkillCatalog = agent_module.SkillCatalog
+StagingBuffer = agent_module.StagingBuffer
+STAGING_DIR = agent_module.STAGING_DIR
+TurnEvent = agent_module.TurnEvent
+_build_gateway_channels = agent_module._build_gateway_channels
+_new_id = agent_module._new_id
+_save_ralph_task = agent_module._save_ralph_task
+_with_task_context = agent_module._with_task_context
+prepare_user_message_for_skills = agent_module.prepare_user_message_for_skills
+
+app = typer.Typer(
+    name="agent",
+    help="Personal AI Agent with Memory Palace, Multi-Agent Orchestration, and Self-Evolution",
+    add_completion=False,
+)
+memory_app = typer.Typer(help="Memory palace commands")
+app.add_typer(memory_app, name="memory")
+
+async def _ralph_task_loop(
+    agent: "BaseAgent",
+    task: RalphTask,
+    system_prompt: str,
+    skill_catalog: "SkillCatalog",
+    ctx_mgr: Optional["ContextManager"],
+) -> RalphTask:
+    """Ralph-mode autonomous task loop.
+
+    Runs up to task.max_iterations iterations. Each iteration gets a fresh
+    AgentContext (preventing context rot) but receives the full task state and
+    recent progress summary. Completion is determined externally — either by a
+    promise token in the output or by a verify_command exit code — not by LLM
+    self-assessment.
+
+    Context handling contract:
+    - No mark_activity() / staging during iterations → background consolidation
+      does not fire mid-task, keeping iterations uninterrupted.
+    - After the task ends (any status), all iterations are staged as a single
+      summary entry and consolidation is enqueued once. This ensures LTM learns
+      from the Ralph session without fragmenting it into mid-task chunks.
+    """
+    all_summaries: list[str] = []
+
+    def _build_iter_prompt(t: RalphTask) -> str:
+        criteria_text = "\n".join(f"- {c}" for c in t.completion_criteria)
+        progress_text = ""
+        if t.progress:
+            recent = t.progress[-3:]  # only last 3 to keep token cost bounded
+            progress_text = "\n\n## Recent Progress\n" + "\n".join(
+                f"- Iteration {p['iteration']}: {p['summary']}" for p in recent
+            )
+        return (
+            f"## Current Task\n{t.goal}\n\n"
+            f"## Acceptance Criteria\n{criteria_text}\n\n"
+            f"Once all criteria are satisfied, output at the end of your reply: `{t.completion_promise}`\n"
+            f"{progress_text}\n\n"
+            f"This is iteration {t.current_iteration} of {t.max_iterations}."
+        )
+
+    for i in range(task.max_iterations):
+        task.current_iteration = i + 1
+        CONSOLE.print(
+            f"\n[dim]── Ralph iteration {task.current_iteration}/{task.max_iterations} ──[/dim]"
+        )
+
+        # Fresh AgentContext per iteration — prevents context rot across iterations.
+        iter_ctx = AgentContext(system_prompt=system_prompt)
+        iter_ctx.metadata["skill_catalog"] = skill_catalog
+
+        collected: list[str] = []
+
+        def _stream_cb(chunk: str, _col: list = collected) -> None:
+            CONSOLE.print(chunk, end="", markup=False)
+            _col.append(chunk)
+
+        CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+        result = await agent.send_message(
+            iter_ctx, _build_iter_prompt(task), _stream_cb
+        )
+        CONSOLE.print()
+
+        if result.error:
+            CONSOLE.print(f"[red]Error: {result.error}[/red]")
+
+        iter_summary = result.content[:300] if result.content else "(no output)"
+        all_summaries.append(f"Iter {task.current_iteration}: {iter_summary}")
+
+        # ── Notify plugins so evolution / correction detection works in Ralph ─
+        if agent.plugin_catalog:
+            try:
+                await agent.plugin_catalog.fire_turn_end(
+                    TurnEvent(
+                        user_input=_build_iter_prompt(task),
+                        agent_response=result.content or "",
+                        tool_calls=result.tool_calls_made,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        turn_index=task.current_iteration,
+                    )
+                )
+            except Exception:
+                pass  # plugin errors must not abort the task loop
+
+        # ── External completion check 1: promise token ────────────────────────
+        if task.completion_promise in result.content:
+            task.status = "complete"
+            task.progress.append(
+                {
+                    "iteration": task.current_iteration,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "tool_calls": result.tool_calls_made,
+                    "summary": iter_summary,
+                    "completed_by": "promise",
+                }
+            )
+            _save_ralph_task(task)
+            break
+
+        # ── External completion check 2: verify command ───────────────────────
+        if task.verify_command:
+            v_out: bytes = b""
+            v_err: bytes = b""
+            try:
+                verify_proc = await asyncio.create_subprocess_shell(
+                    task.verify_command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                v_out, v_err = await asyncio.wait_for(
+                    verify_proc.communicate(), timeout=60
+                )
+                v_exit = verify_proc.returncode
+            except asyncio.TimeoutError:
+                v_exit = -1
+                CONSOLE.print("[yellow]Verify command timed out (60s)[/yellow]")
+            except Exception as ve:
+                v_exit = -1
+                CONSOLE.print(f"[yellow]Verify command error: {ve}[/yellow]")
+
+            if v_exit == 0:
+                CONSOLE.print("[green]Verify passed (exit 0)[/green]")
+                task.status = "complete"
+                task.progress.append(
+                    {
+                        "iteration": task.current_iteration,
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "tool_calls": result.tool_calls_made,
+                        "summary": iter_summary,
+                        "completed_by": "verify_command",
+                    }
+                )
+                _save_ralph_task(task)
+                break
+            else:
+                # Capture verification output and append to iter_summary so it
+                # flows into task.progress and becomes visible in the next
+                # iteration's prompt via _build_iter_prompt(recent[-3:]).
+                # Without this, the agent knows verification failed but not why,
+                # making subsequent iterations effectively blind retries.
+                verify_output = (v_err or v_out).decode("utf-8", errors="replace")
+                verify_snippet = verify_output[-600:].strip()
+                if verify_snippet:
+                    iter_summary += (
+                        f"\n\nverify_failed (exit {v_exit}):\n{verify_snippet}"
+                    )
+                    CONSOLE.print(
+                        f"[yellow]Verify failed (exit {v_exit}), continuing[/yellow]\n"
+                        f"[dim]{verify_snippet[:200]}[/dim]"
+                    )
+                else:
+                    CONSOLE.print(
+                        f"[yellow]Verify failed (exit {v_exit}), continuing[/yellow]"
+                    )
+
+        task.progress.append(
+            {
+                "iteration": task.current_iteration,
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "tool_calls": result.tool_calls_made,
+                "summary": iter_summary,
+            }
+        )
+        _save_ralph_task(task)
+
+    if task.status == "running":
+        task.status = "max_iterations_reached"
+        _save_ralph_task(task)
+
+    # ── Post-task: stage the full run and enqueue one consolidation job ───────
+    # Done once after the loop ends (not per-iteration) to avoid fragmenting the
+    # task narrative in LTM and to prevent background consolidation from firing
+    # mid-task (which would use a separate API call on incomplete context).
+    if ctx_mgr and all_summaries:
+        goal_line = f"[Ralph/{task.id}] goal: {task.goal} | status: {task.status} | iters: {task.current_iteration}/{task.max_iterations}"
+        ctx_mgr.staging.append("user", goal_line)
+        ctx_mgr.staging.append("assistant", "\n".join(all_summaries[-5:]))
+        ctx_mgr.mark_activity()
+        if ctx_mgr.should_enqueue_consolidation():
+            ctx_mgr.enqueue_consolidation("ralph_task_end")
+
+    return task
+
+def _missing_feishu_dependency_hint() -> str:
+    exe = Path(sys.executable).as_posix()
+    if "/.local/share/uv/tools/" in exe:
+        return (
+            "lark-oapi not installed in the uv tool environment.\n"
+            "If you're running from this repo, use:\n"
+            "  uv run simple gateway\n"
+            "after:\n"
+            "  uv sync --extra feishu\n"
+            "Or reinstall the tool from this repo with:\n"
+            "  uv tool install --reinstall --editable . --with lark-oapi"
+        )
+    return (
+        "lark-oapi not installed in the current Python environment.\n"
+        "If you're in this repo, run:\n"
+        "  uv sync --extra feishu\n"
+        "and start with:\n"
+        "  uv run simple gateway"
+    )
+
+
+async def _interactive_loop(components: dict, cfg: dict):
+    """Main interactive chat loop."""
+    agent: BaseAgent = components["agent"]
+    memory: MemoryPalace = components["memory"]
+    evolution: Optional[EvolutionEngine] = components.get("evolution")
+    plugin_catalog: PluginCatalog = components.get("plugin_catalog")  # type: ignore[assignment]
+    if plugin_catalog is None:
+        plugin_catalog = PluginCatalog(
+            builtin_dir=agent_module.PLUGINS_DIR,
+            user_dir=agent_module.USER_PLUGINS_DIR,
+            plugin_config=cfg.get("plugins", {}),
+        )
+        plugin_catalog.discover_and_load()
+        components["plugin_catalog"] = plugin_catalog
+    system_prompt = components["system_prompt"]
+    ctx_mgr: Optional[ContextManager] = components.get("context_manager")
+    skill_catalog: SkillCatalog = components["skill_catalog"]
+    user_tool_catalog: UserToolCatalog = components["user_tool_catalog"]
+
+    ctx = AgentContext(system_prompt=system_prompt)
+    # Expose ctx in components so plugin slash-command handlers can update it.
+    components["ctx"] = ctx
+    _session_tools_used: list[str] = []  # accumulated for SessionEvent
+    _session_turn_count: int = 0
+    # Track the user's first non-command message so it can be re-injected into
+    # the system prompt after compaction (compact_messages drops early messages
+    # to keep working memory bounded; this preserves the original task intent
+    # without coupling task context to API message-list formatting rules).
+    _task_context: str = ""
+    memory_worker = (
+        agent_module.BackgroundMemoryWorker(
+            ctx_mgr,
+            components["client"],
+            components["model"],
+            agent.api_format,
+            client_factory=lambda: agent_module.ModelClientFactory.from_config(
+                cfg, announce=False
+            )[0],
+        )
+        if ctx_mgr
+        else None
+    )
+    if memory_worker:
+        memory_worker.start()
+
+    # Queue orphaned staging files from previous sessions for background
+    # recovery. Doing this synchronously would block startup on a network model
+    # call before the user even sees the prompt.
+    if ctx_mgr:
+        staging_dir = agent_module.STAGING_DIR
+        current_sid = ctx_mgr.staging.session_id
+        orphans = [
+            p
+            for p in staging_dir.glob("*.jsonl")
+            if p.stem != current_sid and p.stat().st_size > 0
+        ]
+        if orphans:
+            CONSOLE.print(
+                f"[dim]💤 Queueing recovery for {len(orphans)} orphaned session(s)...[/dim]"
+            )
+            for orphan_path in orphans:
+                ctx_mgr.enqueue_staging_job(
+                    "orphan_recovery",
+                    StagingBuffer(path=orphan_path, session_id=orphan_path.stem),
+                )
+            if memory_worker:
+                memory_worker.wake()
+
+    CONSOLE.print(
+        Panel(
+            "[bold cyan]Personal Agent[/bold cyan]\n[dim]Type /help for commands[/dim]",
+            title="Agent Ready",
+            border_style="cyan",
+        )
+    )
+    # Notify all plugins that the session has started.
+    plugin_catalog.fire_session_start(components)
+
+    try:
+        while True:
+            try:
+                # Use asyncio.to_thread so the event loop stays alive (non-blocking
+                # input). This is required for future multi-channel concurrency where
+                # a second channel (Telegram, Feishu, …) runs in the same loop.
+                user_input = await asyncio.to_thread(
+                    Prompt.ask, "\n[bold green]You[/bold green]"
+                )
+            except (EOFError, KeyboardInterrupt):
+                break
+
+            if not user_input.strip():
+                continue
+
+            # Handle slash commands
+            if user_input.startswith("/"):
+                raw_cmd = user_input[1:].strip()
+                cmd = raw_cmd.lower()
+                if cmd in ("quit", "exit", "q"):
+                    break
+                elif cmd in ("help", "?"):
+                    _help_table = Table(title="Commands", show_header=False, box=None)
+                    _help_table.add_column("Command", style="cyan", no_wrap=True)
+                    _help_table.add_column("Description")
+                    for _hcmd, _hdesc in [
+                        ("/help", "Show this help"),
+                        ("/memory", "List memory palace chapters"),
+                        ("/context", "Show LTM context manager stats"),
+                        ("/tools", "List all available tools"),
+                        ("/skills", "List available skills"),
+                        ("/plugins", "List loaded plugins"),
+                        ("/model [name]", "Show or switch active model (session only)"),
+                        ("/ralph <goal>", "Run Ralph autonomous task loop"),
+                        ("  --max N", "  Max iterations (default 10)"),
+                        ("  --verify <cmd>", "  Shell command to verify completion"),
+                        ("/evolve", "Trigger system-prompt self-evolution"),
+                        ("/generate-tool <desc>", "Generate a new user tool"),
+                        ("/quit", "Exit the agent"),
+                    ]:
+                        _help_table.add_row(_hcmd, _hdesc)
+                    CONSOLE.print(_help_table)
+                    continue
+                elif cmd == "memory":
+                    chapters = memory.list_chapters()
+                    table = Table(title="Memory Palace")
+                    table.add_column("Chapter")
+                    table.add_column("Files")
+                    for ch in chapters:
+                        table.add_row(ch["name"], str(len(ch["files"])))
+                    CONSOLE.print(table)
+                    continue
+                elif cmd == "context":
+                    if ctx_mgr:
+                        stats = ctx_mgr.stats()
+                        table = Table(title="Context Manager (LTM)")
+                        table.add_column("Metric")
+                        table.add_column("Value")
+                        table.add_row(
+                            "Dynamic Categories",
+                            f"{stats['dynamic_categories']}/{stats['max_categories']}",
+                        )
+                        table.add_row(
+                            "Total Categories", str(stats["total_categories"])
+                        )
+                        table.add_row("Total Entries", str(stats["total_entries"]))
+                        table.add_row(
+                            "Category Names",
+                            ", ".join(stats["category_names"]) or "—",
+                        )
+                        table.add_row(
+                            "Staged Turns",
+                            str(stats["staged_turns"]),
+                        )
+                        table.add_row(
+                            "Needs Consolidation",
+                            "yes" if stats["needs_consolidation"] else "no",
+                        )
+                        table.add_row(
+                            "Idle",
+                            f"{stats['idle_elapsed_s']}s / {stats['idle_threshold_s']}s",
+                        )
+                        CONSOLE.print(table)
+                    else:
+                        CONSOLE.print("[yellow]Context manager not available.[/yellow]")
+                    continue
+                # ── Plugin-contributed slash commands (checked before built-ins) ──
+                plugin_cmds = plugin_catalog.get_slash_commands()
+                matched_plugin_key: Optional[str] = None
+                for _key in plugin_cmds:
+                    if cmd == _key or cmd.startswith(_key + " "):
+                        matched_plugin_key = _key
+                        break
+                if matched_plugin_key is not None:
+                    await plugin_cmds[matched_plugin_key](raw_cmd, components)
+                    continue
+                elif cmd == "tools":
+                    _tool_list = components["registry"].list_tools()
+                    _tools_table = Table(title="Available Tools")
+                    _tools_table.add_column("Tool", style="cyan")
+                    for _t in _tool_list:
+                        _tools_table.add_row(_t)
+                    CONSOLE.print(_tools_table)
+                    continue
+                elif cmd == "skills":
+                    skills = skill_catalog.list_skills()
+                    if not skills:
+                        CONSOLE.print("[yellow]No skills found.[/yellow]")
+                    else:
+                        table = Table(title="Available Skills")
+                        table.add_column("ID")
+                        table.add_column("Source")
+                        table.add_column("Description")
+                        for bundle in skills:
+                            table.add_row(
+                                bundle.id,
+                                bundle.source,
+                                bundle.description or "—",
+                            )
+                        CONSOLE.print(table)
+                    continue
+                elif cmd == "plugins":
+                    plugins = plugin_catalog.list_plugins()
+                    if not plugins:
+                        CONSOLE.print("[yellow]No plugins loaded.[/yellow]")
+                    else:
+                        table = Table(title="Loaded Plugins")
+                        table.add_column("Name")
+                        table.add_column("Version")
+                        table.add_column("Source")
+                        table.add_column("Description")
+                        for pm in plugins:
+                            table.add_row(
+                                pm.name,
+                                pm.version or "—",
+                                pm.source,
+                                pm.description or "—",
+                            )
+                        CONSOLE.print(table)
+                        CONSOLE.print(
+                            "[dim]Tip: set plugins.<name>.enabled = false "
+                            "in config.json to disable a plugin[/dim]"
+                        )
+                    continue
+                elif cmd.startswith("mode "):
+                    # Kept as a hidden override for debugging; not advertised
+                    CONSOLE.print(
+                        "[dim](manual mode override removed — routing is automatic)[/dim]"
+                    )
+                    continue
+                elif cmd == "model" or cmd.startswith("model "):
+                    parts = cmd.split(None, 1)
+                    provider_cfg = cfg.get("providers", {}).get(
+                        cfg.get("active_provider", ""), {}
+                    )
+                    available = provider_cfg.get(
+                        "models", [provider_cfg.get("default_model", agent.model)]
+                    )
+                    if len(parts) == 1:
+                        # List available models
+                        table = Table(title="Models")
+                        table.add_column("Model")
+                        table.add_column("Active")
+                        for m in available:
+                            mark = (
+                                "[bold green]✓[/bold green]" if m == agent.model else ""
+                            )
+                            table.add_row(m, mark)
+                        CONSOLE.print(table)
+                    else:
+                        new_model = parts[1].strip()
+                        agent.set_model(new_model)
+                        CONSOLE.print(
+                            f"[green]Switched to model: {new_model}[/green] "
+                            "[dim](session only — not persisted)[/dim]"
+                        )
+                    continue
+                elif cmd == "ralph" or cmd.startswith("ralph "):
+                    # /ralph <goal> [--max N] [--verify <shell_cmd>]
+                    # Example: /ralph "make all tests pass" --max 15 --verify "pytest tests/"
+                    parts = raw_cmd.split(None, 1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        CONSOLE.print(
+                            "[yellow]Usage: /ralph <goal> [--max N] [--verify <cmd>][/yellow]\n"
+                            "[dim]Example: /ralph 'make all tests pass' --max 10 --verify 'pytest tests/'[/dim]"
+                        )
+                        continue
+
+                    goal_str = parts[1].strip()
+                    max_iters = RALPH_DEFAULT_MAX_ITERATIONS
+                    verify_cmd: Optional[str] = None
+
+                    # Parse --max N
+                    max_match = re.search(r"--max\s+(\d+)", goal_str)
+                    if max_match:
+                        max_iters = int(max_match.group(1))
+                        goal_str = (
+                            goal_str[: max_match.start()].rstrip()
+                            + goal_str[max_match.end() :]
+                        )
+
+                    # Parse --verify <cmd> (everything after --verify to end of string)
+                    verify_match = re.search(r"--verify\s+(.+)$", goal_str)
+                    if verify_match:
+                        verify_cmd = verify_match.group(1).strip().strip("'\"")
+                        goal_str = goal_str[: verify_match.start()].rstrip()
+
+                    goal_str = goal_str.strip().strip("'\"")
+                    if not goal_str:
+                        CONSOLE.print("[yellow]Goal cannot be empty.[/yellow]")
+                        continue
+
+                    task = RalphTask(
+                        id=_new_id(),
+                        goal=goal_str,
+                        completion_criteria=[
+                            f"Goal achieved: {goal_str}",
+                            "Output contains the completion promise token",
+                        ],
+                        verify_command=verify_cmd,
+                        completion_promise=RALPH_COMPLETION_PROMISE,
+                        max_iterations=max_iters,
+                    )
+                    _save_ralph_task(task)
+                    CONSOLE.print(
+                        f"[cyan]Ralph mode started | id: {task.id} | max_iters: {max_iters}"
+                        + (f" | verify: {verify_cmd}" if verify_cmd else "")
+                        + "[/cyan]"
+                    )
+                    _ralph_sink = CliOutputSink(CONSOLE)
+                    _ralph_token = _active_sink.set(_ralph_sink)
+                    try:
+                        task = await _ralph_task_loop(
+                            agent,
+                            task,
+                            system_prompt,
+                            skill_catalog,
+                            ctx_mgr,
+                        )
+                    finally:
+                        _active_sink.reset(_ralph_token)
+                    status_color = "green" if task.status == "complete" else "yellow"
+                    CONSOLE.print(
+                        f"[{status_color}]Ralph complete | status: {task.status} | "
+                        f"iterations: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
+                    )
+                    continue
+                else:
+                    normalized_input, required_skills = prepare_user_message_for_skills(
+                        user_input, skill_catalog
+                    )
+                    if required_skills:
+                        user_input = normalized_input
+                        ctx.metadata["required_skills"] = required_skills
+                    else:
+                        CONSOLE.print(f"[yellow]Unknown command: {user_input}[/yellow]")
+                        continue
+            else:
+                normalized_input, required_skills = prepare_user_message_for_skills(
+                    user_input, skill_catalog
+                )
+                if required_skills:
+                    user_input = normalized_input
+                    ctx.metadata["required_skills"] = required_skills
+                else:
+                    ctx.metadata.pop("required_skills", None)
+
+            # Mark activity so idle timer resets and dirty flag is set
+            if ctx_mgr:
+                ctx_mgr.mark_activity()
+
+            # Record the first non-command user message as the task context so it
+            # can be re-injected into the system prompt after compaction occurs.
+            if not _task_context:
+                _task_context = user_input[:300]
+
+            # Create a fresh per-turn sink and register it in the ContextVar so
+            # tool helpers (_run_tool_uses) can find it without param threading.
+            _turn_sink = CliOutputSink(CONSOLE)
+            _sink_token = _active_sink.set(_turn_sink)
+
+            try:
+                CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+                ctx.metadata["skill_catalog"] = skill_catalog
+
+                # Hot-reload: recompose system prompt when skill catalog was mutated
+                if skill_catalog.consume_dirty():
+                    refreshed = agent_module._compose_system_prompt(
+                        components["base_system_prompt"],
+                        components["registry"],
+                        components.get("workspace_root"),
+                        components.get("output_dir"),
+                        skill_catalog=skill_catalog,
+                        plugin_catalog=plugin_catalog,
+                    )
+                    components["system_prompt"] = refreshed
+                    ctx.system_prompt = _with_task_context(refreshed, _task_context)
+
+                result = await agent.send_message(
+                    ctx, user_input, stream_callback=_turn_sink.sync_stream_cb
+                )
+                # on_turn_complete: renders markdown if no streaming happened,
+                # always prints trailing newline, and clears _streamed buffer.
+                _turn_sink.on_turn_complete(
+                    result.content or "", result.tool_calls_made
+                )
+                if result.error:
+                    CONSOLE.print(f"[red]Error: {result.error}[/red]")
+
+                # Notify plugins of this completed turn (correction detection, etc.)
+                _session_tools_used.extend(result.tool_calls_made)
+                _session_turn_count += 1
+                await plugin_catalog.fire_turn_end(
+                    TurnEvent(
+                        user_input=user_input,
+                        agent_response=result.content or "",
+                        tool_calls=result.tool_calls_made,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        turn_index=_session_turn_count,
+                    )
+                )
+
+                # Stage this turn (user input + assistant reply) for consolidation
+                if ctx_mgr:
+                    ctx_mgr.staging.append("user", user_input)
+                    if result.content:
+                        ctx_mgr.staging.append("assistant", result.content)
+                    if ctx_mgr.should_enqueue_consolidation():
+                        ctx_mgr.enqueue_consolidation("staged_turns")
+
+                # Keep working memory bounded without blocking on LLM consolidation.
+                if ctx_mgr and ctx_mgr.should_compact_messages(
+                    ctx.messages, agent.max_tokens
+                ):
+                    ctx.messages = ctx_mgr.compact_messages(ctx.messages)
+                    # Rebuild from the latest composed system prompt so prompt
+                    # updates from /evolve or /generate-tool are preserved even
+                    # after message compaction drops earlier turns.
+                    ctx.system_prompt = _with_task_context(
+                        components["system_prompt"], _task_context
+                    )
+                    # Trigger background consolidation of the staging buffer so
+                    # facts from the dropped messages land in LTM and become
+                    # available via retrieve_ltm_context() on the next turn.
+                    # wake() is non-blocking: the background worker thread runs
+                    # the consolidation job while the user reads this response
+                    # and types their next message.
+                    # Guard: require at least min_messages staged entries.
+                    # Without this, compact fires a consolidation job even with
+                    # a single staged turn, and wake() makes the background
+                    # worker bypass the idle gate, running immediately.
+                    if (
+                        memory_worker
+                        and ctx_mgr.staging.count() >= ctx_mgr.min_messages
+                    ):
+                        ctx_mgr.enqueue_consolidation("compact_triggered")
+                        memory_worker.wake()
+
+            except Exception as e:
+                CONSOLE.print(f"\n[red]Error: {e}[/red]")
+            finally:
+                # Always reset the sink ContextVar after each turn so stale
+                # references cannot bleed into the next turn.
+                _active_sink.reset(_sink_token)
+
+    finally:
+        if memory_worker:
+            memory_worker.stop()
+            await memory_worker.wait()
+
+        # Session-end consolidation runs inside the finally block so it is
+        # protected against KeyboardInterrupt during the input loop.  A single
+        # ^C is caught by the inner except and causes a normal break; the
+        # finally block then runs this code before the process exits.
+        # (A ^C^C that arrives *here* can still abort — that is user intent.)
+        if ctx_mgr and ctx_mgr.should_session_end_sleep():
+            CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
+            try:
+                ctx_mgr.enqueue_consolidation("session_end")
+                while ctx_mgr.pending_jobs():
+                    await ctx_mgr.process_one_job(
+                        components["client"],
+                        components["model"],
+                        api_format=agent.api_format,
+                    )
+                ctx.messages = ctx_mgr.compact_messages(ctx.messages)
+            except Exception as e:
+                CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
+
+        # P0-1: session-end plugin notifications INSIDE finally so they fire
+        # even when KeyboardInterrupt breaks the input loop.
+        if len(ctx.messages) >= 2:
+            try:
+                await plugin_catalog.fire_session_end(
+                    SessionEvent(
+                        messages=ctx.messages,
+                        tools_used=_session_tools_used,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        turn_count=_session_turn_count,
+                    )
+                )
+            except Exception as exc:
+                CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
+
+    CONSOLE.print("\n[dim]Goodbye.[/dim]")
+
+
+@app.callback(invoke_without_command=True)
+def main_callback(ctx: typer.Context):
+    """Enter interactive chat when no subcommand is given."""
+    if ctx.invoked_subcommand is None:
+        cfg, first_run = agent_module.load_config()
+        if first_run:
+            if not agent_module._first_run_setup():
+                raise typer.Exit(0)
+            # Reload after potential edits
+            cfg, _ = agent_module.load_config()
+
+        async def _run():
+            try:
+                components = await agent_module._build_components_async(cfg)
+            except RuntimeError as exc:
+                CONSOLE.print(f"[red]Error: {exc}[/red]")
+                raise typer.Exit(1)
+            try:
+                await _interactive_loop(components, cfg)
+            finally:
+                await agent_module._close_components(components)
+
+        asyncio.run(_run())
+
+
+@app.command()
+def gateway():
+    """Start all configured external channels (Feishu, etc.).
+
+    Reads channel configuration from ``~/.agent/config.json`` under the
+    ``channels`` key.  Runs until interrupted (Ctrl-C) or all channels
+    disconnect.
+
+    Example config for Feishu::
+
+        {
+          "channels": {
+            "feishu": {
+              "enabled": true,
+              "app_id": "cli_xxxx",
+              "app_secret": "xxxx"
+            }
+          }
+        }
+
+    Install Feishu dependency from the repository::
+
+        uv sync --extra feishu
+        uv run simple gateway
+
+    Or reinstall the global uv tool with Feishu support::
+
+        uv tool install --reinstall --editable . --with lark-oapi
+        simple gateway
+    """
+    cfg, first_run = agent_module.load_config()
+    if first_run:
+        if not agent_module._first_run_setup():
+            raise typer.Exit(0)
+        cfg, _ = agent_module.load_config()
+
+    async def _run():
+        try:
+            components = await agent_module._build_components_async(cfg)
+        except RuntimeError as exc:
+            CONSOLE.print(f"[red]Error: {exc}[/red]")
+            raise typer.Exit(1)
+        try:
+            channels = _build_gateway_channels(cfg)
+            if not channels:
+                CONSOLE.print(
+                    "[yellow]No channels configured or none could be initialised.\n"
+                    "Add channels.feishu.enabled=true to ~/.agent/config.json[/yellow]"
+                )
+                return
+            CONSOLE.print(
+                f"[dim]Gateway starting {len(channels)} channel(s). "
+                "Press Ctrl-C to stop.[/dim]"
+            )
+            runner = ChannelRunner(channels, components, cfg)
+            await runner.run()
+        finally:
+            await agent_module._close_components(components)
+
+    asyncio.run(_run())
+
+
+@app.command()
+def chat(question: str = typer.Argument(..., help="Question or task for the agent")):
+    """Single-turn chat with the agent."""
+    cfg, first_run = agent_module.load_config()
+    if first_run:
+        if not agent_module._first_run_setup():
+            raise typer.Exit(0)
+        cfg, _ = agent_module.load_config()
+
+    async def _run():
+        components = await agent_module._build_components_async(cfg)
+        agent: BaseAgent = components["agent"]
+        ctx = AgentContext(system_prompt=components["system_prompt"])
+        skill_catalog: SkillCatalog = components["skill_catalog"]
+        normalized_question, required_skills = prepare_user_message_for_skills(
+            question, skill_catalog
+        )
+        if required_skills:
+            ctx.metadata["required_skills"] = required_skills
+        ctx.metadata["skill_catalog"] = skill_catalog
+        CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+        try:
+            result = await agent.send_message(
+                ctx,
+                normalized_question,
+                stream_callback=lambda chunk: CONSOLE.print(
+                    chunk, end="", markup=False
+                ),
+            )
+            CONSOLE.print()
+            if result.error:
+                CONSOLE.print(f"[red]Error: {result.error}[/red]")
+        finally:
+            await agent_module._close_components(components)
+
+    asyncio.run(_run())
+
+
+@app.command()
+def evolve(
+    rewrite: bool = typer.Option(
+        False, "--rewrite", help="Rewrite system prompt from session history"
+    ),
+    apply_best: bool = typer.Option(
+        False, "--apply-best", help="Apply best-scoring prompt"
+    ),
+    stats: bool = typer.Option(False, "--stats", help="Show RL statistics"),
+):
+    """Self-evolution: analyze history and optimize the agent."""
+    cfg, _ = agent_module.load_config()
+
+    async def _run():
+        components = await agent_module._build_components_async(cfg)
+        evolution: Optional[EvolutionEngine] = components["evolution"]
+        if evolution is None:
+            CONSOLE.print(
+                "[yellow]Evolution is disabled (set evolution.enabled=true in config to enable).[/yellow]"
+            )
+            await agent_module._close_components(components)
+            return
+        try:
+            if stats:
+                s = evolution.get_stats()
+                table = Table(title="RL Statistics")
+                table.add_column("Metric")
+                table.add_column("Value")
+                for k, v in s.items():
+                    table.add_row(k, str(v))
+                CONSOLE.print(table)
+            elif apply_best:
+                prompt = evolution.apply_best_prompt()
+                CONSOLE.print("[green]Applied best prompt.[/green]")
+                CONSOLE.print(f"[dim]{prompt[:200]}...[/dim]")
+            else:
+                CONSOLE.print("[yellow]Rewriting system prompt...[/yellow]")
+                new_prompt = await evolution.rewrite_system_prompt()
+                CONSOLE.print("[green]Done. New prompt:[/green]")
+                CONSOLE.print(Markdown(new_prompt[:500]))
+        finally:
+            await _close_components(components)
+
+    asyncio.run(_run())
+
+
+@app.command()
+def config(
+    action: str = typer.Argument(..., help="Action: list | models | get"),
+    key: Optional[str] = typer.Argument(
+        None, help="Config key (dot-notation supported, e.g. providers.qwen.base_url)"
+    ),
+):
+    """View agent configuration (read-only).
+
+    Examples:
+      config list                              # show current config
+      config models                            # list configured providers
+      config get providers.qwen.default_model  # read a specific key
+    """
+    cfg, _ = agent_module.load_config()
+
+    if action == "list":
+        CONSOLE.print(
+            Markdown(f"```json\n{json.dumps(cfg, indent=2, ensure_ascii=False)}\n```")
+        )
+
+    elif action == "models":
+        providers = agent_module.ModelClientFactory.list_providers(cfg)
+        table = Table(title="Configured Providers")
+        table.add_column("Name")
+        table.add_column("Format")
+        table.add_column("Default Model")
+        table.add_column("Base URL")
+        table.add_column("Active")
+        for p in providers:
+            mark = "[bold green]✓[/bold green]" if p["active"] else ""
+            table.add_row(p["name"], p["format"], p["model"], p["base_url"], mark)
+        CONSOLE.print(table)
+
+    elif action == "get":
+        if not key:
+            CONSOLE.print("[red]Key required for 'get'[/red]")
+            raise typer.Exit(1)
+        parts = key.split(".")
+        cur: Any = cfg
+        for p in parts:
+            if not isinstance(cur, dict):
+                cur = None
+                break
+            cur = cur.get(p)
+        if cur is None:
+            CONSOLE.print(f"[yellow]Key '{key}' not found[/yellow]")
+        else:
+            CONSOLE.print(f"{key} = {cur}")
+
+    else:
+        CONSOLE.print(f"[red]Unknown action '{action}'. Use: list | models | get[/red]")
+        raise typer.Exit(1)
+
+
+# ── Memory subcommands ────────────────────────────────────────────────────────
+
+
+@memory_app.command("ls")
+def memory_ls():
+    """List all memory chapters and file counts."""
+    memory = MemoryPalace()
+    table = Table(title="Memory Palace")
+    table.add_column("Chapter")
+    table.add_column("Files")
+    table.add_column("File Names")
+    for ch in memory.list_chapters():
+        table.add_row(ch["name"], str(len(ch["files"])), ", ".join(ch["files"][:5]))
+    CONSOLE.print(table)
+
+
+@memory_app.command("show")
+def memory_show(
+    path: str = typer.Argument(..., help="chapter/name (e.g. projects/myproject)"),
+):
+    """Show contents of a memory file."""
+    parts = path.strip("/").split("/", 1)
+    if len(parts) != 2:
+        CONSOLE.print("[red]Path must be chapter/name[/red]")
+        raise typer.Exit(1)
+    chapter, name = parts
+    memory = MemoryPalace()
+    content = memory.read(chapter, name)
+    if content:
+        CONSOLE.print(Markdown(content))
+    else:
+        CONSOLE.print(f"[yellow]No memory at {path}[/yellow]")
+
+
+@memory_app.command("search")
+def memory_search(query: str = typer.Argument(..., help="Search query")):
+    """Search across all memory files."""
+    memory = MemoryPalace()
+    results = memory.search(query)
+    if not results:
+        CONSOLE.print(f"[yellow]No results for '{query}'[/yellow]")
+        return
+    table = Table(title=f"Search: {query}")
+    table.add_column("Path")
+    table.add_column("Snippet")
+    for r in results:
+        table.add_row(r["path"], r["snippet"][:80])
+    CONSOLE.print(table)
+
+
+@memory_app.command("tidy")
+def memory_tidy():
+    """Manually trigger AI-assisted memory reorganization."""
+    cfg, _ = agent_module.load_config()
+
+    async def _run():
+        components = await agent_module._build_components_async(cfg)
+        mem: MemoryPalace = components["memory"]
+        mem.force_tidy()
+        try:
+            await mem.tidy(components["client"], components["model"])
+        finally:
+            await agent_module._close_components(components)
+
+    asyncio.run(_run())
+
+
+@memory_app.command("index")
+def memory_index():
+    """Show the memory palace index."""
+    memory = MemoryPalace()
+    CONSOLE.print(Markdown(memory.read_index()))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    app()
