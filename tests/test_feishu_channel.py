@@ -382,27 +382,12 @@ def test_feishu_sink_on_tool_end_is_noop():
         loop.close()
 
 
-def test_feishu_sink_stream_chunk_schedules_streaming_update():
+def test_feishu_sink_stream_chunk_does_not_emit_summary_before_turn_complete():
     sink = _make_feishu_sink()
     sink.streaming = True
-    loop = asyncio.new_event_loop()
-    try:
-
-        async def _run():
-            with patch.object(
-                sink,
-                "_flush_stream_async",
-                new=AsyncMock(),
-            ) as mock_flush:
-                sink.on_stream_chunk("hello")
-                assert sink._chunks == ["hello"]
-                assert len(sink._pending) == 1
-                await sink.drain()
-                mock_flush.assert_awaited_once()
-
-        loop.run_until_complete(_run())
-    finally:
-        loop.close()
+    sink.on_stream_chunk("hello")
+    assert sink._chunks == ["hello"]
+    assert sink._pending == []
 
 
 def test_feishu_sink_write_file_tool_end_schedules_file_send(tmp_path):
@@ -493,6 +478,37 @@ def test_feishu_sink_subagent_event_schedules_process_card_update():
         loop.close()
 
 
+def test_feishu_sink_tool_start_always_uses_progress_card_when_streaming():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ) as mock_progress, patch.object(
+                sink,
+                "_send_tool_hint_async",
+                new=AsyncMock(),
+            ) as mock_hint, patch.object(
+                sink,
+                "_flush_stream_async",
+                new=AsyncMock(),
+            ) as mock_stream:
+                sink.on_tool_start("bash", {"command": "ls"})
+                await sink.drain()
+                mock_progress.assert_awaited_once()
+                mock_hint.assert_not_called()
+                mock_stream.assert_not_called()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
 def test_feishu_sink_tool_start_uses_process_card_when_progress_active():
     sink = _make_feishu_sink()
     sink.streaming = True
@@ -514,6 +530,33 @@ def test_feishu_sink_tool_start_uses_process_card_when_progress_active():
                 await sink.drain()
                 mock_flush.assert_awaited_once()
                 mock_hint.assert_not_called()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_tool_start_never_appends_to_summary_card():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    sink._stream_buf.text = "Summary draft"
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ) as mock_progress, patch.object(
+                sink,
+                "_flush_stream_async",
+                new=AsyncMock(),
+            ) as mock_stream:
+                sink.on_tool_start("bash", {"command": "ls"})
+                await sink.drain()
+                mock_progress.assert_awaited_once()
+                mock_stream.assert_not_called()
 
         loop.run_until_complete(_run())
     finally:
@@ -705,6 +748,37 @@ def test_feishu_channel_start_raises_missing_credentials():
         asyncio.run(channel.start(lambda msg, sink: True))
 
 
+def test_register_optional_event_calls_builder_when_method_exists():
+    channel = FeishuChannel(FeishuConfig())
+    builder = MagicMock()
+    handler = object()
+    method = MagicMock(return_value=builder)
+    builder.register_demo_event = method
+
+    result = channel._register_optional_event(builder, "register_demo_event", handler)
+
+    assert result is builder
+    method.assert_called_once_with(handler)
+
+
+def test_register_optional_event_noops_when_method_missing():
+    channel = FeishuChannel(FeishuConfig())
+    builder = MagicMock()
+
+    result = channel._register_optional_event(builder, "register_missing_event", object())
+
+    assert result is builder
+
+
+def test_feishu_optional_event_handlers_are_noops():
+    channel = FeishuChannel(FeishuConfig())
+
+    assert channel._on_reaction_created(MagicMock()) is None
+    assert channel._on_reaction_deleted(MagicMock()) is None
+    assert channel._on_message_read(MagicMock()) is None
+    assert channel._on_bot_p2p_chat_entered(MagicMock()) is None
+
+
 def test_feishu_channel_create_sink_passes_output_dir():
     channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y", streaming=False))
     channel._client = MagicMock()
@@ -837,6 +911,22 @@ def test_build_gateway_channels_falls_back_to_empty_on_import_error():
         assert channels == []  # no fallback to CLI
     finally:
         sys.modules["channels.feishu"] = saved
+
+
+def test_missing_feishu_dependency_hint_mentions_uv_tool_env(monkeypatch):
+    import agent as agent_module
+
+    monkeypatch.setattr(
+        agent_module.sys,
+        "executable",
+        "/Users/shike/.local/share/uv/tools/simple/bin/python",
+    )
+
+    hint = agent_module._missing_feishu_dependency_hint()
+
+    assert "uv tool environment" in hint
+    assert "uv run simple gateway" in hint
+    assert "uv tool install --reinstall --editable . --with lark-oapi" in hint
 
 
 def _selective_import_error(name, *args, **kwargs):

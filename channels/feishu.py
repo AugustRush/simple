@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -289,38 +290,28 @@ class FeishuOutputSink(OutputSink):
     # ── OutputSink interface ──────────────────────────────────────────────────
 
     def on_stream_chunk(self, chunk: str) -> None:
-        """Accumulate chunks and progressively update a streaming card."""
+        """Accumulate final summary text; progress updates use a separate card."""
         self._chunks.append(chunk)
-        if not self.streaming or not chunk:
-            return
         self._stream_buf.text += chunk
-        if self._stream_buf.text.strip() and not self._stream_flush_pending:
-            self._stream_flush_pending = True
-            self._schedule(self._flush_stream_async())
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
         text = full_text or "".join(self._chunks)
         self._chunks.clear()
-        if text.strip() or self._output_dir is not None or self._stream_buf.card_id:
+        if (
+            text.strip()
+            or self._output_dir is not None
+            or self._progress_buf.card_id
+            or self._progress_buf.text.strip()
+        ):
             self._schedule(self._finish_turn_async(text))
 
     def on_tool_start(self, name: str, inputs: dict) -> None:
         hint = f"{name}{_fmt_tool_inputs(name, inputs)}"
-        if self.streaming and (
-            self._progress_buf.card_id is not None or self._progress_buf.text.strip()
-        ):
+        if self.streaming:
             self._append_progress_text(f"**Tool Call**\n\n```text\n{hint}\n```")
             if not self._progress_flush_pending:
                 self._progress_flush_pending = True
                 self._schedule(self._flush_progress_async(force=True))
-            return
-        if self.streaming and (
-            self._stream_buf.card_id is not None or self._stream_buf.text.strip()
-        ):
-            self._stream_buf.text += f"\n\n**Tool Call**\n\n```text\n{hint}\n```"
-            if not self._stream_flush_pending:
-                self._stream_flush_pending = True
-                self._schedule(self._flush_stream_async(force=True))
             return
         self._schedule(self._send_tool_hint_async(hint))
 
@@ -378,10 +369,10 @@ class FeishuOutputSink(OutputSink):
     async def _finish_turn_async(self, text: str) -> None:
         if self._progress_buf.card_id or self._progress_buf.text.strip():
             await self._finalize_progress_async()
-        if self._stream_buf.card_id:
-            await self._finalize_stream_async(text)
-        elif text.strip():
+        if text.strip():
             await self._send_response_async(text)
+        self._stream_buf = _FeishuStreamBuf()
+        self._stream_flush_pending = False
         await self._send_output_dir_files_async()
 
     async def _flush_stream_async(self, force: bool = False) -> None:
@@ -1123,6 +1114,15 @@ class FeishuChannel(Channel):
         # Ordered LRU cache for message-id deduplication
         self._processed_ids: OrderedDict[str, None] = OrderedDict()
 
+    @staticmethod
+    def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
+        """Register an event handler only when the SDK supports it."""
+        method = inspect.getattr_static(builder, method_name, None)
+        if method is None:
+            return builder
+        method = getattr(builder, method_name, None)
+        return method(handler) if callable(method) else builder
+
     # ── Channel interface ─────────────────────────────────────────────────────
 
     async def start(
@@ -1153,14 +1153,34 @@ class FeishuChannel(Channel):
         )
 
         # WebSocket event dispatcher
-        event_handler = (
+        builder = (
             lark.EventDispatcherHandler.builder(
                 self._config.encrypt_key or "",
                 self._config.verification_token or "",
             )
             .register_p2_im_message_receive_v1(self._on_message_sync)
-            .build()
         )
+        builder = self._register_optional_event(
+            builder,
+            "register_p2_im_message_reaction_created_v1",
+            self._on_reaction_created,
+        )
+        builder = self._register_optional_event(
+            builder,
+            "register_p2_im_message_reaction_deleted_v1",
+            self._on_reaction_deleted,
+        )
+        builder = self._register_optional_event(
+            builder,
+            "register_p2_im_message_message_read_v1",
+            self._on_message_read,
+        )
+        builder = self._register_optional_event(
+            builder,
+            "register_p2_im_chat_access_event_bot_p2p_chat_entered_v1",
+            self._on_bot_p2p_chat_entered,
+        )
+        event_handler = builder.build()
 
         ws_client = lark.ws.Client(
             self._config.app_id,
@@ -1229,6 +1249,18 @@ class FeishuChannel(Channel):
         """Called from the WebSocket thread; schedules async processing."""
         if self._loop and self._loop.is_running():
             asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+
+    def _on_reaction_created(self, data: Any) -> None:
+        """Ignore reaction-created events to avoid SDK 'processor not found' noise."""
+
+    def _on_reaction_deleted(self, data: Any) -> None:
+        """Ignore reaction-deleted events to avoid SDK 'processor not found' noise."""
+
+    def _on_message_read(self, data: Any) -> None:
+        """Ignore message-read events to avoid SDK 'processor not found' noise."""
+
+    def _on_bot_p2p_chat_entered(self, data: Any) -> None:
+        """Ignore bot-entered-chat events to avoid SDK 'processor not found' noise."""
 
     async def _on_message(self, data: Any) -> None:
         """Process one incoming Feishu message event (main event loop)."""

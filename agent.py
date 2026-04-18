@@ -7214,13 +7214,32 @@ def _build_gateway_channels(cfg: dict) -> list[Channel]:
             channels.append(FeishuChannel(FeishuConfig(**filtered)))
             CONSOLE.print("[dim]Feishu channel enabled[/dim]")
         except ImportError:
-            CONSOLE.print(
-                "[red]lark-oapi not installed. Run: uv sync --extra feishu[/red]"
-            )
+            CONSOLE.print(f"[red]{_missing_feishu_dependency_hint()}[/red]")
         except Exception as exc:
             CONSOLE.print(f"[red]Feishu channel init failed: {exc}[/red]")
 
     return channels
+
+
+def _missing_feishu_dependency_hint() -> str:
+    exe = Path(sys.executable).as_posix()
+    if "/.local/share/uv/tools/" in exe:
+        return (
+            "lark-oapi not installed in the uv tool environment.\n"
+            "If you're running from this repo, use:\n"
+            "  uv run simple gateway\n"
+            "after:\n"
+            "  uv sync --extra feishu\n"
+            "Or reinstall the tool from this repo with:\n"
+            "  uv tool install --reinstall --editable . --with lark-oapi"
+        )
+    return (
+        "lark-oapi not installed in the current Python environment.\n"
+        "If you're in this repo, run:\n"
+        "  uv sync --extra feishu\n"
+        "and start with:\n"
+        "  uv run simple gateway"
+    )
 
 
 async def _interactive_loop(components: dict, cfg: dict):
@@ -7753,9 +7772,15 @@ def gateway():
           }
         }
 
-    Install Feishu dependency::
+    Install Feishu dependency from the repository::
 
         uv sync --extra feishu
+        uv run simple gateway
+
+    Or reinstall the global uv tool with Feishu support::
+
+        uv tool install --reinstall --editable . --with lark-oapi
+        simple gateway
     """
     cfg, first_run = load_config()
     if first_run:

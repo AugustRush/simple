@@ -115,6 +115,36 @@ Install as a tool to get `simple` directly on `PATH`:
 uv tool install --editable .
 ```
 
+Install as a tool with Feishu support:
+
+```bash
+uv tool install --reinstall --editable . --with lark-oapi
+```
+
+## Feishu Gateway
+
+If you run from the repository, install the optional Feishu dependency into the
+project environment and start through `uv run`:
+
+```bash
+uv sync --extra feishu
+uv run simple gateway
+```
+
+If you use the globally installed `simple` command from `uv tool install`, the
+tool has its own isolated Python environment. In that case, install or reinstall
+the tool with `lark-oapi` included:
+
+```bash
+uv tool install --reinstall --editable . --with lark-oapi
+simple gateway
+```
+
+Do not mix these two paths:
+
+- `uv sync --extra feishu` only affects the repository `.venv`
+- `simple gateway` may use the separate `uv tool` environment on your `PATH`
+
 ## Interactive Commands
 
 | Command | Description |

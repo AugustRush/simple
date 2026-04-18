@@ -131,7 +131,8 @@
     "feishu": {
       "_readme": [
         "Feishu/Lark bot via WebSocket long connection (no public IP required).",
-        "Requires: pip install lark-oapi",
+        "If running from the repo: uv sync --extra feishu && uv run simple gateway",
+        "If using a globally installed uv tool: uv tool install --reinstall --editable . --with lark-oapi",
         "1. Create a Feishu app at https://open.feishu.cn/app",
         "2. Enable 'Bot' capability and subscribe to 'im.message.receive_v1' event",
         "3. Copy App ID and App Secret below",
