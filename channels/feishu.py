@@ -273,6 +273,7 @@ class FeishuOutputSink(OutputSink):
         self.streaming = streaming
         self._chunks: list[str] = []
         self._pending: list[asyncio.Task] = []
+        self._send_tail: asyncio.Task | None = None
         self._first_reply = True  # first send of this response uses Reply API
         self._turn_start = time.time()
         self._stream_buf = _FeishuStreamBuf()
@@ -346,17 +347,31 @@ class FeishuOutputSink(OutputSink):
 
     async def drain(self) -> None:
         """Await all pending send tasks before the handler returns."""
-        if self._pending:
-            await asyncio.gather(*self._pending, return_exceptions=True)
+        while self._pending:
+            pending = list(self._pending)
+            await asyncio.gather(*pending, return_exceptions=True)
             self._pending.clear()
+        if self._send_tail is not None and self._send_tail.done():
+            self._send_tail = None
 
     # ── Internal scheduling ───────────────────────────────────────────────────
 
     def _schedule(self, coro: Any) -> None:
         """Schedule a coroutine as a tracked asyncio task."""
+        previous = self._send_tail
+
+        async def _run_in_order() -> None:
+            if previous is not None:
+                try:
+                    await previous
+                except BaseException:
+                    pass
+            await coro
+
         try:
-            task = asyncio.ensure_future(coro)
+            task = asyncio.ensure_future(_run_in_order())
             self._pending.append(task)
+            self._send_tail = task
         except RuntimeError:
             if inspect.iscoroutine(coro):
                 coro.close()
@@ -367,10 +382,12 @@ class FeishuOutputSink(OutputSink):
     async def _finish_turn_async(self, text: str) -> None:
         if self._progress_buf.card_id or self._progress_buf.text.strip():
             await self._finalize_progress_async()
-        if text.strip():
+        if self.streaming and (
+            self._stream_buf.card_id or self._stream_buf.text.strip()
+        ):
+            await self._finalize_stream_async(text)
+        elif text.strip():
             await self._send_response_async(text)
-        self._stream_buf = _FeishuStreamBuf()
-        self._stream_flush_pending = False
         await self._send_output_dir_files_async()
 
     async def _flush_stream_async(self, force: bool = False) -> None:

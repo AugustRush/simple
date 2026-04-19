@@ -315,14 +315,17 @@ def test_feishu_sink_stream_chunk_schedules_stream_flush_when_streaming_enabled(
     try:
 
         async def _run():
-            sink.on_stream_chunk("hello")
-            assert sink._stream_buf.text == "hello"
-            assert sink._stream_flush_pending is True
-            assert len(sink._pending) == 1
-
-            for task in sink._pending:
-                task.cancel()
-            await asyncio.gather(*sink._pending, return_exceptions=True)
+            with patch.object(
+                sink,
+                "_flush_stream_async",
+                new=AsyncMock(),
+            ) as mock_flush:
+                sink.on_stream_chunk("hello")
+                assert sink._stream_buf.text == "hello"
+                assert sink._stream_flush_pending is True
+                assert len(sink._pending) == 1
+                await sink.drain()
+                mock_flush.assert_awaited_once()
 
         loop.run_until_complete(_run())
     finally:
@@ -411,13 +414,16 @@ def test_feishu_sink_stream_chunk_does_not_emit_summary_before_turn_complete():
     try:
 
         async def _run():
-            sink.on_stream_chunk("hello")
-            assert sink._chunks == ["hello"]
-            assert len(sink._pending) == 1
-
-            for task in sink._pending:
-                task.cancel()
-            await asyncio.gather(*sink._pending, return_exceptions=True)
+            with patch.object(
+                sink,
+                "_flush_stream_async",
+                new=AsyncMock(),
+            ) as mock_flush:
+                sink.on_stream_chunk("hello")
+                assert sink._chunks == ["hello"]
+                assert len(sink._pending) == 1
+                await sink.drain()
+                mock_flush.assert_awaited_once()
 
         loop.run_until_complete(_run())
     finally:
@@ -620,6 +626,78 @@ def test_feishu_sink_turn_complete_finalizes_process_card_before_final_answer():
                 await sink.drain()
                 mock_finalize.assert_awaited_once()
                 mock_send_response.assert_awaited_once_with("final answer")
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_drain_preserves_progress_before_final_answer_order():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    events: list[str] = []
+
+    async def _slow_flush_progress(*args, **kwargs):
+        await asyncio.sleep(0.01)
+        events.append("flush_progress")
+
+    async def _finalize_progress(*args, **kwargs):
+        events.append("finalize_progress")
+
+    async def _send_response(text):
+        events.append(f"final:{text}")
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=_slow_flush_progress,
+            ), patch.object(
+                sink,
+                "_finalize_progress_async",
+                new=_finalize_progress,
+            ), patch.object(
+                sink,
+                "_send_response_async",
+                new=_send_response,
+            ):
+                sink.on_tool_start("shell", {"command": "echo hi"})
+                sink.on_turn_complete("done", [])
+                await sink.drain()
+
+            assert events == ["flush_progress", "finalize_progress", "final:done"]
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_turn_complete_finalizes_stream_card_without_extra_final_message():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    sink._stream_buf.card_id = "card_stream"
+    sink._stream_buf.text = "hello"
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_finalize_stream_async",
+                new=AsyncMock(),
+            ) as mock_finalize, patch.object(
+                sink,
+                "_send_response_async",
+                new=AsyncMock(),
+            ) as mock_send_response:
+                sink.on_turn_complete("hello", [])
+                await sink.drain()
+                mock_finalize.assert_awaited_once_with("hello")
+                mock_send_response.assert_not_awaited()
 
         loop.run_until_complete(_run())
     finally:
