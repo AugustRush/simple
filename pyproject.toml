@@ -31,3 +31,11 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["agent*", "channels*"]
+
+[tool.setuptools.package-data]
+agent = [
+  "_builtin/skills/**/*.md",
+  "_builtin/skills/**/*.py",
+  "_builtin/plugins/**/*.json",
+  "_builtin/plugins/**/*.py",
+]

@@ -530,11 +530,10 @@ def test_evolution_plugin_slash_commands_registered():
 
 
 def test_correction_detector_high_confidence_english(tmp_path):
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from detector import CorrectionDetector
 
     d = CorrectionDetector()
@@ -546,11 +545,10 @@ def test_correction_detector_high_confidence_english(tmp_path):
 
 def test_correction_detector_low_confidence_needs_two_matches():
     """'actually' alone is ambiguous — should NOT fire."""
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from detector import CorrectionDetector
 
     d = CorrectionDetector()
@@ -566,11 +564,10 @@ def test_correction_detector_low_confidence_needs_two_matches():
 
 def test_correction_detector_returns_confidence():
     """detect() should return a CorrectionSignal with confidence."""
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from detector import CorrectionDetector
 
     d = CorrectionDetector()
@@ -585,12 +582,10 @@ def test_correction_detector_returns_confidence():
 
 
 def test_correction_detector_detects_chinese():
-    from pathlib import Path
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from detector import CorrectionDetector
 
     d = CorrectionDetector()
@@ -602,12 +597,10 @@ def test_correction_detector_detects_chinese():
 
 
 def test_correction_detector_ignores_short_prev_response():
-    from pathlib import Path
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from detector import CorrectionDetector
 
     d = CorrectionDetector()
@@ -619,11 +612,10 @@ def test_correction_detector_ignores_short_prev_response():
 
 
 def test_rule_store_add_and_retrieve(tmp_path):
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from rules import RuleStore
 
     store = RuleStore(rules_file=tmp_path / "rules.jsonl")
@@ -634,11 +626,10 @@ def test_rule_store_add_and_retrieve(tmp_path):
 
 
 def test_rule_store_promotion_on_good_performance(tmp_path):
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from rules import RuleStore, EVAL_THRESHOLD
 
     store = RuleStore(rules_file=tmp_path / "rules.jsonl")
@@ -650,11 +641,10 @@ def test_rule_store_promotion_on_good_performance(tmp_path):
 
 
 def test_rule_store_retirement_on_no_improvement(tmp_path):
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from rules import RuleStore, EVAL_THRESHOLD
 
     store = RuleStore(rules_file=tmp_path / "rules.jsonl")
@@ -666,11 +656,10 @@ def test_rule_store_retirement_on_no_improvement(tmp_path):
 
 
 def test_rule_store_get_active_rule_ids(tmp_path):
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from rules import RuleStore
 
     store = RuleStore(rules_file=tmp_path / "rules.jsonl")
@@ -685,11 +674,10 @@ def test_rule_store_get_active_rule_ids(tmp_path):
 
 def test_evolution_plugin_on_turn_end_records_application(tmp_path):
     """on_turn_end must call record_application for every active rule."""
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from rules import RuleStore
     from agent import PluginCatalog, PLUGINS_DIR, TurnEvent
 
@@ -719,11 +707,10 @@ def test_evolution_plugin_on_turn_end_records_application(tmp_path):
 
 def test_evolution_plugin_on_turn_end_records_correction(tmp_path):
     """on_turn_end must detect corrections and increment corrections_after."""
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from rules import RuleStore
     from agent import PluginCatalog, PLUGINS_DIR, TurnEvent
 
@@ -752,11 +739,10 @@ def test_evolution_plugin_on_turn_end_records_correction(tmp_path):
 
 def test_evolution_plugin_compose_returns_rules(tmp_path):
     """compose_system_prompt should include active rules."""
+    from agent import PLUGINS_DIR
     import sys
 
-    sys.path.insert(
-        0, str(Path(__file__).resolve().parent.parent / "plugins" / "evolution")
-    )
+    sys.path.insert(0, str(PLUGINS_DIR / "evolution"))
     from rules import RuleStore
     from agent import PluginCatalog, PLUGINS_DIR
 

@@ -162,7 +162,7 @@ async def _maybe_await(value: Any) -> Any:
 class PluginCatalog:
     """Discovers, loads, and orchestrates agent plugins from disk.
 
-    Built-in plugins are loaded from ``PLUGINS_DIR`` (project-root/plugins/).
+    Built-in plugins are loaded from ``PLUGINS_DIR`` (package builtin plugins).
     User plugins are loaded from ``USER_PLUGINS_DIR`` (~/.agent/plugins/).
 
     Each plugin directory must contain ``__init__.py`` with a top-level
@@ -411,5 +411,4 @@ class PluginCatalog:
                 _pname = getattr(plugin, "name", "?")
                 CONSOLE.print(f"[dim]Plugin '{_pname}' post_tool error: {exc}[/dim]")
         return result
-
 

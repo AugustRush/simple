@@ -894,7 +894,7 @@ def test_hot_reload_updates_summary_lines(tmp_path):
 
 
 def test_skill_manager_builtin_skill_is_discovered(tmp_path):
-    """The skill-manager built-in skill should be discovered from the repo's skills/ dir."""
+    """The skill-manager built-in skill should be discovered from the package builtin skills dir."""
     import agent as agent_module
 
     # Use the package-exported builtin skill root instead of the old single-file path.

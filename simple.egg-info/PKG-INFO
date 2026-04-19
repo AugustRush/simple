@@ -266,7 +266,7 @@ The skill-manager bundle also includes `scripts/init_skill.py` and `scripts/quic
 
 ## Plugins
 
-Plugins extend the agent with lifecycle hooks, system prompt contributions, and slash commands. Each plugin is a directory under `plugins/` (built-in) or `~/.agent/plugins/` (user).
+Plugins extend the agent with lifecycle hooks, system prompt contributions, and slash commands. Each plugin is a directory under `agent/_builtin/plugins/` (built-in) or `~/.agent/plugins/` (user).
 
 ### Plugin structure
 
@@ -383,18 +383,12 @@ User tool plugins are loaded from `~/.agent/tools`. Each plugin is a Python file
 .
 ├── agent/                          # Package runtime and public entrypoints
 ├── config.example.json             # Full config reference
-├── plugins/
-│   └── evolution/
-│       ├── __init__.py             # EvolutionPlugin
-│       ├── plugin.json             # Plugin manifest
-│       ├── detector.py             # CorrectionDetector
-│       └── rules.py                # RuleStore + BehaviorRule
-├── skills/
-│   └── skill-manager/
-│       ├── SKILL.md                # Skill management instructions
-│       └── scripts/
-│           ├── init_skill.py       # Scaffold new skill bundles
-│           └── quick_validate.py   # Validate skill structure
+├── agent/
+│   ├── _builtin/
+│   │   ├── plugins/
+│   │   │   └── evolution/
+│   │   └── skills/
+│   │       └── skill-manager/
 ├── scripts/
 │   └── benchmark_memory.py
 ├── tests/
