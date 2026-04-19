@@ -733,19 +733,31 @@ class BuiltinTools:
     def _error(self, message: str, **payload: Any) -> dict[str, Any]:
         return {"ok": False, "error": message, **payload}
 
-    def _resolve_workspace_path(self, path: str) -> Path:
+    def _allowed_roots(self) -> list[Path]:
+        roots = [self.workspace_root]
+        if self._output_dir is not None:
+            roots.append(self._output_dir.resolve())
+        return roots
+
+    def _resolve_tool_path(self, path: str) -> tuple[Path, str]:
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
             candidate = self.workspace_root / candidate
         resolved = candidate.resolve(strict=False)
-        if (
-            resolved != self.workspace_root
-            and self.workspace_root not in resolved.parents
-        ):
-            raise ValueError(
-                f"Path '{path}' is outside the workspace root '{self.workspace_root}'"
+        for root in self._allowed_roots():
+            if resolved == root or root in resolved.parents:
+                kind = "output_dir" if self._output_dir is not None and root == self._output_dir.resolve() else "workspace"
+                return resolved, kind
+        allowed = [str(root) for root in self._allowed_roots()]
+        raise ValueError(
+            f"Path '{path}' is outside the workspace root '{self.workspace_root}'"
+            + (
+                f" and output directory '{self._output_dir.resolve()}'"
+                if self._output_dir is not None
+                else ""
             )
-        return resolved
+            + f". Allowed roots: {', '.join(allowed)}"
+        )
 
     async def _shell(self, command: str, timeout: int = 30) -> dict[str, Any]:
         # Security: block dangerous commands before spawning any subprocess.
@@ -832,7 +844,7 @@ class BuiltinTools:
         self, path: str, max_bytes: int = TOOL_DEFAULT_MAX_READ_BYTES
     ) -> dict[str, Any]:
         try:
-            p = self._resolve_workspace_path(path)
+            p, root_kind = self._resolve_tool_path(path)
             if not p.exists():
                 return self._error(f"'{path}' does not exist", path=str(p))
             if not p.is_file():
@@ -841,11 +853,24 @@ class BuiltinTools:
             with open(p, "rb") as f:
                 chunk = f.read(max_bytes + 1)
             if self._is_binary_bytes(chunk):
+                if root_kind == "output_dir":
+                    return self._ok(
+                        path=str(p),
+                        content="",
+                        binary=True,
+                        truncated=len(chunk) > max_bytes,
+                        bytes_read=min(len(chunk), max_bytes),
+                        message=(
+                            "Binary generated artifact in output directory; "
+                            "use the path directly or let the channel send the file."
+                        ),
+                    )
                 return self._error(f"'{path}' appears to be binary", path=str(p))
             text = chunk[:max_bytes].decode("utf-8", errors="replace")
             return self._ok(
                 path=str(p),
                 content=text,
+                binary=False,
                 truncated=len(chunk) > max_bytes,
                 bytes_read=min(len(chunk), max_bytes),
             )
@@ -861,7 +886,7 @@ class BuiltinTools:
         max_bytes: int = TOOL_DEFAULT_MAX_WRITE_BYTES,
     ) -> dict[str, Any]:
         try:
-            p = self._resolve_workspace_path(path)
+            p, _root_kind = self._resolve_tool_path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
             payload = content.encode("utf-8")
             max_bytes = max(1, min(int(max_bytes), TOOL_DEFAULT_MAX_WRITE_BYTES))
@@ -887,7 +912,7 @@ class BuiltinTools:
         max_results: int = TOOL_DEFAULT_MAX_LIST_RESULTS,
     ) -> dict[str, Any]:
         try:
-            p = self._resolve_workspace_path(path)
+            p, _root_kind = self._resolve_tool_path(path)
             if not p.exists():
                 return self._error(f"'{path}' does not exist", path=str(p))
             if not p.is_dir():

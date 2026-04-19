@@ -20,6 +20,27 @@ def make_builtin_tools(tmp_path):
     return tools, registry, workspace
 
 
+def make_builtin_tools_with_output_dir(tmp_path):
+    from agent import BuiltinTools, MemoryPalace, ToolRegistry
+
+    registry = ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "agent-output"
+    output.mkdir()
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    tools = BuiltinTools(
+        memory=memory,
+        registry=registry,
+        workspace_root=workspace,
+        output_dir=output,
+    )
+    return tools, registry, workspace, output
+
+
 def test_registry_rejects_duplicate_tool_names():
     from agent import ToolRegistry
 
@@ -145,6 +166,43 @@ def test_read_file_rejects_paths_outside_workspace(tmp_path):
 
     assert result["ok"] is False
     assert "outside the workspace" in result["error"].lower()
+
+
+def test_read_file_allows_text_files_in_output_dir(tmp_path):
+    tools, _, _workspace, output = make_builtin_tools_with_output_dir(tmp_path)
+    artifact = output / "result.txt"
+    artifact.write_text("generated", encoding="utf-8")
+
+    result = tools._read_file(str(artifact))
+
+    assert result["ok"] is True
+    assert result["path"] == str(artifact.resolve())
+    assert result["content"] == "generated"
+
+
+def test_read_file_returns_binary_metadata_for_output_dir_artifacts(tmp_path):
+    tools, _, _workspace, output = make_builtin_tools_with_output_dir(tmp_path)
+    artifact = output / "phoenix_fire.jpeg"
+    artifact.write_bytes(b"\xff\xd8\xff\x00fakejpeg")
+
+    result = tools._read_file(str(artifact))
+
+    assert result["ok"] is True
+    assert result["path"] == str(artifact.resolve())
+    assert result["binary"] is True
+    assert result["content"] == ""
+    assert "generated artifact" in result["message"]
+
+
+def test_list_files_allows_output_dir(tmp_path):
+    tools, _, _workspace, output = make_builtin_tools_with_output_dir(tmp_path)
+    artifact = output / "phoenix_fire.jpeg"
+    artifact.write_bytes(b"fake")
+
+    result = tools._list_files(str(output))
+
+    assert result["ok"] is True
+    assert str(artifact.resolve()) in result["items"]
 
 
 def test_write_file_rejects_paths_outside_workspace(tmp_path):
