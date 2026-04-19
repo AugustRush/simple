@@ -15,13 +15,14 @@ from rich.prompt import Prompt
 from rich.table import Table
 
 import agent as agent_module
+from agent import shared
 from agent.core.output import CliOutputSink, _active_sink
 
 AgentContext = agent_module.AgentContext
 BaseAgent = agent_module.BaseAgent
 ChannelRunner = agent_module.ChannelRunner
 CliOutputSink = CliOutputSink
-CONSOLE = agent_module.CONSOLE
+CONSOLE = shared.CONSOLE
 ContextManager = agent_module.ContextManager
 EvolutionEngine = agent_module.EvolutionEngine
 MemoryPalace = agent_module.MemoryPalace
@@ -31,7 +32,6 @@ RALPH_COMPLETION_PROMISE = agent_module.RALPH_COMPLETION_PROMISE
 RALPH_DEFAULT_MAX_ITERATIONS = agent_module.RALPH_DEFAULT_MAX_ITERATIONS
 SkillCatalog = agent_module.SkillCatalog
 StagingBuffer = agent_module.StagingBuffer
-STAGING_DIR = agent_module.STAGING_DIR
 TurnEvent = agent_module.TurnEvent
 _build_gateway_channels = agent_module._build_gateway_channels
 _new_id = agent_module._new_id
@@ -89,7 +89,7 @@ async def _ralph_task_loop(
 
     for i in range(task.max_iterations):
         task.current_iteration = i + 1
-        CONSOLE.print(
+        shared.CONSOLE.print(
             f"\n[dim]── Ralph iteration {task.current_iteration}/{task.max_iterations} ──[/dim]"
         )
 
@@ -100,17 +100,17 @@ async def _ralph_task_loop(
         collected: list[str] = []
 
         def _stream_cb(chunk: str, _col: list = collected) -> None:
-            CONSOLE.print(chunk, end="", markup=False)
+            shared.CONSOLE.print(chunk, end="", markup=False)
             _col.append(chunk)
 
-        CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+        shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
         result = await agent.send_message(
             iter_ctx, _build_iter_prompt(task), _stream_cb
         )
-        CONSOLE.print()
+        shared.CONSOLE.print()
 
         if result.error:
-            CONSOLE.print(f"[red]Error: {result.error}[/red]")
+            shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
 
         iter_summary = result.content[:300] if result.content else "(no output)"
         all_summaries.append(f"Iter {task.current_iteration}: {iter_summary}")
@@ -161,13 +161,13 @@ async def _ralph_task_loop(
                 v_exit = verify_proc.returncode
             except asyncio.TimeoutError:
                 v_exit = -1
-                CONSOLE.print("[yellow]Verify command timed out (60s)[/yellow]")
+                shared.CONSOLE.print("[yellow]Verify command timed out (60s)[/yellow]")
             except Exception as ve:
                 v_exit = -1
-                CONSOLE.print(f"[yellow]Verify command error: {ve}[/yellow]")
+                shared.CONSOLE.print(f"[yellow]Verify command error: {ve}[/yellow]")
 
             if v_exit == 0:
-                CONSOLE.print("[green]Verify passed (exit 0)[/green]")
+                shared.CONSOLE.print("[green]Verify passed (exit 0)[/green]")
                 task.status = "complete"
                 task.progress.append(
                     {
@@ -192,12 +192,12 @@ async def _ralph_task_loop(
                     iter_summary += (
                         f"\n\nverify_failed (exit {v_exit}):\n{verify_snippet}"
                     )
-                    CONSOLE.print(
+                    shared.CONSOLE.print(
                         f"[yellow]Verify failed (exit {v_exit}), continuing[/yellow]\n"
                         f"[dim]{verify_snippet[:200]}[/dim]"
                     )
                 else:
-                    CONSOLE.print(
+                    shared.CONSOLE.print(
                         f"[yellow]Verify failed (exit {v_exit}), continuing[/yellow]"
                     )
 
@@ -258,8 +258,8 @@ async def _interactive_loop(components: dict, cfg: dict):
     plugin_catalog: PluginCatalog = components.get("plugin_catalog")  # type: ignore[assignment]
     if plugin_catalog is None:
         plugin_catalog = PluginCatalog(
-            builtin_dir=agent_module.PLUGINS_DIR,
-            user_dir=agent_module.USER_PLUGINS_DIR,
+            builtin_dir=shared.PLUGINS_DIR,
+            user_dir=shared.USER_PLUGINS_DIR,
             plugin_config=cfg.get("plugins", {}),
         )
         plugin_catalog.discover_and_load()
@@ -299,7 +299,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     # recovery. Doing this synchronously would block startup on a network model
     # call before the user even sees the prompt.
     if ctx_mgr:
-        staging_dir = agent_module.STAGING_DIR
+        staging_dir = shared.STAGING_DIR
         current_sid = ctx_mgr.staging.session_id
         orphans = [
             p
@@ -307,7 +307,7 @@ async def _interactive_loop(components: dict, cfg: dict):
             if p.stem != current_sid and p.stat().st_size > 0
         ]
         if orphans:
-            CONSOLE.print(
+            shared.CONSOLE.print(
                 f"[dim]💤 Queueing recovery for {len(orphans)} orphaned session(s)...[/dim]"
             )
             for orphan_path in orphans:
@@ -318,7 +318,7 @@ async def _interactive_loop(components: dict, cfg: dict):
             if memory_worker:
                 memory_worker.wake()
 
-    CONSOLE.print(
+    shared.CONSOLE.print(
         Panel(
             "[bold cyan]Personal Agent[/bold cyan]\n[dim]Type /help for commands[/dim]",
             title="Agent Ready",
@@ -369,7 +369,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                         ("/quit", "Exit the agent"),
                     ]:
                         _help_table.add_row(_hcmd, _hdesc)
-                    CONSOLE.print(_help_table)
+                    shared.CONSOLE.print(_help_table)
                     continue
                 elif cmd == "memory":
                     chapters = memory.list_chapters()
@@ -378,7 +378,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                     table.add_column("Files")
                     for ch in chapters:
                         table.add_row(ch["name"], str(len(ch["files"])))
-                    CONSOLE.print(table)
+                    shared.CONSOLE.print(table)
                     continue
                 elif cmd == "context":
                     if ctx_mgr:
@@ -410,9 +410,9 @@ async def _interactive_loop(components: dict, cfg: dict):
                             "Idle",
                             f"{stats['idle_elapsed_s']}s / {stats['idle_threshold_s']}s",
                         )
-                        CONSOLE.print(table)
+                        shared.CONSOLE.print(table)
                     else:
-                        CONSOLE.print("[yellow]Context manager not available.[/yellow]")
+                        shared.CONSOLE.print("[yellow]Context manager not available.[/yellow]")
                     continue
                 # ── Plugin-contributed slash commands (checked before built-ins) ──
                 plugin_cmds = plugin_catalog.get_slash_commands()
@@ -430,12 +430,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                     _tools_table.add_column("Tool", style="cyan")
                     for _t in _tool_list:
                         _tools_table.add_row(_t)
-                    CONSOLE.print(_tools_table)
+                    shared.CONSOLE.print(_tools_table)
                     continue
                 elif cmd == "skills":
                     skills = skill_catalog.list_skills()
                     if not skills:
-                        CONSOLE.print("[yellow]No skills found.[/yellow]")
+                        shared.CONSOLE.print("[yellow]No skills found.[/yellow]")
                     else:
                         table = Table(title="Available Skills")
                         table.add_column("ID")
@@ -447,12 +447,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                                 bundle.source,
                                 bundle.description or "—",
                             )
-                        CONSOLE.print(table)
+                        shared.CONSOLE.print(table)
                     continue
                 elif cmd == "plugins":
                     plugins = plugin_catalog.list_plugins()
                     if not plugins:
-                        CONSOLE.print("[yellow]No plugins loaded.[/yellow]")
+                        shared.CONSOLE.print("[yellow]No plugins loaded.[/yellow]")
                     else:
                         table = Table(title="Loaded Plugins")
                         table.add_column("Name")
@@ -466,15 +466,15 @@ async def _interactive_loop(components: dict, cfg: dict):
                                 pm.source,
                                 pm.description or "—",
                             )
-                        CONSOLE.print(table)
-                        CONSOLE.print(
+                        shared.CONSOLE.print(table)
+                        shared.CONSOLE.print(
                             "[dim]Tip: set plugins.<name>.enabled = false "
                             "in config.json to disable a plugin[/dim]"
                         )
                     continue
                 elif cmd.startswith("mode "):
                     # Kept as a hidden override for debugging; not advertised
-                    CONSOLE.print(
+                    shared.CONSOLE.print(
                         "[dim](manual mode override removed — routing is automatic)[/dim]"
                     )
                     continue
@@ -496,11 +496,11 @@ async def _interactive_loop(components: dict, cfg: dict):
                                 "[bold green]✓[/bold green]" if m == agent.model else ""
                             )
                             table.add_row(m, mark)
-                        CONSOLE.print(table)
+                        shared.CONSOLE.print(table)
                     else:
                         new_model = parts[1].strip()
                         agent.set_model(new_model)
-                        CONSOLE.print(
+                        shared.CONSOLE.print(
                             f"[green]Switched to model: {new_model}[/green] "
                             "[dim](session only — not persisted)[/dim]"
                         )
@@ -510,7 +510,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                     # Example: /ralph "make all tests pass" --max 15 --verify "pytest tests/"
                     parts = raw_cmd.split(None, 1)
                     if len(parts) < 2 or not parts[1].strip():
-                        CONSOLE.print(
+                        shared.CONSOLE.print(
                             "[yellow]Usage: /ralph <goal> [--max N] [--verify <cmd>][/yellow]\n"
                             "[dim]Example: /ralph 'make all tests pass' --max 10 --verify 'pytest tests/'[/dim]"
                         )
@@ -537,7 +537,7 @@ async def _interactive_loop(components: dict, cfg: dict):
 
                     goal_str = goal_str.strip().strip("'\"")
                     if not goal_str:
-                        CONSOLE.print("[yellow]Goal cannot be empty.[/yellow]")
+                        shared.CONSOLE.print("[yellow]Goal cannot be empty.[/yellow]")
                         continue
 
                     task = RalphTask(
@@ -552,12 +552,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                         max_iterations=max_iters,
                     )
                     _save_ralph_task(task)
-                    CONSOLE.print(
+                    shared.CONSOLE.print(
                         f"[cyan]Ralph mode started | id: {task.id} | max_iters: {max_iters}"
                         + (f" | verify: {verify_cmd}" if verify_cmd else "")
                         + "[/cyan]"
                     )
-                    _ralph_sink = CliOutputSink(CONSOLE)
+                    _ralph_sink = CliOutputSink(shared.CONSOLE)
                     _ralph_token = _active_sink.set(_ralph_sink)
                     try:
                         task = await _ralph_task_loop(
@@ -570,7 +570,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                     finally:
                         _active_sink.reset(_ralph_token)
                     status_color = "green" if task.status == "complete" else "yellow"
-                    CONSOLE.print(
+                    shared.CONSOLE.print(
                         f"[{status_color}]Ralph complete | status: {task.status} | "
                         f"iterations: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
                     )
@@ -583,7 +583,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                         user_input = normalized_input
                         ctx.metadata["required_skills"] = required_skills
                     else:
-                        CONSOLE.print(f"[yellow]Unknown command: {user_input}[/yellow]")
+                        shared.CONSOLE.print(f"[yellow]Unknown command: {user_input}[/yellow]")
                         continue
             else:
                 normalized_input, required_skills = prepare_user_message_for_skills(
@@ -606,11 +606,11 @@ async def _interactive_loop(components: dict, cfg: dict):
 
             # Create a fresh per-turn sink and register it in the ContextVar so
             # tool helpers (_run_tool_uses) can find it without param threading.
-            _turn_sink = CliOutputSink(CONSOLE)
+            _turn_sink = CliOutputSink(shared.CONSOLE)
             _sink_token = _active_sink.set(_turn_sink)
 
             try:
-                CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+                shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
                 ctx.metadata["skill_catalog"] = skill_catalog
 
                 # Hot-reload: recompose system prompt when skill catalog was mutated
@@ -635,7 +635,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                     result.content or "", result.tool_calls_made
                 )
                 if result.error:
-                    CONSOLE.print(f"[red]Error: {result.error}[/red]")
+                    shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
 
                 # Notify plugins of this completed turn (correction detection, etc.)
                 _session_tools_used.extend(result.tool_calls_made)
@@ -687,7 +687,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                         memory_worker.wake()
 
             except Exception as e:
-                CONSOLE.print(f"\n[red]Error: {e}[/red]")
+                shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
             finally:
                 # Always reset the sink ContextVar after each turn so stale
                 # references cannot bleed into the next turn.
@@ -704,7 +704,7 @@ async def _interactive_loop(components: dict, cfg: dict):
         # finally block then runs this code before the process exits.
         # (A ^C^C that arrives *here* can still abort — that is user intent.)
         if ctx_mgr and ctx_mgr.should_session_end_sleep():
-            CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
+            shared.CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
             try:
                 ctx_mgr.enqueue_consolidation("session_end")
                 while ctx_mgr.pending_jobs():
@@ -715,7 +715,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                     )
                 ctx.messages = ctx_mgr.compact_messages(ctx.messages)
             except Exception as e:
-                CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
+                shared.CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
 
         # P0-1: session-end plugin notifications INSIDE finally so they fire
         # even when KeyboardInterrupt breaks the input loop.
@@ -730,9 +730,9 @@ async def _interactive_loop(components: dict, cfg: dict):
                     )
                 )
             except Exception as exc:
-                CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
+                shared.CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
 
-    CONSOLE.print("\n[dim]Goodbye.[/dim]")
+    shared.CONSOLE.print("\n[dim]Goodbye.[/dim]")
 
 
 @app.callback(invoke_without_command=True)
@@ -750,7 +750,7 @@ def main_callback(ctx: typer.Context):
             try:
                 components = await agent_module._build_components_async(cfg)
             except RuntimeError as exc:
-                CONSOLE.print(f"[red]Error: {exc}[/red]")
+                shared.CONSOLE.print(f"[red]Error: {exc}[/red]")
                 raise typer.Exit(1)
             try:
                 await _interactive_loop(components, cfg)
@@ -800,17 +800,17 @@ def gateway():
         try:
             components = await agent_module._build_components_async(cfg)
         except RuntimeError as exc:
-            CONSOLE.print(f"[red]Error: {exc}[/red]")
+            shared.CONSOLE.print(f"[red]Error: {exc}[/red]")
             raise typer.Exit(1)
         try:
             channels = _build_gateway_channels(cfg)
             if not channels:
-                CONSOLE.print(
+                shared.CONSOLE.print(
                     "[yellow]No channels configured or none could be initialised.\n"
                     "Add channels.feishu.enabled=true to ~/.agent/config.json[/yellow]"
                 )
                 return
-            CONSOLE.print(
+            shared.CONSOLE.print(
                 f"[dim]Gateway starting {len(channels)} channel(s). "
                 "Press Ctrl-C to stop.[/dim]"
             )
@@ -842,18 +842,18 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
         if required_skills:
             ctx.metadata["required_skills"] = required_skills
         ctx.metadata["skill_catalog"] = skill_catalog
-        CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+        shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
         try:
             result = await agent.send_message(
                 ctx,
                 normalized_question,
-                stream_callback=lambda chunk: CONSOLE.print(
+                stream_callback=lambda chunk: shared.CONSOLE.print(
                     chunk, end="", markup=False
                 ),
             )
-            CONSOLE.print()
+            shared.CONSOLE.print()
             if result.error:
-                CONSOLE.print(f"[red]Error: {result.error}[/red]")
+                shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
         finally:
             await agent_module._close_components(components)
 
@@ -877,7 +877,7 @@ def evolve(
         components = await agent_module._build_components_async(cfg)
         evolution: Optional[EvolutionEngine] = components["evolution"]
         if evolution is None:
-            CONSOLE.print(
+            shared.CONSOLE.print(
                 "[yellow]Evolution is disabled (set evolution.enabled=true in config to enable).[/yellow]"
             )
             await agent_module._close_components(components)
@@ -890,16 +890,16 @@ def evolve(
                 table.add_column("Value")
                 for k, v in s.items():
                     table.add_row(k, str(v))
-                CONSOLE.print(table)
+                shared.CONSOLE.print(table)
             elif apply_best:
                 prompt = evolution.apply_best_prompt()
-                CONSOLE.print("[green]Applied best prompt.[/green]")
-                CONSOLE.print(f"[dim]{prompt[:200]}...[/dim]")
+                shared.CONSOLE.print("[green]Applied best prompt.[/green]")
+                shared.CONSOLE.print(f"[dim]{prompt[:200]}...[/dim]")
             else:
-                CONSOLE.print("[yellow]Rewriting system prompt...[/yellow]")
+                shared.CONSOLE.print("[yellow]Rewriting system prompt...[/yellow]")
                 new_prompt = await evolution.rewrite_system_prompt()
-                CONSOLE.print("[green]Done. New prompt:[/green]")
-                CONSOLE.print(Markdown(new_prompt[:500]))
+                shared.CONSOLE.print("[green]Done. New prompt:[/green]")
+                shared.CONSOLE.print(Markdown(new_prompt[:500]))
         finally:
             await _close_components(components)
 
@@ -923,7 +923,7 @@ def config(
     cfg, _ = agent_module.load_config()
 
     if action == "list":
-        CONSOLE.print(
+        shared.CONSOLE.print(
             Markdown(f"```json\n{json.dumps(cfg, indent=2, ensure_ascii=False)}\n```")
         )
 
@@ -938,11 +938,11 @@ def config(
         for p in providers:
             mark = "[bold green]✓[/bold green]" if p["active"] else ""
             table.add_row(p["name"], p["format"], p["model"], p["base_url"], mark)
-        CONSOLE.print(table)
+        shared.CONSOLE.print(table)
 
     elif action == "get":
         if not key:
-            CONSOLE.print("[red]Key required for 'get'[/red]")
+            shared.CONSOLE.print("[red]Key required for 'get'[/red]")
             raise typer.Exit(1)
         parts = key.split(".")
         cur: Any = cfg
@@ -952,12 +952,12 @@ def config(
                 break
             cur = cur.get(p)
         if cur is None:
-            CONSOLE.print(f"[yellow]Key '{key}' not found[/yellow]")
+            shared.CONSOLE.print(f"[yellow]Key '{key}' not found[/yellow]")
         else:
-            CONSOLE.print(f"{key} = {cur}")
+            shared.CONSOLE.print(f"{key} = {cur}")
 
     else:
-        CONSOLE.print(f"[red]Unknown action '{action}'. Use: list | models | get[/red]")
+        shared.CONSOLE.print(f"[red]Unknown action '{action}'. Use: list | models | get[/red]")
         raise typer.Exit(1)
 
 
@@ -974,7 +974,7 @@ def memory_ls():
     table.add_column("File Names")
     for ch in memory.list_chapters():
         table.add_row(ch["name"], str(len(ch["files"])), ", ".join(ch["files"][:5]))
-    CONSOLE.print(table)
+    shared.CONSOLE.print(table)
 
 
 @memory_app.command("show")
@@ -984,15 +984,15 @@ def memory_show(
     """Show contents of a memory file."""
     parts = path.strip("/").split("/", 1)
     if len(parts) != 2:
-        CONSOLE.print("[red]Path must be chapter/name[/red]")
+        shared.CONSOLE.print("[red]Path must be chapter/name[/red]")
         raise typer.Exit(1)
     chapter, name = parts
     memory = MemoryPalace()
     content = memory.read(chapter, name)
     if content:
-        CONSOLE.print(Markdown(content))
+        shared.CONSOLE.print(Markdown(content))
     else:
-        CONSOLE.print(f"[yellow]No memory at {path}[/yellow]")
+        shared.CONSOLE.print(f"[yellow]No memory at {path}[/yellow]")
 
 
 @memory_app.command("search")
@@ -1001,14 +1001,14 @@ def memory_search(query: str = typer.Argument(..., help="Search query")):
     memory = MemoryPalace()
     results = memory.search(query)
     if not results:
-        CONSOLE.print(f"[yellow]No results for '{query}'[/yellow]")
+        shared.CONSOLE.print(f"[yellow]No results for '{query}'[/yellow]")
         return
     table = Table(title=f"Search: {query}")
     table.add_column("Path")
     table.add_column("Snippet")
     for r in results:
         table.add_row(r["path"], r["snippet"][:80])
-    CONSOLE.print(table)
+    shared.CONSOLE.print(table)
 
 
 @memory_app.command("tidy")
@@ -1032,7 +1032,7 @@ def memory_tidy():
 def memory_index():
     """Show the memory palace index."""
     memory = MemoryPalace()
-    CONSOLE.print(Markdown(memory.read_index()))
+    shared.CONSOLE.print(Markdown(memory.read_index()))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

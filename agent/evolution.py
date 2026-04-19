@@ -8,13 +8,10 @@ from typing import Any
 import agent as agent_module
 from agent.config import _now
 from agent.memory.system import MemoryPalace
+from agent import shared
 from agent.tools.runtime import ToolRegistry
 
-CONSOLE = agent_module.CONSOLE
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
-_atomic_write_text = agent_module._atomic_write_text
-_is_safe_prompt_version = agent_module._is_safe_prompt_version
-_new_id = agent_module._new_id
 
 class EvolutionEngine:
     """Self-evolution: scoring, prompt rewriting, tool generation."""
@@ -30,8 +27,8 @@ class EvolutionEngine:
         self.model = model
         self.memory = memory
         self.api_format = api_format
-        agent_module.RL_DIR.mkdir(parents=True, exist_ok=True)
-        agent_module.PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+        shared.RL_DIR.mkdir(parents=True, exist_ok=True)
+        shared.PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
     async def generate_text(self, prompt: str, max_tokens: int) -> str:
         """Generate text via the configured LLM provider (public API for plugins)."""
@@ -107,7 +104,7 @@ class EvolutionEngine:
 
         # Save to RL log
         record = {
-            "session_id": _new_id(),
+            "session_id": shared._new_id(),
             "timestamp": _now(),
             "score": result.get("score", 5),
             "prompt_version": prompt_version,
@@ -115,16 +112,16 @@ class EvolutionEngine:
             "critique": result.get("critique", ""),
             "improvements": result.get("improvements", []),
         }
-        with open(agent_module.SESSIONS_FILE, "a", encoding="utf-8") as f:
+        with open(shared.SESSIONS_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
         return result
 
     def _load_sessions(self) -> list[dict]:
-        if not agent_module.SESSIONS_FILE.exists():
+        if not shared.SESSIONS_FILE.exists():
             return []
         sessions = []
-        with open(agent_module.SESSIONS_FILE, encoding="utf-8") as f:
+        with open(shared.SESSIONS_FILE, encoding="utf-8") as f:
             for line in f:
                 try:
                     sessions.append(json.loads(line.strip()))
@@ -133,7 +130,7 @@ class EvolutionEngine:
         return sessions
 
     def _get_current_prompt_version(self) -> tuple[str, str]:
-        best = agent_module.PROMPTS_DIR / "best.md"
+        best = shared.PROMPTS_DIR / "best.md"
         if best.exists():
             content = best.read_text()
             # Extract version from filename reference or default
@@ -141,7 +138,7 @@ class EvolutionEngine:
             version = v_match.group(1) if v_match else "best"
             return version, content
         # Find latest version
-        versions = sorted(agent_module.PROMPTS_DIR.glob("system_v*.md"))
+        versions = sorted(shared.PROMPTS_DIR.glob("system_v*.md"))
         if versions:
             latest = versions[-1]
             return latest.stem, latest.read_text()
@@ -176,14 +173,14 @@ class EvolutionEngine:
         new_prompt = await self.generate_text(prompt, max_tokens=2048)
 
         # Save new version
-        existing = list(agent_module.PROMPTS_DIR.glob("system_v*.md"))
+        existing = list(shared.PROMPTS_DIR.glob("system_v*.md"))
         new_version_num = len(existing) + 1
-        new_path = agent_module.PROMPTS_DIR / f"system_v{new_version_num}.md"
+        new_path = shared.PROMPTS_DIR / f"system_v{new_version_num}.md"
         new_path.write_text(
             f"<!-- version: v{new_version_num} -->\n{new_prompt}", encoding="utf-8"
         )
 
-        CONSOLE.print(
+        shared.CONSOLE.print(
             f"[green]New prompt version saved: system_v{new_version_num}.md[/green]"
         )
         return new_prompt
@@ -223,11 +220,11 @@ class EvolutionEngine:
 
         # Generate safe filename
         safe_name = re.sub(r"[^a-z0-9_]", "_", description.lower()[:30])
-        tool_path = agent_module.TOOLS_DIR / f"auto_{safe_name}.py"
-        agent_module.TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        tool_path = shared.TOOLS_DIR / f"auto_{safe_name}.py"
+        shared.TOOLS_DIR.mkdir(parents=True, exist_ok=True)
         tool_path.write_text(code, encoding="utf-8")
 
-        CONSOLE.print(f"[green]Tool saved to {tool_path}[/green]")
+        shared.CONSOLE.print(f"[green]Tool saved to {tool_path}[/green]")
         return f"Tool generated and saved to {tool_path}"
 
     def apply_best_prompt(self) -> str:
@@ -240,7 +237,7 @@ class EvolutionEngine:
         version_scores: dict[str, list[float]] = {}
         for s in sessions:
             v = str(s.get("prompt_version", "default")).strip()
-            if not _is_safe_prompt_version(v):
+            if not shared._is_safe_prompt_version(v):
                 continue
             version_scores.setdefault(v, []).append(s.get("score", 5))
         if not version_scores:
@@ -252,12 +249,12 @@ class EvolutionEngine:
         )
 
         # Load that prompt
-        prompt_file = agent_module.PROMPTS_DIR / f"{best_version}.md"
+        prompt_file = shared.PROMPTS_DIR / f"{best_version}.md"
         if prompt_file.exists():
             content = prompt_file.read_text()
             # Strip version comment
             content = re.sub(r"^<!--.*?-->\n", "", content, flags=re.DOTALL)
-            _atomic_write_text(agent_module.PROMPTS_DIR / "best.md", content)
+            shared._atomic_write_text(shared.PROMPTS_DIR / "best.md", content)
             return content
 
         return DEFAULT_SYSTEM_PROMPT

@@ -21,12 +21,11 @@ from zoneinfo import ZoneInfo
 import mcp
 
 import agent as agent_module
+from agent import shared
 
-CONSOLE = agent_module.CONSOLE
-TOOL_DEFAULT_MAX_READ_BYTES = agent_module.TOOL_DEFAULT_MAX_READ_BYTES
-TOOL_DEFAULT_MAX_WRITE_BYTES = agent_module.TOOL_DEFAULT_MAX_WRITE_BYTES
-TOOL_DEFAULT_MAX_LIST_RESULTS = agent_module.TOOL_DEFAULT_MAX_LIST_RESULTS
-REGULAR_TOOL_TIMEOUT = agent_module.REGULAR_TOOL_TIMEOUT
+TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
+TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
+TOOL_DEFAULT_MAX_LIST_RESULTS = 100
 _atomic_write_text = agent_module._atomic_write_text
 _shell_command_is_blocked = agent_module._shell_command_is_blocked
 
@@ -1012,7 +1011,7 @@ class MCPClient:
                 self._connected_servers += 1
             except Exception as e:
                 self._failed_servers += 1
-                CONSOLE.print(
+                shared.CONSOLE.print(
                     f"[yellow]MCP server connect failed ({server_cfg.get('name', '?')}): {e}[/yellow]"
                 )
 
@@ -1146,7 +1145,7 @@ class UserToolCatalog:
     """Discover and load user-authored Python tool plugins."""
 
     def __init__(self, root: Optional[Path] = None):
-        self.root = root or agent_module.TOOLS_DIR
+        self.root = root or shared.TOOLS_DIR
 
     def load_into_registry(self, registry: ToolRegistry) -> list[str]:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -1170,7 +1169,7 @@ class UserToolCatalog:
                 register(_UserToolRegistryFacade(registry, source))
                 loaded.append(plugin_id)
             except Exception as e:
-                CONSOLE.print(
+                shared.CONSOLE.print(
                     f"[yellow]Failed to load user tool plugin {tool_file}: {e}[/yellow]"
                 )
         return loaded

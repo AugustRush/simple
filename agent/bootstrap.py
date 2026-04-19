@@ -6,29 +6,28 @@ import os
 from typing import Optional
 
 import agent as agent_module
+from agent import shared
 from agent.config import ModelClientFactory, _compose_system_prompt, _load_system_prompt, _resolve_output_dir
 from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, ContextManager, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import BuiltinTools, MCPClient, ToolRegistry, UserToolCatalog
 
-DEFAULT_MAX_PARALLEL_AGENTS = agent_module.DEFAULT_MAX_PARALLEL_AGENTS
-DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = agent_module.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
 
 async def _build_components_async(cfg: dict):
     """Build all components from config using ModelClientFactory."""
-    console = agent_module.CONSOLE
-    context_dir = agent_module.CONTEXT_DIR
-    memory_dir = agent_module.MEMORY_DIR
-    plugins_dir = agent_module.PLUGINS_DIR
-    user_plugins_dir = agent_module.USER_PLUGINS_DIR
-    legacy_memory_aliases = agent_module.LEGACY_MEMORY_ALIASES
-    max_categories = agent_module.MAX_CATEGORIES
-    decay_factor = agent_module.DECAY_FACTOR
-    sleep_token_ratio = agent_module.SLEEP_TOKEN_RATIO
-    chars_per_token = agent_module.CHARS_PER_TOKEN
+    console = shared.CONSOLE
+    context_dir = shared.CONTEXT_DIR
+    memory_dir = shared.MEMORY_DIR
+    plugins_dir = shared.PLUGINS_DIR
+    user_plugins_dir = shared.USER_PLUGINS_DIR
+    legacy_memory_aliases = shared.LEGACY_MEMORY_ALIASES
+    max_categories = shared.MAX_CATEGORIES
+    decay_factor = shared.DECAY_FACTOR
+    sleep_token_ratio = shared.SLEEP_TOKEN_RATIO
+    chars_per_token = shared.CHARS_PER_TOKEN
     registry_cls = agent_module.ToolRegistry
     builtin_tools_cls = agent_module.BuiltinTools
     skill_catalog_cls = agent_module.SkillCatalog
@@ -67,12 +66,8 @@ async def _build_components_async(cfg: dict):
         memory_dir=memory_dir,
     )
     memory = MemoryPalace(
-        tidy_interval=mem_cfg.get(
-            "tidy_interval_seconds", agent_module.MEMORY_TIDY_INTERVAL
-        ),
-        tidy_threshold=mem_cfg.get(
-            "tidy_file_threshold", agent_module.MEMORY_TIDY_FILE_THRESHOLD
-        ),
+        tidy_interval=mem_cfg.get("tidy_interval_seconds", shared.MEMORY_TIDY_INTERVAL),
+        tidy_threshold=mem_cfg.get("tidy_file_threshold", shared.MEMORY_TIDY_FILE_THRESHOLD),
         base_dir=memory_dir,
         context_dir=context_dir,
         store=ctx_store,
@@ -156,12 +151,12 @@ async def _build_components_async(cfg: dict):
     )
     agent.max_parallel_agents = max(
         1,
-        int(orch_cfg.get("max_parallel_agents", DEFAULT_MAX_PARALLEL_AGENTS)),
+        int(orch_cfg.get("max_parallel_agents", shared.DEFAULT_MAX_PARALLEL_AGENTS)),
     )
     agent.sub_agent_timeout_seconds = max(
         1,
         int(
-            orch_cfg.get("sub_agent_timeout_seconds", DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
+            orch_cfg.get("sub_agent_timeout_seconds", shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
         ),
     )
     loaded_user_tools = user_tool_catalog.load_into_registry(registry)

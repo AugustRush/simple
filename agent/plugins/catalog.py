@@ -9,11 +9,11 @@ import re
 import sys
 from typing import Any, Callable, Optional
 
-import agent as agent_module
+from agent import shared
 
-CONSOLE = agent_module.CONSOLE
-PLUGINS_DIR = agent_module.PLUGINS_DIR
-USER_PLUGINS_DIR = agent_module.USER_PLUGINS_DIR
+CONSOLE = shared.CONSOLE
+PLUGINS_DIR = shared.PLUGINS_DIR
+USER_PLUGINS_DIR = shared.USER_PLUGINS_DIR
 
 class AgentPlugin:
     """Protocol that plugin objects may implement (duck-typed).
@@ -162,8 +162,8 @@ async def _maybe_await(value: Any) -> Any:
 class PluginCatalog:
     """Discovers, loads, and orchestrates agent plugins from disk.
 
-    Built-in plugins are loaded from ``PLUGINS_DIR`` (package builtin plugins).
-    User plugins are loaded from ``USER_PLUGINS_DIR`` (~/.agent/plugins/).
+    Built-in plugins are loaded from ``shared.PLUGINS_DIR`` (package builtin plugins).
+    User plugins are loaded from ``shared.USER_PLUGINS_DIR`` (~/.agent/plugins/).
 
     Each plugin directory must contain ``__init__.py`` with a top-level
     ``register() -> plugin`` function that returns an object implementing
@@ -231,7 +231,7 @@ class PluginCatalog:
                     continue
                 # P0-3: reject directory names that could collide with real modules.
                 if not _SAFE_PLUGIN_NAME.match(plugin_dir.name):
-                    CONSOLE.print(
+                    shared.CONSOLE.print(
                         f"[yellow]Plugin '{plugin_dir.name}': unsafe name — skipped[/yellow]"
                     )
                     continue
@@ -260,7 +260,7 @@ class PluginCatalog:
                     sys.modules[mod_name] = mod
                     spec.loader.exec_module(mod)  # type: ignore[union-attr]
                     if not hasattr(mod, "register"):
-                        CONSOLE.print(
+                        shared.CONSOLE.print(
                             f"[yellow]Plugin '{plugin_dir.name}': no register() — skipped[/yellow]"
                         )
                         continue
@@ -282,7 +282,7 @@ class PluginCatalog:
                         ).items():
                             if cmd_key in self._slash_commands:
                                 existing_owner = _slash_command_owners.get(cmd_key, "?")
-                                CONSOLE.print(
+                                shared.CONSOLE.print(
                                     f"[yellow]Plugin '{plugin_name}': slash command "
                                     f"'/{cmd_key}' conflicts with plugin "
                                     f"'{existing_owner}' — overriding[/yellow]"
@@ -305,7 +305,7 @@ class PluginCatalog:
                             self._bundled_mcp.append((plugin_name, mcp_cfg))
 
                 except Exception as exc:
-                    CONSOLE.print(
+                    shared.CONSOLE.print(
                         f"[yellow]Plugin '{plugin_dir.name}' failed to load: {exc}[/yellow]"
                     )
         return [name for name in self._plugins]
@@ -336,7 +336,7 @@ class PluginCatalog:
                     result = result.rstrip() + "\n\n" + suffix.strip()
             except Exception as exc:
                 _pname = getattr(plugin, "name", "?")
-                CONSOLE.print(
+                shared.CONSOLE.print(
                     f"[dim]Plugin '{_pname}' compose_system_prompt error: {exc}[/dim]"
                 )
         return result
@@ -357,7 +357,7 @@ class PluginCatalog:
             try:
                 plugin.on_session_start(components)
             except Exception as exc:
-                CONSOLE.print(f"[dim]Plugin session_start error: {exc}[/dim]")
+                shared.CONSOLE.print(f"[dim]Plugin session_start error: {exc}[/dim]")
 
     async def fire_turn_end(self, event: TurnEvent) -> list[HookResult]:
         """Notify all plugins after each assistant turn; collect HookResults."""
@@ -370,7 +370,7 @@ class PluginCatalog:
                 if isinstance(r, HookResult):
                     results.append(r)
             except Exception as exc:
-                CONSOLE.print(f"[dim]Plugin turn_end error: {exc}[/dim]")
+                shared.CONSOLE.print(f"[dim]Plugin turn_end error: {exc}[/dim]")
         return results
 
     async def fire_session_end(self, event: SessionEvent) -> None:
@@ -381,7 +381,7 @@ class PluginCatalog:
             try:
                 await _maybe_await(plugin.on_session_end(event))
             except Exception as exc:
-                CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
+                shared.CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
 
     async def fire_pre_tool(self, event: PreToolEvent) -> HookResult:
         """Fire before a tool call; first blocking result short-circuits the chain."""
@@ -394,7 +394,7 @@ class PluginCatalog:
                     return r
             except Exception as exc:
                 _pname = getattr(plugin, "name", "?")
-                CONSOLE.print(f"[dim]Plugin '{_pname}' pre_tool error: {exc}[/dim]")
+                shared.CONSOLE.print(f"[dim]Plugin '{_pname}' pre_tool error: {exc}[/dim]")
         return HookResult()
 
     async def fire_post_tool(self, event: PostToolEvent) -> HookResult:
@@ -409,6 +409,5 @@ class PluginCatalog:
                     result = r
             except Exception as exc:
                 _pname = getattr(plugin, "name", "?")
-                CONSOLE.print(f"[dim]Plugin '{_pname}' post_tool error: {exc}[/dim]")
+                shared.CONSOLE.print(f"[dim]Plugin '{_pname}' post_tool error: {exc}[/dim]")
         return result
-

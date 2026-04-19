@@ -14,28 +14,7 @@ import time
 from typing import Any, Callable, Optional
 
 import agent as agent_module
-
-CHARS_PER_TOKEN = agent_module.CHARS_PER_TOKEN
-CONSOLIDATION_MAX_SOURCE_TOKENS = agent_module.CONSOLIDATION_MAX_SOURCE_TOKENS
-CONTEXT_DIR = agent_module.CONTEXT_DIR
-CONSOLE = agent_module.CONSOLE
-DECAY_FACTOR = agent_module.DECAY_FACTOR
-DEFAULT_ROUTE_KEYWORDS = agent_module.DEFAULT_ROUTE_KEYWORDS
-LEGACY_MEMORY_ALIASES = agent_module.LEGACY_MEMORY_ALIASES
-MAX_CATEGORIES = agent_module.MAX_CATEGORIES
-MEMORY_DIR = agent_module.MEMORY_DIR
-MEMORY_TIDY_FILE_THRESHOLD = agent_module.MEMORY_TIDY_FILE_THRESHOLD
-MEMORY_TIDY_INTERVAL = agent_module.MEMORY_TIDY_INTERVAL
-MIN_IMPORTANCE = agent_module.MIN_IMPORTANCE
-PALACE_LOCI = agent_module.PALACE_LOCI
-PALACE_LOCUS_SUMMARIES = agent_module.PALACE_LOCUS_SUMMARIES
-PALACE_DB_FILE = agent_module.PALACE_DB_FILE
-RECENT_SESSION_TURNS = agent_module.RECENT_SESSION_TURNS
-RETRIEVAL_TOP_K = agent_module.RETRIEVAL_TOP_K
-SLEEP_TOKEN_RATIO = agent_module.SLEEP_TOKEN_RATIO
-STAGING_DIR = agent_module.STAGING_DIR
-STAGING_TURN_THRESHOLD = agent_module.STAGING_TURN_THRESHOLD
-STAGING_TOKEN_THRESHOLD = agent_module.STAGING_TOKEN_THRESHOLD
+from agent import shared
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -148,19 +127,19 @@ class MemoryPalace:
 
     def __init__(
         self,
-        tidy_interval: int = MEMORY_TIDY_INTERVAL,
-        tidy_threshold: int = MEMORY_TIDY_FILE_THRESHOLD,
-        base_dir: Path = MEMORY_DIR,
-        context_dir: Path = CONTEXT_DIR,
+        tidy_interval: int = shared.MEMORY_TIDY_INTERVAL,
+        tidy_threshold: int = shared.MEMORY_TIDY_FILE_THRESHOLD,
+        base_dir: Path = shared.MEMORY_DIR,
+        context_dir: Path = shared.CONTEXT_DIR,
         store: Optional["LTMStore"] = None,
     ):
         self.store = store or LTMStore(context_dir=context_dir, memory_dir=base_dir)
         self.base_dir = self.store.memory_dir
         self.index = MemoryIndex(
             base_dir=self.base_dir,
-            loci=PALACE_LOCI,
-            aliases=LEGACY_MEMORY_ALIASES,
-            summaries=PALACE_LOCUS_SUMMARIES,
+            loci=shared.PALACE_LOCI,
+            aliases=shared.LEGACY_MEMORY_ALIASES,
+            summaries=shared.PALACE_LOCUS_SUMMARIES,
             now_fn=_now,
         )
         self._last_tidy: float = 0
@@ -169,13 +148,13 @@ class MemoryPalace:
         self._tidy_threshold = tidy_threshold
 
     def write(self, chapter: str, name: str, content: str, append: bool = False):
-        chapter = normalize_memory_chapter(chapter, LEGACY_MEMORY_ALIASES)
+        chapter = normalize_memory_chapter(chapter, shared.LEGACY_MEMORY_ALIASES)
         self.store.upsert_manual_note(chapter, name, content, append=append)
         self._files_since_tidy += 1
         self.index.update()
 
     def read(self, chapter: str, name: str) -> str:
-        chapter = normalize_memory_chapter(chapter, LEGACY_MEMORY_ALIASES)
+        chapter = normalize_memory_chapter(chapter, shared.LEGACY_MEMORY_ALIASES)
         note = self.store.read_manual_note(chapter, name)
         if note:
             return note.content
@@ -218,7 +197,7 @@ class MemoryPalace:
 
     async def tidy(self, client: Any, model: str):
         """Local maintenance pass: apply retention and rebuild projections."""
-        CONSOLE.print("[dim]Tidying memory palace...[/dim]")
+        shared.CONSOLE.print("[dim]Tidying memory palace...[/dim]")
         self.store.apply_retention()
         snapshot = self.store.maintenance_snapshot(limit=20)
         if snapshot:
@@ -239,7 +218,7 @@ class MemoryPalace:
         self.index.update()
         self._last_tidy = time.time()
         self._files_since_tidy = 0
-        CONSOLE.print("[dim]Memory tidy complete.[/dim]")
+        shared.CONSOLE.print("[dim]Memory tidy complete.[/dim]")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,7 +244,7 @@ class StagingBuffer:
     def __init__(
         self,
         path: Optional[Path] = None,
-        context_dir: Path = CONTEXT_DIR,
+        context_dir: Path = shared.CONTEXT_DIR,
         session_id: Optional[str] = None,
     ):
         self.session_id = session_id or _new_id()
@@ -361,7 +340,7 @@ class LTMEntry:
     source_session: str = ""
     confidence: float = 1.0
 
-    def decay(self, factor: float = DECAY_FACTOR) -> None:
+    def decay(self, factor: float = shared.DECAY_FACTOR) -> None:
         self.importance = max(0.0, self.importance * factor)
 
     def to_dict(self) -> dict:
@@ -412,9 +391,9 @@ class LTMStore:
 
     def __init__(
         self,
-        context_dir: Path = CONTEXT_DIR,
-        max_categories: int = MAX_CATEGORIES,
-        memory_dir: Path = MEMORY_DIR,
+        context_dir: Path = shared.CONTEXT_DIR,
+        max_categories: int = shared.MAX_CATEGORIES,
+        memory_dir: Path = shared.MEMORY_DIR,
     ):
         self.dir = context_dir
         self.max_categories = max_categories
@@ -572,7 +551,7 @@ class LTMStore:
         return path
 
     def _is_palace_locus(self, category: str) -> bool:
-        return self.normalize_category_name(category) in PALACE_LOCI
+        return self.normalize_category_name(category) in shared.PALACE_LOCI
 
     def _normalize_entity(self, entity: str, category: str) -> str:
         raw = str(entity).strip()
@@ -704,7 +683,7 @@ class LTMStore:
         original_category = self.normalize_category_name(entry.category)
         original_entity = str(entry.entity or "")
         entry.category = self._coerce_category_for_storage(conn, original_category)
-        if entry.category == "concepts" and original_category not in PALACE_LOCI:
+        if entry.category == "concepts" and original_category not in shared.PALACE_LOCI:
             entry.entity = (
                 self.normalize_category_name(original_entity)
                 if original_entity.strip()
@@ -773,7 +752,7 @@ class LTMStore:
         self, conn: sqlite3.Connection, category: str
     ) -> str:
         normalized = self.normalize_category_name(category)
-        if normalized in PALACE_LOCI:
+        if normalized in shared.PALACE_LOCI:
             return normalized
         dynamic_categories = self._dynamic_category_names(conn)
         if normalized in dynamic_categories:
@@ -789,7 +768,7 @@ class LTMStore:
             WHERE status = 'active'
             """
         ).fetchall()
-        return {row["category"] for row in rows if row["category"] not in PALACE_LOCI}
+        return {row["category"] for row in rows if row["category"] not in shared.PALACE_LOCI}
 
     def _refresh_indexes(self) -> None:
         previous = {c["name"] for c in self._meta.get("categories", [])}
@@ -943,7 +922,7 @@ class LTMStore:
             [
                 category
                 for category in self._meta.get("categories", [])
-                if category["name"] not in PALACE_LOCI
+                if category["name"] not in shared.PALACE_LOCI
             ]
         )
 
@@ -1086,7 +1065,7 @@ class LTMStore:
         self,
         query: str,
         categories: Optional[list[str]] = None,
-        limit: int = RETRIEVAL_TOP_K,
+        limit: int = shared.RETRIEVAL_TOP_K,
     ) -> list[LTMEntry]:
         tokens = [
             t
@@ -1138,8 +1117,8 @@ class LTMStore:
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 
-    def apply_decay(self, factor: float = DECAY_FACTOR) -> None:
-        """Decay importance of all entries; prune those below MIN_IMPORTANCE."""
+    def apply_decay(self, factor: float = shared.DECAY_FACTOR) -> None:
+        """Decay importance of all entries; prune those below shared.MIN_IMPORTANCE."""
         affected_categories: set[str] = set()
         with self._connect() as conn:
             rows = conn.execute(
@@ -1150,7 +1129,7 @@ class LTMStore:
                 affected_categories.add(self.normalize_category_name(entry.category))
                 entry.decay(factor)
                 entry.updated_at = _now()
-                if entry.importance < MIN_IMPORTANCE:
+                if entry.importance < shared.MIN_IMPORTANCE:
                     conn.execute("DELETE FROM memory_items WHERE id = ?", (entry.id,))
                     self._delete_fts_rows(conn, [entry.id])
                 else:
@@ -1175,7 +1154,7 @@ class LTMStore:
                 WHERE category = 'episodes'
                   AND status NOT IN ('archived', 'superseded')
                 """,
-                (DECAY_FACTOR, now),
+                (shared.DECAY_FACTOR, now),
             )
             # Step 2: archive episodes that fell below the importance floor.
             archived_ids = [
@@ -1187,7 +1166,7 @@ class LTMStore:
                       AND importance < ?
                       AND status NOT IN ('archived', 'superseded')
                     """,
-                    (MIN_IMPORTANCE,),
+                    (shared.MIN_IMPORTANCE,),
                 ).fetchall()
             ]
             if archived_ids:
@@ -1301,7 +1280,7 @@ class LocalRetriever:
         return scored
 
     def retrieve(
-        self, query: str, entries: list[LTMEntry], top_k: int = RETRIEVAL_TOP_K
+        self, query: str, entries: list[LTMEntry], top_k: int = shared.RETRIEVAL_TOP_K
     ) -> list[LTMEntry]:
         """Return top-K most relevant entries (score > 0 only)."""
         scored = self.score(query, entries)
@@ -1311,7 +1290,7 @@ class LocalRetriever:
 class ConsolidationEngine:
     """LLM-driven context consolidation — the 'sleep' mechanism.
 
-    Triggered when working memory exceeds SLEEP_TOKEN_RATIO of max_tokens.
+    Triggered when working memory exceeds shared.SLEEP_TOKEN_RATIO of max_tokens.
     Extracts structured facts from conversation, stores in LTM, applies decay,
     and compresses ctx.messages to the most recent entries.
     """
@@ -1319,12 +1298,12 @@ class ConsolidationEngine:
     def __init__(
         self,
         store: LTMStore,
-        max_categories: int = MAX_CATEGORIES,
-        decay_factor: float = DECAY_FACTOR,
-        sleep_token_ratio: float = SLEEP_TOKEN_RATIO,
+        max_categories: int = shared.MAX_CATEGORIES,
+        decay_factor: float = shared.DECAY_FACTOR,
+        sleep_token_ratio: float = shared.SLEEP_TOKEN_RATIO,
         keep_last_messages: int = 6,
-        max_source_tokens: int = CONSOLIDATION_MAX_SOURCE_TOKENS,
-        chars_per_token: float = float(CHARS_PER_TOKEN),
+        max_source_tokens: int = shared.CONSOLIDATION_MAX_SOURCE_TOKENS,
+        chars_per_token: float = float(shared.CHARS_PER_TOKEN),
         cjk_chars_per_token: float = 1.0,
     ):
         self.store = store
@@ -1445,7 +1424,7 @@ class ConsolidationEngine:
         return (
             f"Analyze this conversation and extract important facts worth remembering.\n"
             f"For each item output JSON on its own line (no markdown fences):\n"
-            f'{{"locus": "<one of {", ".join(PALACE_LOCI)}>", "entity": "<anchor>", '
+            f'{{"locus": "<one of {", ".join(shared.PALACE_LOCI)}>", "entity": "<anchor>", '
             f'"memory_type": "<type>", "content": "<fact>", "importance": <0.1-1.0>, "confidence": <0.1-1.0>}}\n\n'
             f"Rules:\n"
             f"- Use only the fixed loci listed above; never invent new top-level loci\n"
@@ -1481,7 +1460,7 @@ class ConsolidationEngine:
         """
         if keep_last is None:
             keep_last = self.keep_last_messages
-        CONSOLE.print("[dim]💤 Context consolidation (sleep)...[/dim]")
+        shared.CONSOLE.print("[dim]💤 Context consolidation (sleep)...[/dim]")
 
         # Choose extraction source
         staged = staging.read_all() if staging else []
@@ -1491,7 +1470,7 @@ class ConsolidationEngine:
                 messages[-keep_last:] if len(messages) > keep_last else messages
             )
             if messages:  # only print if there was something to compress
-                CONSOLE.print(
+                shared.CONSOLE.print(
                     f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
                 )
             return compressed
@@ -1536,20 +1515,20 @@ class ConsolidationEngine:
             if staging and staged:
                 staging.drop_prefix(len(staged))
 
-            CONSOLE.print(
+            shared.CONSOLE.print(
                 f"[dim]💤 Stored {len(entries)} entries from {source_label} "
                 f"across {len(conversation_chunks)} chunk(s). "
                 f"Dynamic categories: {self.store.dynamic_category_count()}/{self.max_categories}[/dim]"
             )
         except Exception as e:
-            CONSOLE.print(f"[dim]Sleep extraction error: {e}[/dim]")
+            shared.CONSOLE.print(f"[dim]Sleep extraction error: {e}[/dim]")
 
         compressed = messages[-keep_last:] if len(messages) > keep_last else messages
         if messages:
             # Only print when there is actual working memory to compress; skip the
             # "0 → 0" line that appears when consolidate() is called from the
             # background job path (which passes messages=[]).
-            CONSOLE.print(
+            shared.CONSOLE.print(
                 f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
             )
         return compressed
@@ -1573,7 +1552,7 @@ class ConsolidationEngine:
                 category = data.get("locus") or data.get("category") or "concepts"
                 normalized_category = self.store.normalize_category_name(category)
                 entity = str(data.get("entity", "")).strip()
-                if normalized_category not in PALACE_LOCI:
+                if normalized_category not in shared.PALACE_LOCI:
                     entity = entity or normalized_category
                     normalized_category = "concepts"
                 entries.append(
@@ -1650,8 +1629,8 @@ class ContextManager:
         idle_seconds: int = 300,
         min_messages: int = 4,
         staging: Optional[StagingBuffer] = None,
-        staging_turn_threshold: int = STAGING_TURN_THRESHOLD,
-        staging_token_threshold: int = STAGING_TOKEN_THRESHOLD,
+        staging_turn_threshold: int = shared.STAGING_TURN_THRESHOLD,
+        staging_token_threshold: int = shared.STAGING_TOKEN_THRESHOLD,
         route_keywords: Optional[dict[str, list[str] | tuple[str, ...]]] = None,
     ):
         self.store = store
@@ -1662,7 +1641,7 @@ class ContextManager:
         self.staging_turn_threshold = staging_turn_threshold
         self.staging_token_threshold = staging_token_threshold
         self.staging: StagingBuffer = staging or StagingBuffer()
-        source_keywords = route_keywords or DEFAULT_ROUTE_KEYWORDS
+        source_keywords = route_keywords or shared.DEFAULT_ROUTE_KEYWORDS
         self.route_keywords = {
             category: tuple(str(keyword).lower() for keyword in keywords)
             for category, keywords in source_keywords.items()
@@ -1911,7 +1890,7 @@ class ContextManager:
                 seen.append(cat)
         return seen
 
-    def retrieve_ltm_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
+    def retrieve_ltm_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
         """Return top-K relevant LTM entries as an injectable string.
 
         Two-stage retrieval:
@@ -1945,7 +1924,7 @@ class ContextManager:
             lines.append(f"- [{anchor}] {e.content}")
         return "\n".join(lines)
 
-    def _recent_session_context(self, limit: int = RECENT_SESSION_TURNS) -> str:
+    def _recent_session_context(self, limit: int = shared.RECENT_SESSION_TURNS) -> str:
         """Return the most recent staged turns for explicit current-session recall."""
         staged = self.staging.read_all()
         if not staged:
@@ -1958,7 +1937,7 @@ class ContextManager:
                 lines.append(f"- {role}: {content}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
-    def retrieve_context(self, query: str, top_k: int = RETRIEVAL_TOP_K) -> str:
+    def retrieve_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
         """Return explicit context lookup results across active session and LTM."""
         sections = []
         recent = self._recent_session_context()
@@ -1970,7 +1949,7 @@ class ContextManager:
         return "\n\n".join(sections)
 
     def retrieve_implicit_context(
-        self, query: str, top_k: int = RETRIEVAL_TOP_K
+        self, query: str, top_k: int = shared.RETRIEVAL_TOP_K
     ) -> str:
         """Return context for automatic prompt injection.
 
@@ -2170,7 +2149,7 @@ class BackgroundMemoryWorker:
                             )
                         )
                 except Exception as e:
-                    CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
+                    shared.CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
                 # Sleep for poll_seconds OR until wake()/stop() interrupts,
                 # whichever comes first.  This replaces the old _stop_event.wait()
                 # so that wake() can also cut the sleep short.

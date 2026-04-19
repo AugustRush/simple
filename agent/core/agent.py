@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional
 import anthropic
 
 import agent as agent_module
+from agent import shared
 from agent.config import _compose_system_prompt
 from agent.core.output import CliOutputSink, _active_sink, _fmt_tool_inputs
 from agent.memory.system import ContextManager
@@ -19,27 +20,13 @@ from agent.plugins.catalog import PluginCatalog, PostToolEvent, PreToolEvent
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry
 
-CONSOLE = agent_module.CONSOLE
-DEFAULT_MAX_PARALLEL_AGENTS = agent_module.DEFAULT_MAX_PARALLEL_AGENTS
-DEFAULT_MAX_TOKENS = agent_module.DEFAULT_MAX_TOKENS
-DEFAULT_MODEL = agent_module.DEFAULT_MODEL
-DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = agent_module.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
-MAX_TOOL_CALL_ITERATIONS = agent_module.MAX_TOOL_CALL_ITERATIONS
-REGULAR_TOOL_TIMEOUT = agent_module.REGULAR_TOOL_TIMEOUT
-_new_id = agent_module._new_id
-_AnthropicFallbackResponse = agent_module._AnthropicFallbackResponse
-_OAIChoice = agent_module._OAIChoice
-_OAIFunc = agent_module._OAIFunc
-_OAIMsg = agent_module._OAIMsg
-_OAIResponse = agent_module._OAIResponse
-_OAITC = agent_module._OAITC
 
 @dataclass
 class AgentContext:
     """State for a single agent instance."""
 
-    agent_id: str = field(default_factory=_new_id)
+    agent_id: str = field(default_factory=shared._new_id)
     role: str = "assistant"
     messages: list[dict] = field(default_factory=list)
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
@@ -72,8 +59,8 @@ class BaseAgent:
         self,
         client: Any,
         registry: ToolRegistry,
-        model: str = DEFAULT_MODEL,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
+        model: str = shared.DEFAULT_MODEL,
+        max_tokens: int = shared.DEFAULT_MAX_TOKENS,
         api_format: str = "anthropic",
     ):
         self.client = client
@@ -83,8 +70,8 @@ class BaseAgent:
         self.max_tokens = max_tokens
         self.context_manager: Optional[ContextManager] = None
         self.plugin_catalog: Optional["PluginCatalog"] = None
-        self.max_parallel_agents = DEFAULT_MAX_PARALLEL_AGENTS
-        self.sub_agent_timeout_seconds = DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
+        self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
+        self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self._context_stack: list[AgentContext] = []
 
     def _emit_subagent_event(self, event: SubAgentProgressEvent) -> None:
@@ -92,7 +79,7 @@ class BaseAgent:
         if sink is not None:
             sink.on_subagent_event(event)
             return
-        CliOutputSink(CONSOLE).on_subagent_event(event)
+        CliOutputSink(shared.CONSOLE).on_subagent_event(event)
 
     def set_model(self, model: str) -> None:
         """Switch the model used for subsequent calls."""
@@ -249,7 +236,7 @@ class BaseAgent:
                     if sink:
                         sink.on_tool_blocked(name, pre.message)
                     else:
-                        CONSOLE.print(
+                        shared.CONSOLE.print(
                             f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {pre.message})[/yellow]"
                         )
                     return json.dumps(
@@ -260,26 +247,26 @@ class BaseAgent:
             if sink:
                 sink.on_tool_start(name, tu["input"])
             else:
-                CONSOLE.print(
+                shared.CONSOLE.print(
                     f"\n[cyan]→ {name}[/cyan]{_fmt_tool_inputs(name, tu['input'])}"
                 )
             try:
                 res = await asyncio.wait_for(
                     self.registry.call(name, tu["input"]),
-                    timeout=REGULAR_TOOL_TIMEOUT,
+                    timeout=shared.REGULAR_TOOL_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 res = json.dumps(
                     {
                         "ok": False,
-                        "error": f"tool '{name}' timed out after {REGULAR_TOOL_TIMEOUT}s",
+                        "error": f"tool '{name}' timed out after {shared.REGULAR_TOOL_TIMEOUT}s",
                     }
                 )
             # Display result after call completes
             if sink:
                 sink.on_tool_end(name, res)
             else:
-                CONSOLE.print(
+                shared.CONSOLE.print(
                     f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]"
                 )
             # post_tool hook — observational, does not alter the result
@@ -449,14 +436,14 @@ class BaseAgent:
             self._context_stack.append(ctx)
 
             # D1: bounded tool-call loop — prevents infinite model loops
-            for _iteration in range(MAX_TOOL_CALL_ITERATIONS + 1):
-                if _iteration == MAX_TOOL_CALL_ITERATIONS:
+            for _iteration in range(shared.MAX_TOOL_CALL_ITERATIONS + 1):
+                if _iteration == shared.MAX_TOOL_CALL_ITERATIONS:
                     return AgentResult(
                         agent_id=ctx.agent_id,
                         content=result_text,
                         tool_calls_made=tool_calls_made,
                         error=(
-                            f"Tool-call loop exceeded {MAX_TOOL_CALL_ITERATIONS} "
+                            f"Tool-call loop exceeded {shared.MAX_TOOL_CALL_ITERATIONS} "
                             "iterations; possible model loop detected."
                         ),
                     )
@@ -597,18 +584,18 @@ class BaseAgent:
         # Build a synthetic response object using module-level dataclasses
         oi_tool_calls = (
             [
-                _OAITC(v["id"], _OAIFunc(v["name"], v["arguments"]))
+                shared._OAITC(v["id"], shared._OAIFunc(v["name"], v["arguments"]))
                 for _, v in sorted(tool_calls_acc.items())
             ]
             if tool_calls_acc
             else None
         )
 
-        response = _OAIResponse(
+        response = shared._OAIResponse(
             [
-                _OAIChoice(
+                shared._OAIChoice(
                     finish_reason,
-                    _OAIMsg("".join(collected), oi_tool_calls),
+                    shared._OAIMsg("".join(collected), oi_tool_calls),
                 )
             ]
         )
@@ -629,7 +616,7 @@ class BaseAgent:
             # B2: snapshot the registry to avoid RuntimeError if tools are added
             # concurrently (e.g. via /generate-tool while a spawn batch runs).
             tools_snapshot = dict(parent.registry._tools)
-            sub_registry = ToolRegistry(console=CONSOLE)
+            sub_registry = ToolRegistry(console=shared.CONSOLE)
             for name, tool_def in tools_snapshot.items():
                 if name != "spawn_agent":
                     sub_registry._tools[name] = tool_def

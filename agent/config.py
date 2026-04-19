@@ -12,20 +12,10 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 import agent as agent_module
+from agent import shared
 
-CONSOLE = agent_module.CONSOLE
 DEFAULT_CONFIG = None
-DEFAULT_MAX_PARALLEL_AGENTS = agent_module.DEFAULT_MAX_PARALLEL_AGENTS
-DEFAULT_MAX_TOKENS = agent_module.DEFAULT_MAX_TOKENS
-DEFAULT_MODEL = agent_module.DEFAULT_MODEL
-DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = agent_module.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
-MEMORY_TIDY_FILE_THRESHOLD = agent_module.MEMORY_TIDY_FILE_THRESHOLD
-MEMORY_TIDY_INTERVAL = agent_module.MEMORY_TIDY_INTERVAL
-SLEEP_TOKEN_RATIO = agent_module.SLEEP_TOKEN_RATIO
-CHARS_PER_TOKEN = agent_module.CHARS_PER_TOKEN
-DECAY_FACTOR = agent_module.DECAY_FACTOR
-_atomic_write_text = agent_module._atomic_write_text
 
 # ── Default config.json template ─────────────────────────────────────────────
 DEFAULT_CONFIG: dict = {
@@ -68,13 +58,13 @@ DEFAULT_CONFIG: dict = {
     },
     # ── Memory settings ───────────────────────────────────────────────────
     "memory": {
-        "tidy_interval_seconds": MEMORY_TIDY_INTERVAL,
-        "tidy_file_threshold": MEMORY_TIDY_FILE_THRESHOLD,
+        "tidy_interval_seconds": shared.MEMORY_TIDY_INTERVAL,
+        "tidy_file_threshold": shared.MEMORY_TIDY_FILE_THRESHOLD,
     },
     # ── Multi-agent orchestration ─────────────────────────────────────────
     "orchestration": {
-        "max_parallel_agents": DEFAULT_MAX_PARALLEL_AGENTS,
-        "sub_agent_timeout_seconds": DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
+        "max_parallel_agents": shared.DEFAULT_MAX_PARALLEL_AGENTS,
+        "sub_agent_timeout_seconds": shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
     },
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
@@ -111,10 +101,10 @@ def _ensure_config_file() -> bool:
 
     Returns True if this is the first run (file was just created).
     """
-    agent_module.AGENT_HOME.mkdir(parents=True, exist_ok=True)
-    if not agent_module.CONFIG_FILE.exists():
-        _atomic_write_text(
-            agent_module.CONFIG_FILE,
+    shared.AGENT_HOME.mkdir(parents=True, exist_ok=True)
+    if not shared.CONFIG_FILE.exists():
+        shared._atomic_write_text(
+            shared.CONFIG_FILE,
             json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False),
         )
         return True  # first run
@@ -149,9 +139,9 @@ class ModelClientFactory:
         api_format = provider_cfg.get("api_format", "openai")
         raw_key = provider_cfg.get("api_key", "")
         base_url = provider_cfg.get("base_url", None)
-        model = cfg.get("model") or provider_cfg.get("default_model", DEFAULT_MODEL)
+        model = cfg.get("model") or provider_cfg.get("default_model", shared.DEFAULT_MODEL)
         max_tokens = cfg.get("max_tokens") or provider_cfg.get(
-            "max_tokens", DEFAULT_MAX_TOKENS
+            "max_tokens", shared.DEFAULT_MAX_TOKENS
         )
 
         # Resolve api key:
@@ -191,7 +181,7 @@ class ModelClientFactory:
             )
 
         if announce:
-            CONSOLE.print(
+            shared.CONSOLE.print(
                 f"[dim]Provider: {active_name} | format: {api_format} | model: {model}[/dim]"
             )
         return client, model, int(max_tokens)
@@ -226,7 +216,7 @@ def load_config() -> tuple[dict, bool]:
     """
     first_run = _ensure_config_file()
     try:
-        raw = json.loads(agent_module.CONFIG_FILE.read_text())
+        raw = json.loads(shared.CONFIG_FILE.read_text())
         # Only backfill structural sections the user hasn't touched;
         # never overwrite top-level identity keys.
         for section in (
@@ -240,16 +230,13 @@ def load_config() -> tuple[dict, bool]:
                 raw[section] = DEFAULT_CONFIG[section]
         return raw, first_run
     except Exception as e:
-        CONSOLE.print(f"[yellow]Config parse error: {e} — using defaults[/yellow]")
+        shared.CONSOLE.print(f"[yellow]Config parse error: {e} — using defaults[/yellow]")
         return dict(DEFAULT_CONFIG), first_run
 
 
 def save_config(cfg: dict):
-    agent_module.AGENT_HOME.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(
-        agent_module.CONFIG_FILE,
-        json.dumps(cfg, indent=2, ensure_ascii=False),
-    )
+    shared.AGENT_HOME.mkdir(parents=True, exist_ok=True)
+    shared._atomic_write_text(shared.CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False))
 
 
 def _first_run_setup() -> bool:
@@ -259,11 +246,11 @@ def _first_run_setup() -> bool:
     """
     from rich.prompt import Confirm
 
-    CONSOLE.print(
+    shared.CONSOLE.print(
         Panel(
             f"[bold cyan]Welcome to Personal Agent![/bold cyan]\n\n"
             f"Config file created at:\n"
-            f"  [bold]{agent_module.CONFIG_FILE}[/bold]\n\n"
+            f"  [bold]{shared.CONFIG_FILE}[/bold]\n\n"
             f"Let's set up your AI provider. You can change this anytime:\n"
             f"  [dim]python -m agent config use-provider <name>[/dim]\n"
             f"  [dim]python -m agent config edit[/dim]",
@@ -281,12 +268,12 @@ def _first_run_setup() -> bool:
         "5": ("other", "openai", None, None),
     }
 
-    CONSOLE.print("\n[bold]Select provider:[/bold]")
-    CONSOLE.print("  1. Anthropic Claude  (native SDK)")
-    CONSOLE.print("  2. OpenAI            (openai SDK)")
-    CONSOLE.print("  3. DeepSeek          (OpenAI-compatible)")
-    CONSOLE.print("  4. Ollama            (local, no key needed)")
-    CONSOLE.print("  5. Other             (custom OpenAI-compatible endpoint)")
+    shared.CONSOLE.print("\n[bold]Select provider:[/bold]")
+    shared.CONSOLE.print("  1. Anthropic Claude  (native SDK)")
+    shared.CONSOLE.print("  2. OpenAI            (openai SDK)")
+    shared.CONSOLE.print("  3. DeepSeek          (OpenAI-compatible)")
+    shared.CONSOLE.print("  4. Ollama            (local, no key needed)")
+    shared.CONSOLE.print("  5. Other             (custom OpenAI-compatible endpoint)")
 
     choice = ""
     while choice not in provider_menu:
@@ -299,7 +286,7 @@ def _first_run_setup() -> bool:
             Prompt.ask("Provider name (e.g. siliconflow, together)").strip() or "custom"
         )
 
-    CONSOLE.print(
+    shared.CONSOLE.print(
         f"\n[dim]Provider: [bold]{provider_name}[/bold] | format: {api_format}[/dim]"
     )
 
@@ -317,22 +304,22 @@ def _first_run_setup() -> bool:
     # ── Step 3: API key ───────────────────────────────────────────────────────
     if provider_name == "ollama":
         api_key_val = "ollama"
-        CONSOLE.print("[dim]Ollama: no API key needed.[/dim]")
+        shared.CONSOLE.print("[dim]Ollama: no API key needed.[/dim]")
     else:
         existing_key = os.environ.get(env_key, "") if env_key else ""
         if existing_key:
-            CONSOLE.print(f"[green]Found {env_key} in environment. ✓[/green]")
+            shared.CONSOLE.print(f"[green]Found {env_key} in environment. ✓[/green]")
             api_key_val = f"${env_key}" if env_key else existing_key
         else:
-            CONSOLE.print(
+            shared.CONSOLE.print(
                 f"\n[yellow]API key not found in env '{env_key or '?'}'.[/yellow]"
             )
-            CONSOLE.print("Options:")
-            CONSOLE.print("  a) Enter key now  (stored in config.json — less secure)")
+            shared.CONSOLE.print("Options:")
+            shared.CONSOLE.print("  a) Enter key now  (stored in config.json — less secure)")
             env_hint = (
                 f"export {env_key}=<key>" if env_key else "set your API key env var"
             )
-            CONSOLE.print(f"  b) Leave blank    (add '{env_hint}' later and restart)")
+            shared.CONSOLE.print(f"  b) Leave blank    (add '{env_hint}' later and restart)")
 
             raw = Prompt.ask(
                 "API key (enter to skip)", default="", password=True
@@ -341,7 +328,7 @@ def _first_run_setup() -> bool:
                 api_key_val = raw
             else:
                 api_key_val = f"${env_key}" if env_key else "$API_KEY"
-                CONSOLE.print(f"[dim]Stored as reference: {api_key_val}[/dim]")
+                shared.CONSOLE.print(f"[dim]Stored as reference: {api_key_val}[/dim]")
 
     # ── Step 4: default model ─────────────────────────────────────────────────
     model_defaults = {
@@ -367,7 +354,7 @@ def _first_run_setup() -> bool:
 
     save_config(cfg)
 
-    CONSOLE.print(
+    shared.CONSOLE.print(
         Panel(
             f"[green]Config saved.[/green]\n\n"
             f"  Provider : [bold]{provider_name}[/bold] ({api_format})\n"
@@ -395,13 +382,13 @@ def _resolve_output_dir(cfg: dict) -> Path:
     if raw:
         p = Path(os.path.expandvars(str(raw))).expanduser().resolve()
     else:
-        p = agent_module.DEFAULT_OUTPUT_DIR
+        p = shared.DEFAULT_OUTPUT_DIR
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def _load_system_prompt(cfg: dict) -> str:
-    best = agent_module.PROMPTS_DIR / "best.md"
+    best = shared.PROMPTS_DIR / "best.md"
     if best.exists():
         content = best.read_text()
         content = re.sub(r"^<!--.*?-->\n", "", content, flags=re.DOTALL)
@@ -411,7 +398,7 @@ def _load_system_prompt(cfg: dict) -> str:
         p = Path(prompt_file)
         if p.exists():
             return p.read_text()
-        CONSOLE.print(
+        shared.CONSOLE.print(
             f"[yellow]system_prompt_file '{prompt_file}' not found — using default[/yellow]"
         )
     return DEFAULT_SYSTEM_PROMPT
@@ -463,8 +450,8 @@ def _compose_system_prompt(
             )
     lines.append(
         "Agent-managed paths are separate from the workspace root: "
-        f"user tools live in {agent_module.TOOLS_DIR}, "
-        f"user skills live in {agent_module.SKILLS_DIR}."
+        f"user tools live in {shared.TOOLS_DIR}, "
+        f"user skills live in {shared.SKILLS_DIR}."
     )
     if output_dir:
         lines.append(

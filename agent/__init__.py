@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import types
 import time
 import traceback
 import uuid
@@ -41,7 +42,6 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 import typer
-from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -49,90 +49,64 @@ from rich.table import Table
 
 import mcp
 
+from . import shared as _shared
 from .channels import Channel, ChannelRunner, CliChannel, IncomingMessage, _build_gateway_channels
 from .core.output import CliOutputSink, OutputSink, _active_sink, _fmt_tool_inputs
-
-# ── Constants ─────────────────────────────────────────────────────────────────
-AGENT_HOME = Path.home() / ".agent"
-MEMORY_DIR = AGENT_HOME / "memory"
-SKILLS_DIR = AGENT_HOME / "skills"
-TOOLS_DIR = AGENT_HOME / "tools"
-PACKAGE_ROOT = Path(__file__).resolve().parent
-BUILTIN_SKILLS_DIR = PACKAGE_ROOT / "_builtin" / "skills"
-PROMPTS_DIR = AGENT_HOME / "prompts"
-RL_DIR = AGENT_HOME / "rl"
-CONFIG_FILE = AGENT_HOME / "config.json"
-INDEX_FILE = MEMORY_DIR / "INDEX.md"
-SESSIONS_FILE = RL_DIR / "sessions.jsonl"
-DEFAULT_OUTPUT_DIR = AGENT_HOME / "output"
-PLUGINS_DIR = PACKAGE_ROOT / "_builtin" / "plugins"
-USER_PLUGINS_DIR = AGENT_HOME / "plugins"
-
-DEFAULT_MODEL = "claude-opus-4-5"
-DEFAULT_MAX_TOKENS = 8192
-MEMORY_TIDY_INTERVAL = 3600  # seconds
-MEMORY_TIDY_FILE_THRESHOLD = 5
-DEFAULT_MAX_PARALLEL_AGENTS = 3
-DEFAULT_SUB_AGENT_TIMEOUT_SECONDS = (
-    300  # must be > REGULAR_TOOL_TIMEOUT to allow multi-tool sub-agents
+from .shared import (
+    AGENT_HOME,
+    BUILTIN_SKILLS_DIR,
+    CHARS_PER_TOKEN,
+    CONFIG_FILE,
+    CONSOLIDATION_MAX_SOURCE_TOKENS,
+    CONSOLE,
+    CONTEXT_DIR,
+    DECAY_FACTOR,
+    DEFAULT_MAX_PARALLEL_AGENTS,
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_MODEL,
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_ROUTE_KEYWORDS,
+    DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
+    INDEX_FILE,
+    LEGACY_MEMORY_ALIASES,
+    MAX_CATEGORIES,
+    MAX_TOOL_CALL_ITERATIONS,
+    MEMORY_DIR,
+    MEMORY_TIDY_FILE_THRESHOLD,
+    MEMORY_TIDY_INTERVAL,
+    MIN_IMPORTANCE,
+    PACKAGE_ROOT,
+    PALACE_DB_FILE,
+    PALACE_LOCI,
+    PALACE_LOCUS_SUMMARIES,
+    PLUGINS_DIR,
+    PROMPTS_DIR,
+    RECENT_SESSION_TURNS,
+    REGULAR_TOOL_TIMEOUT,
+    RETRIEVAL_TOP_K,
+    RL_DIR,
+    SESSIONS_FILE,
+    SKILLS_DIR,
+    SLEEP_TOKEN_RATIO,
+    STAGING_DIR,
+    STAGING_TOKEN_THRESHOLD,
+    STAGING_TURN_THRESHOLD,
+    TOOLS_DIR,
+    USER_PLUGINS_DIR,
+    _AnthropicFallbackResponse,
+    _AnthropicTextBlock,
+    _OAIChoice,
+    _OAIFunc,
+    _OAIMsg,
+    _OAIResponse,
+    _OAITC,
+    _atomic_write_text,
+    _is_safe_prompt_version,
+    _new_id,
+    _with_task_context,
 )
-MAX_TOOL_CALL_ITERATIONS = 40  # hard ceiling on tool-call rounds per send_message call
-REGULAR_TOOL_TIMEOUT = 120  # wall-clock timeout (s) for any single non-spawn tool call
 
-# ── Context Manager constants ──────────────────────────────────────────────────
-CONTEXT_DIR = AGENT_HOME / "context"
-MAX_CATEGORIES = 15  # upper limit on dynamic LTM categories
-MIN_IMPORTANCE = 0.05  # entries below this are pruned after decay
-CHARS_PER_TOKEN = 4  # rough estimate: 4 chars ≈ 1 token
-SLEEP_TOKEN_RATIO = 0.70  # trigger sleep when working memory > 70% of max_tokens
-DECAY_FACTOR = 0.95  # per-sleep importance multiplier
-RETRIEVAL_TOP_K = 5  # top-K entries injected per turn
-STAGING_DIR = CONTEXT_DIR / "_staging"  # per-session raw conversation buffers
-RECENT_SESSION_TURNS = 6  # recent staged turns exposed to explicit context lookup
-PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
-STAGING_TURN_THRESHOLD = 6
-CONSOLIDATION_MAX_SOURCE_TOKENS = 1200
-# Token threshold for the slow-path staging consolidation check.
-# Must be large enough to avoid firing on a single verbose turn.
-# CJK text costs ~1 estimated token/char, so 2100 fired on every response
-# over ~2100 chars. 8000 tokens ≈ 8 typical turns of mixed CJK/English
-# conversation, matching the intent of "consolidate after meaningful context
-# has accumulated" rather than "consolidate after one long reply".
-STAGING_TOKEN_THRESHOLD = 8000
-PALACE_LOCI = (
-    "identity",
-    "projects",
-    "people",
-    "concepts",
-    "episodes",
-    "tasks",
-    "procedures",
-    "archive",
-)
-LEGACY_MEMORY_ALIASES = {
-    "knowledge": "concepts",
-}
-PALACE_LOCUS_SUMMARIES = {
-    "identity": "User identity, preferences, communication style, and durable constraints",
-    "projects": "Project background, decisions, risks, and current state",
-    "people": "People-specific facts, relationships, and collaboration context",
-    "concepts": "Stable concepts, definitions, and domain knowledge",
-    "episodes": "Session and event summaries",
-    "tasks": "Open loops, commitments, and next actions",
-    "procedures": "Reusable workflows and preferred methods",
-    "archive": "Superseded or historical memory items",
-}
-DEFAULT_ROUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "episodes": (),
-    "identity": ("偏好", "喜欢", "风格", "prefer", "preference"),
-    "projects": ("项目", "project", "repo", "仓库"),
-    "tasks": ("任务", "todo", "待办", "next step", "open loop"),
-    "procedures": ("流程", "通常怎么", "workflow", "procedure"),
-    "people": ("人", "person", "people", "同事"),
-    "concepts": ("概念", "是什么", "what is", "define", "知识"),
-}
-
-CONSOLE = Console()
+# Shared constants/helpers are defined in agent.shared and re-exported here.
 
 # ── Ralph Loop ────────────────────────────────────────────────────────────────
 TASKS_DIR = AGENT_HOME / "tasks"
@@ -183,78 +157,6 @@ def _load_ralph_task(task_id: str) -> Optional[RalphTask]:
         return RalphTask(**data)
     except Exception:
         return None
-
-
-def _new_id() -> str:
-    return uuid.uuid4().hex
-
-
-def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(content, encoding=encoding)
-    tmp.replace(path)
-
-
-def _is_safe_prompt_version(version: str) -> bool:
-    return bool(re.fullmatch(r"[A-Za-z0-9_-]+", version))
-
-
-def _with_task_context(system_prompt: str, task_context: str) -> str:
-    task_context = str(task_context or "").strip()
-    if not task_context:
-        return system_prompt
-    return (
-        system_prompt
-        + "\n\n## Current Task Context (original request)\n"
-        + task_context
-    )
-
-
-# ── OpenAI streaming synthetic response types ─────────────────────────────────
-# These replace the inline anonymous classes that were previously defined inside
-# _stream_response(), making the code testable and eliminating duplication.
-
-
-@dataclass
-class _OAIFunc:
-    name: str
-    arguments: str
-
-
-@dataclass
-class _OAITC:
-    id: str
-    function: _OAIFunc
-
-
-@dataclass
-class _OAIMsg:
-    content: str
-    tool_calls: Optional[list]
-
-
-@dataclass
-class _OAIChoice:
-    finish_reason: str
-    message: _OAIMsg
-
-
-@dataclass
-class _OAIResponse:
-    choices: list
-
-
-@dataclass
-class _AnthropicTextBlock:
-    text: str
-    type: str = "text"
-
-
-@dataclass
-class _AnthropicFallbackResponse:
-    stop_reason: str
-    content: list
 
 
 DEFAULT_SYSTEM_PROMPT = """You are a powerful personal AI agent with tools, memory, and the ability to spawn sub-agents.
@@ -504,6 +406,67 @@ from .config import (
 from .bootstrap import _build_components, _build_components_async
 
 
+class _AgentModule(types.ModuleType):
+    _FORWARDED = {
+        "AGENT_HOME",
+        "MEMORY_DIR",
+        "SKILLS_DIR",
+        "TOOLS_DIR",
+        "PACKAGE_ROOT",
+        "BUILTIN_SKILLS_DIR",
+        "PROMPTS_DIR",
+        "RL_DIR",
+        "CONFIG_FILE",
+        "INDEX_FILE",
+        "SESSIONS_FILE",
+        "DEFAULT_OUTPUT_DIR",
+        "PLUGINS_DIR",
+        "USER_PLUGINS_DIR",
+        "DEFAULT_MODEL",
+        "DEFAULT_MAX_TOKENS",
+        "MEMORY_TIDY_INTERVAL",
+        "MEMORY_TIDY_FILE_THRESHOLD",
+        "DEFAULT_MAX_PARALLEL_AGENTS",
+        "DEFAULT_SUB_AGENT_TIMEOUT_SECONDS",
+        "MAX_TOOL_CALL_ITERATIONS",
+        "REGULAR_TOOL_TIMEOUT",
+        "CONTEXT_DIR",
+        "MAX_CATEGORIES",
+        "MIN_IMPORTANCE",
+        "CHARS_PER_TOKEN",
+        "SLEEP_TOKEN_RATIO",
+        "DECAY_FACTOR",
+        "RETRIEVAL_TOP_K",
+        "STAGING_DIR",
+        "RECENT_SESSION_TURNS",
+        "PALACE_DB_FILE",
+        "STAGING_TURN_THRESHOLD",
+        "CONSOLIDATION_MAX_SOURCE_TOKENS",
+        "STAGING_TOKEN_THRESHOLD",
+        "PALACE_LOCI",
+        "LEGACY_MEMORY_ALIASES",
+        "PALACE_LOCUS_SUMMARIES",
+        "DEFAULT_ROUTE_KEYWORDS",
+        "CONSOLE",
+        "_new_id",
+        "_atomic_write_text",
+        "_is_safe_prompt_version",
+        "_with_task_context",
+        "_OAIFunc",
+        "_OAITC",
+        "_OAIMsg",
+        "_OAIChoice",
+        "_OAIResponse",
+        "_AnthropicTextBlock",
+        "_AnthropicFallbackResponse",
+    }
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in self._FORWARDED:
+            setattr(_shared, name, value)
+        super().__setattr__(name, value)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. CLI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -522,3 +485,6 @@ def __getattr__(name: str):
 
         return getattr(cli_module, name)
     raise AttributeError(name)
+
+
+sys.modules[__name__].__class__ = _AgentModule

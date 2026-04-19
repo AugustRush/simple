@@ -9,11 +9,8 @@ import shutil
 from typing import Any, Optional
 
 import agent as agent_module
+from agent import shared
 from agent.tools.runtime import ToolRegistry
-
-CONSOLE = agent_module.CONSOLE
-_atomic_write_text = agent_module._atomic_write_text
-DEFAULT_OUTPUT_DIR = agent_module.DEFAULT_OUTPUT_DIR
 
 
 def _datestamp() -> str:
@@ -149,8 +146,8 @@ class SkillCatalog:
     def __init__(
         self, user_root: Optional[Path] = None, builtin_root: Optional[Path] = None
     ):
-        self.user_root = user_root or agent_module.SKILLS_DIR
-        self.builtin_root = builtin_root or agent_module.BUILTIN_SKILLS_DIR
+        self.user_root = user_root or shared.SKILLS_DIR
+        self.builtin_root = builtin_root or shared.BUILTIN_SKILLS_DIR
         self._skills: dict[str, SkillBundle] = {}
         self._aliases: dict[str, str] = {}
         self._registry: Optional[ToolRegistry] = None
@@ -179,7 +176,7 @@ class SkillCatalog:
         try:
             raw_text = skill_file.read_text(encoding="utf-8")
         except Exception as e:
-            CONSOLE.print(f"[yellow]Failed to read skill {skill_file}: {e}[/yellow]")
+            shared.CONSOLE.print(f"[yellow]Failed to read skill {skill_file}: {e}[/yellow]")
             return None
 
         metadata, body = parse_skill_markdown(raw_text)
@@ -768,8 +765,8 @@ class SkillCatalog:
             )
         lines.append(
             "Agent-managed paths are separate from the workspace root: "
-            f"user tools live in {agent_module.TOOLS_DIR}, "
-            f"user skills live in {agent_module.SKILLS_DIR}."
+            f"user tools live in {shared.TOOLS_DIR}, "
+            f"user skills live in {shared.SKILLS_DIR}."
         )
         lines.append("")
         lines.append(bundle.body or "(No instructions in SKILL.md body)")
