@@ -115,13 +115,15 @@ def test_merge_removes_old_files(tmp_path):
     store.merge_categories("cat_a", "cat_b", "merged")
     assert not (tmp_path / "context" / "cat_a.json").exists()
     assert not (tmp_path / "context" / "cat_b.json").exists()
-    assert (tmp_path / "context" / "merged.json").exists()
+    assert not (tmp_path / "context" / "merged.json").exists()
 
 
-def test_meta_persists_across_instances(tmp_path):
+def test_category_stats_are_derived_from_sqlite_across_instances(tmp_path):
     store1 = make_store(tmp_path)
     store1.add_entry(make_entry(cid="1", category="persistent"))
-    # New instance — should reload meta from disk
+    assert not (tmp_path / "context" / "_meta.json").exists()
+
+    # New instance derives stats from SQLite, not _meta.json.
     from agent import LTMStore
 
     store2 = LTMStore(context_dir=tmp_path / "context")
@@ -302,7 +304,7 @@ def test_add_entry_preserves_created_at_when_upserting(tmp_path):
     assert entry.updated_at == "2026-04-12"
 
 
-def test_projection_sync_removes_stale_entity_files(tmp_path):
+def test_write_entries_does_not_project_markdown_files(tmp_path):
     from agent import LTMEntry, LTMStore
 
     memory_dir = tmp_path / "memory"
@@ -324,7 +326,7 @@ def test_projection_sync_removes_stale_entity_files(tmp_path):
         )
     )
 
-    assert (memory_dir / "identity" / "user.md").exists()
+    assert not (memory_dir / "identity" / "user.md").exists()
 
     store.write_entries(
         "identity",
@@ -344,7 +346,7 @@ def test_projection_sync_removes_stale_entity_files(tmp_path):
     )
 
     assert not (memory_dir / "identity" / "user.md").exists()
-    assert (memory_dir / "identity" / "admin.md").exists()
+    assert not (memory_dir / "identity" / "admin.md").exists()
 
 
 def test_add_entry_maps_overflow_dynamic_categories_to_concepts(tmp_path):
@@ -438,7 +440,7 @@ def test_search_entries_queries_fts_index(tmp_path, monkeypatch):
     assert any("memory_items_fts" in sql for sql in seen_sql)
 
 
-def test_add_entry_only_syncs_affected_categories(tmp_path, monkeypatch):
+def test_add_entry_does_not_write_user_visible_projections(tmp_path, monkeypatch):
     from agent import LTMEntry, LTMStore
 
     store = LTMStore(
@@ -469,16 +471,8 @@ def test_add_entry_only_syncs_affected_categories(tmp_path, monkeypatch):
     )
 
     synced_categories: list[str] = []
-    monkeypatch.setattr(
-        store,
-        "_sync_category_snapshot",
-        lambda category: synced_categories.append(f"snapshot:{category}"),
-    )
-    monkeypatch.setattr(
-        store,
-        "_sync_projection",
-        lambda category: synced_categories.append(f"projection:{category}"),
-    )
+    monkeypatch.setattr(store, "_sync_category_snapshot", lambda category: None)
+    monkeypatch.setattr(store, "_sync_projection", lambda category: None)
 
     store.add_entry(
         LTMEntry(
@@ -492,7 +486,7 @@ def test_add_entry_only_syncs_affected_categories(tmp_path, monkeypatch):
         )
     )
 
-    assert synced_categories == ["snapshot:tasks", "projection:tasks"]
+    assert synced_categories == []
 
 
 def test_ensure_fts_index_repairs_mismatched_rows_even_when_counts_match(tmp_path):

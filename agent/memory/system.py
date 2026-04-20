@@ -179,8 +179,19 @@ class MemoryPalace:
         return self.index.list_chapters()
 
     def read_index(self) -> str:
-        self.index.update()
-        return self.index.read()
+        path = self.export_jsonl()
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def export_jsonl(self, path: Optional[Path] = None) -> Path:
+        path = path or (self.base_dir / "memory.jsonl")
+        entries = self.store.all_entries()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [
+            json.dumps(entry.to_dict(), ensure_ascii=False)
+            for entry in entries
+        ]
+        path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+        return path
 
     def should_tidy(self) -> bool:
         if self._files_since_tidy >= self._tidy_threshold:
@@ -196,7 +207,7 @@ class MemoryPalace:
         self._files_since_tidy = self._tidy_threshold
 
     async def tidy(self, client: Any, model: str):
-        """Local maintenance pass: apply retention and rebuild projections."""
+        """Local maintenance pass: apply retention and refresh JSONL export."""
         shared.CONSOLE.print("[dim]Tidying memory palace...[/dim]")
         self.store.apply_retention()
         snapshot = self.store.maintenance_snapshot(limit=20)
@@ -215,7 +226,7 @@ class MemoryPalace:
                     updated_at=_now(),
                 )
             )
-        self.index.update()
+        self.export_jsonl()
         self._last_tidy = time.time()
         self._files_since_tidy = 0
         shared.CONSOLE.print("[dim]Memory tidy complete.[/dim]")
@@ -521,6 +532,7 @@ class LTMStore:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_schema()
         self._ensure_fts_index()
+        self._cleanup_legacy_artifacts()
         self._meta = {"categories": [], "total_entries": 0}
         self._refresh_indexes()
 
@@ -644,7 +656,18 @@ class LTMStore:
             )
 
     def _save_meta(self) -> None:
-        self._meta_path.write_text(json.dumps(self._meta, indent=2, ensure_ascii=False))
+        """Compatibility no-op: category stats are derived from SQLite."""
+
+    def _cleanup_legacy_artifacts(self) -> None:
+        self._meta_path.unlink(missing_ok=True)
+        for path in self.dir.glob("*.json"):
+            if path.name == "palace.db":
+                continue
+            path.unlink(missing_ok=True)
+        for path in self.memory_dir.rglob("*.md"):
+            if path.name == "memory.jsonl":
+                continue
+            path.unlink(missing_ok=True)
 
     @staticmethod
     def normalize_category_name(name: str) -> str:
@@ -872,7 +895,9 @@ class LTMStore:
         return {row["category"] for row in rows if row["category"] not in shared.PALACE_LOCI}
 
     def _refresh_indexes(self) -> None:
-        previous = {c["name"] for c in self._meta.get("categories", [])}
+        self._meta = self._category_stats()
+
+    def _category_stats(self) -> dict:
         with self._connect() as conn:
             rows = conn.execute(
                 """
@@ -885,116 +910,28 @@ class LTMStore:
                 ORDER BY category
                 """
             ).fetchall()
-        self._meta = {
-            "categories": [
-                {
-                    "name": row["category"],
-                    "entry_count": int(row["entry_count"]),
-                    "avg_importance": float(row["avg_importance"] or 0.0),
-                    "last_updated": row["last_updated"] or "",
-                }
-                for row in rows
-            ],
-            "total_entries": sum(int(row["entry_count"]) for row in rows),
-        }
-        self._save_meta()
-        current = {c["name"] for c in self._meta.get("categories", [])}
-        for category in previous | current:
-            self._sync_category_snapshot(category)
-            if self._is_palace_locus(category):
-                self._sync_projection(category)
-
-    def _sync_after_mutation(self, categories: set[str]) -> None:
-        normalized = {
-            self.normalize_category_name(category)
-            for category in categories
-            if str(category).strip()
-        }
-        if not normalized:
-            return
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT category, COUNT(*) AS entry_count,
-                       AVG(importance) AS avg_importance,
-                       MAX(updated_at) AS last_updated
-                FROM memory_items
-                WHERE status = 'active'
-                  AND category IN ({",".join("?" for _ in normalized)})
-                GROUP BY category
-                ORDER BY category
-                """,
-                tuple(sorted(normalized)),
-            ).fetchall()
-
-        meta_by_name = {
-            category["name"]: dict(category)
-            for category in self._meta.get("categories", [])
-        }
-        for category in normalized:
-            meta_by_name.pop(category, None)
-        for row in rows:
-            meta_by_name[row["category"]] = {
+        categories = [
+            {
                 "name": row["category"],
                 "entry_count": int(row["entry_count"]),
                 "avg_importance": float(row["avg_importance"] or 0.0),
                 "last_updated": row["last_updated"] or "",
             }
-        self._meta = {
-            "categories": [meta_by_name[name] for name in sorted(meta_by_name)],
-            "total_entries": sum(
-                int(category["entry_count"]) for category in meta_by_name.values()
-            ),
+            for row in rows
+        ]
+        return {
+            "categories": categories,
+            "total_entries": sum(int(row["entry_count"]) for row in rows),
         }
-        self._save_meta()
-        for category in sorted(normalized):
-            self._sync_category_snapshot(category)
-            if self._is_palace_locus(category):
-                self._sync_projection(category)
+
+    def _sync_after_mutation(self, categories: set[str]) -> None:
+        self._meta = self._category_stats()
 
     def _sync_category_snapshot(self, category: str) -> None:
-        category = self.normalize_category_name(category)
-        entries = self.read_entries(category)
-        path = self._category_path(category)
-        if not entries:
-            path.unlink(missing_ok=True)
-            return
-        path.write_text(
-            json.dumps([e.to_dict() for e in entries], indent=2, ensure_ascii=False)
-        )
+        """Compatibility no-op: user-visible memory is exported as JSONL."""
 
     def _sync_projection(self, category: str) -> None:
-        category = self.normalize_category_name(category)
-        if not self._is_palace_locus(category):
-            return
-        entries = self.read_entries(category)
-        category_dir = self.memory_dir / category
-        category_dir.mkdir(parents=True, exist_ok=True)
-        grouped: dict[str, list[LTMEntry]] = {}
-        for entry in entries:
-            grouped.setdefault(entry.entity, []).append(entry)
-        expected_files = {f"{entity}.md" for entity in grouped}
-        for existing in category_dir.glob("*.md"):
-            if existing.name == "_index.md":
-                continue
-            if existing.name not in expected_files:
-                existing.unlink(missing_ok=True)
-        for entity, entity_entries in grouped.items():
-            path = self._projection_path(category, entity)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            lines = [
-                f"# {category}/{entity}",
-                f"_updated: {_now()}_",
-                "",
-            ]
-            for entry in sorted(
-                entity_entries, key=lambda e: (e.importance, e.updated_at), reverse=True
-            ):
-                lines.append(
-                    f"- ({entry.memory_type}) {entry.content} "
-                    f"[importance={entry.importance:.2f}, status={entry.status}]"
-                )
-            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        """Compatibility no-op: memory palace loci are internal categories."""
 
     def _remove_category(self, category: str) -> None:
         category = self.normalize_category_name(category)
@@ -1013,17 +950,17 @@ class LTMStore:
     # ── Category helpers ──────────────────────────────────────────────────────
 
     def list_categories(self) -> list[LTMCategory]:
-        return [LTMCategory.from_dict(c) for c in self._meta.get("categories", [])]
+        return [LTMCategory.from_dict(c) for c in self._category_stats()["categories"]]
 
     def category_count(self) -> int:
-        return len(self._meta.get("categories", []))
+        return len(self.list_categories())
 
     def dynamic_category_count(self) -> int:
         return len(
             [
                 category
-                for category in self._meta.get("categories", [])
-                if category["name"] not in shared.PALACE_LOCI
+                for category in self.list_categories()
+                if category.name not in shared.PALACE_LOCI
             ]
         )
 

@@ -1,4 +1,4 @@
-"""Tests for the fixed-loci memory palace store and markdown projection."""
+"""Tests for the fixed-loci memory palace store and JSONL user export."""
 
 import inspect
 
@@ -36,7 +36,7 @@ def make_entry(
     )
 
 
-def test_store_persists_to_sqlite_and_projects_markdown(tmp_path):
+def test_store_persists_to_sqlite_without_markdown_projection(tmp_path):
     store = make_store(tmp_path)
     store.add_entry(make_entry())
 
@@ -48,10 +48,25 @@ def test_store_persists_to_sqlite_and_projects_markdown(tmp_path):
     assert entries[0].memory_type == "preference"
 
     projection = tmp_path / "memory" / "identity" / "user.md"
-    assert projection.exists()
-    text = projection.read_text()
-    assert "Prefers concise responses" in text
-    assert "identity/user" in text
+    assert not projection.exists()
+
+
+def test_memory_palace_exports_user_jsonl(tmp_path):
+    from agent import MemoryPalace
+
+    palace = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    palace.write("identity", "user", "Prefers concise responses")
+
+    path = palace.export_jsonl()
+
+    assert path == tmp_path / "memory" / "memory.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+    assert '"category": "identity"' in lines[0]
+    assert '"content": "Prefers concise responses"' in lines[0]
 
 
 def test_search_entries_can_be_filtered_by_locus(tmp_path):
@@ -86,7 +101,7 @@ def test_memory_palace_legacy_chapter_alias_maps_to_fixed_locus(tmp_path):
     palace.write("knowledge", "python", "Async notes")
 
     assert palace.read("concepts", "python") == "Async notes"
-    assert (tmp_path / "memory" / "concepts" / "python.md").exists()
+    assert not (tmp_path / "memory" / "concepts" / "python.md").exists()
 
 
 def test_memory_palace_reads_from_store_when_projection_is_missing(tmp_path):
@@ -99,8 +114,7 @@ def test_memory_palace_reads_from_store_when_projection_is_missing(tmp_path):
     palace.write("identity", "user", "Prefers concise responses")
 
     projection = tmp_path / "memory" / "identity" / "user.md"
-    assert projection.exists()
-    projection.unlink()
+    assert not projection.exists()
 
     assert "Prefers concise responses" in palace.read("identity", "user")
 
@@ -113,9 +127,6 @@ def test_memory_palace_search_uses_structured_store_as_source_of_truth(tmp_path)
         context_dir=tmp_path / "context",
     )
     palace.write("identity", "user", "Prefers concise responses")
-
-    projection = tmp_path / "memory" / "identity" / "user.md"
-    projection.unlink()
 
     results = palace.search("concise")
 
