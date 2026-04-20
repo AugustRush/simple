@@ -220,6 +220,49 @@ def test_add_entry_upserts_task_status(tmp_path):
     assert entries[0].status == "done"
 
 
+def test_add_entry_keeps_distinct_tasks_for_same_entity(tmp_path):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    store.add_entry(
+        LTMEntry(
+            id="task-1",
+            category="tasks",
+            entity="backend",
+            memory_type="task",
+            content="Fix the auth bug",
+            importance=0.9,
+            status="open",
+            created_at="2026-04-11",
+            updated_at="2026-04-11",
+        )
+    )
+    store.add_entry(
+        LTMEntry(
+            id="task-2",
+            category="tasks",
+            entity="backend",
+            memory_type="task",
+            content="Ship the retry worker",
+            importance=0.8,
+            status="open",
+            created_at="2026-04-12",
+            updated_at="2026-04-12",
+        )
+    )
+
+    entries = [e for e in store.read_entries("tasks") if e.entity == "backend"]
+
+    assert len(entries) == 2
+    assert {e.content for e in entries} == {
+        "Fix the auth bug",
+        "Ship the retry worker",
+    }
+
+
 def test_add_entry_preserves_created_at_when_upserting(tmp_path):
     from agent import LTMEntry, LTMStore
 

@@ -271,6 +271,43 @@ def test_retrieve_implicit_context_skips_current_session_for_non_recall_queries(
     assert "Current Session" not in result
 
 
+def test_retrieve_implicit_context_includes_recent_staging_after_compaction(
+    tmp_path,
+):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    staging = StagingBuffer(path=tmp_path / "staging.jsonl")
+    staging.append("user", "We decided to keep retries enabled after failures.")
+    staging.append("assistant", "Noted, retries must remain armed.")
+    staging.append("user", "Also keep the auth fix and retry worker as separate tasks.")
+    staging.append("assistant", "Separate tasks, same project.")
+
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=staging,
+    )
+
+    compacted_messages = ctx_mgr.compact_messages(
+        [{"role": "user", "content": f"older turn {i}"} for i in range(10)]
+    )
+    result = ctx_mgr.retrieve_implicit_context(
+        "What did we decide about retries?",
+        current_messages=compacted_messages,
+    )
+
+    assert "Current Session" in result
+    assert "keep retries enabled after failures" in result
+
+
 def test_sleep_clears_staging(tmp_path):
     """After sleep(), the staging file is cleared."""
     import asyncio

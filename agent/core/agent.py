@@ -455,7 +455,10 @@ class BaseAgent:
             # not yet consolidated into LTM, causing the agent to "forget" recent
             # turns when asked about them.
             if self.context_manager:
-                retrieved = self.context_manager.retrieve_implicit_context(user_message)
+                retrieved = self.context_manager.retrieve_implicit_context(
+                    user_message,
+                    current_messages=ctx.messages,
+                )
                 if retrieved:
                     ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
             skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")

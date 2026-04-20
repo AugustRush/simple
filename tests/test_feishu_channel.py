@@ -1068,6 +1068,26 @@ def test_feishu_channel_create_sink_passes_output_dir():
     assert sink.streaming is False
 
 
+def test_feishu_channel_create_sink_treats_group_chat_type_as_chat_id():
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y", streaming=False))
+    channel._client = MagicMock()
+
+    msg = IncomingMessage(
+        text="hi",
+        channel_name="feishu",
+        metadata={
+            "chat_id": "oc_test_chat",
+            "chat_type": "group_chat",
+            "message_id": "msg_1",
+        },
+    )
+
+    sink = channel.create_sink(msg)
+
+    assert sink._receive_id_type == "chat_id"
+    assert sink._receive_id == "oc_test_chat"
+
+
 def test_feishu_channel_send_command_uses_output_dir(tmp_path):
     channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
     channel._client = MagicMock()

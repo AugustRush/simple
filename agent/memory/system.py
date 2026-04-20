@@ -386,6 +386,13 @@ class LTMCategory:
         return cls(**d)
 
 
+@dataclass
+class ConsolidationResult:
+    success: bool
+    compressed_messages: list[dict]
+    stored_entries: int = 0
+
+
 class LTMStore:
     """SQLite-backed long-term memory with JSON and markdown projections."""
 
@@ -599,7 +606,8 @@ class LTMStore:
         if category in {"episodes", "archive", "concepts"}:
             return None
         if category == "tasks":
-            return f"{category}|{entity}|{memory_type}"
+            normalized_content = self._normalize_content_key(entry.content)
+            return f"{category}|{entity}|{memory_type}|{normalized_content}"
         if category not in {"identity", "projects", "people", "procedures"}:
             return None
 
@@ -616,19 +624,6 @@ class LTMStore:
         category = self.normalize_category_name(entry.category)
         entity = self._normalize_entity(entry.entity, category)
         memory_type = (entry.memory_type or "fact").strip().lower()
-
-        if category == "tasks":
-            row = conn.execute(
-                """
-                SELECT id FROM memory_items
-                WHERE category = ? AND entity = ? AND memory_type = ?
-                  AND status NOT IN ('archived', 'superseded')
-                ORDER BY updated_at DESC, id ASC
-                LIMIT 1
-                """,
-                (category, entity, memory_type),
-            ).fetchone()
-            return row["id"] if row else None
 
         normalized_content = self._normalize_content_key(entry.content)
         rows = conn.execute(
@@ -1450,7 +1445,7 @@ class ConsolidationEngine:
         api_format: str = "anthropic",
         keep_last: Optional[int] = None,
         staging: Optional["StagingBuffer"] = None,
-    ) -> list[dict]:
+    ) -> ConsolidationResult:
         """One sleep cycle: extract → classify → store → decay → compress.
 
         Source priority for LLM extraction:
@@ -1473,7 +1468,7 @@ class ConsolidationEngine:
                 shared.CONSOLE.print(
                     f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
                 )
-            return compressed
+            return ConsolidationResult(success=True, compressed_messages=compressed)
         source_label = (
             f"staging ({len(staged)} turns)"
             if staged
@@ -1520,8 +1515,10 @@ class ConsolidationEngine:
                 f"across {len(conversation_chunks)} chunk(s). "
                 f"Dynamic categories: {self.store.dynamic_category_count()}/{self.max_categories}[/dim]"
             )
+            success = True
         except Exception as e:
             shared.CONSOLE.print(f"[dim]Sleep extraction error: {e}[/dim]")
+            success = False
 
         compressed = messages[-keep_last:] if len(messages) > keep_last else messages
         if messages:
@@ -1531,7 +1528,11 @@ class ConsolidationEngine:
             shared.CONSOLE.print(
                 f"[dim]💤 Messages compressed: {len(messages)} → {len(compressed)}[/dim]"
             )
-        return compressed
+        return ConsolidationResult(
+            success=success,
+            compressed_messages=compressed,
+            stored_entries=len(entries) if success else 0,
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1651,6 +1652,14 @@ class ContextManager:
         self._lock = threading.RLock()
         self._jobs: deque[dict[str, Any]] = deque()
         self._processing_job = False
+
+    @staticmethod
+    def _coerce_consolidation_result(result: Any) -> ConsolidationResult:
+        if isinstance(result, ConsolidationResult):
+            return result
+        if isinstance(result, list):
+            return ConsolidationResult(success=True, compressed_messages=result)
+        return ConsolidationResult(success=bool(result), compressed_messages=[])
 
     def spawn_session(self, session_id: Optional[str] = None) -> "ContextManager":
         """Create a session-scoped manager that shares durable memory primitives.
@@ -1919,28 +1928,35 @@ class ContextManager:
         """Return top-K relevant LTM entries as an injectable string.
 
         Two-stage retrieval:
-          1. SQLite FTS5 fetches a broad candidate set (top_k * 3) via BM25.
-          2. LocalRetriever re-ranks candidates with importance-boosted BM25
-             (score = fts_bm25 × (1 + importance)) and returns the final top_k.
+          1. SQLite FTS5 fetches a broad candidate set via BM25.
+          2. LocalRetriever re-ranks candidates with importance-boosted BM25.
+          3. Routed categories receive a small score bonus rather than hard filtering.
 
-        Using only FTS5 misses the importance boost; using only LocalRetriever
-        on all rows would be O(n) in Python. Two-stage gives the best of both.
+        This keeps keyword routing useful without hiding relevant memories that
+        live outside the routed categories.
         """
         categories = self._route_categories(query)
-        # Fetch a wider candidate pool so the re-ranker has good material.
-        candidates = self.store.search_entries(
-            query, categories=categories or None, limit=top_k * 3
-        )
-        if not candidates and categories:
-            candidates = self.store.search_entries(
-                query, categories=None, limit=top_k * 3
-            )
+        candidates = self.store.search_entries(query, categories=None, limit=top_k * 6)
+        if not candidates:
+            candidates = [
+                entry for entry in self.store.all_entries() if entry.category != "episodes"
+            ]
         if not candidates and self._is_episode_recall_query(query):
             candidates = self.store.read_entries("episodes")[: top_k * 3]
         if not candidates:
             return ""
-        # Re-rank with importance-boosted BM25 and take the final top_k.
-        top = self.retriever.retrieve(query, candidates, top_k=top_k)
+        scored = self.retriever.score(query, candidates)
+        if categories:
+            routed = set(categories)
+            scored = [
+                (
+                    entry,
+                    score * (1.15 if entry.category in routed else 1.0),
+                )
+                for entry, score in scored
+            ]
+            scored.sort(key=lambda item: item[1], reverse=True)
+        top = [entry for entry, score in scored[:top_k] if score > 0]
         if not top:
             top = candidates[:top_k]
         lines = ["## Retrieved Context (from long-term memory)"]
@@ -1962,6 +1978,49 @@ class ContextManager:
                 lines.append(f"- {role}: {content}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
+    def _recent_unconsolidated_context(
+        self,
+        current_messages: Optional[list[dict]] = None,
+        limit: int = shared.RECENT_SESSION_TURNS,
+    ) -> str:
+        staged = self.staging.read_all()
+        if not staged:
+            return ""
+        if current_messages is None:
+            return ""
+        visible_contents: set[str] = set()
+        for msg in current_messages:
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                text = content.strip()
+                if text:
+                    visible_contents.add(text)
+                continue
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = str(
+                    block.get("text", "") or block.get("content", "")
+                ).strip()
+                if text:
+                    visible_contents.add(text)
+        staged_contents = [
+            str(msg.get("content", "")).strip()
+            for msg in staged[-limit:]
+            if str(msg.get("content", "")).strip()
+        ]
+        if not staged_contents or all(text in visible_contents for text in staged_contents):
+            return ""
+        lines = ["## Current Session (not yet consolidated)"]
+        for msg in staged[-limit:]:
+            role = str(msg.get("role", "unknown")).upper()
+            content = str(msg.get("content", "")).strip()
+            if content:
+                lines.append(f"- {role}: {content}")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
     def retrieve_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
         """Return explicit context lookup results across active session and LTM."""
         sections = []
@@ -1974,7 +2033,10 @@ class ContextManager:
         return "\n\n".join(sections)
 
     def retrieve_implicit_context(
-        self, query: str, top_k: int = shared.RETRIEVAL_TOP_K
+        self,
+        query: str,
+        top_k: int = shared.RETRIEVAL_TOP_K,
+        current_messages: Optional[list[dict]] = None,
     ) -> str:
         """Return context for automatic prompt injection.
 
@@ -1985,6 +2047,12 @@ class ContextManager:
         sections = []
         if "episodes" in self._route_categories(query):
             recent = self._recent_session_context()
+            if recent:
+                sections.append(recent)
+        else:
+            recent = self._recent_unconsolidated_context(
+                current_messages=current_messages
+            )
             if recent:
                 sections.append(recent)
         ltm = self.retrieve_ltm_context(query, top_k=top_k)
@@ -2003,9 +2071,10 @@ class ContextManager:
     ) -> list[dict]:
         """Run one sleep cycle (uses staging as source), then clear dirty flag."""
         try:
-            return await self.consolidation.consolidate(
+            result = await self.consolidation.consolidate(
                 messages, client, model, api_format, staging=self.staging
             )
+            return self._coerce_consolidation_result(result).compressed_messages
         finally:
             with self._lock:
                 self._needs_consolidation = False
@@ -2063,13 +2132,20 @@ class ContextManager:
                         self._needs_consolidation = False
                 return True
 
-            await self.consolidation.consolidate(
-                [],
-                client,
-                model,
-                api_format,
-                staging=staging_buffer,
-            )
+            try:
+                result = await self.consolidation.consolidate(
+                    [],
+                    client,
+                    model,
+                    api_format,
+                    staging=staging_buffer,
+                )
+            except Exception as exc:
+                shared.CONSOLE.print(f"[dim]Sleep extraction error: {exc}[/dim]")
+                return False
+            consolidated = self._coerce_consolidation_result(result)
+            if not consolidated.success:
+                return False
             if is_primary_staging:
                 with self._lock:
                     self._needs_consolidation = False

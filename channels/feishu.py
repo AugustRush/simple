@@ -123,6 +123,11 @@ def _clean_at_mentions(text: str) -> str:
     return _AT_PLACEHOLDER_RE.sub("", text).strip()
 
 
+def _is_group_chat_type(chat_type: str) -> bool:
+    normalized = str(chat_type or "").strip().lower()
+    return normalized in {"group", "group_chat", "chat"}
+
+
 def _extract_post_content(content_json: dict) -> tuple[str, list[str]]:
     """Extract plain text and embedded image keys from a Feishu *post* message.
 
@@ -1263,7 +1268,7 @@ class FeishuChannel(Channel):
         assert self._client is not None, "FeishuChannel.start() not called"
         chat_id = msg.metadata["chat_id"]
         chat_type = msg.metadata.get("chat_type", "p2p")
-        receive_id_type = "chat_id" if chat_type == "group" else "open_id"
+        receive_id_type = "chat_id" if _is_group_chat_type(chat_type) else "open_id"
         return FeishuOutputSink(
             client=self._client,
             receive_id_type=receive_id_type,
@@ -1324,7 +1329,8 @@ class FeishuChannel(Channel):
                 return
 
             # ── Group policy ─────────────────────────────────────────────────
-            if chat_type == "group" and not self._is_bot_mentioned(message):
+            is_group_chat = _is_group_chat_type(chat_type)
+            if is_group_chat and not self._is_bot_mentioned(message):
                 if self._config.group_policy != "open":
                     logger.debug("Feishu: skipping group message (not mentioned)")
                     return
@@ -1363,7 +1369,7 @@ class FeishuChannel(Channel):
 
             # ── Route to handler with per-chat serialisation ─────────────────
             # Group chats reply to the group (chat_id); DMs reply to the user
-            reply_to = chat_id if chat_type == "group" else sender_id
+            reply_to = chat_id if is_group_chat else sender_id
             msg_obj = IncomingMessage(
                 text=content,
                 channel_name="feishu",

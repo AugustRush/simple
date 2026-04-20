@@ -252,3 +252,43 @@ def test_process_one_job_logs_reason_and_session_context(tmp_path, capsys):
 
     assert "staged_turns" in out
     assert staging.session_id in out
+
+
+def test_process_one_job_keeps_retry_signal_when_consolidation_fails(tmp_path):
+    import agent.memory.system as memory_system
+
+    ctx_mgr, staging = _build_context_manager(tmp_path)
+    staging.append("user", "remember this")
+    staging.append("assistant", "ack")
+    ctx_mgr.mark_activity()
+    ctx_mgr.enqueue_consolidation("staged_turns")
+
+    original_consolidate = memory_system.ConsolidationEngine.consolidate
+
+    async def failing_consolidate(
+        self,
+        messages,
+        client,
+        model,
+        api_format="anthropic",
+        keep_last=None,
+        staging=None,
+    ):
+        raise RuntimeError("transient failure")
+
+    memory_system.ConsolidationEngine.consolidate = failing_consolidate
+    try:
+        async def run_once():
+            return await ctx_mgr.process_one_job(
+                client=None,
+                model="x",
+                api_format="openai",
+            )
+
+        result = asyncio.run(run_once())
+    finally:
+        memory_system.ConsolidationEngine.consolidate = original_consolidate
+
+    assert result is False
+    assert ctx_mgr._needs_consolidation is True
+    assert staging.count() == 2

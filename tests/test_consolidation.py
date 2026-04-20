@@ -510,6 +510,54 @@ def test_retrieve_ltm_context_does_not_fallback_episode_for_generic_history_quer
     assert result == ""
 
 
+def test_retrieve_ltm_context_soft_biases_routes_without_hard_filtering(tmp_path):
+    from agent import (
+        LTMEntry,
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+    )
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    store.add_entry(
+        LTMEntry(
+            id="concept-1",
+            category="concepts",
+            entity="retries",
+            memory_type="fact",
+            content="Retries should remain armed after transient consolidation failures.",
+            importance=0.8,
+            created_at="2026-04-13",
+            updated_at="2026-04-13",
+        )
+    )
+    store.add_entry(
+        LTMEntry(
+            id="project-1",
+            category="projects",
+            entity="workspace",
+            memory_type="decision",
+            content="Workspace decisions are tracked here.",
+            importance=0.5,
+            created_at="2026-04-13",
+            updated_at="2026-04-13",
+        )
+    )
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        route_keywords={
+            "projects": ["workspace"],
+        },
+    )
+
+    result = ctx_mgr.retrieve_ltm_context("workspace retries", top_k=3)
+
+    assert "retries should remain armed after transient consolidation failures" in result.lower()
+
+
 # ── Regression: all consolidation trigger guards ──────────────────────────────
 
 
