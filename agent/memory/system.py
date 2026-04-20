@@ -481,6 +481,34 @@ class LTMEntry:
         return cls(**d)
 
 
+@dataclass(frozen=True)
+class ConversationTurn:
+    """A durable event-log row for one plain-text conversation message."""
+
+    id: int
+    session_id: str
+    role: str
+    content: str
+    channel: str = ""
+    message_id: str = ""
+    reply_to_id: str = ""
+    metadata: dict[str, Any] | None = None
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "role": self.role,
+            "content": self.content,
+            "channel": self.channel,
+            "message_id": self.message_id,
+            "reply_to_id": self.reply_to_id,
+            "metadata": self.metadata or {},
+            "created_at": self.created_at,
+        }
+
+
 @dataclass
 class LTMCategory:
     """Metadata for a long-term memory category."""
@@ -605,6 +633,21 @@ class LTMStore:
                         category,
                         tokenize='unicode61'
                     );
+                CREATE TABLE IF NOT EXISTS conversation_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    channel TEXT NOT NULL DEFAULT '',
+                    message_id TEXT NOT NULL DEFAULT '',
+                    reply_to_id TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_conversation_turns_session_id
+                    ON conversation_turns(session_id, id);
+                CREATE INDEX IF NOT EXISTS idx_conversation_turns_created_at
+                    ON conversation_turns(created_at);
                 """
             )
 
@@ -720,6 +763,25 @@ class LTMStore:
             status=row["status"],
             source_session=row["source_session"],
             confidence=row["confidence"],
+        )
+
+    def _row_to_conversation_turn(self, row: sqlite3.Row) -> ConversationTurn:
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except Exception:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return ConversationTurn(
+            id=int(row["id"]),
+            session_id=row["session_id"],
+            role=row["role"],
+            content=row["content"],
+            channel=row["channel"],
+            message_id=row["message_id"],
+            reply_to_id=row["reply_to_id"],
+            metadata=metadata,
+            created_at=row["created_at"],
         )
 
     @staticmethod
@@ -1055,6 +1117,71 @@ class LTMStore:
                 entry.entity = self._normalize_entity(entry.entity, entry.category)
                 affected_categories.update(self._write_entry_row(conn, entry))
         self._sync_after_mutation(affected_categories)
+
+    def append_conversation_turn(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        channel: str = "",
+        message_id: str = "",
+        reply_to_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+        created_at: Optional[str] = None,
+    ) -> Optional[ConversationTurn]:
+        """Append one durable conversation event without affecting staging."""
+        clean_content = str(content or "").strip()
+        if not clean_content:
+            return None
+        clean_role = str(role or "").strip().lower()
+        if clean_role not in {"user", "assistant"}:
+            return None
+        payload = metadata or {}
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO conversation_turns (
+                    session_id, role, content, channel, message_id, reply_to_id,
+                    metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(session_id or "").strip() or "default",
+                    clean_role,
+                    clean_content,
+                    str(channel or ""),
+                    str(message_id or ""),
+                    str(reply_to_id or ""),
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                    created_at or _now(),
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM conversation_turns WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+        return self._row_to_conversation_turn(row) if row else None
+
+    def recent_conversation_turns(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        limit: int = shared.RECENT_SESSION_TURNS,
+    ) -> list[ConversationTurn]:
+        limit = max(1, min(int(limit), 100))
+        with self._connect() as conn:
+            sql = "SELECT * FROM conversation_turns"
+            params: list[Any] = []
+            if session_id:
+                sql += " WHERE session_id = ?"
+                params.append(session_id)
+            sql += " ORDER BY id DESC LIMIT ?"
+            params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_conversation_turn(row) for row in reversed(rows)]
 
     def upsert_manual_note(
         self, category: str, entity: str, content: str, append: bool = False
@@ -1737,6 +1864,36 @@ class ContextManager:
             self._last_activity = time.time()
             self._needs_consolidation = True
 
+    def record_turn(
+        self,
+        *,
+        user_content: str,
+        assistant_content: str = "",
+        channel: str = "",
+        message_id: str = "",
+        reply_to_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Persist the completed exchange as durable event history."""
+        session_id = self.staging.session_id
+        self.store.append_conversation_turn(
+            session_id=session_id,
+            role="user",
+            content=user_content,
+            channel=channel,
+            message_id=message_id,
+            reply_to_id=reply_to_id,
+            metadata=metadata,
+        )
+        self.store.append_conversation_turn(
+            session_id=session_id,
+            role="assistant",
+            content=assistant_content,
+            channel=channel,
+            reply_to_id=message_id,
+            metadata=metadata,
+        )
+
     def idle_elapsed(self) -> float:
         """Seconds since last activity (0 if never active)."""
         with self._lock:
@@ -2041,6 +2198,29 @@ class ContextManager:
                 lines.append(f"- {role}: {content}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
+    def retrieve_history_context(
+        self,
+        query: str,
+        limit: int = shared.RECENT_SESSION_TURNS,
+    ) -> str:
+        """Return durable event-history evidence when the query asks for it."""
+        if not self._is_episode_recall_query(query):
+            return ""
+        turns = self.store.recent_conversation_turns(
+            session_id=self.staging.session_id,
+            limit=limit,
+        )
+        if not turns:
+            turns = self.store.recent_conversation_turns(limit=limit)
+        if not turns:
+            return ""
+        lines = ["## Conversation History"]
+        for turn in turns:
+            content = turn.content.strip()
+            if content:
+                lines.append(f"- {turn.role.upper()}: {content}")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
     def _recent_unconsolidated_context(
         self,
         current_messages: Optional[list[dict]] = None,
@@ -2087,7 +2267,10 @@ class ContextManager:
     def retrieve_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
         """Return explicit context lookup results across active session and LTM."""
         sections = []
-        recent = self._recent_session_context()
+        history = self.retrieve_history_context(query)
+        if history:
+            sections.append(history)
+        recent = "" if history else self._recent_session_context()
         if recent:
             sections.append(recent)
         ltm = self.retrieve_ltm_context(query, top_k=top_k)

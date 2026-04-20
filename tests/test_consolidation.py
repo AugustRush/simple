@@ -26,6 +26,82 @@ def make_ctx_manager(tmp_path, idle_seconds=300, min_messages=4):
     )
 
 
+# ── Durable conversation history tests ───────────────────────────────────────
+
+
+def test_conversation_turns_persist_in_order(tmp_path):
+    from agent import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context")
+
+    store.append_conversation_turn(
+        session_id="session-1",
+        role="user",
+        content="我们刚才先讨论了记忆架构",
+        channel="feishu",
+    )
+    store.append_conversation_turn(
+        session_id="session-1",
+        role="assistant",
+        content="我建议把工作上下文、语义记忆、事件历史分开。",
+        channel="feishu",
+    )
+
+    turns = store.recent_conversation_turns(session_id="session-1", limit=10)
+
+    assert [turn.role for turn in turns] == ["user", "assistant"]
+    assert turns[0].content == "我们刚才先讨论了记忆架构"
+    assert turns[1].channel == "feishu"
+
+
+def test_conversation_history_survives_staging_clear(tmp_path):
+    from agent import LTMStore, StagingBuffer
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    staging = StagingBuffer(context_dir=context_dir, session_id="session-1")
+
+    staging.append("user", "这个会进入 staging")
+    store.append_conversation_turn(
+        session_id="session-1",
+        role="user",
+        content="这个会进入 durable history",
+    )
+
+    staging.clear_all()
+
+    assert staging.read_all() == []
+    turns = store.recent_conversation_turns(session_id="session-1", limit=10)
+    assert [turn.content for turn in turns] == ["这个会进入 durable history"]
+
+
+def test_retrieve_context_prefers_conversation_turns_for_event_recall(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.record_turn(
+        user_content="刚才我们聊历史记录为什么找不到",
+        assistant_content="原因是系统只有语义记忆和摘要，没有 durable event history。",
+        channel="feishu",
+    )
+
+    result = ctx_mgr.retrieve_context("刚才我们聊了什么", top_k=5)
+
+    assert "## Conversation History" in result
+    assert "USER: 刚才我们聊历史记录为什么找不到" in result
+    assert "ASSISTANT: 原因是系统只有语义记忆和摘要" in result
+
+
+def test_retrieve_context_keeps_generic_history_semantic(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.record_turn(
+        user_content="我们刚才聊了 event history",
+        assistant_content="这条不应该被 git history 查询召回。",
+    )
+
+    result = ctx_mgr.retrieve_context("git history", top_k=5)
+
+    assert "## Conversation History" not in result
+
+
 # ── ConsolidationEngine tests ─────────────────────────────────────────────────
 
 

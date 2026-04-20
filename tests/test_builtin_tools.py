@@ -242,6 +242,44 @@ def test_current_time_returns_structured_timestamps(tmp_path):
     assert "unix_timestamp" in payload
 
 
+def test_context_retrieve_returns_conversation_history_sections(tmp_path):
+    from agent import BuiltinTools, ConsolidationEngine, ContextManager, LTMStore
+    from agent import LocalRetriever, MemoryPalace, ToolRegistry
+
+    registry = ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+    )
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+        store=store,
+    )
+    tools = BuiltinTools(
+        memory=memory,
+        registry=registry,
+        context_manager=ctx_mgr,
+        workspace_root=workspace,
+    )
+    ctx_mgr.record_turn(
+        user_content="我们刚才确认要做 durable event history",
+        assistant_content="我会先写测试再实现。",
+        channel="feishu",
+    )
+
+    result = tools._context_retrieve("刚才我们聊了什么", top_k=5)
+
+    assert result["ok"] is True
+    assert result["count"] >= 1
+    assert "## Conversation History" in result["content"]
+    assert "durable event history" in result["content"]
+
+
 def test_memory_search_returns_structured_results(tmp_path):
     tools, registry, workspace = make_builtin_tools(tmp_path)
     tools.memory.write("identity", "user", "Prefers concise responses")

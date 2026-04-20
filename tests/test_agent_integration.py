@@ -1986,6 +1986,9 @@ def test_interactive_loop_context_command_uses_dynamic_category_stats(
         class staging:
             session_id = "session-1"
 
+        def record_turn(self, *, user_content, assistant_content="", channel="", **_kwargs):
+            return None
+
         def stats(self):
             return {
                 "dynamic_categories": 2,
@@ -2097,6 +2100,9 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
             self.staging = _FakeStaging()
 
         def mark_activity(self):
+            pass
+
+        def record_turn(self, *, user_content, assistant_content="", channel="", **_kwargs):
             pass
 
         def should_enqueue_consolidation(self):
@@ -2224,6 +2230,9 @@ def test_interactive_loop_queues_orphan_recovery_in_background(monkeypatch, tmp_
         def __init__(self):
             self.staging = _FakeStaging()
             self.queued = []
+
+        def record_turn(self, *, user_content, assistant_content="", channel="", **_kwargs):
+            return None
 
         def enqueue_staging_job(self, reason, staging):
             self.queued.append((reason, staging.path.name, staging.session_id))

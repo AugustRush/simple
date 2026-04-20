@@ -336,6 +336,7 @@ from .memory.system import (
     BackgroundMemoryWorker,
     ConsolidationEngine,
     ContextManager,
+    ConversationTurn,
     LTMCategory,
     LTMEntry,
     LTMStore,

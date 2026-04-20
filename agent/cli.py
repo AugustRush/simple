@@ -761,6 +761,11 @@ async def _interactive_loop(components: dict, cfg: dict):
 
                 # Stage this turn (user input + assistant reply) for consolidation
                 if ctx_mgr:
+                    ctx_mgr.record_turn(
+                        user_content=user_input,
+                        assistant_content=result.content or "",
+                        channel="cli",
+                    )
                     ctx_mgr.staging.append("user", user_input)
                     if result.content:
                         ctx_mgr.staging.append("assistant", result.content)

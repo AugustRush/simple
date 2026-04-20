@@ -258,6 +258,13 @@ class ChannelRunner:
                     )
 
                 if ctx_mgr:
+                    ctx_mgr.record_turn(
+                        user_content=msg.text,
+                        assistant_content=result.content or "",
+                        channel=msg.channel_name,
+                        message_id=str(msg.metadata.get("message_id", "")),
+                        metadata=msg.metadata,
+                    )
                     ctx_mgr.staging.append("user", msg.text)
                     if result.content:
                         ctx_mgr.staging.append("assistant", result.content)

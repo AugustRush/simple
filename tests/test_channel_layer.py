@@ -370,9 +370,13 @@ def test_channel_runner_scopes_context_manager_per_chat():
             self.session_id = session_id
             self.staging = _RecordingStaging(session_id)
             self.mark_calls = 0
+            self.recorded_turns: list[tuple[str, str, str]] = []
 
         def mark_activity(self):
             self.mark_calls += 1
+
+        def record_turn(self, *, user_content, assistant_content="", channel="", **_kwargs):
+            self.recorded_turns.append((user_content, assistant_content, channel))
 
         def should_enqueue_consolidation(self):
             return False
@@ -459,6 +463,12 @@ def test_channel_runner_scopes_context_manager_per_chat():
         ("user", "world"),
         ("assistant", "reply:world"),
     ]
+    assert root_ctx_mgr.spawned["chat-a"].recorded_turns == [
+        ("hello", "reply:hello", "cli")
+    ]
+    assert root_ctx_mgr.spawned["chat-b"].recorded_turns == [
+        ("world", "reply:world", "cli")
+    ]
 
 
 def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
@@ -512,6 +522,9 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
             self.enqueued: list[str] = []
 
         def mark_activity(self):
+            return None
+
+        def record_turn(self, *, user_content, assistant_content="", channel="", **_kwargs):
             return None
 
         def should_enqueue_consolidation(self):
