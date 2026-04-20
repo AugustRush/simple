@@ -99,6 +99,26 @@ def test_default_staging_isolated_per_session(tmp_path):
     assert [m["content"] for m in buf2.read_all()] == ["session two"]
 
 
+def test_default_staging_persists_in_sqlite_without_jsonl_file(tmp_path):
+    from agent import StagingBuffer
+
+    context_dir = tmp_path / "context"
+    buf1 = StagingBuffer(context_dir=context_dir, session_id="session-1")
+    buf1.append("user", "sqlite turn")
+    buf1.append("assistant", "sqlite reply")
+
+    assert (context_dir / "palace.db").exists()
+    assert not buf1.path.exists()
+
+    buf2 = StagingBuffer(context_dir=context_dir, session_id="session-1")
+
+    assert buf2.count() == 2
+    assert [msg["content"] for msg in buf2.read_all()] == [
+        "sqlite turn",
+        "sqlite reply",
+    ]
+
+
 def test_count_does_not_depend_on_read_all(tmp_path, monkeypatch):
     buf = make_staging(tmp_path)
     buf.append("user", "one")

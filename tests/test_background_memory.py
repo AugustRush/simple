@@ -254,6 +254,50 @@ def test_process_one_job_logs_reason_and_session_context(tmp_path, capsys):
     assert staging.session_id in out
 
 
+def test_process_one_job_reconstructs_sqlite_staging_from_job_metadata(tmp_path):
+    from agent import (
+        ConsolidationEngine,
+        ContextManager,
+        LocalRetriever,
+        LTMStore,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir, memory_dir=tmp_path / "memory")
+    primary = StagingBuffer(context_dir=context_dir, session_id="primary")
+    other = StagingBuffer(context_dir=context_dir, session_id="other")
+    other.append("user", "other session turn")
+    other.append("assistant", "other session reply")
+
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=primary,
+    )
+    ctx_mgr.enqueue_staging_job("test", other)
+
+    seen = {}
+
+    def extractor(staged, job):
+        seen["contents"] = [msg["content"] for msg in staged]
+        seen["job"] = dict(job)
+        return []
+
+    async def run_once():
+        return await ctx_mgr.process_one_job(
+            client=None,
+            model="x",
+            api_format="openai",
+            extractor=extractor,
+        )
+
+    assert asyncio.run(run_once()) is True
+    assert seen["contents"] == ["other session turn", "other session reply"]
+    assert other.count() == 0
+
+
 def test_process_one_job_keeps_retry_signal_when_consolidation_fails(tmp_path):
     import agent.memory.system as memory_system
 

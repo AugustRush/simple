@@ -227,7 +227,7 @@ class MemoryPalace:
 
 
 class StagingBuffer:
-    """Append-only JSONL buffer that persists raw conversation turns to disk.
+    """Append-only buffer that persists raw conversation turns.
 
     Stores only user/assistant plain-text messages (skips tool calls and
     tool results to avoid noise and oversized entries).
@@ -238,7 +238,9 @@ class StagingBuffer:
       clear_all()     — called after successful consolidation
       count()         — number of staged messages
 
-    File: ~/.agent/context/_staging/<session>.jsonl
+    Default storage is SQLite under ``<context_dir>/palace.db``. Passing an
+    explicit ``path`` keeps the legacy JSONL backend for compatibility with
+    orphan recovery and focused file-based tests.
     """
 
     def __init__(
@@ -248,12 +250,51 @@ class StagingBuffer:
         session_id: Optional[str] = None,
     ):
         self.session_id = session_id or _new_id()
+        self.context_dir = context_dir
+        self._sqlite_backed = path is None
         self.path = path or (context_dir / "_staging" / f"{self.session_id}.jsonl")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self._sqlite_backed:
+            self.context_dir.mkdir(parents=True, exist_ok=True)
+            self._db_path = self.context_dir / "palace.db"
+            self._ensure_sqlite_schema()
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._count = self._load_count()
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_sqlite_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS staging_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    ts TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_staging_turns_session_id
+                ON staging_turns(session_id, id)
+                """
+            )
+
     def _load_count(self) -> int:
+        if self._sqlite_backed:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS count FROM staging_turns WHERE session_id = ?",
+                    (self.session_id,),
+                ).fetchone()
+            return int(row["count"] if row else 0)
         if not self.path.exists():
             return 0
         with open(self.path, encoding="utf-8") as f:
@@ -269,6 +310,22 @@ class StagingBuffer:
             "ts": _now(),
         }
         with self._lock:
+            if self._sqlite_backed:
+                with self._connect() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO staging_turns (session_id, role, content, ts)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            self.session_id,
+                            entry["role"],
+                            entry["content"],
+                            entry["ts"],
+                        ),
+                    )
+                self._count += 1
+                return
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             self._count += 1
@@ -276,6 +333,25 @@ class StagingBuffer:
     def read_all(self) -> list[dict]:
         """Return all staged messages in order."""
         with self._lock:
+            if self._sqlite_backed:
+                with self._connect() as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT role, content, ts
+                        FROM staging_turns
+                        WHERE session_id = ?
+                        ORDER BY id ASC
+                        """,
+                        (self.session_id,),
+                    ).fetchall()
+                return [
+                    {
+                        "role": row["role"],
+                        "content": row["content"],
+                        "ts": row["ts"],
+                    }
+                    for row in rows
+                ]
             if not self.path.exists():
                 return []
             msgs = []
@@ -291,11 +367,21 @@ class StagingBuffer:
 
     def count(self) -> int:
         with self._lock:
+            if self._sqlite_backed:
+                self._count = self._load_count()
             return self._count
 
     def clear_all(self) -> None:
         """Delete the staging file after successful consolidation."""
         with self._lock:
+            if self._sqlite_backed:
+                with self._connect() as conn:
+                    conn.execute(
+                        "DELETE FROM staging_turns WHERE session_id = ?",
+                        (self.session_id,),
+                    )
+                self._count = 0
+                return
             self.path.unlink(missing_ok=True)
             self._count = 0
 
@@ -304,6 +390,26 @@ class StagingBuffer:
         if count <= 0:
             return
         with self._lock:
+            if self._sqlite_backed:
+                with self._connect() as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT id
+                        FROM staging_turns
+                        WHERE session_id = ?
+                        ORDER BY id ASC
+                        LIMIT ?
+                        """,
+                        (self.session_id, count),
+                    ).fetchall()
+                    ids = [row["id"] for row in rows]
+                    if ids:
+                        conn.execute(
+                            f"DELETE FROM staging_turns WHERE id IN ({','.join('?' for _ in ids)})",
+                            ids,
+                        )
+                self._count = self._load_count()
+                return
             if not self.path.exists():
                 self._count = 0
                 return
@@ -1779,6 +1885,14 @@ class ContextManager:
                     "reason": reason,
                     "session_id": session_id,
                     "staging_path": staging_path,
+                    "staging_backend": (
+                        "sqlite"
+                        if getattr(staging, "_sqlite_backed", False)
+                        else "jsonl"
+                    ),
+                    "context_dir": str(
+                        getattr(staging, "context_dir", self.staging.context_dir).resolve()
+                    ),
                     "queued_at": _now(),
                 }
             )
@@ -1803,8 +1917,20 @@ class ContextManager:
             return len(self._jobs)
 
     def _job_staging(self, job: dict) -> tuple["StagingBuffer", bool]:
+        backend = str(job.get("staging_backend", "jsonl"))
         path_value = job.get("staging_path")
         session_id = str(job.get("session_id", self.staging.session_id))
+        if backend == "sqlite":
+            context_dir = Path(
+                job.get("context_dir", str(self.staging.context_dir))
+            ).resolve()
+            if (
+                context_dir == self.staging.context_dir.resolve()
+                and session_id == self.staging.session_id
+                and getattr(self.staging, "_sqlite_backed", False)
+            ):
+                return self.staging, True
+            return StagingBuffer(context_dir=context_dir, session_id=session_id), False
         if not path_value:
             return self.staging, True
         path = Path(path_value).resolve()
