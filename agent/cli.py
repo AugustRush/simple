@@ -309,8 +309,11 @@ async def _build_scheduler_service(
     *,
     poll_seconds: float,
     lease_seconds: int,
+    components: Optional[dict] = None,
 ):
-    components = await agent_module._build_components_async(cfg)
+    owned_components = components is None
+    if components is None:
+        components = await agent_module._build_components_async(cfg)
     store = _scheduler_store()
     delivery = SchedulerDelivery(
         cfg=cfg,
@@ -353,7 +356,7 @@ async def _build_scheduler_service(
         poll_seconds=poll_seconds,
         lease_seconds=lease_seconds,
     )
-    return service, store, components
+    return service, store, components if owned_components else None
 
 
 async def _interactive_loop(components: dict, cfg: dict):
@@ -930,6 +933,7 @@ def gateway():
                 cfg,
                 poll_seconds=scheduler_poll,
                 lease_seconds=scheduler_lease,
+                components=components,
             )
             scheduler_task = asyncio.create_task(service.run_forever())
             runner = ChannelRunner(channels, components, cfg)

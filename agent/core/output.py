@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextvars
 from abc import ABC
+from pathlib import Path
 from typing import Any, Optional
 
 from rich.markdown import Markdown
@@ -67,6 +68,9 @@ class OutputSink(ABC):
 
     def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
         """Display structured multi-agent progress."""
+
+    def queue_attachment(self, path: Path) -> None:
+        """Queue a file attachment for delivery with the current turn."""
 
     def sync_stream_cb(self, chunk: str) -> None:
         """Synchronous callback adapter for BaseAgent.send_message."""

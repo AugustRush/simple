@@ -231,3 +231,24 @@ def test_background_worker_wake_drains_all_pending_jobs():
     asyncio.run(run())
 
     assert ctx_mgr.processed == 3
+
+
+def test_process_one_job_logs_reason_and_session_context(tmp_path, capsys):
+    ctx_mgr, staging = _build_context_manager(tmp_path)
+    staging.append("user", "hello")
+    staging.append("assistant", "world")
+    ctx_mgr.enqueue_consolidation("staged_turns")
+
+    async def run_once():
+        await ctx_mgr.process_one_job(
+            client=None,
+            model="x",
+            api_format="openai",
+            extractor=lambda *_: [],
+        )
+
+    asyncio.run(run_once())
+    out = capsys.readouterr().out
+
+    assert "staged_turns" in out
+    assert staging.session_id in out

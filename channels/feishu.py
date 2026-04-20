@@ -60,6 +60,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 LARK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
+FEISHU_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
 
 
 def build_feishu_client(config: "FeishuConfig") -> Any:
@@ -298,28 +299,18 @@ class FeishuOutputSink(OutputSink):
         self._stream_flush_pending = False
         self._progress_buf = _FeishuStreamBuf()
         self._progress_flush_pending = False
-        self._progress_phase_transition_pending = False
-        self._progress_phase_closed = False
         self._progress_disabled = False
         self._last_batch_progress_key: tuple[int, int] | None = None
-        self._final_phase_started = False
+        self._attachments: list[Path] = []
+        self._attachment_keys: set[str] = set()
 
     # ── OutputSink interface ──────────────────────────────────────────────────
 
     def on_stream_chunk(self, chunk: str) -> None:
-        """Accumulate final summary text; progress updates use a separate card."""
+        """Accumulate final summary text and update the primary reply surface."""
         self._chunks.append(chunk)
         self._stream_buf.text += chunk
         if not self.streaming:
-            return
-        # First-principles ordering rule: the user must never see final-answer
-        # streaming before the progress phase has been committed.  Without this
-        # barrier, stream flush tasks can overtake progress finalization because
-        # on_turn_complete() is scheduled after stream-chunk tasks.
-        if self._progress_phase_active() and not self._final_phase_started:
-            if not self._progress_phase_transition_pending:
-                self._progress_phase_transition_pending = True
-                self._schedule(self._begin_final_phase_async())
             return
         if not self._stream_flush_pending:
             self._stream_flush_pending = True
@@ -355,7 +346,7 @@ class FeishuOutputSink(OutputSink):
             return
         path = self._extract_written_path(result)
         if path is not None:
-            self._schedule(self._send_file_async(path))
+            self._queue_attachment(path)
 
     def on_tool_blocked(self, name: str, reason: str) -> None:
         self._schedule(self._send_plain_async(f"🚫 Tool `{name}` blocked: {reason}"))
@@ -394,6 +385,9 @@ class FeishuOutputSink(OutputSink):
         if level in ("error", "warning"):
             self._schedule(self._send_plain_async(text))
 
+    def queue_attachment(self, path: Path) -> None:
+        self._queue_attachment(path)
+
     async def drain(self) -> None:
         """Await all pending send tasks before the handler returns."""
         while self._pending:
@@ -430,151 +424,91 @@ class FeishuOutputSink(OutputSink):
 
     async def _finish_turn_async(self, text: str) -> None:
         try:
-            if (
-                not self._progress_phase_closed
-                and (self._progress_buf.card_id or self._progress_buf.text.strip())
-            ):
-                await self._finalize_progress_async()
-                self._progress_phase_closed = True
             if self.streaming and (
                 self._stream_buf.card_id or self._stream_buf.text.strip()
             ):
                 await self._finalize_stream_async(text)
             elif text.strip():
                 await self._send_response_async(text)
-            await self._send_output_dir_files_async()
+            await self._send_attachments_async()
         finally:
-            self._progress_phase_transition_pending = False
-            self._progress_phase_closed = False
             self._progress_disabled = False
             self._last_batch_progress_key = None
-            self._final_phase_started = False
+            self._attachments = []
+            self._attachment_keys = set()
 
-    def _progress_phase_active(self) -> bool:
-        if self._progress_phase_closed or self._progress_disabled:
-            return False
-        return bool(
-            self._progress_buf.card_id
-            or self._progress_buf.text.strip()
-            or self._progress_flush_pending
+    def _render_primary_markdown(self) -> str:
+        parts: list[str] = []
+        progress = self._progress_buf.text.strip()
+        final_text = self._stream_buf.text.strip()
+        if progress and not self._progress_disabled:
+            parts.append(progress)
+        if final_text:
+            if parts:
+                parts.append("---")
+            parts.append(final_text)
+        return "\n\n".join(parts).strip()
+
+    async def _ensure_primary_surface_card(self) -> str | None:
+        if self._stream_buf.card_id is not None:
+            return self._stream_buf.card_id
+        loop = asyncio.get_running_loop()
+        card_id = await loop.run_in_executor(None, self._create_streaming_card_sync)
+        if card_id:
+            self._stream_buf.card_id = card_id
+            self._stream_buf.sequence = 0
+        return card_id
+
+    async def _flush_primary_surface_async(self, force: bool = False) -> None:
+        content = self._render_primary_markdown()
+        if not self.streaming or not content:
+            return
+        if self._progress_disabled:
+            return
+
+        loop = asyncio.get_running_loop()
+        now = time.monotonic()
+        card_id = await self._ensure_primary_surface_card()
+        if not card_id:
+            self._progress_disabled = True
+            self._progress_buf = _FeishuStreamBuf()
+            return
+
+        if not force and (now - self._stream_buf.last_edit) < self._STREAM_EDIT_INTERVAL:
+            return
+
+        self._stream_buf.sequence += 1
+        ok = await loop.run_in_executor(
+            None,
+            self._stream_update_text_sync,
+            card_id,
+            content,
+            self._stream_buf.sequence,
         )
-
-    async def _begin_final_phase_async(self) -> None:
-        try:
-            if (
-                not self._progress_phase_closed
-                and (self._progress_buf.card_id or self._progress_buf.text.strip())
-            ):
-                await self._finalize_progress_async()
-                self._progress_phase_closed = True
-            self._final_phase_started = True
-            if self.streaming and self._stream_buf.text.strip():
-                await self._flush_stream_async(force=True)
-        finally:
-            self._progress_phase_transition_pending = False
+        if ok:
+            self._stream_buf.last_edit = now
+        else:
+            self._progress_disabled = True
+            self._progress_buf = _FeishuStreamBuf()
 
     async def _flush_stream_async(self, force: bool = False) -> None:
-        """Create/update the CardKit streaming card when possible."""
         try:
-            if not self.streaming or not self._stream_buf.text.strip():
-                return
-
-            loop = asyncio.get_running_loop()
-            now = time.monotonic()
-
-            if self._stream_buf.card_id is None:
-                card_id = await loop.run_in_executor(
-                    None,
-                    self._create_streaming_card_sync,
-                )
-                if not card_id:
-                    return
-                self._stream_buf.card_id = card_id
-                self._stream_buf.sequence = 1
-                ok = await loop.run_in_executor(
-                    None,
-                    self._stream_update_text_sync,
-                    card_id,
-                    self._stream_buf.text,
-                    self._stream_buf.sequence,
-                )
-                if ok:
-                    self._stream_buf.last_edit = now
-                return
-
-            if not force and (
-                now - self._stream_buf.last_edit
-            ) < self._STREAM_EDIT_INTERVAL:
-                return
-
-            self._stream_buf.sequence += 1
-            ok = await loop.run_in_executor(
-                None,
-                self._stream_update_text_sync,
-                self._stream_buf.card_id,
-                self._stream_buf.text,
-                self._stream_buf.sequence,
-            )
-            if ok:
-                self._stream_buf.last_edit = now
+            await self._flush_primary_surface_async(force=force)
         finally:
             self._stream_flush_pending = False
 
     async def _flush_progress_async(self, force: bool = False) -> None:
         try:
-            if not self.streaming or not self._progress_buf.text.strip():
-                return
-
-            loop = asyncio.get_running_loop()
-            now = time.monotonic()
-
-            if self._progress_buf.card_id is None:
-                card_id = await loop.run_in_executor(None, self._create_streaming_card_sync)
-                if not card_id:
-                    self._progress_disabled = True
-                    self._progress_phase_closed = True
-                    self._progress_buf = _FeishuStreamBuf()
-                    return
-                self._progress_buf.card_id = card_id
-                self._progress_buf.sequence = 1
-                ok = await loop.run_in_executor(
-                    None,
-                    self._stream_update_text_sync,
-                    card_id,
-                    self._progress_buf.text,
-                    self._progress_buf.sequence,
-                )
-                if ok:
-                    self._progress_buf.last_edit = now
-                return
-
-            if not force and (
-                now - self._progress_buf.last_edit
-            ) < self._STREAM_EDIT_INTERVAL:
-                return
-
-            self._progress_buf.sequence += 1
-            ok = await loop.run_in_executor(
-                None,
-                self._stream_update_text_sync,
-                self._progress_buf.card_id,
-                self._progress_buf.text,
-                self._progress_buf.sequence,
-            )
-            if ok:
-                self._progress_buf.last_edit = now
-            else:
-                self._progress_disabled = True
-                self._progress_phase_closed = True
-                self._progress_buf = _FeishuStreamBuf()
+            await self._flush_primary_surface_async(force=force)
         finally:
             self._progress_flush_pending = False
 
     async def _finalize_stream_async(self, text: str) -> None:
-        """Send the final streamed text, with fallback to regular response."""
         loop = asyncio.get_running_loop()
         final_text = text or self._stream_buf.text or "".join(self._chunks)
         card_id = self._stream_buf.card_id
+        self._stream_buf.text = final_text
+        content = self._render_primary_markdown()
 
         try:
             if not card_id:
@@ -588,7 +522,7 @@ class FeishuOutputSink(OutputSink):
                 None,
                 self._stream_update_text_sync,
                 card_id,
-                final_text,
+                content,
                 self._stream_buf.sequence,
             )
             if not ok:
@@ -605,46 +539,11 @@ class FeishuOutputSink(OutputSink):
             )
         finally:
             self._stream_buf = _FeishuStreamBuf()
+            self._progress_buf = _FeishuStreamBuf()
             self._stream_flush_pending = False
 
     async def _finalize_progress_async(self) -> None:
-        loop = asyncio.get_running_loop()
-        final_text = self._progress_buf.text
-        card_id = self._progress_buf.card_id
-
-        try:
-            if not final_text.strip():
-                return
-            if self._progress_disabled:
-                return
-            if not card_id:
-                return
-
-            self._progress_buf.sequence += 1
-            ok = await loop.run_in_executor(
-                None,
-                self._stream_update_text_sync,
-                card_id,
-                final_text,
-                    self._progress_buf.sequence,
-                )
-            if not ok:
-                return
-
-            self._progress_buf.sequence += 1
-            await loop.run_in_executor(
-                None,
-                self._close_streaming_mode_sync,
-                card_id,
-                self._progress_buf.sequence,
-            )
-        finally:
-            self._progress_buf = _FeishuStreamBuf()
-            self._progress_flush_pending = False
-
-    async def _send_output_dir_files_async(self) -> None:
-        for path in self._collect_output_dir_files():
-            await self._send_file_async(path)
+        self._progress_flush_pending = False
 
     async def _send_response_async(self, text: str) -> None:
         """Send the final response using the optimal Feishu message format."""
@@ -721,6 +620,23 @@ class FeishuOutputSink(OutputSink):
                 "file",
                 json.dumps({"file_key": key}, ensure_ascii=False),
             )
+
+    def _queue_attachment(self, file_path: Path) -> None:
+        try:
+            path = Path(file_path).resolve()
+        except OSError:
+            return
+        key = str(path)
+        if key in self._attachment_keys:
+            return
+        self._attachment_keys.add(key)
+        self._attachments.append(path)
+
+    async def _send_attachments_async(self) -> None:
+        for path in self._collect_output_dir_files():
+            self._queue_attachment(path)
+        for path in self._attachments:
+            await self._send_file_async(path)
 
     # ── Synchronous Feishu API calls (run in thread-pool) ─────────────────────
 
@@ -889,6 +805,18 @@ class FeishuOutputSink(OutputSink):
         path = Path(file_path)
         file_type = self._FILE_TYPE_MAP.get(path.suffix.lower(), "stream")
         try:
+            if not path.exists():
+                logger.error("Feishu file upload skipped, file not found: %s", path)
+                return None
+            size_bytes = path.stat().st_size
+            if size_bytes > FEISHU_UPLOAD_MAX_BYTES:
+                logger.error(
+                    "Feishu file upload skipped, file too large for Feishu upload: path=%s size=%s limit=%s",
+                    path,
+                    size_bytes,
+                    FEISHU_UPLOAD_MAX_BYTES,
+                )
+                return None
             with path.open("rb") as handle:
                 req = (
                     CreateFileRequest.builder()
@@ -905,12 +833,14 @@ class FeishuOutputSink(OutputSink):
                 if resp.success():
                     return resp.data.file_key
                 logger.error(
-                    "Feishu file upload failed: code=%s msg=%s",
+                    "Feishu file upload failed: path=%s size=%s code=%s msg=%s",
+                    path,
+                    size_bytes,
                     resp.code,
                     resp.msg,
                 )
         except Exception as exc:
-            logger.error("Feishu file upload error: %s", exc)
+            logger.error("Feishu file upload error: path=%s error=%s", path, exc)
         return None
 
     def _extract_written_path(self, result: str) -> Optional[Path]:

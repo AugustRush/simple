@@ -2030,6 +2030,10 @@ class ContextManager:
 
         try:
             staging_buffer, is_primary_staging = self._job_staging(job)
+            shared.CONSOLE.print(
+                f"[dim]💤 Context consolidation (sleep)... reason={job.get('reason', '?')} "
+                f"session={staging_buffer.session_id}[/dim]"
+            )
             with self._lock:
                 staged = staging_buffer.read_all()
             if not staged:

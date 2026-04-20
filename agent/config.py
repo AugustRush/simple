@@ -464,6 +464,16 @@ def _compose_system_prompt(
                 "`action_type=system_job` for internal maintenance. "
                 "Do not pretend the scheduled action has already run."
             )
+        if "shell" in builtin_names:
+            lines.append(
+                "For shell commands that generate files, direct outputs into the configured output directory "
+                "using command-specific output flags or the shell tool's `cwd` parameter."
+            )
+        if "send_file" in builtin_names:
+            lines.append(
+                "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "
+                "instead of claiming file delivery is unsupported."
+            )
     lines.append(
         "Agent-managed paths are separate from the workspace root: "
         f"user tools live in {shared.TOOLS_DIR}, "

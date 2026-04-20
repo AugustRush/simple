@@ -247,6 +247,7 @@ user-invocable: true
     assert "read_skill_file" in registry.list_tools()
     assert "schedule_create" in registry.list_tools()
     assert "schedule_list" in registry.list_tools()
+    assert "send_file" in registry.list_tools()
     assert "Available skills:" in prompt
     assert "quality/review" in prompt
     assert "Review code changes" in prompt
@@ -255,6 +256,7 @@ user-invocable: true
     assert "schedule_create" in prompt
     assert "use the schedule tools instead of saying you cannot act in the future" in prompt
     assert "Do not pretend the scheduled action has already run" in prompt
+    assert "use `send_file` with the resolved file path" in prompt
 
     payload = json.loads(
         asyncio.run(registry.call("activate_skill", {"skill_name": "quality/review"}))
@@ -1717,7 +1719,9 @@ def test_gateway_starts_background_scheduler(monkeypatch):
     async def fake_build_components_async(cfg):
         return {"agent": object()}
 
-    async def fake_build_scheduler_service(cfg, poll_seconds, lease_seconds):
+    async def fake_build_scheduler_service(
+        cfg, poll_seconds, lease_seconds, components=None
+    ):
         return _FakeService(), _FakeStore(), {"scheduler_components": True}
 
     async def fake_close_components(components):
@@ -1738,6 +1742,58 @@ def test_gateway_starts_background_scheduler(monkeypatch):
     assert started["runner"] == 1
     assert started["store_closed"] == 1
     assert started["sched_closed"] == 1
+
+
+def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
+    import agent.cli as cli_module
+
+    observed = {"primary": None, "scheduler": None}
+
+    class _FakeService:
+        async def run_forever(self):
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+
+    class _FakeStore:
+        def close(self):
+            return None
+
+    class _FakeRunner:
+        def __init__(self, channels, components, cfg):
+            observed["primary"] = components
+
+        async def run(self):
+            await asyncio.sleep(0)
+
+    primary_components = {"agent": object(), "marker": "primary"}
+
+    async def fake_build_components_async(cfg):
+        return primary_components
+
+    async def fake_build_scheduler_service(
+        cfg, poll_seconds, lease_seconds, components=None
+    ):
+        observed["scheduler"] = components
+        return _FakeService(), _FakeStore(), None
+
+    async def fake_close_components(components):
+        return None
+
+    monkeypatch.setattr(cli_module.agent_module, "load_config", lambda: ({}, False))
+    monkeypatch.setattr(
+        cli_module.agent_module, "_build_components_async", fake_build_components_async
+    )
+    monkeypatch.setattr(cli_module.agent_module, "_close_components", fake_close_components)
+    monkeypatch.setattr(cli_module, "_build_scheduler_service", fake_build_scheduler_service)
+    monkeypatch.setattr(cli_module, "_build_gateway_channels", lambda cfg: ["feishu"])
+    monkeypatch.setattr(cli_module, "ChannelRunner", _FakeRunner)
+
+    cli_module.gateway()
+
+    assert observed["primary"] is primary_components
+    assert observed["scheduler"] is primary_components
 
 
 def test_stream_response_propagates_stream_failures():

@@ -320,6 +320,30 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
 
 
+def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
+    tools, reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_shell(*args, **kwargs):
+        captured["cwd"] = kwargs.get("cwd")
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+
+    result = asyncio.run(
+        tools._shell("echo ok", timeout=1, cwd=str(output_dir))
+    )
+
+    assert result["ok"] is True
+    assert captured["cwd"] == str(output_dir.resolve())
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -536,6 +560,7 @@ def test_builtin_tools_register_scheduler_runtime_tools(tmp_path):
     assert "schedule_create" in tool_names
     assert "schedule_list" in tool_names
     assert "schedule_delete" in tool_names
+    assert "send_file" in tool_names
 
 
 def test_schedule_create_uses_active_delivery_target_for_channel_messages(tmp_path):
@@ -604,6 +629,35 @@ def test_schedule_create_defaults_to_standalone_without_active_target(tmp_path):
     assert payload["ok"] is True
     assert payload["task"]["kind"] == "message"
     assert payload["task"]["delivery_mode"] == "standalone"
+
+
+def test_send_file_queues_attachment_on_active_sink(tmp_path):
+    import agent.tools.runtime as runtime_module
+
+    _tools, registry, workspace = make_builtin_tools(tmp_path)
+    target = workspace / "clip.mp4"
+    target.write_bytes(b"video")
+
+    class _Sink:
+        def __init__(self):
+            self.paths: list[Path] = []
+
+        def queue_attachment(self, path: Path) -> None:
+            self.paths.append(path)
+
+    sink = _Sink()
+    token = runtime_module._active_sink.set(sink)
+    try:
+        result = asyncio.run(
+            registry.call("send_file", {"path": str(target)})
+        )
+    finally:
+        runtime_module._active_sink.reset(token)
+
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert sink.paths == [target.resolve()]
 
 
 def test_schedule_create_supports_agent_task_action_type(tmp_path):

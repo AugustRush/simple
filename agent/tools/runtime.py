@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 import mcp
 
 from agent import shared
+from agent.core.output import OutputSink, _active_sink
 
 TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
 TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
@@ -223,6 +224,10 @@ class BuiltinTools:
                         "description": "Timeout in seconds (default 30)",
                         "default": 30,
                     },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional working directory inside the workspace or output directory. Use this for downloads and generated artifacts.",
+                    },
                 },
                 "required": ["command"],
             },
@@ -269,6 +274,23 @@ class BuiltinTools:
                 "required": ["path", "content"],
             },
             self._write_file,
+            source="builtin",
+        )
+
+        r.register(
+            "send_file",
+            "Queue an existing file to be sent back to the current user/channel when the turn completes. Use after generating or locating a file the user asked to receive.",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative file path within the workspace or output directory",
+                    }
+                },
+                "required": ["path"],
+            },
+            self._send_file,
             source="builtin",
         )
 
@@ -862,7 +884,9 @@ class BuiltinTools:
             + f". Allowed roots: {', '.join(allowed)}"
         )
 
-    async def _shell(self, command: str, timeout: int = 30) -> dict[str, Any]:
+    async def _shell(
+        self, command: str, timeout: int = 30, cwd: Optional[str] = None
+    ) -> dict[str, Any]:
         # Security: block dangerous commands before spawning any subprocess.
         extra_blocked: list[str] = (
             self.registry.get_context("shell_blocked_commands") or []
@@ -882,12 +906,16 @@ class BuiltinTools:
             output_dir = self.registry.get_context("output_dir")
             if output_dir:
                 env["AGENT_OUTPUT_DIR"] = str(output_dir)
+            resolved_cwd = None
+            if cwd:
+                resolved_cwd, _root_kind = self._resolve_tool_path(cwd)
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
                 env=env,
+                cwd=str(resolved_cwd) if resolved_cwd is not None else None,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             out = stdout.decode(errors="replace")
@@ -920,6 +948,31 @@ class BuiltinTools:
             return self._error(f"Invalid shell input: {e}", command=command)
         except Exception as e:
             return self._error(f"Shell command failed: {e}", command=command)
+
+    def _send_file(self, path: str) -> dict[str, Any]:
+        try:
+            resolved, _root_kind = self._resolve_tool_path(path)
+            if not resolved.exists():
+                return self._error(f"'{path}' does not exist", path=str(resolved))
+            if not resolved.is_file():
+                return self._error(f"'{path}' is not a regular file", path=str(resolved))
+            sink = _active_sink.get()
+            if sink is None:
+                return self._error(
+                    "Current channel does not support sending files in this context.",
+                    path=str(resolved),
+                )
+            if type(sink).queue_attachment is OutputSink.queue_attachment:
+                return self._error(
+                    "Current channel does not support sending files in this context.",
+                    path=str(resolved),
+                )
+            sink.queue_attachment(resolved)
+            return self._ok(path=str(resolved), queued=True)
+        except ValueError as e:
+            return self._error(str(e))
+        except Exception as e:
+            return self._error(f"Error queueing file: {e}")
 
     async def _terminate_process(self, proc: Any) -> None:
         if proc is None:

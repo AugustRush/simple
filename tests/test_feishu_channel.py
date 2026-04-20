@@ -21,6 +21,7 @@ from channels.feishu import (
     FeishuChannel,
     FeishuConfig,
     FeishuOutputSink,
+    FEISHU_UPLOAD_MAX_BYTES,
     _clean_at_mentions,
     _extract_post_content,
 )
@@ -430,7 +431,7 @@ def test_feishu_sink_stream_chunk_does_not_emit_summary_before_turn_complete():
         loop.close()
 
 
-def test_feishu_sink_write_file_tool_end_schedules_file_send(tmp_path):
+def test_feishu_sink_write_file_tool_end_queues_attachment_until_turn_complete(tmp_path):
     sink = _make_feishu_sink()
     target = tmp_path / "report.txt"
     target.write_text("hello", encoding="utf-8")
@@ -446,7 +447,9 @@ def test_feishu_sink_write_file_tool_end_schedules_file_send(tmp_path):
                 new=AsyncMock(),
             ) as mock_send:
                 sink.on_tool_end("write_file", result)
-                assert len(sink._pending) == 1
+                assert len(sink._pending) == 0
+                assert sink._attachments == [target.resolve()]
+                sink.on_turn_complete("done", [])
                 await sink.drain()
                 mock_send.assert_awaited_once_with(target)
 
@@ -657,11 +660,11 @@ def test_feishu_sink_tool_start_never_appends_to_summary_card():
         loop.close()
 
 
-def test_feishu_sink_turn_complete_finalizes_process_card_before_final_answer():
+def test_feishu_sink_turn_complete_uses_single_primary_surface_for_progress_and_final():
     sink = _make_feishu_sink()
     sink.streaming = True
-    sink._progress_buf.card_id = "card_progress"
     sink._progress_buf.text = "Running"
+    sink._stream_buf.card_id = "card_primary"
 
     loop = asyncio.new_event_loop()
     try:
@@ -669,17 +672,17 @@ def test_feishu_sink_turn_complete_finalizes_process_card_before_final_answer():
         async def _run():
             with patch.object(
                 sink,
-                "_finalize_progress_async",
-                new=AsyncMock(),
-            ) as mock_finalize, patch.object(
-                sink,
                 "_send_response_async",
                 new=AsyncMock(),
-            ) as mock_send_response:
+            ) as mock_send_response, patch.object(
+                sink,
+                "_finalize_stream_async",
+                new=AsyncMock(),
+            ) as mock_finalize_stream:
                 sink.on_turn_complete("final answer", [])
                 await sink.drain()
-                mock_finalize.assert_awaited_once()
-                mock_send_response.assert_awaited_once_with("final answer")
+                mock_finalize_stream.assert_awaited_once_with("final answer")
+                mock_send_response.assert_not_awaited()
 
         loop.run_until_complete(_run())
     finally:
@@ -695,9 +698,6 @@ def test_feishu_sink_drain_preserves_progress_before_final_answer_order():
         await asyncio.sleep(0.01)
         events.append("flush_progress")
 
-    async def _finalize_progress(*args, **kwargs):
-        events.append("finalize_progress")
-
     async def _send_response(text):
         events.append(f"final:{text}")
 
@@ -711,10 +711,6 @@ def test_feishu_sink_drain_preserves_progress_before_final_answer_order():
                 new=_slow_flush_progress,
             ), patch.object(
                 sink,
-                "_finalize_progress_async",
-                new=_finalize_progress,
-            ), patch.object(
-                sink,
                 "_send_response_async",
                 new=_send_response,
             ):
@@ -722,7 +718,7 @@ def test_feishu_sink_drain_preserves_progress_before_final_answer_order():
                 sink.on_turn_complete("done", [])
                 await sink.drain()
 
-            assert events == ["flush_progress", "finalize_progress", "final:done"]
+            assert events == ["flush_progress", "final:done"]
 
         loop.run_until_complete(_run())
     finally:
@@ -736,9 +732,6 @@ def test_feishu_sink_stream_waits_for_progress_phase_barrier():
 
     async def _flush_progress(*args, **kwargs):
         events.append("flush_progress")
-
-    async def _finalize_progress(*args, **kwargs):
-        events.append("finalize_progress")
 
     async def _flush_stream(*args, **kwargs):
         events.append("flush_stream")
@@ -754,10 +747,6 @@ def test_feishu_sink_stream_waits_for_progress_phase_barrier():
                 sink,
                 "_flush_progress_async",
                 new=_flush_progress,
-            ), patch.object(
-                sink,
-                "_finalize_progress_async",
-                new=_finalize_progress,
             ), patch.object(
                 sink,
                 "_flush_stream_async",
@@ -781,7 +770,6 @@ def test_feishu_sink_stream_waits_for_progress_phase_barrier():
 
             assert events == [
                 "flush_progress",
-                "finalize_progress",
                 "flush_stream",
                 "finalize_stream:answer chunk",
             ]
@@ -929,6 +917,25 @@ def test_feishu_sink_reply_used_first_then_create():
     assert sink._client.im.v1.message.reply.called
     assert not sink._client.im.v1.message.create.called
     assert sink._first_reply is False  # consumed
+
+
+def test_feishu_sink_skips_large_file_upload_with_clear_log(tmp_path, caplog):
+    sink = _make_feishu_sink()
+    target = tmp_path / "movie.mp4"
+    target.write_bytes(b"x" * 10)
+
+    real_stat = Path.stat
+
+    def fake_stat(path_self):
+        if path_self == target:
+            return type("Stat", (), {"st_size": FEISHU_UPLOAD_MAX_BYTES + 1})()
+        return real_stat(path_self)
+
+    with patch.object(Path, "stat", fake_stat):
+        result = sink._upload_file_sync(target)
+
+    assert result is None
+    assert "too large for Feishu upload" in caplog.text
 
 
 def test_feishu_sink_falls_back_to_create_on_reply_failure():
