@@ -267,6 +267,12 @@ class FeishuOutputSink(OutputSink):
 
     _TEXT_MAX_LEN = 200  # plain-text ceiling; longer → post
     _POST_MAX_LEN = 2000  # post ceiling; longer → interactive card
+    _SUPPRESSED_TOOL_HINTS = {
+        "current_time",
+        "schedule_create",
+        "schedule_list",
+        "schedule_delete",
+    }
 
     def __init__(
         self,
@@ -331,6 +337,8 @@ class FeishuOutputSink(OutputSink):
             self._schedule(self._finish_turn_async(text))
 
     def on_tool_start(self, name: str, inputs: dict) -> None:
+        if name in self._SUPPRESSED_TOOL_HINTS:
+            return
         hint = f"{name}{_fmt_tool_inputs(name, inputs)}"
         if self.streaming:
             if self._progress_disabled:

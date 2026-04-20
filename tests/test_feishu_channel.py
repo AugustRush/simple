@@ -573,6 +573,36 @@ def test_feishu_sink_tool_start_always_uses_progress_card_when_streaming():
         loop.close()
 
 
+def test_feishu_sink_tool_start_suppresses_internal_scheduler_hints():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ) as mock_progress, patch.object(
+                sink,
+                "_send_tool_hint_async",
+                new=AsyncMock(),
+            ) as mock_hint:
+                sink.on_tool_start("current_time", {})
+                sink.on_tool_start(
+                    "schedule_create",
+                    {"name": "测试提醒", "trigger_type": "once"},
+                )
+                await sink.drain()
+                mock_progress.assert_not_called()
+                mock_hint.assert_not_called()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
 def test_feishu_sink_tool_start_uses_process_card_when_progress_active():
     sink = _make_feishu_sink()
     sink.streaming = True

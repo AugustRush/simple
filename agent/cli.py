@@ -908,6 +908,12 @@ def gateway():
         except RuntimeError as exc:
             shared.CONSOLE.print(f"[red]Error: {exc}[/red]")
             raise typer.Exit(1)
+        sched_cfg = cfg.get("scheduler", {})
+        scheduler_poll = float(sched_cfg.get("poll_seconds", 30))
+        scheduler_lease = int(sched_cfg.get("lease_seconds", 300))
+        scheduler_task: Optional[asyncio.Task] = None
+        scheduler_store = None
+        scheduler_components = None
         try:
             channels = _build_gateway_channels(cfg)
             if not channels:
@@ -920,9 +926,22 @@ def gateway():
                 f"[dim]Gateway starting {len(channels)} channel(s). "
                 "Press Ctrl-C to stop.[/dim]"
             )
+            service, scheduler_store, scheduler_components = await _build_scheduler_service(
+                cfg,
+                poll_seconds=scheduler_poll,
+                lease_seconds=scheduler_lease,
+            )
+            scheduler_task = asyncio.create_task(service.run_forever())
             runner = ChannelRunner(channels, components, cfg)
             await runner.run()
         finally:
+            if scheduler_task is not None:
+                scheduler_task.cancel()
+                await asyncio.gather(scheduler_task, return_exceptions=True)
+            if scheduler_store is not None:
+                scheduler_store.close()
+            if scheduler_components is not None:
+                await agent_module._close_components(scheduler_components)
             await agent_module._close_components(components)
 
     asyncio.run(_run())

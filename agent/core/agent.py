@@ -221,6 +221,24 @@ class BaseAgent:
             return f"Invalid model request: {exc}"
         return str(exc) or exc.__class__.__name__
 
+    @staticmethod
+    def _synthesize_tool_only_response(
+        tool_history: list[tuple[str, str]]
+    ) -> str:
+        for tool_name, raw_result in reversed(tool_history):
+            if tool_name != "schedule_create":
+                continue
+            try:
+                payload = json.loads(raw_result)
+            except Exception:
+                continue
+            if not isinstance(payload, dict) or not payload.get("ok"):
+                continue
+            summary_text = str(payload.get("summary_text", "")).strip()
+            if summary_text:
+                return summary_text
+        return ""
+
     async def _run_tool_uses(self, tool_uses: list[dict]) -> list[str]:
         # D3: wrap each regular tool call with a wall-clock timeout so a hung
         # user-generated tool cannot block the loop indefinitely.
@@ -422,6 +440,7 @@ class BaseAgent:
         # Capture original system prompt before any per-turn injections.
         original_system = ctx.system_prompt
         tool_calls_made: list[str] = []
+        tool_result_history: list[tuple[str, str]] = []
         result_text = ""
 
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
@@ -491,6 +510,9 @@ class BaseAgent:
 
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
                         results = await self._run_tool_uses(tool_uses)
+                        tool_result_history.extend(
+                            (tu["name"], res) for tu, res in zip(tool_uses, results)
+                        )
                         ctx.messages.extend(
                             self._tool_result_messages(tool_uses, results)
                         )
@@ -499,6 +521,10 @@ class BaseAgent:
                         # Prefer the parsed text; fall back to streamed text for
                         # the final turn (streaming accumulates what the user saw).
                         result_text = text or streamed_text or result_text
+                        if not result_text and tool_result_history:
+                            result_text = self._synthesize_tool_only_response(
+                                tool_result_history
+                            )
                         ctx.messages.append(
                             {"role": "assistant", "content": result_text}
                         )

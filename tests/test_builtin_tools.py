@@ -576,9 +576,12 @@ def test_schedule_create_uses_active_delivery_target_for_channel_messages(tmp_pa
 
     assert payload["ok"] is True
     assert task is not None
+    assert task.kind == "message"
     assert task.delivery_mode == "channel"
+    assert task.payload["message_text"] == "测试一下"
     assert task.delivery_target.target_type == "feishu_chat"
     assert task.delivery_target.payload["chat_id"] == "oc_test_chat"
+    assert "summary_text" in payload
 
 
 def test_schedule_create_defaults_to_standalone_without_active_target(tmp_path):
@@ -599,4 +602,67 @@ def test_schedule_create_defaults_to_standalone_without_active_target(tmp_path):
     payload = json.loads(result)
 
     assert payload["ok"] is True
+    assert payload["task"]["kind"] == "message"
     assert payload["task"]["delivery_mode"] == "standalone"
+
+
+def test_schedule_create_supports_agent_task_action_type(tmp_path):
+    from agent.scheduler import SchedulerStore
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(
+        registry.call(
+            "schedule_create",
+            {
+                "name": "summary-task",
+                "trigger_type": "once",
+                "action_type": "agent_task",
+                "instruction": "总结今天的群消息",
+                "at": "2026-04-20T10:00:00+08:00",
+                "timezone_name": "Asia/Shanghai",
+            },
+        )
+    )
+    payload = json.loads(result)
+    store = SchedulerStore(db_path=Path(payload["task"]["db_path"]))
+    try:
+        task = store.get_task(payload["task"]["id"])
+    finally:
+        store.close()
+
+    assert payload["ok"] is True
+    assert task is not None
+    assert task.kind == "agent_prompt"
+    assert task.payload["prompt"] == "总结今天的群消息"
+
+
+def test_schedule_create_supports_system_job_action_type(tmp_path):
+    from agent.scheduler import SchedulerStore
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(
+        registry.call(
+            "schedule_create",
+            {
+                "name": "memory-tidy",
+                "trigger_type": "daily",
+                "action_type": "system_job",
+                "job_name": "memory_tidy",
+                "time_of_day": "03:00",
+                "timezone_name": "Asia/Shanghai",
+            },
+        )
+    )
+    payload = json.loads(result)
+    store = SchedulerStore(db_path=Path(payload["task"]["db_path"]))
+    try:
+        task = store.get_task(payload["task"]["id"])
+    finally:
+        store.close()
+
+    assert payload["ok"] is True
+    assert task is not None
+    assert task.kind == "system_job"
+    assert task.payload["job_name"] == "memory_tidy"

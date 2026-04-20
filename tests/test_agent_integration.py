@@ -254,6 +254,7 @@ user-invocable: true
     assert "Loaded skill tools" not in prompt
     assert "schedule_create" in prompt
     assert "use the schedule tools instead of saying you cannot act in the future" in prompt
+    assert "Do not pretend the scheduled action has already run" in prompt
 
     payload = json.loads(
         asyncio.run(registry.call("activate_skill", {"skill_name": "quality/review"}))
@@ -1472,6 +1473,83 @@ def test_send_message_emits_spawn_batch_events(monkeypatch):
     assert "batch_finished" in kinds
 
 
+def test_send_message_synthesizes_schedule_confirmation_when_model_returns_empty(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "current_time",
+                json.dumps({}),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-2",
+            agent_module._OAIFunc(
+                "schedule_create",
+                json.dumps(
+                    {
+                        "name": "测试消息",
+                        "trigger_type": "once",
+                        "prompt": "测试一下",
+                        "at": "2026-04-20T10:02:00+08:00",
+                        "timezone_name": "Asia/Shanghai",
+                    }
+                ),
+            ),
+        ),
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("tool_calls", agent_module._OAIMsg("", tool_calls))]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_call(tool_name, tool_input):
+        if tool_name == "current_time":
+            return json.dumps({"ok": True, "local_time": "2026-04-20T10:00:00+08:00"})
+        if tool_name == "schedule_create":
+            return json.dumps(
+                {
+                    "ok": True,
+                    "task": {
+                        "id": "task-1",
+                        "name": "测试消息",
+                        "delivery_mode": "channel",
+                        "next_run_at": "2026-04-20T02:02:00+00:00",
+                    },
+                    "summary_text": "已设置定时任务：两分钟后在当前对话发送“测试一下”。",
+                },
+                ensure_ascii=False,
+            )
+        raise AssertionError(f"unexpected tool {tool_name}")
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "两分钟后给我发一条消息"))
+
+    assert result.error is None
+    assert result.content == "已设置定时任务：两分钟后在当前对话发送“测试一下”。"
+
+
 def test_send_message_batches_excess_parallel_spawn_calls(monkeypatch):
     import agent as agent_module
 
@@ -1606,6 +1684,60 @@ def test_memory_tidy_uses_force_tidy(monkeypatch):
     agent_module.memory_tidy()
 
     assert calls == {"force_tidy": 1, "tidy": 1, "closed": 1}
+
+
+def test_gateway_starts_background_scheduler(monkeypatch):
+    import agent.cli as cli_module
+
+    started = {"scheduler": 0, "stopped": 0, "runner": 0, "store_closed": 0, "sched_closed": 0}
+
+    class _FakeService:
+        async def run_forever(self):
+            started["scheduler"] += 1
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                started["stopped"] += 1
+                raise
+
+    class _FakeStore:
+        def close(self):
+            started["store_closed"] += 1
+
+    class _FakeRunner:
+        def __init__(self, channels, components, cfg):
+            self.channels = channels
+            self.components = components
+            self.cfg = cfg
+
+        async def run(self):
+            started["runner"] += 1
+            await asyncio.sleep(0)
+
+    async def fake_build_components_async(cfg):
+        return {"agent": object()}
+
+    async def fake_build_scheduler_service(cfg, poll_seconds, lease_seconds):
+        return _FakeService(), _FakeStore(), {"scheduler_components": True}
+
+    async def fake_close_components(components):
+        if components.get("scheduler_components"):
+            started["sched_closed"] += 1
+
+    monkeypatch.setattr(cli_module.agent_module, "load_config", lambda: ({}, False))
+    monkeypatch.setattr(cli_module.agent_module, "_build_components_async", fake_build_components_async)
+    monkeypatch.setattr(cli_module.agent_module, "_close_components", fake_close_components)
+    monkeypatch.setattr(cli_module, "_build_scheduler_service", fake_build_scheduler_service)
+    monkeypatch.setattr(cli_module, "_build_gateway_channels", lambda cfg: ["feishu"])
+    monkeypatch.setattr(cli_module, "ChannelRunner", _FakeRunner)
+
+    cli_module.gateway()
+
+    assert started["scheduler"] == 1
+    assert started["stopped"] == 1
+    assert started["runner"] == 1
+    assert started["store_closed"] == 1
+    assert started["sched_closed"] == 1
 
 
 def test_stream_response_propagates_stream_failures():

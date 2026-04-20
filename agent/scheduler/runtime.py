@@ -50,6 +50,11 @@ class SchedulerService:
         try:
             if task.kind == "agent_prompt":
                 result = await self.agent_executor(task, run)
+            elif task.kind == "message":
+                text = str(task.payload.get("message_text", "")).strip()
+                if not text:
+                    raise ValueError("Message task has no message_text")
+                result = ExecutionResult(summary=text, text_output=text)
             elif task.kind == "system_job":
                 result = await self.system_executor(task, run)
             else:

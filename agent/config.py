@@ -458,6 +458,12 @@ def _compose_system_prompt(
                 "If the user asks for a reminder, delayed follow-up, or recurring future message, "
                 "use the schedule tools instead of saying you cannot act in the future."
             )
+            lines.append(
+                "Use `action_type=message` for literal future messages, "
+                "`action_type=agent_task` for future work to execute later, and "
+                "`action_type=system_job` for internal maintenance. "
+                "Do not pretend the scheduled action has already run."
+            )
     lines.append(
         "Agent-managed paths are separate from the workspace root: "
         f"user tools live in {shared.TOOLS_DIR}, "

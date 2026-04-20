@@ -305,6 +305,63 @@ def test_scheduler_service_executes_memory_tidy_system_job(tmp_path):
     assert runs[0].summary == "tidied"
 
 
+def test_scheduler_service_executes_due_message_task_without_agent_executor(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="message-task",
+            kind="message",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"message_text": "测试一下"},
+            delivery_mode="channel",
+            delivery_target=DeliveryTarget.channel(
+                target_type="feishu_chat",
+                chat_id="oc_test_chat",
+                chat_type="group",
+            ),
+        )
+    )
+
+    observed = {}
+
+    async def fake_agent_executor(task, run):
+        raise AssertionError("agent executor should not be called")
+
+    async def fake_system_executor(task, run):
+        raise AssertionError("system executor should not be called")
+
+    async def fake_delivery(task, run, result):
+        observed["text_output"] = result.text_output
+        observed["summary"] = result.summary
+        return "delivered"
+
+    service = SchedulerService(
+        store=store,
+        agent_executor=fake_agent_executor,
+        system_executor=fake_system_executor,
+        delivery=fake_delivery,
+    )
+
+    asyncio.run(
+        service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc))
+    )
+
+    runs = store.list_runs(task.id)
+
+    assert observed["text_output"] == "测试一下"
+    assert observed["summary"] == "测试一下"
+    assert runs[0].status == "succeeded"
+    assert runs[0].summary == "测试一下"
+
+
 def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_path):
     from agent.scheduler import DeliveryTarget
     from agent.scheduler.delivery import SchedulerDelivery

@@ -409,6 +409,9 @@ class BuiltinTools:
             (
                 "Create a persistent scheduled task. Use when the user asks for a reminder, "
                 "a delayed follow-up, or a recurring future message. "
+                "Choose `action_type=message` for a literal future message, "
+                "`action_type=agent_task` for future agent work, or "
+                "`action_type=system_job` for internal maintenance. "
                 "For once: provide `at`. For interval: provide `every` and `unit`. "
                 "For daily: provide `time_of_day`. For weekly: provide `day_of_week` and `time_of_day`."
             ),
@@ -422,7 +425,23 @@ class BuiltinTools:
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "Prompt/content the scheduled agent should send or execute",
+                        "description": "Backward-compatible content field. Defaults to a literal message unless action_type=agent_task.",
+                    },
+                    "action_type": {
+                        "type": "string",
+                        "description": "one of: message, agent_task, system_job",
+                    },
+                    "message_text": {
+                        "type": "string",
+                        "description": "Literal message to send at the scheduled time",
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "Agent instruction to execute at the scheduled time",
+                    },
+                    "job_name": {
+                        "type": "string",
+                        "description": "Internal system job name, e.g. memory_tidy",
                     },
                     "timezone_name": {
                         "type": "string",
@@ -1123,7 +1142,11 @@ class BuiltinTools:
         self,
         name: str,
         trigger_type: str,
-        prompt: str,
+        prompt: str = "",
+        action_type: str = "message",
+        message_text: Optional[str] = None,
+        instruction: Optional[str] = None,
+        job_name: Optional[str] = None,
         timezone_name: str = "UTC",
         at: Optional[str] = None,
         every: Optional[int] = None,
@@ -1144,14 +1167,53 @@ class BuiltinTools:
         resolved_mode, target = self._schedule_target(delivery_mode)
         from agent.scheduler import NewScheduledTask
 
+        normalized_action = str(action_type or "message").strip().lower()
+        task_kind = "message"
+        payload: dict[str, Any]
+        if normalized_action == "message":
+            text = str(message_text or prompt).strip()
+            if not text:
+                raise ValueError("`message_text` is required for message actions")
+            task_kind = "message"
+            payload = {"message_text": text}
+            summary_text = (
+                f"已设置好定时任务！将在 {trigger.initial_run_at().isoformat()} 发送消息“{text}”。"
+                if trigger.initial_run_at()
+                else f"已设置好定时任务，会发送消息“{text}”。"
+            )
+        elif normalized_action == "agent_task":
+            text = str(instruction or prompt).strip()
+            if not text:
+                raise ValueError("`instruction` is required for agent_task actions")
+            task_kind = "agent_prompt"
+            payload = {"prompt": text}
+            summary_text = (
+                f"已设置好定时任务！将在 {trigger.initial_run_at().isoformat()} 执行任务：{text}"
+                if trigger.initial_run_at()
+                else f"已设置好定时任务，会执行任务：{text}"
+            )
+        elif normalized_action == "system_job":
+            text = str(job_name or "").strip()
+            if not text:
+                raise ValueError("`job_name` is required for system_job actions")
+            task_kind = "system_job"
+            payload = {"job_name": text}
+            summary_text = (
+                f"已设置好系统定时任务！将在 {trigger.initial_run_at().isoformat()} 执行 {text}。"
+                if trigger.initial_run_at()
+                else f"已设置好系统定时任务，会执行 {text}。"
+            )
+        else:
+            raise ValueError(f"Unsupported action_type '{action_type}'")
+
         store = self._schedule_store()
         try:
             task = store.create_task(
                 NewScheduledTask(
                     name=name,
-                    kind="agent_prompt",
+                    kind=task_kind,
                     trigger=trigger,
-                    payload={"prompt": prompt},
+                    payload=payload,
                     delivery_mode=resolved_mode,
                     delivery_target=target,
                 )
@@ -1162,10 +1224,12 @@ class BuiltinTools:
             task={
                 "id": task.id,
                 "name": task.name,
+                "kind": task.kind,
                 "delivery_mode": task.delivery_mode,
                 "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
                 "db_path": str(shared.SCHEDULER_DB_FILE),
-            }
+            },
+            summary_text=summary_text,
         )
 
     def _schedule_list(self) -> dict[str, Any]:
