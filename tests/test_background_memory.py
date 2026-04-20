@@ -183,3 +183,51 @@ def test_background_worker_polls_while_main_thread_is_blocked(tmp_path):
     asyncio.run(run())
 
     assert ctx_mgr.polls > 0
+
+
+def test_background_worker_wake_drains_all_pending_jobs():
+    from agent import BackgroundMemoryWorker
+
+    class _FakeContextManager:
+        def __init__(self):
+            self.pending = 3
+            self.processed = 0
+
+        def pending_jobs(self):
+            return self.pending
+
+        def should_process_jobs(self):
+            return False
+
+        async def process_one_job(
+            self,
+            client,
+            model,
+            api_format="anthropic",
+            extractor=None,
+        ):
+            if self.pending <= 0:
+                return False
+            self.pending -= 1
+            self.processed += 1
+            return True
+
+    ctx_mgr = _FakeContextManager()
+    worker = BackgroundMemoryWorker(
+        ctx_mgr=ctx_mgr,
+        client=None,
+        model="x",
+        api_format="openai",
+        poll_seconds=0.01,
+    )
+
+    async def run():
+        worker.start()
+        worker.wake()
+        time.sleep(0.05)
+        worker.stop()
+        await worker.wait()
+
+    asyncio.run(run())
+
+    assert ctx_mgr.processed == 3

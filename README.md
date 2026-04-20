@@ -63,6 +63,7 @@ Key config sections:
 | `mcp_servers` | MCP server definitions (name, command, args) |
 | `plugins` | Per-plugin enable/disable (`{"evolution": {"enabled": false}}`) |
 | `evolution` | Enable/disable session scoring and rule learning |
+| `scheduler` | Poll/lease settings for the persistent scheduler service |
 | `tavily_api_key` | Optional Tavily search key |
 | `output_dir` | Override default `~/.agent/output` |
 | `system_prompt_file` | Load a custom system prompt from a `.md` or `.txt` file |
@@ -81,6 +82,21 @@ Single-turn chat:
 
 ```bash
 uv run simple chat "Summarize this repository"
+```
+
+Scheduler service:
+
+```bash
+uv run simple scheduler
+```
+
+Create a daily scheduled task:
+
+```bash
+uv run simple schedule daily daily-summary \
+  --time 09:00 \
+  --timezone Asia/Shanghai \
+  --prompt "Summarize yesterday's progress"
 ```
 
 Config commands:
@@ -159,6 +175,21 @@ Do not mix these two paths:
 | `/model [name]` | Show current model or switch to a different one |
 | `/ralph <goal>` | Launch an autonomous multi-iteration task loop |
 | `/quit` | End the session |
+
+## Scheduler Commands
+
+| Command | Description |
+|---|---|
+| `simple schedule once ...` | Create a one-shot scheduled task |
+| `simple schedule interval ...` | Create a fixed-interval scheduled task |
+| `simple schedule daily ...` | Create a daily scheduled task |
+| `simple schedule weekly ...` | Create a weekly scheduled task |
+| `simple schedule list` | List persisted scheduled tasks |
+| `simple schedule show <id>` | Show one task and its run history |
+| `simple schedule pause <id>` | Disable a scheduled task |
+| `simple schedule resume <id>` | Re-enable a scheduled task |
+| `simple schedule delete <id>` | Delete a task and its recorded runs |
+| `simple scheduler` | Run the persistent scheduler service |
 
 Invoke a skill explicitly with a slash prefix matching its ID:
 

@@ -112,6 +112,16 @@
     "enabled": true
   },
 
+  "scheduler": {
+    "_readme": [
+      "Persistent scheduled task service.",
+      "poll_seconds: how often the scheduler checks for due tasks.",
+      "lease_seconds: how long a claimed run is considered owned before stale-run recovery may requeue it."
+    ],
+    "poll_seconds": 30,
+    "lease_seconds": 300
+  },
+
   "plugins": {
     "_readme": "Per-plugin enable/disable. Use the plugin name as key. Set enabled=false to disable a plugin without removing it.",
     "_example_disabled": { "enabled": false }

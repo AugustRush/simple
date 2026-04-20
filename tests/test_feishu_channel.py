@@ -518,6 +518,30 @@ def test_feishu_sink_subagent_event_schedules_process_card_update():
         loop.close()
 
 
+def test_feishu_sink_dedupes_duplicate_batch_progress_events():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                event = SubAgentProgressEvent(kind="batch_progress", completed=0, total=3)
+                sink.on_subagent_event(event)
+                sink.on_subagent_event(event)
+                await sink.drain()
+
+            assert sink._progress_buf.text.count("Sub-agents running: 0/3 completed") == 1
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
 def test_feishu_sink_tool_start_always_uses_progress_card_when_streaming():
     sink = _make_feishu_sink()
     sink.streaming = True
@@ -669,6 +693,107 @@ def test_feishu_sink_drain_preserves_progress_before_final_answer_order():
                 await sink.drain()
 
             assert events == ["flush_progress", "finalize_progress", "final:done"]
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_stream_waits_for_progress_phase_barrier():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    events: list[str] = []
+
+    async def _flush_progress(*args, **kwargs):
+        events.append("flush_progress")
+
+    async def _finalize_progress(*args, **kwargs):
+        events.append("finalize_progress")
+
+    async def _flush_stream(*args, **kwargs):
+        events.append("flush_stream")
+
+    async def _finalize_stream(text):
+        events.append(f"finalize_stream:{text}")
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=_flush_progress,
+            ), patch.object(
+                sink,
+                "_finalize_progress_async",
+                new=_finalize_progress,
+            ), patch.object(
+                sink,
+                "_flush_stream_async",
+                new=_flush_stream,
+            ), patch.object(
+                sink,
+                "_finalize_stream_async",
+                new=_finalize_stream,
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="agent_started",
+                        role="researcher",
+                        task="inspect code",
+                        message="researcher started",
+                    )
+                )
+                sink.on_stream_chunk("answer chunk")
+                sink.on_turn_complete("answer chunk", [])
+                await sink.drain()
+
+            assert events == [
+                "flush_progress",
+                "finalize_progress",
+                "flush_stream",
+                "finalize_stream:answer chunk",
+            ]
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_progress_failure_drops_progress_and_keeps_final_answer():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    events: list[str] = []
+
+    async def _send_response(text: str):
+        events.append(f"final:{text}")
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_create_streaming_card_sync",
+                return_value=None,
+            ), patch.object(
+                sink,
+                "_send_response_async",
+                new=_send_response,
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="agent_started",
+                        role="researcher",
+                        task="inspect code",
+                        message="researcher started",
+                    )
+                )
+                sink.on_turn_complete("final answer", [])
+                await sink.drain()
+
+            assert events == ["final:final answer"]
 
         loop.run_until_complete(_run())
     finally:

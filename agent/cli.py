@@ -25,14 +25,21 @@ CliOutputSink = CliOutputSink
 CONSOLE = shared.CONSOLE
 ContextManager = agent_module.ContextManager
 EvolutionEngine = agent_module.EvolutionEngine
+ExecutionResult = agent_module.ExecutionResult
+DeliveryTarget = agent_module.DeliveryTarget
 MemoryPalace = agent_module.MemoryPalace
+NewScheduledTask = agent_module.NewScheduledTask
 PluginCatalog = agent_module.PluginCatalog
 RalphTask = agent_module.RalphTask
 RALPH_COMPLETION_PROMISE = agent_module.RALPH_COMPLETION_PROMISE
 RALPH_DEFAULT_MAX_ITERATIONS = agent_module.RALPH_DEFAULT_MAX_ITERATIONS
+SchedulerDelivery = agent_module.SchedulerDelivery
+SchedulerService = agent_module.SchedulerService
+SchedulerStore = agent_module.SchedulerStore
 SkillCatalog = agent_module.SkillCatalog
 StagingBuffer = agent_module.StagingBuffer
 TurnEvent = agent_module.TurnEvent
+TriggerSpec = agent_module.TriggerSpec
 _build_gateway_channels = agent_module._build_gateway_channels
 _new_id = agent_module._new_id
 _save_ralph_task = agent_module._save_ralph_task
@@ -46,6 +53,8 @@ app = typer.Typer(
 )
 memory_app = typer.Typer(help="Memory palace commands")
 app.add_typer(memory_app, name="memory")
+schedule_app = typer.Typer(help="Scheduled task commands")
+app.add_typer(schedule_app, name="schedule")
 
 async def _ralph_task_loop(
     agent: "BaseAgent",
@@ -248,6 +257,103 @@ def _missing_feishu_dependency_hint() -> str:
         "and start with:\n"
         "  uv run simple gateway"
     )
+
+
+def _scheduler_store() -> SchedulerStore:
+    return SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+
+
+def _scheduler_delivery_target(
+    delivery_mode: str,
+    *,
+    chat_id: Optional[str] = None,
+    chat_type: str = "p2p",
+):
+    if delivery_mode == "standalone":
+        return DeliveryTarget.standalone()
+    if delivery_mode == "channel":
+        if not chat_id:
+            raise typer.BadParameter(
+                "--chat-id is required when delivery-mode=channel"
+            )
+        return DeliveryTarget.channel(
+            target_type="feishu_chat",
+            chat_id=chat_id,
+            chat_type=chat_type,
+        )
+    raise typer.BadParameter(f"Unsupported delivery mode: {delivery_mode}")
+
+
+def _scheduler_print_task_table(tasks: list) -> None:
+    table = Table(title="Scheduled Tasks")
+    table.add_column("ID")
+    table.add_column("Name")
+    table.add_column("Kind")
+    table.add_column("Enabled")
+    table.add_column("Delivery")
+    table.add_column("Next Run")
+    for task in tasks:
+        table.add_row(
+            task.id,
+            task.name,
+            task.kind,
+            "yes" if task.enabled else "no",
+            task.delivery_mode,
+            task.next_run_at.isoformat() if task.next_run_at else "—",
+        )
+    shared.CONSOLE.print(table)
+
+
+async def _build_scheduler_service(
+    cfg: dict,
+    *,
+    poll_seconds: float,
+    lease_seconds: int,
+):
+    components = await agent_module._build_components_async(cfg)
+    store = _scheduler_store()
+    delivery = SchedulerDelivery(
+        cfg=cfg,
+        output_root=(components.get("output_dir") or shared.DEFAULT_OUTPUT_DIR)
+        / "scheduler",
+    )
+
+    async def _agent_executor(task, run):
+        agent: BaseAgent = components["agent"]
+        skill_catalog: SkillCatalog = components["skill_catalog"]
+        ctx = AgentContext(system_prompt=components["system_prompt"])
+        ctx.metadata["skill_catalog"] = skill_catalog
+        prompt = str(task.payload.get("prompt", "")).strip()
+        if not prompt:
+            raise RuntimeError(f"Scheduled task '{task.name}' has no prompt")
+        result = await agent.send_message(ctx, prompt)
+        if result.error:
+            raise RuntimeError(result.error)
+        content = result.content or ""
+        summary = content.strip().splitlines()[0][:120] if content.strip() else task.name
+        return ExecutionResult(summary=summary, text_output=content)
+
+    async def _system_executor(task, run):
+        job_name = str(task.payload.get("job_name", "")).strip()
+        if job_name == "memory_tidy":
+            memory: MemoryPalace = components["memory"]
+            memory.force_tidy()
+            await memory.tidy(components["client"], components["model"])
+            return ExecutionResult(
+                summary="memory tidied",
+                text_output="Memory tidy complete.",
+            )
+        raise RuntimeError(f"Unsupported system job: {job_name}")
+
+    service = SchedulerService(
+        store=store,
+        agent_executor=_agent_executor,
+        system_executor=_system_executor,
+        delivery=delivery,
+        poll_seconds=poll_seconds,
+        lease_seconds=lease_seconds,
+    )
+    return service, store, components
 
 
 async def _interactive_loop(components: dict, cfg: dict):
@@ -959,6 +1065,254 @@ def config(
     else:
         shared.CONSOLE.print(f"[red]Unknown action '{action}'. Use: list | models | get[/red]")
         raise typer.Exit(1)
+
+
+# ── Scheduler commands ───────────────────────────────────────────────────────
+
+
+@schedule_app.command("once")
+def schedule_once(
+    name: str = typer.Argument(..., help="Task name"),
+    at: str = typer.Option(..., "--at", help="ISO datetime with timezone"),
+    timezone_name: str = typer.Option("UTC", "--timezone", help="IANA timezone name"),
+    prompt: str = typer.Option(..., "--prompt", help="Prompt to run"),
+    delivery_mode: str = typer.Option("standalone", "--delivery-mode"),
+    chat_id: Optional[str] = typer.Option(None, "--chat-id"),
+    chat_type: str = typer.Option("p2p", "--chat-type"),
+    model: Optional[str] = typer.Option(None, "--model"),
+):
+    store = _scheduler_store()
+    try:
+        task = store.create_task(
+            NewScheduledTask(
+                name=name,
+                kind="agent_prompt",
+                trigger=TriggerSpec.once(at, timezone_name),
+                payload={"prompt": prompt},
+                delivery_mode=delivery_mode,
+                delivery_target=_scheduler_delivery_target(
+                    delivery_mode, chat_id=chat_id, chat_type=chat_type
+                ),
+                model_override=model,
+            )
+        )
+        shared.CONSOLE.print(
+            f"[green]Created scheduled task[/green] {task.name} ({task.id})"
+        )
+    finally:
+        store.close()
+
+
+@schedule_app.command("interval")
+def schedule_interval(
+    name: str = typer.Argument(..., help="Task name"),
+    every: int = typer.Option(..., "--every", min=1),
+    unit: str = typer.Option(..., "--unit", help="minutes|hours|days|weeks"),
+    anchor_at: str = typer.Option(..., "--anchor-at", help="ISO datetime with timezone"),
+    timezone_name: str = typer.Option("UTC", "--timezone", help="IANA timezone name"),
+    prompt: str = typer.Option(..., "--prompt", help="Prompt to run"),
+    delivery_mode: str = typer.Option("standalone", "--delivery-mode"),
+    chat_id: Optional[str] = typer.Option(None, "--chat-id"),
+    chat_type: str = typer.Option("p2p", "--chat-type"),
+    model: Optional[str] = typer.Option(None, "--model"),
+):
+    store = _scheduler_store()
+    try:
+        task = store.create_task(
+            NewScheduledTask(
+                name=name,
+                kind="agent_prompt",
+                trigger=TriggerSpec.interval(every, unit, anchor_at, timezone_name),
+                payload={"prompt": prompt},
+                delivery_mode=delivery_mode,
+                delivery_target=_scheduler_delivery_target(
+                    delivery_mode, chat_id=chat_id, chat_type=chat_type
+                ),
+                model_override=model,
+            )
+        )
+        shared.CONSOLE.print(
+            f"[green]Created scheduled task[/green] {task.name} ({task.id})"
+        )
+    finally:
+        store.close()
+
+
+@schedule_app.command("daily")
+def schedule_daily(
+    name: str = typer.Argument(..., help="Task name"),
+    time_of_day: str = typer.Option(..., "--time", help="HH:MM local wall clock"),
+    timezone_name: str = typer.Option("UTC", "--timezone", help="IANA timezone name"),
+    prompt: str = typer.Option(..., "--prompt", help="Prompt to run"),
+    delivery_mode: str = typer.Option("standalone", "--delivery-mode"),
+    chat_id: Optional[str] = typer.Option(None, "--chat-id"),
+    chat_type: str = typer.Option("p2p", "--chat-type"),
+    model: Optional[str] = typer.Option(None, "--model"),
+):
+    store = _scheduler_store()
+    try:
+        task = store.create_task(
+            NewScheduledTask(
+                name=name,
+                kind="agent_prompt",
+                trigger=TriggerSpec.daily(time_of_day, timezone_name),
+                payload={"prompt": prompt},
+                delivery_mode=delivery_mode,
+                delivery_target=_scheduler_delivery_target(
+                    delivery_mode, chat_id=chat_id, chat_type=chat_type
+                ),
+                model_override=model,
+            )
+        )
+        shared.CONSOLE.print(
+            f"[green]Created scheduled task[/green] {task.name} ({task.id})"
+        )
+    finally:
+        store.close()
+
+
+@schedule_app.command("weekly")
+def schedule_weekly(
+    name: str = typer.Argument(..., help="Task name"),
+    day_of_week: str = typer.Option(..., "--day", help="mon|tue|..."),
+    time_of_day: str = typer.Option(..., "--time", help="HH:MM local wall clock"),
+    timezone_name: str = typer.Option("UTC", "--timezone", help="IANA timezone name"),
+    prompt: str = typer.Option(..., "--prompt", help="Prompt to run"),
+    delivery_mode: str = typer.Option("standalone", "--delivery-mode"),
+    chat_id: Optional[str] = typer.Option(None, "--chat-id"),
+    chat_type: str = typer.Option("p2p", "--chat-type"),
+    model: Optional[str] = typer.Option(None, "--model"),
+):
+    store = _scheduler_store()
+    try:
+        task = store.create_task(
+            NewScheduledTask(
+                name=name,
+                kind="agent_prompt",
+                trigger=TriggerSpec.weekly(day_of_week, time_of_day, timezone_name),
+                payload={"prompt": prompt},
+                delivery_mode=delivery_mode,
+                delivery_target=_scheduler_delivery_target(
+                    delivery_mode, chat_id=chat_id, chat_type=chat_type
+                ),
+                model_override=model,
+            )
+        )
+        shared.CONSOLE.print(
+            f"[green]Created scheduled task[/green] {task.name} ({task.id})"
+        )
+    finally:
+        store.close()
+
+
+@schedule_app.command("list")
+def schedule_list():
+    store = _scheduler_store()
+    try:
+        tasks = store.list_tasks()
+    finally:
+        store.close()
+    if not tasks:
+        shared.CONSOLE.print("[yellow]No scheduled tasks.[/yellow]")
+        return
+    _scheduler_print_task_table(tasks)
+
+
+@schedule_app.command("show")
+def schedule_show(task_id: str = typer.Argument(..., help="Task id")):
+    store = _scheduler_store()
+    try:
+        task = store.get_task(task_id)
+        runs = store.list_runs(task_id)
+    finally:
+        store.close()
+    if task is None:
+        shared.CONSOLE.print(f"[red]Task not found:[/red] {task_id}")
+        raise typer.Exit(1)
+    payload = {
+        "id": task.id,
+        "name": task.name,
+        "kind": task.kind,
+        "enabled": task.enabled,
+        "delivery_mode": task.delivery_mode,
+        "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
+        "payload": task.payload,
+        "runs": [
+            {
+                "id": run.id,
+                "status": run.status,
+                "scheduled_for": run.scheduled_for.isoformat(),
+                "summary": run.summary,
+            }
+            for run in runs
+        ],
+    }
+    shared.CONSOLE.print(
+        Markdown(f"```json\n{json.dumps(payload, indent=2, ensure_ascii=False)}\n```")
+    )
+
+
+@schedule_app.command("pause")
+def schedule_pause(task_id: str = typer.Argument(..., help="Task id")):
+    store = _scheduler_store()
+    try:
+        store.set_enabled(task_id, False)
+    finally:
+        store.close()
+    shared.CONSOLE.print(f"[green]Paused[/green] {task_id}")
+
+
+@schedule_app.command("resume")
+def schedule_resume(task_id: str = typer.Argument(..., help="Task id")):
+    store = _scheduler_store()
+    try:
+        store.set_enabled(task_id, True)
+    finally:
+        store.close()
+    shared.CONSOLE.print(f"[green]Resumed[/green] {task_id}")
+
+
+@schedule_app.command("delete")
+def schedule_delete(task_id: str = typer.Argument(..., help="Task id")):
+    store = _scheduler_store()
+    try:
+        store.delete_task(task_id)
+    finally:
+        store.close()
+    shared.CONSOLE.print(f"[green]Deleted[/green] {task_id}")
+
+
+@app.command()
+def scheduler(
+    poll_seconds: Optional[float] = typer.Option(None, "--poll-seconds", min=0.1),
+    lease_seconds: Optional[int] = typer.Option(None, "--lease-seconds", min=1),
+):
+    """Run the persistent scheduler service."""
+    cfg, first_run = agent_module.load_config()
+    if first_run:
+        if not agent_module._first_run_setup():
+            raise typer.Exit(0)
+        cfg, _ = agent_module.load_config()
+    sched_cfg = cfg.get("scheduler", {})
+    effective_poll = float(poll_seconds or sched_cfg.get("poll_seconds", 30))
+    effective_lease = int(lease_seconds or sched_cfg.get("lease_seconds", 300))
+
+    async def _run():
+        service, store, components = await _build_scheduler_service(
+            cfg,
+            poll_seconds=effective_poll,
+            lease_seconds=effective_lease,
+        )
+        shared.CONSOLE.print(
+            f"[dim]Scheduler running (poll={effective_poll}s, lease={effective_lease}s)[/dim]"
+        )
+        try:
+            await service.run_forever()
+        finally:
+            store.close()
+            await agent_module._close_components(components)
+
+    asyncio.run(_run())
 
 
 # ── Memory subcommands ────────────────────────────────────────────────────────

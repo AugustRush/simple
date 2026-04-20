@@ -80,6 +80,7 @@ class CliOutputSink(OutputSink):
     def __init__(self, console: Any) -> None:
         self._console = console
         self._streamed: list[str] = []
+        self._last_batch_progress_key: tuple[int, int] | None = None
 
     def on_stream_chunk(self, chunk: str) -> None:
         self._console.print(chunk, end="", markup=False)
@@ -116,6 +117,15 @@ class CliOutputSink(OutputSink):
         self._console.print(f"[red]{error}[/red]")
 
     def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
+        if event.kind == "batch_started":
+            self._last_batch_progress_key = None
+        elif event.kind == "batch_progress":
+            key = (event.completed, event.total)
+            if self._last_batch_progress_key == key:
+                return
+            self._last_batch_progress_key = key
+        elif event.kind == "batch_finished":
+            self._last_batch_progress_key = None
         msg = event.message or self._format_subagent_event(event)
         if not msg:
             return

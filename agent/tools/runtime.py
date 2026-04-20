@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from contextlib import AsyncExitStack
 import html
 import importlib.util
@@ -20,14 +21,12 @@ from zoneinfo import ZoneInfo
 
 import mcp
 
-import agent as agent_module
 from agent import shared
 
 TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
 TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
 TOOL_DEFAULT_MAX_LIST_RESULTS = 100
-_atomic_write_text = agent_module._atomic_write_text
-_shell_command_is_blocked = agent_module._shell_command_is_blocked
+_atomic_write_text = shared._atomic_write_text
 
 WEB_FETCH_MAX_BYTES = 512 * 1024
 WEB_FETCH_TIMEOUT = 20
@@ -36,6 +35,10 @@ TAVILY_SEARCH_MAX_RESULTS = 10
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 WEB_USER_AGENT = (
     "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
+)
+
+_active_schedule_target: contextvars.ContextVar[Optional[dict[str, Any]]] = (
+    contextvars.ContextVar("_active_schedule_target", default=None)
 )
 
 @dataclass
@@ -402,6 +405,87 @@ class BuiltinTools:
         )
 
         r.register(
+            "schedule_create",
+            (
+                "Create a persistent scheduled task. Use when the user asks for a reminder, "
+                "a delayed follow-up, or a recurring future message. "
+                "For once: provide `at`. For interval: provide `every` and `unit`. "
+                "For daily: provide `time_of_day`. For weekly: provide `day_of_week` and `time_of_day`."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short task name"},
+                    "trigger_type": {
+                        "type": "string",
+                        "description": "one of: once, interval, daily, weekly",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "Prompt/content the scheduled agent should send or execute",
+                    },
+                    "timezone_name": {
+                        "type": "string",
+                        "description": "IANA timezone name like Asia/Shanghai",
+                        "default": "UTC",
+                    },
+                    "at": {
+                        "type": "string",
+                        "description": "ISO datetime for once triggers",
+                    },
+                    "every": {
+                        "type": "integer",
+                        "description": "Interval count for interval triggers",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "description": "minutes|hours|days|weeks for interval triggers",
+                    },
+                    "time_of_day": {
+                        "type": "string",
+                        "description": "HH:MM for daily/weekly triggers",
+                    },
+                    "day_of_week": {
+                        "type": "string",
+                        "description": "mon|tue|wed|thu|fri|sat|sun for weekly triggers",
+                    },
+                    "delivery_mode": {
+                        "type": "string",
+                        "description": "optional override: standalone or channel",
+                    },
+                },
+                "required": ["name", "trigger_type", "prompt"],
+            },
+            self._schedule_create,
+            source="builtin",
+        )
+
+        r.register(
+            "schedule_list",
+            "List persistent scheduled tasks.",
+            {"type": "object", "properties": {}, "required": []},
+            self._schedule_list,
+            source="builtin",
+        )
+
+        r.register(
+            "schedule_delete",
+            "Delete a persistent scheduled task by id.",
+            {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Scheduled task id to delete",
+                    }
+                },
+                "required": ["task_id"],
+            },
+            self._schedule_delete,
+            source="builtin",
+        )
+
+        r.register(
             "web_search",
             (
                 "Search the web using Tavily and return a list of results (title, url, snippet). "
@@ -764,6 +848,9 @@ class BuiltinTools:
         extra_blocked: list[str] = (
             self.registry.get_context("shell_blocked_commands") or []
         )
+        import agent as agent_module
+
+        _shell_command_is_blocked = agent_module._shell_command_is_blocked
         block_reason = _shell_command_is_blocked(command, extra_blocked)
         if block_reason:
             return self._error(
@@ -974,6 +1061,141 @@ class BuiltinTools:
         return self._ok(
             query=query, count=len(sections), content=result, sections=sections
         )
+
+    def _schedule_store(self) -> SchedulerStore:
+        from agent.scheduler import SchedulerStore
+
+        return SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+
+    def _schedule_target(self, delivery_mode: Optional[str] = None):
+        from agent.scheduler import DeliveryTarget
+
+        active = _active_schedule_target.get()
+        if delivery_mode == "standalone":
+            return "standalone", DeliveryTarget.standalone()
+        if delivery_mode == "channel" and active:
+            return "channel", DeliveryTarget.channel(
+                target_type=str(active.get("target_type", "feishu_chat")),
+                chat_id=str(active["chat_id"]),
+                chat_type=str(active.get("chat_type", "p2p")),
+            )
+        if active:
+            return "channel", DeliveryTarget.channel(
+                target_type=str(active.get("target_type", "feishu_chat")),
+                chat_id=str(active["chat_id"]),
+                chat_type=str(active.get("chat_type", "p2p")),
+            )
+        return "standalone", DeliveryTarget.standalone()
+
+    def _schedule_trigger(
+        self,
+        *,
+        trigger_type: str,
+        timezone_name: str,
+        at: Optional[str] = None,
+        every: Optional[int] = None,
+        unit: Optional[str] = None,
+        time_of_day: Optional[str] = None,
+        day_of_week: Optional[str] = None,
+    ):
+        from agent.scheduler import TriggerSpec
+
+        kind = str(trigger_type).strip().lower()
+        if kind == "once":
+            if not at:
+                raise ValueError("`at` is required for once triggers")
+            return TriggerSpec.once(at, timezone_name)
+        if kind == "interval":
+            if every is None or not unit or not at:
+                raise ValueError("`every`, `unit`, and `at` are required for interval triggers")
+            return TriggerSpec.interval(every, unit, at, timezone_name)
+        if kind == "daily":
+            if not time_of_day:
+                raise ValueError("`time_of_day` is required for daily triggers")
+            return TriggerSpec.daily(time_of_day, timezone_name)
+        if kind == "weekly":
+            if not day_of_week or not time_of_day:
+                raise ValueError("`day_of_week` and `time_of_day` are required for weekly triggers")
+            return TriggerSpec.weekly(day_of_week, time_of_day, timezone_name)
+        raise ValueError(f"Unsupported trigger_type '{trigger_type}'")
+
+    def _schedule_create(
+        self,
+        name: str,
+        trigger_type: str,
+        prompt: str,
+        timezone_name: str = "UTC",
+        at: Optional[str] = None,
+        every: Optional[int] = None,
+        unit: Optional[str] = None,
+        time_of_day: Optional[str] = None,
+        day_of_week: Optional[str] = None,
+        delivery_mode: Optional[str] = None,
+    ) -> dict[str, Any]:
+        trigger = self._schedule_trigger(
+            trigger_type=trigger_type,
+            timezone_name=timezone_name,
+            at=at,
+            every=every,
+            unit=unit,
+            time_of_day=time_of_day,
+            day_of_week=day_of_week,
+        )
+        resolved_mode, target = self._schedule_target(delivery_mode)
+        from agent.scheduler import NewScheduledTask
+
+        store = self._schedule_store()
+        try:
+            task = store.create_task(
+                NewScheduledTask(
+                    name=name,
+                    kind="agent_prompt",
+                    trigger=trigger,
+                    payload={"prompt": prompt},
+                    delivery_mode=resolved_mode,
+                    delivery_target=target,
+                )
+            )
+        finally:
+            store.close()
+        return self._ok(
+            task={
+                "id": task.id,
+                "name": task.name,
+                "delivery_mode": task.delivery_mode,
+                "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
+                "db_path": str(shared.SCHEDULER_DB_FILE),
+            }
+        )
+
+    def _schedule_list(self) -> dict[str, Any]:
+        store = self._schedule_store()
+        try:
+            tasks = store.list_tasks()
+        finally:
+            store.close()
+        return self._ok(
+            count=len(tasks),
+            items=[
+                {
+                    "id": task.id,
+                    "name": task.name,
+                    "kind": task.kind,
+                    "delivery_mode": task.delivery_mode,
+                    "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
+                    "enabled": task.enabled,
+                }
+                for task in tasks
+            ],
+        )
+
+    def _schedule_delete(self, task_id: str) -> dict[str, Any]:
+        store = self._schedule_store()
+        try:
+            store.delete_task(task_id)
+        finally:
+            store.close()
+        return self._ok(task_id=task_id, deleted=True)
 
     def _clean_output(
         self, max_age_hours: float = 0, subdir: str = ""

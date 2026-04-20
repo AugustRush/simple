@@ -5,7 +5,9 @@ _active_sink ContextVar, IncomingMessage, Channel ABC, CliChannel, ChannelRunner
 from __future__ import annotations
 
 import asyncio
+import json
 from io import StringIO
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -183,6 +185,19 @@ def test_cli_output_sink_sync_stream_cb_delegates():
     assert sink._streamed == ["chunk"]
 
 
+def test_cli_output_sink_dedupes_duplicate_batch_progress_events():
+    sink, console = _make_sink()
+    event = SubAgentProgressEvent(kind="batch_progress", completed=0, total=3)
+
+    sink.on_subagent_event(event)
+    sink.on_subagent_event(event)
+
+    matching = [
+        line for line in console.lines if "Sub-agents running: 0/3 completed" in line
+    ]
+    assert len(matching) == 1
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _active_sink ContextVar isolation
 # ─────────────────────────────────────────────────────────────────────────────
@@ -336,3 +351,315 @@ def test_channel_runner_sets_output_dir_on_channels_with_setter(tmp_path):
 
     assert channel.started is True
     assert channel.output_dir == tmp_path / "output"
+
+
+def test_channel_runner_scopes_context_manager_per_chat():
+    class _RecordingStaging:
+        def __init__(self, session_id: str):
+            self.session_id = session_id
+            self.entries: list[tuple[str, str]] = []
+
+        def append(self, role: str, content: str):
+            self.entries.append((role, content))
+
+        def count(self) -> int:
+            return len(self.entries)
+
+    class _SessionContextManager:
+        def __init__(self, session_id: str):
+            self.session_id = session_id
+            self.staging = _RecordingStaging(session_id)
+            self.mark_calls = 0
+
+        def mark_activity(self):
+            self.mark_calls += 1
+
+        def should_enqueue_consolidation(self):
+            return False
+
+        def enqueue_consolidation(self, reason):
+            raise AssertionError(f"unexpected enqueue: {reason}")
+
+        def should_compact_messages(self, messages, max_tokens):
+            return False
+
+    class _RootContextManager:
+        def __init__(self):
+            self.staging = _RecordingStaging("root")
+            self.spawned: dict[str, _SessionContextManager] = {}
+            self.mark_calls = 0
+
+        def spawn_session(self, session_id: str):
+            mgr = _SessionContextManager(session_id)
+            self.spawned[session_id] = mgr
+            return mgr
+
+        # Fallback methods keep the old implementation running long enough for
+        # the assertions below to catch the shared-state bug.
+        def mark_activity(self):
+            self.mark_calls += 1
+
+        def should_enqueue_consolidation(self):
+            return False
+
+        def enqueue_consolidation(self, reason):
+            raise AssertionError(f"unexpected enqueue on root manager: {reason}")
+
+        def should_compact_messages(self, messages, max_tokens):
+            return False
+
+    class _FakeAgent:
+        max_tokens = 1024
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            return agent_module.AgentResult(
+                agent_id="agent",
+                content=f"reply:{user_message}",
+            )
+
+    root_ctx_mgr = _RootContextManager()
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": _FakeAgent(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": root_ctx_mgr,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+
+    async def _run():
+        await handler(
+            IncomingMessage(
+                text="hello",
+                metadata={"chat_id": "chat-a"},
+            ),
+            OutputSink(),
+        )
+        await handler(
+            IncomingMessage(
+                text="world",
+                metadata={"chat_id": "chat-b"},
+            ),
+            OutputSink(),
+        )
+
+    asyncio.run(_run())
+
+    assert set(root_ctx_mgr.spawned) == {"chat-a", "chat-b"}
+    assert root_ctx_mgr.staging.entries == []
+    assert root_ctx_mgr.spawned["chat-a"].staging.entries == [
+        ("user", "hello"),
+        ("assistant", "reply:hello"),
+    ]
+    assert root_ctx_mgr.spawned["chat-b"].staging.entries == [
+        ("user", "world"),
+        ("assistant", "reply:world"),
+    ]
+
+
+def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
+    worker_instances = []
+
+    class _FakeBackgroundMemoryWorker:
+        def __init__(
+            self,
+            ctx_mgr,
+            client,
+            model,
+            api_format,
+            poll_seconds=1.0,
+            client_factory=None,
+        ):
+            self.ctx_mgr = ctx_mgr
+            self.started = False
+            self.wake_calls = 0
+            worker_instances.append(self)
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            return None
+
+        async def wait(self):
+            return None
+
+        def wake(self):
+            self.wake_calls += 1
+
+    monkeypatch.setattr(agent_module, "BackgroundMemoryWorker", _FakeBackgroundMemoryWorker)
+
+    class _RecordingStaging:
+        def __init__(self, session_id: str):
+            self.session_id = session_id
+            self.entries: list[tuple[str, str]] = []
+
+        def append(self, role: str, content: str):
+            self.entries.append((role, content))
+
+        def count(self) -> int:
+            return len(self.entries)
+
+    class _SessionContextManager:
+        min_messages = 2
+
+        def __init__(self, session_id: str):
+            self.staging = _RecordingStaging(session_id)
+            self.enqueued: list[str] = []
+
+        def mark_activity(self):
+            return None
+
+        def should_enqueue_consolidation(self):
+            return False
+
+        def enqueue_consolidation(self, reason):
+            self.enqueued.append(reason)
+
+        def should_compact_messages(self, messages, max_tokens):
+            return True
+
+        def compact_messages(self, messages):
+            return [{"role": "user", "content": "compacted"}]
+
+    class _RootContextManager:
+        def __init__(self):
+            self.staging = _RecordingStaging("root")
+            self.spawned: dict[str, _SessionContextManager] = {}
+
+        def spawn_session(self, session_id: str):
+            mgr = _SessionContextManager(session_id)
+            self.spawned[session_id] = mgr
+            return mgr
+
+        def mark_activity(self):
+            return None
+
+        def should_enqueue_consolidation(self):
+            return False
+
+        def enqueue_consolidation(self, reason):
+            raise AssertionError(f"unexpected root enqueue: {reason}")
+
+        def should_compact_messages(self, messages, max_tokens):
+            return False
+
+    class _FakeAgent:
+        api_format = "openai"
+        max_tokens = 1024
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            ctx.messages = [{"role": "user", "content": "history"}] * 4
+            return agent_module.AgentResult(agent_id="agent", content="reply")
+
+    root_ctx_mgr = _RootContextManager()
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": _FakeAgent(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": root_ctx_mgr,
+            "system_prompt": "system",
+            "client": object(),
+            "model": "fake-model",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+
+    async def _run():
+        await handler(
+            IncomingMessage(
+                text="trigger compaction",
+                metadata={"chat_id": "chat-a"},
+            ),
+            OutputSink(),
+        )
+
+    asyncio.run(_run())
+
+    assert len(worker_instances) == 1
+    assert worker_instances[0].started is True
+    assert worker_instances[0].wake_calls == 1
+    assert root_ctx_mgr.spawned["chat-a"].enqueued == ["compact_triggered"]
+
+
+def test_channel_runner_exposes_feishu_delivery_target_to_scheduler_tools(
+    monkeypatch, tmp_path
+):
+    import agent.tools.runtime as runtime_module
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(agent_module.shared, "SCHEDULER_DIR", tmp_path / "tasks")
+    monkeypatch.setattr(
+        agent_module.shared, "SCHEDULER_DB_FILE", tmp_path / "tasks" / "scheduler.db"
+    )
+
+    registry = agent_module.ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    memory = agent_module.MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    agent_module.BuiltinTools(memory=memory, registry=registry, workspace_root=workspace)
+    observed: dict[str, str] = {}
+
+    class _FakeAgent:
+        max_tokens = 1024
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            result = await registry.call(
+                "schedule_create",
+                {
+                    "name": "reminder",
+                    "trigger_type": "once",
+                    "prompt": "测试一下",
+                    "at": "2026-04-20T10:00:00+08:00",
+                    "timezone_name": "Asia/Shanghai",
+                },
+            )
+            observed["payload"] = result
+            return agent_module.AgentResult(agent_id="agent", content="scheduled")
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": _FakeAgent(),
+            "registry": registry,
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+
+    async def _run():
+        await handler(
+            IncomingMessage(
+                text="两分钟后提醒我",
+                channel_name="feishu",
+                metadata={"chat_id": "oc_test_chat", "chat_type": "group"},
+            ),
+            OutputSink(),
+        )
+
+    asyncio.run(_run())
+
+    payload = json.loads(observed["payload"])
+    store = SchedulerStore(db_path=Path(payload["task"]["db_path"]))
+    try:
+        task = store.get_task(payload["task"]["id"])
+    finally:
+        store.close()
+
+    assert task is not None
+    assert task.delivery_mode == "channel"
+    assert task.delivery_target.payload["chat_id"] == "oc_test_chat"

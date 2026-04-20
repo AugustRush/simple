@@ -1652,6 +1652,31 @@ class ContextManager:
         self._jobs: deque[dict[str, Any]] = deque()
         self._processing_job = False
 
+    def spawn_session(self, session_id: Optional[str] = None) -> "ContextManager":
+        """Create a session-scoped manager that shares durable memory primitives.
+
+        Channel transports may multiplex many independent chats through one
+        process. Those chats should share the same long-term store and
+        consolidation rules, but they must not share staging buffers, idle
+        timers, or dirty flags.
+        """
+        if self.staging.path.parent.name == "_staging":
+            context_dir = self.staging.path.parent.parent
+        else:
+            context_dir = self.staging.path.parent
+        staging = StagingBuffer(context_dir=context_dir, session_id=session_id)
+        return ContextManager(
+            store=self.store,
+            retriever=self.retriever,
+            consolidation=self.consolidation,
+            idle_seconds=self.idle_seconds,
+            min_messages=self.min_messages,
+            staging=staging,
+            staging_turn_threshold=self.staging_turn_threshold,
+            staging_token_threshold=self.staging_token_threshold,
+            route_keywords=dict(self.route_keywords),
+        )
+
     # ── Activity tracking ─────────────────────────────────────────────────────
 
     def mark_activity(self) -> None:
@@ -2133,21 +2158,27 @@ class BackgroundMemoryWorker:
                 on_demand = self._wake_event.is_set()
                 self._wake_event.clear()
                 try:
-                    # on_demand bypasses the idle gate: run immediately when the
-                    # caller explicitly requested consolidation (e.g. after a
-                    # compact_messages truncation).  Normal polling still
-                    # requires the idle threshold to be satisfied.
-                    should_run = (
-                        on_demand and self.ctx_mgr.pending_jobs() > 0
-                    ) or self.ctx_mgr.should_process_jobs()
-                    if should_run:
-                        asyncio.run(
+                    while not self._stop_event.is_set():
+                        # on_demand bypasses the idle gate: once explicitly
+                        # woken, drain the currently available queue rather than
+                        # processing only a single job and falling back to the
+                        # idle gate for the rest.
+                        should_run = (
+                            on_demand or self.ctx_mgr.should_process_jobs()
+                        )
+                        if not should_run:
+                            break
+                        processed = asyncio.run(
                             self.ctx_mgr.process_one_job(
                                 client,
                                 self.model,
                                 api_format=self.api_format,
                             )
                         )
+                        if not processed:
+                            break
+                        if not on_demand:
+                            continue
                 except Exception as e:
                     shared.CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
                 # Sleep for poll_seconds OR until wake()/stop() interrupts,

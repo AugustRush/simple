@@ -85,6 +85,8 @@ from .shared import (
     REGULAR_TOOL_TIMEOUT,
     RETRIEVAL_TOP_K,
     RL_DIR,
+    SCHEDULER_DB_FILE,
+    SCHEDULER_DIR,
     SESSIONS_FILE,
     SKILLS_DIR,
     SLEEP_TOKEN_RATIO,
@@ -404,6 +406,23 @@ from .config import (
     save_config,
 )
 from .bootstrap import _build_components, _build_components_async
+from .scheduler import (
+    ClaimedTask,
+    DailyTrigger,
+    DeliveryResult,
+    DeliveryTarget,
+    ExecutionResult,
+    IntervalTrigger,
+    NewScheduledTask,
+    OnceTrigger,
+    ScheduledTask,
+    SchedulerDelivery,
+    SchedulerService,
+    SchedulerStore,
+    TaskRun,
+    TriggerSpec,
+    WeeklyTrigger,
+)
 
 
 class _AgentModule(types.ModuleType):
@@ -416,6 +435,8 @@ class _AgentModule(types.ModuleType):
         "BUILTIN_SKILLS_DIR",
         "PROMPTS_DIR",
         "RL_DIR",
+        "SCHEDULER_DIR",
+        "SCHEDULER_DB_FILE",
         "CONFIG_FILE",
         "INDEX_FILE",
         "SESSIONS_FILE",

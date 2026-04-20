@@ -303,7 +303,31 @@ class BaseAgent:
         if spawn_calls:
             roles = ", ".join(tu["input"].get("role", "?") for _, tu in spawn_calls)
             total_spawns = len(spawn_calls)
-            progress_state = {"completed": 0}
+            progress_state = {
+                "completed": 0,
+                "last_notified_completed": 0,
+                "last_emit_monotonic": time.monotonic(),
+            }
+            idle_heartbeat_seconds = 10.0
+
+            def _emit_progress(*, stale: bool = False) -> None:
+                if progress_state["completed"] >= total_spawns:
+                    return
+                progress_state["last_notified_completed"] = progress_state["completed"]
+                progress_state["last_emit_monotonic"] = time.monotonic()
+                message = (
+                    f"Sub-agents still running: {progress_state['completed']}/{total_spawns} completed"
+                    if stale
+                    else f"Sub-agents running: {progress_state['completed']}/{total_spawns} completed"
+                )
+                self._emit_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="batch_progress",
+                        completed=progress_state["completed"],
+                        total=total_spawns,
+                        message=message,
+                    )
+                )
             self._emit_subagent_event(
                 SubAgentProgressEvent(
                     kind="batch_started",
@@ -327,17 +351,13 @@ class BaseAgent:
                         pass
                     if heartbeat_stop.is_set():
                         break
-                    self._emit_subagent_event(
-                        SubAgentProgressEvent(
-                            kind="batch_progress",
-                            completed=progress_state["completed"],
-                            total=total_spawns,
-                            message=(
-                                "Sub-agents running: "
-                                f"{progress_state['completed']}/{total_spawns} completed"
-                            ),
-                        )
-                    )
+                    if (
+                        progress_state["completed"]
+                        == progress_state["last_notified_completed"]
+                        and time.monotonic() - progress_state["last_emit_monotonic"]
+                        >= idle_heartbeat_seconds
+                    ):
+                        _emit_progress(stale=True)
 
             async def _exec_spawn_with_sem(tu: dict) -> str:
                 async with sem:
@@ -345,9 +365,11 @@ class BaseAgent:
                         outcome = await self.registry.call(tu["name"], tu["input"])
                     except Exception as exc:
                         progress_state["completed"] += 1
+                        _emit_progress()
                         raise
 
                     progress_state["completed"] += 1
+                    _emit_progress()
                     return outcome
 
             # D5: return_exceptions=True prevents one failing spawn from cancelling others

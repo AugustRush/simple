@@ -72,6 +72,10 @@ DEFAULT_CONFIG: dict = {
     "evolution": {
         "enabled": True,  # set to false to disable session scoring and rule learning
     },
+    "scheduler": {
+        "poll_seconds": 30,
+        "lease_seconds": 300,
+    },
     # ── Context manager ──────────────────────────────────────────────────
     "context": {
         "storage": {
@@ -223,6 +227,7 @@ def load_config() -> tuple[dict, bool]:
             "memory",
             "orchestration",
             "evolution",
+            "scheduler",
             "mcp_servers",
             "context",
         ):
@@ -447,6 +452,11 @@ def _compose_system_prompt(
         if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
             lines.append(
                 f"Workspace root for read_file/write_file/list_files only: {workspace_root}"
+            )
+        if "schedule_create" in builtin_names:
+            lines.append(
+                "If the user asks for a reminder, delayed follow-up, or recurring future message, "
+                "use the schedule tools instead of saying you cannot act in the future."
             )
     lines.append(
         "Agent-managed paths are separate from the workspace root: "

@@ -245,11 +245,15 @@ user-invocable: true
     assert "activate_skill" in registry.list_tools()
     assert "list_skill_files" in registry.list_tools()
     assert "read_skill_file" in registry.list_tools()
+    assert "schedule_create" in registry.list_tools()
+    assert "schedule_list" in registry.list_tools()
     assert "Available skills:" in prompt
     assert "quality/review" in prompt
     assert "Review code changes" in prompt
     assert skill_body not in prompt
     assert "Loaded skill tools" not in prompt
+    assert "schedule_create" in prompt
+    assert "use the schedule tools instead of saying you cannot act in the future" in prompt
 
     payload = json.loads(
         asyncio.run(registry.call("activate_skill", {"skill_name": "quality/review"}))

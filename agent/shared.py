@@ -17,6 +17,8 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 BUILTIN_SKILLS_DIR = PACKAGE_ROOT / "_builtin" / "skills"
 PROMPTS_DIR = AGENT_HOME / "prompts"
 RL_DIR = AGENT_HOME / "rl"
+SCHEDULER_DIR = AGENT_HOME / "tasks"
+SCHEDULER_DB_FILE = SCHEDULER_DIR / "scheduler.db"
 CONFIG_FILE = AGENT_HOME / "config.json"
 INDEX_FILE = MEMORY_DIR / "INDEX.md"
 SESSIONS_FILE = RL_DIR / "sessions.jsonl"
@@ -157,6 +159,8 @@ __all__ = [
     "BUILTIN_SKILLS_DIR",
     "PROMPTS_DIR",
     "RL_DIR",
+    "SCHEDULER_DIR",
+    "SCHEDULER_DB_FILE",
     "CONFIG_FILE",
     "INDEX_FILE",
     "SESSIONS_FILE",

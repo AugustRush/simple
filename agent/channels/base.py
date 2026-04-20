@@ -10,6 +10,7 @@ from typing import Any, Callable
 from rich.console import Console
 
 from agent.core.output import CliOutputSink, OutputSink, _active_sink
+from agent.tools.runtime import _active_schedule_target
 
 
 def _new_id() -> str:
@@ -79,6 +80,60 @@ class ChannelRunner:
         self._components = components
         self._cfg = cfg
 
+    def _build_session_context_manager(self, session_id: str):
+        base_ctx_mgr = self._components.get("context_manager")
+        if base_ctx_mgr is None:
+            return None
+        spawn_session = getattr(base_ctx_mgr, "spawn_session", None)
+        if callable(spawn_session):
+            return spawn_session(session_id)
+        return base_ctx_mgr
+
+    def _build_session_memory_worker(self, session_ctx_mgr):
+        import agent as agent_module
+
+        if session_ctx_mgr is None:
+            return None
+        if (
+            "client" not in self._components
+            or "model" not in self._components
+            or "agent" not in self._components
+            or not hasattr(self._components["agent"], "api_format")
+        ):
+            return None
+        worker = agent_module.BackgroundMemoryWorker(
+            session_ctx_mgr,
+            self._components["client"],
+            self._components["model"],
+            self._components["agent"].api_format,
+            client_factory=lambda: agent_module.ModelClientFactory.from_config(
+                self._cfg, announce=False
+            )[0],
+        )
+        worker.start()
+        return worker
+
+    def _ensure_session_state(self, sessions: dict, session_id: str) -> dict:
+        import agent as agent_module
+
+        state = sessions.get(session_id)
+        if state is not None:
+            return state
+
+        session_ctx_mgr = self._build_session_context_manager(session_id)
+        state = {
+            "ctx": agent_module.AgentContext(
+                system_prompt=self._components["system_prompt"]
+            ),
+            "tools_used": [],
+            "turn_count": 0,
+            "task_context": "",
+            "context_manager": session_ctx_mgr,
+            "memory_worker": self._build_session_memory_worker(session_ctx_mgr),
+        }
+        sessions[session_id] = state
+        return state
+
     async def run(self) -> None:
         tasks = [asyncio.create_task(self._run_channel(ch)) for ch in self._channels]
         try:
@@ -96,24 +151,6 @@ class ChannelRunner:
             return
 
         components = self._components
-        cfg = self._cfg
-        ctx_mgr = components.get("context_manager")
-        memory_worker = (
-            agent_module.BackgroundMemoryWorker(
-                ctx_mgr,
-                components["client"],
-                components["model"],
-                components["agent"].api_format,
-                client_factory=lambda: agent_module.ModelClientFactory.from_config(
-                    cfg, announce=False
-                )[0],
-            )
-            if ctx_mgr
-            else None
-        )
-        if memory_worker:
-            memory_worker.start()
-
         plugin_catalog = components.get("plugin_catalog")
         if plugin_catalog:
             plugin_catalog.fire_session_start(components)
@@ -127,9 +164,12 @@ class ChannelRunner:
         try:
             await channel.start(self._make_message_handler(sessions))
         finally:
-            if memory_worker:
-                memory_worker.stop()
-                await memory_worker.wait()
+            for session in sessions.values():
+                worker = session.get("memory_worker")
+                if worker is None:
+                    continue
+                worker.stop()
+                await worker.wait()
             if plugin_catalog:
                 try:
                     all_messages: list[dict] = []
@@ -167,19 +207,10 @@ class ChannelRunner:
             agent = components["agent"]
             skill_catalog = components["skill_catalog"]
             plugin_catalog = components.get("plugin_catalog")
-            ctx_mgr = components.get("context_manager")
-
-            if session_id not in sessions:
-                sessions[session_id] = {
-                    "ctx": agent_module.AgentContext(
-                        system_prompt=components["system_prompt"]
-                    ),
-                    "tools_used": [],
-                    "turn_count": 0,
-                    "task_context": "",
-                }
-            state = sessions[session_id]
+            state = self._ensure_session_state(sessions, session_id)
             ctx = state["ctx"]
+            ctx_mgr = state.get("context_manager")
+            memory_worker = state.get("memory_worker")
             ctx.metadata["skill_catalog"] = skill_catalog
 
             if not state["task_context"]:
@@ -189,6 +220,16 @@ class ChannelRunner:
                 ctx_mgr.mark_activity()
 
             token = _active_sink.set(sink)
+            schedule_target_token = None
+            if msg.channel_name == "feishu" and msg.metadata.get("chat_id"):
+                schedule_target_token = _active_schedule_target.set(
+                    {
+                        "delivery_mode": "channel",
+                        "target_type": "feishu_chat",
+                        "chat_id": msg.metadata["chat_id"],
+                        "chat_type": msg.metadata.get("chat_type", "p2p"),
+                    }
+                )
             try:
                 result = await agent.send_message(
                     ctx, msg.text, stream_callback=sink.sync_stream_cb
@@ -232,6 +273,8 @@ class ChannelRunner:
                     )
                     if ctx_mgr.staging.count() >= ctx_mgr.min_messages:
                         ctx_mgr.enqueue_consolidation("compact_triggered")
+                        if memory_worker is not None:
+                            memory_worker.wake()
 
             except Exception as exc:
                 sink.on_error(str(exc))
@@ -239,6 +282,8 @@ class ChannelRunner:
                     await sink.drain()
             finally:
                 _active_sink.reset(token)
+                if schedule_target_token is not None:
+                    _active_schedule_target.reset(schedule_target_token)
 
             return True
 

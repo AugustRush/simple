@@ -61,6 +61,18 @@ logger = logging.getLogger(__name__)
 
 LARK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 
+
+def build_feishu_client(config: "FeishuConfig") -> Any:
+    import lark_oapi as lark  # type: ignore[import]
+
+    return (
+        lark.Client.builder()
+        .app_id(config.app_id)
+        .app_secret(config.app_secret)
+        .log_level(lark.LogLevel.WARNING)
+        .build()
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -280,6 +292,11 @@ class FeishuOutputSink(OutputSink):
         self._stream_flush_pending = False
         self._progress_buf = _FeishuStreamBuf()
         self._progress_flush_pending = False
+        self._progress_phase_transition_pending = False
+        self._progress_phase_closed = False
+        self._progress_disabled = False
+        self._last_batch_progress_key: tuple[int, int] | None = None
+        self._final_phase_started = False
 
     # ── OutputSink interface ──────────────────────────────────────────────────
 
@@ -287,7 +304,18 @@ class FeishuOutputSink(OutputSink):
         """Accumulate final summary text; progress updates use a separate card."""
         self._chunks.append(chunk)
         self._stream_buf.text += chunk
-        if self.streaming and not self._stream_flush_pending:
+        if not self.streaming:
+            return
+        # First-principles ordering rule: the user must never see final-answer
+        # streaming before the progress phase has been committed.  Without this
+        # barrier, stream flush tasks can overtake progress finalization because
+        # on_turn_complete() is scheduled after stream-chunk tasks.
+        if self._progress_phase_active() and not self._final_phase_started:
+            if not self._progress_phase_transition_pending:
+                self._progress_phase_transition_pending = True
+                self._schedule(self._begin_final_phase_async())
+            return
+        if not self._stream_flush_pending:
             self._stream_flush_pending = True
             self._schedule(self._flush_stream_async())
 
@@ -305,6 +333,8 @@ class FeishuOutputSink(OutputSink):
     def on_tool_start(self, name: str, inputs: dict) -> None:
         hint = f"{name}{_fmt_tool_inputs(name, inputs)}"
         if self.streaming:
+            if self._progress_disabled:
+                return
             self._append_progress_text(f"**Tool Call**\n\n```text\n{hint}\n```")
             if not self._progress_flush_pending:
                 self._progress_flush_pending = True
@@ -326,11 +356,22 @@ class FeishuOutputSink(OutputSink):
         self._schedule(self._send_plain_async(f"❌ {error}"))
 
     def on_subagent_event(self, event: SubAgentProgressEvent) -> None:
+        if event.kind == "batch_started":
+            self._last_batch_progress_key = None
+        elif event.kind == "batch_progress":
+            key = (event.completed, event.total)
+            if self._last_batch_progress_key == key:
+                return
+            self._last_batch_progress_key = key
+        elif event.kind == "batch_finished":
+            self._last_batch_progress_key = None
         line = self._format_subagent_event(event)
         if not line:
             return
         if not self.streaming:
             self._schedule(self._send_plain_async(line))
+            return
+        if self._progress_disabled:
             return
         self._append_progress_text(line)
         if not self._progress_flush_pending:
@@ -380,15 +421,49 @@ class FeishuOutputSink(OutputSink):
     # ── Async send helpers ────────────────────────────────────────────────────
 
     async def _finish_turn_async(self, text: str) -> None:
-        if self._progress_buf.card_id or self._progress_buf.text.strip():
-            await self._finalize_progress_async()
-        if self.streaming and (
-            self._stream_buf.card_id or self._stream_buf.text.strip()
-        ):
-            await self._finalize_stream_async(text)
-        elif text.strip():
-            await self._send_response_async(text)
-        await self._send_output_dir_files_async()
+        try:
+            if (
+                not self._progress_phase_closed
+                and (self._progress_buf.card_id or self._progress_buf.text.strip())
+            ):
+                await self._finalize_progress_async()
+                self._progress_phase_closed = True
+            if self.streaming and (
+                self._stream_buf.card_id or self._stream_buf.text.strip()
+            ):
+                await self._finalize_stream_async(text)
+            elif text.strip():
+                await self._send_response_async(text)
+            await self._send_output_dir_files_async()
+        finally:
+            self._progress_phase_transition_pending = False
+            self._progress_phase_closed = False
+            self._progress_disabled = False
+            self._last_batch_progress_key = None
+            self._final_phase_started = False
+
+    def _progress_phase_active(self) -> bool:
+        if self._progress_phase_closed or self._progress_disabled:
+            return False
+        return bool(
+            self._progress_buf.card_id
+            or self._progress_buf.text.strip()
+            or self._progress_flush_pending
+        )
+
+    async def _begin_final_phase_async(self) -> None:
+        try:
+            if (
+                not self._progress_phase_closed
+                and (self._progress_buf.card_id or self._progress_buf.text.strip())
+            ):
+                await self._finalize_progress_async()
+                self._progress_phase_closed = True
+            self._final_phase_started = True
+            if self.streaming and self._stream_buf.text.strip():
+                await self._flush_stream_async(force=True)
+        finally:
+            self._progress_phase_transition_pending = False
 
     async def _flush_stream_async(self, force: bool = False) -> None:
         """Create/update the CardKit streaming card when possible."""
@@ -448,6 +523,9 @@ class FeishuOutputSink(OutputSink):
             if self._progress_buf.card_id is None:
                 card_id = await loop.run_in_executor(None, self._create_streaming_card_sync)
                 if not card_id:
+                    self._progress_disabled = True
+                    self._progress_phase_closed = True
+                    self._progress_buf = _FeishuStreamBuf()
                     return
                 self._progress_buf.card_id = card_id
                 self._progress_buf.sequence = 1
@@ -477,6 +555,10 @@ class FeishuOutputSink(OutputSink):
             )
             if ok:
                 self._progress_buf.last_edit = now
+            else:
+                self._progress_disabled = True
+                self._progress_phase_closed = True
+                self._progress_buf = _FeishuStreamBuf()
         finally:
             self._progress_flush_pending = False
 
@@ -525,8 +607,9 @@ class FeishuOutputSink(OutputSink):
         try:
             if not final_text.strip():
                 return
+            if self._progress_disabled:
+                return
             if not card_id:
-                await self._send_response_async(final_text)
                 return
 
             self._progress_buf.sequence += 1
@@ -535,10 +618,9 @@ class FeishuOutputSink(OutputSink):
                 self._stream_update_text_sync,
                 card_id,
                 final_text,
-                self._progress_buf.sequence,
-            )
+                    self._progress_buf.sequence,
+                )
             if not ok:
-                await self._send_response_async(final_text)
                 return
 
             self._progress_buf.sequence += 1
@@ -853,6 +935,7 @@ class FeishuOutputSink(OutputSink):
     def _append_progress_text(self, line: str) -> None:
         if not line.strip():
             return
+        self._progress_phase_closed = False
         if not self._progress_buf.text:
             self._progress_buf.text = "## Multi-Agent Progress\n\n" + line
             return
@@ -1159,13 +1242,7 @@ class FeishuChannel(Channel):
         self._handler = handler
 
         # Lark REST client for sending messages / adding reactions
-        self._client = (
-            lark.Client.builder()
-            .app_id(self._config.app_id)
-            .app_secret(self._config.app_secret)
-            .log_level(lark.LogLevel.WARNING)
-            .build()
-        )
+        self._client = build_feishu_client(self._config)
 
         # WebSocket event dispatcher
         builder = (

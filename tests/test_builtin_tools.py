@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -525,3 +526,77 @@ def test_registry_call_returns_structured_error_for_timeout():
         "tool": "slow",
         "error": "Timeout calling tool 'slow'",
     }
+
+
+def test_builtin_tools_register_scheduler_runtime_tools(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    tool_names = registry.list_tools()
+
+    assert "schedule_create" in tool_names
+    assert "schedule_list" in tool_names
+    assert "schedule_delete" in tool_names
+
+
+def test_schedule_create_uses_active_delivery_target_for_channel_messages(tmp_path):
+    import agent.tools.runtime as runtime_module
+    from agent.scheduler import SchedulerStore
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    token = runtime_module._active_schedule_target.set(
+        {
+            "delivery_mode": "channel",
+            "target_type": "feishu_chat",
+            "chat_id": "oc_test_chat",
+            "chat_type": "group",
+        }
+    )
+    try:
+        result = asyncio.run(
+            registry.call(
+                "schedule_create",
+                {
+                    "name": "reminder",
+                    "trigger_type": "once",
+                    "prompt": "测试一下",
+                    "at": "2026-04-20T10:00:00+08:00",
+                    "timezone_name": "Asia/Shanghai",
+                },
+            )
+        )
+    finally:
+        runtime_module._active_schedule_target.reset(token)
+
+    payload = json.loads(result)
+    store = SchedulerStore(db_path=Path(payload["task"]["db_path"]))
+    try:
+        task = store.get_task(payload["task"]["id"])
+    finally:
+        store.close()
+
+    assert payload["ok"] is True
+    assert task is not None
+    assert task.delivery_mode == "channel"
+    assert task.delivery_target.target_type == "feishu_chat"
+    assert task.delivery_target.payload["chat_id"] == "oc_test_chat"
+
+
+def test_schedule_create_defaults_to_standalone_without_active_target(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(
+        registry.call(
+            "schedule_create",
+            {
+                "name": "reminder",
+                "trigger_type": "once",
+                "prompt": "测试一下",
+                "at": "2026-04-20T10:00:00+08:00",
+                "timezone_name": "Asia/Shanghai",
+            },
+        )
+    )
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["task"]["delivery_mode"] == "standalone"
