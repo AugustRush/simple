@@ -171,6 +171,18 @@ class BaseAgent:
                 return "tool_use", text, tool_calls
             return "end_turn", text, []
 
+    def _response_completion_error(self, response: Any) -> Optional[str]:
+        """Classify provider completion states that should not be treated as clean ends."""
+        if self.api_format != "openai":
+            return None
+        try:
+            finish = response.choices[0].finish_reason
+        except Exception:
+            return None
+        if finish == "length":
+            return "Model response was truncated (finish_reason=length)"
+        return None
+
     def _assistant_message(self, response: Any, text: str) -> dict:
         """Build the assistant history entry after a tool_use stop."""
         if self.api_format == "anthropic":
@@ -531,6 +543,14 @@ class BaseAgent:
                         ctx.messages.append(
                             {"role": "assistant", "content": result_text}
                         )
+                        completion_error = self._response_completion_error(response)
+                        if completion_error:
+                            return AgentResult(
+                                agent_id=ctx.agent_id,
+                                content=result_text,
+                                tool_calls_made=tool_calls_made,
+                                error=completion_error,
+                            )
                         break
 
                 except Exception as e:

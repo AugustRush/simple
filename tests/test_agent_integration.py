@@ -1655,6 +1655,35 @@ def test_send_message_classifies_request_timeout(monkeypatch):
     assert result.error == "Model request timed out"
 
 
+def test_send_message_classifies_openai_length_finish_as_truncated(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    response = agent_module.shared._OAIResponse(
+        [
+            agent_module.shared._OAIChoice(
+                "length",
+                agent_module.shared._OAIMsg("回答到一半", None),
+            )
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return response
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "hello"))
+
+    assert result.content == "回答到一半"
+    assert result.error == "Model response was truncated (finish_reason=length)"
+
+
 def test_memory_tidy_uses_force_tidy(monkeypatch):
     import agent as agent_module
 

@@ -492,6 +492,46 @@ def test_feishu_sink_turn_complete_sends_new_output_dir_files(tmp_path):
         loop.close()
 
 
+def test_feishu_sink_error_keeps_partial_stream_text(tmp_path):
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            seen = []
+
+            async def fake_finish(text: str):
+                seen.append(("finish", text))
+
+            async def fake_send_plain(text: str):
+                seen.append(("error", text))
+
+            with patch.object(
+                sink,
+                "_finish_turn_async",
+                new=fake_finish,
+            ), patch.object(
+                sink,
+                "_send_plain_async",
+                new=fake_send_plain,
+            ):
+                sink.on_stream_chunk("前半句")
+                sink.on_turn_complete("", [])
+                sink.on_error("Model response was truncated (finish_reason=length)")
+                await sink.drain()
+
+            assert seen[0] == ("finish", "前半句")
+            assert seen[1] == (
+                "error",
+                "❌ Model response was truncated (finish_reason=length)",
+            )
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
 def test_feishu_sink_subagent_event_schedules_process_card_update():
     sink = _make_feishu_sink()
     sink.streaming = True
