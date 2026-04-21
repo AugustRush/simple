@@ -21,6 +21,7 @@ class SchedulerService:
         delivery: Any,
         poll_seconds: float = 30.0,
         lease_seconds: int = 300,
+        max_concurrent_runs: int = 3,
     ):
         self.store = store
         self.agent_executor = agent_executor
@@ -28,6 +29,7 @@ class SchedulerService:
         self.delivery = delivery
         self.poll_seconds = poll_seconds
         self.lease_seconds = lease_seconds
+        self.max_concurrent_runs = max(1, int(max_concurrent_runs))
 
     async def run_once(self, now: Optional[datetime] = None) -> int:
         current = (now or datetime.now(UTC)).astimezone(UTC)
@@ -37,8 +39,14 @@ class SchedulerService:
             limit=10,
             lease_seconds=self.lease_seconds,
         )
-        for item in claimed:
-            await self._execute_claimed(item.task, item.run)
+        if claimed:
+            sem = asyncio.Semaphore(self.max_concurrent_runs)
+
+            async def _run_item(item) -> None:
+                async with sem:
+                    await self._execute_claimed(item.task, item.run)
+
+            await asyncio.gather(*[_run_item(item) for item in claimed])
         return len(claimed)
 
     async def run_forever(self) -> None:

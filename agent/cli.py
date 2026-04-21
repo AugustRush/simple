@@ -309,6 +309,7 @@ async def _build_scheduler_service(
     *,
     poll_seconds: float,
     lease_seconds: int,
+    max_concurrent_runs: int,
     components: Optional[dict] = None,
 ):
     owned_components = components is None
@@ -355,6 +356,7 @@ async def _build_scheduler_service(
         delivery=delivery,
         poll_seconds=poll_seconds,
         lease_seconds=lease_seconds,
+        max_concurrent_runs=max_concurrent_runs,
     )
     return service, store, components if owned_components else None
 
@@ -370,6 +372,10 @@ async def _interactive_loop(components: dict, cfg: dict):
             builtin_dir=shared.PLUGINS_DIR,
             user_dir=shared.USER_PLUGINS_DIR,
             plugin_config=cfg.get("plugins", {}),
+            turn_hook_timeout_seconds=cfg.get("orchestration", {}).get(
+                "turn_hook_timeout_seconds",
+                shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
+            ),
         )
         plugin_catalog.discover_and_load()
         components["plugin_catalog"] = plugin_catalog
@@ -923,6 +929,7 @@ def gateway():
         sched_cfg = cfg.get("scheduler", {})
         scheduler_poll = float(sched_cfg.get("poll_seconds", 30))
         scheduler_lease = int(sched_cfg.get("lease_seconds", 300))
+        scheduler_max_concurrent = int(sched_cfg.get("max_concurrent_runs", 3))
         scheduler_task: Optional[asyncio.Task] = None
         scheduler_store = None
         scheduler_components = None
@@ -942,6 +949,7 @@ def gateway():
                 cfg,
                 poll_seconds=scheduler_poll,
                 lease_seconds=scheduler_lease,
+                max_concurrent_runs=scheduler_max_concurrent,
                 components=components,
             )
             scheduler_task = asyncio.create_task(service.run_forever())
@@ -1328,15 +1336,19 @@ def scheduler(
     sched_cfg = cfg.get("scheduler", {})
     effective_poll = float(poll_seconds or sched_cfg.get("poll_seconds", 30))
     effective_lease = int(lease_seconds or sched_cfg.get("lease_seconds", 300))
+    effective_max_concurrent = int(sched_cfg.get("max_concurrent_runs", 3))
 
     async def _run():
         service, store, components = await _build_scheduler_service(
             cfg,
             poll_seconds=effective_poll,
             lease_seconds=effective_lease,
+            max_concurrent_runs=effective_max_concurrent,
         )
         shared.CONSOLE.print(
-            f"[dim]Scheduler running (poll={effective_poll}s, lease={effective_lease}s)[/dim]"
+            "[dim]Scheduler running "
+            f"(poll={effective_poll}s, lease={effective_lease}s, "
+            f"max_concurrent={effective_max_concurrent})[/dim]"
         )
         try:
             await service.run_forever()

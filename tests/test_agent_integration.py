@@ -1255,6 +1255,103 @@ def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
     assert payload["content"] == "partial output"
 
 
+def test_concurrent_send_message_isolates_spawn_parent_context(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.register_spawn_capability("base system prompt")
+
+    first_entered_create = asyncio.Event()
+    second_entered_create = asyncio.Event()
+    first_can_return_tool_call = asyncio.Event()
+    captured_sub_contexts = []
+    create_calls_by_context = {}
+
+    def _tool_response(task: str):
+        return agent_module._OAIResponse(
+            [
+                agent_module._OAIChoice(
+                    "tool_calls",
+                    agent_module._OAIMsg(
+                        "",
+                        [
+                            agent_module._OAITC(
+                                f"call-{task}",
+                                agent_module._OAIFunc(
+                                    "spawn_agent",
+                                    json.dumps({"role": "worker", "task": task}),
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ]
+        )
+
+    def _final_response(label: str):
+        return agent_module._OAIResponse(
+            [agent_module._OAIChoice("stop", agent_module._OAIMsg(label, None))]
+        )
+
+    async def fake_create(ctx, tools):
+        calls = create_calls_by_context.get(ctx.agent_id, 0)
+        create_calls_by_context[ctx.agent_id] = calls + 1
+        if calls == 0 and ctx.metadata["label"] == "first":
+            first_entered_create.set()
+            await second_entered_create.wait()
+            await first_can_return_tool_call.wait()
+            return _tool_response("first-task")
+        if calls == 0 and ctx.metadata["label"] == "second":
+            second_entered_create.set()
+            await first_entered_create.wait()
+            first_can_return_tool_call.set()
+            return _tool_response("second-task")
+        return _final_response(f"final-{ctx.metadata['label']}")
+
+    async def fake_sub_send_message(self, ctx, user_message, stream_callback=None):
+        captured_sub_contexts.append(
+            {
+                "task": user_message,
+                "required_skills": list(ctx.metadata.get("required_skills", [])),
+            }
+        )
+        return agent_module.AgentResult(agent_id=ctx.agent_id, content="ok")
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    original_send_message = agent_module.BaseAgent.send_message
+
+    async def send_message_dispatch(self, ctx, user_message, stream_callback=None):
+        if self is agent:
+            return await original_send_message(self, ctx, user_message, stream_callback)
+        return await fake_sub_send_message(self, ctx, user_message, stream_callback)
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", send_message_dispatch)
+
+    first_ctx = agent_module.AgentContext(system_prompt="system")
+    first_ctx.metadata["label"] = "first"
+    first_ctx.metadata["required_skills"] = ["skill:first"]
+    second_ctx = agent_module.AgentContext(system_prompt="system")
+    second_ctx.metadata["label"] = "second"
+    second_ctx.metadata["required_skills"] = ["skill:second"]
+
+    async def run_concurrent():
+        return await asyncio.gather(
+            agent.send_message(first_ctx, "first message"),
+            agent.send_message(second_ctx, "second message"),
+        )
+
+    results = asyncio.run(run_concurrent())
+
+    assert [result.error for result in results] == [None, None]
+    assert sorted(captured_sub_contexts, key=lambda item: item["task"]) == [
+        {"task": "first-task", "required_skills": ["skill:first"]},
+        {"task": "second-task", "required_skills": ["skill:second"]},
+    ]
+
+
 def test_spawn_agent_reports_events_to_active_sink(monkeypatch):
     import agent as agent_module
 
@@ -1907,8 +2004,9 @@ def test_gateway_starts_background_scheduler(monkeypatch):
         return {"agent": object()}
 
     async def fake_build_scheduler_service(
-        cfg, poll_seconds, lease_seconds, components=None
+        cfg, poll_seconds, lease_seconds, max_concurrent_runs, components=None
     ):
+        assert max_concurrent_runs == 3
         return _FakeService(), _FakeStore(), {"scheduler_components": True}
 
     async def fake_close_components(components):
@@ -1960,8 +2058,9 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
         return primary_components
 
     async def fake_build_scheduler_service(
-        cfg, poll_seconds, lease_seconds, components=None
+        cfg, poll_seconds, lease_seconds, max_concurrent_runs, components=None
     ):
+        assert max_concurrent_runs == 3
         observed["scheduler"] = components
         return _FakeService(), _FakeStore(), None
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 from dataclasses import dataclass, field
 import inspect
@@ -52,6 +53,31 @@ class SubAgentProgressEvent:
     total: int = 0
 
 
+class _TaskLocalContextStack:
+    """List-like context stack backed by ContextVar for per-task isolation."""
+
+    def __init__(self) -> None:
+        self._stack: contextvars.ContextVar[tuple[AgentContext, ...]] = (
+            contextvars.ContextVar("agent_context_stack", default=())
+        )
+
+    def append(self, ctx: AgentContext) -> None:
+        self._stack.set((*self._stack.get(), ctx))
+
+    def pop(self) -> AgentContext:
+        stack = self._stack.get()
+        if not stack:
+            raise IndexError("pop from empty context stack")
+        self._stack.set(stack[:-1])
+        return stack[-1]
+
+    def __bool__(self) -> bool:
+        return bool(self._stack.get())
+
+    def __getitem__(self, index: int) -> AgentContext:
+        return self._stack.get()[index]
+
+
 class BaseAgent:
     """Core agent: streams Claude, handles tool_use loop."""
 
@@ -79,7 +105,7 @@ class BaseAgent:
         self.plugin_catalog: Optional["PluginCatalog"] = None
         self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
         self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
-        self._context_stack: list[AgentContext] = []
+        self._context_stack = _TaskLocalContextStack()
 
     def _emit_subagent_event(self, event: SubAgentProgressEvent) -> None:
         sink = _active_sink.get()

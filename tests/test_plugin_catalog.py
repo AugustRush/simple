@@ -221,6 +221,35 @@ def test_fire_turn_end_async(tmp_path):
     assert plugin_obj.__class__.last_event is event
 
 
+def test_fire_turn_end_times_out_slow_plugin(tmp_path):
+    from agent import PluginCatalog, TurnEvent
+
+    _write_plugin(
+        tmp_path / "slowpoke",
+        """
+        import asyncio
+
+        def register():
+            class P:
+                name = "slowpoke"
+                completed = False
+
+                async def on_turn_end(self, event):
+                    await asyncio.sleep(0.05)
+                    P.completed = True
+            return P()
+    """,
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path, turn_hook_timeout_seconds=0.01)
+    catalog.discover_and_load()
+    event = TurnEvent(user_input="hi", agent_response="hello", tool_calls=[])
+
+    asyncio.run(catalog.fire_turn_end(event))
+
+    plugin_obj = catalog._plugins["slowpoke"][0]
+    assert plugin_obj.__class__.completed is False
+
+
 def test_fire_pre_tool_block(tmp_path):
     from agent import PluginCatalog, PreToolEvent, HookResult
 

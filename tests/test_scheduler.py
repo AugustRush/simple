@@ -362,6 +362,83 @@ def test_scheduler_service_executes_due_message_task_without_agent_executor(tmp_
     assert runs[0].summary == "测试一下"
 
 
+def test_scheduler_service_executes_claimed_tasks_concurrently(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    first = store.create_task(
+        NewScheduledTask(
+            name="first",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "first"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+    second = store.create_task(
+        NewScheduledTask(
+            name="second",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "second"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+
+    starts = {}
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    async def fake_agent_executor(task, run):
+        starts[task.id] = asyncio.get_running_loop().time()
+        if task.id == first.id:
+            first_started.set()
+            await second_started.wait()
+            await allow_finish.wait()
+        else:
+            second_started.set()
+            await first_started.wait()
+            allow_finish.set()
+        return ExecutionResult(summary=task.name, text_output=task.name)
+
+    async def fake_system_executor(task, run):
+        raise AssertionError("system executor should not be called")
+
+    async def fake_delivery(task, run, result):
+        return "stored"
+
+    service = SchedulerService(
+        store=store,
+        agent_executor=fake_agent_executor,
+        system_executor=fake_system_executor,
+        delivery=fake_delivery,
+        max_concurrent_runs=2,
+    )
+
+    asyncio.run(
+        service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc))
+    )
+
+    runs_first = store.list_runs(first.id)
+    runs_second = store.list_runs(second.id)
+
+    assert first_started.is_set()
+    assert second_started.is_set()
+    assert len(starts) == 2
+    assert runs_first[0].status == "succeeded"
+    assert runs_second[0].status == "succeeded"
+
+
 def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_path):
     from agent.scheduler import DeliveryTarget
     from agent.scheduler.delivery import SchedulerDelivery

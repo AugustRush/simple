@@ -65,6 +65,7 @@ DEFAULT_CONFIG: dict = {
     "orchestration": {
         "max_parallel_agents": shared.DEFAULT_MAX_PARALLEL_AGENTS,
         "sub_agent_timeout_seconds": shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
+        "turn_hook_timeout_seconds": shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
     },
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
@@ -75,6 +76,7 @@ DEFAULT_CONFIG: dict = {
     "scheduler": {
         "poll_seconds": 30,
         "lease_seconds": 300,
+        "max_concurrent_runs": 3,
     },
     # ── Context manager ──────────────────────────────────────────────────
     "context": {

@@ -181,10 +181,12 @@ class PluginCatalog:
         builtin_dir: Path,
         user_dir: Optional[Path] = None,
         plugin_config: Optional[dict] = None,
+        turn_hook_timeout_seconds: float = shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
     ) -> None:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
         self._plugin_config = plugin_config or {}
+        self._turn_hook_timeout_seconds = max(0.0, float(turn_hook_timeout_seconds))
         # name → (plugin_object, PluginMeta)
         self._plugins: dict[str, tuple[Any, PluginMeta]] = {}
         self._slash_commands: dict[str, Callable] = {}
@@ -366,9 +368,21 @@ class PluginCatalog:
             if not hasattr(plugin, "on_turn_end"):
                 continue
             try:
-                r = await _maybe_await(plugin.on_turn_end(event))
+                if self._turn_hook_timeout_seconds > 0:
+                    r = await asyncio.wait_for(
+                        _maybe_await(plugin.on_turn_end(event)),
+                        timeout=self._turn_hook_timeout_seconds,
+                    )
+                else:
+                    r = await _maybe_await(plugin.on_turn_end(event))
                 if isinstance(r, HookResult):
                     results.append(r)
+            except asyncio.TimeoutError:
+                _pname = getattr(plugin, "name", "?")
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{_pname}' turn_end timed out after "
+                    f"{self._turn_hook_timeout_seconds:.2f}s[/dim]"
+                )
             except Exception as exc:
                 shared.CONSOLE.print(f"[dim]Plugin turn_end error: {exc}[/dim]")
         return results

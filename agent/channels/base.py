@@ -172,22 +172,19 @@ class ChannelRunner:
                 await worker.wait()
             if plugin_catalog:
                 try:
-                    all_messages: list[dict] = []
-                    all_tools: list[str] = []
-                    total_turns = 0
-                    for session in sessions.values():
-                        all_messages.extend(
-                            session.get("ctx", agent_module.AgentContext("")).messages
-                        )
-                        all_tools.extend(session.get("tools_used", []))
-                        total_turns += session.get("turn_count", 0)
-                    if total_turns > 0:
+                    for session_id, session in sessions.items():
+                        turn_count = session.get("turn_count", 0)
+                        if turn_count <= 0:
+                            continue
                         await plugin_catalog.fire_session_end(
                             agent_module.SessionEvent(
-                                messages=all_messages,
-                                tools_used=all_tools,
+                                messages=session.get(
+                                    "ctx", agent_module.AgentContext("")
+                                ).messages,
+                                tools_used=list(session.get("tools_used", [])),
+                                session_id=session_id,
                                 timestamp=datetime.now(timezone.utc).isoformat(),
-                                turn_count=total_turns,
+                                turn_count=turn_count,
                             )
                         )
                 except Exception as exc:

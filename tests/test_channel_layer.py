@@ -602,6 +602,80 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
     assert root_ctx_mgr.spawned["chat-a"].enqueued == ["compact_triggered"]
 
 
+def test_channel_runner_fires_session_end_per_chat_session():
+    class _FakeChannel(Channel):
+        async def start(self, handler):
+            await handler(
+                IncomingMessage(text="hello", metadata={"chat_id": "chat-a"}),
+                OutputSink(),
+            )
+            await handler(
+                IncomingMessage(text="world", metadata={"chat_id": "chat-b"}),
+                OutputSink(),
+            )
+
+        async def stop(self):
+            return None
+
+        def create_sink(self, msg):
+            return OutputSink()
+
+    class _FakeAgent:
+        max_tokens = 1024
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            ctx.messages.append({"role": "assistant", "content": f"reply:{user_message}"})
+            return agent_module.AgentResult(
+                agent_id=ctx.agent_id,
+                content=f"reply:{user_message}",
+            )
+
+    class _PluginCatalog:
+        def __init__(self):
+            self.session_events = []
+            self.turn_events = []
+
+        def fire_session_start(self, components):
+            return None
+
+        async def fire_turn_end(self, event):
+            self.turn_events.append(event)
+            return []
+
+        async def fire_session_end(self, event):
+            self.session_events.append(event)
+
+    plugin_catalog = _PluginCatalog()
+    channel = _FakeChannel()
+    runner = ChannelRunner(
+        channels=[channel],
+        components={
+            "agent": _FakeAgent(),
+            "skill_catalog": object(),
+            "plugin_catalog": plugin_catalog,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+
+    asyncio.run(runner._run_channel(channel))
+
+    assert [(event.session_id, event.turn_count) for event in plugin_catalog.session_events] == [
+        ("chat-a", 1),
+        ("chat-b", 1),
+    ]
+    assert [event.tools_used for event in plugin_catalog.session_events] == [[], []]
+    assert [event.messages for event in plugin_catalog.session_events] == [
+        [
+            {"role": "assistant", "content": "reply:hello"},
+        ],
+        [
+            {"role": "assistant", "content": "reply:world"},
+        ],
+    ]
+
+
 def test_channel_runner_exposes_feishu_delivery_target_to_scheduler_tools(
     monkeypatch, tmp_path
 ):
