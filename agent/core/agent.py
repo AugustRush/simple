@@ -55,6 +55,13 @@ class SubAgentProgressEvent:
 class BaseAgent:
     """Core agent: streams Claude, handles tool_use loop."""
 
+    _MAX_TRUNCATION_CONTINUATIONS = 2
+    _CONTINUE_PROMPT = (
+        "Continue exactly from where you left off. "
+        "Do not repeat previous text. "
+        "Do not restart the answer."
+    )
+
     def __init__(
         self,
         client: Any,
@@ -182,6 +189,47 @@ class BaseAgent:
         if finish == "length":
             return "Model response was truncated (finish_reason=length)"
         return None
+
+    @staticmethod
+    def _merge_continuation_text(prefix: str, continuation: str) -> str:
+        """Append continuation text while trimming simple duplicated overlap."""
+        if not prefix:
+            return continuation
+        if not continuation:
+            return prefix
+        max_overlap = min(len(prefix), len(continuation), 64)
+        for size in range(max_overlap, 0, -1):
+            if prefix.endswith(continuation[:size]):
+                return prefix + continuation[size:]
+        return prefix + continuation
+
+    async def _continue_truncated_response(
+        self,
+        ctx: "AgentContext",
+        partial_text: str,
+    ) -> tuple[str, Optional[str]]:
+        """Try to complete a truncated final response with bounded follow-up calls."""
+        merged = partial_text
+        continuation_error = "Model response was truncated (finish_reason=length)"
+        for _ in range(self._MAX_TRUNCATION_CONTINUATIONS):
+            continuation_ctx = copy.deepcopy(ctx)
+            continuation_ctx.messages.append({"role": "assistant", "content": merged})
+            continuation_ctx.messages.append(
+                {"role": "user", "content": self._CONTINUE_PROMPT}
+            )
+            response = await self._create(continuation_ctx, [])
+            stop_reason, text, tool_uses = self._parse_response(response)
+            if stop_reason == "tool_use" and tool_uses:
+                break
+            merged = self._merge_continuation_text(merged, text)
+            continuation_error = self._response_completion_error(response)
+            if continuation_error is None:
+                return merged, None
+        return (
+            merged,
+            f"Model response remained truncated after "
+            f"{self._MAX_TRUNCATION_CONTINUATIONS} auto-continue attempts",
+        )
 
     def _assistant_message(self, response: Any, text: str) -> dict:
         """Build the assistant history entry after a tool_use stop."""
@@ -545,11 +593,18 @@ class BaseAgent:
                         )
                         completion_error = self._response_completion_error(response)
                         if completion_error:
+                            result_text, continuation_error = (
+                                await self._continue_truncated_response(ctx, result_text)
+                            )
+                            ctx.messages[-1] = {
+                                "role": "assistant",
+                                "content": result_text,
+                            }
                             return AgentResult(
                                 agent_id=ctx.agent_id,
                                 content=result_text,
                                 tool_calls_made=tool_calls_made,
-                                error=completion_error,
+                                error=continuation_error,
                             )
                         break
 

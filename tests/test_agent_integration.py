@@ -1655,7 +1655,9 @@ def test_send_message_classifies_request_timeout(monkeypatch):
     assert result.error == "Model request timed out"
 
 
-def test_send_message_classifies_openai_length_finish_as_truncated(monkeypatch):
+def test_send_message_reports_terminal_error_when_openai_length_stays_truncated(
+    monkeypatch,
+):
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
@@ -1663,17 +1665,37 @@ def test_send_message_classifies_openai_length_finish_as_truncated(monkeypatch):
         object(), registry, model="fake-model", api_format="openai"
     )
 
-    response = agent_module.shared._OAIResponse(
+    responses = iter(
         [
-            agent_module.shared._OAIChoice(
-                "length",
-                agent_module.shared._OAIMsg("回答到一半", None),
-            )
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("回答到一半", None),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("", None),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("", None),
+                    )
+                ]
+            ),
         ]
     )
 
     async def fake_create(ctx, tools):
-        return response
+        return next(responses)
 
     monkeypatch.setattr(agent, "_create", fake_create)
 
@@ -1681,7 +1703,143 @@ def test_send_message_classifies_openai_length_finish_as_truncated(monkeypatch):
     result = asyncio.run(agent.send_message(ctx, "hello"))
 
     assert result.content == "回答到一半"
-    assert result.error == "Model response was truncated (finish_reason=length)"
+    assert result.error == "Model response remained truncated after 2 auto-continue attempts"
+
+
+def test_send_message_auto_continues_openai_length_finish(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("第一段没有说完", None),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop",
+                        agent_module.shared._OAIMsg("，这是续写完成。", None),
+                    )
+                ]
+            ),
+        ]
+    )
+    seen_messages = []
+
+    async def fake_create(ctx, tools):
+        seen_messages.append(list(ctx.messages))
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "hello"))
+
+    assert result.error is None
+    assert result.content == "第一段没有说完，这是续写完成。"
+    assert len(seen_messages) == 2
+    assert seen_messages[1][-2] == {"role": "assistant", "content": "第一段没有说完"}
+    assert "Continue exactly from where you left off" in seen_messages[1][-1]["content"]
+
+
+def test_send_message_auto_continue_trims_overlap(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("这是一个长回答，后半", None),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop",
+                        agent_module.shared._OAIMsg("后半继续完成。", None),
+                    )
+                ]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "hello"))
+
+    assert result.error is None
+    assert result.content == "这是一个长回答，后半继续完成。"
+
+
+def test_send_message_reports_error_after_auto_continue_budget(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("第一段", None),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("第二段", None),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("第三段", None),
+                    )
+                ]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "hello"))
+
+    assert result.content == "第一段第二段第三段"
+    assert result.error == "Model response remained truncated after 2 auto-continue attempts"
 
 
 def test_memory_tidy_uses_force_tidy(monkeypatch):
