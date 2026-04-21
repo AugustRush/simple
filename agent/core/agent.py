@@ -384,8 +384,11 @@ class BaseAgent:
         _MISSING = object()
         results: list[Any] = [_MISSING] * len(tool_uses)
 
+        delegated_tool_names = {"spawn_agent", "team_run"}
         regular_calls = [
-            (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] != "spawn_agent"
+            (idx, tu)
+            for idx, tu in enumerate(tool_uses)
+            if tu["name"] not in delegated_tool_names
         ]
         if regular_calls:
             # D2: return_exceptions=True preserves successes when one tool errors
@@ -401,12 +404,16 @@ class BaseAgent:
                 else:
                     results[idx] = outcome
 
-        spawn_calls = [
-            (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] == "spawn_agent"
+        delegated_calls = [
+            (idx, tu)
+            for idx, tu in enumerate(tool_uses)
+            if tu["name"] in delegated_tool_names
         ]
-        if spawn_calls:
-            roles = ", ".join(tu["input"].get("role", "?") for _, tu in spawn_calls)
-            total_spawns = len(spawn_calls)
+        if delegated_calls:
+            roles = ", ".join(
+                tu["input"].get("role", tu["name"]) for _, tu in delegated_calls
+            )
+            total_spawns = len(delegated_calls)
             progress_state = {
                 "completed": 0,
                 "last_notified_completed": 0,
@@ -480,7 +487,7 @@ class BaseAgent:
             heartbeat_task = asyncio.create_task(_heartbeat())
             try:
                 raw_spawn = await asyncio.gather(
-                    *[_exec_spawn_with_sem(tu) for _, tu in spawn_calls],
+                    *[_exec_spawn_with_sem(tu) for _, tu in delegated_calls],
                     return_exceptions=True,
                 )
             finally:
@@ -497,13 +504,13 @@ class BaseAgent:
                         ),
                     )
                 )
-            for (idx, tu), outcome in zip(spawn_calls, raw_spawn):
+            for (idx, tu), outcome in zip(delegated_calls, raw_spawn):
                 if isinstance(outcome, BaseException):
                     results[idx] = json.dumps(
                         {
                             "ok": False,
                             "role": tu["input"].get("role", "?"),
-                            "error": f"spawn failed: {outcome}",
+                            "error": f"{tu['name']} failed: {outcome}",
                         }
                     )
                 else:

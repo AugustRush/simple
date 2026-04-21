@@ -1499,6 +1499,90 @@ def test_team_run_honors_concurrency_limit(monkeypatch):
     assert max_active == 1
 
 
+def test_send_message_team_run_uses_sub_agent_timeout_not_regular_tool_timeout(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.sub_agent_timeout_seconds = 1
+    agent.register_spawn_capability("base system prompt")
+    monkeypatch.setattr(agent_module.shared, "REGULAR_TOOL_TIMEOUT", 0.01)
+
+    tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "team_run",
+                json.dumps(
+                    {
+                        "goal": "review orchestration",
+                        "members": [
+                            {
+                                "name": "critic",
+                                "role": "reviewer",
+                                "task": "inspect",
+                            }
+                        ],
+                    }
+                ),
+            ),
+        )
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls", agent_module._OAIMsg("", tool_calls)
+                    )
+                ]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        if self is agent:
+            return await original_send_message(self, ctx, user_message, stream_callback)
+        await asyncio.sleep(0.02)
+        return agent_module.AgentResult(
+            agent_id=ctx.agent_id,
+            content=json.dumps(
+                {
+                    "findings": ["finding"],
+                    "evidence": ["evidence"],
+                    "confidence": 0.7,
+                    "risks": [],
+                }
+            ),
+        )
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    original_send_message = agent_module.BaseAgent.send_message
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "run team review"))
+
+    tool_results = [msg for msg in ctx.messages if msg.get("role") == "tool"]
+
+    assert result.error is None
+    assert result.content == "final"
+    assert tool_results
+    payload = json.loads(tool_results[0]["content"])
+    assert payload["ok"] is True
+    assert payload["summary"]["completed"] == 1
+
+
 def test_team_run_marks_unstructured_member_result_invalid(monkeypatch):
     import agent as agent_module
 
