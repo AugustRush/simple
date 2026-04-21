@@ -341,7 +341,6 @@ from .memory.system import (
     LTMEntry,
     LTMStore,
     LocalRetriever,
-    MemoryIndex,
     MemoryPalace,
     StagingBuffer,
     normalize_memory_chapter,

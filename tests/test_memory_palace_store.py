@@ -69,6 +69,68 @@ def test_memory_palace_exports_user_jsonl(tmp_path):
     assert '"content": "Prefers concise responses"' in lines[0]
 
 
+def test_memory_palace_does_not_create_chapter_dirs(tmp_path):
+    from agent import MemoryPalace
+
+    palace = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    palace.write("identity", "user", "Prefers concise responses")
+
+    assert (tmp_path / "memory" / "memory.jsonl").exists()
+    assert not (tmp_path / "memory" / "identity").exists()
+    assert not (tmp_path / "memory" / "projects").exists()
+    assert not (tmp_path / "memory" / "INDEX.md").exists()
+
+
+def test_memory_palace_exports_jsonl_in_updated_at_order(tmp_path):
+    from agent import LTMEntry, LTMStore, MemoryPalace
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    store.add_entries(
+        [
+            LTMEntry(
+                id="late",
+                content="Second item",
+                importance=0.7,
+                category="projects",
+                entity="demo",
+                memory_type="decision",
+                source_session="session-1",
+                created_at="2026-04-21 10:00 UTC",
+                updated_at="2026-04-21 11:00 UTC",
+            ),
+            LTMEntry(
+                id="early",
+                content="First item",
+                importance=0.8,
+                category="identity",
+                entity="user",
+                memory_type="preference",
+                source_session="session-1",
+                created_at="2026-04-21 08:00 UTC",
+                updated_at="2026-04-21 09:00 UTC",
+            ),
+        ]
+    )
+    palace = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+        store=store,
+    )
+
+    path = palace.export_jsonl()
+    lines = path.read_text(encoding="utf-8").splitlines()
+
+    assert len(lines) == 2
+    assert '"id": "early"' in lines[0]
+    assert '"id": "late"' in lines[1]
+
+
 def test_search_entries_can_be_filtered_by_locus(tmp_path):
     store = make_store(tmp_path)
     store.add_entry(

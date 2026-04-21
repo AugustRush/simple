@@ -464,7 +464,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                     _help_table.add_column("Description")
                     for _hcmd, _hdesc in [
                         ("/help", "Show this help"),
-                        ("/memory", "List memory palace chapters"),
+                        ("/memory", "Show memory export summary"),
                         ("/context", "Show LTM context manager stats"),
                         ("/tools", "List all available tools"),
                         ("/skills", "List available skills"),
@@ -481,12 +481,16 @@ async def _interactive_loop(components: dict, cfg: dict):
                     shared.CONSOLE.print(_help_table)
                     continue
                 elif cmd == "memory":
-                    chapters = memory.list_chapters()
-                    table = Table(title="Memory Palace")
-                    table.add_column("Chapter")
-                    table.add_column("Files")
-                    for ch in chapters:
-                        table.add_row(ch["name"], str(len(ch["files"])))
+                    lines = [
+                        line
+                        for line in memory.read_index().splitlines()
+                        if line.strip()
+                    ]
+                    table = Table(title="Memory Export")
+                    table.add_column("Metric")
+                    table.add_column("Value")
+                    table.add_row("Projection", "memory/memory.jsonl")
+                    table.add_row("Entries", str(len(lines)))
                     shared.CONSOLE.print(table)
                     continue
                 elif cmd == "context":
@@ -1348,14 +1352,14 @@ def scheduler(
 
 @memory_app.command("ls")
 def memory_ls():
-    """List all memory chapters and file counts."""
+    """Show memory export summary."""
     memory = MemoryPalace()
-    table = Table(title="Memory Palace")
-    table.add_column("Chapter")
-    table.add_column("Files")
-    table.add_column("File Names")
-    for ch in memory.list_chapters():
-        table.add_row(ch["name"], str(len(ch["files"])), ", ".join(ch["files"][:5]))
+    lines = [line for line in memory.read_index().splitlines() if line.strip()]
+    table = Table(title="Memory Export")
+    table.add_column("Metric")
+    table.add_column("Value")
+    table.add_row("Projection", "memory/memory.jsonl")
+    table.add_row("Entries", str(len(lines)))
     shared.CONSOLE.print(table)
 
 
@@ -1412,7 +1416,7 @@ def memory_tidy():
 
 @memory_app.command("index")
 def memory_index():
-    """Show the memory palace index."""
+    """Show the memory JSONL export."""
     memory = MemoryPalace()
     shared.CONSOLE.print(Markdown(memory.read_index()))
 
