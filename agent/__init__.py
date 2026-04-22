@@ -366,6 +366,7 @@ from .core.agent import (
     BaseAgent,
     SubAgentProgressEvent,
 )
+from .orchestration import SubtaskResult, SubtaskSpec
 
 
 

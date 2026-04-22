@@ -17,6 +17,13 @@ from agent import shared
 from agent.config import _compose_system_prompt
 from agent.core.output import CliOutputSink, _active_sink, _fmt_tool_inputs
 from agent.memory.system import ContextManager
+from agent.orchestration.runtime import (
+    SubtaskResult,
+    SubtaskSpec,
+    run_parallel_subtasks as _run_parallel_subtasks,
+    run_pipeline_subtasks as _run_pipeline_subtasks,
+    run_rendezvous_round as _run_rendezvous_round,
+)
 from agent.plugins.catalog import PluginCatalog, PostToolEvent, PreToolEvent
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry
@@ -120,6 +127,145 @@ class BaseAgent:
 
     def current_context(self) -> Optional["AgentContext"]:
         return self._context_stack[-1] if self._context_stack else None
+
+    async def _execute_subtask_spec(self, spec: SubtaskSpec) -> SubtaskResult:
+        payload_raw = await self.registry.call(
+            "spawn_agent",
+            {
+                "role": spec.role,
+                "task": spec.task,
+            },
+        )
+        try:
+            payload = json.loads(payload_raw)
+        except Exception:
+            payload = {
+                "ok": False,
+                "role": spec.role,
+                "task": spec.task,
+                "error": "spawn_agent returned invalid JSON",
+                "content": "",
+                "tool_calls_made": [],
+            }
+
+        content = str(payload.get("content", "") or "")
+        return SubtaskResult(
+            id=spec.id,
+            ok=bool(payload.get("ok")),
+            content=content,
+            summary=self._summarize_subtask_result(content),
+            tool_calls_made=list(payload.get("tool_calls_made", [])),
+            error=payload.get("error"),
+        )
+
+    @staticmethod
+    def _summarize_subtask_result(content: str, limit: int = 400) -> str:
+        text = str(content or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3].rstrip() + "..."
+
+    @staticmethod
+    def _append_named_block(
+        base_text: str,
+        heading: str,
+        lines: list[str],
+    ) -> str:
+        if not lines:
+            return base_text
+        extra = f"{heading}\n" + "\n".join(lines)
+        if not base_text:
+            return extra
+        return f"{base_text}\n\n{extra}"
+
+    def _with_upstream_summaries(
+        self,
+        spec: SubtaskSpec,
+        upstream_summaries: dict[str, str],
+    ) -> SubtaskSpec:
+        lines = [f"- {dep}: {summary}" for dep, summary in upstream_summaries.items()]
+        task = self._append_named_block(spec.task, "Upstream summaries:", lines)
+        return SubtaskSpec(
+            id=spec.id,
+            role=spec.role,
+            task=task,
+            depends_on=list(spec.depends_on),
+            expected_output=spec.expected_output,
+            write_scope=list(spec.write_scope),
+        )
+
+    def _with_lead_summary(self, spec: SubtaskSpec, lead_summary: str) -> SubtaskSpec:
+        if not lead_summary:
+            return spec
+        task = self._append_named_block(spec.task, "Lead summary:", [lead_summary])
+        return SubtaskSpec(
+            id=spec.id,
+            role=spec.role,
+            task=task,
+            depends_on=list(spec.depends_on),
+            expected_output=spec.expected_output,
+            write_scope=list(spec.write_scope),
+        )
+
+    def _summarize_rendezvous_round(self, results: list[SubtaskResult]) -> str:
+        lines = []
+        for result in results:
+            status = "ok" if result.ok else "error"
+            detail = result.summary or result.error or ""
+            lines.append(f"- {result.id} ({status}): {detail}".rstrip())
+        return "\n".join(lines)
+
+    async def run_parallel_subtasks(
+        self,
+        specs: list[SubtaskSpec],
+        *,
+        max_concurrency: int | None = None,
+    ) -> list[SubtaskResult]:
+        return await _run_parallel_subtasks(
+            specs,
+            executor=self._execute_subtask_spec,
+            max_concurrency=max_concurrency or self.max_parallel_agents,
+        )
+
+    async def run_pipeline_subtasks(
+        self,
+        specs: list[SubtaskSpec],
+    ) -> list[SubtaskResult]:
+        async def _executor(
+            spec: SubtaskSpec,
+            upstream_summaries: dict[str, str],
+        ) -> SubtaskResult:
+            return await self._execute_subtask_spec(
+                self._with_upstream_summaries(spec, upstream_summaries)
+            )
+
+        return await _run_pipeline_subtasks(specs, executor=_executor)
+
+    async def run_rendezvous_subtasks(
+        self,
+        specs: list[SubtaskSpec],
+        *,
+        max_rounds: int = 2,
+    ) -> list[SubtaskResult]:
+        async def _executor(
+            spec: SubtaskSpec,
+            *,
+            round_index: int,
+            lead_summary: str,
+        ) -> SubtaskResult:
+            adjusted = (
+                self._with_lead_summary(spec, lead_summary)
+                if round_index > 1
+                else spec
+            )
+            return await self._execute_subtask_spec(adjusted)
+
+        return await _run_rendezvous_round(
+            specs,
+            executor=_executor,
+            summarize=self._summarize_rendezvous_round,
+            max_rounds=max_rounds,
+        )
 
     # ── Format-aware API helpers ──────────────────────────────────────────
 
