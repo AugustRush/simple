@@ -384,11 +384,8 @@ class BaseAgent:
         _MISSING = object()
         results: list[Any] = [_MISSING] * len(tool_uses)
 
-        delegated_tool_names = {"spawn_agent", "team_run"}
         regular_calls = [
-            (idx, tu)
-            for idx, tu in enumerate(tool_uses)
-            if tu["name"] not in delegated_tool_names
+            (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] != "spawn_agent"
         ]
         if regular_calls:
             # D2: return_exceptions=True preserves successes when one tool errors
@@ -404,16 +401,12 @@ class BaseAgent:
                 else:
                     results[idx] = outcome
 
-        delegated_calls = [
-            (idx, tu)
-            for idx, tu in enumerate(tool_uses)
-            if tu["name"] in delegated_tool_names
+        spawn_calls = [
+            (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] == "spawn_agent"
         ]
-        if delegated_calls:
-            roles = ", ".join(
-                tu["input"].get("role", tu["name"]) for _, tu in delegated_calls
-            )
-            total_spawns = len(delegated_calls)
+        if spawn_calls:
+            roles = ", ".join(tu["input"].get("role", "?") for _, tu in spawn_calls)
+            total_spawns = len(spawn_calls)
             progress_state = {
                 "completed": 0,
                 "last_notified_completed": 0,
@@ -487,7 +480,7 @@ class BaseAgent:
             heartbeat_task = asyncio.create_task(_heartbeat())
             try:
                 raw_spawn = await asyncio.gather(
-                    *[_exec_spawn_with_sem(tu) for _, tu in delegated_calls],
+                    *[_exec_spawn_with_sem(tu) for _, tu in spawn_calls],
                     return_exceptions=True,
                 )
             finally:
@@ -504,13 +497,13 @@ class BaseAgent:
                         ),
                     )
                 )
-            for (idx, tu), outcome in zip(delegated_calls, raw_spawn):
+            for (idx, tu), outcome in zip(spawn_calls, raw_spawn):
                 if isinstance(outcome, BaseException):
                     results[idx] = json.dumps(
                         {
                             "ok": False,
                             "role": tu["input"].get("role", "?"),
-                            "error": f"{tu['name']} failed: {outcome}",
+                            "error": f"spawn failed: {outcome}",
                         }
                     )
                 else:
@@ -777,7 +770,7 @@ class BaseAgent:
             tools_snapshot = dict(parent.registry._tools)
             sub_registry = ToolRegistry(console=shared.CONSOLE)
             for name, tool_def in tools_snapshot.items():
-                if name not in {"spawn_agent", "team_run"}:
+                if name != "spawn_agent":
                     sub_registry._tools[name] = tool_def
             # Deep-copy the context dict so sub-agents cannot mutate parent's
             # mutable values (e.g. shell_blocked_commands list).
@@ -840,39 +833,6 @@ class BaseAgent:
             sub_agent.max_parallel_agents = parent.max_parallel_agents
             sub_agent.sub_agent_timeout_seconds = parent.sub_agent_timeout_seconds
             return sub_agent
-
-        def _parse_quality_result(content: str) -> tuple[Optional[dict], str]:
-            try:
-                parsed = json.loads(content)
-            except Exception:
-                return None, (
-                    "member result must be JSON with keys: "
-                    "findings, evidence, confidence, risks"
-                )
-            if not isinstance(parsed, dict):
-                return None, "member result JSON must be an object"
-            required = {
-                "findings": list,
-                "evidence": list,
-                "risks": list,
-            }
-            missing = [key for key in [*required, "confidence"] if key not in parsed]
-            if missing:
-                return None, "member result missing required keys: " + ", ".join(missing)
-            invalid_types = [
-                key
-                for key, expected in required.items()
-                if not isinstance(parsed[key], expected)
-            ]
-            if invalid_types:
-                return None, (
-                    "member result has invalid list keys: "
-                    + ", ".join(invalid_types)
-                )
-            if not isinstance(parsed["confidence"], (int, float)):
-                return None, "member result confidence must be a number"
-            parsed["confidence"] = max(0.0, min(1.0, float(parsed["confidence"])))
-            return parsed, ""
 
         async def spawn_agent(role: str, task: str, system_suffix: str = "") -> dict:
             sub_registry = _sub_registry()
@@ -965,136 +925,6 @@ class BaseAgent:
             )
             return payload
 
-        async def team_run(
-            goal: str,
-            members: list[dict],
-            max_concurrency: Optional[int] = None,
-        ) -> dict:
-            goal = str(goal or "").strip()
-            if not goal:
-                return {"ok": False, "error": "goal is required"}
-            if not isinstance(members, list) or not members:
-                return {"ok": False, "error": "members must be a non-empty list"}
-            limit = max(1, int(max_concurrency or parent.max_parallel_agents))
-            sem = asyncio.Semaphore(limit)
-
-            async def _run_member(index: int, member: dict) -> dict:
-                if not isinstance(member, dict):
-                    return {
-                        "ok": False,
-                        "name": f"member-{index + 1}",
-                        "role": "",
-                        "task": "",
-                        "error": "member must be an object",
-                    }
-                name = str(member.get("name") or f"member-{index + 1}").strip()
-                role = str(member.get("role") or "teammate").strip()
-                task = str(member.get("task") or "").strip()
-                if not task:
-                    return {
-                        "ok": False,
-                        "name": name,
-                        "role": role,
-                        "task": task,
-                        "error": "member task is required",
-                    }
-                async with sem:
-                    sub_registry = _sub_registry()
-                    sub_agent = _new_sub_agent(sub_registry)
-                    sys_prompt, active_ctx = _sub_system_prompt(
-                        sub_registry,
-                        (
-                            "You are one member of a lightweight agent team. "
-                            "Work independently and return ONLY valid JSON with keys: "
-                            "findings (list), evidence (list), confidence (number 0..1), "
-                            "risks (list). Do not include markdown."
-                        ),
-                    )
-                    sub_ctx = AgentContext(role=role, system_prompt=sys_prompt)
-                    _propagate_sub_metadata(sub_ctx, active_ctx)
-                    prompt = (
-                        f"Team goal:\n{goal}\n\n"
-                        f"Your member name: {name}\n"
-                        f"Your role: {role}\n"
-                        f"Your task:\n{task}\n\n"
-                        "Return ONLY JSON with keys: findings, evidence, confidence, risks."
-                    )
-                    try:
-                        result = await asyncio.wait_for(
-                            sub_agent.send_message(sub_ctx, prompt),
-                            timeout=parent.sub_agent_timeout_seconds,
-                        )
-                    except asyncio.TimeoutError:
-                        return {
-                            "ok": False,
-                            "name": name,
-                            "role": role,
-                            "task": task,
-                            "timed_out": True,
-                            "error": (
-                                f"team member timed out after "
-                                f"{parent.sub_agent_timeout_seconds}s"
-                            ),
-                        }
-                    except Exception as exc:
-                        return {
-                            "ok": False,
-                            "name": name,
-                            "role": role,
-                            "task": task,
-                            "error": f"team member failed: {parent._format_agent_error(exc)}",
-                        }
-                    content = result.content or ""
-                    if result.error:
-                        return {
-                            "ok": False,
-                            "name": name,
-                            "role": role,
-                            "task": task,
-                            "content": content,
-                            "error": result.error,
-                        }
-                    parsed, quality_error = _parse_quality_result(content)
-                    if quality_error:
-                        return {
-                            "ok": False,
-                            "name": name,
-                            "role": role,
-                            "task": task,
-                            "content": content,
-                            "quality_error": quality_error,
-                        }
-                    return {
-                        "ok": True,
-                        "name": name,
-                        "role": role,
-                        "task": task,
-                        "result": parsed,
-                        "tool_calls_made": result.tool_calls_made,
-                    }
-
-            results = await asyncio.gather(
-                *[_run_member(index, member) for index, member in enumerate(members)]
-            )
-            completed = sum(1 for item in results if item.get("ok") is True)
-            invalid = sum(1 for item in results if item.get("quality_error"))
-            failed = len(results) - completed - invalid
-            return {
-                "ok": failed == 0 and invalid == 0,
-                "goal": goal,
-                "summary": {
-                    "total": len(results),
-                    "completed": completed,
-                    "failed": failed,
-                    "invalid": invalid,
-                },
-                "members": results,
-                "synthesis_instruction": (
-                    "Use the member results as evidence. Merge duplicates, surface "
-                    "disagreements, and produce the final answer yourself."
-                ),
-            }
-
         self.registry.register(
             "spawn_agent",
             (
@@ -1128,44 +958,6 @@ class BaseAgent:
             },
             spawn_agent,
             source="runtime:spawn",
-        )
-        self.registry.register(
-            "team_run",
-            (
-                "Run a lightweight team of independent sub-agents for parallel "
-                "research, review, or implementation planning. Each member must "
-                "return structured JSON with findings, evidence, confidence, and risks; "
-                "the lead agent then synthesizes the final answer."
-            ),
-            {
-                "type": "object",
-                "properties": {
-                    "goal": {
-                        "type": "string",
-                        "description": "Overall goal the team is working toward.",
-                    },
-                    "members": {
-                        "type": "array",
-                        "description": "Independent team member tasks.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "role": {"type": "string"},
-                                "task": {"type": "string"},
-                            },
-                            "required": ["role", "task"],
-                        },
-                    },
-                    "max_concurrency": {
-                        "type": "integer",
-                        "description": "Optional concurrency limit for member execution.",
-                    },
-                },
-                "required": ["goal", "members"],
-            },
-            team_run,
-            source="runtime:team",
         )
 
 
