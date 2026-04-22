@@ -1429,6 +1429,41 @@ def test_run_pipeline_subtasks_passes_summary_only():
     assert observed["b"] == {"a": "summary:a"}
 
 
+def test_run_pipeline_subtasks_stops_after_upstream_failure():
+    from agent.orchestration import SubtaskResult, SubtaskSpec
+    from agent.orchestration.runtime import run_pipeline_subtasks
+
+    executed = []
+
+    async def executor(spec: SubtaskSpec, upstream_summaries: dict[str, str]) -> SubtaskResult:
+        executed.append(spec.id)
+        if spec.id == "a":
+            return SubtaskResult(
+                id="a",
+                ok=False,
+                content="partial",
+                summary="",
+                tool_calls_made=[],
+                error="upstream failed",
+            )
+        raise AssertionError("downstream stage should not execute after upstream failure")
+
+    results = asyncio.run(
+        run_pipeline_subtasks(
+            [
+                SubtaskSpec(id="a", role="researcher", task="a"),
+                SubtaskSpec(id="b", role="reviewer", task="b", depends_on=["a"]),
+            ],
+            executor=executor,
+        )
+    )
+
+    assert executed == ["a"]
+    assert len(results) == 1
+    assert results[0].ok is False
+    assert results[0].error == "upstream failed"
+
+
 def test_run_rendezvous_round_uses_lead_summary_for_followup():
     from agent.orchestration import SubtaskResult, SubtaskSpec
     from agent.orchestration.runtime import run_rendezvous_round
@@ -1470,6 +1505,53 @@ def test_run_rendezvous_round_uses_lead_summary_for_followup():
     assert observed_round_inputs[("b", 1)] == ""
     assert observed_round_inputs[("a", 2)] == "lead-summary"
     assert observed_round_inputs[("b", 2)] == "lead-summary"
+
+
+def test_run_rendezvous_round_executes_each_round_in_parallel():
+    from agent.orchestration import SubtaskResult, SubtaskSpec
+    from agent.orchestration.runtime import run_rendezvous_round
+
+    async def run():
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+
+        async def executor(
+            spec: SubtaskSpec,
+            *,
+            round_index: int,
+            lead_summary: str,
+        ) -> SubtaskResult:
+            if round_index == 1:
+                if spec.id == "a":
+                    first_started.set()
+                    await second_started.wait()
+                else:
+                    second_started.set()
+                    await first_started.wait()
+            return SubtaskResult(
+                id=spec.id,
+                ok=True,
+                content=f"content:{spec.id}:{round_index}",
+                summary=f"summary:{spec.id}:{round_index}",
+                tool_calls_made=[],
+            )
+
+        return await asyncio.wait_for(
+            run_rendezvous_round(
+                [
+                    SubtaskSpec(id="a", role="researcher", task="a"),
+                    SubtaskSpec(id="b", role="critic", task="b"),
+                ],
+                executor=executor,
+                summarize=lambda results: "lead-summary",
+                max_rounds=2,
+            ),
+            timeout=1,
+        )
+
+    results = asyncio.run(run())
+
+    assert len(results) == 4
 
 
 def test_run_rendezvous_round_enforces_round_limit():
@@ -1764,6 +1846,41 @@ def test_spawn_agent_enforces_timeout(monkeypatch):
     assert payload["ok"] is False
     assert payload["timed_out"] is True
     assert payload["role"] == "researcher"
+
+
+def test_base_agent_internal_orchestration_preserves_partial_content(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    async def fake_call(tool_name, tool_input):
+        assert tool_name == "spawn_agent"
+        return json.dumps(
+            {
+                "ok": False,
+                "role": tool_input["role"],
+                "task": tool_input["task"],
+                "timed_out": True,
+                "partial_content": "partial-result",
+                "error": "timed out",
+            }
+        )
+
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    result = asyncio.run(
+        agent._execute_subtask_spec(
+            agent_module.SubtaskSpec(id="a", role="researcher", task="inspect")
+        )
+    )
+
+    assert result.ok is False
+    assert result.content == "partial-result"
+    assert result.summary == "partial-result"
+    assert result.error == "timed out"
 
 
 def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch):
@@ -2178,6 +2295,31 @@ def test_base_agent_runs_internal_parallel_orchestration_without_public_tool_exp
     assert "run_parallel_subtasks" not in registry.list_tools()
     assert "run_pipeline_subtasks" not in registry.list_tools()
     assert "run_rendezvous_round" not in registry.list_tools()
+
+
+def test_build_components_marks_multi_agent_orchestration_skill_non_model_invocable(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+    bundle = components["skill_catalog"].get("multi-agent-orchestration")
+
+    assert bundle is not None
+    assert bundle.disable_model_invocation is True
 
 
 def test_base_agent_runs_internal_pipeline_with_summary_only(monkeypatch):

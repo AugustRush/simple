@@ -2,7 +2,7 @@
 name: Multi-Agent Orchestration
 description: Decide when to answer directly, when to run parallel subtasks, when to use a dependency pipeline, and when to do a lead-controlled rendezvous.
 user-invocable: false
-disable-model-invocation: false
+disable-model-invocation: true
 ---
 
 # Multi-Agent Orchestration

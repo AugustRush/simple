@@ -74,9 +74,11 @@ async def run_pipeline_subtasks(
                 continue
             upstream_summaries = {dep: summaries[dep] for dep in spec.depends_on}
             result = await executor(spec, upstream_summaries)
-            summaries[spec.id] = result.summary
             results.append(result)
             pending.pop(spec_id)
+            if not result.ok:
+                return results
+            summaries[spec.id] = result.summary
             progressed = True
         if not progressed:
             raise ValueError("pipeline contains unresolved or cyclic dependencies")
@@ -96,14 +98,16 @@ async def run_rendezvous_round(
     lead_summary = ""
 
     for round_index in range(1, rounds + 1):
-        round_results: list[SubtaskResult] = []
-        for spec in specs:
-            result = await executor(
-                spec,
-                round_index=round_index,
-                lead_summary=lead_summary,
-            )
-            round_results.append(result)
+        round_results = await asyncio.gather(
+            *[
+                executor(
+                    spec,
+                    round_index=round_index,
+                    lead_summary=lead_summary,
+                )
+                for spec in specs
+            ]
+        )
         all_results.extend(round_results)
         if round_index < rounds:
             lead_summary = summarize(round_results)

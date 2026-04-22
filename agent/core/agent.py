@@ -148,7 +148,11 @@ class BaseAgent:
                 "tool_calls_made": [],
             }
 
-        content = str(payload.get("content", "") or "")
+        content = str(
+            payload.get("content")
+            or payload.get("partial_content")
+            or ""
+        )
         return SubtaskResult(
             id=spec.id,
             ok=bool(payload.get("ok")),
