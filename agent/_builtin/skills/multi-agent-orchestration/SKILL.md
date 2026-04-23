@@ -3,6 +3,14 @@ name: Multi-Agent Orchestration
 description: Decide when to answer directly, when to run parallel subtasks, when to use a dependency pipeline, and when to do a lead-controlled rendezvous.
 user-invocable: false
 disable-model-invocation: true
+planner-policy: orchestration
+default-mode: direct
+parallel-keywords: ["分别", "各自", "parallel", "multiple perspectives"]
+pipeline-leading-keywords: ["先", "first"]
+pipeline-followup-keywords: ["再", "然后", "then"]
+pipeline-keywords: ["分阶段", "step by step"]
+rendezvous-keywords: ["辩论", "debate", "正反", "多轮", "讨论"]
+max-rendezvous-rounds: 2
 ---
 
 # Multi-Agent Orchestration

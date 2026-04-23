@@ -23,6 +23,7 @@ import mcp
 
 from agent import shared
 from agent.core.output import OutputSink, _active_sink
+from agent.pathing import path_contains, resolve_workspace_path
 
 TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
 TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
@@ -49,14 +50,46 @@ class ToolDef:
     parameters: dict
     fn: Callable
     source: str = "runtime"
+    capabilities: frozenset[str] = field(default_factory=frozenset)
 
 
 class ToolRegistry:
     """Central registry for all tools."""
 
+    _DEFAULT_TOOL_CAPABILITIES: dict[tuple[str, str], frozenset[str]] = {
+        ("builtin", "current_time"): frozenset({"read"}),
+        ("builtin", "read_file"): frozenset({"read"}),
+        ("builtin", "list_files"): frozenset({"read"}),
+        ("builtin", "memory_read"): frozenset({"read"}),
+        ("builtin", "memory_search"): frozenset({"read"}),
+        ("builtin", "memory_index"): frozenset({"read"}),
+        ("builtin", "context_retrieve"): frozenset({"read"}),
+        ("builtin", "schedule_list"): frozenset({"read"}),
+        ("builtin", "web_search"): frozenset({"read"}),
+        ("builtin", "web_fetch"): frozenset({"read"}),
+        ("builtin", "tavily_search"): frozenset({"read"}),
+        ("builtin", "write_file"): frozenset({"workspace_write"}),
+        ("builtin", "clean_output"): frozenset({"output_write"}),
+        ("builtin", "shell"): frozenset({"shell"}),
+        ("builtin", "send_file"): frozenset({"side_effect"}),
+        ("builtin", "memory_write"): frozenset({"state_write"}),
+        ("builtin", "schedule_create"): frozenset({"state_write"}),
+        ("builtin", "schedule_delete"): frozenset({"state_write"}),
+        ("runtime:skill", "activate_skill"): frozenset({"read"}),
+        ("runtime:skill", "list_skill_files"): frozenset({"read"}),
+        ("runtime:skill", "read_skill_file"): frozenset({"read"}),
+        ("runtime:skill", "create_skill"): frozenset({"state_write"}),
+        ("runtime:skill", "update_skill"): frozenset({"state_write"}),
+        ("runtime:skill", "delete_skill"): frozenset({"state_write"}),
+        ("runtime:skill", "write_skill_file"): frozenset({"state_write"}),
+    }
+
     def __init__(self, console: Optional[Any] = None):
         self._tools: dict[str, ToolDef] = {}
         self._context: dict[str, Any] = {}
+        self._context_override: contextvars.ContextVar[Optional[dict[str, Any]]] = (
+            contextvars.ContextVar("tool_registry_context_override", default=None)
+        )
         self.console = console
 
     def register(
@@ -68,6 +101,7 @@ class ToolRegistry:
         *,
         replace: bool = False,
         source: str = "runtime",
+        capabilities: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None = None,
     ):
         if name in self._tools:
             existing = self._tools[name]
@@ -87,7 +121,19 @@ class ToolRegistry:
             parameters=parameters,
             fn=fn,
             source=source,
+            capabilities=self._coerce_capabilities(name, source, capabilities),
         )
+
+    @classmethod
+    def _coerce_capabilities(
+        cls,
+        name: str,
+        source: str,
+        capabilities: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None,
+    ) -> frozenset[str]:
+        if capabilities is None:
+            return cls._DEFAULT_TOOL_CAPABILITIES.get((source, name), frozenset())
+        return frozenset(str(item) for item in capabilities if str(item).strip())
 
     def tool(self, name: str, description: str, parameters: dict):
         def decorator(fn: Callable):
@@ -116,8 +162,17 @@ class ToolRegistry:
     async def call(self, tool_name: str, tool_input: dict) -> str:
         if tool_name not in self._tools:
             return self._error_payload(tool_name, f"tool '{tool_name}' not found")
+        override_registry: Optional["ToolRegistry"] = None
+        override_token = None
         try:
             fn = self._tools[tool_name].fn
+            owner = getattr(fn, "__self__", None)
+            owner_registry = getattr(owner, "registry", None)
+            if isinstance(owner_registry, ToolRegistry) and owner_registry is not self:
+                merged_context = dict(owner_registry._context)
+                merged_context.update(self._context)
+                override_registry = owner_registry
+                override_token = owner_registry._context_override.set(merged_context)
             if asyncio.iscoroutinefunction(fn):
                 result = await fn(**tool_input)
             else:
@@ -139,6 +194,9 @@ class ToolRegistry:
             return self._error_payload(
                 tool_name, f"Error calling tool '{tool_name}': {e}"
             )
+        finally:
+            if override_registry is not None and override_token is not None:
+                override_registry._context_override.reset(override_token)
 
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())
@@ -147,6 +205,9 @@ class ToolRegistry:
         self._context[key] = value
 
     def get_context(self, key: str, default: Any = None) -> Any:
+        override = self._context_override.get()
+        if override is not None and key in override:
+            return override[key]
         return self._context.get(key, default)
 
     def unregister_by_source_prefix(self, prefix: str) -> None:
@@ -858,30 +919,26 @@ class BuiltinTools:
     def _error(self, message: str, **payload: Any) -> dict[str, Any]:
         return {"ok": False, "error": message, **payload}
 
-    def _allowed_roots(self) -> list[Path]:
-        roots = [self.workspace_root]
-        if self._output_dir is not None:
-            roots.append(self._output_dir.resolve())
-        return roots
-
     def _resolve_tool_path(self, path: str) -> tuple[Path, str]:
-        candidate = Path(path).expanduser()
-        if not candidate.is_absolute():
-            candidate = self.workspace_root / candidate
-        resolved = candidate.resolve(strict=False)
-        for root in self._allowed_roots():
-            if resolved == root or root in resolved.parents:
-                kind = "output_dir" if self._output_dir is not None and root == self._output_dir.resolve() else "workspace"
-                return resolved, kind
-        allowed = [str(root) for root in self._allowed_roots()]
+        return resolve_workspace_path(
+            path,
+            workspace_root=self.workspace_root,
+            output_dir=self._output_dir,
+        )
+
+    def _ensure_within_write_scope(self, path: Path) -> None:
+        scope_entries = self.registry.get_context("write_scope") or []
+        if not scope_entries:
+            return
+        allowed: list[str] = []
+        for entry in scope_entries:
+            scope_path, _root_kind = self._resolve_tool_path(str(entry))
+            allowed.append(str(scope_path))
+            if path_contains(scope_path, path):
+                return
         raise ValueError(
-            f"Path '{path}' is outside the workspace root '{self.workspace_root}'"
-            + (
-                f" and output directory '{self._output_dir.resolve()}'"
-                if self._output_dir is not None
-                else ""
-            )
-            + f". Allowed roots: {', '.join(allowed)}"
+            f"Path '{path}' is outside the sub-agent write scope. "
+            f"Allowed paths: {', '.join(allowed)}"
         )
 
     async def _shell(
@@ -1046,6 +1103,7 @@ class BuiltinTools:
     ) -> dict[str, Any]:
         try:
             p, _root_kind = self._resolve_tool_path(path)
+            self._ensure_within_write_scope(p)
             p.parent.mkdir(parents=True, exist_ok=True)
             payload = content.encode("utf-8")
             max_bytes = max(1, min(int(max_bytes), TOOL_DEFAULT_MAX_WRITE_BYTES))
@@ -1494,6 +1552,7 @@ class _UserToolRegistryFacade:
         fn: Callable,
         *,
         replace: bool = False,
+        capabilities: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None = None,
     ) -> None:
         self._registry.register(
             name,
@@ -1502,6 +1561,7 @@ class _UserToolRegistryFacade:
             fn,
             replace=replace,
             source=self._source,
+            capabilities=capabilities,
         )
 
 

@@ -169,28 +169,26 @@ Your exact tool capabilities are appended later in this prompt. Use only the too
 ## spawn_agent — multi-agent orchestration
 
 Use `spawn_agent` when the task benefits from specialised sub-agents. Two core patterns:
+Prefer lead-controlled coordination over free-form sub-agent debate.
 
 ### Pattern 1 — Parallel (independent subtasks)
 Call `spawn_agent` **multiple times in ONE turn** when subtasks are fully independent.
 They run concurrently; you synthesise the results afterward.
 Example: "summarise these 3 articles" → spawn 3 summarisers simultaneously.
 
-### Pattern 2 — Pipeline / Debate (dependent or iterative)
-Call `spawn_agent` **one at a time across multiple turns**, passing each result forward.
-Use when role B needs role A's output, OR when you need multiple debate rounds.
+### Pattern 2 — Pipeline / Lead-Controlled Rendezvous
+Call `spawn_agent` **one at a time across multiple turns**, passing only the minimum
+summary needed for the next step.
+Use when role B needs role A's output, OR when you need a bounded second round on
+important disagreements.
 
-**Multi-round debate example:**
-- Round 1, turn 1: spawn(proposer, task=question)           → proposal_1
-- Round 1, turn 2: spawn(critic,   task=proposal_1)         → critique_1
-- Round 2, turn 3: spawn(proposer, task=critique_1)         → proposal_2  ← refined
-- Round 2, turn 4: spawn(critic,   task=proposal_2)         → critique_2
-- … repeat until positions converge or you judge it sufficient …
-- Final turn:      spawn(judge, task=full_history)           → verdict
+**Lead-controlled rendezvous example:**
+- Round 1: spawn(proposer, task=question) and/or spawn(critic, task=question)
+- Lead: summarize the main disagreements yourself
+- Round 2: spawn(follow-up worker, task=lead_summary) only if another round is justified
+- Final: synthesise the answer yourself
 
-**Deciding when to stop**: after each critic turn, assess whether the debate has converged
-(positions are close, or further rounds yield diminishing returns). One round is often
-insufficient for complex or controversial questions — use your judgement.
-The user can also specify a number of rounds explicitly (e.g. "debate for 3 rounds").
+Default to a bounded number of rounds. Prefer concise summaries over full raw histories.
 
 The key rule: **if role B needs role A's output, they must be sequential, not parallel.**
 

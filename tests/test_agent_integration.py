@@ -258,36 +258,262 @@ user-invocable: true
     assert "Do not pretend the scheduled action has already run" in prompt
     assert "use `send_file` with the resolved file path" in prompt
 
-    payload = json.loads(
-        asyncio.run(registry.call("activate_skill", {"skill_name": "quality/review"}))
-    )
-    assert payload["ok"] is True
-    assert payload["skill"]["id"] == "quality/review"
-    assert payload["skill"]["bundle_root"] == "builtin://quality/review"
-    assert payload["skill"]["instructions"] == skill_body
-    assert "template.md" in payload["skill"]["supporting_files"]
 
-    files_payload = json.loads(
-        asyncio.run(registry.call("list_skill_files", {"skill_name": "quality/review"}))
-    )
-    assert files_payload["ok"] is True
-    assert files_payload["bundle_root"] == "builtin://quality/review"
-    assert "template.md" in files_payload["files"]
+def test_orchestration_planner_exposes_policy_from_skill_metadata(tmp_path):
+    from agent.orchestration.planner import OrchestrationPlanner
+    from agent.skills.catalog import SkillCatalog
 
-    file_payload = json.loads(
-        asyncio.run(
-            registry.call(
-                "read_skill_file",
-                {"skill_name": "quality/review", "path": "template.md"},
+    builtin_root = tmp_path / "builtin-skills"
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        builtin_root,
+        "multi-agent-orchestration",
+        """---
+name: Multi-Agent Orchestration
+description: Decide orchestration mode
+user-invocable: false
+disable-model-invocation: true
+planner-policy: orchestration
+default-mode: direct
+parallel-keywords: ["分别", "各自", "parallel", "multiple perspectives"]
+pipeline-leading-keywords: ["先", "first"]
+pipeline-followup-keywords: ["再", "然后", "then"]
+pipeline-keywords: ["分阶段", "step by step"]
+rendezvous-keywords: ["辩论", "debate", "正反", "多轮"]
+max-rendezvous-rounds: 2
+---
+Policy body.
+""",
+    )
+
+    catalog = SkillCatalog(user_root=user_root, builtin_root=builtin_root)
+    catalog.load_all()
+    planner = OrchestrationPlanner.from_skill_catalog(catalog)
+
+    decision = planner.decide(
+        "请做一轮正反辩论，再给最终判断",
+        tools_enabled=True,
+        has_spawn_agent=True,
+    )
+
+    assert decision.mode == "explicit"
+    assert decision.reason == "runtime derives mode from explicit subtask plan"
+    assert decision.max_rendezvous_rounds == 2
+
+
+def test_send_message_executes_parallel_spawn_calls_via_internal_runtime(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    builtin_root = tmp_path / "builtin-skills"
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        builtin_root,
+        "multi-agent-orchestration",
+        """---
+name: Multi-Agent Orchestration
+description: Decide orchestration mode
+user-invocable: false
+disable-model-invocation: true
+planner-policy: orchestration
+default-mode: direct
+parallel-keywords: ["分别", "各自", "parallel", "multiple perspectives"]
+pipeline-leading-keywords: ["先", "first"]
+pipeline-followup-keywords: ["再", "然后", "then"]
+pipeline-keywords: ["分阶段", "step by step"]
+rendezvous-keywords: ["辩论", "debate", "正反", "多轮"]
+max-rendezvous-rounds: 2
+---
+Policy body.
+""",
+    )
+
+    catalog = agent_module.SkillCatalog(user_root=user_root, builtin_root=builtin_root)
+    catalog.load_all()
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.register_spawn_capability("base system prompt")
+
+    spawn_tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps(
+                    {
+                        "role": "researcher",
+                        "task": "inspect performance",
+                        "capability_profile": "read_only",
+                    }
+                ),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-2",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps(
+                    {
+                        "role": "critic",
+                        "task": "inspect correctness",
+                        "capability_profile": "read_only",
+                    }
+                ),
+            ),
+        ),
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls", agent_module._OAIMsg("", spawn_tool_calls)
+                    )
+                ]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final answer", None))]
+            ),
+        ]
+    )
+
+    observed = {"calls": 0, "specs": []}
+
+    async def fake_create(ctx, tools):
+        observed["calls"] += 1
+        observed["system_prompt"] = ctx.system_prompt
+        return next(responses)
+
+    async def fake_run_parallel_subtasks(specs, max_concurrency=None):
+        observed["specs"] = [
+            (spec.role, spec.task, spec.capability_profile) for spec in specs
+        ]
+        return [
+            agent_module.SubtaskResult(
+                id=spec.id,
+                ok=True,
+                content=f"content:{spec.role}",
+                summary=f"summary:{spec.role}",
+                tool_calls_made=["spawn_agent"],
             )
-        )
+            for spec in specs
+        ]
+
+    async def fail_direct_spawn(tool_name, tool_input):
+        raise AssertionError("spawn_agent should be executed via internal runtime")
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "run_parallel_subtasks", fake_run_parallel_subtasks)
+    monkeypatch.setattr(registry, "call", fail_direct_spawn)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    ctx.metadata["skill_catalog"] = catalog
+    result = asyncio.run(
+        agent.send_message(ctx, "请分别从性能和正确性两个角度 review 方案")
     )
-    assert file_payload["ok"] is True
-    assert file_payload["bundle_root"] == "builtin://quality/review"
-    assert file_payload["content"] == "Checklist template"
-    assert "user tools live in" in prompt
-    assert str(agent_module.SKILLS_DIR) in prompt
-    assert "Workspace root for read_file/write_file/list_files only:" in prompt
+
+    assert result.error is None
+    assert result.content == "final answer"
+    assert observed["calls"] == 2
+    assert observed["specs"] == [
+        ("researcher", "inspect performance", "read_only"),
+        ("critic", "inspect correctness", "read_only"),
+    ]
+    assert "Planner selected orchestration mode" not in observed["system_prompt"]
+
+
+def test_send_message_ignores_keyword_hint_when_spawn_plan_is_explicitly_parallel(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    builtin_root = tmp_path / "builtin-skills"
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        builtin_root,
+        "multi-agent-orchestration",
+        """---
+name: Multi-Agent Orchestration
+description: Coordination policy
+user-invocable: false
+disable-model-invocation: true
+max-rendezvous-rounds: 2
+---
+Policy body.
+""",
+    )
+
+    catalog = agent_module.SkillCatalog(user_root=user_root, builtin_root=builtin_root)
+    catalog.load_all()
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.register_spawn_capability("base system prompt")
+
+    spawn_tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "researcher", "task": "inspect performance"}),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-2",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "critic", "task": "inspect correctness"}),
+            ),
+        ),
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("tool_calls", agent_module._OAIMsg("", spawn_tool_calls))]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final answer", None))]
+            ),
+        ]
+    )
+
+    observed = {}
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_run_parallel_subtasks(specs, max_concurrency=None):
+        observed["parallel"] = [spec.id for spec in specs]
+        return [
+            agent_module.SubtaskResult(
+                id=spec.id,
+                ok=True,
+                content=f"content:{spec.id}",
+                summary=f"summary:{spec.id}",
+                tool_calls_made=["spawn_agent"],
+            )
+            for spec in specs
+        ]
+
+    async def fail_pipeline(specs):
+        raise AssertionError("pipeline mode should not be forced by user-message keywords")
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "run_parallel_subtasks", fake_run_parallel_subtasks)
+    monkeypatch.setattr(agent, "run_pipeline_subtasks", fail_pipeline)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    ctx.metadata["skill_catalog"] = catalog
+    result = asyncio.run(agent.send_message(ctx, "先看性能，再看正确性"))
+
+    assert result.error is None
+    assert observed["parallel"] == ["call-1", "call-2"]
 
 
 def test_builtin_skill_activation_text_uses_logical_bundle_root(tmp_path):
@@ -1245,6 +1471,9 @@ def test_system_prompt_keeps_spawn_agent_as_only_public_delegation_tool(
 
     assert "spawn_agent" in prompt
     assert "team_run" not in prompt
+    assert "full_history" not in prompt
+    assert "repeat until positions converge" not in prompt
+    assert "lead-controlled" in prompt
 
 
 def test_sub_agents_do_not_receive_orchestration_public_surface(monkeypatch):
@@ -1289,8 +1518,10 @@ def test_orchestration_runtime_exports_minimal_types():
     assert spec.id == "s1"
     assert spec.depends_on == []
     assert spec.write_scope == []
+    assert spec.output_contract == {}
     assert result.ok is True
     assert result.summary == ""
+    assert result.structured_content is None
     assert result.error is None
 
 
@@ -1369,6 +1600,41 @@ def test_run_parallel_subtasks_preserves_sibling_results_on_failure():
     assert results[1].error == "failed"
 
 
+def test_run_parallel_subtasks_reports_telemetry():
+    from agent.orchestration import SubtaskResult, SubtaskSpec
+    from agent.orchestration.runtime import run_parallel_subtasks
+
+    telemetry = {}
+
+    async def executor(spec: SubtaskSpec) -> SubtaskResult:
+        return SubtaskResult(
+            id=spec.id,
+            ok=True,
+            content=f"done:{spec.id}",
+            tool_calls_made=[],
+        )
+
+    results = asyncio.run(
+        run_parallel_subtasks(
+            [
+                SubtaskSpec(id="a", role="reviewer", task="a"),
+                SubtaskSpec(id="b", role="reviewer", task="b"),
+            ],
+            executor=executor,
+            max_concurrency=2,
+            telemetry=telemetry,
+        )
+    )
+
+    assert [result.id for result in results] == ["a", "b"]
+    assert telemetry["execution_mode"] == "parallel"
+    assert telemetry["spec_count"] == 2
+    assert telemetry["max_concurrency"] == 2
+    assert telemetry["write_scope_count"] == 0
+    assert telemetry["write_scope_check_seconds"] >= 0
+    assert telemetry["duration_seconds"] >= telemetry["write_scope_check_seconds"]
+
+
 def test_run_pipeline_subtasks_executes_in_dependency_order():
     from agent.orchestration import SubtaskResult, SubtaskSpec
     from agent.orchestration.runtime import run_pipeline_subtasks
@@ -1429,6 +1695,50 @@ def test_run_pipeline_subtasks_passes_summary_only():
     assert observed["b"] == {"a": "summary:a"}
 
 
+def test_run_pipeline_subtasks_can_pass_upstream_results_when_executor_accepts_them():
+    from agent.orchestration import SubtaskResult, SubtaskSpec
+    from agent.orchestration.runtime import run_pipeline_subtasks
+
+    observed = {}
+
+    async def executor(
+        spec: SubtaskSpec,
+        upstream_summaries: dict[str, str],
+        *,
+        upstream_results: dict[str, SubtaskResult],
+    ) -> SubtaskResult:
+        observed[spec.id] = {
+            "summaries": dict(upstream_summaries),
+            "structured": {
+                dep: result.structured_content
+                for dep, result in upstream_results.items()
+            },
+        }
+        return SubtaskResult(
+            id=spec.id,
+            ok=True,
+            content=f"raw-content:{spec.id}",
+            summary=f"summary:{spec.id}",
+            structured_content={"id": spec.id},
+            tool_calls_made=[],
+        )
+
+    asyncio.run(
+        run_pipeline_subtasks(
+            [
+                SubtaskSpec(id="a", role="researcher", task="a"),
+                SubtaskSpec(id="b", role="reviewer", task="b", depends_on=["a"]),
+            ],
+            executor=executor,
+        )
+    )
+
+    assert observed["b"] == {
+        "summaries": {"a": "summary:a"},
+        "structured": {"a": {"id": "a"}},
+    }
+
+
 def test_run_pipeline_subtasks_stops_after_upstream_failure():
     from agent.orchestration import SubtaskResult, SubtaskSpec
     from agent.orchestration.runtime import run_pipeline_subtasks
@@ -1462,6 +1772,48 @@ def test_run_pipeline_subtasks_stops_after_upstream_failure():
     assert len(results) == 1
     assert results[0].ok is False
     assert results[0].error == "upstream failed"
+
+
+def test_run_pipeline_subtasks_executes_ready_stage_in_parallel():
+    from agent.orchestration import SubtaskResult, SubtaskSpec
+    from agent.orchestration.runtime import run_pipeline_subtasks
+
+    async def run():
+        b_started = asyncio.Event()
+        c_started = asyncio.Event()
+
+        async def executor(
+            spec: SubtaskSpec, upstream_summaries: dict[str, str]
+        ) -> SubtaskResult:
+            if spec.id == "b":
+                b_started.set()
+                await c_started.wait()
+            elif spec.id == "c":
+                c_started.set()
+                await b_started.wait()
+            return SubtaskResult(
+                id=spec.id,
+                ok=True,
+                content=f"content:{spec.id}",
+                summary=f"summary:{spec.id}",
+                tool_calls_made=[],
+            )
+
+        return await asyncio.wait_for(
+            run_pipeline_subtasks(
+                [
+                    SubtaskSpec(id="a", role="researcher", task="a"),
+                    SubtaskSpec(id="b", role="reviewer", task="b", depends_on=["a"]),
+                    SubtaskSpec(id="c", role="critic", task="c", depends_on=["a"]),
+                ],
+                executor=executor,
+            ),
+            timeout=1,
+        )
+
+    results = asyncio.run(run())
+
+    assert [result.id for result in results] == ["a", "b", "c"]
 
 
 def test_run_rendezvous_round_uses_lead_summary_for_followup():
@@ -1505,6 +1857,55 @@ def test_run_rendezvous_round_uses_lead_summary_for_followup():
     assert observed_round_inputs[("b", 1)] == ""
     assert observed_round_inputs[("a", 2)] == "lead-summary"
     assert observed_round_inputs[("b", 2)] == "lead-summary"
+
+
+def test_run_rendezvous_round_can_stop_or_narrow_followup():
+    from agent.orchestration import SubtaskResult, SubtaskSpec
+    from agent.orchestration.runtime import RendezvousDirective, run_rendezvous_round
+
+    observed_rounds = []
+
+    async def executor(
+        spec: SubtaskSpec,
+        *,
+        round_index: int,
+        lead_summary: str,
+    ) -> SubtaskResult:
+        observed_rounds.append((spec.id, round_index, lead_summary))
+        return SubtaskResult(
+            id=spec.id,
+            ok=True,
+            content=f"content:{spec.id}:round:{round_index}",
+            summary=f"summary:{spec.id}:round:{round_index}",
+            tool_calls_made=[],
+        )
+
+    def summarize(results):
+        if len(results) == 2:
+            return RendezvousDirective(
+                summary="focus-on-a",
+                continue_with=["a"],
+            )
+        return RendezvousDirective(summary="done", stop=True)
+
+    results = asyncio.run(
+        run_rendezvous_round(
+            [
+                SubtaskSpec(id="a", role="researcher", task="a"),
+                SubtaskSpec(id="b", role="critic", task="b"),
+            ],
+            executor=executor,
+            summarize=summarize,
+            max_rounds=3,
+        )
+    )
+
+    assert [result.id for result in results] == ["a", "b", "a"]
+    assert observed_rounds == [
+        ("a", 1, ""),
+        ("b", 1, ""),
+        ("a", 2, "focus-on-a"),
+    ]
 
 
 def test_run_rendezvous_round_executes_each_round_in_parallel():
@@ -1599,19 +2000,33 @@ def test_parallel_orchestration_rejects_overlapping_write_scope():
                         id="a",
                         role="implementer",
                         task="a",
-                        write_scope=["agent/core/agent.py"],
+                        write_scope=["agent/core"],
                     ),
                     SubtaskSpec(
                         id="b",
                         role="reviewer",
                         task="b",
-                        write_scope=["agent/core/agent.py"],
+                        write_scope=[str(Path.cwd() / "agent" / "core" / "agent.py")],
                     ),
                 ],
                 executor=executor,
                 max_concurrency=2,
             )
         )
+
+
+def test_workspace_path_helpers_share_canonical_scope_semantics(tmp_path):
+    from agent.pathing import canonicalize_user_path, path_contains, paths_overlap, resolve_workspace_path
+
+    scope_path = canonicalize_user_path("src", base_dir=tmp_path)
+    target_path, root_kind = resolve_workspace_path(
+        str(tmp_path / "src" / "main.py"),
+        workspace_root=tmp_path,
+    )
+
+    assert root_kind == "workspace"
+    assert path_contains(scope_path, target_path) is True
+    assert paths_overlap(scope_path, target_path) is True
 
 
 def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
@@ -1672,6 +2087,335 @@ def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
     assert payload["role"] == "critic"
     assert payload["error"] == "sub-agent failed"
     assert payload["content"] == "partial output"
+
+
+def test_spawn_agent_restricts_subagent_tools_for_read_only_profile(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    registry.register(
+        "read_file",
+        "Read files",
+        {"type": "object", "properties": {}, "required": []},
+        lambda: {"ok": True},
+        source="test",
+        capabilities=("read",),
+    )
+    registry.register(
+        "write_file",
+        "Write files",
+        {"type": "object", "properties": {}, "required": []},
+        lambda: {"ok": True},
+        source="test",
+        capabilities=("workspace_write",),
+    )
+    registry.register(
+        "shell",
+        "Run shell commands",
+        {"type": "object", "properties": {}, "required": []},
+        lambda: {"ok": True},
+        source="test",
+        capabilities=("shell",),
+    )
+    registry.register(
+        "dangerous_mutator",
+        "Custom mutating tool without declared capabilities",
+        {"type": "object", "properties": {}, "required": []},
+        lambda: {"ok": True},
+        source="plugin:test",
+    )
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+
+    observed = {}
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        observed["tools"] = sorted(self.registry.list_tools())
+        return agent_module.AgentResult(agent_id="sub", content="ok")
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "critic",
+                    "task": "inspect",
+                    "capability_profile": "read_only",
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is True
+    assert observed["tools"] == ["read_file"]
+
+
+def test_spawn_agent_validates_expected_output_contract(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        return agent_module.AgentResult(agent_id="sub", content="plain text without contract")
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "researcher",
+                    "task": "summarize the change",
+                    "expected_output": "A concise summary paragraph.",
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert "expected output contract" in payload["error"].lower()
+
+
+def test_spawn_agent_extracts_deliverable_from_expected_output_contract(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        return agent_module.AgentResult(
+            agent_id="sub",
+            content=(
+                "Some working notes.\n"
+                "<deliverable>\n"
+                "Final summary paragraph.\n"
+                "</deliverable>\n"
+                "Ignored tail."
+            ),
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "researcher",
+                    "task": "summarize the change",
+                    "expected_output": "A concise summary paragraph.",
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is True
+    assert payload["content"] == "Final summary paragraph."
+
+
+def test_spawn_agent_validates_json_output_contract_required_keys(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        return agent_module.AgentResult(
+            agent_id="sub",
+            content='<deliverable>{"summary":"done"}</deliverable>',
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "researcher",
+                    "task": "summarize the change",
+                    "output_contract": {
+                        "format": "json",
+                        "required_keys": ["summary", "risks"],
+                    },
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert "required deliverable keys" in payload["error"].lower()
+
+
+def test_spawn_agent_accepts_json_output_contract(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        return agent_module.AgentResult(
+            agent_id="sub",
+            content='<deliverable>{"summary":"done","risks":[]}</deliverable>',
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "researcher",
+                    "task": "summarize the change",
+                    "output_contract": {
+                        "format": "json",
+                        "required_keys": ["summary", "risks"],
+                    },
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is True
+    assert json.loads(payload["content"]) == {"summary": "done", "risks": []}
+
+
+def test_spawn_agent_validates_required_output_files(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt", workspace_root=tmp_path)
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        return agent_module.AgentResult(
+            agent_id="sub",
+            content="<deliverable>done</deliverable>",
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "implementer",
+                    "task": "build artifact",
+                    "write_scope": ["artifact.json"],
+                    "output_contract": {
+                        "required_files": ["artifact.json"],
+                    },
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert "required output file" in payload["error"].lower()
+
+
+def test_spawn_agent_accepts_file_only_output_contract_without_deliverable(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt", workspace_root=tmp_path)
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        (tmp_path / "artifact.json").write_text('{"ok": true}', encoding="utf-8")
+        return agent_module.AgentResult(
+            agent_id="sub",
+            content="artifact written",
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "implementer",
+                    "task": "build artifact",
+                    "write_scope": ["artifact.json"],
+                    "output_contract": {
+                        "required_files": ["artifact.json"],
+                    },
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is True
+    assert payload["content"] == "artifact written"
+
+
+def test_spawn_agent_requires_deliverable_when_json_and_files_are_both_requested(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt", workspace_root=tmp_path)
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        (tmp_path / "artifact.json").write_text("{}", encoding="utf-8")
+        return agent_module.AgentResult(
+            agent_id="sub",
+            content="artifact written without deliverable block",
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "implementer",
+                    "task": "build artifact",
+                    "write_scope": ["artifact.json"],
+                    "output_contract": {
+                        "format": "json",
+                        "required_keys": ["summary"],
+                        "required_files": ["artifact.json"],
+                    },
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert "missing <deliverable> block" in payload["error"].lower()
 
 
 def test_concurrent_send_message_isolates_spawn_parent_context(monkeypatch):
@@ -1883,6 +2627,141 @@ def test_base_agent_internal_orchestration_preserves_partial_content(monkeypatch
     assert result.error == "timed out"
 
 
+def test_base_agent_internal_orchestration_preserves_structured_content(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    async def fake_call(tool_name, tool_input):
+        assert tool_name == "spawn_agent"
+        return json.dumps(
+            {
+                "ok": True,
+                "role": tool_input["role"],
+                "task": tool_input["task"],
+                "content": '{"summary":"done"}',
+                "structured_content": {"summary": "done"},
+                "tool_calls_made": [],
+            }
+        )
+
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    result = asyncio.run(
+        agent._execute_subtask_spec(
+            agent_module.SubtaskSpec(id="a", role="researcher", task="inspect")
+        )
+    )
+
+    assert result.ok is True
+    assert result.structured_content == {"summary": "done"}
+
+
+def test_execute_subtask_spec_passes_expected_output_and_constraints_to_spawn_agent(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    observed = {}
+
+    async def fake_call(tool_name, tool_input):
+        observed["tool_name"] = tool_name
+        observed["tool_input"] = dict(tool_input)
+        return json.dumps({"ok": True, "content": "done", "tool_calls_made": []})
+
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    asyncio.run(
+        agent._execute_subtask_spec(
+            agent_module.SubtaskSpec(
+                id="a",
+                role="implementer",
+                task="patch the file",
+                expected_output="Return a concise diff summary.",
+                output_contract={
+                    "format": "json",
+                    "required_keys": ["summary"],
+                },
+                write_scope=["agent/core/agent.py"],
+                capability_profile="implementation",
+            )
+        )
+    )
+
+    assert observed["tool_name"] == "spawn_agent"
+    assert observed["tool_input"] == {
+        "role": "implementer",
+        "task": "patch the file",
+        "expected_output": "Return a concise diff summary.",
+        "output_contract": {
+            "format": "json",
+            "required_keys": ["summary"],
+        },
+        "write_scope": ["agent/core/agent.py"],
+        "capability_profile": "implementation",
+    }
+
+
+def test_spawn_agent_enforces_write_scope_for_write_file(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    class _FakeMemory:
+        def write(self, *args, **kwargs):
+            return None
+
+        def read(self, *args, **kwargs):
+            return ""
+
+        def search(self, *args, **kwargs):
+            return []
+
+        def read_index(self):
+            return ""
+
+    registry = agent_module.ToolRegistry()
+    agent_module.BuiltinTools(_FakeMemory(), registry, workspace_root=tmp_path)
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt", workspace_root=tmp_path)
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        content = await self.registry.call(
+            "write_file",
+            {"path": "forbidden.txt", "content": "blocked"},
+        )
+        return agent_module.AgentResult(agent_id="sub", content=content)
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "implementer",
+                    "task": "edit a file",
+                    "capability_profile": "implementation",
+                    "write_scope": ["allowed.txt"],
+                },
+            )
+        )
+    )
+    write_payload = json.loads(payload["content"])
+
+    assert payload["ok"] is True
+    assert write_payload["ok"] is False
+    assert "write scope" in write_payload["error"].lower()
+
+
 def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch):
     import agent as agent_module
 
@@ -2023,6 +2902,87 @@ def test_send_message_emits_spawn_batch_events(monkeypatch):
     kinds = [event.kind for event in sink.events]
     assert "batch_started" in kinds
     assert "batch_finished" in kinds
+
+
+def test_send_message_emits_structured_orchestration_metrics(monkeypatch):
+    import agent as agent_module
+
+    class _Sink:
+        def __init__(self):
+            self.events = []
+
+        def on_subagent_event(self, event):
+            self.events.append(event)
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.max_parallel_agents = 2
+
+    spawn_tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "researcher", "task": "first"}),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-2",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "critic", "task": "second"}),
+            ),
+        ),
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls", agent_module._OAIMsg("", spawn_tool_calls)
+                    )
+                ]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_call(tool_name, tool_input):
+        await asyncio.sleep(0)
+        return json.dumps(
+            {
+                "ok": True,
+                "role": tool_input["role"],
+                "content": "done",
+                "tool_calls_made": [],
+            }
+        )
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    sink = _Sink()
+    token = agent_module._active_sink.set(sink)
+    try:
+        ctx = agent_module.AgentContext(system_prompt="system")
+        result = asyncio.run(agent.send_message(ctx, "run parallel agents"))
+    finally:
+        agent_module._active_sink.reset(token)
+
+    assert result.error is None
+    batch_finished = next(event for event in sink.events if event.kind == "batch_finished")
+    assert batch_finished.metrics["execution_mode"] == "parallel"
+    assert batch_finished.metrics["spec_count"] == 2
+    assert batch_finished.metrics["max_parallel_agents"] == 2
+    assert batch_finished.metrics["write_scope_check_seconds"] >= 0
+    assert batch_finished.metrics["duration_seconds"] >= 0
 
 
 def test_send_message_synthesizes_schedule_confirmation_when_model_returns_empty(
@@ -2363,6 +3323,56 @@ def test_base_agent_runs_internal_pipeline_with_summary_only(monkeypatch):
     assert observed_tasks["second"] == "judge\n\nUpstream summaries:\n- first: summary:first"
 
 
+def test_base_agent_runs_internal_pipeline_with_structured_upstream_results(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    observed_tasks = {}
+
+    async def fake_spawn(spec):
+        observed_tasks[spec.id] = spec.task
+        structured = {"summary": "done", "risks": []} if spec.id == "first" else None
+        return agent_module.SubtaskResult(
+            id=spec.id,
+            ok=True,
+            content=f"content:{spec.id}",
+            summary=f"summary:{spec.id}",
+            structured_content=structured,
+            tool_calls_made=["spawn_agent"],
+        )
+
+    monkeypatch.setattr(agent, "_execute_subtask_spec", fake_spawn)
+
+    results = asyncio.run(
+        agent.run_pipeline_subtasks(
+            [
+                agent_module.SubtaskSpec(id="first", role="researcher", task="collect"),
+                agent_module.SubtaskSpec(
+                    id="second",
+                    role="reviewer",
+                    task="judge",
+                    depends_on=["first"],
+                ),
+            ]
+        )
+    )
+
+    assert [result.id for result in results] == ["first", "second"]
+    assert observed_tasks["second"] == (
+        "judge\n\n"
+        "Upstream summaries:\n"
+        "- first: summary:first\n\n"
+        "Upstream structured results:\n"
+        '- first: {"risks": [], "summary": "done"}'
+    )
+
+
 def test_base_agent_runs_internal_rendezvous_with_lead_summary(monkeypatch):
     import agent as agent_module
 
@@ -2403,6 +3413,109 @@ def test_base_agent_runs_internal_rendezvous_with_lead_summary(monkeypatch):
     ]
     assert observed_tasks[2][1].startswith("analyze\n\nLead summary:\n")
     assert observed_tasks[3][1].startswith("challenge\n\nLead summary:\n")
+
+
+def test_base_agent_default_rendezvous_does_not_rebroadcast_raw_structured_results(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    observed_tasks = []
+
+    async def fake_spawn(spec):
+        observed_tasks.append((spec.id, spec.task))
+        round_label = "round-2" if "Lead summary" in spec.task else "round-1"
+        structured = (
+            {"position": spec.id, "confidence": 0.8} if round_label == "round-1" else None
+        )
+        return agent_module.SubtaskResult(
+            id=spec.id,
+            ok=True,
+            content=f"content:{spec.id}:{round_label}",
+            summary=f"summary:{spec.id}:{round_label}",
+            structured_content=structured,
+            tool_calls_made=["spawn_agent"],
+        )
+
+    monkeypatch.setattr(agent, "_execute_subtask_spec", fake_spawn)
+
+    results = asyncio.run(
+        agent.run_rendezvous_subtasks(
+            [
+                agent_module.SubtaskSpec(id="analyze", role="analyst", task="analyze"),
+                agent_module.SubtaskSpec(id="challenge", role="critic", task="challenge"),
+            ],
+            max_rounds=2,
+        )
+    )
+
+    assert len(results) == 4
+    assert "Lead structured results:" not in observed_tasks[2][1]
+    assert "Lead structured results:" not in observed_tasks[3][1]
+
+
+def test_base_agent_runs_internal_rendezvous_with_lead_selected_structured_results(
+    monkeypatch,
+):
+    import agent as agent_module
+    from agent.orchestration.runtime import RendezvousDirective
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    observed_tasks = []
+
+    async def fake_spawn(spec):
+        observed_tasks.append((spec.id, spec.task))
+        round_label = "round-2" if "Lead summary" in spec.task else "round-1"
+        structured = (
+            {"position": spec.id, "confidence": 0.8} if round_label == "round-1" else None
+        )
+        return agent_module.SubtaskResult(
+            id=spec.id,
+            ok=True,
+            content=f"content:{spec.id}:{round_label}",
+            summary=f"summary:{spec.id}:{round_label}",
+            structured_content=structured,
+            tool_calls_made=["spawn_agent"],
+        )
+
+    def fake_summarize(results):
+        return RendezvousDirective(
+            summary="focus the unresolved disagreement",
+            structured_context={
+                "focus": {
+                    "winner": "analyze",
+                    "needs_followup": True,
+                }
+            },
+        )
+
+    monkeypatch.setattr(agent, "_execute_subtask_spec", fake_spawn)
+    monkeypatch.setattr(agent, "_summarize_rendezvous_round", fake_summarize)
+
+    results = asyncio.run(
+        agent.run_rendezvous_subtasks(
+            [
+                agent_module.SubtaskSpec(id="analyze", role="analyst", task="analyze"),
+                agent_module.SubtaskSpec(id="challenge", role="critic", task="challenge"),
+            ],
+            max_rounds=2,
+        )
+    )
+
+    assert len(results) == 4
+    assert "Lead structured results:" in observed_tasks[2][1]
+    assert '- focus: {"needs_followup": true, "winner": "analyze"}' in observed_tasks[2][1]
+    assert '- analyze: {"confidence": 0.8, "position": "analyze"}' not in observed_tasks[2][1]
+    assert '- challenge: {"confidence": 0.8, "position": "challenge"}' not in observed_tasks[2][1]
 
 
 def test_send_message_auto_continues_openai_length_finish(monkeypatch):
