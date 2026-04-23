@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 import re
 import sys
@@ -55,6 +56,23 @@ memory_app = typer.Typer(help="Memory palace commands")
 app.add_typer(memory_app, name="memory")
 schedule_app = typer.Typer(help="Scheduled task commands")
 app.add_typer(schedule_app, name="schedule")
+
+_INTERACTION_LOGGER_NAMES = (
+    "agent.channels.base",
+    "agent.core.agent",
+    "channels.feishu",
+)
+
+
+def _configure_runtime_logging() -> None:
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    for logger_name in _INTERACTION_LOGGER_NAMES:
+        logging.getLogger(logger_name).setLevel(logging.INFO)
 
 async def _ralph_task_loop(
     agent: "BaseAgent",
@@ -915,6 +933,7 @@ def gateway():
         simple gateway
     """
     cfg, first_run = agent_module.load_config()
+    _configure_runtime_logging()
     if first_run:
         if not agent_module._first_run_setup():
             raise typer.Exit(0)

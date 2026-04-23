@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -469,6 +470,110 @@ def test_channel_runner_scopes_context_manager_per_chat():
     assert root_ctx_mgr.spawned["chat-b"].recorded_turns == [
         ("world", "reply:world", "cli")
     ]
+
+
+def test_channel_runner_emits_latency_trace(monkeypatch, caplog):
+    monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
+    caplog.set_level(logging.WARNING, logger="agent.channels.base")
+
+    class _TracingSink(OutputSink):
+        def __init__(self):
+            self.turns = []
+            self.drains = 0
+
+        def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
+            self.turns.append((full_text, tool_calls))
+
+        async def drain(self):
+            self.drains += 1
+
+    class _FakeAgent:
+        max_tokens = 1024
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            return agent_module.AgentResult(
+                agent_id="agent",
+                content=f"reply:{user_message}",
+            )
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": _FakeAgent(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+    sink = _TracingSink()
+
+    asyncio.run(
+        handler(
+            IncomingMessage(
+                text="hello",
+                channel_name="feishu",
+                metadata={"chat_id": "chat-a", "message_id": "msg-123"},
+            ),
+            sink,
+        )
+    )
+
+    assert "latency_trace component=channel_runner stage=message_handler_started" in caplog.text
+    assert "latency_trace component=channel_runner stage=agent_send_message_finished" in caplog.text
+    assert "latency_trace component=channel_runner stage=message_handler_finished" in caplog.text
+    assert "message_id=msg-123" in caplog.text
+
+
+def test_channel_runner_emits_interaction_logs(caplog):
+    caplog.set_level(logging.INFO, logger="agent.channels.base")
+
+    class _TracingSink(OutputSink):
+        def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
+            return None
+
+        async def drain(self):
+            return None
+
+    class _FakeAgent:
+        max_tokens = 1024
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            return agent_module.AgentResult(
+                agent_id="agent",
+                content=f"reply:{user_message}",
+            )
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": _FakeAgent(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+
+    asyncio.run(
+        handler(
+            IncomingMessage(
+                text="hello",
+                channel_name="feishu",
+                metadata={"chat_id": "chat-a", "message_id": "msg-123"},
+            ),
+            _TracingSink(),
+        )
+    )
+
+    assert "interaction component=channel_runner event=turn_started" in caplog.text
+    assert "interaction component=channel_runner event=agent_result_ready" in caplog.text
+    assert "interaction component=channel_runner event=turn_response_delivered" in caplog.text
+    assert "message_id=msg-123" in caplog.text
 
 
 def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):

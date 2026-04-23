@@ -50,7 +50,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
-from agent import _active_sink, _fmt_tool_inputs
+from agent import _active_sink, _fmt_tool_inputs, shared
 from agent.channels import Channel, IncomingMessage
 from agent.core import OutputSink, SubAgentProgressEvent
 
@@ -73,6 +73,21 @@ def build_feishu_client(config: "FeishuConfig") -> Any:
         .log_level(lark.LogLevel.WARNING)
         .build()
     )
+
+
+def _preview_text(text: object, limit: int = 80) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _interaction_log(event: str, **fields: object) -> None:
+    payload = shared._trace_fields(**fields)
+    message = f"interaction component=feishu_channel event={event}"
+    if payload:
+        message += f" {payload}"
+    logger.info(message)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -288,11 +303,13 @@ class FeishuOutputSink(OutputSink):
         reply_message_id: Optional[str] = None,
         output_dir: Optional[Path] = None,
         streaming: bool = True,
+        trace_id: Optional[str] = None,
     ) -> None:
         self._client = client
         self._receive_id_type = receive_id_type
         self._receive_id = receive_id
         self._reply_message_id = reply_message_id
+        self._trace_id = str(trace_id or reply_message_id or receive_id)
         self._output_dir = output_dir
         self.streaming = streaming
         self._chunks: list[str] = []
@@ -309,6 +326,30 @@ class FeishuOutputSink(OutputSink):
         self._attachments: list[Path] = []
         self._attachment_keys: set[str] = set()
 
+    def _trace_latency(self, stage: str, **fields: object) -> None:
+        if not shared._latency_trace_enabled():
+            return
+        payload = shared._trace_fields(
+            trace_id=self._trace_id,
+            receive_id=self._receive_id,
+            **fields,
+        )
+        message = f"latency_trace component=feishu_sink stage={stage}"
+        if payload:
+            message += f" {payload}"
+        logger.warning(message)
+
+    def _interaction_log(self, event: str, **fields: object) -> None:
+        payload = shared._trace_fields(
+            trace_id=self._trace_id,
+            receive_id=self._receive_id,
+            **fields,
+        )
+        message = f"interaction component=feishu_sink event={event}"
+        if payload:
+            message += f" {payload}"
+        logger.info(message)
+
     # ── OutputSink interface ──────────────────────────────────────────────────
 
     def on_stream_chunk(self, chunk: str) -> None:
@@ -319,7 +360,7 @@ class FeishuOutputSink(OutputSink):
             return
         if not self._stream_flush_pending:
             self._stream_flush_pending = True
-            self._schedule(self._flush_stream_async())
+            self._schedule(self._flush_stream_async(), label="flush_stream")
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
         text = full_text or "".join(self._chunks)
@@ -330,7 +371,7 @@ class FeishuOutputSink(OutputSink):
             or self._progress_buf.card_id
             or self._progress_buf.text.strip()
         ):
-            self._schedule(self._finish_turn_async(text))
+            self._schedule(self._finish_turn_async(text), label="finish_turn")
 
     def on_tool_start(self, name: str, inputs: dict) -> None:
         if name in self._SUPPRESSED_TOOL_HINTS:
@@ -342,9 +383,12 @@ class FeishuOutputSink(OutputSink):
             self._append_progress_text(f"**Tool Call**\n\n```text\n{hint}\n```")
             if not self._progress_flush_pending:
                 self._progress_flush_pending = True
-                self._schedule(self._flush_progress_async(force=True))
+                self._schedule(
+                    self._flush_progress_async(force=True),
+                    label="flush_progress",
+                )
             return
-        self._schedule(self._send_tool_hint_async(hint))
+        self._schedule(self._send_tool_hint_async(hint), label="send_tool_hint")
 
     def on_tool_end(self, name: str, result: str) -> None:
         if name != "write_file":
@@ -354,10 +398,16 @@ class FeishuOutputSink(OutputSink):
             self._queue_attachment(path)
 
     def on_tool_blocked(self, name: str, reason: str) -> None:
-        self._schedule(self._send_plain_async(f"🚫 Tool `{name}` blocked: {reason}"))
+        self._schedule(
+            self._send_plain_async(f"🚫 Tool `{name}` blocked: {reason}"),
+            label="send_blocked_notice",
+        )
 
     def on_error(self, error: str) -> None:
-        self._schedule(self._send_plain_async(f"❌ {error}"))
+        self._schedule(
+            self._send_plain_async(f"❌ {error}"),
+            label="send_error_notice",
+        )
 
     def on_subagent_event(self, event: SubAgentProgressEvent) -> None:
         if event.kind == "batch_started":
@@ -373,22 +423,22 @@ class FeishuOutputSink(OutputSink):
         if not line:
             return
         if not self.streaming:
-            self._schedule(self._send_plain_async(line))
+            self._schedule(self._send_plain_async(line), label="send_progress_plain")
             return
         if self._progress_disabled:
             return
         self._append_progress_text(line)
         if not self._progress_flush_pending:
             self._progress_flush_pending = True
-            self._schedule(self._flush_progress_async())
+            self._schedule(self._flush_progress_async(), label="flush_progress")
 
     def on_info(self, content: Any) -> None:
         if isinstance(content, str):
-            self._schedule(self._send_plain_async(content))
+            self._schedule(self._send_plain_async(content), label="send_info")
 
     def on_status(self, text: str, *, level: str = "info") -> None:
         if level in ("error", "warning"):
-            self._schedule(self._send_plain_async(text))
+            self._schedule(self._send_plain_async(text), label="send_status")
 
     def queue_attachment(self, path: Path) -> None:
         self._queue_attachment(path)
@@ -404,9 +454,15 @@ class FeishuOutputSink(OutputSink):
 
     # ── Internal scheduling ───────────────────────────────────────────────────
 
-    def _schedule(self, coro: Any) -> None:
+    def _schedule(self, coro: Any, *, label: str = "task") -> None:
         """Schedule a coroutine as a tracked asyncio task."""
         previous = self._send_tail
+        queued_at = time.perf_counter()
+        self._trace_latency(
+            "task_queued",
+            op=label,
+            pending_before=len(self._pending),
+        )
 
         async def _run_in_order() -> None:
             if previous is not None:
@@ -414,7 +470,22 @@ class FeishuOutputSink(OutputSink):
                     await previous
                 except BaseException:
                     pass
-            await coro
+            started_at = time.perf_counter()
+            self._trace_latency(
+                "task_started",
+                op=label,
+                queue_wait_ms=f"{(started_at - queued_at) * 1000:.1f}",
+            )
+            try:
+                await coro
+            finally:
+                finished_at = time.perf_counter()
+                self._trace_latency(
+                    "task_finished",
+                    op=label,
+                    run_ms=f"{(finished_at - started_at) * 1000:.1f}",
+                    total_ms=f"{(finished_at - queued_at) * 1000:.1f}",
+                )
 
         try:
             task = asyncio.ensure_future(_run_in_order())
@@ -428,6 +499,19 @@ class FeishuOutputSink(OutputSink):
     # ── Async send helpers ────────────────────────────────────────────────────
 
     async def _finish_turn_async(self, text: str) -> None:
+        started_at = time.perf_counter()
+        finish_mode = "attachments_only"
+        if self.streaming and (self._stream_buf.card_id or self._stream_buf.text.strip()):
+            finish_mode = "stream_finalize"
+        elif text.strip():
+            finish_mode = "send_response"
+        self._trace_latency(
+            "finish_turn_started",
+            mode=finish_mode,
+            text_len=len(text),
+            streaming=self.streaming,
+            attachment_count=len(self._attachments),
+        )
         try:
             if self.streaming and (
                 self._stream_buf.card_id or self._stream_buf.text.strip()
@@ -437,6 +521,13 @@ class FeishuOutputSink(OutputSink):
                 await self._send_response_async(text)
             await self._send_attachments_async()
         finally:
+            self._trace_latency(
+                "finish_turn_finished",
+                mode=finish_mode,
+                text_len=len(text),
+                streaming=self.streaming,
+                duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+            )
             self._progress_disabled = False
             self._last_batch_progress_key = None
             self._attachments = []
@@ -552,27 +643,40 @@ class FeishuOutputSink(OutputSink):
 
     async def _send_response_async(self, text: str) -> None:
         """Send the final response using the optimal Feishu message format."""
+        started_at = time.perf_counter()
         loop = asyncio.get_running_loop()
         fmt = self._detect_msg_format(text)
+        group_count = 1
 
-        if fmt == "text":
-            body = json.dumps({"text": text.strip()}, ensure_ascii=False)
-            await loop.run_in_executor(None, self._do_send, "text", body)
+        try:
+            if fmt == "text":
+                body = json.dumps({"text": text.strip()}, ensure_ascii=False)
+                await loop.run_in_executor(None, self._do_send, "text", body)
 
-        elif fmt == "post":
-            body = self._markdown_to_post(text)
-            await loop.run_in_executor(None, self._do_send, "post", body)
+            elif fmt == "post":
+                body = self._markdown_to_post(text)
+                await loop.run_in_executor(None, self._do_send, "post", body)
 
-        else:  # "interactive" — full card with table/heading support
-            elements = self._build_card_elements(text)
-            for group in self._split_elements_by_table_limit(elements):
-                card = {"config": {"wide_screen_mode": True}, "elements": group}
-                await loop.run_in_executor(
-                    None,
-                    self._do_send,
-                    "interactive",
-                    json.dumps(card, ensure_ascii=False),
-                )
+            else:  # "interactive" — full card with table/heading support
+                elements = self._build_card_elements(text)
+                groups = self._split_elements_by_table_limit(elements)
+                group_count = len(groups)
+                for group in groups:
+                    card = {"config": {"wide_screen_mode": True}, "elements": group}
+                    await loop.run_in_executor(
+                        None,
+                        self._do_send,
+                        "interactive",
+                        json.dumps(card, ensure_ascii=False),
+                    )
+        finally:
+            self._trace_latency(
+                "response_send_finished",
+                format=fmt,
+                text_len=len(text),
+                groups=group_count,
+                duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+            )
 
     async def _send_tool_hint_async(self, hint: str) -> None:
         """Send a 'Tool Call' code-block card so the user sees progress."""
@@ -599,9 +703,16 @@ class FeishuOutputSink(OutputSink):
         await loop.run_in_executor(None, self._do_send, "text", body)
 
     async def _send_file_async(self, file_path: Path) -> None:
+        started_at = time.perf_counter()
         path = Path(file_path)
         if not path.is_file():
             logger.warning("Feishu file send skipped, file not found: %s", path)
+            self._trace_latency(
+                "attachment_send_finished",
+                path=path,
+                result="missing",
+                duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+            )
             return
 
         loop = asyncio.get_running_loop()
@@ -615,6 +726,13 @@ class FeishuOutputSink(OutputSink):
                     "image",
                     json.dumps({"image_key": key}, ensure_ascii=False),
                 )
+            self._trace_latency(
+                "attachment_send_finished",
+                path=path,
+                kind="image",
+                uploaded=bool(key),
+                duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+            )
             return
 
         key = await loop.run_in_executor(None, self._upload_file_sync, path)
@@ -625,6 +743,13 @@ class FeishuOutputSink(OutputSink):
                 "file",
                 json.dumps({"file_key": key}, ensure_ascii=False),
             )
+        self._trace_latency(
+            "attachment_send_finished",
+            path=path,
+            kind="file",
+            uploaded=bool(key),
+            duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+        )
 
     def _queue_attachment(self, file_path: Path) -> None:
         try:
@@ -652,6 +777,8 @@ class FeishuOutputSink(OutputSink):
             CreateCardRequestBody,
         )
 
+        started_at = time.perf_counter()
+        card_id: str | None = None
         card_json = {
             "schema": "2.0",
             "config": {
@@ -701,6 +828,13 @@ class FeishuOutputSink(OutputSink):
         except Exception as exc:
             logger.warning("Feishu streaming card create error: %s", exc)
             return None
+        finally:
+            self._trace_latency(
+                "stream_card_create_finished",
+                card_id=card_id,
+                success=bool(card_id),
+                duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+            )
 
     def _stream_update_text_sync(
         self, card_id: str, content: str, sequence: int
@@ -710,6 +844,8 @@ class FeishuOutputSink(OutputSink):
             ContentCardElementRequestBody,
         )
 
+        started_at = time.perf_counter()
+        success = False
         try:
             req = (
                 ContentCardElementRequest.builder()
@@ -732,10 +868,20 @@ class FeishuOutputSink(OutputSink):
                     resp.msg,
                 )
                 return False
+            success = True
             return True
         except Exception as exc:
             logger.warning("Feishu stream update error: %s", exc)
             return False
+        finally:
+            self._trace_latency(
+                "stream_card_update_finished",
+                card_id=card_id,
+                sequence=sequence,
+                content_len=len(content),
+                success=success,
+                duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+            )
 
     def _close_streaming_mode_sync(self, card_id: str, sequence: int) -> bool:
         from lark_oapi.api.cardkit.v1 import (  # type: ignore[import]
@@ -744,6 +890,8 @@ class FeishuOutputSink(OutputSink):
         )
 
         settings_payload = json.dumps({"config": {"streaming_mode": False}})
+        started_at = time.perf_counter()
+        success = False
         try:
             req = (
                 SettingsCardRequest.builder()
@@ -766,10 +914,19 @@ class FeishuOutputSink(OutputSink):
                     resp.msg,
                 )
                 return False
+            success = True
             return True
         except Exception as exc:
             logger.warning("Feishu close streaming error: %s", exc)
             return False
+        finally:
+            self._trace_latency(
+                "stream_card_close_finished",
+                card_id=card_id,
+                sequence=sequence,
+                success=success,
+                duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+            )
 
     def _upload_image_sync(self, file_path: Path) -> str | None:
         from lark_oapi.api.im.v1 import (  # type: ignore[import]
@@ -1022,30 +1179,43 @@ class FeishuOutputSink(OutputSink):
             ReplyMessageRequestBody,
         )
 
+        started_at = time.perf_counter()
+        route = "create"
+        fallback = False
+        success = False
+        error: str | None = None
         # First message of this response: try to reply to the user's message
         # so Feishu shows a thread/quote context.
-        if self._reply_message_id and self._first_reply:
-            self._first_reply = False
-            try:
-                req = (
-                    ReplyMessageRequest.builder()
-                    .message_id(self._reply_message_id)
-                    .request_body(
-                        ReplyMessageRequestBody.builder()
-                        .msg_type(msg_type)
-                        .content(content)
+        try:
+            if self._reply_message_id and self._first_reply:
+                route = "reply"
+                self._first_reply = False
+                try:
+                    req = (
+                        ReplyMessageRequest.builder()
+                        .message_id(self._reply_message_id)
+                        .request_body(
+                            ReplyMessageRequestBody.builder()
+                            .msg_type(msg_type)
+                            .content(content)
+                            .build()
+                        )
                         .build()
                     )
-                    .build()
-                )
-                resp = self._client.im.v1.message.reply(req)
-                if resp.success():
-                    return
-                logger.debug("Feishu reply failed (%s), falling back to send", resp.msg)
-            except Exception as exc:
-                logger.debug("Feishu reply error: %s", exc)
+                    resp = self._client.im.v1.message.reply(req)
+                    if resp.success():
+                        success = True
+                        return
+                    fallback = True
+                    logger.debug(
+                        "Feishu reply failed (%s), falling back to send",
+                        resp.msg,
+                    )
+                except Exception as exc:
+                    fallback = True
+                    logger.debug("Feishu reply error: %s", exc)
 
-        try:
+            route = "create"
             req = (
                 CreateMessageRequest.builder()
                 .receive_id_type(self._receive_id_type)
@@ -1066,8 +1236,30 @@ class FeishuOutputSink(OutputSink):
                     resp.msg,
                     resp.get_log_id(),
                 )
+                return
+            success = True
         except Exception as exc:
+            error = str(exc)
             logger.error("Feishu send error: %s", exc)
+        finally:
+            if success:
+                self._interaction_log(
+                    "message_sent",
+                    route=route,
+                    fallback=fallback,
+                    msg_type=msg_type,
+                    content_len=len(content),
+                    duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+                )
+            self._trace_latency(
+                "do_send_finished",
+                route=route,
+                fallback=fallback,
+                msg_type=msg_type,
+                success=success,
+                error=error,
+                duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
+            )
 
     # ── Format detection ──────────────────────────────────────────────────────
 
@@ -1384,6 +1576,7 @@ class FeishuChannel(Channel):
             receive_id_type=receive_id_type,
             receive_id=chat_id,
             reply_message_id=msg.metadata.get("message_id"),
+            trace_id=msg.metadata.get("message_id"),
             output_dir=self._output_dir,
             streaming=self._config.streaming,
         )
@@ -1430,6 +1623,14 @@ class FeishuChannel(Channel):
             chat_id: str = message.chat_id
             chat_type: str = message.chat_type
             msg_type: str = message.message_type
+            _interaction_log(
+                "message_received",
+                message_id=message_id,
+                sender_id=sender_id,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                msg_type=msg_type,
+            )
 
             # ── Allow-list check ─────────────────────────────────────────────
             if self._config.allow_from and sender_id not in self._config.allow_from:
@@ -1491,9 +1692,25 @@ class FeishuChannel(Channel):
                     "msg_type": msg_type,
                 },
             )
+            _interaction_log(
+                "message_accepted",
+                message_id=message_id,
+                sender_id=sender_id,
+                chat_id=reply_to,
+                chat_type=chat_type,
+                msg_type=msg_type,
+                text_len=len(content),
+                text_preview=_preview_text(content),
+            )
 
             if content.startswith("/send "):
                 requested = content[len("/send ") :].strip()
+                _interaction_log(
+                    "send_command_received",
+                    message_id=message_id,
+                    chat_id=reply_to,
+                    requested_path=requested,
+                )
                 sink = self.create_sink(msg_obj)
                 path = self._resolve_send_path(requested)
                 if path is None or not path.is_file():
@@ -1508,9 +1725,16 @@ class FeishuChannel(Channel):
                 lock = self._chat_locks.setdefault(reply_to, asyncio.Lock())
                 async with lock:
                     sink = self.create_sink(msg_obj)
+                    _interaction_log(
+                        "message_dispatched",
+                        message_id=message_id,
+                        chat_id=reply_to,
+                        sink=type(sink).__name__,
+                    )
                     await self._handler(msg_obj, sink)
 
         except Exception as exc:
+            _interaction_log("message_processing_failed", error=str(exc))
             logger.error("Feishu: error processing message: %s", exc)
 
     # ── Helpers ───────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -2985,6 +2986,94 @@ def test_send_message_emits_structured_orchestration_metrics(monkeypatch):
     assert batch_finished.metrics["duration_seconds"] >= 0
 
 
+def test_send_message_emits_latency_trace(monkeypatch, caplog):
+    import agent as agent_module
+
+    monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
+    caplog.set_level(logging.WARNING, logger="agent.core.agent")
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "researcher", "task": "first"}),
+            ),
+        )
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls", agent_module._OAIMsg("", tool_calls)
+                    )
+                ]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_call(tool_name, tool_input):
+        return json.dumps({"ok": True, "role": tool_input["role"]})
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "run parallel agents"))
+
+    assert result.error is None
+    assert "latency_trace component=agent stage=send_message_started" in caplog.text
+    assert "latency_trace component=agent stage=model_response_received" in caplog.text
+    assert "latency_trace component=agent stage=tool_uses_finished" in caplog.text
+    assert "latency_trace component=agent stage=send_message_finished" in caplog.text
+    assert f"agent_id={ctx.agent_id}" in caplog.text
+
+
+def test_send_message_emits_interaction_logs(monkeypatch, caplog):
+    import agent as agent_module
+
+    caplog.set_level(logging.INFO, logger="agent.core.agent")
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "hello world"))
+
+    assert result.error is None
+    assert "interaction component=agent event=turn_started" in caplog.text
+    assert "interaction component=agent event=turn_finished" in caplog.text
+    assert f"agent_id={ctx.agent_id}" in caplog.text
+    assert "message_len=11" in caplog.text
+    assert "content_len=5" in caplog.text
+
+
 def test_send_message_synthesizes_schedule_confirmation_when_model_returns_empty(
     monkeypatch,
 ):
@@ -3795,6 +3884,41 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
 
     assert observed["primary"] is primary_components
     assert observed["scheduler"] is primary_components
+
+
+def test_configure_runtime_logging_enables_interaction_loggers(monkeypatch):
+    import agent.cli as cli_module
+
+    calls = {}
+
+    def fake_basic_config(**kwargs):
+        calls.update(kwargs)
+
+    root_logger = logging.getLogger()
+    original_root_handlers = list(root_logger.handlers)
+    original_levels = {
+        name: logging.getLogger(name).level
+        for name in (
+            "agent.channels.base",
+            "agent.core.agent",
+            "channels.feishu",
+        )
+    }
+    try:
+        root_logger.handlers.clear()
+        monkeypatch.setattr(cli_module.logging, "basicConfig", fake_basic_config)
+
+        cli_module._configure_runtime_logging()
+
+        assert calls["level"] == logging.INFO
+        assert calls["format"]
+        assert logging.getLogger("agent.channels.base").level == logging.INFO
+        assert logging.getLogger("agent.core.agent").level == logging.INFO
+        assert logging.getLogger("channels.feishu").level == logging.INFO
+    finally:
+        root_logger.handlers[:] = original_root_handlers
+        for name, level in original_levels.items():
+            logging.getLogger(name).setLevel(level)
 
 
 def test_stream_response_propagates_stream_failures():

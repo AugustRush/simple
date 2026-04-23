@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import uuid
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ MAX_TOOL_CALL_ITERATIONS = 40
 REGULAR_TOOL_TIMEOUT = 120
 
 CONTEXT_DIR = AGENT_HOME / "context"
+LATENCY_TRACE_ENV_VAR = "SIMPLE_TRACE_LATENCY"
 MAX_CATEGORIES = 15
 MIN_IMPORTANCE = 0.05
 CHARS_PER_TOKEN = 4
@@ -94,6 +96,25 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> Non
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(content, encoding=encoding)
     tmp.replace(path)
+
+
+def _latency_trace_enabled() -> bool:
+    raw = os.environ.get(LATENCY_TRACE_ENV_VAR, "")
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _trace_fields(**fields: object) -> str:
+    parts: list[str] = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = str(value).replace("\n", "\\n")
+        if not text:
+            continue
+        if any(ch.isspace() for ch in text):
+            text = repr(text)
+        parts.append(f"{key}={text}")
+    return " ".join(parts)
 
 
 def _is_safe_prompt_version(version: str) -> bool:
@@ -178,6 +199,7 @@ __all__ = [
     "MAX_TOOL_CALL_ITERATIONS",
     "REGULAR_TOOL_TIMEOUT",
     "CONTEXT_DIR",
+    "LATENCY_TRACE_ENV_VAR",
     "MAX_CATEGORIES",
     "MIN_IMPORTANCE",
     "CHARS_PER_TOKEN",
@@ -197,6 +219,8 @@ __all__ = [
     "CONSOLE",
     "_new_id",
     "_atomic_write_text",
+    "_latency_trace_enabled",
+    "_trace_fields",
     "_is_safe_prompt_version",
     "_with_task_context",
     "_OAIFunc",

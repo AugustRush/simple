@@ -6,6 +6,7 @@ import copy
 from dataclasses import dataclass, field
 import inspect
 import json
+import logging
 from pathlib import Path
 import re
 import time
@@ -33,6 +34,32 @@ from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
+logger = logging.getLogger(__name__)
+
+
+def _trace_latency(stage: str, **fields: object) -> None:
+    if not shared._latency_trace_enabled():
+        return
+    payload = shared._trace_fields(**fields)
+    message = f"latency_trace component=agent stage={stage}"
+    if payload:
+        message += f" {payload}"
+    logger.warning(message)
+
+
+def _preview_text(text: object, limit: int = 80) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _interaction_log(event: str, **fields: object) -> None:
+    payload = shared._trace_fields(**fields)
+    message = f"interaction component=agent event={event}"
+    if payload:
+        message += f" {payload}"
+    logger.info(message)
 
 @dataclass
 class AgentContext:
@@ -1282,6 +1309,25 @@ class BaseAgent:
         tool_calls_made: list[str] = []
         tool_result_history: list[tuple[str, str]] = []
         result_text = ""
+        turn_started_at = time.perf_counter()
+        trace_status = "ok"
+        trace_error: str | None = None
+        trace_iterations = 0
+        _interaction_log(
+            "turn_started",
+            agent_id=ctx.agent_id,
+            tools_enabled=ctx.tools_enabled,
+            stream=bool(stream_callback),
+            message_len=len(user_message),
+            message_preview=_preview_text(user_message),
+        )
+        _trace_latency(
+            "send_message_started",
+            agent_id=ctx.agent_id,
+            tools_enabled=ctx.tools_enabled,
+            stream=bool(stream_callback),
+            message_len=len(user_message),
+        )
 
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
@@ -1322,19 +1368,23 @@ class BaseAgent:
 
             # D1: bounded tool-call loop — prevents infinite model loops
             for _iteration in range(shared.MAX_TOOL_CALL_ITERATIONS + 1):
+                trace_iterations = _iteration + 1
                 if _iteration == shared.MAX_TOOL_CALL_ITERATIONS:
+                    trace_status = "tool_loop_exceeded"
+                    trace_error = (
+                        f"Tool-call loop exceeded {shared.MAX_TOOL_CALL_ITERATIONS} "
+                        "iterations; possible model loop detected."
+                    )
                     return AgentResult(
                         agent_id=ctx.agent_id,
                         content=result_text,
                         tool_calls_made=tool_calls_made,
-                        error=(
-                            f"Tool-call loop exceeded {shared.MAX_TOOL_CALL_ITERATIONS} "
-                            "iterations; possible model loop detected."
-                        ),
+                        error=trace_error,
                     )
                 tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
 
                 try:
+                    response_started_at = time.perf_counter()
                     if stream_callback:
                         # Stream for display AND use the full response for tool detection.
                         response, streamed_text = await self._stream_response(
@@ -1344,6 +1394,23 @@ class BaseAgent:
                         response = await self._create(ctx, tools)
                         streamed_text = ""
                     stop_reason, text, tool_uses = self._parse_response(response)
+                    _trace_latency(
+                        "model_response_received",
+                        agent_id=ctx.agent_id,
+                        iteration=_iteration + 1,
+                        stop_reason=stop_reason,
+                        tool_uses=len(tool_uses),
+                        duration_ms=f"{(time.perf_counter() - response_started_at) * 1000:.1f}",
+                    )
+                    if tool_uses:
+                        _interaction_log(
+                            "tool_batch_requested",
+                            agent_id=ctx.agent_id,
+                            iteration=_iteration + 1,
+                            stop_reason=stop_reason,
+                            tool_uses=len(tool_uses),
+                            tool_names=",".join(tu["name"] for tu in tool_uses[:5]),
+                        )
 
                     if stop_reason == "tool_use" and tool_uses:
                         # M4: only update result_text from the parsed text field;
@@ -1353,9 +1420,30 @@ class BaseAgent:
                         ctx.messages.append(self._assistant_message(response, text))
 
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
+                        tool_use_started_at = time.perf_counter()
                         results = await self._run_tool_uses(
                             tool_uses,
                             orchestration_decision=orchestration_decision,
+                        )
+                        _trace_latency(
+                            "tool_uses_finished",
+                            agent_id=ctx.agent_id,
+                            iteration=_iteration + 1,
+                            total_tool_uses=len(tool_uses),
+                            spawn_calls=sum(
+                                1 for tool_use in tool_uses if tool_use["name"] == "spawn_agent"
+                            ),
+                            regular_calls=sum(
+                                1 for tool_use in tool_uses if tool_use["name"] != "spawn_agent"
+                            ),
+                            duration_ms=f"{(time.perf_counter() - tool_use_started_at) * 1000:.1f}",
+                        )
+                        _interaction_log(
+                            "tool_batch_finished",
+                            agent_id=ctx.agent_id,
+                            iteration=_iteration + 1,
+                            tool_uses=len(tool_uses),
+                            duration_ms=f"{(time.perf_counter() - tool_use_started_at) * 1000:.1f}",
                         )
                         tool_result_history.extend(
                             (tu["name"], res) for tu, res in zip(tool_uses, results)
@@ -1384,6 +1472,8 @@ class BaseAgent:
                                 "role": "assistant",
                                 "content": result_text,
                             }
+                            trace_status = "continuation_error"
+                            trace_error = continuation_error
                             return AgentResult(
                                 agent_id=ctx.agent_id,
                                 content=result_text,
@@ -1393,13 +1483,35 @@ class BaseAgent:
                         break
 
                 except Exception as e:
+                    trace_status = "exception"
+                    trace_error = self._format_agent_error(e)
                     return AgentResult(
                         agent_id=ctx.agent_id,
                         content="",
                         tool_calls_made=tool_calls_made,
-                        error=self._format_agent_error(e),
+                        error=trace_error,
                     )
         finally:
+            _interaction_log(
+                "turn_finished",
+                agent_id=ctx.agent_id,
+                status=trace_status,
+                error=trace_error,
+                iterations=trace_iterations,
+                tool_calls=len(tool_calls_made),
+                content_len=len(result_text),
+                content_preview=_preview_text(result_text),
+                duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
+            )
+            _trace_latency(
+                "send_message_finished",
+                agent_id=ctx.agent_id,
+                status=trace_status,
+                error=trace_error,
+                iterations=trace_iterations,
+                tool_calls=len(tool_calls_made),
+                duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
+            )
             # Always restore the original system prompt and pop the context stack.
             ctx.system_prompt = original_system
             if self._context_stack and self._context_stack[-1] is ctx:

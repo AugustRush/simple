@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -9,8 +11,36 @@ from typing import Any, Callable
 
 from rich.console import Console
 
+from agent import shared
 from agent.core.output import CliOutputSink, OutputSink, _active_sink
 from agent.tools.runtime import _active_schedule_target
+
+logger = logging.getLogger(__name__)
+
+
+def _trace_latency(stage: str, **fields: object) -> None:
+    if not shared._latency_trace_enabled():
+        return
+    payload = shared._trace_fields(**fields)
+    message = f"latency_trace component=channel_runner stage={stage}"
+    if payload:
+        message += f" {payload}"
+    logger.warning(message)
+
+
+def _preview_text(text: object, limit: int = 80) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _interaction_log(event: str, **fields: object) -> None:
+    payload = shared._trace_fields(**fields)
+    message = f"interaction component=channel_runner event={event}"
+    if payload:
+        message += f" {payload}"
+    logger.info(message)
 
 
 def _new_id() -> str:
@@ -200,6 +230,7 @@ class ChannelRunner:
         async def _handle(msg: IncomingMessage, sink: OutputSink) -> bool:
             import agent as agent_module
 
+            turn_started_at = time.perf_counter()
             session_id = msg.metadata.get("chat_id") or msg.session_id
             agent = components["agent"]
             skill_catalog = components["skill_catalog"]
@@ -228,17 +259,81 @@ class ChannelRunner:
                     }
                 )
             try:
+                _interaction_log(
+                    "turn_started",
+                    session_id=session_id,
+                    channel=msg.channel_name,
+                    message_id=msg.metadata.get("message_id"),
+                    chat_id=msg.metadata.get("chat_id"),
+                    text_len=len(msg.text),
+                    text_preview=_preview_text(msg.text),
+                )
+                _trace_latency(
+                    "message_handler_started",
+                    session_id=session_id,
+                    channel=msg.channel_name,
+                    message_id=msg.metadata.get("message_id"),
+                    chat_id=msg.metadata.get("chat_id"),
+                    sink=type(sink).__name__,
+                    text_len=len(msg.text),
+                )
+                agent_started_at = time.perf_counter()
                 result = await agent.send_message(
                     ctx, msg.text, stream_callback=sink.sync_stream_cb
                 )
+                _trace_latency(
+                    "agent_send_message_finished",
+                    session_id=session_id,
+                    message_id=msg.metadata.get("message_id"),
+                    duration_ms=f"{(time.perf_counter() - agent_started_at) * 1000:.1f}",
+                    tool_calls=len(result.tool_calls_made),
+                    error=bool(result.error),
+                )
+                _interaction_log(
+                    "agent_result_ready",
+                    session_id=session_id,
+                    message_id=msg.metadata.get("message_id"),
+                    duration_ms=f"{(time.perf_counter() - agent_started_at) * 1000:.1f}",
+                    tool_calls=len(result.tool_calls_made),
+                    error=bool(result.error),
+                    content_len=len(result.content or ""),
+                    content_preview=_preview_text(result.content or ""),
+                )
+                sink_started_at = time.perf_counter()
                 sink.on_turn_complete(result.content or "", result.tool_calls_made)
                 if hasattr(sink, "drain"):
                     await sink.drain()
+                _trace_latency(
+                    "sink_turn_complete_finished",
+                    session_id=session_id,
+                    message_id=msg.metadata.get("message_id"),
+                    duration_ms=f"{(time.perf_counter() - sink_started_at) * 1000:.1f}",
+                )
+                _interaction_log(
+                    "turn_response_delivered",
+                    session_id=session_id,
+                    message_id=msg.metadata.get("message_id"),
+                    duration_ms=f"{(time.perf_counter() - sink_started_at) * 1000:.1f}",
+                )
 
                 if result.error:
+                    error_started_at = time.perf_counter()
                     sink.on_error(result.error)
                     if hasattr(sink, "drain"):
                         await sink.drain()
+                    _trace_latency(
+                        "sink_error_finished",
+                        session_id=session_id,
+                        message_id=msg.metadata.get("message_id"),
+                        duration_ms=f"{(time.perf_counter() - error_started_at) * 1000:.1f}",
+                    )
+                    _interaction_log(
+                        "turn_error_reported",
+                        session_id=session_id,
+                        message_id=msg.metadata.get("message_id"),
+                        duration_ms=f"{(time.perf_counter() - error_started_at) * 1000:.1f}",
+                        error=result.error,
+                    )
 
                 state["tools_used"].extend(result.tool_calls_made)
                 state["turn_count"] += 1
@@ -281,10 +376,25 @@ class ChannelRunner:
                             memory_worker.wake()
 
             except Exception as exc:
+                _interaction_log(
+                    "turn_failed",
+                    session_id=session_id,
+                    channel=msg.channel_name,
+                    message_id=msg.metadata.get("message_id"),
+                    error=str(exc),
+                )
                 sink.on_error(str(exc))
                 if hasattr(sink, "drain"):
                     await sink.drain()
             finally:
+                _trace_latency(
+                    "message_handler_finished",
+                    session_id=session_id,
+                    channel=msg.channel_name,
+                    message_id=msg.metadata.get("message_id"),
+                    duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
+                    turn_count=state.get("turn_count", 0),
+                )
                 _active_sink.reset(token)
                 if schedule_target_token is not None:
                     _active_schedule_target.reset(schedule_target_token)

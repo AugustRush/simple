@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from dataclasses import asdict
 from typing import Any
@@ -559,6 +560,71 @@ def test_feishu_sink_subagent_event_schedules_process_card_update():
         loop.run_until_complete(_run())
     finally:
         loop.close()
+
+
+def test_feishu_sink_latency_trace_logs_scheduled_work(monkeypatch, caplog):
+    monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
+    caplog.set_level(logging.WARNING, logger="channels.feishu")
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="agent_started",
+                        role="researcher",
+                        task="inspect code",
+                    )
+                )
+                await sink.drain()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    assert "latency_trace component=feishu_sink stage=task_queued" in caplog.text
+    assert "latency_trace component=feishu_sink stage=task_finished" in caplog.text
+    assert "trace_id=msg_001" in caplog.text
+    assert "op=flush_progress" in caplog.text
+
+
+def test_feishu_sink_latency_trace_logs_finish_turn(monkeypatch, caplog):
+    monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
+    caplog.set_level(logging.WARNING, logger="channels.feishu")
+    sink = _make_feishu_sink()
+    sink.streaming = False
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_send_response_async",
+                new=AsyncMock(),
+            ) as mock_send, patch.object(
+                sink,
+                "_send_attachments_async",
+                new=AsyncMock(),
+            ) as mock_attachments:
+                await sink._finish_turn_async("hello")
+                mock_send.assert_awaited_once_with("hello")
+                mock_attachments.assert_awaited_once()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    assert "latency_trace component=feishu_sink stage=finish_turn_started" in caplog.text
+    assert "latency_trace component=feishu_sink stage=finish_turn_finished" in caplog.text
+    assert "trace_id=msg_001" in caplog.text
+    assert "text_len=5" in caplog.text
 
 
 def test_feishu_sink_dedupes_duplicate_batch_progress_events():
@@ -1167,6 +1233,39 @@ def test_feishu_sink_reply_used_first_then_create():
     assert sink._first_reply is False  # consumed
 
 
+def test_feishu_sink_latency_trace_logs_api_send(monkeypatch, caplog):
+    monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
+    caplog.set_level(logging.WARNING, logger="channels.feishu")
+    sink = _make_feishu_sink()
+
+    mock_resp = MagicMock()
+    mock_resp.success.return_value = True
+    sink._client.im.v1.message.reply.return_value = mock_resp
+
+    sink._do_send("text", '{"text":"hi"}')
+
+    assert "latency_trace component=feishu_sink stage=do_send_finished" in caplog.text
+    assert "trace_id=msg_001" in caplog.text
+    assert "route=reply" in caplog.text
+    assert "msg_type=text" in caplog.text
+
+
+def test_feishu_sink_logs_send_success(caplog):
+    caplog.set_level(logging.INFO, logger="channels.feishu")
+    sink = _make_feishu_sink()
+
+    mock_resp = MagicMock()
+    mock_resp.success.return_value = True
+    sink._client.im.v1.message.reply.return_value = mock_resp
+
+    sink._do_send("text", '{"text":"hi"}')
+
+    assert "interaction component=feishu_sink event=message_sent" in caplog.text
+    assert "trace_id=msg_001" in caplog.text
+    assert "route=reply" in caplog.text
+    assert "msg_type=text" in caplog.text
+
+
 def test_feishu_sink_skips_large_file_upload_with_clear_log(tmp_path, caplog):
     sink = _make_feishu_sink()
     target = tmp_path / "movie.mp4"
@@ -1381,6 +1480,50 @@ def test_feishu_channel_send_command_uses_output_dir(tmp_path):
         loop.run_until_complete(_run())
     finally:
         loop.close()
+
+
+def test_feishu_channel_logs_received_message(caplog):
+    caplog.set_level(logging.INFO, logger="channels.feishu")
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._handler = AsyncMock()
+    mock_sink = MagicMock()
+
+    message = MagicMock()
+    message.message_id = "msg_123"
+    message.chat_id = "ou_sender"
+    message.chat_type = "p2p"
+    message.message_type = "text"
+    message.content = json.dumps({"text": "hello logger"})
+    message.mentions = []
+
+    sender = MagicMock()
+    sender.sender_type = "user"
+    sender.sender_id.open_id = "ou_sender"
+
+    data = MagicMock()
+    data.event.message = message
+    data.event.sender = sender
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+                channel,
+                "create_sink",
+                return_value=mock_sink,
+            ):
+                await channel._on_message(data)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    assert "interaction component=feishu_channel event=message_received" in caplog.text
+    assert "interaction component=feishu_channel event=message_dispatched" in caplog.text
+    assert "message_id=msg_123" in caplog.text
+    assert "text_len=12" in caplog.text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
