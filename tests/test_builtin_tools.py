@@ -7,6 +7,21 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_scheduler_state(monkeypatch, tmp_path):
+    import agent.shared as shared_module
+
+    agent_home = tmp_path / ".agent"
+    monkeypatch.setattr(shared_module, "AGENT_HOME", agent_home)
+    monkeypatch.setattr(shared_module, "DEFAULT_OUTPUT_DIR", agent_home / "output")
+    monkeypatch.setattr(shared_module, "SCHEDULER_DIR", agent_home / "tasks")
+    monkeypatch.setattr(
+        shared_module,
+        "SCHEDULER_DB_FILE",
+        agent_home / "tasks" / "scheduler.db",
+    )
+
+
 def make_builtin_tools(tmp_path):
     from agent import BuiltinTools, MemoryPalace, ToolRegistry
 
@@ -667,6 +682,29 @@ def test_schedule_create_defaults_to_standalone_without_active_target(tmp_path):
     assert payload["ok"] is True
     assert payload["task"]["kind"] == "message"
     assert payload["task"]["delivery_mode"] == "standalone"
+
+
+def test_schedule_create_uses_isolated_scheduler_db_in_tests(tmp_path):
+    import agent.shared as shared_module
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(
+        registry.call(
+            "schedule_create",
+            {
+                "name": "isolated-reminder",
+                "trigger_type": "once",
+                "prompt": "测试隔离",
+                "at": "2026-04-20T10:00:00+08:00",
+                "timezone_name": "Asia/Shanghai",
+            },
+        )
+    )
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["task"]["db_path"] == str(shared_module.SCHEDULER_DB_FILE)
 
 
 def test_send_file_queues_attachment_on_active_sink(tmp_path):
