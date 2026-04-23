@@ -585,6 +585,214 @@ def test_feishu_sink_dedupes_duplicate_batch_progress_events():
         loop.close()
 
 
+def test_feishu_sink_parallel_batch_started_uses_mode_aware_summary():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="batch_started",
+                        total=3,
+                        metrics={
+                            "execution_mode": "parallel",
+                            "spec_count": 3,
+                            "max_parallel_agents": 2,
+                        },
+                    )
+                )
+                await sink.drain()
+
+            assert "Parallel batch: 3 subtasks, max concurrency 2" in sink._progress_buf.text
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_parallel_batch_finished_shows_detailed_metrics():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="batch_finished",
+                        completed=3,
+                        total=3,
+                        metrics={
+                            "execution_mode": "parallel",
+                            "spec_count": 3,
+                            "duration_seconds": 1.24,
+                            "write_scope_check_seconds": 0.004,
+                        },
+                    )
+                )
+                await sink.drain()
+
+            assert (
+                "Parallel batch finished: 3/3 in 1.24s (scope check 0.004s)"
+                in sink._progress_buf.text
+            )
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_pipeline_batch_finished_shows_stage_count():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="batch_finished",
+                        completed=3,
+                        total=3,
+                        metrics={
+                            "execution_mode": "pipeline",
+                            "spec_count": 3,
+                            "stage_count": 2,
+                            "duration_seconds": 1.02,
+                        },
+                    )
+                )
+                await sink.drain()
+
+            assert (
+                "Pipeline batch finished: 3/3 across 2 stages in 1.02s"
+                in sink._progress_buf.text
+            )
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_pipeline_batch_finished_marks_early_stop():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="batch_finished",
+                        completed=2,
+                        total=3,
+                        metrics={
+                            "execution_mode": "pipeline",
+                            "spec_count": 3,
+                            "stage_count": 2,
+                            "duration_seconds": 0.88,
+                        },
+                    )
+                )
+                await sink.drain()
+
+            assert (
+                "Pipeline batch ended early: 2/3 across 2 stages in 0.88s"
+                in sink._progress_buf.text
+            )
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_rendezvous_batch_finished_shows_rounds():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="batch_finished",
+                        completed=2,
+                        total=2,
+                        metrics={
+                            "execution_mode": "rendezvous",
+                            "spec_count": 2,
+                            "rounds_completed": 2,
+                            "duration_seconds": 1.88,
+                        },
+                    )
+                )
+                await sink.drain()
+
+            assert (
+                "Rendezvous batch finished: 2 subtasks, 2 rounds in 1.88s"
+                in sink._progress_buf.text
+            )
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_batch_events_fall_back_without_metrics():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="batch_finished",
+                        completed=2,
+                        total=3,
+                    )
+                )
+                await sink.drain()
+
+            assert "Sub-agent batch finished: 2/3" in sink._progress_buf.text
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
 def test_feishu_sink_tool_start_always_uses_progress_card_when_streaming():
     sink = _make_feishu_sink()
     sink.streaming = True

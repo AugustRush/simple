@@ -369,7 +369,7 @@ class FeishuOutputSink(OutputSink):
             self._last_batch_progress_key = key
         elif event.kind == "batch_finished":
             self._last_batch_progress_key = None
-        line = self._format_subagent_event(event)
+        line = self._format_mode_aware_subagent_event(event)
         if not line:
             return
         if not self.streaming:
@@ -883,6 +883,116 @@ class FeishuOutputSink(OutputSink):
             self._progress_buf.text = "## Multi-Agent Progress\n\n" + line
             return
         self._progress_buf.text += "\n\n" + line
+
+    def _format_mode_aware_subagent_event(self, event: SubAgentProgressEvent) -> str:
+        if event.kind == "batch_started":
+            formatted = self._format_batch_started_event(event)
+            if formatted:
+                return formatted
+        if event.kind == "batch_finished":
+            formatted = self._format_batch_finished_event(event)
+            if formatted:
+                return formatted
+        return self._format_subagent_event(event)
+
+    @staticmethod
+    def _positive_int(value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            candidate = int(value)
+            return candidate if candidate > 0 else None
+        return None
+
+    @classmethod
+    def _event_spec_count(cls, event: SubAgentProgressEvent) -> int | None:
+        return cls._positive_int(event.metrics.get("spec_count")) or cls._positive_int(
+            event.total
+        )
+
+    @classmethod
+    def _format_seconds(cls, value: Any, *, precision: int) -> str | None:
+        if isinstance(value, bool):
+            return None
+        if not isinstance(value, (int, float)):
+            return None
+        return f"{float(value):.{precision}f}s"
+
+    @staticmethod
+    def _pluralize(value: int, singular: str) -> str:
+        return singular if value == 1 else f"{singular}s"
+
+    def _format_batch_started_event(self, event: SubAgentProgressEvent) -> str | None:
+        metrics = event.metrics or {}
+        mode = str(metrics.get("execution_mode", "") or "").strip().lower()
+        spec_count = self._event_spec_count(event)
+        if mode == "parallel" and spec_count is not None:
+            max_parallel_agents = self._positive_int(metrics.get("max_parallel_agents"))
+            if max_parallel_agents is None:
+                return None
+            return (
+                f"Parallel batch: {spec_count} subtasks, "
+                f"max concurrency {max_parallel_agents}"
+            )
+        if mode == "pipeline" and spec_count is not None:
+            return (
+                f"Pipeline batch: {spec_count} subtasks, "
+                "dependency-driven execution"
+            )
+        if mode == "rendezvous" and spec_count is not None:
+            max_rounds = self._positive_int(
+                metrics.get("max_rounds") or metrics.get("max_rendezvous_rounds")
+            )
+            if max_rounds is not None:
+                return (
+                    f"Rendezvous batch: {spec_count} subtasks, "
+                    f"max {max_rounds} {self._pluralize(max_rounds, 'round')}"
+                )
+            return f"Rendezvous batch: {spec_count} subtasks"
+        return None
+
+    def _format_batch_finished_event(self, event: SubAgentProgressEvent) -> str | None:
+        metrics = event.metrics or {}
+        mode = str(metrics.get("execution_mode", "") or "").strip().lower()
+        spec_count = self._event_spec_count(event)
+        completed = self._positive_int(event.completed) or 0
+        duration = self._format_seconds(metrics.get("duration_seconds"), precision=2)
+
+        if mode == "parallel" and spec_count is not None and completed and duration:
+            line = f"Parallel batch finished: {completed}/{spec_count} in {duration}"
+            scope_check = self._format_seconds(
+                metrics.get("write_scope_check_seconds"),
+                precision=3,
+            )
+            if scope_check is not None:
+                line += f" (scope check {scope_check})"
+            return line
+
+        if mode == "pipeline" and spec_count is not None and completed and duration:
+            stage_count = self._positive_int(metrics.get("stage_count"))
+            if stage_count is None:
+                return None
+            prefix = (
+                "Pipeline batch ended early"
+                if completed < spec_count
+                else "Pipeline batch finished"
+            )
+            return (
+                f"{prefix}: {completed}/{spec_count} across {stage_count} "
+                f"{self._pluralize(stage_count, 'stage')} in {duration}"
+            )
+
+        if mode == "rendezvous" and spec_count is not None and duration:
+            rounds_completed = self._positive_int(metrics.get("rounds_completed"))
+            if rounds_completed is None:
+                return None
+            return (
+                f"Rendezvous batch finished: {spec_count} subtasks, "
+                f"{rounds_completed} {self._pluralize(rounds_completed, 'round')} "
+                f"in {duration}"
+            )
+
+        return None
 
     @staticmethod
     def _format_subagent_event(event: SubAgentProgressEvent) -> str:
