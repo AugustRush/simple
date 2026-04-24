@@ -227,6 +227,112 @@ Behaviour guarantees:
 - shell calls are timeout-bounded
 - sub-agents inherit the parent context manager but do not recursively receive `spawn_agent`
 
+## Multi-Agent Orchestration Modes
+
+The runtime does not primarily choose orchestration mode from user-facing
+keywords. Instead, mode selection happens when the model emits one or more
+`spawn_agent` calls in the same assistant turn.
+
+At the runtime level, the trigger rules are:
+
+- `direct`
+  - no `spawn_agent` call is emitted, or only one sub-agent is spawned
+- `parallel`
+  - multiple `spawn_agent` calls are emitted in the same turn
+  - none of them has `depends_on`
+  - none of them sets `coordination_mode="rendezvous"`
+- `pipeline`
+  - multiple `spawn_agent` calls are emitted in the same turn
+  - at least one subtask declares a non-empty `depends_on`
+- `rendezvous`
+  - multiple `spawn_agent` calls are emitted in the same turn
+  - at least one subtask sets `coordination_mode="rendezvous"`
+  - this takes precedence over `pipeline` and `parallel`
+
+Important constraints:
+
+- Orchestration only happens within one assistant response. If the model emits
+  one sub-agent now and another in a later turn, the runtime will not join them
+  into the same pipeline or rendezvous batch.
+- `depends_on` must point to subtask ids from the same batch.
+- `rendezvous` is bounded. The current default is two rounds.
+
+### How To Trigger Each Mode
+
+From the user side, the practical way to trigger a mode is to ask for a task
+shape that naturally leads the model to emit the matching `spawn_agent`
+structure.
+
+#### `parallel`
+
+Use when you want several independent perspectives to work at the same time.
+
+Example prompts:
+
+```text
+同时让 3 个子 agent 分别从性能、正确性、可维护性 review 这次改动，最后汇总结论。
+```
+
+```text
+并行找出这个项目里和认证、缓存、调度相关的实现风险，每个子 agent 负责一个方向。
+```
+
+Expected runtime shape:
+
+- same-turn multiple `spawn_agent`
+- no `depends_on`
+
+#### `pipeline`
+
+Use when later workers should consume earlier workers' outputs.
+
+Example prompts:
+
+```text
+先让 researcher 收集事实，再让 planner 基于这些事实给出方案，最后让 critic 审查方案。
+```
+
+```text
+先分析问题根因，再生成修复方案，最后基于修复方案补测试。
+```
+
+Expected runtime shape:
+
+- same-turn multiple `spawn_agent`
+- downstream subtasks include `depends_on`
+
+#### `rendezvous`
+
+Use when you want bounded multi-round coordination rather than one-pass fan-out.
+
+Example prompts:
+
+```text
+让正方和反方分别给方案，互相回应一轮后，再收敛成最终建议。
+```
+
+```text
+让 researcher 和 critic 先各自独立判断，再进行一轮交叉校验，最后输出共识和分歧。
+```
+
+Expected runtime shape:
+
+- same-turn multiple `spawn_agent`
+- at least one subtask sets `coordination_mode="rendezvous"`
+
+### Notes For Prompting
+
+- If you want `parallel`, avoid wording that implies strict sequencing such as
+  “先…再…”.
+- If you want `pipeline`, be explicit about stage order and upstream/downstream
+  dependency.
+- If you want `rendezvous`, explicitly ask for “互相回应一轮”, “交叉校验”, or
+  “收敛共识”, because that is what encourages the model to emit coordinated
+  subtask structure instead of plain fan-out.
+- If you want deterministic testing, inspect gateway logs. The runtime emits
+  `execution_mode` in sub-agent batch events, and the gateway now also emits
+  interaction logs for message receipt, agent execution, and reply delivery.
+
 ## Skills
 
 Skills are instruction bundles that extend the agent with specialized workflows. Each skill is a directory containing `SKILL.md` (required) and optional supporting files.
@@ -436,4 +542,4 @@ python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.csv
 python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.jsonl
 ```
 
-Latest local verification: `uv run pytest -q` → `217 passed, 1 skipped`
+Latest local verification: `uv run pytest -q` → `451 passed, 1 skipped`

@@ -831,6 +831,58 @@ def test_feishu_sink_rendezvous_batch_finished_shows_rounds():
         loop.close()
 
 
+def test_feishu_sink_rendezvous_phase_events_show_runtime_stage_messages():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ):
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="phase_started",
+                        message="Debate round 1/2 started: 2 participants (researcher, critic)",
+                        metrics={
+                            "execution_mode": "rendezvous",
+                            "phase_kind": "round",
+                            "phase_index": 1,
+                            "phase_total": 2,
+                        },
+                    )
+                )
+                sink.on_subagent_event(
+                    SubAgentProgressEvent(
+                        kind="phase_note",
+                        message="Lead summary ready for round 2/2: 2 continue (researcher, critic)",
+                        metrics={
+                            "execution_mode": "rendezvous",
+                            "phase_kind": "lead_summary",
+                            "phase_index": 1,
+                            "phase_total": 2,
+                        },
+                    )
+                )
+                await sink.drain()
+
+            assert (
+                "Debate round 1/2 started: 2 participants (researcher, critic)"
+                in sink._progress_buf.text
+            )
+            assert (
+                "Lead summary ready for round 2/2: 2 continue (researcher, critic)"
+                in sink._progress_buf.text
+            )
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
 def test_feishu_sink_batch_events_fall_back_without_metrics():
     sink = _make_feishu_sink()
     sink.streaming = True

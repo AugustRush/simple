@@ -148,6 +148,7 @@ class _OAITC:
 class _OAIMsg:
     content: str
     tool_calls: list[_OAITC] | None = None
+    model_extra: dict[str, object] | None = None
 
 
 @dataclass

@@ -41,6 +41,18 @@ class RendezvousDirective:
     stop: bool = False
 
 
+RuntimeProgressCallback = Callable[[str, dict[str, Any]], None]
+
+
+def _emit_progress(
+    progress_callback: RuntimeProgressCallback | None,
+    kind: str,
+    **payload: Any,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(kind, payload)
+
+
 async def run_parallel_subtasks(
     specs: list[SubtaskSpec],
     *,
@@ -48,6 +60,7 @@ async def run_parallel_subtasks(
     max_concurrency: int,
     canonicalize_write_scope: Callable[[str], Path] | None = None,
     telemetry: dict[str, Any] | None = None,
+    progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
     scope_check_started_at = time.perf_counter()
@@ -71,20 +84,39 @@ async def run_parallel_subtasks(
 
     sem = asyncio.Semaphore(max(1, int(max_concurrency)))
 
-    async def _run(spec: SubtaskSpec) -> SubtaskResult:
+    async def _run(index: int, spec: SubtaskSpec) -> tuple[int, SubtaskResult]:
         async with sem:
             try:
-                return await executor(spec)
+                result = await executor(spec)
             except Exception as exc:
-                return SubtaskResult(
+                result = SubtaskResult(
                     id=spec.id,
                     ok=False,
                     content="",
                     tool_calls_made=[],
                     error=str(exc) or exc.__class__.__name__,
                 )
+            return index, result
 
-    results = await asyncio.gather(*[_run(spec) for spec in specs])
+    results: list[SubtaskResult | None] = [None] * len(specs)
+    completed_count = 0
+    tasks = [
+        asyncio.create_task(_run(index, spec))
+        for index, spec in enumerate(specs)
+    ]
+    for task in asyncio.as_completed(tasks):
+        index, result = await task
+        results[index] = result
+        completed_count += 1
+        _emit_progress(
+            progress_callback,
+            "batch_progress",
+            execution_mode="parallel",
+            completed=completed_count,
+            total=len(specs),
+            spec_count=len(specs),
+            max_concurrency=max(1, int(max_concurrency)),
+        )
     if telemetry is not None:
         telemetry.update(
             {
@@ -96,7 +128,7 @@ async def run_parallel_subtasks(
                 "duration_seconds": time.perf_counter() - started_at,
             }
         )
-    return results
+    return [result for result in results if result is not None]
 
 
 async def run_pipeline_subtasks(
@@ -104,6 +136,7 @@ async def run_pipeline_subtasks(
     *,
     executor: Callable[[SubtaskSpec, dict[str, str]], Awaitable[SubtaskResult]],
     telemetry: dict[str, Any] | None = None,
+    progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
     pending = {spec.id: spec for spec in specs}
@@ -121,6 +154,17 @@ async def run_pipeline_subtasks(
         if not ready:
             raise ValueError("pipeline contains unresolved or cyclic dependencies")
         stage_count += 1
+        _emit_progress(
+            progress_callback,
+            "phase_started",
+            execution_mode="pipeline",
+            phase_kind="stage",
+            phase_index=stage_count,
+            ready_count=len(ready),
+            ready_ids=[spec.id for _, spec in ready],
+            ready_roles=[spec.role for _, spec in ready],
+            spec_count=len(specs),
+        )
         stage_results = await asyncio.gather(
             *[
                 _invoke_pipeline_executor(
@@ -131,6 +175,22 @@ async def run_pipeline_subtasks(
                 )
                 for _, spec in ready
             ]
+        )
+        succeeded_count = sum(1 for result in stage_results if result.ok)
+        failed_count = len(stage_results) - succeeded_count
+        _emit_progress(
+            progress_callback,
+            "phase_finished",
+            execution_mode="pipeline",
+            phase_kind="stage",
+            phase_index=stage_count,
+            ready_count=len(ready),
+            ready_ids=[spec.id for _, spec in ready],
+            ready_roles=[spec.role for _, spec in ready],
+            succeeded_count=succeeded_count,
+            failed_count=failed_count,
+            halted=failed_count > 0,
+            spec_count=len(specs),
         )
         stage_failed = False
         for (spec_id, spec), result in zip(ready, stage_results):
@@ -174,6 +234,7 @@ async def run_rendezvous_round(
     summarize: Callable[[list[SubtaskResult]], str | RendezvousDirective],
     max_rounds: int,
     telemetry: dict[str, Any] | None = None,
+    progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
     rounds = max(1, int(max_rounds))
@@ -185,6 +246,18 @@ async def run_rendezvous_round(
 
     for round_index in range(1, rounds + 1):
         rounds_completed = round_index
+        _emit_progress(
+            progress_callback,
+            "phase_started",
+            execution_mode="rendezvous",
+            phase_kind="round",
+            phase_index=round_index,
+            phase_total=rounds,
+            participant_count=len(active_specs),
+            participant_ids=[spec.id for spec in active_specs],
+            participant_roles=[spec.role for spec in active_specs],
+            spec_count=len(specs),
+        )
         round_results = await asyncio.gather(
             *[
                 _invoke_rendezvous_executor(
@@ -198,19 +271,49 @@ async def run_rendezvous_round(
             ]
         )
         all_results.extend(round_results)
+        succeeded_count = sum(1 for result in round_results if result.ok)
+        failed_count = len(round_results) - succeeded_count
+        _emit_progress(
+            progress_callback,
+            "phase_finished",
+            execution_mode="rendezvous",
+            phase_kind="round",
+            phase_index=round_index,
+            phase_total=rounds,
+            participant_count=len(active_specs),
+            participant_ids=[spec.id for spec in active_specs],
+            participant_roles=[spec.role for spec in active_specs],
+            succeeded_count=succeeded_count,
+            failed_count=failed_count,
+            spec_count=len(specs),
+        )
         if round_index < rounds:
             directive = summarize(round_results)
             if isinstance(directive, str):
                 directive = RendezvousDirective(summary=directive)
             lead_summary = directive.summary
             lead_structured_context = directive.structured_context
+            if directive.continue_with is None:
+                next_specs = list(specs)
+            else:
+                selected_ids = set(directive.continue_with)
+                next_specs = [spec for spec in specs if spec.id in selected_ids]
+            _emit_progress(
+                progress_callback,
+                "phase_note",
+                execution_mode="rendezvous",
+                phase_kind="lead_summary",
+                phase_index=round_index,
+                phase_total=rounds,
+                continue_count=len(next_specs),
+                continue_ids=[spec.id for spec in next_specs],
+                continue_roles=[spec.role for spec in next_specs],
+                stop=directive.stop,
+                spec_count=len(specs),
+            )
             if directive.stop:
                 break
-            if directive.continue_with is None:
-                active_specs = list(specs)
-                continue
-            selected_ids = set(directive.continue_with)
-            active_specs = [spec for spec in specs if spec.id in selected_ids]
+            active_specs = next_specs
             if not active_specs:
                 break
 

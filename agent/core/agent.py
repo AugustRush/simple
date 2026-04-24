@@ -36,6 +36,22 @@ from agent.tools.runtime import ToolRegistry
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
+_OPENAI_MESSAGE_RESERVED_FIELDS = frozenset(
+    {
+        "role",
+        "content",
+        "tool_calls",
+        "function_call",
+        "name",
+        "refusal",
+        "audio",
+        "annotations",
+        "parsed",
+        "model_extra",
+    }
+)
+_SKIP_OPENAI_EXTRA = object()
+
 
 def _trace_latency(stage: str, **fields: object) -> None:
     if not shared._latency_trace_enabled():
@@ -153,6 +169,101 @@ class BaseAgent:
             sink.on_subagent_event(event)
             return
         CliOutputSink(shared.CONSOLE).on_subagent_event(event)
+
+    @staticmethod
+    def _format_role_list(roles: list[str], *, limit: int = 3) -> str:
+        cleaned = [str(role).strip() for role in roles if str(role).strip()]
+        if not cleaned:
+            return "sub-agents"
+        if len(cleaned) <= limit:
+            return ", ".join(cleaned)
+        remaining = len(cleaned) - limit
+        return f"{', '.join(cleaned[:limit])}, +{remaining} more"
+
+    def _runtime_progress_message(self, kind: str, payload: dict[str, Any]) -> str:
+        mode = str(payload.get("execution_mode", "") or "").strip().lower()
+        if kind == "batch_progress" and mode == "parallel":
+            completed = int(payload.get("completed", 0) or 0)
+            total = int(payload.get("total", 0) or 0)
+            running = max(0, total - completed)
+            return (
+                f"Parallel batch running: {completed}/{total} completed, "
+                f"{running} still running"
+            )
+
+        if kind == "phase_started" and mode == "pipeline":
+            stage_index = int(payload.get("phase_index", 0) or 0)
+            ready_count = int(payload.get("ready_count", 0) or 0)
+            roles = self._format_role_list(list(payload.get("ready_roles", [])))
+            return (
+                f"Pipeline stage {stage_index} started: "
+                f"{ready_count} ready ({roles})"
+            )
+
+        if kind == "phase_finished" and mode == "pipeline":
+            stage_index = int(payload.get("phase_index", 0) or 0)
+            succeeded = int(payload.get("succeeded_count", 0) or 0)
+            failed = int(payload.get("failed_count", 0) or 0)
+            if failed:
+                return (
+                    f"Pipeline stage {stage_index} finished: "
+                    f"{succeeded} succeeded, {failed} failed"
+                )
+            return f"Pipeline stage {stage_index} finished: {succeeded} succeeded"
+
+        if kind == "phase_started" and mode == "rendezvous":
+            round_index = int(payload.get("phase_index", 0) or 0)
+            round_total = int(payload.get("phase_total", 0) or 0)
+            participants = int(payload.get("participant_count", 0) or 0)
+            roles = self._format_role_list(list(payload.get("participant_roles", [])))
+            return (
+                f"Debate round {round_index}/{round_total} started: "
+                f"{participants} participants ({roles})"
+            )
+
+        if kind == "phase_finished" and mode == "rendezvous":
+            round_index = int(payload.get("phase_index", 0) or 0)
+            round_total = int(payload.get("phase_total", 0) or 0)
+            succeeded = int(payload.get("succeeded_count", 0) or 0)
+            failed = int(payload.get("failed_count", 0) or 0)
+            if failed:
+                return (
+                    f"Debate round {round_index}/{round_total} finished: "
+                    f"{succeeded} succeeded, {failed} failed"
+                )
+            return (
+                f"Debate round {round_index}/{round_total} finished: "
+                f"{succeeded} views collected"
+            )
+
+        if kind == "phase_note" and mode == "rendezvous":
+            round_index = int(payload.get("phase_index", 0) or 0)
+            round_total = int(payload.get("phase_total", 0) or 0)
+            continue_count = int(payload.get("continue_count", 0) or 0)
+            if bool(payload.get("stop")):
+                return (
+                    f"Lead summary after round {round_index}/{round_total}: "
+                    "no further round needed"
+                )
+            roles = self._format_role_list(list(payload.get("continue_roles", [])))
+            next_round = min(round_total, round_index + 1)
+            return (
+                f"Lead summary ready for round {next_round}/{round_total}: "
+                f"{continue_count} continue ({roles})"
+            )
+
+        return ""
+
+    def _emit_runtime_progress_event(self, kind: str, payload: dict[str, Any]) -> None:
+        self._emit_subagent_event(
+            SubAgentProgressEvent(
+                kind=kind,
+                completed=int(payload.get("completed", 0) or 0),
+                total=int(payload.get("total", 0) or 0),
+                message=self._runtime_progress_message(kind, payload),
+                metrics=dict(payload),
+            )
+        )
 
     def set_model(self, model: str) -> None:
         """Switch the model used for subsequent calls."""
@@ -757,6 +868,7 @@ class BaseAgent:
             max_concurrency=max_concurrency or self.max_parallel_agents,
             canonicalize_write_scope=self._canonicalize_write_scope,
             telemetry=telemetry,
+            progress_callback=self._emit_runtime_progress_event,
         )
 
     async def run_pipeline_subtasks(
@@ -783,6 +895,7 @@ class BaseAgent:
             specs,
             executor=_executor,
             telemetry=telemetry,
+            progress_callback=self._emit_runtime_progress_event,
         )
 
     async def run_rendezvous_subtasks(
@@ -816,6 +929,7 @@ class BaseAgent:
             summarize=self._summarize_rendezvous_round,
             max_rounds=max_rounds,
             telemetry=telemetry,
+            progress_callback=self._emit_runtime_progress_event,
         )
 
     # ── Format-aware API helpers ──────────────────────────────────────────
@@ -914,6 +1028,118 @@ class BaseAgent:
         return None
 
     @staticmethod
+    def _openai_message_extras(message: Any) -> dict[str, Any]:
+        """Extract provider-specific fields from OpenAI-compatible messages/deltas."""
+        if message is None:
+            return {}
+
+        extras: dict[str, Any] = {}
+
+        if isinstance(message, dict):
+            for key, value in message.items():
+                if key in _OPENAI_MESSAGE_RESERVED_FIELDS:
+                    continue
+                sanitized = BaseAgent._sanitize_openai_extra_value(value)
+                if sanitized is not _SKIP_OPENAI_EXTRA:
+                    extras[key] = sanitized
+            model_extra = message.get("model_extra")
+            if isinstance(model_extra, dict):
+                for key, value in model_extra.items():
+                    if key in _OPENAI_MESSAGE_RESERVED_FIELDS:
+                        continue
+                    sanitized = BaseAgent._sanitize_openai_extra_value(value)
+                    if sanitized is not _SKIP_OPENAI_EXTRA:
+                        extras[key] = sanitized
+            return extras
+
+        raw_fields = getattr(message, "__dict__", None)
+        if isinstance(raw_fields, dict):
+            for key, value in raw_fields.items():
+                if key.startswith("_") or key in _OPENAI_MESSAGE_RESERVED_FIELDS:
+                    continue
+                sanitized = BaseAgent._sanitize_openai_extra_value(value)
+                if sanitized is not _SKIP_OPENAI_EXTRA:
+                    extras[key] = sanitized
+
+        model_extra = getattr(message, "model_extra", None)
+        if isinstance(model_extra, dict):
+            for key, value in model_extra.items():
+                if key in _OPENAI_MESSAGE_RESERVED_FIELDS:
+                    continue
+                sanitized = BaseAgent._sanitize_openai_extra_value(value)
+                if sanitized is not _SKIP_OPENAI_EXTRA:
+                    extras[key] = sanitized
+        return extras
+
+    @classmethod
+    def _sanitize_openai_extra_value(cls, value: Any) -> Any:
+        """Keep only JSON-safe provider extras that can be sent back to the API."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, dict):
+            cleaned: dict[str, Any] = {}
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    continue
+                sanitized = cls._sanitize_openai_extra_value(item)
+                if sanitized is _SKIP_OPENAI_EXTRA:
+                    continue
+                cleaned[key] = sanitized
+            return cleaned
+        if isinstance(value, (list, tuple)):
+            cleaned_list: list[Any] = []
+            for item in value:
+                sanitized = cls._sanitize_openai_extra_value(item)
+                if sanitized is _SKIP_OPENAI_EXTRA:
+                    continue
+                cleaned_list.append(sanitized)
+            return cleaned_list
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            try:
+                return cls._sanitize_openai_extra_value(model_dump(mode="python"))
+            except Exception:
+                return _SKIP_OPENAI_EXTRA
+        return _SKIP_OPENAI_EXTRA
+
+    @classmethod
+    def _merge_openai_extra_value(cls, current: Any, incoming: Any) -> Any:
+        """Merge streamed provider extras while preserving chunked text fields."""
+        incoming = cls._sanitize_openai_extra_value(incoming)
+        if incoming is _SKIP_OPENAI_EXTRA:
+            return copy.deepcopy(current)
+        current = cls._sanitize_openai_extra_value(current)
+        if current is _SKIP_OPENAI_EXTRA:
+            current = None
+        if current is None:
+            return copy.deepcopy(incoming)
+        if incoming is None:
+            return copy.deepcopy(current)
+        if isinstance(current, str) and isinstance(incoming, str):
+            if incoming == current:
+                return current
+            if incoming.startswith(current):
+                return incoming
+            if current.startswith(incoming) or current.endswith(incoming):
+                return current
+            return current + incoming
+        if isinstance(current, dict) and isinstance(incoming, dict):
+            merged = copy.deepcopy(current)
+            for key, value in incoming.items():
+                merged[key] = cls._merge_openai_extra_value(merged.get(key), value)
+            return merged
+        return copy.deepcopy(incoming)
+
+    @classmethod
+    def _merge_openai_message_extras(
+        cls, current: dict[str, Any], incoming: dict[str, Any]
+    ) -> dict[str, Any]:
+        merged = copy.deepcopy(current)
+        for key, value in incoming.items():
+            merged[key] = cls._merge_openai_extra_value(merged.get(key), value)
+        return merged
+
+    @staticmethod
     def _merge_continuation_text(prefix: str, continuation: str) -> str:
         """Append continuation text while trimming simple duplicated overlap."""
         if not prefix:
@@ -936,7 +1162,6 @@ class BaseAgent:
         continuation_error = "Model response was truncated (finish_reason=length)"
         for _ in range(self._MAX_TRUNCATION_CONTINUATIONS):
             continuation_ctx = copy.deepcopy(ctx)
-            continuation_ctx.messages.append({"role": "assistant", "content": merged})
             continuation_ctx.messages.append(
                 {"role": "user", "content": self._CONTINUE_PROMPT}
             )
@@ -961,7 +1186,8 @@ class BaseAgent:
         else:
             # For OpenAI we store the raw message object (or a dict)
             msg = response.choices[0].message
-            entry: dict = {"role": "assistant", "content": msg.content}
+            entry: dict = {"role": "assistant", "content": text}
+            entry.update(self._openai_message_extras(msg))
             if msg.tool_calls:
                 entry["tool_calls"] = [
                     {
@@ -1119,6 +1345,10 @@ class BaseAgent:
                     "spec_count": total_spawns,
                     "max_parallel_agents": self.max_parallel_agents,
                 }
+                if execution_mode == "rendezvous":
+                    batch_metrics["max_rounds"] = (
+                        orchestration_decision.max_rendezvous_rounds
+                    )
                 self._emit_subagent_event(
                     SubAgentProgressEvent(
                         kind="batch_started",
@@ -1460,18 +1690,28 @@ class BaseAgent:
                             result_text = self._synthesize_tool_only_response(
                                 tool_result_history
                             )
-                        ctx.messages.append(
-                            {"role": "assistant", "content": result_text}
-                        )
+                        if self.api_format == "openai":
+                            ctx.messages.append(
+                                self._assistant_message(response, result_text)
+                            )
+                        else:
+                            ctx.messages.append(
+                                {"role": "assistant", "content": result_text}
+                            )
                         completion_error = self._response_completion_error(response)
                         if completion_error:
                             result_text, continuation_error = (
                                 await self._continue_truncated_response(ctx, result_text)
                             )
-                            ctx.messages[-1] = {
-                                "role": "assistant",
-                                "content": result_text,
-                            }
+                            if self.api_format == "openai":
+                                ctx.messages[-1] = self._assistant_message(
+                                    response, result_text
+                                )
+                            else:
+                                ctx.messages[-1] = {
+                                    "role": "assistant",
+                                    "content": result_text,
+                                }
                             trace_status = "continuation_error"
                             trace_error = continuation_error
                             return AgentResult(
@@ -1566,6 +1806,7 @@ class BaseAgent:
             kwargs["tools"] = api_tools
         finish_reason = "stop"
         tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
+        provider_extras_acc: dict[str, Any] = {}
         # AsyncOpenAI.chat.completions.create() is a coroutine; await it to get
         # the AsyncStream object, then iterate the stream chunk by chunk.
         # Do NOT remove the `await` — create() returns a coroutine, not an
@@ -1580,6 +1821,11 @@ class BaseAgent:
                 _r = callback(delta.content)
                 if inspect.isawaitable(_r):
                     await _r
+            delta_extras = self._openai_message_extras(delta)
+            if delta_extras:
+                provider_extras_acc = self._merge_openai_message_extras(
+                    provider_extras_acc, delta_extras
+                )
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
                     idx = tc_delta.index
@@ -1617,7 +1863,11 @@ class BaseAgent:
             [
                 shared._OAIChoice(
                     finish_reason,
-                    shared._OAIMsg("".join(collected), oi_tool_calls),
+                    shared._OAIMsg(
+                        "".join(collected),
+                        oi_tool_calls,
+                        provider_extras_acc or None,
+                    ),
                 )
             ]
         )

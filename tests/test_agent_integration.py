@@ -2986,6 +2986,88 @@ def test_send_message_emits_structured_orchestration_metrics(monkeypatch):
     assert batch_finished.metrics["duration_seconds"] >= 0
 
 
+def test_send_message_emits_parallel_batch_progress_for_orchestrated_spawn_calls(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    class _Sink:
+        def __init__(self):
+            self.events = []
+
+        def on_subagent_event(self, event):
+            self.events.append(event)
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.max_parallel_agents = 2
+
+    spawn_tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "researcher", "task": "first"}),
+            ),
+        ),
+        agent_module._OAITC(
+            "call-2",
+            agent_module._OAIFunc(
+                "spawn_agent",
+                json.dumps({"role": "critic", "task": "second"}),
+            ),
+        ),
+    ]
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls", agent_module._OAIMsg("", spawn_tool_calls)
+                    )
+                ]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_call(tool_name, tool_input):
+        await asyncio.sleep(0)
+        return json.dumps(
+            {
+                "ok": True,
+                "role": tool_input["role"],
+                "content": "done",
+                "tool_calls_made": [],
+            }
+        )
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    sink = _Sink()
+    token = agent_module._active_sink.set(sink)
+    try:
+        ctx = agent_module.AgentContext(system_prompt="system")
+        result = asyncio.run(agent.send_message(ctx, "run parallel agents"))
+    finally:
+        agent_module._active_sink.reset(token)
+
+    assert result.error is None
+    progress_events = [event for event in sink.events if event.kind == "batch_progress"]
+    assert progress_events
+    assert progress_events[-1].metrics["execution_mode"] == "parallel"
+    assert progress_events[-1].completed == 2
+    assert progress_events[-1].total == 2
+
+
 def test_send_message_emits_latency_trace(monkeypatch, caplog):
     import agent as agent_module
 
@@ -3504,6 +3586,62 @@ def test_base_agent_runs_internal_rendezvous_with_lead_summary(monkeypatch):
     assert observed_tasks[3][1].startswith("challenge\n\nLead summary:\n")
 
 
+def test_base_agent_emits_pipeline_phase_events(monkeypatch):
+    import agent as agent_module
+
+    class _Sink:
+        def __init__(self):
+            self.events = []
+
+        def on_subagent_event(self, event):
+            self.events.append(event)
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    async def fake_spawn(spec):
+        return agent_module.SubtaskResult(
+            id=spec.id,
+            ok=True,
+            content=f"content:{spec.id}",
+            summary=f"summary:{spec.id}",
+            tool_calls_made=["spawn_agent"],
+        )
+
+    monkeypatch.setattr(agent, "_execute_subtask_spec", fake_spawn)
+
+    sink = _Sink()
+    token = agent_module._active_sink.set(sink)
+    try:
+        results = asyncio.run(
+            agent.run_pipeline_subtasks(
+                [
+                    agent_module.SubtaskSpec(id="first", role="researcher", task="collect"),
+                    agent_module.SubtaskSpec(
+                        id="second",
+                        role="reviewer",
+                        task="judge",
+                        depends_on=["first"],
+                    ),
+                ]
+            )
+        )
+    finally:
+        agent_module._active_sink.reset(token)
+
+    assert [result.id for result in results] == ["first", "second"]
+    phase_events = [event for event in sink.events if event.kind == "phase_started"]
+    assert len(phase_events) == 2
+    assert phase_events[0].metrics["execution_mode"] == "pipeline"
+    assert phase_events[0].metrics["phase_kind"] == "stage"
+    assert phase_events[0].metrics["phase_index"] == 1
+    assert phase_events[0].metrics["ready_roles"] == ["researcher"]
+    assert phase_events[1].metrics["phase_index"] == 2
+    assert phase_events[1].metrics["ready_roles"] == ["reviewer"]
+
+
 def test_base_agent_default_rendezvous_does_not_rebroadcast_raw_structured_results(
     monkeypatch,
 ):
@@ -3546,6 +3684,63 @@ def test_base_agent_default_rendezvous_does_not_rebroadcast_raw_structured_resul
     assert len(results) == 4
     assert "Lead structured results:" not in observed_tasks[2][1]
     assert "Lead structured results:" not in observed_tasks[3][1]
+
+
+def test_base_agent_emits_rendezvous_phase_events(monkeypatch):
+    import agent as agent_module
+
+    class _Sink:
+        def __init__(self):
+            self.events = []
+
+        def on_subagent_event(self, event):
+            self.events.append(event)
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    async def fake_spawn(spec):
+        round_label = "round-2" if "Lead summary" in spec.task else "round-1"
+        return agent_module.SubtaskResult(
+            id=spec.id,
+            ok=True,
+            content=f"content:{spec.id}:{round_label}",
+            summary=f"summary:{spec.id}:{round_label}",
+            tool_calls_made=["spawn_agent"],
+        )
+
+    monkeypatch.setattr(agent, "_execute_subtask_spec", fake_spawn)
+
+    sink = _Sink()
+    token = agent_module._active_sink.set(sink)
+    try:
+        results = asyncio.run(
+            agent.run_rendezvous_subtasks(
+                [
+                    agent_module.SubtaskSpec(id="a", role="researcher", task="analyze"),
+                    agent_module.SubtaskSpec(id="b", role="critic", task="challenge"),
+                ],
+                max_rounds=2,
+            )
+        )
+    finally:
+        agent_module._active_sink.reset(token)
+
+    assert len(results) == 4
+    phase_started = [event for event in sink.events if event.kind == "phase_started"]
+    assert len(phase_started) == 2
+    assert phase_started[0].metrics["execution_mode"] == "rendezvous"
+    assert phase_started[0].metrics["phase_kind"] == "round"
+    assert phase_started[0].metrics["phase_index"] == 1
+    assert phase_started[0].metrics["phase_total"] == 2
+    assert phase_started[1].metrics["phase_index"] == 2
+    phase_notes = [event for event in sink.events if event.kind == "phase_note"]
+    assert len(phase_notes) == 1
+    assert phase_notes[0].metrics["execution_mode"] == "rendezvous"
+    assert phase_notes[0].metrics["phase_kind"] == "lead_summary"
+    assert phase_notes[0].metrics["continue_count"] == 2
 
 
 def test_base_agent_runs_internal_rendezvous_with_lead_selected_structured_results(
@@ -3651,6 +3846,591 @@ def test_send_message_auto_continues_openai_length_finish(monkeypatch):
     assert len(seen_messages) == 2
     assert seen_messages[1][-2] == {"role": "assistant", "content": "第一段没有说完"}
     assert "Continue exactly from where you left off" in seen_messages[1][-1]["content"]
+
+
+def test_send_message_stream_preserves_reasoning_content_for_openai_tool_loop(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    class _DeltaToolFunction:
+        def __init__(self, name=None, arguments=None):
+            self.name = name
+            self.arguments = arguments
+
+    class _DeltaToolCall:
+        def __init__(self, index, id=None, name=None, arguments=None):
+            self.index = index
+            self.id = id
+            self.function = _DeltaToolFunction(name, arguments)
+
+    class _Delta:
+        def __init__(self, content=None, reasoning_content=None, tool_calls=None):
+            self.content = content
+            self.tool_calls = tool_calls
+            self.model_extra = {}
+            if reasoning_content is not None:
+                self.model_extra["reasoning_content"] = reasoning_content
+
+    class _ChunkChoice:
+        def __init__(self, delta, finish_reason=None):
+            self.delta = delta
+            self.finish_reason = finish_reason
+
+    class _Chunk:
+        def __init__(self, delta, finish_reason=None):
+            self.choices = [_ChunkChoice(delta, finish_reason)]
+
+    class _FakeStream:
+        def __init__(self, chunks):
+            self._chunks = iter(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._chunks)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    class _FakeCompletions:
+        def __init__(self, owner):
+            self._owner = owner
+
+        async def create(self, **kwargs):
+            self._owner.calls.append(kwargs)
+            return next(self._owner.responses)
+
+    class _FakeClient:
+        def __init__(self, responses):
+            self.responses = iter(responses)
+            self.calls = []
+            self.chat = type("Chat", (), {})()
+            self.chat.completions = _FakeCompletions(self)
+
+    registry = agent_module.ToolRegistry()
+    client = _FakeClient(
+        [
+            _FakeStream(
+                [
+                    _Chunk(
+                        _Delta(
+                            content="我来查一下",
+                            reasoning_content="先判断是否需要工具。",
+                            tool_calls=[
+                                _DeltaToolCall(
+                                    0,
+                                    id="call-1",
+                                    name="current_time",
+                                    arguments="{",
+                                )
+                            ],
+                        )
+                    ),
+                    _Chunk(
+                        _Delta(
+                            reasoning_content="调用时间工具后再继续回答。",
+                            tool_calls=[_DeltaToolCall(0, arguments="}")],
+                        ),
+                        finish_reason="tool_calls",
+                    ),
+                ]
+            ),
+            _FakeStream(
+                [
+                    _Chunk(
+                        _Delta(content="千岛湖今天晴。"),
+                        finish_reason="stop",
+                    )
+                ]
+            ),
+        ]
+    )
+    agent = agent_module.BaseAgent(
+        client, registry, model="fake-model", api_format="openai"
+    )
+
+    async def fake_call(tool_name, tool_input):
+        assert tool_name == "current_time"
+        return json.dumps({"ok": True, "local_time": "2026-04-24T15:20:28+08:00"})
+
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    streamed = []
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(
+        agent.send_message(
+            ctx,
+            "下午好啊，今天千岛湖的天气如何",
+            stream_callback=streamed.append,
+        )
+    )
+
+    assert result.error is None
+    assert result.content == "千岛湖今天晴。"
+    assert streamed == ["我来查一下", "千岛湖今天晴。"]
+    assert len(client.calls) == 2
+    assistant_message = client.calls[1]["messages"][-2]
+    assert assistant_message["role"] == "assistant"
+    assert assistant_message["content"] == "我来查一下"
+    assert assistant_message["reasoning_content"] == "先判断是否需要工具。调用时间工具后再继续回答。"
+    assert assistant_message["tool_calls"][0]["function"]["name"] == "current_time"
+
+
+def test_send_message_preserves_reasoning_content_for_openai_tool_loop(monkeypatch):
+    import agent as agent_module
+
+    class _ModelExtraMessage:
+        def __init__(self, content, tool_calls=None, reasoning_content=None):
+            self.content = content
+            self.tool_calls = tool_calls
+            self.model_extra = {}
+            if reasoning_content is not None:
+                self.model_extra["reasoning_content"] = reasoning_content
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc("current_time", json.dumps({})),
+        )
+    ]
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "tool_calls",
+                        _ModelExtraMessage(
+                            "我来查一下",
+                            tool_calls,
+                            reasoning_content="先判断是否需要工具，再调用时间工具。",
+                        ),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop",
+                        agent_module.shared._OAIMsg("现在是下午三点二十。", None),
+                    )
+                ]
+            ),
+        ]
+    )
+    seen_messages = []
+
+    async def fake_create(ctx, tools):
+        seen_messages.append(list(ctx.messages))
+        return next(responses)
+
+    async def fake_call(tool_name, tool_input):
+        assert tool_name == "current_time"
+        return json.dumps({"ok": True, "local_time": "2026-04-24T15:20:28+08:00"})
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "现在几点"))
+
+    assert result.error is None
+    assert result.content == "现在是下午三点二十。"
+    assert len(seen_messages) == 2
+    assistant_message = seen_messages[1][-2]
+    assert assistant_message["role"] == "assistant"
+    assert assistant_message["content"] == "我来查一下"
+    assert assistant_message["reasoning_content"] == "先判断是否需要工具，再调用时间工具。"
+    assert assistant_message["tool_calls"][0]["function"]["name"] == "current_time"
+
+
+def test_send_message_preserves_generic_provider_extras_for_openai_tool_loop(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    class _ModelExtraMessage:
+        def __init__(self, content, tool_calls=None, model_extra=None):
+            self.content = content
+            self.tool_calls = tool_calls
+            self.model_extra = dict(model_extra or {})
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc("current_time", json.dumps({})),
+        )
+    ]
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "tool_calls",
+                        _ModelExtraMessage(
+                            "我来查一下",
+                            tool_calls,
+                            model_extra={
+                                "thinking_signature": "sig-123",
+                                "provider_state": {
+                                    "phase": "tool",
+                                    "confidence": 0.8,
+                                },
+                            },
+                        ),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop",
+                        agent_module.shared._OAIMsg("现在是下午三点二十。", None),
+                    )
+                ]
+            ),
+        ]
+    )
+    seen_messages = []
+
+    async def fake_create(ctx, tools):
+        seen_messages.append(list(ctx.messages))
+        return next(responses)
+
+    async def fake_call(tool_name, tool_input):
+        assert tool_name == "current_time"
+        return json.dumps({"ok": True, "local_time": "2026-04-24T15:20:28+08:00"})
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "现在几点"))
+
+    assert result.error is None
+    assistant_message = seen_messages[1][-2]
+    assert assistant_message["thinking_signature"] == "sig-123"
+    assert assistant_message["provider_state"] == {
+        "phase": "tool",
+        "confidence": 0.8,
+    }
+
+
+def test_send_message_stream_merges_generic_provider_extras_for_openai_tool_loop(
+    monkeypatch,
+):
+    import agent as agent_module
+
+    class _DeltaToolFunction:
+        def __init__(self, name=None, arguments=None):
+            self.name = name
+            self.arguments = arguments
+
+    class _DeltaToolCall:
+        def __init__(self, index, id=None, name=None, arguments=None):
+            self.index = index
+            self.id = id
+            self.function = _DeltaToolFunction(name, arguments)
+
+    class _Delta:
+        def __init__(self, content=None, tool_calls=None, model_extra=None):
+            self.content = content
+            self.tool_calls = tool_calls
+            self.model_extra = dict(model_extra or {})
+
+    class _ChunkChoice:
+        def __init__(self, delta, finish_reason=None):
+            self.delta = delta
+            self.finish_reason = finish_reason
+
+    class _Chunk:
+        def __init__(self, delta, finish_reason=None):
+            self.choices = [_ChunkChoice(delta, finish_reason)]
+
+    class _FakeStream:
+        def __init__(self, chunks):
+            self._chunks = iter(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._chunks)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    class _FakeCompletions:
+        def __init__(self, owner):
+            self._owner = owner
+
+        async def create(self, **kwargs):
+            self._owner.calls.append(kwargs)
+            return next(self._owner.responses)
+
+    class _FakeClient:
+        def __init__(self, responses):
+            self.responses = iter(responses)
+            self.calls = []
+            self.chat = type("Chat", (), {})()
+            self.chat.completions = _FakeCompletions(self)
+
+    registry = agent_module.ToolRegistry()
+    client = _FakeClient(
+        [
+            _FakeStream(
+                [
+                    _Chunk(
+                        _Delta(
+                            content="我来查一下",
+                            model_extra={
+                                "thinking_signature": "sig-",
+                                "provider_state": {"phase": "tool"},
+                            },
+                            tool_calls=[
+                                _DeltaToolCall(
+                                    0,
+                                    id="call-1",
+                                    name="current_time",
+                                    arguments="{",
+                                )
+                            ],
+                        )
+                    ),
+                    _Chunk(
+                        _Delta(
+                            model_extra={
+                                "thinking_signature": "123",
+                                "provider_state": {"step": 1},
+                            },
+                            tool_calls=[_DeltaToolCall(0, arguments="}")],
+                        ),
+                        finish_reason="tool_calls",
+                    ),
+                ]
+            ),
+            _FakeStream(
+                [
+                    _Chunk(
+                        _Delta(content="现在是下午三点二十。"),
+                        finish_reason="stop",
+                    )
+                ]
+            ),
+        ]
+    )
+    agent = agent_module.BaseAgent(
+        client, registry, model="fake-model", api_format="openai"
+    )
+
+    async def fake_call(tool_name, tool_input):
+        assert tool_name == "current_time"
+        return json.dumps({"ok": True, "local_time": "2026-04-24T15:20:28+08:00"})
+
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "现在几点", stream_callback=lambda _: None))
+
+    assert result.error is None
+    assistant_message = client.calls[1]["messages"][-2]
+    assert assistant_message["thinking_signature"] == "sig-123"
+    assert assistant_message["provider_state"] == {"phase": "tool", "step": 1}
+
+
+def test_send_message_auto_continue_preserves_openai_provider_extras(monkeypatch):
+    import agent as agent_module
+
+    class _ModelExtraMessage:
+        def __init__(self, content, tool_calls=None, model_extra=None):
+            self.content = content
+            self.tool_calls = tool_calls
+            self.model_extra = dict(model_extra or {})
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        _ModelExtraMessage(
+                            "第一段没有说完",
+                            None,
+                            model_extra={
+                                "reasoning_content": "先内部思考。",
+                                "thinking_signature": "sig-123",
+                            },
+                        ),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop",
+                        agent_module.shared._OAIMsg("，这是续写完成。", None),
+                    )
+                ]
+            ),
+        ]
+    )
+    seen_messages = []
+
+    async def fake_create(ctx, tools):
+        seen_messages.append(list(ctx.messages))
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "hello"))
+
+    assert result.error is None
+    assert result.content == "第一段没有说完，这是续写完成。"
+    assert len(seen_messages) == 2
+    assert seen_messages[1] == [
+        {"role": "user", "content": "hello"},
+        {
+            "role": "assistant",
+            "content": "第一段没有说完",
+            "reasoning_content": "先内部思考。",
+            "thinking_signature": "sig-123",
+        },
+        {
+            "role": "user",
+            "content": "Continue exactly from where you left off. Do not repeat previous text. Do not restart the answer.",
+        },
+    ]
+
+
+def test_send_message_stream_drops_non_serializable_openai_provider_extras(
+    monkeypatch,
+):
+    import threading
+    import agent as agent_module
+
+    class _DeltaToolFunction:
+        def __init__(self, name=None, arguments=None):
+            self.name = name
+            self.arguments = arguments
+
+    class _DeltaToolCall:
+        def __init__(self, index, id=None, name=None, arguments=None):
+            self.index = index
+            self.id = id
+            self.function = _DeltaToolFunction(name, arguments)
+
+    class _Delta:
+        def __init__(self, content=None, tool_calls=None, model_extra=None):
+            self.content = content
+            self.tool_calls = tool_calls
+            self.model_extra = dict(model_extra or {})
+
+    class _ChunkChoice:
+        def __init__(self, delta, finish_reason=None):
+            self.delta = delta
+            self.finish_reason = finish_reason
+
+    class _Chunk:
+        def __init__(self, delta, finish_reason=None):
+            self.choices = [_ChunkChoice(delta, finish_reason)]
+
+    class _FakeStream:
+        def __init__(self, chunks):
+            self._chunks = iter(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._chunks)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    class _FakeCompletions:
+        def __init__(self, owner):
+            self._owner = owner
+
+        async def create(self, **kwargs):
+            self._owner.calls.append(kwargs)
+            return next(self._owner.responses)
+
+    class _FakeClient:
+        def __init__(self, responses):
+            self.responses = iter(responses)
+            self.calls = []
+            self.chat = type("Chat", (), {})()
+            self.chat.completions = _FakeCompletions(self)
+
+    registry = agent_module.ToolRegistry()
+    client = _FakeClient(
+        [
+            _FakeStream(
+                [
+                    _Chunk(
+                        _Delta(
+                            content="我来查一下",
+                            model_extra={
+                                "reasoning_content": "先判断是否需要工具。",
+                                "unsafe_local": threading.local(),
+                            },
+                            tool_calls=[
+                                _DeltaToolCall(
+                                    0,
+                                    id="call-1",
+                                    name="current_time",
+                                    arguments="{}",
+                                )
+                            ],
+                        ),
+                        finish_reason="tool_calls",
+                    )
+                ]
+            ),
+            _FakeStream(
+                [
+                    _Chunk(
+                        _Delta(content="现在是下午三点二十。"),
+                        finish_reason="stop",
+                    )
+                ]
+            ),
+        ]
+    )
+    agent = agent_module.BaseAgent(
+        client, registry, model="fake-model", api_format="openai"
+    )
+
+    async def fake_call(tool_name, tool_input):
+        assert tool_name == "current_time"
+        return json.dumps({"ok": True, "local_time": "2026-04-24T15:20:28+08:00"})
+
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "现在几点", stream_callback=lambda _: None))
+
+    assert result.error is None
+    assistant_message = client.calls[1]["messages"][-2]
+    assert assistant_message["reasoning_content"] == "先判断是否需要工具。"
+    assert "unsafe_local" not in assistant_message
 
 
 def test_send_message_auto_continue_trims_overlap(monkeypatch):
