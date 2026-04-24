@@ -759,6 +759,38 @@ def test_update_skill_partial_update_preserves_unset_fields(tmp_path):
     assert bundle.body == "Original body."
 
 
+def test_update_skill_empty_instructions_preserves_existing_body(tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    _write_skill_bundle(
+        user_root,
+        "partial",
+        "---\nname: Keep Me\ndescription: Also keep\n---\nOriginal body.",
+    )
+
+    catalog = agent_module.SkillCatalog(
+        user_root=user_root, builtin_root=tmp_path / "b"
+    )
+    catalog.load_all()
+    registry = agent_module.ToolRegistry()
+    catalog.register_tools(registry)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "update_skill",
+                {"skill_id": "partial", "instructions": ""},
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    bundle = catalog.get("partial")
+    assert bundle is not None
+    assert bundle.body == "Original body."
+
+
 def test_update_skill_rejects_builtin(tmp_path):
     import agent as agent_module
 
@@ -4608,6 +4640,32 @@ def test_memory_tidy_uses_force_tidy(monkeypatch):
     agent_module.memory_tidy()
 
     assert calls == {"force_tidy": 1, "tidy": 1, "closed": 1}
+
+
+def test_evolve_uses_qualified_component_cleanup(monkeypatch):
+    import agent.cli as cli_module
+
+    calls = {"closed": 0}
+
+    class _FakeEvolution:
+        async def rewrite_system_prompt(self):
+            return "new prompt"
+
+    async def fake_build_components_async(cfg):
+        return {"evolution": _FakeEvolution()}
+
+    async def fake_close_components(components):
+        calls["closed"] += 1
+
+    monkeypatch.setattr(cli_module.agent_module, "load_config", lambda: ({}, False))
+    monkeypatch.setattr(
+        cli_module.agent_module, "_build_components_async", fake_build_components_async
+    )
+    monkeypatch.setattr(cli_module.agent_module, "_close_components", fake_close_components)
+
+    cli_module.evolve(rewrite=False, apply_best=False, stats=False)
+
+    assert calls["closed"] == 1
 
 
 def test_gateway_starts_background_scheduler(monkeypatch):

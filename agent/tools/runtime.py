@@ -217,18 +217,6 @@ class ToolRegistry:
             self._tools.pop(name, None)
 
 
-# ── Web tool constants ─────────────────────────────────────────────────────────
-WEB_FETCH_MAX_BYTES = 512 * 1024  # 512 KB response cap
-WEB_FETCH_TIMEOUT = 20  # seconds
-WEB_SEARCH_MAX_RESULTS = 10
-TAVILY_SEARCH_MAX_RESULTS = 10
-TAVILY_SEARCH_URL = "https://api.tavily.com/search"
-# User-Agent sent with every request – identifies the agent honestly.
-WEB_USER_AGENT = (
-    "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
-)
-
-
 class BuiltinTools:
     """Built-in tools with bounded file access and structured responses."""
 

@@ -40,6 +40,8 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
+    SCHEMA_VERSION = 1
+
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -95,6 +97,18 @@ class SchedulerStore:
                     ON scheduled_task_runs(task_id, created_at);
                 """
             )
+            current_version = int(
+                self._conn.execute("PRAGMA user_version").fetchone()[0]
+            )
+            if current_version < self.SCHEMA_VERSION:
+                self._migrate_schema(current_version, self.SCHEMA_VERSION)
+
+    def _migrate_schema(self, current_version: int, target_version: int) -> None:
+        version = int(current_version)
+        while version < target_version:
+            version += 1
+            if version == 1:
+                self._conn.execute("PRAGMA user_version = 1")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(

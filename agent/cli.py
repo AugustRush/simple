@@ -1066,7 +1066,7 @@ def evolve(
                 shared.CONSOLE.print("[green]Done. New prompt:[/green]")
                 shared.CONSOLE.print(Markdown(new_prompt[:500]))
         finally:
-            await _close_components(components)
+            await agent_module._close_components(components)
 
     asyncio.run(_run())
 

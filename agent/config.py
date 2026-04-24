@@ -14,7 +14,6 @@ from rich.prompt import Prompt
 import agent as agent_module
 from agent import shared
 
-DEFAULT_CONFIG = None
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
 
 # ── Default config.json template ─────────────────────────────────────────────

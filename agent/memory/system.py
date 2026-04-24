@@ -42,6 +42,8 @@ class MemoryPalace:
         self.store = store or LTMStore(context_dir=context_dir, memory_dir=base_dir)
         self.base_dir = self.store.memory_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._export_path = self.base_dir / "memory.jsonl"
+        self._export_dirty = True
         self._last_tidy: float = 0
         self._files_since_tidy: int = 0
         self._tidy_interval = tidy_interval
@@ -51,7 +53,7 @@ class MemoryPalace:
         chapter = normalize_memory_chapter(chapter, shared.LEGACY_MEMORY_ALIASES)
         self.store.upsert_manual_note(chapter, name, content, append=append)
         self._files_since_tidy += 1
-        self.export_jsonl()
+        self._export_dirty = True
 
     def read(self, chapter: str, name: str) -> str:
         chapter = normalize_memory_chapter(chapter, shared.LEGACY_MEMORY_ALIASES)
@@ -80,7 +82,9 @@ class MemoryPalace:
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
     def export_jsonl(self, path: Optional[Path] = None) -> Path:
-        path = path or (self.base_dir / "memory.jsonl")
+        path = path or self._export_path
+        if path == self._export_path and path.exists() and not self._export_dirty:
+            return path
         entries = sorted(
             self.store.all_entries(),
             key=lambda entry: (str(entry.updated_at), str(entry.id)),
@@ -91,6 +95,8 @@ class MemoryPalace:
             for entry in entries
         ]
         path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+        if path == self._export_path:
+            self._export_dirty = False
         return path
 
     def should_tidy(self) -> bool:
@@ -603,14 +609,7 @@ class LTMStore:
 
     def _cleanup_legacy_artifacts(self) -> None:
         self._meta_path.unlink(missing_ok=True)
-        for path in self.dir.glob("*.json"):
-            if path.name == "palace.db":
-                continue
-            path.unlink(missing_ok=True)
-        for path in self.memory_dir.rglob("*.md"):
-            if path.name == "memory.jsonl":
-                continue
-            path.unlink(missing_ok=True)
+        (self.memory_dir / "INDEX.md").unlink(missing_ok=True)
 
     @staticmethod
     def normalize_category_name(name: str) -> str:

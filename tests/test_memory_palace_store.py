@@ -78,10 +78,24 @@ def test_memory_palace_does_not_create_chapter_dirs(tmp_path):
     )
     palace.write("identity", "user", "Prefers concise responses")
 
-    assert (tmp_path / "memory" / "memory.jsonl").exists()
     assert not (tmp_path / "memory" / "identity").exists()
     assert not (tmp_path / "memory" / "projects").exists()
     assert not (tmp_path / "memory" / "INDEX.md").exists()
+
+
+def test_memory_palace_write_defers_jsonl_export_until_requested(tmp_path):
+    from agent import MemoryPalace
+
+    palace = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+
+    palace.write("identity", "user", "Prefers concise responses")
+
+    assert not (tmp_path / "memory" / "memory.jsonl").exists()
+    assert "Prefers concise responses" in palace.read_index()
+    assert (tmp_path / "memory" / "memory.jsonl").exists()
 
 
 def test_memory_palace_exports_jsonl_in_updated_at_order(tmp_path):
@@ -221,3 +235,21 @@ def test_memory_palace_force_tidy_marks_state_dirty(tmp_path):
     palace.force_tidy()
 
     assert palace.should_tidy() is True
+
+
+def test_ltm_store_legacy_cleanup_preserves_unrelated_json_and_markdown(tmp_path):
+    from agent import LTMStore
+
+    context_dir = tmp_path / "context"
+    memory_dir = tmp_path / "memory"
+    context_dir.mkdir()
+    memory_dir.mkdir()
+    custom_json = context_dir / "user-settings.json"
+    custom_json.write_text('{"theme":"light"}', encoding="utf-8")
+    custom_md = memory_dir / "notes.md"
+    custom_md.write_text("keep me", encoding="utf-8")
+
+    LTMStore(context_dir=context_dir, memory_dir=memory_dir)
+
+    assert custom_json.exists()
+    assert custom_md.exists()

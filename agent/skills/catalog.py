@@ -484,7 +484,11 @@ class SkillCatalog:
                 final_desc = (
                     description if description is not None else bundle.description
                 )
-                final_body = instructions if instructions is not None else bundle.body
+                final_body = (
+                    instructions
+                    if instructions is not None and instructions.strip()
+                    else bundle.body
+                )
                 final_user_inv = (
                     user_invocable
                     if user_invocable is not None

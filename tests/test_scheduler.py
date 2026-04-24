@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+import sqlite3
 
 from typer.testing import CliRunner
 
@@ -54,6 +55,19 @@ def test_scheduler_store_creates_and_lists_tasks(tmp_path):
     assert tasks[0].id == created.id
     assert tasks[0].name == "daily-summary"
     assert tasks[0].delivery_mode == "standalone"
+
+
+def test_scheduler_store_sets_schema_version(tmp_path):
+    from agent.scheduler import SchedulerStore
+
+    db_path = tmp_path / "scheduler.db"
+    store = SchedulerStore(db_path=db_path)
+
+    version = sqlite3.connect(db_path).execute("PRAGMA user_version").fetchone()[0]
+
+    store.close()
+
+    assert version >= 1
 
 
 def test_scheduler_store_claims_due_task_and_creates_run(tmp_path):
