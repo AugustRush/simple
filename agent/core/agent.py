@@ -1152,6 +1152,17 @@ class BaseAgent:
                 return prefix + continuation[size:]
         return prefix + continuation
 
+    @staticmethod
+    def _build_continuation_context(ctx: "AgentContext") -> "AgentContext":
+        """Create the minimal context needed for bounded auto-continue requests."""
+        return AgentContext(
+            agent_id=ctx.agent_id,
+            role=ctx.role,
+            messages=list(ctx.messages),
+            system_prompt=ctx.system_prompt,
+            tools_enabled=ctx.tools_enabled,
+        )
+
     async def _continue_truncated_response(
         self,
         ctx: "AgentContext",
@@ -1161,7 +1172,7 @@ class BaseAgent:
         merged = partial_text
         continuation_error = "Model response was truncated (finish_reason=length)"
         for _ in range(self._MAX_TRUNCATION_CONTINUATIONS):
-            continuation_ctx = copy.deepcopy(ctx)
+            continuation_ctx = self._build_continuation_context(ctx)
             continuation_ctx.messages.append(
                 {"role": "user", "content": self._CONTINUE_PROMPT}
             )

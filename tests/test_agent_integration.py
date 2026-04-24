@@ -4319,6 +4319,60 @@ def test_send_message_auto_continue_preserves_openai_provider_extras(monkeypatch
     ]
 
 
+def test_send_message_auto_continue_ignores_non_copyable_context_metadata(monkeypatch):
+    import threading
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length",
+                        agent_module.shared._OAIMsg("第一段没有说完", None),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop",
+                        agent_module.shared._OAIMsg("，这是续写完成。", None),
+                    )
+                ]
+            ),
+        ]
+    )
+    seen_messages = []
+
+    async def fake_create(ctx, tools):
+        seen_messages.append(list(ctx.messages))
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    ctx.metadata["unsafe_local"] = threading.local()
+    result = asyncio.run(agent.send_message(ctx, "hello"))
+
+    assert result.error is None
+    assert result.content == "第一段没有说完，这是续写完成。"
+    assert len(seen_messages) == 2
+    assert seen_messages[1] == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "第一段没有说完"},
+        {
+            "role": "user",
+            "content": "Continue exactly from where you left off. Do not repeat previous text. Do not restart the answer.",
+        },
+    ]
+
+
 def test_send_message_stream_drops_non_serializable_openai_provider_extras(
     monkeypatch,
 ):
