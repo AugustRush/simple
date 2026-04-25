@@ -467,9 +467,9 @@ Connected MCP tools are injected into the runtime tool registry and appear in th
 The context system has four layers:
 
 1. **Working memory** — active `ctx.messages` kept in RAM for the current interaction loop
-2. **Staging** — raw user/assistant turns appended to per-session JSONL buffers in `~/.agent/context/_staging/`
-3. **Long-term memory** — structured memories stored in `~/.agent/context/palace.db`, with JSON snapshots and markdown projections in `~/.agent/memory/`
-4. **Memory palace projection** — human-readable markdown views written per locus for inspection and manual edits
+2. **Staging** — raw user/assistant turns appended to per-session buffers in `~/.agent/context/palace.db` by default, with legacy JSONL compatibility for explicit file-based staging
+3. **Long-term memory** — structured memories stored in `~/.agent/context/palace.db`, with user-facing JSONL export in `~/.agent/memory/memory.jsonl`
+4. **Memory palace export** — on-demand JSONL projection for inspection; SQLite remains the source of truth
 
 Fixed palace loci:
 
@@ -491,7 +491,7 @@ Consolidation is chunked: long staged conversations are split into manageable pr
 
 ### Retrieval
 
-- **Implicit prompt injection** — long-term memory by default; current-session staging only for clear recall queries
+- **Implicit prompt injection** — assistant self-identity plus relevant long-term memory by default; current-session staging only for clear recall queries or post-compaction recovery
 - **Explicit tool retrieval** — `context_retrieve` searches current-session staging plus long-term memory
 
 For recall-style queries such as "what did we just discuss", the runtime falls back to recent `episodes` summaries when keyword search alone would miss the latest session.

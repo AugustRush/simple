@@ -15,6 +15,12 @@ from typing import Any, Callable, Optional
 
 import agent as agent_module
 from agent import shared
+
+
+_LATIN_TOKEN_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9]*\b")
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -27,6 +33,36 @@ def _new_id() -> str:
 def normalize_memory_chapter(chapter: str, aliases: dict[str, str]) -> str:
     chapter = str(chapter).strip().lower()
     return aliases.get(chapter, chapter)
+
+
+def _cjk_ngrams(text: str, min_n: int = 2, max_n: int = 3) -> list[str]:
+    terms: list[str] = []
+    clean = str(text or "").strip()
+    if not clean:
+        return terms
+    for run in _CJK_RUN_RE.findall(clean):
+        if len(run) < min_n:
+            terms.append(run)
+            continue
+        upper = min(max_n, len(run))
+        for n in range(min_n, upper + 1):
+            for i in range(0, len(run) - n + 1):
+                terms.append(run[i : i + n])
+    return terms
+
+
+def _lexical_terms(text: str) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    for token in _LATIN_TOKEN_RE.findall(str(text or "").lower()):
+        if token not in seen:
+            terms.append(token)
+            seen.add(token)
+    for token in _cjk_ngrams(text):
+        if token not in seen:
+            terms.append(token)
+            seen.add(token)
+    return terms
 
 class MemoryPalace:
     """Facade for all memory operations."""
@@ -1131,14 +1167,8 @@ class LTMStore:
         categories: Optional[list[str]] = None,
         limit: int = shared.RETRIEVAL_TOP_K,
     ) -> list[LTMEntry]:
-        tokens = [
-            t
-            for t in re.findall(
-                r"\b[a-zA-Z\u4e00-\u9fff][a-zA-Z0-9\u4e00-\u9fff]*\b", query.lower()
-            )
-            if t
-        ]
-        if not tokens:
+        query_terms = _lexical_terms(query)
+        if not query_terms:
             with self._connect() as conn:
                 sql = """
                     SELECT * FROM memory_items
@@ -1154,30 +1184,70 @@ class LTMStore:
                 rows = conn.execute(sql, params).fetchall()
             return [self._row_to_entry(row) for row in rows]
 
-        escaped_tokens = [token.replace('"', '""') for token in tokens]
-        match_query = " ".join(f'"{token}"*' for token in escaped_tokens)
+        latin_terms = [term for term in query_terms if _LATIN_TOKEN_RE.fullmatch(term)]
+        cjk_terms = [term for term in query_terms if term not in latin_terms]
+        results_by_id: dict[str, LTMEntry] = {}
+
+        def _merge(rows: list[sqlite3.Row]) -> None:
+            for row in rows:
+                entry = self._row_to_entry(row)
+                results_by_id.setdefault(entry.id, entry)
+
+        normalized_categories = (
+            [self.normalize_category_name(c) for c in categories] if categories else []
+        )
+
         with self._connect() as conn:
-            sql = """
-                SELECT m.*
-                FROM memory_items_fts
-                JOIN memory_items AS m
-                  ON m.id = memory_items_fts.memory_id
-                WHERE memory_items_fts MATCH ?
-                  AND m.status NOT IN ('archived', 'superseded')
-            """
-            params: list[Any] = [match_query]
-            if categories:
-                cats = [self.normalize_category_name(c) for c in categories]
-                sql += f" AND m.category IN ({','.join('?' for _ in cats)})"
-                params.extend(cats)
-            sql += """
-                ORDER BY bm25(memory_items_fts), m.importance DESC,
-                         m.updated_at DESC, m.id ASC
-                LIMIT ?
-            """
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_entry(row) for row in rows]
+            if latin_terms:
+                escaped_tokens = [token.replace('"', '""') for token in latin_terms]
+                match_query = " OR ".join(f'"{token}"*' for token in escaped_tokens)
+                sql = """
+                    SELECT m.*
+                    FROM memory_items_fts
+                    JOIN memory_items AS m
+                      ON m.id = memory_items_fts.memory_id
+                    WHERE memory_items_fts MATCH ?
+                      AND m.status NOT IN ('archived', 'superseded')
+                """
+                params: list[Any] = [match_query]
+                if normalized_categories:
+                    sql += f" AND m.category IN ({','.join('?' for _ in normalized_categories)})"
+                    params.extend(normalized_categories)
+                sql += """
+                    ORDER BY bm25(memory_items_fts), m.importance DESC,
+                             m.updated_at DESC, m.id ASC
+                    LIMIT ?
+                """
+                params.append(limit * 6)
+                _merge(conn.execute(sql, params).fetchall())
+
+            if cjk_terms:
+                like_clauses = []
+                params = []
+                for term in cjk_terms[:12]:
+                    pattern = f"%{term}%"
+                    like_clauses.append(
+                        "(content LIKE ? OR entity LIKE ? OR category LIKE ?)"
+                    )
+                    params.extend([pattern, pattern, pattern])
+                sql = """
+                    SELECT *
+                    FROM memory_items
+                    WHERE status NOT IN ('archived', 'superseded')
+                """
+                if like_clauses:
+                    sql += " AND (" + " OR ".join(like_clauses) + ")"
+                if normalized_categories:
+                    sql += f" AND category IN ({','.join('?' for _ in normalized_categories)})"
+                    params.extend(normalized_categories)
+                sql += """
+                    ORDER BY importance DESC, updated_at DESC, id ASC
+                    LIMIT ?
+                """
+                params.append(limit * 6)
+                _merge(conn.execute(sql, params).fetchall())
+
+        return list(results_by_id.values())[: limit * 6]
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 
@@ -1287,10 +1357,8 @@ class LocalRetriever:
 
     @staticmethod
     def tokenize(text: str) -> list[str]:
-        """Lowercase tokenizer: splits on non-alphanumeric, keeps CJK chars."""
-        return re.findall(
-            r"\b[a-zA-Z\u4e00-\u9fff][a-zA-Z0-9\u4e00-\u9fff]*\b", text.lower()
-        )
+        """Language-aware tokenizer for lexical recall and reranking."""
+        return _lexical_terms(text)
 
     def score(
         self, query: str, entries: list[LTMEntry]
@@ -1307,7 +1375,9 @@ class LocalRetriever:
         tokenized: list[list[str]] = []
 
         for entry in entries:
-            tokens = self.tokenize(entry.content)
+            tokens = self.tokenize(
+                f"{entry.content} {entry.entity} {entry.category} {entry.memory_type}"
+            )
             tokenized.append(tokens)
             for term in set(tokens):
                 df[term] = df.get(term, 0) + 1
@@ -1492,13 +1562,14 @@ class ConsolidationEngine:
             f'"memory_type": "<type>", "content": "<fact>", "importance": <0.1-1.0>, "confidence": <0.1-1.0>}}\n\n'
             f"Rules:\n"
             f"- Use only the fixed loci listed above; never invent new top-level loci\n"
-            f"- identity: user preferences/style/constraints\n"
+            f"- identity: durable identity facts; use entity='user' for user facts and entity='assistant' for agent self-identity\n"
             f"- projects: project decisions/state/risks\n"
             f"- people: person-specific facts\n"
             f"- concepts: durable domain knowledge\n"
             f"- tasks: commitments, next steps, open loops\n"
             f"- procedures: repeatable workflows and preferred methods\n"
             f"- archive: only if the memory is historical or superseded\n"
+            f"- If the user gives the agent a stable name/role/identity, store it under identity with entity='assistant' and memory_type='self_identity'\n"
             f"- Do not output episodes; session summary is generated separately\n"
             f"- Be selective: max 8 items, 1-2 sentences each\n\n"
             f"Conversation ({chunk_label}):\n{conversation_text}"
@@ -1608,6 +1679,40 @@ class ConsolidationEngine:
     def _format_messages_for_llm(self, messages: list[dict]) -> str:
         return "\n\n".join(self._message_lines_for_llm(messages))
 
+    @staticmethod
+    def _infer_identity_entity(content: str, memory_type: str, entity: str) -> str:
+        explicit = str(entity or "").strip().lower()
+        if explicit:
+            return explicit
+        normalized_type = str(memory_type or "").strip().lower()
+        if normalized_type in {"self_identity", "assistant_identity"}:
+            return "assistant"
+
+        lowered = str(content or "").strip().lower()
+        assistant_markers = (
+            "assistant",
+            "agent",
+            "bot",
+            "your name",
+            "你叫",
+            "你的名字",
+            "助手",
+            "机器人",
+        )
+        user_markers = (
+            "user",
+            "the user",
+            "用户",
+            "我喜欢",
+            "我通常",
+            "prefers",
+        )
+        assistant_hit = any(marker in lowered for marker in assistant_markers)
+        user_hit = any(marker in lowered for marker in user_markers)
+        if assistant_hit and not user_hit:
+            return "assistant"
+        return "user"
+
     def _parse_entries(self, raw: str) -> list[LTMEntry]:
         entries = []
         for line in raw.splitlines():
@@ -1621,7 +1726,10 @@ class ConsolidationEngine:
                     continue
                 category = data.get("locus") or data.get("category") or "concepts"
                 normalized_category = self.store.normalize_category_name(category)
+                memory_type = str(data.get("memory_type", "fact")).strip() or "fact"
                 entity = str(data.get("entity", "")).strip()
+                if normalized_category == "identity":
+                    entity = self._infer_identity_entity(content, memory_type, entity)
                 if normalized_category not in shared.PALACE_LOCI:
                     entity = entity or normalized_category
                     normalized_category = "concepts"
@@ -1634,8 +1742,7 @@ class ConsolidationEngine:
                         created_at=_now(),
                         updated_at=_now(),
                         entity=entity,
-                        memory_type=str(data.get("memory_type", "fact")).strip()
-                        or "fact",
+                        memory_type=memory_type,
                         source_session=str(data.get("source_session", "")).strip(),
                         confidence=float(data.get("confidence", 1.0)),
                     )
@@ -1685,10 +1792,11 @@ class ContextManager:
     After each sleep() the flag is cleared; mark_activity() re-arms it.
 
     Staging buffer: every user/assistant turn is appended to a per-session
-    JSONL file under _staging/. This ensures consolidation always has a
-    complete source even if the session ends before the token threshold fires,
-    without mixing raw turns across unrelated sessions. Buffer is cleared after
-    each sleep.
+    staging buffer. The default backend is SQLite under ``palace.db`` with a
+    legacy JSONL fallback for explicit file-based callers. This ensures
+    consolidation always has a complete source even if the session ends before
+    the token threshold fires, without mixing raw turns across unrelated
+    sessions. Buffer is drained only after confirmed successful consolidation.
     """
 
     def __init__(
@@ -2056,10 +2164,6 @@ class ContextManager:
         """
         categories = self._route_categories(query)
         candidates = self.store.search_entries(query, categories=None, limit=top_k * 6)
-        if not candidates:
-            candidates = [
-                entry for entry in self.store.all_entries() if entry.category != "episodes"
-            ]
         if not candidates and self._is_episode_recall_query(query):
             candidates = self.store.read_entries("episodes")[: top_k * 3]
         if not candidates:
@@ -2077,7 +2181,7 @@ class ContextManager:
             scored.sort(key=lambda item: item[1], reverse=True)
         top = [entry for entry, score in scored[:top_k] if score > 0]
         if not top:
-            top = candidates[:top_k]
+            return ""
         lines = ["## Retrieved Context (from long-term memory)"]
         for e in top:
             anchor = f"{e.category}/{e.entity}" if e.entity else e.category
@@ -2109,8 +2213,6 @@ class ContextManager:
             session_id=self.staging.session_id,
             limit=limit,
         )
-        if not turns:
-            turns = self.store.recent_conversation_turns(limit=limit)
         if not turns:
             return ""
         lines = ["## Conversation History"]
@@ -2163,6 +2265,17 @@ class ContextManager:
                 lines.append(f"- {role}: {content}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
+    def _assistant_identity_context(self, limit: int = 3) -> str:
+        entries = self.store.read_entries_for_entity("identity", "assistant")
+        if not entries:
+            return ""
+        lines = ["## Assistant Identity"]
+        for entry in entries[: max(1, limit)]:
+            content = entry.content.strip()
+            if content:
+                lines.append(f"- {content}")
+        return "\n".join(lines) if len(lines) > 1 else ""
+
     def retrieve_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
         """Return explicit context lookup results across active session and LTM."""
         sections = []
@@ -2190,6 +2303,9 @@ class ContextManager:
         recent conversation.
         """
         sections = []
+        assistant_identity = self._assistant_identity_context()
+        if assistant_identity:
+            sections.append(assistant_identity)
         if "episodes" in self._route_categories(query):
             recent = self._recent_session_context()
             if recent:

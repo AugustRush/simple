@@ -90,6 +90,54 @@ def test_retrieve_context_prefers_conversation_turns_for_event_recall(tmp_path):
     assert "ASSISTANT: 原因是系统只有语义记忆和摘要" in result
 
 
+def test_retrieve_history_context_does_not_fallback_to_other_sessions(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    memory_dir = tmp_path / "memory"
+    store = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
+    store.append_conversation_turn(
+        session_id="chat-a",
+        role="user",
+        content="A session asked about payroll",
+        channel="feishu",
+    )
+    store.append_conversation_turn(
+        session_id="chat-a",
+        role="assistant",
+        content="A session answer about payroll",
+        channel="feishu",
+    )
+    store.append_conversation_turn(
+        session_id="chat-b",
+        role="user",
+        content="B session asked about auth bug",
+        channel="feishu",
+    )
+    store.append_conversation_turn(
+        session_id="chat-b",
+        role="assistant",
+        content="B session answer about auth bug",
+        channel="feishu",
+    )
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="fresh-session"),
+    )
+
+    result = ctx_mgr.retrieve_history_context("刚才我们聊了什么")
+
+    assert result == ""
+
+
 def test_retrieve_context_keeps_generic_history_semantic(tmp_path):
     ctx_mgr = make_ctx_manager(tmp_path)
     ctx_mgr.record_turn(
@@ -208,6 +256,21 @@ def test_parse_entries_supports_fixed_loci_fields(tmp_path):
     assert entries[0].entity == "user"
     assert entries[0].memory_type == "preference"
     assert entries[0].confidence == pytest.approx(0.9)
+
+
+def test_parse_entries_infers_assistant_entity_for_self_identity(tmp_path):
+    eng = make_engine(tmp_path)
+    raw = (
+        '{"locus": "identity", "memory_type": "self_identity", '
+        '"content": "助手的名字是阿福", "importance": 0.8, "confidence": 0.9}\n'
+    )
+
+    entries = eng._parse_entries(raw)
+
+    assert len(entries) == 1
+    assert entries[0].category == "identity"
+    assert entries[0].entity == "assistant"
+    assert entries[0].memory_type == "self_identity"
 
 
 def test_parse_entries_skips_empty_content(tmp_path):
@@ -632,6 +695,144 @@ def test_retrieve_ltm_context_soft_biases_routes_without_hard_filtering(tmp_path
     result = ctx_mgr.retrieve_ltm_context("workspace retries", top_k=3)
 
     assert "retries should remain armed after transient consolidation failures" in result.lower()
+
+
+def test_retrieve_ltm_context_returns_empty_for_irrelevant_query(tmp_path):
+    from agent import (
+        LTMEntry,
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+    )
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    store.add_entry(
+        LTMEntry(
+            id="identity-1",
+            category="identity",
+            entity="user",
+            memory_type="preference",
+            content="Prefers concise responses",
+            importance=0.9,
+            created_at="2026-04-13",
+            updated_at="2026-04-13",
+        )
+    )
+    store.add_entry(
+        LTMEntry(
+            id="task-1",
+            category="tasks",
+            entity="demo",
+            memory_type="task",
+            content="Finish the auth migration",
+            importance=0.8,
+            created_at="2026-04-13",
+            updated_at="2026-04-13",
+        )
+    )
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+    )
+
+    result = ctx_mgr.retrieve_ltm_context("quantum banana zebra", top_k=3)
+
+    assert result == ""
+
+
+@pytest.mark.parametrize("query", ["简洁回复", "喜欢简洁", "回复"])
+def test_retrieve_ltm_context_matches_common_chinese_substrings(tmp_path, query):
+    from agent import (
+        LTMEntry,
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+    )
+
+    store = LTMStore(
+        context_dir=tmp_path / "context",
+        memory_dir=tmp_path / "memory",
+    )
+    store.add_entry(
+        LTMEntry(
+            id="identity-1",
+            category="identity",
+            entity="user",
+            memory_type="preference",
+            content="用户喜欢简洁回复，不要表情",
+            importance=0.8,
+            created_at="2026-04-13",
+            updated_at="2026-04-13",
+        )
+    )
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+    )
+
+    result = ctx_mgr.retrieve_ltm_context(query, top_k=3)
+
+    assert "用户喜欢简洁回复，不要表情" in result
+
+
+def test_retrieve_implicit_context_includes_assistant_identity_after_restart(tmp_path):
+    from agent import (
+        LTMEntry,
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    memory_dir = tmp_path / "memory"
+    store = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
+    store.add_entry(
+        LTMEntry(
+            id="user-pref",
+            category="identity",
+            entity="user",
+            memory_type="preference",
+            content="Prefers concise responses",
+            importance=0.95,
+            created_at="2026-04-13",
+            updated_at="2026-04-13",
+        )
+    )
+    store.add_entry(
+        LTMEntry(
+            id="assistant-name",
+            category="identity",
+            entity="assistant",
+            memory_type="self_identity",
+            content="助手的名字是阿福",
+            importance=0.4,
+            created_at="2026-04-13",
+            updated_at="2026-04-13",
+        )
+    )
+
+    reloaded_store = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
+    ctx_mgr = ContextManager(
+        store=reloaded_store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=reloaded_store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="new-session"),
+    )
+
+    result = ctx_mgr.retrieve_implicit_context(
+        "你叫什么名字",
+        top_k=1,
+        current_messages=[],
+    )
+
+    assert "助手的名字是阿福" in result
+    assert "Prefers concise responses" not in result
 
 
 # ── Regression: all consolidation trigger guards ──────────────────────────────
