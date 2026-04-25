@@ -97,6 +97,15 @@
     }
   },
 
+  "assistant_identity": {
+    "_readme": [
+      "Optional deterministic assistant identity bootstrap.",
+      "When set, these values are written into structured fact storage at startup so exact questions like 'what is your name' do not rely on free-form memory recall."
+    ],
+    "name": "",
+    "role": ""
+  },
+
   "mcp_servers": [
     {
       "_readme": "Remove this object and add real MCP server entries. Each entry needs name, command, and args.",

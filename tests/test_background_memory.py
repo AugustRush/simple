@@ -75,6 +75,41 @@ def test_background_worker_processes_queued_consolidation(tmp_path):
     assert ctx_mgr.staging.count() == 0
 
 
+def test_process_one_job_materializes_resolved_fact_from_identity_entry(tmp_path):
+    from agent import LTMEntry
+
+    ctx_mgr, staging = _build_context_manager(tmp_path)
+
+    staging.append("user", "以后你叫阿福。")
+    staging.append("assistant", "好，从现在开始我叫阿福。")
+    ctx_mgr.enqueue_consolidation("staged_turns")
+
+    async def run_once():
+        await ctx_mgr.process_one_job(
+            client=None,
+            model="x",
+            api_format="openai",
+            extractor=lambda *_: [
+                LTMEntry(
+                    id="assistant-identity",
+                    category="identity",
+                    entity="assistant",
+                    memory_type="self_identity",
+                    content="助手的名字是阿福",
+                    importance=0.9,
+                    created_at="2026-04-25",
+                    updated_at="2026-04-25",
+                )
+            ],
+        )
+
+    asyncio.run(run_once())
+
+    facts = ctx_mgr.store.read_resolved_facts(subject="assistant", predicate="name")
+
+    assert [fact.value for fact in facts] == ["阿福"]
+
+
 def test_process_one_job_preserves_turns_appended_during_consolidation(tmp_path):
     ctx_mgr, staging = _build_context_manager(tmp_path)
 

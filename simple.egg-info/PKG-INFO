@@ -77,6 +77,7 @@ Key config sections:
 | `mcp_servers` | MCP server definitions (name, command, args) |
 | `plugins` | Per-plugin enable/disable (`{"evolution": {"enabled": false}}`) |
 | `evolution` | Enable/disable session scoring and rule learning |
+| `scheduler` | Poll/lease settings for the persistent scheduler service |
 | `tavily_api_key` | Optional Tavily search key |
 | `output_dir` | Override default `~/.agent/output` |
 | `system_prompt_file` | Load a custom system prompt from a `.md` or `.txt` file |
@@ -95,6 +96,21 @@ Single-turn chat:
 
 ```bash
 uv run simple chat "Summarize this repository"
+```
+
+Scheduler service:
+
+```bash
+uv run simple scheduler
+```
+
+Create a daily scheduled task:
+
+```bash
+uv run simple schedule daily daily-summary \
+  --time 09:00 \
+  --timezone Asia/Shanghai \
+  --prompt "Summarize yesterday's progress"
 ```
 
 Config commands:
@@ -174,6 +190,21 @@ Do not mix these two paths:
 | `/ralph <goal>` | Launch an autonomous multi-iteration task loop |
 | `/quit` | End the session |
 
+## Scheduler Commands
+
+| Command | Description |
+|---|---|
+| `simple schedule once ...` | Create a one-shot scheduled task |
+| `simple schedule interval ...` | Create a fixed-interval scheduled task |
+| `simple schedule daily ...` | Create a daily scheduled task |
+| `simple schedule weekly ...` | Create a weekly scheduled task |
+| `simple schedule list` | List persisted scheduled tasks |
+| `simple schedule show <id>` | Show one task and its run history |
+| `simple schedule pause <id>` | Disable a scheduled task |
+| `simple schedule resume <id>` | Re-enable a scheduled task |
+| `simple schedule delete <id>` | Delete a task and its recorded runs |
+| `simple scheduler` | Run the persistent scheduler service |
+
 Invoke a skill explicitly with a slash prefix matching its ID:
 
 ```
@@ -209,6 +240,112 @@ Behaviour guarantees:
 - tool payloads are structured JSON where possible
 - shell calls are timeout-bounded
 - sub-agents inherit the parent context manager but do not recursively receive `spawn_agent`
+
+## Multi-Agent Orchestration Modes
+
+The runtime does not primarily choose orchestration mode from user-facing
+keywords. Instead, mode selection happens when the model emits one or more
+`spawn_agent` calls in the same assistant turn.
+
+At the runtime level, the trigger rules are:
+
+- `direct`
+  - no `spawn_agent` call is emitted, or only one sub-agent is spawned
+- `parallel`
+  - multiple `spawn_agent` calls are emitted in the same turn
+  - none of them has `depends_on`
+  - none of them sets `coordination_mode="rendezvous"`
+- `pipeline`
+  - multiple `spawn_agent` calls are emitted in the same turn
+  - at least one subtask declares a non-empty `depends_on`
+- `rendezvous`
+  - multiple `spawn_agent` calls are emitted in the same turn
+  - at least one subtask sets `coordination_mode="rendezvous"`
+  - this takes precedence over `pipeline` and `parallel`
+
+Important constraints:
+
+- Orchestration only happens within one assistant response. If the model emits
+  one sub-agent now and another in a later turn, the runtime will not join them
+  into the same pipeline or rendezvous batch.
+- `depends_on` must point to subtask ids from the same batch.
+- `rendezvous` is bounded. The current default is two rounds.
+
+### How To Trigger Each Mode
+
+From the user side, the practical way to trigger a mode is to ask for a task
+shape that naturally leads the model to emit the matching `spawn_agent`
+structure.
+
+#### `parallel`
+
+Use when you want several independent perspectives to work at the same time.
+
+Example prompts:
+
+```text
+同时让 3 个子 agent 分别从性能、正确性、可维护性 review 这次改动，最后汇总结论。
+```
+
+```text
+并行找出这个项目里和认证、缓存、调度相关的实现风险，每个子 agent 负责一个方向。
+```
+
+Expected runtime shape:
+
+- same-turn multiple `spawn_agent`
+- no `depends_on`
+
+#### `pipeline`
+
+Use when later workers should consume earlier workers' outputs.
+
+Example prompts:
+
+```text
+先让 researcher 收集事实，再让 planner 基于这些事实给出方案，最后让 critic 审查方案。
+```
+
+```text
+先分析问题根因，再生成修复方案，最后基于修复方案补测试。
+```
+
+Expected runtime shape:
+
+- same-turn multiple `spawn_agent`
+- downstream subtasks include `depends_on`
+
+#### `rendezvous`
+
+Use when you want bounded multi-round coordination rather than one-pass fan-out.
+
+Example prompts:
+
+```text
+让正方和反方分别给方案，互相回应一轮后，再收敛成最终建议。
+```
+
+```text
+让 researcher 和 critic 先各自独立判断，再进行一轮交叉校验，最后输出共识和分歧。
+```
+
+Expected runtime shape:
+
+- same-turn multiple `spawn_agent`
+- at least one subtask sets `coordination_mode="rendezvous"`
+
+### Notes For Prompting
+
+- If you want `parallel`, avoid wording that implies strict sequencing such as
+  “先…再…”.
+- If you want `pipeline`, be explicit about stage order and upstream/downstream
+  dependency.
+- If you want `rendezvous`, explicitly ask for “互相回应一轮”, “交叉校验”, or
+  “收敛共识”, because that is what encourages the model to emit coordinated
+  subtask structure instead of plain fan-out.
+- If you want deterministic testing, inspect gateway logs. The runtime emits
+  `execution_mode` in sub-agent batch events, and the gateway now also emits
+  interaction logs for message receipt, agent execution, and reply delivery.
 
 ## Skills
 
@@ -344,9 +481,9 @@ Connected MCP tools are injected into the runtime tool registry and appear in th
 The context system has four layers:
 
 1. **Working memory** — active `ctx.messages` kept in RAM for the current interaction loop
-2. **Staging** — raw user/assistant turns appended to per-session JSONL buffers in `~/.agent/context/_staging/`
-3. **Long-term memory** — structured memories stored in `~/.agent/context/palace.db`, with JSON snapshots and markdown projections in `~/.agent/memory/`
-4. **Memory palace projection** — human-readable markdown views written per locus for inspection and manual edits
+2. **Staging** — raw user/assistant turns appended to per-session buffers in `~/.agent/context/palace.db` by default, with legacy JSONL compatibility for explicit file-based staging
+3. **Long-term memory** — structured memories stored in `~/.agent/context/palace.db`, with user-facing JSONL export in `~/.agent/memory/memory.jsonl`
+4. **Memory palace export** — on-demand JSONL projection for inspection; SQLite remains the source of truth
 
 Fixed palace loci:
 
@@ -368,7 +505,7 @@ Consolidation is chunked: long staged conversations are split into manageable pr
 
 ### Retrieval
 
-- **Implicit prompt injection** — long-term memory by default; current-session staging only for clear recall queries
+- **Implicit prompt injection** — assistant self-identity plus relevant long-term memory by default; current-session staging only for clear recall queries or post-compaction recovery
 - **Explicit tool retrieval** — `context_retrieve` searches current-session staging plus long-term memory
 
 For recall-style queries such as "what did we just discuss", the runtime falls back to recent `episodes` summaries when keyword search alone would miss the latest session.
@@ -419,4 +556,4 @@ python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.csv
 python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.jsonl
 ```
 
-Latest local verification: `uv run pytest -q` → `217 passed, 1 skipped`
+Latest local verification: `uv run pytest -q` → `451 passed, 1 skipped`

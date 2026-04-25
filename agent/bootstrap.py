@@ -8,7 +8,7 @@ from typing import Optional
 import agent as agent_module
 from agent import shared
 from agent.config import ModelClientFactory, _compose_system_prompt, _load_system_prompt, _resolve_output_dir
-from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, ContextManager, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
+from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import BuiltinTools, MCPClient, ToolRegistry, UserToolCatalog
@@ -65,6 +65,31 @@ async def _build_components_async(cfg: dict):
         max_categories=storage_cfg.get("max_categories", max_categories),
         memory_dir=memory_dir,
     )
+    assistant_identity_cfg = cfg.get("assistant_identity", {})
+    assistant_name = str(assistant_identity_cfg.get("name", "") or "").strip()
+    assistant_role = str(assistant_identity_cfg.get("role", "") or "").strip()
+    if assistant_name:
+        ctx_store.add_fact_assertion(
+            FactAssertion(
+                id=f"bootstrap-assistant-name-{assistant_name.lower()}",
+                subject="assistant",
+                predicate="name",
+                value=assistant_name,
+                source_kind="bootstrap",
+                source_id="config.assistant_identity.name",
+            )
+        )
+    if assistant_role:
+        ctx_store.add_fact_assertion(
+            FactAssertion(
+                id=f"bootstrap-assistant-role-{assistant_role.lower().replace(' ', '_')}",
+                subject="assistant",
+                predicate="role",
+                value=assistant_role,
+                source_kind="bootstrap",
+                source_id="config.assistant_identity.role",
+            )
+        )
     memory = MemoryPalace(
         tidy_interval=mem_cfg.get("tidy_interval_seconds", shared.MEMORY_TIDY_INTERVAL),
         tidy_threshold=mem_cfg.get("tidy_file_threshold", shared.MEMORY_TIDY_FILE_THRESHOLD),

@@ -66,6 +66,7 @@ Key config sections:
 | `scheduler` | Poll/lease settings for the persistent scheduler service |
 | `tavily_api_key` | Optional Tavily search key |
 | `output_dir` | Override default `~/.agent/output` |
+| `assistant_identity` | Deterministic assistant name/role bootstrap for exact fact recall |
 | `system_prompt_file` | Load a custom system prompt from a `.md` or `.txt` file |
 
 `config.example.json` shows the full shape used by the current runtime.
@@ -468,8 +469,9 @@ The context system has four layers:
 
 1. **Working memory** — active `ctx.messages` kept in RAM for the current interaction loop
 2. **Staging** — raw user/assistant turns appended to per-session buffers in `~/.agent/context/palace.db` by default, with legacy JSONL compatibility for explicit file-based staging
-3. **Long-term memory** — structured memories stored in `~/.agent/context/palace.db`, with user-facing JSONL export in `~/.agent/memory/memory.jsonl`
-4. **Memory palace export** — on-demand JSONL projection for inspection; SQLite remains the source of truth
+3. **Fact storage** — append-only `fact_assertions` plus derived `resolved_facts` for exact beliefs such as assistant identity
+4. **Long-term memory** — free-form `memory_items` stored in `~/.agent/context/palace.db`, with user-facing JSONL export in `~/.agent/memory/memory.jsonl`
+5. **Memory palace export** — on-demand JSONL projection for inspection; SQLite remains the source of truth
 
 Fixed palace loci:
 
@@ -483,7 +485,8 @@ Legacy alias: `knowledge` → `concepts`
 - Queue background jobs when staged volume or idle time warrants it
 - Recover orphaned staging files from interrupted sessions on next startup
 - Summarize the session into `episodes`
-- Extract durable memories into fixed loci
+- Materialize exact facts into `fact_assertions` / `resolved_facts` when the extractor emits high-precision identity content
+- Extract free-form durable memories into fixed loci
 - Apply retention/decay policies
 - Compact working memory while preserving task context
 
@@ -491,10 +494,13 @@ Consolidation is chunked: long staged conversations are split into manageable pr
 
 ### Retrieval
 
-- **Implicit prompt injection** — assistant self-identity plus relevant long-term memory by default; current-session staging only for clear recall queries or post-compaction recovery
-- **Explicit tool retrieval** — `context_retrieve` searches current-session staging plus long-term memory
+- **Implicit prompt injection** — resolved assistant identity plus relevant long-term memory by default; current-session staging only for clear recall queries or post-compaction recovery
+- **Exact fact lookup** — resolved facts are consulted before free-form memory search for structured questions such as assistant name/role
+- **Explicit tool retrieval** — `context_retrieve` searches current-session staging, resolved facts, and long-term memory
 
 For recall-style queries such as "what did we just discuss", the runtime falls back to recent `episodes` summaries when keyword search alone would miss the latest session.
+
+If an exact fact key is conflicted, the runtime preserves the conflicting evidence in `fact_assertions` but suppresses implicit identity injection instead of guessing.
 
 ## User Tool Plugins
 

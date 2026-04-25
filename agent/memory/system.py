@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
@@ -19,6 +19,69 @@ from agent import shared
 
 _LATIN_TOKEN_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9]*\b")
 _CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+_FACT_SOURCE_PRECEDENCE = {
+    "user_statement": 0,
+    "direct_user": 0,
+    "correction": 1,
+    "bootstrap": 2,
+    "manual_write": 3,
+    "conversation_turn": 4,
+    "consolidation_extract": 5,
+    "summary_extract": 6,
+}
+_FACT_QUERY_SUBJECT_ALIASES: dict[str, tuple[str, ...]] = {
+    "assistant": (
+        "assistant",
+        "agent",
+        "bot",
+        "you",
+        "your",
+        "你",
+        "你自己",
+        "你的",
+        "助手",
+        "机器人",
+    ),
+    "user": (
+        "user",
+        "the user",
+        "me",
+        "my",
+        "我",
+        "我的",
+        "用户",
+    ),
+}
+_FACT_QUERY_PREDICATE_ALIASES: dict[str, tuple[str, ...]] = {
+    "name": (
+        "name",
+        "your name",
+        "my name",
+        "名字",
+        "叫什么",
+        "叫啥",
+        "称呼",
+    ),
+    "role": (
+        "role",
+        "who are you",
+        "what are you",
+        "身份",
+        "角色",
+        "你是谁",
+        "你是什么",
+    ),
+}
+_ASSISTANT_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:以后)?你(?:就)?叫([^\s，。,！!?？；;:：]{1,40})"),
+    re.compile(r"你的名字是([^\s，。,！!?？；;:：]{1,40})"),
+    re.compile(r"助手的名字是([^\s，。,！!?？；;:：]{1,40})"),
+    re.compile(r"agent(?:'s)? name is\s+([A-Za-z0-9_-]{1,40})", re.I),
+    re.compile(r"我叫([^\s，。,！!?？；;:：]{1,40})"),
+    re.compile(r"我的名字是([^\s，。,！!?？；;:：]{1,40})"),
+    re.compile(r"(?:my name is|you can call me|i am)\s+([A-Za-z0-9_-]{1,40})", re.I),
+    re.compile(r"(?:your name is|i(?:'ll| will) call you)\s+([A-Za-z0-9_-]{1,40})", re.I),
+)
 
 
 def _now() -> str:
@@ -30,9 +93,61 @@ def _new_id() -> str:
 
     return uuid.uuid4().hex
 
+
 def normalize_memory_chapter(chapter: str, aliases: dict[str, str]) -> str:
     chapter = str(chapter).strip().lower()
     return aliases.get(chapter, chapter)
+
+
+def _normalize_fact_part(value: str, default: str = "") -> str:
+    normalized = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    return normalized or default
+
+
+def _fact_key(subject: str, predicate: str, scope: str) -> str:
+    return json.dumps(
+        [
+            _normalize_fact_part(subject),
+            _normalize_fact_part(predicate),
+            _normalize_fact_part(scope, "global"),
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _fact_value_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, (dict, list)):
+        return "json"
+    return "string"
+
+
+def _dump_fact_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _load_fact_value(value_json: str) -> Any:
+    return json.loads(value_json)
+
+
+def _extract_assistant_name(text: str) -> str:
+    clean = str(text or "").strip()
+    if not clean:
+        return ""
+    for pattern in _ASSISTANT_NAME_PATTERNS:
+        match = pattern.search(clean)
+        if not match:
+            continue
+        candidate = match.group(1).strip().strip("“”\"'.,!?，。！？：:；;()[]{}")
+        if candidate:
+            return candidate
+    return ""
 
 
 def _cjk_ngrams(text: str, min_n: int = 2, max_n: int = 3) -> list[str]:
@@ -452,6 +567,57 @@ class ConversationTurn:
 
 
 @dataclass
+class FactAssertion:
+    """An append-only normalized fact claim derived from some evidence source."""
+
+    id: str
+    subject: str
+    predicate: str
+    value: Any
+    value_type: str = ""
+    scope: str = "global"
+    source_kind: str = "manual_write"
+    source_id: str = ""
+    source_session: str = ""
+    channel: str = ""
+    confidence: float = 1.0
+    status: str = "active"
+    valid_from: str = ""
+    valid_to: str = ""
+    created_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+
+
+@dataclass
+class ResolvedFact:
+    """The current best belief for a canonical fact key."""
+
+    fact_key: str
+    subject: str
+    predicate: str
+    value: Any
+    value_type: str = ""
+    scope: str = "global"
+    winning_assertion_id: str = ""
+    resolution_reason: str = "resolved"
+    confidence: float = 1.0
+    resolved_at: str = field(default_factory=_now)
+    updated_at: str = field(default_factory=_now)
+
+
+@dataclass(frozen=True)
+class QueryPlan:
+    """A lightweight plan for exact-fact versus freeform retrieval."""
+
+    query_type: str = "freeform_context"
+    scope: str = "global"
+    target_subjects: tuple[str, ...] = ()
+    target_predicates: tuple[str, ...] = ()
+    lexical_terms: tuple[str, ...] = ()
+    allow_freeform_fallback: bool = True
+
+
+@dataclass
 class LTMCategory:
     """Metadata for a long-term memory category."""
 
@@ -590,6 +756,41 @@ class LTMStore:
                     ON conversation_turns(session_id, id);
                 CREATE INDEX IF NOT EXISTS idx_conversation_turns_created_at
                     ON conversation_turns(created_at);
+                CREATE TABLE IF NOT EXISTS fact_assertions (
+                    id TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    value_type TEXT NOT NULL DEFAULT 'string',
+                    scope TEXT NOT NULL DEFAULT 'global',
+                    source_kind TEXT NOT NULL DEFAULT 'manual_write',
+                    source_id TEXT NOT NULL DEFAULT '',
+                    source_session TEXT NOT NULL DEFAULT '',
+                    channel TEXT NOT NULL DEFAULT '',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    valid_from TEXT NOT NULL DEFAULT '',
+                    valid_to TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_fact_assertions_lookup
+                    ON fact_assertions(subject, predicate, scope, created_at, id);
+                CREATE TABLE IF NOT EXISTS resolved_facts (
+                    fact_key TEXT PRIMARY KEY,
+                    subject TEXT NOT NULL,
+                    predicate TEXT NOT NULL,
+                    value_json TEXT NOT NULL,
+                    value_type TEXT NOT NULL DEFAULT 'string',
+                    scope TEXT NOT NULL DEFAULT 'global',
+                    winning_assertion_id TEXT NOT NULL,
+                    resolution_reason TEXT NOT NULL DEFAULT 'resolved',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    resolved_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_resolved_facts_lookup
+                    ON resolved_facts(subject, predicate, scope);
                 """
             )
 
@@ -717,6 +918,41 @@ class LTMStore:
             reply_to_id=row["reply_to_id"],
             metadata=metadata,
             created_at=row["created_at"],
+        )
+
+    def _row_to_fact_assertion(self, row: sqlite3.Row) -> FactAssertion:
+        return FactAssertion(
+            id=row["id"],
+            subject=row["subject"],
+            predicate=row["predicate"],
+            value=_load_fact_value(row["value_json"]),
+            value_type=row["value_type"],
+            scope=row["scope"],
+            source_kind=row["source_kind"],
+            source_id=row["source_id"],
+            source_session=row["source_session"],
+            channel=row["channel"],
+            confidence=float(row["confidence"] or 1.0),
+            status=row["status"],
+            valid_from=row["valid_from"],
+            valid_to=row["valid_to"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def _row_to_resolved_fact(self, row: sqlite3.Row) -> ResolvedFact:
+        return ResolvedFact(
+            fact_key=row["fact_key"],
+            subject=row["subject"],
+            predicate=row["predicate"],
+            value=_load_fact_value(row["value_json"]),
+            value_type=row["value_type"],
+            scope=row["scope"],
+            winning_assertion_id=row["winning_assertion_id"],
+            resolution_reason=row["resolution_reason"],
+            confidence=float(row["confidence"] or 1.0),
+            resolved_at=row["resolved_at"],
+            updated_at=row["updated_at"],
         )
 
     @staticmethod
@@ -1007,6 +1243,45 @@ class LTMStore:
             ).fetchone()
         return self._row_to_entry(row) if row else None
 
+    def _fact_assertions_from_entry(self, entry: LTMEntry) -> list[FactAssertion]:
+        facts: list[FactAssertion] = []
+        category = self.normalize_category_name(entry.category)
+        entity = self._normalize_entity(entry.entity, category)
+        memory_type = str(entry.memory_type or "").strip().lower()
+        if category == "identity" and entity == "assistant":
+            name = _extract_assistant_name(entry.content)
+            if name:
+                facts.append(
+                    FactAssertion(
+                        id=_new_id(),
+                        subject="assistant",
+                        predicate="name",
+                        value=name,
+                        source_kind="consolidation_extract",
+                        source_id=entry.id,
+                        source_session=entry.source_session,
+                        confidence=float(entry.confidence or 1.0),
+                        created_at=entry.created_at or _now(),
+                        updated_at=entry.updated_at or _now(),
+                    )
+                )
+            elif memory_type in {"self_identity", "assistant_identity"}:
+                facts.append(
+                    FactAssertion(
+                        id=_new_id(),
+                        subject="assistant",
+                        predicate="identity_note",
+                        value=entry.content,
+                        source_kind="consolidation_extract",
+                        source_id=entry.id,
+                        source_session=entry.source_session,
+                        confidence=float(entry.confidence or 1.0),
+                        created_at=entry.created_at or _now(),
+                        updated_at=entry.updated_at or _now(),
+                    )
+                )
+        return facts
+
     def write_entries(self, category: str, entries: list[LTMEntry]) -> None:
         category = self.normalize_category_name(category)
         if not entries:
@@ -1035,6 +1310,8 @@ class LTMStore:
         with self._connect() as conn:
             affected_categories = self._write_entry_row(conn, entry)
         self._sync_after_mutation(affected_categories)
+        for fact in self._fact_assertions_from_entry(entry):
+            self.add_fact_assertion(fact)
 
     def add_entries(self, entries: list[LTMEntry]) -> None:
         """Batch-insert multiple entries in a single transaction and one sync pass.
@@ -1052,6 +1329,9 @@ class LTMStore:
                 entry.entity = self._normalize_entity(entry.entity, entry.category)
                 affected_categories.update(self._write_entry_row(conn, entry))
         self._sync_after_mutation(affected_categories)
+        for entry in entries:
+            for fact in self._fact_assertions_from_entry(entry):
+                self.add_fact_assertion(fact)
 
     def append_conversation_turn(
         self,
@@ -1117,6 +1397,255 @@ class LTMStore:
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_conversation_turn(row) for row in reversed(rows)]
+
+    @staticmethod
+    def _fact_assertion_core_score(assertion: FactAssertion) -> tuple[int, float, str]:
+        precedence = _FACT_SOURCE_PRECEDENCE.get(str(assertion.source_kind or "").strip().lower(), 9)
+        return (-precedence, float(assertion.confidence or 0.0), assertion.created_at or "")
+
+    @classmethod
+    def _fact_assertion_total_score(cls, assertion: FactAssertion) -> tuple[int, float, str, str]:
+        return (*cls._fact_assertion_core_score(assertion), assertion.id)
+
+    def add_fact_assertion(self, assertion: FactAssertion) -> FactAssertion:
+        subject = _normalize_fact_part(assertion.subject)
+        predicate = _normalize_fact_part(assertion.predicate)
+        scope = _normalize_fact_part(assertion.scope, "global")
+        if not subject or not predicate:
+            raise ValueError("fact assertions require non-empty subject and predicate")
+
+        normalized = FactAssertion(
+            id=assertion.id or _new_id(),
+            subject=subject,
+            predicate=predicate,
+            value=assertion.value,
+            value_type=assertion.value_type or _fact_value_type(assertion.value),
+            scope=scope,
+            source_kind=_normalize_fact_part(assertion.source_kind, "manual_write"),
+            source_id=str(assertion.source_id or "").strip(),
+            source_session=str(assertion.source_session or "").strip(),
+            channel=str(assertion.channel or "").strip(),
+            confidence=float(assertion.confidence or 0.0),
+            status=_normalize_fact_part(assertion.status, "active"),
+            valid_from=str(assertion.valid_from or "").strip(),
+            valid_to=str(assertion.valid_to or "").strip(),
+            created_at=assertion.created_at or _now(),
+            updated_at=assertion.updated_at or _now(),
+        )
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO fact_assertions (
+                    id, subject, predicate, value_json, value_type, scope,
+                    source_kind, source_id, source_session, channel, confidence,
+                    status, valid_from, valid_to, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    normalized.id,
+                    normalized.subject,
+                    normalized.predicate,
+                    _dump_fact_value(normalized.value),
+                    normalized.value_type,
+                    normalized.scope,
+                    normalized.source_kind,
+                    normalized.source_id,
+                    normalized.source_session,
+                    normalized.channel,
+                    normalized.confidence,
+                    normalized.status,
+                    normalized.valid_from,
+                    normalized.valid_to,
+                    normalized.created_at,
+                    normalized.updated_at,
+                ),
+            )
+
+        self.resolve_fact(normalized.subject, normalized.predicate, normalized.scope)
+        return normalized
+
+    def read_fact_assertions(
+        self,
+        *,
+        subject: Optional[str] = None,
+        predicate: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> list[FactAssertion]:
+        sql = "SELECT * FROM fact_assertions WHERE 1 = 1"
+        params: list[Any] = []
+        if subject is not None:
+            sql += " AND subject = ?"
+            params.append(_normalize_fact_part(subject))
+        if predicate is not None:
+            sql += " AND predicate = ?"
+            params.append(_normalize_fact_part(predicate))
+        if scope is not None:
+            sql += " AND scope = ?"
+            params.append(_normalize_fact_part(scope, "global"))
+        sql += " ORDER BY created_at ASC, id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_fact_assertion(row) for row in rows]
+
+    def resolve_fact(
+        self,
+        subject: str,
+        predicate: str,
+        scope: str = "global",
+    ) -> Optional[ResolvedFact]:
+        normalized_subject = _normalize_fact_part(subject)
+        normalized_predicate = _normalize_fact_part(predicate)
+        normalized_scope = _normalize_fact_part(scope, "global")
+        key = _fact_key(normalized_subject, normalized_predicate, normalized_scope)
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM fact_assertions
+                WHERE subject = ? AND predicate = ? AND scope = ?
+                  AND status != 'archived'
+                ORDER BY created_at ASC, id ASC
+                """,
+                (normalized_subject, normalized_predicate, normalized_scope),
+            ).fetchall()
+            assertions = [self._row_to_fact_assertion(row) for row in rows]
+            if not assertions:
+                conn.execute("DELETE FROM resolved_facts WHERE fact_key = ?", (key,))
+                return None
+
+            active = [assertion for assertion in assertions if not assertion.valid_to]
+            if not active:
+                conn.execute("DELETE FROM resolved_facts WHERE fact_key = ?", (key,))
+                return None
+
+            best_core_score = max(
+                self._fact_assertion_core_score(assertion) for assertion in active
+            )
+            top_assertions = [
+                assertion
+                for assertion in active
+                if self._fact_assertion_core_score(assertion) == best_core_score
+            ]
+            top_values = {
+                _dump_fact_value(assertion.value) for assertion in top_assertions
+            }
+
+            if len(top_values) > 1:
+                now = _now()
+                conn.execute(
+                    """
+                    UPDATE fact_assertions
+                    SET status = 'conflicted',
+                        updated_at = ?
+                    WHERE subject = ? AND predicate = ? AND scope = ?
+                      AND status != 'archived'
+                    """,
+                    (now, normalized_subject, normalized_predicate, normalized_scope),
+                )
+                conn.execute("DELETE FROM resolved_facts WHERE fact_key = ?", (key,))
+                return None
+
+            winning_value_json = next(iter(top_values))
+            winner = max(
+                [
+                    assertion
+                    for assertion in active
+                    if _dump_fact_value(assertion.value) == winning_value_json
+                ],
+                key=self._fact_assertion_total_score,
+            )
+            now = _now()
+            for assertion in assertions:
+                status = "active" if assertion.id == winner.id else "superseded"
+                conn.execute(
+                    "UPDATE fact_assertions SET status = ?, updated_at = ? WHERE id = ?",
+                    (status, now, assertion.id),
+                )
+
+            resolved = ResolvedFact(
+                fact_key=key,
+                subject=normalized_subject,
+                predicate=normalized_predicate,
+                value=winner.value,
+                value_type=winner.value_type or _fact_value_type(winner.value),
+                scope=normalized_scope,
+                winning_assertion_id=winner.id,
+                resolution_reason="resolved",
+                confidence=float(winner.confidence or 0.0),
+                resolved_at=now,
+                updated_at=now,
+            )
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO resolved_facts (
+                    fact_key, subject, predicate, value_json, value_type, scope,
+                    winning_assertion_id, resolution_reason, confidence,
+                    resolved_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    resolved.fact_key,
+                    resolved.subject,
+                    resolved.predicate,
+                    _dump_fact_value(resolved.value),
+                    resolved.value_type,
+                    resolved.scope,
+                    resolved.winning_assertion_id,
+                    resolved.resolution_reason,
+                    resolved.confidence,
+                    resolved.resolved_at,
+                    resolved.updated_at,
+                ),
+            )
+        return resolved
+
+    def read_resolved_facts(
+        self,
+        *,
+        subject: Optional[str] = None,
+        predicate: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> list[ResolvedFact]:
+        sql = "SELECT * FROM resolved_facts WHERE 1 = 1"
+        params: list[Any] = []
+        if subject is not None:
+            sql += " AND subject = ?"
+            params.append(_normalize_fact_part(subject))
+        if predicate is not None:
+            sql += " AND predicate = ?"
+            params.append(_normalize_fact_part(predicate))
+        if scope is not None:
+            sql += " AND scope = ?"
+            params.append(_normalize_fact_part(scope, "global"))
+        sql += " ORDER BY subject ASC, predicate ASC, scope ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_resolved_fact(row) for row in rows]
+
+    def has_conflicted_fact(
+        self,
+        subject: str,
+        predicate: str,
+        scope: str = "global",
+    ) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM fact_assertions
+                WHERE subject = ? AND predicate = ? AND scope = ?
+                  AND status = 'conflicted'
+                LIMIT 1
+                """,
+                (
+                    _normalize_fact_part(subject),
+                    _normalize_fact_part(predicate),
+                    _normalize_fact_part(scope, "global"),
+                ),
+            ).fetchone()
+        return row is not None
 
     def upsert_manual_note(
         self, category: str, entity: str, content: str, append: bool = False
@@ -1871,6 +2400,100 @@ class ContextManager:
             self._last_activity = time.time()
             self._needs_consolidation = True
 
+    @staticmethod
+    def _matched_fact_alias_terms(
+        lowered_query: str,
+        aliases: dict[str, tuple[str, ...]],
+    ) -> tuple[list[str], set[str]]:
+        targets: list[str] = []
+        matched_terms: set[str] = set()
+        for key, variants in aliases.items():
+            hits = [variant for variant in variants if variant in lowered_query]
+            if not hits:
+                continue
+            targets.append(key)
+            for hit in hits:
+                terms = _lexical_terms(hit)
+                if terms:
+                    matched_terms.update(terms)
+                else:
+                    matched_terms.add(hit)
+        return targets, matched_terms
+
+    def _plan_query(self, query: str) -> QueryPlan:
+        lexical_terms = tuple(_lexical_terms(query))
+        if self._is_episode_recall_query(query):
+            return QueryPlan(
+                query_type="event_recall",
+                scope="current_session",
+                lexical_terms=lexical_terms,
+                allow_freeform_fallback=False,
+            )
+
+        lowered_query = str(query or "").strip().lower()
+        subjects, subject_terms = self._matched_fact_alias_terms(
+            lowered_query,
+            _FACT_QUERY_SUBJECT_ALIASES,
+        )
+        predicates, predicate_terms = self._matched_fact_alias_terms(
+            lowered_query,
+            _FACT_QUERY_PREDICATE_ALIASES,
+        )
+        if not subjects and predicates:
+            if "你" in lowered_query or "your" in lowered_query or "assistant" in lowered_query:
+                subjects = ["assistant"]
+
+        if not subjects and not predicates:
+            return QueryPlan(
+                query_type="freeform_context",
+                scope="global",
+                lexical_terms=lexical_terms,
+                allow_freeform_fallback=True,
+            )
+
+        residual_terms = tuple(
+            term
+            for term in lexical_terms
+            if term not in subject_terms and term not in predicate_terms
+        )
+        return QueryPlan(
+            query_type="mixed" if residual_terms else "fact_lookup",
+            scope="global",
+            target_subjects=tuple(subjects),
+            target_predicates=tuple(predicates),
+            lexical_terms=lexical_terms,
+            allow_freeform_fallback=True,
+        )
+
+    def _extract_turn_fact_assertions(
+        self,
+        *,
+        role: str,
+        content: str,
+        session_id: str,
+        channel: str,
+        source_id: str = "",
+    ) -> list[FactAssertion]:
+        name = _extract_assistant_name(content)
+        if not name:
+            return []
+        normalized_role = str(role or "").strip().lower()
+        return [
+            FactAssertion(
+                id=_new_id(),
+                subject="assistant",
+                predicate="name",
+                value=name,
+                source_kind=(
+                    "user_statement" if normalized_role == "user" else "conversation_turn"
+                ),
+                source_id=source_id,
+                source_session=session_id,
+                channel=channel,
+                confidence=1.0 if normalized_role == "user" else 0.8,
+            )
+        ]
+
     def record_turn(
         self,
         *,
@@ -1900,6 +2523,22 @@ class ContextManager:
             reply_to_id=message_id,
             metadata=metadata,
         )
+        for assertion in self._extract_turn_fact_assertions(
+            role="user",
+            content=user_content,
+            session_id=session_id,
+            channel=channel,
+            source_id=message_id,
+        ):
+            self.store.add_fact_assertion(assertion)
+        for assertion in self._extract_turn_fact_assertions(
+            role="assistant",
+            content=assistant_content,
+            session_id=session_id,
+            channel=channel,
+            source_id=reply_to_id or message_id,
+        ):
+            self.store.add_fact_assertion(assertion)
 
     def idle_elapsed(self) -> float:
         """Seconds since last activity (0 if never active)."""
@@ -2151,6 +2790,114 @@ class ContextManager:
                 seen.append(cat)
         return seen
 
+    @staticmethod
+    def _format_fact_value(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+    def _targeted_fact_conflict(self, plan: QueryPlan) -> bool:
+        if not plan.target_subjects or not plan.target_predicates:
+            return False
+        for subject in plan.target_subjects:
+            for predicate in plan.target_predicates:
+                if self.store.has_conflicted_fact(subject, predicate, plan.scope):
+                    return True
+        return False
+
+    @staticmethod
+    def _has_multi_intent_marker(query: str) -> bool:
+        lowered = str(query or "").lower()
+        return any(
+            marker in lowered
+            for marker in (
+                " and ",
+                " also ",
+                " plus ",
+                "另外",
+                "还有",
+                "以及",
+                "顺便",
+                "并且",
+            )
+        )
+
+    def _should_include_freeform_context(
+        self,
+        *,
+        query: str,
+        plan: QueryPlan,
+        has_fact_hits: bool,
+    ) -> bool:
+        if plan.query_type == "event_recall":
+            return False
+        if self._targeted_fact_conflict(plan):
+            return False
+        if plan.query_type == "fact_lookup":
+            return not has_fact_hits
+        if plan.query_type == "mixed":
+            if not has_fact_hits:
+                return True
+            return self._has_multi_intent_marker(query)
+        return True
+
+    def _resolved_fact_candidates(
+        self,
+        query: str,
+        *,
+        plan: Optional[QueryPlan] = None,
+        top_k: int = shared.RETRIEVAL_TOP_K,
+    ) -> list[ResolvedFact]:
+        plan = plan or self._plan_query(query)
+        if plan.query_type not in {"fact_lookup", "mixed"}:
+            return []
+        facts = self.store.read_resolved_facts()
+        if not facts:
+            return []
+
+        candidates: list[ResolvedFact] = []
+        for fact in facts:
+            if plan.target_subjects and fact.subject not in plan.target_subjects:
+                continue
+            if plan.target_predicates and fact.predicate not in plan.target_predicates:
+                continue
+            candidates.append(fact)
+        if not candidates:
+            return []
+
+        query_terms = set(plan.lexical_terms)
+
+        def score(fact: ResolvedFact) -> float:
+            value_terms = set(_lexical_terms(self._format_fact_value(fact.value)))
+            total = float(fact.confidence or 0.0)
+            if fact.subject in plan.target_subjects:
+                total += 3.0
+            if fact.predicate in plan.target_predicates:
+                total += 3.0
+            total += 0.25 * len(query_terms & value_terms)
+            return total
+
+        ranked = sorted(candidates, key=score, reverse=True)
+        return [fact for fact in ranked[:top_k] if score(fact) > 0]
+
+    def retrieve_resolved_fact_context(
+        self,
+        query: str,
+        *,
+        top_k: int = shared.RETRIEVAL_TOP_K,
+        plan: Optional[QueryPlan] = None,
+        title: str = "## Resolved Facts",
+    ) -> str:
+        facts = self._resolved_fact_candidates(query, plan=plan, top_k=top_k)
+        if not facts:
+            return ""
+        lines = [title]
+        for fact in facts:
+            lines.append(
+                f"- {fact.subject}.{fact.predicate} = {self._format_fact_value(fact.value)}"
+            )
+        return "\n".join(lines)
+
     def retrieve_ltm_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
         """Return top-K relevant LTM entries as an injectable string.
 
@@ -2266,6 +3013,24 @@ class ContextManager:
         return "\n".join(lines) if len(lines) > 1 else ""
 
     def _assistant_identity_context(self, limit: int = 3) -> str:
+        name_conflict = self.store.has_conflicted_fact("assistant", "name")
+        role_conflict = self.store.has_conflicted_fact("assistant", "role")
+        facts = [
+            fact
+            for fact in self.store.read_resolved_facts(subject="assistant")
+            if fact.predicate in {"name", "role", "identity_note"}
+            and not (name_conflict and fact.predicate in {"name", "identity_note"})
+            and not (role_conflict and fact.predicate == "role")
+        ]
+        if facts:
+            lines = ["## Assistant Identity"]
+            for fact in facts[: max(1, limit)]:
+                lines.append(
+                    f"- {fact.subject}.{fact.predicate} = {self._format_fact_value(fact.value)}"
+                )
+            return "\n".join(lines)
+        if name_conflict or role_conflict:
+            return ""
         entries = self.store.read_entries_for_entity("identity", "assistant")
         if not entries:
             return ""
@@ -2278,6 +3043,7 @@ class ContextManager:
 
     def retrieve_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
         """Return explicit context lookup results across active session and LTM."""
+        plan = self._plan_query(query)
         sections = []
         history = self.retrieve_history_context(query)
         if history:
@@ -2285,7 +3051,15 @@ class ContextManager:
         recent = "" if history else self._recent_session_context()
         if recent:
             sections.append(recent)
-        ltm = self.retrieve_ltm_context(query, top_k=top_k)
+        facts = self.retrieve_resolved_fact_context(query, top_k=top_k, plan=plan)
+        if facts:
+            sections.append(facts)
+        include_freeform = self._should_include_freeform_context(
+            query=query,
+            plan=plan,
+            has_fact_hits=bool(facts),
+        )
+        ltm = self.retrieve_ltm_context(query, top_k=top_k) if include_freeform else ""
         if ltm:
             sections.append(ltm)
         return "\n\n".join(sections)
@@ -2302,6 +3076,7 @@ class ContextManager:
         in-session staging buffer when the user is explicitly asking to recall
         recent conversation.
         """
+        plan = self._plan_query(query)
         sections = []
         assistant_identity = self._assistant_identity_context()
         if assistant_identity:
@@ -2316,7 +3091,17 @@ class ContextManager:
             )
             if recent:
                 sections.append(recent)
-        ltm = self.retrieve_ltm_context(query, top_k=top_k)
+        facts = ""
+        if plan.query_type in {"fact_lookup", "mixed"}:
+            facts = self.retrieve_resolved_fact_context(query, top_k=top_k, plan=plan)
+            if facts and facts not in sections:
+                sections.append(facts)
+        include_freeform = self._should_include_freeform_context(
+            query=query,
+            plan=plan,
+            has_fact_hits=bool(facts),
+        )
+        ltm = self.retrieve_ltm_context(query, top_k=top_k) if include_freeform else ""
         if ltm:
             sections.append(ltm)
         return "\n\n".join(sections)

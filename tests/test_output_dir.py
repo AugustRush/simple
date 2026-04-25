@@ -251,6 +251,40 @@ def test_build_components_passes_output_dir_to_mcp_env(monkeypatch, tmp_path):
     assert client.extra_env["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
 
 
+def test_build_components_bootstraps_assistant_identity_fact(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["assistant_identity"] = {
+        "name": "Afu",
+        "role": "coding assistant",
+    }
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    resolved_name = components["context_manager"].store.read_resolved_facts(
+        subject="assistant",
+        predicate="name",
+    )
+    resolved_role = components["context_manager"].store.read_resolved_facts(
+        subject="assistant",
+        predicate="role",
+    )
+
+    assert [fact.value for fact in resolved_name] == ["Afu"]
+    assert [fact.value for fact in resolved_role] == ["coding assistant"]
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 

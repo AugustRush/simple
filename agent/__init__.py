@@ -335,11 +335,13 @@ from .memory.system import (
     ConsolidationEngine,
     ContextManager,
     ConversationTurn,
+    FactAssertion,
     LTMCategory,
     LTMEntry,
     LTMStore,
     LocalRetriever,
     MemoryPalace,
+    ResolvedFact,
     StagingBuffer,
     normalize_memory_chapter,
 )
