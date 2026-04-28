@@ -13,7 +13,7 @@ from rich.console import Console
 
 from agent import shared
 from agent.core.output import CliOutputSink, OutputSink, _active_sink
-from agent.runtime import RuntimeComponents, TurnInput, TurnRunner
+from agent.runtime import RuntimeComponents, RuntimeSessionState, TurnInput, TurnRunner
 from agent.tools.runtime import _active_schedule_target
 
 logger = logging.getLogger(__name__)
@@ -144,7 +144,9 @@ class ChannelRunner:
         worker.start()
         return worker
 
-    def _ensure_session_state(self, sessions: dict, session_id: str) -> dict:
+    def _ensure_session_state(
+        self, sessions: dict[str, RuntimeSessionState], session_id: str
+    ) -> RuntimeSessionState:
         import agent as agent_module
 
         state = sessions.get(session_id)
@@ -152,16 +154,13 @@ class ChannelRunner:
             return state
 
         session_ctx_mgr = self._build_session_context_manager(session_id)
-        state = {
-            "ctx": agent_module.AgentContext(
+        state = RuntimeSessionState(
+            ctx=agent_module.AgentContext(
                 system_prompt=self._components["system_prompt"]
             ),
-            "tools_used": [],
-            "turn_count": 0,
-            "task_context": "",
-            "context_manager": session_ctx_mgr,
-            "memory_worker": self._build_session_memory_worker(session_ctx_mgr),
-        }
+            context_manager=session_ctx_mgr,
+            memory_worker=self._build_session_memory_worker(session_ctx_mgr),
+        )
         sessions[session_id] = state
         return state
 
@@ -196,7 +195,7 @@ class ChannelRunner:
             await channel.start(self._make_message_handler(sessions))
         finally:
             for session in sessions.values():
-                worker = session.get("memory_worker")
+                worker = session.memory_worker
                 if worker is None:
                     continue
                 worker.stop()
@@ -204,15 +203,13 @@ class ChannelRunner:
             if plugin_catalog:
                 try:
                     for session_id, session in sessions.items():
-                        turn_count = session.get("turn_count", 0)
+                        turn_count = session.turn_count
                         if turn_count <= 0:
                             continue
                         await plugin_catalog.fire_session_end(
                             agent_module.SessionEvent(
-                                messages=session.get(
-                                    "ctx", agent_module.AgentContext("")
-                                ).messages,
-                                tools_used=list(session.get("tools_used", [])),
+                                messages=session.ctx.messages,
+                                tools_used=list(session.tools_used),
                                 session_id=session_id,
                                 timestamp=datetime.now(timezone.utc).isoformat(),
                                 turn_count=turn_count,
@@ -224,7 +221,7 @@ class ChannelRunner:
                     )
 
     def _make_message_handler(
-        self, sessions: dict
+        self, sessions: dict[str, RuntimeSessionState]
     ) -> Callable[["IncomingMessage", OutputSink], Any]:
         components = self._components
         turn_runner = components.get("turn_runner")
@@ -240,13 +237,12 @@ class ChannelRunner:
             skill_catalog = components["skill_catalog"]
             plugin_catalog = components.get("plugin_catalog")
             state = self._ensure_session_state(sessions, session_id)
-            ctx = state["ctx"]
-            ctx_mgr = state.get("context_manager")
-            memory_worker = state.get("memory_worker")
+            ctx = state.ctx
+            ctx_mgr = state.context_manager
+            memory_worker = state.memory_worker
             ctx.metadata["skill_catalog"] = skill_catalog
 
-            if not state["task_context"]:
-                state["task_context"] = msg.text[:300]
+            state.ensure_task_context(msg.text)
 
             if ctx_mgr:
                 ctx_mgr.mark_activity()
@@ -347,8 +343,7 @@ class ChannelRunner:
                         error=result.error,
                     )
 
-                state["tools_used"].extend(tool_calls)
-                state["turn_count"] += 1
+                state.record_turn(tool_calls)
 
                 if plugin_catalog:
                     await plugin_catalog.fire_turn_end(
@@ -357,7 +352,7 @@ class ChannelRunner:
                             agent_response=result.text or "",
                             tool_calls=tool_calls,
                             timestamp=datetime.now(timezone.utc).isoformat(),
-                            turn_index=state["turn_count"],
+                            turn_index=state.turn_count,
                         )
                     )
 
@@ -374,7 +369,7 @@ class ChannelRunner:
                     },
                     memory_worker=memory_worker,
                     system_prompt=components["system_prompt"],
-                    task_context=state["task_context"],
+                    task_context=state.task_context,
                 )
 
             except Exception as exc:
@@ -395,7 +390,7 @@ class ChannelRunner:
                     channel=msg.channel_name,
                     message_id=msg.metadata.get("message_id"),
                     duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
-                    turn_count=state.get("turn_count", 0),
+                    turn_count=state.turn_count,
                 )
                 _active_sink.reset(token)
                 if schedule_target_token is not None:

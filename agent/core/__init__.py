@@ -10,6 +10,7 @@ __all__ = [
     "OutputSink",
     "RalphTask",
     "RuntimeComponents",
+    "RuntimeSessionState",
     "SubAgentProgressEvent",
     "TurnInput",
     "TurnResult",
@@ -31,7 +32,13 @@ def __getattr__(name: str):
         import agent as agent_module
 
         return agent_module.RalphTask
-    if name in {"RuntimeComponents", "TurnInput", "TurnResult", "TurnRunner"}:
+    if name in {
+        "RuntimeComponents",
+        "RuntimeSessionState",
+        "TurnInput",
+        "TurnResult",
+        "TurnRunner",
+    }:
         from agent import runtime
 
         return getattr(runtime, name)

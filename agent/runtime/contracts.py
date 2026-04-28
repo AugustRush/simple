@@ -95,6 +95,26 @@ class RuntimeComponents:
         return value
 
 
+@dataclass
+class RuntimeSessionState:
+    """Mutable per-session state shared by turn-oriented runners."""
+
+    ctx: Any
+    tools_used: list[str] = field(default_factory=list)
+    turn_count: int = 0
+    task_context: str = ""
+    context_manager: Any = None
+    memory_worker: Any = None
+
+    def ensure_task_context(self, text: str) -> None:
+        if not self.task_context:
+            self.task_context = text[:300]
+
+    def record_turn(self, tool_calls: list[str]) -> None:
+        self.tools_used.extend(tool_calls)
+        self.turn_count += 1
+
+
 class TurnRunner:
     """Executes one normalized turn through the current agent implementation."""
 

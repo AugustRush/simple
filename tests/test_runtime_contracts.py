@@ -4,7 +4,13 @@ import asyncio
 
 import pytest
 
-from agent.runtime import RuntimeComponents, TurnInput, TurnResult, TurnRunner
+from agent.runtime import (
+    RuntimeComponents,
+    RuntimeSessionState,
+    TurnInput,
+    TurnResult,
+    TurnRunner,
+)
 
 
 def test_turn_input_from_text_normalizes_channel_message():
@@ -89,3 +95,21 @@ def test_turn_runner_delegates_to_agent_and_normalizes_result():
         tool_calls=("bash",),
         agent_id="agent-1",
     )
+
+
+def test_runtime_session_state_records_task_context_once_and_truncates():
+    state = RuntimeSessionState(ctx=object())
+
+    state.ensure_task_context("x" * 350)
+    state.ensure_task_context("new task")
+
+    assert state.task_context == "x" * 300
+
+
+def test_runtime_session_state_records_turns_and_tools():
+    state = RuntimeSessionState(ctx=object())
+
+    state.record_turn(["bash", "search"])
+
+    assert state.turn_count == 1
+    assert state.tools_used == ["bash", "search"]
