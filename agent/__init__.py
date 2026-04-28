@@ -110,6 +110,11 @@ from .shared import (
     _new_id,
     _with_task_context,
 )
+from .security.shell import (
+    SHELL_BLOCKED_COMMANDS as _SHELL_BLOCKED_COMMANDS,
+    SHELL_BLOCKED_PATTERNS as _SHELL_BLOCKED_PATTERNS,
+    shell_command_is_blocked as _shell_command_is_blocked,
+)
 
 # Shared constants/helpers are defined in agent.shared and re-exported here.
 
@@ -206,132 +211,6 @@ Save important facts, decisions, and learnings to memory so they persist across 
 TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
 TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
 TOOL_DEFAULT_MAX_LIST_RESULTS = 100
-
-# ── Shell tool security ────────────────────────────────────────────────────────
-# Commands listed here are blocked unconditionally, regardless of arguments.
-# Operators can extend this list via config key "shell_blocked_commands".
-_SHELL_BLOCKED_COMMANDS: frozenset[str] = frozenset(
-    {
-        "rm",
-        "rmdir",
-        "mkfs",
-        "dd",
-        "shred",
-        "fdisk",
-        "parted",
-    }
-)
-
-# Dangerous pipe-idiom substrings – checked as literal substring of the command.
-_SHELL_BLOCKED_PATTERNS: tuple[str, ...] = (
-    "curl | sh",
-    "wget | sh",
-    "wget -O- |",
-    "curl -s |",
-)
-
-
-def _shell_command_is_blocked(
-    command: str, extra_blocked: Optional[list[str]] = None
-) -> Optional[str]:
-    """Return a human-readable reason if *command* is blocked, or None.
-
-    Two checks are performed:
-      1. Dangerous pipe patterns (substring match against the full command).
-      2. The effective executable basename, after skipping wrappers such as
-         env-var prefixes, ``env``, and ``sudo``, against the built-in and
-         caller-supplied blocklists.
-    """
-    import shlex as _shlex
-    import os as _os
-
-    def _is_env_assignment(token: str) -> bool:
-        return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", token))
-
-    def _resolve_effective_command(tokens: list[str]) -> Optional[str]:
-        idx = 0
-        while idx < len(tokens):
-            token = tokens[idx]
-            if _is_env_assignment(token):
-                idx += 1
-                continue
-
-            cmd = _os.path.basename(token.strip().lstrip("./"))
-            if cmd == "env":
-                idx += 1
-                while idx < len(tokens):
-                    token = tokens[idx]
-                    if token == "--":
-                        idx += 1
-                        break
-                    if _is_env_assignment(token):
-                        idx += 1
-                        continue
-                    if token.startswith("-"):
-                        idx += 1
-                        if token in {
-                            "-C",
-                            "--chdir",
-                            "-S",
-                            "--split-string",
-                            "-u",
-                            "--unset",
-                        } and idx < len(tokens):
-                            idx += 1
-                        continue
-                    break
-                continue
-
-            if cmd == "sudo":
-                idx += 1
-                while idx < len(tokens):
-                    token = tokens[idx]
-                    if token == "--":
-                        idx += 1
-                        break
-                    if token.startswith("-"):
-                        idx += 1
-                        if token in {
-                            "-g",
-                            "--group",
-                            "-h",
-                            "--host",
-                            "-p",
-                            "--prompt",
-                            "-R",
-                            "--chroot",
-                            "-r",
-                            "--role",
-                            "-t",
-                            "--type",
-                            "-u",
-                            "--user",
-                        } and idx < len(tokens):
-                            idx += 1
-                        continue
-                    break
-                continue
-
-            return cmd
-        return None
-
-    blocked = _SHELL_BLOCKED_COMMANDS | frozenset(extra_blocked or [])
-    for pattern in _SHELL_BLOCKED_PATTERNS:
-        if pattern in command:
-            return f"command pattern '{pattern}' is blocked for safety"
-    try:
-        tokens = _shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-    if not tokens:
-        return None
-    argv0 = _resolve_effective_command(tokens)
-    if not argv0:
-        return None
-    if argv0 in blocked:
-        return f"command '{argv0}' is blocked for safety"
-    return None
-
 
 from .memory.system import (
     BackgroundMemoryWorker,
