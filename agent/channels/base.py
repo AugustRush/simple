@@ -233,13 +233,10 @@ class ChannelRunner:
 
             turn_started_at = time.perf_counter()
             session_id = msg.metadata.get("chat_id") or msg.session_id
-            agent = components["agent"]
             skill_catalog = components["skill_catalog"]
-            plugin_catalog = components.get("plugin_catalog")
             state = self._ensure_session_state(sessions, session_id)
             ctx = state.ctx
             ctx_mgr = state.context_manager
-            memory_worker = state.memory_worker
             ctx.metadata["skill_catalog"] = skill_catalog
 
             state.ensure_task_context(msg.text)
@@ -278,13 +275,14 @@ class ChannelRunner:
                     text_len=len(msg.text),
                 )
                 agent_started_at = time.perf_counter()
+                turn_input = TurnInput.from_text(
+                    msg.text,
+                    session_id=session_id,
+                    channel_name=msg.channel_name,
+                    metadata=msg.metadata,
+                )
                 result = await turn_runner.run(
-                    TurnInput.from_text(
-                        msg.text,
-                        session_id=session_id,
-                        channel_name=msg.channel_name,
-                        metadata=msg.metadata,
-                    ),
+                    turn_input,
                     ctx,
                     stream_callback=sink.sync_stream_cb,
                 )
@@ -343,34 +341,7 @@ class ChannelRunner:
                         error=result.error,
                     )
 
-                state.record_turn(tool_calls)
-
-                if plugin_catalog:
-                    await plugin_catalog.fire_turn_end(
-                        agent_module.TurnEvent(
-                            user_input=msg.text,
-                            agent_response=result.text or "",
-                            tool_calls=tool_calls,
-                            timestamp=datetime.now(timezone.utc).isoformat(),
-                            turn_index=state.turn_count,
-                        )
-                    )
-
-                agent_module.BaseAgent._post_turn_maintenance(
-                    ctx_mgr=ctx_mgr,
-                    agent=agent,
-                    ctx=ctx,
-                    user_content=msg.text,
-                    assistant_content=result.text or "",
-                    channel=msg.channel_name,
-                    record_kwargs={
-                        "message_id": str(msg.metadata.get("message_id", "")),
-                        "metadata": msg.metadata,
-                    },
-                    memory_worker=memory_worker,
-                    system_prompt=components["system_prompt"],
-                    task_context=state.task_context,
-                )
+                await turn_runner.complete_turn(turn_input, state, result)
 
             except Exception as exc:
                 _interaction_log(

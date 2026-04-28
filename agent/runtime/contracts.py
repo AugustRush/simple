@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, TypeVar, overload
 
@@ -138,3 +139,46 @@ class TurnRunner:
             stream_callback=stream_callback,
         )
         return TurnResult.from_agent_result(result)
+
+    async def complete_turn(
+        self,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        result: TurnResult,
+    ) -> None:
+        import agent as agent_module
+
+        tool_calls = list(result.tool_calls)
+        state.record_turn(tool_calls)
+
+        plugin_catalog = self._components.values.get("plugin_catalog")
+        if plugin_catalog:
+            await plugin_catalog.fire_turn_end(
+                agent_module.TurnEvent(
+                    user_input=turn_input.text,
+                    agent_response=result.text or "",
+                    tool_calls=tool_calls,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    turn_index=state.turn_count,
+                )
+            )
+
+        maintenance = self._components.values.get("post_turn_maintenance")
+        if maintenance is None:
+            maintenance = agent_module.BaseAgent._post_turn_maintenance
+
+        maintenance(
+            ctx_mgr=state.context_manager,
+            agent=self._components.require("agent"),
+            ctx=state.ctx,
+            user_content=turn_input.text,
+            assistant_content=result.text or "",
+            channel=turn_input.channel_name,
+            record_kwargs={
+                "message_id": str(turn_input.metadata.get("message_id", "")),
+                "metadata": dict(turn_input.metadata),
+            },
+            memory_worker=state.memory_worker,
+            system_prompt=self._components.require("system_prompt"),
+            task_context=state.task_context,
+        )

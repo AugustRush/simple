@@ -113,3 +113,69 @@ def test_runtime_session_state_records_turns_and_tools():
 
     assert state.turn_count == 1
     assert state.tools_used == ["bash", "search"]
+
+
+def test_turn_runner_complete_turn_records_state_and_maintenance():
+    class _PluginCatalog:
+        def __init__(self):
+            self.events = []
+
+        async def fire_turn_end(self, event):
+            self.events.append(event)
+
+    maintenance_calls = []
+    plugin_catalog = _PluginCatalog()
+    state = RuntimeSessionState(
+        ctx=object(),
+        task_context="original task",
+        context_manager=object(),
+        memory_worker=object(),
+    )
+    agent = object()
+    components = RuntimeComponents(
+        {
+            "agent": agent,
+            "plugin_catalog": plugin_catalog,
+            "system_prompt": "system",
+            "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
+        }
+    )
+    runner = TurnRunner(components)
+
+    asyncio.run(
+        runner.complete_turn(
+            TurnInput.from_text(
+                "hello",
+                session_id="session-1",
+                channel_name="feishu",
+                metadata={"message_id": "msg-1"},
+            ),
+            state,
+            TurnResult(text="reply", tool_calls=("bash",)),
+        )
+    )
+
+    assert state.turn_count == 1
+    assert state.tools_used == ["bash"]
+    assert len(plugin_catalog.events) == 1
+    assert plugin_catalog.events[0].user_input == "hello"
+    assert plugin_catalog.events[0].agent_response == "reply"
+    assert plugin_catalog.events[0].tool_calls == ["bash"]
+    assert plugin_catalog.events[0].turn_index == 1
+    assert maintenance_calls == [
+        {
+            "ctx_mgr": state.context_manager,
+            "agent": agent,
+            "ctx": state.ctx,
+            "user_content": "hello",
+            "assistant_content": "reply",
+            "channel": "feishu",
+            "record_kwargs": {
+                "message_id": "msg-1",
+                "metadata": {"message_id": "msg-1"},
+            },
+            "memory_worker": state.memory_worker,
+            "system_prompt": "system",
+            "task_context": "original task",
+        }
+    ]
