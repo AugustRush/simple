@@ -911,6 +911,39 @@ def test_evolution_plugin_records_applications_only_for_related_rules(tmp_path):
     assert store._load()[0].applications == 1
 
 
+def test_rule_store_matches_chinese_rule_to_chinese_context(tmp_path):
+    import agent._builtin.plugins.evolution.rules as rules_mod
+
+    store = rules_mod.RuleStore(rules_file=tmp_path / "rules.jsonl")
+    rule = store.add_rule("修改文件前先展示 diff。", [])
+
+    ids = store.get_relevant_rule_ids("帮我改一下这个文件，最后给我看 diff。")
+
+    assert ids == [rule.id]
+
+
+def test_rule_store_does_not_match_chinese_rule_to_unrelated_chinese_context(tmp_path):
+    import agent._builtin.plugins.evolution.rules as rules_mod
+
+    store = rules_mod.RuleStore(rules_file=tmp_path / "rules.jsonl")
+    store.add_rule("修改文件前先展示 diff。", [])
+
+    ids = store.get_relevant_rule_ids("今天上海天气怎么样？适合出门吗？")
+
+    assert ids == []
+
+
+def test_rule_store_matches_mixed_language_synonyms(tmp_path):
+    import agent._builtin.plugins.evolution.rules as rules_mod
+
+    store = rules_mod.RuleStore(rules_file=tmp_path / "rules.jsonl")
+    rule = store.add_rule("Always show a diff before modifying files.", [])
+
+    ids = store.get_relevant_rule_ids("修改代码后请展示变更。")
+
+    assert ids == [rule.id]
+
+
 def test_evolution_plugin_engine_none_is_safe():
     """All hooks must degrade gracefully when _engine is None."""
     from agent import PluginCatalog, PLUGINS_DIR, TurnEvent, SessionEvent

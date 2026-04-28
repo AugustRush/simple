@@ -46,7 +46,51 @@ _RULE_STOPWORDS = {
     "will",
     "must",
     "should",
+    "总是",
+    "应该",
+    "需要",
+    "之前",
+    "之后",
+    "如果",
+    "这个",
+    "那个",
+    "时候",
+    "请先",
 }
+
+_TOKEN_ALIASES = {
+    "changes": "diff",
+    "change": "diff",
+    "diff": "diff",
+    "display": "show",
+    "displaying": "show",
+    "file": "file",
+    "files": "file",
+    "modified": "modify",
+    "modifies": "modify",
+    "modify": "modify",
+    "modifying": "modify",
+    "show": "show",
+    "showing": "show",
+    "test": "test",
+    "tests": "test",
+    "testing": "test",
+    "error": "error",
+    "errors": "error",
+    "报错": "error",
+    "错误": "error",
+    "差异": "diff",
+    "变更": "diff",
+    "展示": "show",
+    "显示": "show",
+    "文件": "file",
+    "测试": "test",
+    "修改": "modify",
+    "改动": "modify",
+}
+
+_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
+_EN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_]{2,}")
 
 
 def _now() -> str:
@@ -140,11 +184,26 @@ class RuleStore:
 
     @staticmethod
     def _keywords(text: str) -> set[str]:
-        return {
-            token
-            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]{3,}", text.lower())
-            if token not in _RULE_STOPWORDS
-        }
+        terms: set[str] = set()
+        lowered = str(text or "").lower()
+
+        for token in _EN_RE.findall(lowered):
+            if token in _RULE_STOPWORDS:
+                continue
+            terms.add(_TOKEN_ALIASES.get(token, token))
+
+        for run in _CJK_RE.findall(str(text or "")):
+            for phrase, canonical in _TOKEN_ALIASES.items():
+                if any("\u3400" <= ch <= "\ufaff" for ch in phrase) and phrase in run:
+                    terms.add(canonical)
+            max_n = min(3, len(run))
+            for n in range(2, max_n + 1):
+                for idx in range(0, len(run) - n + 1):
+                    gram = run[idx : idx + n]
+                    if gram not in _RULE_STOPWORDS:
+                        terms.add(_TOKEN_ALIASES.get(gram, gram))
+
+        return terms
 
     def get_relevant_rule_ids(self, context_text: str) -> list[str]:
         """Return active/probation rule IDs relevant to the current turn context."""
