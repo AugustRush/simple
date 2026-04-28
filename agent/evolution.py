@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import re
@@ -12,6 +13,60 @@ from agent import shared
 from agent.tools.runtime import ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
+
+@dataclass
+class SessionExperience:
+    """Structured record of what happened in a session and how it went.
+
+    Replaces the flat score+crtique JSONL entry with a richer structure
+    that captures the task, the tool-level outcomes, user corrections,
+    and an objective performance score derived from those outcomes.
+    """
+
+    session_id: str = ""
+    timestamp: str = ""
+    task_summary: str = ""
+    tool_outcomes: list[dict] = field(default_factory=list)
+    correction_count: int = 0
+    objective_score: float = 5.0
+    prompt_version: str = "default"
+    tools_used: list[str] = field(default_factory=list)
+    key_findings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "timestamp": self.timestamp,
+            "task_summary": self.task_summary,
+            "tool_outcomes": [
+                {
+                    "tool": o.get("tool", "unknown"),
+                    "ok": o.get("ok", True),
+                    "error": o.get("error", ""),
+                }
+                for o in self.tool_outcomes
+            ],
+            "correction_count": self.correction_count,
+            "objective_score": round(self.objective_score, 2),
+            "prompt_version": self.prompt_version,
+            "tools_used": self.tools_used,
+            "key_findings": self.key_findings,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SessionExperience":
+        return cls(
+            session_id=d.get("session_id", ""),
+            timestamp=d.get("timestamp", ""),
+            task_summary=d.get("task_summary", ""),
+            tool_outcomes=d.get("tool_outcomes", []),
+            correction_count=d.get("correction_count", 0),
+            objective_score=d.get("objective_score", 5.0),
+            prompt_version=d.get("prompt_version", "default"),
+            tools_used=d.get("tools_used", []),
+            key_findings=d.get("key_findings", []),
+        )
+
 
 class EvolutionEngine:
     """Self-evolution: scoring, prompt rewriting, tool generation."""
@@ -86,34 +141,174 @@ class EvolutionEngine:
 
         raise ValueError("Unable to parse scorer response as strict JSON")
 
-    async def score_session(
-        self, messages: list[dict], prompt_version: str, tools_used: list[str]
-    ) -> dict:
-        """Let the active provider score the session quality."""
-        if len(messages) < 2:
-            return {"score": 5, "critique": "Session too short to evaluate"}
-        prompt = self._build_scoring_prompt(messages)
+    @staticmethod
+    def _parse_tool_outcomes(
+        messages: list[dict],
+    ) -> list[dict]:
+        """Extract objective tool outcomes from session messages.
 
+        Each tool_result block is inspected to determine whether the
+        tool call succeeded, failed, or was a user correction trigger.
+        """
+        def _append_outcome(raw_content: Any, role: str, outcomes: list[dict]) -> None:
+            if not isinstance(raw_content, str) or not raw_content.strip():
+                return
+            try:
+                data = json.loads(raw_content)
+            except (json.JSONDecodeError, TypeError):
+                return
+            if not isinstance(data, dict):
+                return
+            tool_name = data.get("role", data.get("tool", role))
+            succeeded = bool(data.get("ok"))
+            error = str(data.get("error", ""))
+            outcomes.append(
+                {
+                    "tool": str(tool_name),
+                    "ok": succeeded,
+                    "error": error[:200] if error else "",
+                }
+            )
+
+        outcomes: list[dict] = []
+        for msg in messages:
+            role = str(msg.get("role", "")).lower()
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for block in content:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "tool_result"
+                    ):
+                        _append_outcome(block.get("content", ""), role, outcomes)
+                continue
+            _append_outcome(content, role, outcomes)
+        return outcomes
+
+    @staticmethod
+    def _session_score(session: dict) -> float:
+        raw = session.get("score", session.get("objective_score", 5.0))
         try:
-            text = await self.generate_text(prompt, max_tokens=512)
-            result = self._parse_scoring_response(text)
-            if not isinstance(result, dict):
-                raise ValueError("scorer returned non-object JSON")
-        except Exception as e:
-            result = {"score": 5, "critique": str(e)[:200]}
+            return float(raw)
+        except (TypeError, ValueError):
+            return 5.0
 
-        # Save to RL log
-        record = {
-            "session_id": shared._new_id(),
-            "timestamp": _now(),
-            "score": result.get("score", 5),
-            "prompt_version": prompt_version,
-            "tools_used": tools_used,
-            "critique": result.get("critique", ""),
-            "improvements": result.get("improvements", []),
-        }
+    @staticmethod
+    def _session_critique(session: dict) -> str:
+        critique = str(session.get("critique", "") or "").strip()
+        if critique:
+            return critique
+        parts: list[str] = []
+        task_summary = str(session.get("task_summary", "") or "").strip()
+        if task_summary:
+            parts.append(task_summary[:160])
+        outcomes = session.get("tool_outcomes", [])
+        if isinstance(outcomes, list) and outcomes:
+            succeeded = sum(
+                1 for outcome in outcomes
+                if isinstance(outcome, dict) and outcome.get("ok")
+            )
+            parts.append(f"{succeeded}/{len(outcomes)} tools succeeded")
+        correction_count = int(session.get("correction_count", 0) or 0)
+        if correction_count:
+            parts.append(f"{correction_count} correction(s)")
+        findings = session.get("key_findings", [])
+        if isinstance(findings, list):
+            parts.extend(str(f)[:160] for f in findings[:3] if str(f).strip())
+        return "; ".join(parts) or "No critique recorded"
+
+    @staticmethod
+    def _session_improvements(session: dict) -> list[str]:
+        improvements = session.get("improvements", [])
+        result = (
+            [str(i) for i in improvements if str(i).strip()]
+            if isinstance(improvements, list)
+            else []
+        )
+        findings = session.get("key_findings", [])
+        if isinstance(findings, list):
+            result.extend(str(f) for f in findings if str(f).strip())
+        return result
+
+    @staticmethod
+    def _compute_objective_score(
+        outcomes: list[dict],
+        correction_count: int,
+        *,
+        tool_count: int = 0,
+    ) -> float:
+        """Compute an objective session score from observable signals.
+
+        Scoring is a weighted combination:
+          - Tool success rate (70%) — did agent actions succeed?
+          - Correction penalty  (30%) — did the user have to correct the agent?
+        Returns a float in [0.0, 10.0].
+        """
+        if tool_count == 0 and not outcomes:
+            return 5.0
+        total = max(len(outcomes), tool_count)
+        succeeded = sum(1 for o in outcomes if o.get("ok"))
+        success_rate = succeeded / max(total, 1)
+        # Corrections per tool: 0 → no penalty, >0.5 → full penalty
+        correction_ratio = min(correction_count / max(total, 1), 1.0)
+        score = (success_rate * 7.0) + ((1.0 - correction_ratio) * 3.0)
+        return max(0.0, min(10.0, score))
+
+    async def score_session(
+        self,
+        messages: list[dict],
+        prompt_version: str,
+        tools_used: list[str],
+        *,
+        correction_count: int = 0,
+        task_summary: str = "",
+    ) -> dict:
+        """Score the session using objective tool outcomes.
+
+        Falls back to LLM scoring only when there are no tool calls to
+        measure (e.g. a purely conversational session).
+        """
+        outcomes = self._parse_tool_outcomes(messages)
+        if outcomes or correction_count > 0:
+            score = self._compute_objective_score(
+                outcomes,
+                correction_count,
+                tool_count=len(tools_used),
+            )
+            result = {
+                "score": round(score, 1),
+                "critique": (
+                    f"{sum(1 for o in outcomes if o.get('ok'))}/{len(outcomes)} "
+                    f"tools succeeded"
+                    if outcomes
+                    else ""
+                ),
+                "improvements": [],
+            }
+        elif len(messages) < 2:
+            result = {"score": 5.0, "critique": "Session too short to evaluate"}
+        else:
+            # Fallback: LLM scoring for pure conversation (rare after tool use)
+            try:
+                prompt = self._build_scoring_prompt(messages)
+                text = await self.generate_text(prompt, max_tokens=512)
+                result = self._parse_scoring_response(text)
+            except Exception:
+                result = {"score": 5.0, "critique": "Unable to score"}
+
+        # Save structured session experience
+        experience = SessionExperience(
+            session_id=shared._new_id(),
+            timestamp=_now(),
+            task_summary=task_summary[:500],
+            tool_outcomes=outcomes,
+            correction_count=correction_count,
+            objective_score=result.get("score", 5.0),
+            prompt_version=prompt_version,
+            tools_used=tools_used,
+        )
         with open(shared.SESSIONS_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
+            f.write(json.dumps(experience.to_dict()) + "\n")
 
         return result
 
@@ -150,13 +345,13 @@ class EvolutionEngine:
         if not sessions:
             return "No sessions to analyze"
 
-        # Get low-score sessions for potential filtering (currently using all recent)
         critiques = "\n".join(
-            f"- Score {s['score']}: {s['critique']}" for s in sessions[-20:]
+            f"- Score {self._session_score(s):g}: {self._session_critique(s)}"
+            for s in sessions[-20:]
         )
         improvements = []
         for s in sessions[-20:]:
-            improvements.extend(s.get("improvements", []))
+            improvements.extend(self._session_improvements(s))
 
         version, current_prompt = self._get_current_prompt_version()
 
@@ -186,7 +381,7 @@ class EvolutionEngine:
         return new_prompt
 
     async def generate_tool(self, description: str, registry: ToolRegistry) -> str:
-        """Let Claude generate a new tool plugin and save it to the user tool dir."""
+        """Generate a new tool plugin with syntax validation before saving."""
         prompt = (
             f"Generate a Python tool plugin for: {description}\n\n"
             "Requirements:\n"
@@ -218,6 +413,19 @@ class EvolutionEngine:
         if code_match:
             code = code_match.group(1)
 
+        # Validate syntax before saving — a syntax error would crash the
+        # agent on next launch when the tool is loaded.
+        import ast
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            shared.CONSOLE.print(
+                f"[red]Generated tool has a syntax error: {e}[/red]"
+            )
+            return (
+                f"Tool generation failed: syntax error at line {e.lineno}: {e.msg}"
+            )
+
         # Generate safe filename
         safe_name = re.sub(r"[^a-z0-9_]", "_", description.lower()[:30])
         tool_path = shared.TOOLS_DIR / f"auto_{safe_name}.py"
@@ -239,7 +447,7 @@ class EvolutionEngine:
             v = str(s.get("prompt_version", "default")).strip()
             if not shared._is_safe_prompt_version(v):
                 continue
-            version_scores.setdefault(v, []).append(s.get("score", 5))
+            version_scores.setdefault(v, []).append(self._session_score(s))
         if not version_scores:
             return DEFAULT_SYSTEM_PROMPT
 
@@ -263,7 +471,7 @@ class EvolutionEngine:
         sessions = self._load_sessions()
         if not sessions:
             return {"total": 0, "avg_score": 0}
-        scores = [s.get("score", 5) for s in sessions]
+        scores = [self._session_score(s) for s in sessions]
         return {
             "total": len(sessions),
             "avg_score": round(sum(scores) / len(scores), 2),

@@ -297,8 +297,8 @@ Policy body.
         has_spawn_agent=True,
     )
 
-    assert decision.mode == "explicit"
-    assert decision.reason == "runtime derives mode from explicit subtask plan"
+    assert decision.mode == "rendezvous"
+    assert "辩论" in decision.reason
     assert decision.max_rendezvous_rounds == 2
 
 
@@ -2633,20 +2633,17 @@ def test_base_agent_internal_orchestration_preserves_partial_content(monkeypatch
         object(), registry, model="fake-model", api_format="openai"
     )
 
-    async def fake_call(tool_name, tool_input):
-        assert tool_name == "spawn_agent"
-        return json.dumps(
-            {
-                "ok": False,
-                "role": tool_input["role"],
-                "task": tool_input["task"],
-                "timed_out": True,
-                "partial_content": "partial-result",
-                "error": "timed out",
-            }
-        )
+    async def fake_execute(role, task, **kwargs):
+        return {
+            "ok": False,
+            "role": role,
+            "task": task,
+            "timed_out": True,
+            "partial_content": "partial-result",
+            "error": "timed out",
+        }
 
-    monkeypatch.setattr(registry, "call", fake_call)
+    monkeypatch.setattr(agent, "_execute_agent", fake_execute)
 
     result = asyncio.run(
         agent._execute_subtask_spec(
@@ -2668,20 +2665,17 @@ def test_base_agent_internal_orchestration_preserves_structured_content(monkeypa
         object(), registry, model="fake-model", api_format="openai"
     )
 
-    async def fake_call(tool_name, tool_input):
-        assert tool_name == "spawn_agent"
-        return json.dumps(
-            {
-                "ok": True,
-                "role": tool_input["role"],
-                "task": tool_input["task"],
-                "content": '{"summary":"done"}',
-                "structured_content": {"summary": "done"},
-                "tool_calls_made": [],
-            }
-        )
+    async def fake_execute(role, task, **kwargs):
+        return {
+            "ok": True,
+            "role": role,
+            "task": task,
+            "content": '{"summary":"done"}',
+            "structured_content": {"summary": "done"},
+            "tool_calls_made": [],
+        }
 
-    monkeypatch.setattr(registry, "call", fake_call)
+    monkeypatch.setattr(agent, "_execute_agent", fake_execute)
 
     result = asyncio.run(
         agent._execute_subtask_spec(
@@ -2705,12 +2699,13 @@ def test_execute_subtask_spec_passes_expected_output_and_constraints_to_spawn_ag
 
     observed = {}
 
-    async def fake_call(tool_name, tool_input):
-        observed["tool_name"] = tool_name
-        observed["tool_input"] = dict(tool_input)
-        return json.dumps({"ok": True, "content": "done", "tool_calls_made": []})
+    async def fake_execute(role, task, **kwargs):
+        observed["role"] = role
+        observed["task"] = task
+        observed["kwargs"] = dict(kwargs)
+        return {"ok": True, "content": "done", "tool_calls_made": []}
 
-    monkeypatch.setattr(registry, "call", fake_call)
+    monkeypatch.setattr(agent, "_execute_agent", fake_execute)
 
     asyncio.run(
         agent._execute_subtask_spec(
@@ -2729,10 +2724,9 @@ def test_execute_subtask_spec_passes_expected_output_and_constraints_to_spawn_ag
         )
     )
 
-    assert observed["tool_name"] == "spawn_agent"
-    assert observed["tool_input"] == {
-        "role": "implementer",
-        "task": "patch the file",
+    assert observed["role"] == "implementer"
+    assert observed["task"] == "patch the file"
+    assert observed["kwargs"] == {
         "expected_output": "Return a concise diff summary.",
         "output_contract": {
             "format": "json",
@@ -2740,6 +2734,7 @@ def test_execute_subtask_spec_passes_expected_output_and_constraints_to_spawn_ag
         },
         "write_scope": ["agent/core/agent.py"],
         "capability_profile": "implementation",
+        "handoff": None,
     }
 
 
@@ -2844,12 +2839,12 @@ def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch
 
     calls = []
 
-    async def fake_call(tool_name, tool_input):
-        calls.append((tool_name, tool_input))
-        return json.dumps({"ok": True})
+    async def fake_execute_agent(role, task, **kwargs):
+        calls.append(("spawn_agent", {"role": role, "task": task}))
+        return {"ok": True, "role": role, "task": task, "content": "ok", "tool_calls_made": []}
 
     monkeypatch.setattr(agent, "_create", fake_create)
-    monkeypatch.setattr(registry, "call", fake_call)
+    monkeypatch.setattr(agent, "_execute_agent", fake_execute_agent)
 
     ctx = agent_module.AgentContext(system_prompt="system")
     result = asyncio.run(agent.send_message(ctx, "run parallel agents"))
@@ -3323,17 +3318,17 @@ def test_send_message_batches_excess_parallel_spawn_calls(monkeypatch):
     concurrent = 0
     max_concurrent = 0
 
-    async def fake_call(tool_name, tool_input):
+    async def fake_execute_agent(role, task, **kwargs):
         nonlocal concurrent, max_concurrent
-        call_order.append(tool_input["role"])
+        call_order.append(role)
         concurrent += 1
         max_concurrent = max(max_concurrent, concurrent)
         await asyncio.sleep(0)
         concurrent -= 1
-        return json.dumps({"ok": True, "role": tool_input["role"]})
+        return {"ok": True, "role": role, "task": task, "content": "ok", "tool_calls_made": []}
 
     monkeypatch.setattr(agent, "_create", fake_create)
-    monkeypatch.setattr(registry, "call", fake_call)
+    monkeypatch.setattr(agent, "_execute_agent", fake_execute_agent)
 
     ctx = agent_module.AgentContext(system_prompt="system")
     result = asyncio.run(agent.send_message(ctx, "run parallel agents"))

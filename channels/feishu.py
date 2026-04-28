@@ -284,7 +284,7 @@ class FeishuOutputSink(OutputSink):
         ".ppt": "ppt",
         ".pptx": "ppt",
     }
-    _STREAM_EDIT_INTERVAL = 0.5
+    _STREAM_EDIT_INTERVAL = 0.2
 
     _TEXT_MAX_LEN = 200  # plain-text ceiling; longer → post
     _POST_MAX_LEN = 2000  # post ceiling; longer → interactive card
@@ -321,7 +321,7 @@ class FeishuOutputSink(OutputSink):
         self._stream_flush_pending = False
         self._progress_buf = _FeishuStreamBuf()
         self._progress_flush_pending = False
-        self._progress_disabled = False
+        self._progress_fail_count = 0
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._attachments: list[Path] = []
         self._attachment_keys: set[str] = set()
@@ -378,7 +378,7 @@ class FeishuOutputSink(OutputSink):
             return
         hint = f"{name}{_fmt_tool_inputs(name, inputs)}"
         if self.streaming:
-            if self._progress_disabled:
+            if self._progress_fail_count >= 3:
                 return
             self._append_progress_text(f"**Tool Call**\n\n```text\n{hint}\n```")
             if not self._progress_flush_pending:
@@ -425,7 +425,7 @@ class FeishuOutputSink(OutputSink):
         if not self.streaming:
             self._schedule(self._send_plain_async(line), label="send_progress_plain")
             return
-        if self._progress_disabled:
+        if self._progress_fail_count >= 3:
             return
         self._append_progress_text(line)
         if not self._progress_flush_pending:
@@ -468,7 +468,7 @@ class FeishuOutputSink(OutputSink):
             if previous is not None:
                 try:
                     await previous
-                except BaseException:
+                except Exception:
                     pass
             started_at = time.perf_counter()
             self._trace_latency(
@@ -528,7 +528,7 @@ class FeishuOutputSink(OutputSink):
                 streaming=self.streaming,
                 duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
             )
-            self._progress_disabled = False
+            self._progress_fail_count = 0
             self._last_batch_progress_key = None
             self._attachments = []
             self._attachment_keys = set()
@@ -537,7 +537,7 @@ class FeishuOutputSink(OutputSink):
         parts: list[str] = []
         progress = self._progress_buf.text.strip()
         final_text = self._stream_buf.text.strip()
-        if progress and not self._progress_disabled:
+        if progress and self._progress_fail_count < 3:
             parts.append(progress)
         if final_text:
             if parts:
@@ -559,14 +559,14 @@ class FeishuOutputSink(OutputSink):
         content = self._render_primary_markdown()
         if not self.streaming or not content:
             return
-        if self._progress_disabled:
+        if self._progress_fail_count >= 3:
             return
 
         loop = asyncio.get_running_loop()
         now = time.monotonic()
         card_id = await self._ensure_primary_surface_card()
         if not card_id:
-            self._progress_disabled = True
+            self._progress_fail_count += 1
             self._progress_buf = _FeishuStreamBuf()
             return
 
@@ -584,7 +584,7 @@ class FeishuOutputSink(OutputSink):
         if ok:
             self._stream_buf.last_edit = now
         else:
-            self._progress_disabled = True
+            self._progress_fail_count += 1
             self._progress_buf = _FeishuStreamBuf()
 
     async def _flush_stream_async(self, force: bool = False) -> None:
@@ -1153,22 +1153,39 @@ class FeishuOutputSink(OutputSink):
 
     @staticmethod
     def _format_subagent_event(event: SubAgentProgressEvent) -> str:
-        if event.message:
-            return event.message
         role = event.role or "agent"
-        if event.kind == "batch_started":
-            return f"Starting {event.total} sub-agents"
-        if event.kind == "batch_progress":
-            return f"Sub-agents running: {event.completed}/{event.total} completed"
-        if event.kind == "batch_finished":
-            return f"Sub-agent batch finished: {event.completed}/{event.total}"
-        if event.kind == "agent_started":
-            return f"{role} started"
-        if event.kind == "agent_finished":
-            return f"{role} finished"
-        if event.kind == "agent_failed":
-            return f"{role} failed"
-        return ""
+        kind = event.kind
+        # Phase events: runtime generates good messages; prefix with an
+        # emoji for visual hierarchy.
+        if kind == "phase_started":
+            prefix = "▸ "
+            return f"{prefix}{event.message}" if event.message else f"{prefix}Started"
+        if kind == "phase_finished":
+            prefix = "▾ "
+            return f"{prefix}{event.message}" if event.message else f"{prefix}Complete"
+        if kind == "phase_note":
+            return f"💬 {event.message}" if event.message else ""
+        # Agent lifecycle events: always use the new structured format
+        # since it includes role, status, and duration.
+        if kind == "agent_started":
+            return f"→ **{role}** started"
+        if kind == "agent_finished":
+            dur = event.metrics.get("duration_seconds")
+            dur_str = f" ({dur:.1f}s)" if isinstance(dur, (int, float)) else ""
+            return f"✓ **{role}** finished{dur_str}"
+        if kind == "agent_failed":
+            return f"✗ **{role}** failed"
+        if kind == "agent_retry":
+            return f"↻ **{role}** retry"
+        # Batch-level events: use the runtime's pre-computed message
+        # when available, otherwise a minimal fallback.
+        if kind == "batch_started":
+            return event.message or f"Starting {event.total} sub-agents"
+        if kind == "batch_progress":
+            return event.message or f"Running: {event.completed}/{event.total}"
+        if kind == "batch_finished":
+            return event.message or f"Batch finished: {event.completed}/{event.total}"
+        return event.message or ""
 
     def _do_send(self, msg_type: str, content: str) -> None:
         """Send one message, using Reply API for the first message of a response."""

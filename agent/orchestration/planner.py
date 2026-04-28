@@ -71,11 +71,38 @@ class OrchestrationPlanner:
         tools_enabled: bool,
         has_spawn_agent: bool,
     ) -> OrchestrationDecision:
-        del user_message
         if not tools_enabled or not has_spawn_agent:
             return OrchestrationDecision(mode="direct", reason="spawn unavailable")
+        lowered = user_message.lower()
+        if self.rendezvous_keywords and self._contains_any(lowered, self.rendezvous_keywords):
+            return OrchestrationDecision(
+                mode="rendezvous",
+                reason=f"user message matched rendezvous keywords: "
+                       f"{self._matched_keywords(lowered, self.rendezvous_keywords)}",
+                max_rendezvous_rounds=self.max_rendezvous_rounds,
+            )
+        pipeline_hits = self._matched_keywords(
+            lowered,
+            self.pipeline_keywords + self.pipeline_leading_keywords + self.pipeline_followup_keywords,
+        )
+        if pipeline_hits:
+            return OrchestrationDecision(
+                mode="pipeline",
+                reason=f"user message matched pipeline keywords: {pipeline_hits}",
+            )
+        if self.parallel_keywords and self._contains_any(lowered, self.parallel_keywords):
+            return OrchestrationDecision(
+                mode="parallel",
+                reason=f"user message matched parallel keywords: "
+                       f"{self._matched_keywords(lowered, self.parallel_keywords)}",
+            )
         return OrchestrationDecision(
             mode="explicit",
-            reason="runtime derives mode from explicit subtask plan",
+            reason="no keyword match; runtime derives mode from explicit subtask plan",
             max_rendezvous_rounds=self.max_rendezvous_rounds,
         )
+
+    @staticmethod
+    def _matched_keywords(text: str, keywords: tuple[str, ...]) -> str:
+        hits = [kw for kw in keywords if kw.lower() in text]
+        return ", ".join(hits[:5])

@@ -20,6 +20,8 @@ class SubtaskSpec:
     output_contract: dict[str, Any] = field(default_factory=dict)
     write_scope: list[str] = field(default_factory=list)
     capability_profile: str = "full"
+    handoff: dict[str, Any] = field(default_factory=dict)
+    early_exit: bool = False
 
 
 @dataclass
@@ -31,6 +33,7 @@ class SubtaskResult:
     summary: str = ""
     structured_content: Any = None
     error: str | None = None
+    full_content: str = ""
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,35 @@ def _emit_progress(
         progress_callback(kind, payload)
 
 
+def _validate_write_scopes(
+    specs: list[SubtaskSpec],
+    canonicalize_write_scope: Callable[[str], Path] | None = None,
+) -> tuple[int, float]:
+    """Check for overlapping write scopes across specs.
+
+    Returns (write_scope_count, duration_seconds).  Raises ValueError
+    if two specs claim overlapping paths.
+    """
+    started = time.perf_counter()
+    normalize = canonicalize_write_scope or (
+        lambda raw_scope: canonicalize_user_path(raw_scope, base_dir=Path.cwd())
+    )
+    claimed: list[tuple[str, Path]] = []
+    count = 0
+    for spec in specs:
+        for raw_scope in spec.write_scope:
+            count += 1
+            normalized = normalize(raw_scope)
+            for claimed_raw, claimed_path in claimed:
+                if paths_overlap(normalized, claimed_path):
+                    raise ValueError(
+                        "overlapping write_scope detected: "
+                        + ", ".join(sorted({claimed_raw, raw_scope}))
+                    )
+            claimed.append((raw_scope, normalized))
+    return count, time.perf_counter() - started
+
+
 async def run_parallel_subtasks(
     specs: list[SubtaskSpec],
     *,
@@ -63,31 +95,36 @@ async def run_parallel_subtasks(
     progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
-    scope_check_started_at = time.perf_counter()
-    normalize_write_scope = canonicalize_write_scope or (
-        lambda raw_scope: canonicalize_user_path(raw_scope, base_dir=Path.cwd())
+    write_scope_count, write_scope_check_seconds = _validate_write_scopes(
+        specs, canonicalize_write_scope
     )
-    claimed_write_scopes: list[tuple[str, Path]] = []
-    write_scope_count = 0
-    for spec in specs:
-        for raw_scope in spec.write_scope:
-            write_scope_count += 1
-            normalized_scope = normalize_write_scope(raw_scope)
-            for claimed_raw_scope, claimed_scope in claimed_write_scopes:
-                if paths_overlap(normalized_scope, claimed_scope):
-                    raise ValueError(
-                        "overlapping write_scope detected: "
-                        + ", ".join(sorted({claimed_raw_scope, raw_scope}))
-                    )
-            claimed_write_scopes.append((raw_scope, normalized_scope))
-    write_scope_check_seconds = time.perf_counter() - scope_check_started_at
 
     sem = asyncio.Semaphore(max(1, int(max_concurrency)))
+    early_exit_event = asyncio.Event()
+    early_exit_triggered = False
 
     async def _run(index: int, spec: SubtaskSpec) -> tuple[int, SubtaskResult]:
         async with sem:
+            if early_exit_event.is_set():
+                return index, SubtaskResult(
+                    id=spec.id,
+                    ok=False,
+                    content="",
+                    tool_calls_made=[],
+                    error="cancelled: another agent triggered early exit",
+                )
             try:
                 result = await executor(spec)
+            except asyncio.CancelledError:
+                if early_exit_event.is_set():
+                    return index, SubtaskResult(
+                        id=spec.id,
+                        ok=False,
+                        content="",
+                        tool_calls_made=[],
+                        error="cancelled: another agent triggered early exit",
+                    )
+                raise
             except Exception as exc:
                 result = SubtaskResult(
                     id=spec.id,
@@ -100,14 +137,24 @@ async def run_parallel_subtasks(
 
     results: list[SubtaskResult | None] = [None] * len(specs)
     completed_count = 0
-    tasks = [
+    cancelled_count = 0
+    task_objects = [
         asyncio.create_task(_run(index, spec))
         for index, spec in enumerate(specs)
     ]
-    for task in asyncio.as_completed(tasks):
+    for task in asyncio.as_completed(task_objects):
         index, result = await task
         results[index] = result
-        completed_count += 1
+        completed_count = len([r for r in results if r is not None])
+        if result.ok and specs[index].early_exit and not early_exit_triggered:
+            early_exit_triggered = True
+            early_exit_event.set()
+            for t in task_objects:
+                if not t.done():
+                    t.cancel()
+        cancelled_count = sum(
+            1 for r in results if r is not None and "cancelled" in (r.error or "")
+        )
         _emit_progress(
             progress_callback,
             "batch_progress",
@@ -116,6 +163,7 @@ async def run_parallel_subtasks(
             total=len(specs),
             spec_count=len(specs),
             max_concurrency=max(1, int(max_concurrency)),
+            cancelled=cancelled_count,
         )
     if telemetry is not None:
         telemetry.update(
@@ -125,6 +173,8 @@ async def run_parallel_subtasks(
                 "max_concurrency": max(1, int(max_concurrency)),
                 "write_scope_count": write_scope_count,
                 "write_scope_check_seconds": write_scope_check_seconds,
+                "cancelled_count": cancelled_count,
+                "early_exit_triggered": early_exit_triggered,
                 "duration_seconds": time.perf_counter() - started_at,
             }
         )
@@ -139,6 +189,7 @@ async def run_pipeline_subtasks(
     progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
+    _validate_write_scopes(specs)  # no-op for zero scopes; catches overlaps early
     pending = {spec.id: spec for spec in specs}
     summaries: dict[str, str] = {}
     successful_results: dict[str, SubtaskResult] = {}
@@ -231,12 +282,19 @@ async def run_rendezvous_round(
     specs: list[SubtaskSpec],
     *,
     executor: Callable[..., Awaitable[SubtaskResult]],
-    summarize: Callable[[list[SubtaskResult]], str | RendezvousDirective],
+    summarize: Callable[
+        [list[SubtaskResult]],
+        str | RendezvousDirective | Awaitable[str | RendezvousDirective],
+    ],
     max_rounds: int,
+    canonicalize_write_scope: Callable[[str], Path] | None = None,
     telemetry: dict[str, Any] | None = None,
     progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
+    write_scope_count, write_scope_check_seconds = _validate_write_scopes(
+        specs, canonicalize_write_scope
+    )
     rounds = max(1, int(max_rounds))
     all_results: list[SubtaskResult] = []
     lead_summary = ""
@@ -289,6 +347,8 @@ async def run_rendezvous_round(
         )
         if round_index < rounds:
             directive = summarize(round_results)
+            if inspect.isawaitable(directive):
+                directive = await directive
             if isinstance(directive, str):
                 directive = RendezvousDirective(summary=directive)
             lead_summary = directive.summary
@@ -324,6 +384,8 @@ async def run_rendezvous_round(
                 "spec_count": len(specs),
                 "rounds_completed": rounds_completed,
                 "result_count": len(all_results),
+                "write_scope_count": write_scope_count,
+                "write_scope_check_seconds": write_scope_check_seconds,
                 "duration_seconds": time.perf_counter() - started_at,
             }
         )

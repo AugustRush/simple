@@ -644,7 +644,7 @@ def test_feishu_sink_dedupes_duplicate_batch_progress_events():
                 sink.on_subagent_event(event)
                 await sink.drain()
 
-            assert sink._progress_buf.text.count("Sub-agents running: 0/3 completed") == 1
+            assert sink._progress_buf.text.count("Running: 0/3") == 1
 
         loop.run_until_complete(_run())
     finally:
@@ -870,11 +870,11 @@ def test_feishu_sink_rendezvous_phase_events_show_runtime_stage_messages():
                 await sink.drain()
 
             assert (
-                "Debate round 1/2 started: 2 participants (researcher, critic)"
+                "▸ Debate round 1/2 started: 2 participants (researcher, critic)"
                 in sink._progress_buf.text
             )
             assert (
-                "Lead summary ready for round 2/2: 2 continue (researcher, critic)"
+                "💬 Lead summary ready for round 2/2: 2 continue (researcher, critic)"
                 in sink._progress_buf.text
             )
 
@@ -904,7 +904,7 @@ def test_feishu_sink_batch_events_fall_back_without_metrics():
                 )
                 await sink.drain()
 
-            assert "Sub-agent batch finished: 2/3" in sink._progress_buf.text
+            assert "Batch finished: 2/3" in sink._progress_buf.text
 
         loop.run_until_complete(_run())
     finally:

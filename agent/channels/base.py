@@ -349,31 +349,21 @@ class ChannelRunner:
                         )
                     )
 
-                if ctx_mgr:
-                    ctx_mgr.record_turn(
-                        user_content=msg.text,
-                        assistant_content=result.content or "",
-                        channel=msg.channel_name,
-                        message_id=str(msg.metadata.get("message_id", "")),
-                        metadata=msg.metadata,
-                    )
-                    ctx_mgr.staging.append("user", msg.text)
-                    if result.content:
-                        ctx_mgr.staging.append("assistant", result.content)
-                    if ctx_mgr.should_enqueue_consolidation():
-                        ctx_mgr.enqueue_consolidation("staged_turns")
-
-                if ctx_mgr and ctx_mgr.should_compact_messages(
-                    ctx.messages, agent.max_tokens
-                ):
-                    ctx.messages = ctx_mgr.compact_messages(ctx.messages)
-                    ctx.system_prompt = agent_module._with_task_context(
-                        components["system_prompt"], state["task_context"]
-                    )
-                    if ctx_mgr.staging.count() >= ctx_mgr.min_messages:
-                        ctx_mgr.enqueue_consolidation("compact_triggered")
-                        if memory_worker is not None:
-                            memory_worker.wake()
+                agent_module.BaseAgent._post_turn_maintenance(
+                    ctx_mgr=ctx_mgr,
+                    agent=agent,
+                    ctx=ctx,
+                    user_content=msg.text,
+                    assistant_content=result.content or "",
+                    channel=msg.channel_name,
+                    record_kwargs={
+                        "message_id": str(msg.metadata.get("message_id", "")),
+                        "metadata": msg.metadata,
+                    },
+                    memory_worker=memory_worker,
+                    system_prompt=components["system_prompt"],
+                    task_context=state["task_context"],
+                )
 
             except Exception as exc:
                 _interaction_log(

@@ -184,6 +184,14 @@ async def _build_components_async(cfg: dict):
             orch_cfg.get("sub_agent_timeout_seconds", shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
         ),
     )
+    agent.sub_agent_retries = max(
+        0,
+        int(orch_cfg.get("sub_agent_retries", shared.DEFAULT_SUB_AGENT_RETRIES)),
+    )
+    agent.result_content_max_chars = max(
+        0,
+        int(orch_cfg.get("result_content_max_chars", shared.DEFAULT_RESULT_CONTENT_MAX_CHARS)),
+    )
     loaded_user_tools = user_tool_catalog.load_into_registry(registry)
     if loaded_user_tools:
             console.print(

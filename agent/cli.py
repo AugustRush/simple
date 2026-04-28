@@ -787,46 +787,17 @@ async def _interactive_loop(components: dict, cfg: dict):
                     )
                 )
 
-                # Stage this turn (user input + assistant reply) for consolidation
-                if ctx_mgr:
-                    ctx_mgr.record_turn(
-                        user_content=user_input,
-                        assistant_content=result.content or "",
-                        channel="cli",
-                    )
-                    ctx_mgr.staging.append("user", user_input)
-                    if result.content:
-                        ctx_mgr.staging.append("assistant", result.content)
-                    if ctx_mgr.should_enqueue_consolidation():
-                        ctx_mgr.enqueue_consolidation("staged_turns")
-
-                # Keep working memory bounded without blocking on LLM consolidation.
-                if ctx_mgr and ctx_mgr.should_compact_messages(
-                    ctx.messages, agent.max_tokens
-                ):
-                    ctx.messages = ctx_mgr.compact_messages(ctx.messages)
-                    # Rebuild from the latest composed system prompt so prompt
-                    # updates from /evolve or /generate-tool are preserved even
-                    # after message compaction drops earlier turns.
-                    ctx.system_prompt = _with_task_context(
-                        components["system_prompt"], _task_context
-                    )
-                    # Trigger background consolidation of the staging buffer so
-                    # facts from the dropped messages land in LTM and become
-                    # available via retrieve_ltm_context() on the next turn.
-                    # wake() is non-blocking: the background worker thread runs
-                    # the consolidation job while the user reads this response
-                    # and types their next message.
-                    # Guard: require at least min_messages staged entries.
-                    # Without this, compact fires a consolidation job even with
-                    # a single staged turn, and wake() makes the background
-                    # worker bypass the idle gate, running immediately.
-                    if (
-                        memory_worker
-                        and ctx_mgr.staging.count() >= ctx_mgr.min_messages
-                    ):
-                        ctx_mgr.enqueue_consolidation("compact_triggered")
-                        memory_worker.wake()
+                agent_module.BaseAgent._post_turn_maintenance(
+                    ctx_mgr=ctx_mgr,
+                    agent=agent,
+                    ctx=ctx,
+                    user_content=user_input,
+                    assistant_content=result.content or "",
+                    channel="cli",
+                    memory_worker=memory_worker,
+                    system_prompt=components["system_prompt"],
+                    task_context=_task_context,
+                )
 
             except Exception as e:
                 shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")

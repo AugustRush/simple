@@ -625,6 +625,7 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
         def __init__(self, session_id: str):
             self.staging = _RecordingStaging(session_id)
             self.enqueued: list[str] = []
+            self.min_messages = 2
 
         def mark_activity(self):
             return None

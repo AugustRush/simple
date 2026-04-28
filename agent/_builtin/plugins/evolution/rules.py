@@ -14,6 +14,7 @@ to the pre-rule baseline, it is promoted to *active*; otherwise it is
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -27,6 +28,25 @@ IMPROVEMENT_DELTA = 0.05
 
 _RL_DIR = Path.home() / ".agent" / "rl"
 _RULES_FILE = _RL_DIR / "rules.jsonl"
+
+_RULE_STOPWORDS = {
+    "always",
+    "before",
+    "after",
+    "when",
+    "then",
+    "with",
+    "from",
+    "that",
+    "this",
+    "into",
+    "your",
+    "have",
+    "been",
+    "will",
+    "must",
+    "should",
+}
 
 
 def _now() -> str:
@@ -110,9 +130,33 @@ class RuleStore:
         """Return rule texts for all *active* and *probation* rules."""
         return [r.rule for r in self._load() if r.status in ("active", "probation")]
 
+    def get_prompt_rules(self) -> list[str]:
+        """Return verified rules that are safe to inject into the system prompt."""
+        return [r.rule for r in self._load() if r.status == "active"]
+
     def get_active_rule_ids(self) -> list[str]:
         """Return IDs of all *active* and *probation* rules."""
         return [r.id for r in self._load() if r.status in ("active", "probation")]
+
+    @staticmethod
+    def _keywords(text: str) -> set[str]:
+        return {
+            token
+            for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_]{3,}", text.lower())
+            if token not in _RULE_STOPWORDS
+        }
+
+    def get_relevant_rule_ids(self, context_text: str) -> list[str]:
+        """Return active/probation rule IDs relevant to the current turn context."""
+        context_terms = self._keywords(context_text)
+        relevant: list[str] = []
+        for rule in self._load():
+            if rule.status not in ("active", "probation"):
+                continue
+            rule_terms = self._keywords(rule.rule)
+            if not rule_terms or len(rule_terms) <= 2 or rule_terms & context_terms:
+                relevant.append(rule.id)
+        return relevant
 
     def record_application(self, rule_id: str, was_corrected: bool) -> None:
         """Increment application counter; optionally record a correction event.
