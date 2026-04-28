@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
-from typing import Any, Mapping, TypeVar, overload
+from typing import Any, Callable, Mapping, TypeVar, overload
 
 T = TypeVar("T")
 
@@ -46,6 +46,8 @@ class TurnResult:
 
     text: str
     tool_calls: tuple[str, ...] = ()
+    agent_id: str = ""
+    error: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -54,6 +56,15 @@ class TurnResult:
 
     def record_tool_use(self, tool_name: str) -> "TurnResult":
         return replace(self, tool_calls=(*self.tool_calls, tool_name))
+
+    @classmethod
+    def from_agent_result(cls, result: Any) -> "TurnResult":
+        return cls(
+            text=getattr(result, "content", None) or "",
+            tool_calls=tuple(getattr(result, "tool_calls_made", ()) or ()),
+            agent_id=getattr(result, "agent_id", "") or "",
+            error=getattr(result, "error", None),
+        )
 
 
 @dataclass(frozen=True)
@@ -82,3 +93,28 @@ class RuntimeComponents:
                 f"{expected_type.__name__}, got {type(value).__name__}"
             )
         return value
+
+
+class TurnRunner:
+    """Executes one normalized turn through the current agent implementation."""
+
+    def __init__(self, components: RuntimeComponents | Mapping[str, Any]) -> None:
+        if isinstance(components, RuntimeComponents):
+            self._components = components
+        else:
+            self._components = RuntimeComponents(components)
+
+    async def run(
+        self,
+        turn_input: TurnInput,
+        ctx: Any,
+        *,
+        stream_callback: Callable[[str], None] | None = None,
+    ) -> TurnResult:
+        agent = self._components.require("agent")
+        result = await agent.send_message(
+            ctx,
+            turn_input.text,
+            stream_callback=stream_callback,
+        )
+        return TurnResult.from_agent_result(result)

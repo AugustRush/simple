@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from agent.runtime import RuntimeComponents, TurnInput, TurnResult
+from agent.runtime import RuntimeComponents, TurnInput, TurnResult, TurnRunner
 
 
 def test_turn_input_from_text_normalizes_channel_message():
@@ -50,3 +52,40 @@ def test_core_lazy_exports_runtime_contracts():
     assert CoreRuntimeComponents is RuntimeComponents
     assert CoreTurnInput is TurnInput
     assert CoreTurnResult is TurnResult
+
+
+def test_turn_runner_delegates_to_agent_and_normalizes_result():
+    class _FakeAgentResult:
+        agent_id = "agent-1"
+        content = "reply"
+        tool_calls_made = ["bash"]
+        error = None
+
+    class _FakeAgent:
+        def __init__(self):
+            self.calls = []
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            self.calls.append((ctx, user_message, stream_callback))
+            return _FakeAgentResult()
+
+    agent = _FakeAgent()
+    components = RuntimeComponents({"agent": agent})
+    runner = TurnRunner(components)
+    stream_callback = object()
+    ctx = object()
+
+    result = asyncio.run(
+        runner.run(
+            TurnInput.from_text("hello"),
+            ctx,
+            stream_callback=stream_callback,  # type: ignore[arg-type]
+        )
+    )
+
+    assert agent.calls == [(ctx, "hello", stream_callback)]
+    assert result == TurnResult(
+        text="reply",
+        tool_calls=("bash",),
+        agent_id="agent-1",
+    )

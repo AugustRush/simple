@@ -527,6 +527,66 @@ def test_channel_runner_emits_latency_trace(monkeypatch, caplog):
     assert "message_id=msg-123" in caplog.text
 
 
+def test_channel_runner_uses_turn_runner_when_provided():
+    from agent.runtime import TurnResult
+
+    class _RecordingSink(OutputSink):
+        def __init__(self):
+            self.turns = []
+
+        def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
+            self.turns.append((full_text, tool_calls))
+
+    class _ExplodingAgent:
+        max_tokens = 1024
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            raise AssertionError("ChannelRunner should call TurnRunner")
+
+    class _FakeTurnRunner:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, turn_input, ctx, stream_callback=None):
+            self.calls.append((turn_input, ctx, stream_callback))
+            return TurnResult(text="runtime reply", tool_calls=("search",))
+
+    turn_runner = _FakeTurnRunner()
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": _ExplodingAgent(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+            "turn_runner": turn_runner,
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+    sink = _RecordingSink()
+
+    asyncio.run(
+        handler(
+            IncomingMessage(
+                text="hello",
+                channel_name="feishu",
+                metadata={"chat_id": "chat-a"},
+            ),
+            sink,
+        )
+    )
+
+    assert sink.turns == [("runtime reply", ["search"])]
+    assert len(turn_runner.calls) == 1
+    turn_input, _ctx, stream_callback = turn_runner.calls[0]
+    assert turn_input.text == "hello"
+    assert turn_input.session_id == "chat-a"
+    assert turn_input.channel_name == "feishu"
+    assert callable(stream_callback)
+
+
 def test_channel_runner_emits_interaction_logs(caplog):
     caplog.set_level(logging.INFO, logger="agent.channels.base")
 

@@ -13,6 +13,7 @@ from rich.console import Console
 
 from agent import shared
 from agent.core.output import CliOutputSink, OutputSink, _active_sink
+from agent.runtime import RuntimeComponents, TurnInput, TurnRunner
 from agent.tools.runtime import _active_schedule_target
 
 logger = logging.getLogger(__name__)
@@ -226,6 +227,9 @@ class ChannelRunner:
         self, sessions: dict
     ) -> Callable[["IncomingMessage", OutputSink], Any]:
         components = self._components
+        turn_runner = components.get("turn_runner")
+        if turn_runner is None:
+            turn_runner = TurnRunner(RuntimeComponents(components))
 
         async def _handle(msg: IncomingMessage, sink: OutputSink) -> bool:
             import agent as agent_module
@@ -278,15 +282,23 @@ class ChannelRunner:
                     text_len=len(msg.text),
                 )
                 agent_started_at = time.perf_counter()
-                result = await agent.send_message(
-                    ctx, msg.text, stream_callback=sink.sync_stream_cb
+                result = await turn_runner.run(
+                    TurnInput.from_text(
+                        msg.text,
+                        session_id=session_id,
+                        channel_name=msg.channel_name,
+                        metadata=msg.metadata,
+                    ),
+                    ctx,
+                    stream_callback=sink.sync_stream_cb,
                 )
+                tool_calls = list(result.tool_calls)
                 _trace_latency(
                     "agent_send_message_finished",
                     session_id=session_id,
                     message_id=msg.metadata.get("message_id"),
                     duration_ms=f"{(time.perf_counter() - agent_started_at) * 1000:.1f}",
-                    tool_calls=len(result.tool_calls_made),
+                    tool_calls=len(tool_calls),
                     error=bool(result.error),
                 )
                 _interaction_log(
@@ -294,13 +306,13 @@ class ChannelRunner:
                     session_id=session_id,
                     message_id=msg.metadata.get("message_id"),
                     duration_ms=f"{(time.perf_counter() - agent_started_at) * 1000:.1f}",
-                    tool_calls=len(result.tool_calls_made),
+                    tool_calls=len(tool_calls),
                     error=bool(result.error),
-                    content_len=len(result.content or ""),
-                    content_preview=_preview_text(result.content or ""),
+                    content_len=len(result.text or ""),
+                    content_preview=_preview_text(result.text or ""),
                 )
                 sink_started_at = time.perf_counter()
-                sink.on_turn_complete(result.content or "", result.tool_calls_made)
+                sink.on_turn_complete(result.text or "", tool_calls)
                 if hasattr(sink, "drain"):
                     await sink.drain()
                 _trace_latency(
@@ -335,15 +347,15 @@ class ChannelRunner:
                         error=result.error,
                     )
 
-                state["tools_used"].extend(result.tool_calls_made)
+                state["tools_used"].extend(tool_calls)
                 state["turn_count"] += 1
 
                 if plugin_catalog:
                     await plugin_catalog.fire_turn_end(
                         agent_module.TurnEvent(
                             user_input=msg.text,
-                            agent_response=result.content or "",
-                            tool_calls=result.tool_calls_made,
+                            agent_response=result.text or "",
+                            tool_calls=tool_calls,
                             timestamp=datetime.now(timezone.utc).isoformat(),
                             turn_index=state["turn_count"],
                         )
@@ -354,7 +366,7 @@ class ChannelRunner:
                     agent=agent,
                     ctx=ctx,
                     user_content=msg.text,
-                    assistant_content=result.content or "",
+                    assistant_content=result.text or "",
                     channel=msg.channel_name,
                     record_kwargs={
                         "message_id": str(msg.metadata.get("message_id", "")),
