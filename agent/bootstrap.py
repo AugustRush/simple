@@ -10,6 +10,7 @@ from agent import shared
 from agent.config import ModelClientFactory, _compose_system_prompt, _load_system_prompt, _resolve_output_dir
 from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
+from agent.runtime import TurnRunner
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import BuiltinTools, MCPClient, ToolRegistry, UserToolCatalog
 
@@ -194,7 +195,7 @@ async def _build_components_async(cfg: dict):
     )
     loaded_user_tools = user_tool_catalog.load_into_registry(registry)
     if loaded_user_tools:
-            console.print(
+        console.print(
             "[green]User tools loaded:[/green] " + ", ".join(loaded_user_tools)
         )
     agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
@@ -273,6 +274,7 @@ async def _build_components_async(cfg: dict):
         "mcp_client": mcp_client,
         "mcp_status": mcp_status,
     }
+    components["turn_runner"] = TurnRunner(components)
     return components
 
 

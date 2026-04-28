@@ -243,6 +243,7 @@ user-invocable: true
     registry = components["registry"]
     prompt = components["system_prompt"]
 
+    assert components["turn_runner"].__class__.__name__ == "TurnRunner"
     assert "activate_skill" in registry.list_tools()
     assert "list_skill_files" in registry.list_tools()
     assert "read_skill_file" in registry.list_tools()
