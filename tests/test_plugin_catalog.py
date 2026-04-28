@@ -250,6 +250,68 @@ def test_fire_turn_end_times_out_slow_plugin(tmp_path):
     assert plugin_obj.__class__.completed is False
 
 
+def test_fire_pre_tool_times_out_slow_plugin(tmp_path):
+    from agent import PluginCatalog, PreToolEvent
+
+    _write_plugin(
+        tmp_path / "slow_pre",
+        """
+        import asyncio
+
+        def register():
+            class P:
+                name = "slow_pre"
+                completed = False
+
+                async def on_pre_tool(self, event):
+                    await asyncio.sleep(0.05)
+                    P.completed = True
+            return P()
+    """,
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path, turn_hook_timeout_seconds=0.01)
+    catalog.discover_and_load()
+
+    result = asyncio.run(
+        catalog.fire_pre_tool(PreToolEvent(tool_name="shell", tool_kwargs={}))
+    )
+
+    plugin_obj = catalog._plugins["slow_pre"][0]
+    assert result.action == "noop"
+    assert plugin_obj.__class__.completed is False
+
+
+def test_fire_post_tool_times_out_slow_plugin(tmp_path):
+    from agent import PluginCatalog, PostToolEvent
+
+    _write_plugin(
+        tmp_path / "slow_post",
+        """
+        import asyncio
+
+        def register():
+            class P:
+                name = "slow_post"
+                completed = False
+
+                async def on_post_tool(self, event):
+                    await asyncio.sleep(0.05)
+                    P.completed = True
+            return P()
+    """,
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path, turn_hook_timeout_seconds=0.01)
+    catalog.discover_and_load()
+
+    result = asyncio.run(
+        catalog.fire_post_tool(PostToolEvent(tool_name="shell", tool_kwargs={}, result="{}"))
+    )
+
+    plugin_obj = catalog._plugins["slow_post"][0]
+    assert result.action == "noop"
+    assert plugin_obj.__class__.completed is False
+
+
 def test_fire_pre_tool_block(tmp_path):
     from agent import PluginCatalog, PreToolEvent, HookResult
 
@@ -304,6 +366,34 @@ def test_fire_session_end_async(tmp_path):
     asyncio.run(catalog.fire_session_end(event))
     plugin_obj = catalog._plugins["ender"][0]
     assert plugin_obj.__class__.ended is True
+
+
+def test_fire_session_end_times_out_slow_plugin(tmp_path):
+    from agent import PluginCatalog, SessionEvent
+
+    _write_plugin(
+        tmp_path / "slow_end",
+        """
+        import asyncio
+
+        def register():
+            class P:
+                name = "slow_end"
+                completed = False
+
+                async def on_session_end(self, event):
+                    await asyncio.sleep(0.05)
+                    P.completed = True
+            return P()
+    """,
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path, turn_hook_timeout_seconds=0.01)
+    catalog.discover_and_load()
+
+    asyncio.run(catalog.fire_session_end(SessionEvent(messages=[], tools_used=[])))
+
+    plugin_obj = catalog._plugins["slow_end"][0]
+    assert plugin_obj.__class__.completed is False
 
 
 # ─── Plugin.json, enable/disable, dedup, skill bundling ──────────────────────

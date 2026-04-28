@@ -159,6 +159,12 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+async def _maybe_await_with_timeout(value: Any, timeout_seconds: float) -> Any:
+    if timeout_seconds > 0:
+        return await asyncio.wait_for(_maybe_await(value), timeout=timeout_seconds)
+    return await _maybe_await(value)
+
+
 class PluginCatalog:
     """Discovers, loads, and orchestrates agent plugins from disk.
 
@@ -368,13 +374,10 @@ class PluginCatalog:
             if not hasattr(plugin, "on_turn_end"):
                 continue
             try:
-                if self._turn_hook_timeout_seconds > 0:
-                    r = await asyncio.wait_for(
-                        _maybe_await(plugin.on_turn_end(event)),
-                        timeout=self._turn_hook_timeout_seconds,
-                    )
-                else:
-                    r = await _maybe_await(plugin.on_turn_end(event))
+                r = await _maybe_await_with_timeout(
+                    plugin.on_turn_end(event),
+                    self._turn_hook_timeout_seconds,
+                )
                 if isinstance(r, HookResult):
                     results.append(r)
             except asyncio.TimeoutError:
@@ -393,7 +396,16 @@ class PluginCatalog:
             if not hasattr(plugin, "on_session_end"):
                 continue
             try:
-                await _maybe_await(plugin.on_session_end(event))
+                await _maybe_await_with_timeout(
+                    plugin.on_session_end(event),
+                    self._turn_hook_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                _pname = getattr(plugin, "name", "?")
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{_pname}' session_end timed out after "
+                    f"{self._turn_hook_timeout_seconds:.2f}s[/dim]"
+                )
             except Exception as exc:
                 shared.CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
 
@@ -403,9 +415,18 @@ class PluginCatalog:
             if not hasattr(plugin, "on_pre_tool"):
                 continue
             try:
-                r = await _maybe_await(plugin.on_pre_tool(event))
+                r = await _maybe_await_with_timeout(
+                    plugin.on_pre_tool(event),
+                    self._turn_hook_timeout_seconds,
+                )
                 if isinstance(r, HookResult) and r.action == "block":
                     return r
+            except asyncio.TimeoutError:
+                _pname = getattr(plugin, "name", "?")
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{_pname}' pre_tool timed out after "
+                    f"{self._turn_hook_timeout_seconds:.2f}s[/dim]"
+                )
             except Exception as exc:
                 _pname = getattr(plugin, "name", "?")
                 shared.CONSOLE.print(f"[dim]Plugin '{_pname}' pre_tool error: {exc}[/dim]")
@@ -418,9 +439,18 @@ class PluginCatalog:
             if not hasattr(plugin, "on_post_tool"):
                 continue
             try:
-                r = await _maybe_await(plugin.on_post_tool(event))
+                r = await _maybe_await_with_timeout(
+                    plugin.on_post_tool(event),
+                    self._turn_hook_timeout_seconds,
+                )
                 if isinstance(r, HookResult) and r.context:
                     result = r
+            except asyncio.TimeoutError:
+                _pname = getattr(plugin, "name", "?")
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{_pname}' post_tool timed out after "
+                    f"{self._turn_hook_timeout_seconds:.2f}s[/dim]"
+                )
             except Exception as exc:
                 _pname = getattr(plugin, "name", "?")
                 shared.CONSOLE.print(f"[dim]Plugin '{_pname}' post_tool error: {exc}[/dim]")
