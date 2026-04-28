@@ -9,7 +9,10 @@ __all__ = [
     "CliOutputSink",
     "OutputSink",
     "RalphTask",
+    "RuntimeComponents",
     "SubAgentProgressEvent",
+    "TurnInput",
+    "TurnResult",
 ]
 
 
@@ -27,4 +30,8 @@ def __getattr__(name: str):
         import agent as agent_module
 
         return agent_module.RalphTask
+    if name in {"RuntimeComponents", "TurnInput", "TurnResult"}:
+        from agent import runtime
+
+        return getattr(runtime, name)
     raise AttributeError(name)
