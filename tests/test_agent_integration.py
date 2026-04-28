@@ -4960,6 +4960,93 @@ def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
     assert evolution.calls == 0
 
 
+def test_interactive_loop_routes_turn_through_runtime_runner(monkeypatch, tmp_path):
+    import agent as agent_module
+    from agent.runtime import TurnResult
+
+    class _ExplodingAgent:
+        api_format = "openai"
+        max_tokens = 1024
+        model = "fake-model"
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            raise AssertionError("interactive loop should call TurnRunner")
+
+    class _FakeTurnRunner:
+        def __init__(self):
+            self.run_calls = []
+            self.complete_calls = []
+
+        async def run(self, turn_input, ctx, stream_callback=None):
+            self.run_calls.append((turn_input, ctx, stream_callback))
+            return TurnResult(text="reply", tool_calls=("bash",))
+
+        async def complete_turn(self, turn_input, state, result):
+            self.complete_calls.append((turn_input, state, result))
+            state.record_turn(list(result.tool_calls))
+
+    class _FakeMemory:
+        def list_chapters(self):
+            return []
+
+    class _FakeEvolution:
+        def get_stats(self):
+            return {"total": 0, "avg_score": 0}
+
+    class _FakeSkillCatalog:
+        def list_skills(self):
+            return []
+
+        def consume_dirty(self):
+            return False
+
+    class _FakeUserToolCatalog:
+        def load_into_registry(self, registry):
+            return []
+
+    class _FakePluginCatalog:
+        def fire_session_start(self, components):
+            return None
+
+        async def fire_session_end(self, event):
+            self.session_end = event
+
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
+    answers = iter(["hello", "/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    turn_runner = _FakeTurnRunner()
+    components = {
+        "agent": _ExplodingAgent(),
+        "memory": _FakeMemory(),
+        "evolution": _FakeEvolution(),
+        "system_prompt": "system",
+        "base_system_prompt": "system",
+        "skill_catalog": _FakeSkillCatalog(),
+        "user_tool_catalog": _FakeUserToolCatalog(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path / "output",
+        "plugin_catalog": _FakePluginCatalog(),
+        "turn_runner": turn_runner,
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    assert len(turn_runner.run_calls) == 1
+    turn_input, _ctx, stream_callback = turn_runner.run_calls[0]
+    assert turn_input.text == "hello"
+    assert turn_input.channel_name == "cli"
+    assert callable(stream_callback)
+    assert len(turn_runner.complete_calls) == 1
+    assert turn_runner.complete_calls[0][1].turn_count == 1
+
+
 def test_interactive_loop_context_command_uses_dynamic_category_stats(
     monkeypatch, tmp_path
 ):

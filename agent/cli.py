@@ -18,6 +18,7 @@ from rich.table import Table
 import agent as agent_module
 from agent import shared
 from agent.core.output import CliOutputSink, _active_sink
+from agent.runtime import RuntimeComponents, RuntimeSessionState, TurnInput, TurnRunner
 
 AgentContext = agent_module.AgentContext
 BaseAgent = agent_module.BaseAgent
@@ -405,13 +406,10 @@ async def _interactive_loop(components: dict, cfg: dict):
     ctx = AgentContext(system_prompt=system_prompt)
     # Expose ctx in components so plugin slash-command handlers can update it.
     components["ctx"] = ctx
-    _session_tools_used: list[str] = []  # accumulated for SessionEvent
-    _session_turn_count: int = 0
     # Track the user's first non-command message so it can be re-injected into
     # the system prompt after compaction (compact_messages drops early messages
     # to keep working memory bounded; this preserves the original task intent
     # without coupling task context to API message-list formatting rules).
-    _task_context: str = ""
     memory_worker = (
         agent_module.BackgroundMemoryWorker(
             ctx_mgr,
@@ -427,6 +425,11 @@ async def _interactive_loop(components: dict, cfg: dict):
     )
     if memory_worker:
         memory_worker.start()
+    state = RuntimeSessionState(
+        ctx=ctx,
+        context_manager=ctx_mgr,
+        memory_worker=memory_worker,
+    )
 
     # Queue orphaned staging files from previous sessions for background
     # recovery. Doing this synchronously would block startup on a network model
@@ -738,8 +741,7 @@ async def _interactive_loop(components: dict, cfg: dict):
 
             # Record the first non-command user message as the task context so it
             # can be re-injected into the system prompt after compaction occurs.
-            if not _task_context:
-                _task_context = user_input[:300]
+            state.ensure_task_context(user_input)
 
             # Create a fresh per-turn sink and register it in the ContextVar so
             # tool helpers (_run_tool_uses) can find it without param threading.
@@ -761,43 +763,29 @@ async def _interactive_loop(components: dict, cfg: dict):
                         plugin_catalog=plugin_catalog,
                     )
                     components["system_prompt"] = refreshed
-                    ctx.system_prompt = _with_task_context(refreshed, _task_context)
+                    ctx.system_prompt = _with_task_context(
+                        refreshed, state.task_context
+                    )
 
-                result = await agent.send_message(
-                    ctx, user_input, stream_callback=_turn_sink.sync_stream_cb
+                turn_runner = components.get("turn_runner")
+                if turn_runner is None or isinstance(turn_runner, TurnRunner):
+                    turn_runner = TurnRunner(RuntimeComponents(components))
+                turn_input = TurnInput.from_text(user_input, channel_name="cli")
+                result = await turn_runner.run(
+                    turn_input,
+                    ctx,
+                    stream_callback=_turn_sink.sync_stream_cb,
                 )
                 # on_turn_complete: renders markdown if no streaming happened,
                 # always prints trailing newline, and clears _streamed buffer.
+                tool_calls = list(result.tool_calls)
                 _turn_sink.on_turn_complete(
-                    result.content or "", result.tool_calls_made
+                    result.text or "", tool_calls
                 )
                 if result.error:
                     shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
 
-                # Notify plugins of this completed turn (correction detection, etc.)
-                _session_tools_used.extend(result.tool_calls_made)
-                _session_turn_count += 1
-                await plugin_catalog.fire_turn_end(
-                    TurnEvent(
-                        user_input=user_input,
-                        agent_response=result.content or "",
-                        tool_calls=result.tool_calls_made,
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        turn_index=_session_turn_count,
-                    )
-                )
-
-                agent_module.BaseAgent._post_turn_maintenance(
-                    ctx_mgr=ctx_mgr,
-                    agent=agent,
-                    ctx=ctx,
-                    user_content=user_input,
-                    assistant_content=result.content or "",
-                    channel="cli",
-                    memory_worker=memory_worker,
-                    system_prompt=components["system_prompt"],
-                    task_context=_task_context,
-                )
+                await turn_runner.complete_turn(turn_input, state, result)
 
             except Exception as e:
                 shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
@@ -837,9 +825,9 @@ async def _interactive_loop(components: dict, cfg: dict):
                 await plugin_catalog.fire_session_end(
                     SessionEvent(
                         messages=ctx.messages,
-                        tools_used=_session_tools_used,
+                        tools_used=state.tools_used,
                         timestamp=datetime.now(timezone.utc).isoformat(),
-                        turn_count=_session_turn_count,
+                        turn_count=state.turn_count,
                     )
                 )
             except Exception as exc:
