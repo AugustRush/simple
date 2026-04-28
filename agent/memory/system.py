@@ -15,10 +15,7 @@ from typing import Any, Callable, Optional
 
 import agent as agent_module
 from agent import shared
-
-
-_LATIN_TOKEN_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9]*\b")
-_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+from agent.lexical import LATIN_TOKEN_RE, count_cjk_chars, lexical_terms
 _FACT_SOURCE_PRECEDENCE = {
     "user_statement": 0,
     "direct_user": 0,
@@ -150,34 +147,8 @@ def _extract_assistant_name(text: str) -> str:
     return ""
 
 
-def _cjk_ngrams(text: str, min_n: int = 2, max_n: int = 3) -> list[str]:
-    terms: list[str] = []
-    clean = str(text or "").strip()
-    if not clean:
-        return terms
-    for run in _CJK_RUN_RE.findall(clean):
-        if len(run) < min_n:
-            terms.append(run)
-            continue
-        upper = min(max_n, len(run))
-        for n in range(min_n, upper + 1):
-            for i in range(0, len(run) - n + 1):
-                terms.append(run[i : i + n])
-    return terms
-
-
 def _lexical_terms(text: str) -> list[str]:
-    terms: list[str] = []
-    seen: set[str] = set()
-    for token in _LATIN_TOKEN_RE.findall(str(text or "").lower()):
-        if token not in seen:
-            terms.append(token)
-            seen.add(token)
-    for token in _cjk_ngrams(text):
-        if token not in seen:
-            terms.append(token)
-            seen.add(token)
-    return terms
+    return lexical_terms(text)
 
 class MemoryPalace:
     """Facade for all memory operations."""
@@ -1713,7 +1684,7 @@ class LTMStore:
                 rows = conn.execute(sql, params).fetchall()
             return [self._row_to_entry(row) for row in rows]
 
-        latin_terms = [term for term in query_terms if _LATIN_TOKEN_RE.fullmatch(term)]
+        latin_terms = [term for term in query_terms if LATIN_TOKEN_RE.fullmatch(term)]
         cjk_terms = [term for term in query_terms if term not in latin_terms]
         results_by_id: dict[str, LTMEntry] = {}
 
@@ -1996,10 +1967,8 @@ class ConsolidationEngine:
         later than intended.  Also counts tool_use ``input`` payloads which the
         previous implementation silently ignored.
         """
-        _CJK_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
-
         def _count(text: str) -> int:
-            cjk = len(_CJK_RE.findall(text))
+            cjk = count_cjk_chars(text)
             non_cjk = len(text) - cjk
             return int(cjk / self.cjk_chars_per_token) + int(
                 non_cjk / self.chars_per_token

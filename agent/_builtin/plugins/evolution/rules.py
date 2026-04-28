@@ -14,12 +14,13 @@ to the pre-rule baseline, it is promoted to *active*; otherwise it is
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from agent.lexical import keyword_terms
 
 # Minimum number of applications before a probation rule is evaluated.
 EVAL_THRESHOLD = 10
@@ -88,10 +89,6 @@ _TOKEN_ALIASES = {
     "修改": "modify",
     "改动": "modify",
 }
-
-_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
-_EN_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9_]{2,}")
-
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -184,26 +181,12 @@ class RuleStore:
 
     @staticmethod
     def _keywords(text: str) -> set[str]:
-        terms: set[str] = set()
-        lowered = str(text or "").lower()
-
-        for token in _EN_RE.findall(lowered):
-            if token in _RULE_STOPWORDS:
-                continue
-            terms.add(_TOKEN_ALIASES.get(token, token))
-
-        for run in _CJK_RE.findall(str(text or "")):
-            for phrase, canonical in _TOKEN_ALIASES.items():
-                if any("\u3400" <= ch <= "\ufaff" for ch in phrase) and phrase in run:
-                    terms.add(canonical)
-            max_n = min(3, len(run))
-            for n in range(2, max_n + 1):
-                for idx in range(0, len(run) - n + 1):
-                    gram = run[idx : idx + n]
-                    if gram not in _RULE_STOPWORDS:
-                        terms.add(_TOKEN_ALIASES.get(gram, gram))
-
-        return terms
+        return keyword_terms(
+            text,
+            stopwords=_RULE_STOPWORDS,
+            aliases=_TOKEN_ALIASES,
+            latin_min_len=3,
+        )
 
     def get_relevant_rule_ids(self, context_text: str) -> list[str]:
         """Return active/probation rule IDs relevant to the current turn context."""
