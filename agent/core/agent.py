@@ -18,7 +18,7 @@ import anthropic
 import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt
-from agent.core.output import CliOutputSink, _active_sink, _fmt_tool_inputs
+from agent.core.output import CliOutputSink, _active_sink
 from agent.memory.system import ContextManager, LTMEntry
 from agent.orchestration.runtime import (
     RendezvousDirective,
@@ -30,7 +30,8 @@ from agent.orchestration.runtime import (
 )
 from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlanner
 from agent.pathing import canonicalize_user_path, resolve_workspace_path
-from agent.plugins.catalog import PluginCatalog, PostToolEvent, PreToolEvent
+from agent.plugins.catalog import PluginCatalog
+from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry
 
@@ -1338,60 +1339,6 @@ class BaseAgent:
         tool_uses: list[dict],
         orchestration_decision: OrchestrationDecision | None = None,
     ) -> list[str]:
-        # D3: wrap each regular tool call with a wall-clock timeout so a hung
-        # user-generated tool cannot block the loop indefinitely.
-        async def _exec_regular(tu: dict) -> str:
-            name = tu["name"]
-            sink = _active_sink.get()
-            # pre_tool hook — a blocking result short-circuits execution
-            if self.plugin_catalog:
-                pre = await self.plugin_catalog.fire_pre_tool(
-                    PreToolEvent(tool_name=name, tool_kwargs=tu["input"])
-                )
-                if pre.action == "block":
-                    if sink:
-                        sink.on_tool_blocked(name, pre.message)
-                    else:
-                        shared.CONSOLE.print(
-                            f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {pre.message})[/yellow]"
-                        )
-                    return json.dumps(
-                        {"ok": False, "blocked": True, "reason": pre.message}
-                    )
-            # Announce the tool call *before* execution so the user sees
-            # what is happening while they wait (UX fix #2).
-            if sink:
-                sink.on_tool_start(name, tu["input"])
-            else:
-                shared.CONSOLE.print(
-                    f"\n[cyan]→ {name}[/cyan]{_fmt_tool_inputs(name, tu['input'])}"
-                )
-            try:
-                res = await asyncio.wait_for(
-                    self.registry.call(name, tu["input"]),
-                    timeout=shared.REGULAR_TOOL_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
-                res = json.dumps(
-                    {
-                        "ok": False,
-                        "error": f"tool '{name}' timed out after {shared.REGULAR_TOOL_TIMEOUT}s",
-                    }
-                )
-            # Display result after call completes
-            if sink:
-                sink.on_tool_end(name, res)
-            else:
-                shared.CONSOLE.print(
-                    f"[dim]{res[:200]}{'...' if len(res) > 200 else ''}[/dim]"
-                )
-            # post_tool hook — observational, does not alter the result
-            if self.plugin_catalog:
-                await self.plugin_catalog.fire_post_tool(
-                    PostToolEvent(tool_name=name, tool_kwargs=tu["input"], result=res)
-                )
-            return res
-
         # M2: use a sentinel so we can distinguish "tool not run" from "tool returned empty"
         _MISSING = object()
         results: list[Any] = [_MISSING] * len(tool_uses)
@@ -1400,9 +1347,13 @@ class BaseAgent:
             (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] != "spawn_agent"
         ]
         if regular_calls:
+            regular_executor = RegularToolExecutor(
+                self.registry,
+                plugin_catalog=self.plugin_catalog,
+            )
             # D2: return_exceptions=True preserves successes when one tool errors
             raw = await asyncio.gather(
-                *[_exec_regular(tu) for _, tu in regular_calls],
+                *[regular_executor.run(tu) for _, tu in regular_calls],
                 return_exceptions=True,
             )
             for (idx, tu), outcome in zip(regular_calls, raw):
