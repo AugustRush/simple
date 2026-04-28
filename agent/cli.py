@@ -65,6 +65,13 @@ _INTERACTION_LOGGER_NAMES = (
 )
 
 
+def _turn_runner_for_components(components: dict):
+    turn_runner = components.get("turn_runner")
+    if turn_runner is None or isinstance(turn_runner, TurnRunner):
+        return TurnRunner(RuntimeComponents(components))
+    return turn_runner
+
+
 def _configure_runtime_logging() -> None:
     root_logger = logging.getLogger()
     if not root_logger.handlers:
@@ -342,17 +349,19 @@ async def _build_scheduler_service(
     )
 
     async def _agent_executor(task, run):
-        agent: BaseAgent = components["agent"]
         skill_catalog: SkillCatalog = components["skill_catalog"]
         ctx = AgentContext(system_prompt=components["system_prompt"])
         ctx.metadata["skill_catalog"] = skill_catalog
         prompt = str(task.payload.get("prompt", "")).strip()
         if not prompt:
             raise RuntimeError(f"Scheduled task '{task.name}' has no prompt")
-        result = await agent.send_message(ctx, prompt)
+        result = await _turn_runner_for_components(components).run(
+            TurnInput.from_text(prompt, channel_name="scheduler"),
+            ctx,
+        )
         if result.error:
             raise RuntimeError(result.error)
-        content = result.content or ""
+        content = result.text or ""
         summary = content.strip().splitlines()[0][:120] if content.strip() else task.name
         return ExecutionResult(summary=summary, text_output=content)
 
@@ -767,9 +776,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                         refreshed, state.task_context
                     )
 
-                turn_runner = components.get("turn_runner")
-                if turn_runner is None or isinstance(turn_runner, TurnRunner):
-                    turn_runner = TurnRunner(RuntimeComponents(components))
+                turn_runner = _turn_runner_for_components(components)
                 turn_input = TurnInput.from_text(user_input, channel_name="cli")
                 result = await turn_runner.run(
                     turn_input,
@@ -957,7 +964,6 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
 
     async def _run():
         components = await agent_module._build_components_async(cfg)
-        agent: BaseAgent = components["agent"]
         ctx = AgentContext(system_prompt=components["system_prompt"])
         skill_catalog: SkillCatalog = components["skill_catalog"]
         normalized_question, required_skills = prepare_user_message_for_skills(
@@ -968,9 +974,9 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
         ctx.metadata["skill_catalog"] = skill_catalog
         shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
         try:
-            result = await agent.send_message(
+            result = await _turn_runner_for_components(components).run(
+                TurnInput.from_text(normalized_question, channel_name="cli"),
                 ctx,
-                normalized_question,
                 stream_callback=lambda chunk: shared.CONSOLE.print(
                     chunk, end="", markup=False
                 ),

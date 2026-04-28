@@ -5047,6 +5047,119 @@ def test_interactive_loop_routes_turn_through_runtime_runner(monkeypatch, tmp_pa
     assert turn_runner.complete_calls[0][1].turn_count == 1
 
 
+def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
+    import agent as agent_module
+    import agent.cli as cli_module
+    from agent.runtime import TurnResult
+    from typer.testing import CliRunner
+
+    class _ExplodingAgent:
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            raise AssertionError("chat command should call TurnRunner")
+
+    class _FakeSkillCatalog:
+        pass
+
+    class _FakeTurnRunner:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, turn_input, ctx, stream_callback=None):
+            self.calls.append((turn_input, ctx, stream_callback))
+            return TurnResult(text="chat reply")
+
+    turn_runner = _FakeTurnRunner()
+    components = {
+        "agent": _ExplodingAgent(),
+        "system_prompt": "system",
+        "skill_catalog": _FakeSkillCatalog(),
+        "turn_runner": turn_runner,
+    }
+
+    monkeypatch.setattr(agent_module, "load_config", lambda: (_minimal_cfg(), False))
+
+    async def fake_build_components_async(cfg):
+        return components
+
+    async def fake_close_components(components):
+        return None
+
+    monkeypatch.setattr(agent_module, "_build_components_async", fake_build_components_async)
+    monkeypatch.setattr(agent_module, "_close_components", fake_close_components)
+    monkeypatch.setattr(
+        cli_module,
+        "prepare_user_message_for_skills",
+        lambda text, _catalog: (text, []),
+    )
+
+    result = CliRunner().invoke(cli_module.app, ["chat", "hello"])
+
+    assert result.exit_code == 0
+    assert len(turn_runner.calls) == 1
+    turn_input, _ctx, stream_callback = turn_runner.calls[0]
+    assert turn_input.text == "hello"
+    assert turn_input.channel_name == "cli"
+    assert callable(stream_callback)
+
+
+def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch, tmp_path):
+    import types
+
+    import agent.cli as cli_module
+    from agent.runtime import TurnResult
+
+    class _ExplodingAgent:
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            raise AssertionError("scheduler agent executor should call TurnRunner")
+
+    class _FakeTurnRunner:
+        def __init__(self):
+            self.calls = []
+
+        async def run(self, turn_input, ctx, stream_callback=None):
+            self.calls.append((turn_input, ctx, stream_callback))
+            return TurnResult(text="scheduled reply\nsecond line")
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            self.agent_executor = kwargs["agent_executor"]
+
+    class _FakeStore:
+        pass
+
+    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
+    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+
+    turn_runner = _FakeTurnRunner()
+    components = {
+        "agent": _ExplodingAgent(),
+        "system_prompt": "system",
+        "skill_catalog": object(),
+        "output_dir": tmp_path,
+        "turn_runner": turn_runner,
+    }
+
+    service, _store, _components = asyncio.run(
+        cli_module._build_scheduler_service(
+            _minimal_cfg(),
+            poll_seconds=1,
+            lease_seconds=30,
+            max_concurrent_runs=1,
+            components=components,
+        )
+    )
+    task = types.SimpleNamespace(name="daily", payload={"prompt": "hello"})
+
+    result = asyncio.run(service.agent_executor(task, object()))
+
+    assert result.text_output == "scheduled reply\nsecond line"
+    assert result.summary == "scheduled reply"
+    assert len(turn_runner.calls) == 1
+    turn_input, _ctx, _stream_callback = turn_runner.calls[0]
+    assert turn_input.text == "hello"
+    assert turn_input.channel_name == "scheduler"
+
+
 def test_interactive_loop_context_command_uses_dynamic_category_stats(
     monkeypatch, tmp_path
 ):
