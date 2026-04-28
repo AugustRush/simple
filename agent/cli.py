@@ -373,7 +373,7 @@ async def _build_scheduler_service(
             await memory.tidy(components["client"], components["model"])
             return ExecutionResult(
                 summary="memory tidied",
-                text_output="Memory tidy complete.",
+                text_output="",
             )
         raise RuntimeError(f"Unsupported system job: {job_name}")
 

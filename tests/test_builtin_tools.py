@@ -796,3 +796,32 @@ def test_schedule_create_supports_system_job_action_type(tmp_path):
     assert task is not None
     assert task.kind == "system_job"
     assert task.payload["job_name"] == "memory_tidy"
+
+
+def test_schedule_create_is_idempotent_for_same_task_signature(tmp_path):
+    from agent.scheduler import SchedulerStore
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    args = {
+        "name": "memory-tidy",
+        "trigger_type": "daily",
+        "action_type": "system_job",
+        "job_name": "memory_tidy",
+        "time_of_day": "03:00",
+        "timezone_name": "Asia/Shanghai",
+    }
+
+    first = json.loads(asyncio.run(registry.call("schedule_create", args)))
+    second = json.loads(asyncio.run(registry.call("schedule_create", args)))
+
+    store = SchedulerStore(db_path=Path(first["task"]["db_path"]))
+    try:
+        tasks = store.list_tasks()
+    finally:
+        store.close()
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["task"]["id"] == first["task"]["id"]
+    assert second["task"]["existing"] is True
+    assert [task.id for task in tasks] == [first["task"]["id"]]

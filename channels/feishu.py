@@ -391,11 +391,7 @@ class FeishuOutputSink(OutputSink):
         self._schedule(self._send_tool_hint_async(hint), label="send_tool_hint")
 
     def on_tool_end(self, name: str, result: str) -> None:
-        if name != "write_file":
-            return
-        path = self._extract_written_path(result)
-        if path is not None:
-            self._queue_attachment(path)
+        return
 
     def on_tool_blocked(self, name: str, reason: str) -> None:
         self._schedule(
@@ -763,8 +759,6 @@ class FeishuOutputSink(OutputSink):
         self._attachments.append(path)
 
     async def _send_attachments_async(self) -> None:
-        for path in self._collect_output_dir_files():
-            self._queue_attachment(path)
         for path in self._attachments:
             await self._send_file_async(path)
 
@@ -1004,33 +998,6 @@ class FeishuOutputSink(OutputSink):
         except Exception as exc:
             logger.error("Feishu file upload error: path=%s error=%s", path, exc)
         return None
-
-    def _extract_written_path(self, result: str) -> Optional[Path]:
-        try:
-            payload = json.loads(result)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(payload, dict) or not payload.get("ok"):
-            return None
-        path = payload.get("path")
-        if isinstance(path, str) and path:
-            return Path(path)
-        return None
-
-    def _collect_output_dir_files(self) -> list[Path]:
-        if self._output_dir is None or not self._output_dir.exists():
-            return []
-
-        files: list[Path] = []
-        for candidate in self._output_dir.rglob("*"):
-            if not candidate.is_file():
-                continue
-            try:
-                if candidate.stat().st_mtime >= self._turn_start:
-                    files.append(candidate)
-            except OSError:
-                continue
-        return sorted(files)
 
     def _append_progress_text(self, line: str) -> None:
         if not line.strip():

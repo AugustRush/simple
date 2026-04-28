@@ -432,7 +432,7 @@ def test_feishu_sink_stream_chunk_does_not_emit_summary_before_turn_complete():
         loop.close()
 
 
-def test_feishu_sink_write_file_tool_end_queues_attachment_until_turn_complete(tmp_path):
+def test_feishu_sink_write_file_tool_end_does_not_queue_attachment(tmp_path):
     sink = _make_feishu_sink()
     target = tmp_path / "report.txt"
     target.write_text("hello", encoding="utf-8")
@@ -449,17 +449,17 @@ def test_feishu_sink_write_file_tool_end_queues_attachment_until_turn_complete(t
             ) as mock_send:
                 sink.on_tool_end("write_file", result)
                 assert len(sink._pending) == 0
-                assert sink._attachments == [target.resolve()]
+                assert sink._attachments == []
                 sink.on_turn_complete("done", [])
                 await sink.drain()
-                mock_send.assert_awaited_once_with(target)
+                mock_send.assert_not_awaited()
 
         loop.run_until_complete(_run())
     finally:
         loop.close()
 
 
-def test_feishu_sink_turn_complete_sends_new_output_dir_files(tmp_path):
+def test_feishu_sink_turn_complete_does_not_auto_send_output_dir_files(tmp_path):
     sink = FeishuOutputSink(
         client=MagicMock(),
         receive_id_type="open_id",
@@ -486,7 +486,7 @@ def test_feishu_sink_turn_complete_sends_new_output_dir_files(tmp_path):
                 sink.on_turn_complete("done", [])
                 await sink.drain()
                 mock_send_response.assert_awaited_once_with("done")
-                mock_send_file.assert_awaited_once_with(generated)
+                mock_send_file.assert_not_awaited()
 
         loop.run_until_complete(_run())
     finally:

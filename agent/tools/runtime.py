@@ -1307,16 +1307,18 @@ class BuiltinTools:
 
         store = self._schedule_store()
         try:
-            task = store.create_task(
-                NewScheduledTask(
-                    name=name,
-                    kind=task_kind,
-                    trigger=trigger,
-                    payload=payload,
-                    delivery_mode=resolved_mode,
-                    delivery_target=target,
-                )
+            new_task = NewScheduledTask(
+                name=name,
+                kind=task_kind,
+                trigger=trigger,
+                payload=payload,
+                delivery_mode=resolved_mode,
+                delivery_target=target,
             )
+            task = store.find_matching_task(new_task)
+            existing = task is not None
+            if task is None:
+                task = store.create_task(new_task)
         finally:
             store.close()
         return self._ok(
@@ -1327,6 +1329,7 @@ class BuiltinTools:
                 "delivery_mode": task.delivery_mode,
                 "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
                 "db_path": str(shared.SCHEDULER_DB_FILE),
+                "existing": existing,
             },
             summary_text=summary_text,
         )

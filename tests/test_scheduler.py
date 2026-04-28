@@ -319,6 +319,61 @@ def test_scheduler_service_executes_memory_tidy_system_job(tmp_path):
     assert runs[0].summary == "tidied"
 
 
+def test_scheduler_service_disables_duplicate_enabled_tasks_before_running(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    spec = NewScheduledTask(
+        name="memory-tidy",
+        kind="system_job",
+        trigger=TriggerSpec.daily("03:00", "Asia/Shanghai"),
+        payload={"job_name": "memory_tidy"},
+        delivery_mode="standalone",
+        delivery_target=DeliveryTarget.standalone(),
+    )
+    first = store.create_task(spec, now=datetime(2026, 4, 19, 18, 0, tzinfo=timezone.utc))
+    second = store.create_task(spec, now=datetime(2026, 4, 19, 18, 1, tzinfo=timezone.utc))
+    executions = []
+
+    async def fake_agent_executor(task, run):
+        raise AssertionError("agent executor should not be called")
+
+    async def fake_system_executor(task, run):
+        executions.append(task.id)
+        return ExecutionResult(summary="tidied", text_output="")
+
+    async def fake_delivery(task, run, result):
+        return "skipped"
+
+    service = SchedulerService(
+        store=store,
+        agent_executor=fake_agent_executor,
+        system_executor=fake_system_executor,
+        delivery=fake_delivery,
+    )
+
+    claimed = asyncio.run(
+        service.run_once(now=datetime(2026, 4, 19, 19, 0, tzinfo=timezone.utc))
+    )
+
+    refreshed_first = store.get_task(first.id)
+    refreshed_second = store.get_task(second.id)
+
+    assert claimed == 1
+    assert executions == [first.id]
+    assert refreshed_first is not None
+    assert refreshed_first.enabled is True
+    assert refreshed_second is not None
+    assert refreshed_second.enabled is False
+
+
 def test_scheduler_service_executes_due_message_task_without_agent_executor(tmp_path):
     from agent.scheduler import (
         DeliveryTarget,
@@ -512,6 +567,24 @@ def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_
     assert sent["receive_id"] == "oc_123"
     assert sent["text"] == "scheduled result"
     assert sent["drained"] is True
+
+
+def test_scheduler_standalone_delivery_skips_empty_output(tmp_path):
+    from agent.scheduler.delivery import SchedulerDelivery
+
+    delivery = SchedulerDelivery(cfg={}, output_root=tmp_path / "scheduler")
+
+    result = asyncio.run(
+        delivery.deliver_standalone(
+            task_id="task-1",
+            run_id="run-1",
+            text="",
+        )
+    )
+
+    assert result.status == "skipped"
+    assert result.output_path == ""
+    assert not (tmp_path / "scheduler" / "task-1" / "run-1.md").exists()
 
 
 def test_schedule_cli_creates_daily_task(monkeypatch, tmp_path):

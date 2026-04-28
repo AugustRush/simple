@@ -15,10 +15,12 @@ class SchedulerDelivery:
     async def deliver_standalone(
         self, task_id: str, run_id: str, text: str
     ) -> DeliveryResult:
+        if not str(text or "").strip():
+            return DeliveryResult(status="skipped")
         output_dir = self.output_root / task_id
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"{run_id}.md"
-        shared._atomic_write_text(path, text or "")
+        shared._atomic_write_text(path, text)
         return DeliveryResult(status="stored", output_path=str(path))
 
     async def deliver_channel(

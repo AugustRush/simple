@@ -33,6 +33,7 @@ class SchedulerService:
 
     async def run_once(self, now: Optional[datetime] = None) -> int:
         current = (now or datetime.now(UTC)).astimezone(UTC)
+        self.store.disable_duplicate_enabled_tasks(current)
         self.store.recover_stale_runs(current)
         claimed = self.store.claim_due_tasks(
             now=current,

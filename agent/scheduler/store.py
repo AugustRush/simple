@@ -185,6 +185,84 @@ class SchedulerStore:
         assert created is not None
         return created
 
+    def find_matching_task(self, task: NewScheduledTask) -> Optional[ScheduledTask]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM scheduled_tasks
+            WHERE name = ?
+              AND kind = ?
+              AND enabled = ?
+              AND trigger_json = ?
+              AND payload_json = ?
+              AND delivery_mode = ?
+              AND delivery_target_json = ?
+              AND (
+                    (model_override IS NULL AND ? IS NULL)
+                    OR model_override = ?
+                  )
+              AND overlap_policy = ?
+              AND missed_run_policy = ?
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (
+                task.name,
+                task.kind,
+                1 if task.enabled else 0,
+                task.trigger.to_json(),
+                json.dumps(task.payload, ensure_ascii=False),
+                task.delivery_mode,
+                task.delivery_target.to_json(),
+                task.model_override,
+                task.model_override,
+                task.overlap_policy,
+                task.missed_run_policy,
+            ),
+        ).fetchone()
+        return self._task_from_row(row) if row else None
+
+    def disable_duplicate_enabled_tasks(
+        self, now: Optional[datetime] = None
+    ) -> int:
+        rows = self._conn.execute(
+            """
+            SELECT * FROM scheduled_tasks
+            WHERE enabled = 1
+            ORDER BY created_at ASC, id ASC
+            """
+        ).fetchall()
+        seen: set[tuple[object, ...]] = set()
+        duplicate_ids: list[str] = []
+        for row in rows:
+            signature = (
+                row["name"],
+                row["kind"],
+                row["trigger_json"],
+                row["payload_json"],
+                row["delivery_mode"],
+                row["delivery_target_json"],
+                row["model_override"],
+                row["overlap_policy"],
+                row["missed_run_policy"],
+            )
+            if signature in seen:
+                duplicate_ids.append(row["id"])
+            else:
+                seen.add(signature)
+        if not duplicate_ids:
+            return 0
+        updated_at = _iso((now or datetime.now(UTC)).astimezone(UTC))
+        with self._conn:
+            self._conn.executemany(
+                """
+                UPDATE scheduled_tasks
+                SET enabled = 0, updated_at = ?
+                WHERE id = ?
+                """,
+                [(updated_at, task_id) for task_id in duplicate_ids],
+            )
+        return len(duplicate_ids)
+
     def list_tasks(self) -> list[ScheduledTask]:
         rows = self._conn.execute(
             "SELECT * FROM scheduled_tasks ORDER BY created_at ASC"

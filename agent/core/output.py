@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextvars
+import re
 from abc import ABC
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +20,20 @@ _TOOL_KEY_PRIORITY: dict[str, list[str]] = {
 }
 
 
+_SENSITIVE_VALUE_RE = re.compile(
+    r"(?i)(authorization:\s*bearer\s+)[^\s'\"`]+"
+    r"|((?:api[_-]?key|access[_-]?token|secret|password|token)\s*[=:]\s*)[^\s'\"`]+"
+)
+
+
+def _redact_sensitive_text(value: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        prefix = match.group(1) or match.group(2) or ""
+        return f"{prefix}[REDACTED]"
+
+    return _SENSITIVE_VALUE_RE.sub(_replace, value)
+
+
 def _fmt_tool_inputs(name: str, inputs: dict) -> str:
     """Return a terse, single-line hint of the most useful input fields.
 
@@ -31,7 +46,7 @@ def _fmt_tool_inputs(name: str, inputs: dict) -> str:
     for k in keys:
         v = inputs.get(k)
         if v is not None:
-            snippet = str(v)[:80].replace("\n", "↵")
+            snippet = _redact_sensitive_text(str(v))[:80].replace("\n", "↵")
             parts.append(f"{k}={snippet!r}" if " " in snippet else f"{k}={snippet}")
     raw = "  " + "  ".join(parts) if parts else ""
     return _markup_escape(raw)

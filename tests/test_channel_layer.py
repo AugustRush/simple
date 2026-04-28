@@ -88,6 +88,21 @@ def test_fmt_tool_inputs_newlines_replaced():
     assert "↵" in result
 
 
+def test_fmt_tool_inputs_redacts_bearer_tokens():
+    result = _fmt_tool_inputs(
+        "bash",
+        {
+            "command": (
+                'curl -H "Authorization: Bearer ms-99441248-dc4c-4e2e-96bc" '
+                "https://example.test"
+            )
+        },
+    )
+
+    assert "ms-99441248" not in result
+    assert "Bearer [REDACTED]" in result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CliOutputSink
 # ─────────────────────────────────────────────────────────────────────────────
