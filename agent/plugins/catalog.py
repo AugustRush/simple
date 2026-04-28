@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import partial
 import importlib.util
+import inspect
 import json
 from pathlib import Path
 import re
@@ -163,6 +166,30 @@ async def _maybe_await_with_timeout(value: Any, timeout_seconds: float) -> Any:
     if timeout_seconds > 0:
         return await asyncio.wait_for(_maybe_await(value), timeout=timeout_seconds)
     return await _maybe_await(value)
+
+
+async def _call_hook_with_timeout(
+    hook: Callable,
+    *args: Any,
+    timeout_seconds: float,
+) -> Any:
+    """Call a plugin hook with timeout covering sync and async hooks."""
+    if timeout_seconds <= 0:
+        return await _maybe_await(hook(*args))
+    if inspect.iscoroutinefunction(hook):
+        return await asyncio.wait_for(
+            _maybe_await(hook(*args)),
+            timeout=timeout_seconds,
+        )
+
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-plugin-hook")
+    future = loop.run_in_executor(executor, partial(hook, *args))
+    try:
+        result = await asyncio.wait_for(future, timeout=timeout_seconds)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return await _maybe_await_with_timeout(result, timeout_seconds)
 
 
 class PluginCatalog:
@@ -374,9 +401,10 @@ class PluginCatalog:
             if not hasattr(plugin, "on_turn_end"):
                 continue
             try:
-                r = await _maybe_await_with_timeout(
-                    plugin.on_turn_end(event),
-                    self._turn_hook_timeout_seconds,
+                r = await _call_hook_with_timeout(
+                    plugin.on_turn_end,
+                    event,
+                    timeout_seconds=self._turn_hook_timeout_seconds,
                 )
                 if isinstance(r, HookResult):
                     results.append(r)
@@ -396,9 +424,10 @@ class PluginCatalog:
             if not hasattr(plugin, "on_session_end"):
                 continue
             try:
-                await _maybe_await_with_timeout(
-                    plugin.on_session_end(event),
-                    self._turn_hook_timeout_seconds,
+                await _call_hook_with_timeout(
+                    plugin.on_session_end,
+                    event,
+                    timeout_seconds=self._turn_hook_timeout_seconds,
                 )
             except asyncio.TimeoutError:
                 _pname = getattr(plugin, "name", "?")
@@ -415,9 +444,10 @@ class PluginCatalog:
             if not hasattr(plugin, "on_pre_tool"):
                 continue
             try:
-                r = await _maybe_await_with_timeout(
-                    plugin.on_pre_tool(event),
-                    self._turn_hook_timeout_seconds,
+                r = await _call_hook_with_timeout(
+                    plugin.on_pre_tool,
+                    event,
+                    timeout_seconds=self._turn_hook_timeout_seconds,
                 )
                 if isinstance(r, HookResult) and r.action == "block":
                     return r
@@ -439,9 +469,10 @@ class PluginCatalog:
             if not hasattr(plugin, "on_post_tool"):
                 continue
             try:
-                r = await _maybe_await_with_timeout(
-                    plugin.on_post_tool(event),
-                    self._turn_hook_timeout_seconds,
+                r = await _call_hook_with_timeout(
+                    plugin.on_post_tool,
+                    event,
+                    timeout_seconds=self._turn_hook_timeout_seconds,
                 )
                 if isinstance(r, HookResult) and r.context:
                     result = r

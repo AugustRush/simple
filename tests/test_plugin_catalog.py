@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import textwrap
 from pathlib import Path
 
@@ -250,6 +251,38 @@ def test_fire_turn_end_times_out_slow_plugin(tmp_path):
     assert plugin_obj.__class__.completed is False
 
 
+def test_fire_turn_end_times_out_sync_blocking_plugin(tmp_path):
+    from agent import PluginCatalog, TurnEvent
+
+    _write_plugin(
+        tmp_path / "sync_slowpoke",
+        """
+        import time
+
+        def register():
+            class P:
+                name = "sync_slowpoke"
+                completed = False
+
+                def on_turn_end(self, event):
+                    time.sleep(0.1)
+                    P.completed = True
+            return P()
+    """,
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path, turn_hook_timeout_seconds=0.01)
+    catalog.discover_and_load()
+    event = TurnEvent(user_input="hi", agent_response="hello", tool_calls=[])
+
+    started = time.perf_counter()
+    asyncio.run(catalog.fire_turn_end(event))
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.08
+    plugin_obj = catalog._plugins["sync_slowpoke"][0]
+    assert plugin_obj.__class__.completed is False
+
+
 def test_fire_pre_tool_times_out_slow_plugin(tmp_path):
     from agent import PluginCatalog, PreToolEvent
 
@@ -394,6 +427,57 @@ def test_fire_session_end_times_out_slow_plugin(tmp_path):
 
     plugin_obj = catalog._plugins["slow_end"][0]
     assert plugin_obj.__class__.completed is False
+
+
+def test_fire_pre_post_and_session_end_timeout_sync_blocking_plugins(tmp_path):
+    from agent import PluginCatalog, PostToolEvent, PreToolEvent, SessionEvent
+
+    _write_plugin(
+        tmp_path / "sync_hooks",
+        """
+        import time
+
+        def register():
+            class P:
+                name = "sync_hooks"
+                pre_completed = False
+                post_completed = False
+                end_completed = False
+
+                def on_pre_tool(self, event):
+                    time.sleep(0.1)
+                    P.pre_completed = True
+
+                def on_post_tool(self, event):
+                    time.sleep(0.1)
+                    P.post_completed = True
+
+                def on_session_end(self, event):
+                    time.sleep(0.1)
+                    P.end_completed = True
+            return P()
+    """,
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path, turn_hook_timeout_seconds=0.01)
+    catalog.discover_and_load()
+
+    started = time.perf_counter()
+    pre_result = asyncio.run(
+        catalog.fire_pre_tool(PreToolEvent(tool_name="shell", tool_kwargs={}))
+    )
+    post_result = asyncio.run(
+        catalog.fire_post_tool(PostToolEvent(tool_name="shell", tool_kwargs={}, result="{}"))
+    )
+    asyncio.run(catalog.fire_session_end(SessionEvent(messages=[], tools_used=[])))
+    elapsed = time.perf_counter() - started
+
+    plugin_obj = catalog._plugins["sync_hooks"][0]
+    assert elapsed < 0.18
+    assert pre_result.action == "noop"
+    assert post_result.action == "noop"
+    assert plugin_obj.__class__.pre_completed is False
+    assert plugin_obj.__class__.post_completed is False
+    assert plugin_obj.__class__.end_completed is False
 
 
 # ─── Plugin.json, enable/disable, dedup, skill bundling ──────────────────────

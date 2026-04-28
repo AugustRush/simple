@@ -43,6 +43,15 @@ def test_runtime_components_require_returns_dependency():
     assert components.require("agent") is components.values["agent"]
 
 
+def test_runtime_components_keeps_live_mapping_updates():
+    values = {"system_prompt": "old"}
+    components = RuntimeComponents(values)
+
+    values["system_prompt"] = "new"
+
+    assert components.require("system_prompt") == "new"
+
+
 def test_runtime_components_require_raises_clear_error_for_missing_dependency():
     components = RuntimeComponents({"agent": object()})
 
@@ -179,3 +188,26 @@ def test_turn_runner_complete_turn_records_state_and_maintenance():
             "task_context": "original task",
         }
     ]
+
+
+def test_turn_runner_complete_turn_uses_live_component_updates():
+    maintenance_calls = []
+    values = {
+        "agent": object(),
+        "system_prompt": "old",
+        "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
+    }
+    runner = TurnRunner(values)
+    state = RuntimeSessionState(ctx=object())
+
+    values["system_prompt"] = "new"
+
+    asyncio.run(
+        runner.complete_turn(
+            TurnInput.from_text("hello"),
+            state,
+            TurnResult(text="reply"),
+        )
+    )
+
+    assert maintenance_calls[0]["system_prompt"] == "new"

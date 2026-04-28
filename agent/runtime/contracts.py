@@ -75,7 +75,7 @@ class RuntimeComponents:
     values: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "values", MappingProxyType(dict(self.values)))
+        object.__setattr__(self, "values", self.values)
 
     @overload
     def require(self, name: str) -> Any: ...
