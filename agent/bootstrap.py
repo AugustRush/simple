@@ -143,6 +143,17 @@ async def _build_components_async(cfg: dict):
         "shell_blocked_commands",
         list(cfg.get("shell_blocked_commands", [])),
     )
+    audio_cfg = cfg.get("audio", {})
+    audio_transcription_command = ""
+    if isinstance(audio_cfg, dict):
+        audio_transcription_command = str(
+            audio_cfg.get("transcription_command", "") or ""
+        ).strip()
+    if audio_transcription_command:
+        registry.set_context(
+            "audio_transcription_command",
+            audio_transcription_command,
+        )
     tavily_api_key = cfg.get("tavily_api_key", "")
     if isinstance(tavily_api_key, str) and tavily_api_key.startswith("$"):
         tavily_api_key = os.environ.get(tavily_api_key[1:], "")

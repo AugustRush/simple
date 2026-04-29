@@ -27,6 +27,26 @@ def test_attachment_context_lists_local_paths(tmp_path):
     assert "如果当前模型不能直接读取附件" in context
 
 
+def test_attachment_context_tells_agent_to_transcribe_audio(tmp_path):
+    from agent.core.attachments import MessageAttachment, format_attachment_context
+
+    audio = tmp_path / "voice.mp3"
+    audio.write_bytes(b"fake")
+
+    context = format_attachment_context(
+        [
+            MessageAttachment(
+                kind="audio",
+                mime_type="audio/mpeg",
+                local_path=audio,
+            )
+        ]
+    )
+
+    assert "transcribe_audio" in context
+    assert "read_file" in context
+
+
 def test_attachment_kind_infers_from_mime_type():
     from agent.core.attachments import attachment_kind_for_mime
 

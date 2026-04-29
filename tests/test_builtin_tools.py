@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -734,6 +735,42 @@ def test_send_file_queues_attachment_on_active_sink(tmp_path):
 
     assert payload["ok"] is True
     assert sink.paths == [target.resolve()]
+
+
+def test_transcribe_audio_requires_configured_command(monkeypatch, tmp_path):
+    monkeypatch.delenv("SIMPLE_AUDIO_TRANSCRIBE_COMMAND", raising=False)
+    _tools, registry, workspace = make_builtin_tools(tmp_path)
+    target = workspace / "voice.mp3"
+    target.write_bytes(b"audio")
+
+    result = asyncio.run(registry.call("transcribe_audio", {"path": str(target)}))
+    payload = json.loads(result)
+
+    assert payload["ok"] is False
+    assert "not configured" in payload["error"]
+
+
+def test_transcribe_audio_uses_configured_command(tmp_path):
+    _tools, registry, workspace = make_builtin_tools(tmp_path)
+    target = workspace / "voice.mp3"
+    target.write_bytes(b"audio")
+    script = tmp_path / "transcribe.py"
+    script.write_text(
+        "import pathlib, sys\n"
+        "print('TRANSCRIPT:' + pathlib.Path(sys.argv[1]).name)\n",
+        encoding="utf-8",
+    )
+    registry.set_context(
+        "audio_transcription_command",
+        f"{sys.executable} {script} {{path}}",
+    )
+
+    result = asyncio.run(registry.call("transcribe_audio", {"path": str(target)}))
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert payload["transcript"].strip() == "TRANSCRIPT:voice.mp3"
+    assert payload["path"] == str(target.resolve())
 
 
 def test_schedule_create_supports_agent_task_action_type(tmp_path):

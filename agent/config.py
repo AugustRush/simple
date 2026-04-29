@@ -81,6 +81,9 @@ DEFAULT_CONFIG: dict = {
         "lease_seconds": 300,
         "max_concurrent_runs": 3,
     },
+    "audio": {
+        "transcription_command": "$SIMPLE_AUDIO_TRANSCRIBE_COMMAND",
+    },
     # ── Context manager ──────────────────────────────────────────────────
     "context": {
         "storage": {
@@ -233,6 +236,7 @@ def load_config() -> tuple[dict, bool]:
             "orchestration",
             "evolution",
             "scheduler",
+            "audio",
             "mcp_servers",
             "context",
         ):

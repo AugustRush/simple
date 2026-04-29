@@ -206,6 +206,30 @@ def test_build_components_wires_shell_blocked_commands(monkeypatch, tmp_path):
     assert components["registry"].get_context("shell_blocked_commands") == ["python"]
 
 
+def test_build_components_wires_audio_transcription_command(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["audio"] = {"transcription_command": "python transcribe.py {path}"}
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert (
+        components["registry"].get_context("audio_transcription_command")
+        == "python transcribe.py {path}"
+    )
+
+
 def test_build_components_passes_output_dir_to_mcp_env(monkeypatch, tmp_path):
     """MCP servers receive AGENT_OUTPUT_DIR in their environment."""
     import agent as agent_module

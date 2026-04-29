@@ -136,6 +136,15 @@
     "lease_seconds": 300
   },
 
+  "audio": {
+    "_readme": [
+      "Optional speech-to-text command used by the built-in transcribe_audio tool.",
+      "Use {path} for the local audio file path and optional {language} for a language hint.",
+      "Example: python /Users/you/bin/transcribe_audio.py {path}"
+    ],
+    "transcription_command": "$SIMPLE_AUDIO_TRANSCRIBE_COMMAND"
+  },
+
   "plugins": {
     "_readme": "Per-plugin enable/disable. Use the plugin name as key. Set enabled=false to disable a plugin without removing it.",
     "_example_disabled": { "enabled": false }

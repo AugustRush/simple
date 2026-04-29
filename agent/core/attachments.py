@@ -67,6 +67,10 @@ def format_attachment_context(attachments: list[MessageAttachment] | tuple[Messa
             f"{attachment.local_path}"
         )
     lines.append("")
+    if any(attachment.kind == "audio" for attachment in attachments):
+        lines.append(
+            "音频附件请优先使用 transcribe_audio 工具转写；不要用 read_file 读取二进制音频。"
+        )
     lines.append(
         "如果当前模型不能直接读取附件，请使用合适的工具或技能读取这些本地文件后再回答。"
     )

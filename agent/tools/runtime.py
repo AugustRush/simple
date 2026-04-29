@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import time
 import traceback
@@ -71,6 +72,7 @@ class ToolRegistry:
         ("builtin", "write_file"): frozenset({"workspace_write"}),
         ("builtin", "clean_output"): frozenset({"output_write"}),
         ("builtin", "shell"): frozenset({"shell"}),
+        ("builtin", "transcribe_audio"): frozenset({"read"}),
         ("builtin", "send_file"): frozenset({"side_effect"}),
         ("builtin", "memory_write"): frozenset({"state_write"}),
         ("builtin", "schedule_create"): frozenset({"state_write"}),
@@ -340,6 +342,32 @@ class BuiltinTools:
                 "required": ["path"],
             },
             self._send_file,
+            source="builtin",
+        )
+
+        r.register(
+            "transcribe_audio",
+            "Transcribe an audio file to text using the configured local speech-to-text command. Use this for audio attachments; do not use read_file on audio files.",
+            {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute or relative path to an audio file within the workspace or output directory",
+                    },
+                    "language": {
+                        "type": "string",
+                        "description": "Optional language hint such as zh, en, ja, or ko",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds",
+                        "default": 300,
+                    },
+                },
+                "required": ["path"],
+            },
+            self._transcribe_audio,
             source="builtin",
         )
 
@@ -1018,6 +1046,83 @@ class BuiltinTools:
             return self._error(str(e))
         except Exception as e:
             return self._error(f"Error queueing file: {e}")
+
+    def _audio_transcription_command(self) -> str:
+        raw = self.registry.get_context("audio_transcription_command", "")
+        if isinstance(raw, str) and raw.startswith("$"):
+            return os.environ.get(raw[1:], "")
+        if raw:
+            return str(raw)
+        return os.environ.get("SIMPLE_AUDIO_TRANSCRIBE_COMMAND", "")
+
+    async def _transcribe_audio(
+        self,
+        path: str,
+        language: str = "",
+        timeout: int = 300,
+    ) -> dict[str, Any]:
+        try:
+            resolved, _root_kind = self._resolve_tool_path(path)
+            if not resolved.exists():
+                return self._error(f"'{path}' does not exist", path=str(resolved))
+            if not resolved.is_file():
+                return self._error(f"'{path}' is not a regular file", path=str(resolved))
+            command_template = self._audio_transcription_command().strip()
+            if not command_template:
+                return self._error(
+                    "Audio transcription is not configured. Set audio.transcription_command "
+                    "in config.json or SIMPLE_AUDIO_TRANSCRIBE_COMMAND. Use {path} as the "
+                    "audio-file placeholder.",
+                    path=str(resolved),
+                )
+            language = str(language or "").strip()
+            replacements = {
+                "{path}": shlex.quote(str(resolved)),
+                "{language}": shlex.quote(language) if language else "",
+            }
+            command = command_template
+            for needle, value in replacements.items():
+                command = command.replace(needle, value)
+            if "{path}" not in command_template:
+                command = f"{command} {shlex.quote(str(resolved))}"
+            timeout = max(1, min(int(timeout), 900))
+            proc = None
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={
+                    **os.environ.copy(),
+                    "AGENT_OUTPUT_DIR": str(self._output_dir),
+                },
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            transcript = stdout.decode(errors="replace").strip()
+            err = stderr.decode(errors="replace").strip()
+            if proc.returncode != 0:
+                return self._error(
+                    f"Audio transcription failed with exit code {proc.returncode}",
+                    path=str(resolved),
+                    stderr=err[-4000:],
+                    exit_code=proc.returncode,
+                )
+            return self._ok(
+                path=str(resolved),
+                transcript=transcript,
+                stderr=err[-4000:] if err else "",
+                exit_code=proc.returncode,
+            )
+        except asyncio.TimeoutError:
+            await self._terminate_process(proc)
+            return self._error(
+                f"Audio transcription timed out after {timeout}s",
+                path=path,
+                timed_out=True,
+            )
+        except ValueError as e:
+            return self._error(str(e))
+        except Exception as e:
+            return self._error(f"Error transcribing audio: {e}")
 
     async def _terminate_process(self, proc: Any) -> None:
         if proc is None:
