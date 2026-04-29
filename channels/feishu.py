@@ -1592,26 +1592,39 @@ class FeishuChannel(Channel):
             return "video/mp4"
         return "application/octet-stream"
 
-    async def _extract_message_attachments(
+    def _resource_fallback_filename(self, resource_key: str, resource_type: str) -> str:
+        if resource_type == "image":
+            return f"{resource_key}.png"
+        if resource_type == "audio":
+            return f"{resource_key}.mp3"
+        if resource_type in ("media", "video"):
+            return f"{resource_key}.mp4"
+        return resource_key
+
+    def _message_attachment_specs(
         self,
-        *,
-        message_id: str,
         msg_type: str,
         content_json: dict,
-    ) -> tuple[MessageAttachment, ...]:
+    ) -> list[tuple[str, str, str]]:
         specs: list[tuple[str, str, str]] = []
         if msg_type == "image":
             key = content_json.get("image_key") or content_json.get("file_key")
             if key:
                 filename = self._safe_resource_filename(
                     content_json.get("file_name", ""),
-                    f"{key}.png",
+                    self._resource_fallback_filename(str(key), "image"),
                 )
                 specs.append((str(key), "image", filename))
         elif msg_type == "post":
             _text, image_keys = _extract_post_content(content_json)
             for key in image_keys:
-                specs.append((str(key), "image", f"{key}.png"))
+                specs.append(
+                    (
+                        str(key),
+                        "image",
+                        self._resource_fallback_filename(str(key), "image"),
+                    )
+                )
         elif msg_type in ("file", "audio", "media", "video"):
             key = (
                 content_json.get("file_key")
@@ -1619,13 +1632,20 @@ class FeishuChannel(Channel):
                 or content_json.get("audio_key")
             )
             if key:
+                resource_type = "file" if msg_type == "file" else msg_type
                 filename = self._safe_resource_filename(
                     content_json.get("file_name", "") or content_json.get("name", ""),
-                    str(key),
+                    self._resource_fallback_filename(str(key), resource_type),
                 )
-                resource_type = "file" if msg_type == "file" else msg_type
                 specs.append((str(key), resource_type, filename))
+        return specs
 
+    async def _download_message_attachments(
+        self,
+        *,
+        message_id: str,
+        specs: list[tuple[str, str, str]],
+    ) -> tuple[MessageAttachment, ...]:
         attachments: list[MessageAttachment] = []
         for resource_key, resource_type, filename in specs:
             path = await self._download_message_resource(
@@ -1654,6 +1674,18 @@ class FeishuChannel(Channel):
                 )
             )
         return tuple(attachments)
+
+    async def _extract_message_attachments(
+        self,
+        *,
+        message_id: str,
+        msg_type: str,
+        content_json: dict,
+    ) -> tuple[MessageAttachment, ...]:
+        return await self._download_message_attachments(
+            message_id=message_id,
+            specs=self._message_attachment_specs(msg_type, content_json),
+        )
 
     async def _download_message_resource(
         self,
@@ -1779,11 +1811,12 @@ class FeishuChannel(Channel):
                 content_json = json.loads(message.content) if message.content else {}
             except json.JSONDecodeError:
                 content_json = {}
-            attachments = await self._extract_message_attachments(
+            attachment_specs = self._message_attachment_specs(msg_type, content_json)
+            attachments = await self._download_message_attachments(
                 message_id=message_id,
-                msg_type=msg_type,
-                content_json=content_json,
+                specs=attachment_specs,
             )
+            attachment_download_failed_count = max(0, len(attachment_specs) - len(attachments))
 
             content_parts: list[str] = []
 
@@ -1803,6 +1836,12 @@ class FeishuChannel(Channel):
 
             else:
                 content_parts.append(f"[{msg_type}]")
+
+            if attachment_download_failed_count:
+                content_parts.append(
+                    f"[{msg_type} attachment download failed: "
+                    f"{attachment_download_failed_count}]"
+                )
 
             content = "\n".join(content_parts).strip()
             if not content and attachments:
@@ -1824,6 +1863,9 @@ class FeishuChannel(Channel):
                     "message_id": message_id,
                     "msg_type": msg_type,
                     "attachment_count": len(attachments),
+                    "attachment_download_failed_count": (
+                        attachment_download_failed_count
+                    ),
                 },
             )
             _interaction_log(

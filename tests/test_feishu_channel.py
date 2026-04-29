@@ -232,6 +232,37 @@ def test_feishu_channel_extracts_file_attachment(monkeypatch, tmp_path):
     assert attachments[0].mime_type == "application/pdf"
 
 
+def test_feishu_channel_extracts_audio_attachment_with_default_extension(
+    monkeypatch, tmp_path
+):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._input_dir = tmp_path
+    saved = tmp_path / "msg_1" / "audio_key_123.mp3"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"fake")
+
+    async def fake_download(message_id, resource_key, resource_type, filename):
+        assert resource_key == "audio_key_123"
+        assert resource_type == "audio"
+        assert filename == "audio_key_123.mp3"
+        return saved
+
+    monkeypatch.setattr(channel, "_download_message_resource", fake_download)
+
+    attachments = asyncio.run(
+        channel._extract_message_attachments(
+            message_id="msg_1",
+            msg_type="audio",
+            content_json={"file_key": "audio_key_123"},
+        )
+    )
+
+    assert len(attachments) == 1
+    assert attachments[0].kind == "audio"
+    assert attachments[0].mime_type == "audio/mpeg"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FeishuOutputSink — format detection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1734,6 +1765,111 @@ def test_feishu_channel_dispatches_image_message_with_attachment(tmp_path):
     assert dispatched.text == "[image]"
     assert len(dispatched.attachments) == 1
     assert dispatched.attachments[0].local_path == saved
+
+
+def test_feishu_channel_dispatches_audio_message_with_attachment(tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._handler = AsyncMock()
+    channel._input_dir = tmp_path
+    mock_sink = MagicMock()
+    saved = tmp_path / "msg_123" / "audio_key_123.mp3"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"fake")
+
+    message = MagicMock()
+    message.message_id = "msg_123"
+    message.chat_id = "ou_sender"
+    message.chat_type = "p2p"
+    message.message_type = "audio"
+    message.content = json.dumps({"file_key": "audio_key_123"})
+    message.mentions = []
+
+    sender = MagicMock()
+    sender.sender_type = "user"
+    sender.sender_id.open_id = "ou_sender"
+
+    data = MagicMock()
+    data.event.message = message
+    data.event.sender = sender
+
+    async def fake_download(message_id, resource_key, resource_type, filename):
+        return saved
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+                channel,
+                "create_sink",
+                return_value=mock_sink,
+            ), patch.object(
+                channel,
+                "_download_message_resource",
+                new=fake_download,
+            ):
+                await channel._on_message(data)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    dispatched = channel._handler.await_args.args[0]
+    assert dispatched.text == "[audio]"
+    assert len(dispatched.attachments) == 1
+    assert dispatched.attachments[0].local_path == saved
+
+
+def test_feishu_channel_audio_download_failure_reaches_agent(tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._handler = AsyncMock()
+    channel._input_dir = tmp_path
+    mock_sink = MagicMock()
+
+    message = MagicMock()
+    message.message_id = "msg_123"
+    message.chat_id = "ou_sender"
+    message.chat_type = "p2p"
+    message.message_type = "audio"
+    message.content = json.dumps({"file_key": "audio_key_123"})
+    message.mentions = []
+
+    sender = MagicMock()
+    sender.sender_type = "user"
+    sender.sender_id.open_id = "ou_sender"
+
+    data = MagicMock()
+    data.event.message = message
+    data.event.sender = sender
+
+    async def fake_download(message_id, resource_key, resource_type, filename):
+        return None
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+                channel,
+                "create_sink",
+                return_value=mock_sink,
+            ), patch.object(
+                channel,
+                "_download_message_resource",
+                new=fake_download,
+            ):
+                await channel._on_message(data)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    dispatched = channel._handler.await_args.args[0]
+    assert "audio attachment download failed" in dispatched.text
+    assert dispatched.metadata["attachment_download_failed_count"] == 1
+    assert dispatched.attachments == ()
 
 
 def test_feishu_channel_dispatches_post_image_only_message_with_attachment(tmp_path):
