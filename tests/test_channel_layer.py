@@ -17,6 +17,7 @@ import pytest
 import agent as agent_module
 from agent.channels import Channel, ChannelRunner, CliChannel, IncomingMessage
 from agent.core import CliOutputSink, OutputSink, SubAgentProgressEvent
+from agent.core.attachments import MessageAttachment
 from agent import (
     _active_sink,
     _fmt_tool_inputs,
@@ -275,6 +276,76 @@ def test_incoming_message_defaults():
     assert msg.channel_name == "cli"
     assert msg.session_id  # non-empty UUID-like string
     assert msg.metadata == {}
+    assert msg.attachments == ()
+
+
+def test_incoming_message_accepts_attachments(tmp_path):
+    image = tmp_path / "photo.png"
+    image.write_bytes(b"fake")
+
+    msg = IncomingMessage(
+        text="describe this",
+        attachments=[
+            MessageAttachment(
+                kind="image",
+                mime_type="image/png",
+                filename="photo.png",
+                local_path=image,
+                source="feishu",
+            )
+        ],
+    )
+
+    assert len(msg.attachments) == 1
+    assert msg.attachments[0].local_path == image
+
+
+def test_channel_runner_passes_attachments_to_turn_input(tmp_path):
+    import agent as agent_module
+
+    image = tmp_path / "photo.png"
+    image.write_bytes(b"fake")
+    observed = {}
+
+    class _FakeTurnRunner:
+        async def run(self, turn_input, ctx, stream_callback=None):
+            observed["attachments"] = turn_input.attachments
+            return agent_module.TurnResult(text="ok")
+
+        async def complete_turn(self, turn_input, state, result):
+            pass
+
+    class _FakeSkillCatalog:
+        pass
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "turn_runner": _FakeTurnRunner(),
+            "skill_catalog": _FakeSkillCatalog(),
+            "system_prompt": "system",
+            "agent": object(),
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+    attachment = MessageAttachment(
+        kind="image",
+        mime_type="image/png",
+        filename="photo.png",
+        local_path=image,
+        source="feishu",
+    )
+
+    async def _run():
+        await handler(
+            IncomingMessage(text="describe", attachments=[attachment]),
+            OutputSink(),
+        )
+
+    asyncio.run(_run())
+
+    assert observed["attachments"] == (attachment,)
 
 
 def test_incoming_message_session_ids_are_unique():

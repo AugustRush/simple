@@ -147,6 +147,91 @@ def test_extract_post_content_empty():
     assert imgs == []
 
 
+def test_feishu_channel_extracts_image_attachment(monkeypatch, tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._input_dir = tmp_path
+    saved = tmp_path / "msg_1" / "img_key_123.png"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"fake")
+
+    async def fake_download(message_id, resource_key, resource_type, filename):
+        assert message_id == "msg_1"
+        assert resource_key == "img_key_123"
+        assert resource_type == "image"
+        return saved
+
+    monkeypatch.setattr(channel, "_download_message_resource", fake_download)
+
+    attachments = asyncio.run(
+        channel._extract_message_attachments(
+            message_id="msg_1",
+            msg_type="image",
+            content_json={"image_key": "img_key_123"},
+        )
+    )
+
+    assert len(attachments) == 1
+    assert attachments[0].kind == "image"
+    assert attachments[0].mime_type == "image/png"
+    assert attachments[0].local_path == saved
+
+
+def test_feishu_channel_extracts_post_image_attachments(monkeypatch, tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._input_dir = tmp_path
+    saved = tmp_path / "msg_1" / "post_img_key.png"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"fake")
+
+    async def fake_download(message_id, resource_key, resource_type, filename):
+        return saved
+
+    monkeypatch.setattr(channel, "_download_message_resource", fake_download)
+
+    attachments = asyncio.run(
+        channel._extract_message_attachments(
+            message_id="msg_1",
+            msg_type="post",
+            content_json={
+                "content": [[{"tag": "img", "image_key": "post_img_key"}]],
+            },
+        )
+    )
+
+    assert [attachment.local_path for attachment in attachments] == [saved]
+
+
+def test_feishu_channel_extracts_file_attachment(monkeypatch, tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._input_dir = tmp_path
+    saved = tmp_path / "msg_1" / "report.pdf"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"fake")
+
+    async def fake_download(message_id, resource_key, resource_type, filename):
+        assert resource_key == "file_key_123"
+        assert resource_type == "file"
+        assert filename == "report.pdf"
+        return saved
+
+    monkeypatch.setattr(channel, "_download_message_resource", fake_download)
+
+    attachments = asyncio.run(
+        channel._extract_message_attachments(
+            message_id="msg_1",
+            msg_type="file",
+            content_json={"file_key": "file_key_123", "file_name": "report.pdf"},
+        )
+    )
+
+    assert len(attachments) == 1
+    assert attachments[0].kind == "document"
+    assert attachments[0].mime_type == "application/pdf"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FeishuOutputSink — format detection
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1467,6 +1552,25 @@ def test_feishu_channel_create_sink_passes_output_dir():
     assert sink.streaming is False
 
 
+def test_feishu_channel_uses_output_dir_for_inbound_attachments(tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    output_dir = tmp_path / "output"
+
+    channel.set_output_dir(output_dir)
+
+    assert channel._input_dir == output_dir / "feishu-input"
+
+
+def test_feishu_channel_explicit_input_dir_overrides_output_dir(tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    input_dir = tmp_path / "incoming"
+
+    channel.set_input_dir(input_dir)
+    channel.set_output_dir(tmp_path / "output")
+
+    assert channel._input_dir == input_dir
+
+
 def test_feishu_channel_create_sink_treats_group_chat_type_as_chat_id():
     channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y", streaming=False))
     channel._client = MagicMock()
@@ -1576,6 +1680,115 @@ def test_feishu_channel_logs_received_message(caplog):
     assert "interaction component=feishu_channel event=message_dispatched" in caplog.text
     assert "message_id=msg_123" in caplog.text
     assert "text_len=12" in caplog.text
+
+
+def test_feishu_channel_dispatches_image_message_with_attachment(tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._handler = AsyncMock()
+    channel._input_dir = tmp_path
+    mock_sink = MagicMock()
+    saved = tmp_path / "msg_123" / "img_key_123.png"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"fake")
+
+    message = MagicMock()
+    message.message_id = "msg_123"
+    message.chat_id = "ou_sender"
+    message.chat_type = "p2p"
+    message.message_type = "image"
+    message.content = json.dumps({"image_key": "img_key_123"})
+    message.mentions = []
+
+    sender = MagicMock()
+    sender.sender_type = "user"
+    sender.sender_id.open_id = "ou_sender"
+
+    data = MagicMock()
+    data.event.message = message
+    data.event.sender = sender
+
+    async def fake_download(message_id, resource_key, resource_type, filename):
+        return saved
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+                channel,
+                "create_sink",
+                return_value=mock_sink,
+            ), patch.object(
+                channel,
+                "_download_message_resource",
+                new=fake_download,
+            ):
+                await channel._on_message(data)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    dispatched = channel._handler.await_args.args[0]
+    assert dispatched.text == "[image]"
+    assert len(dispatched.attachments) == 1
+    assert dispatched.attachments[0].local_path == saved
+
+
+def test_feishu_channel_dispatches_post_image_only_message_with_attachment(tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._handler = AsyncMock()
+    channel._input_dir = tmp_path
+    mock_sink = MagicMock()
+    saved = tmp_path / "msg_123" / "img_key_123.png"
+    saved.parent.mkdir(parents=True)
+    saved.write_bytes(b"fake")
+
+    message = MagicMock()
+    message.message_id = "msg_123"
+    message.chat_id = "ou_sender"
+    message.chat_type = "p2p"
+    message.message_type = "post"
+    message.content = json.dumps(
+        {"content": [[{"tag": "img", "image_key": "img_key_123"}]]}
+    )
+    message.mentions = []
+
+    sender = MagicMock()
+    sender.sender_type = "user"
+    sender.sender_id.open_id = "ou_sender"
+
+    data = MagicMock()
+    data.event.message = message
+    data.event.sender = sender
+
+    async def fake_download(message_id, resource_key, resource_type, filename):
+        return saved
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+                channel,
+                "create_sink",
+                return_value=mock_sink,
+            ), patch.object(
+                channel,
+                "_download_message_resource",
+                new=fake_download,
+            ):
+                await channel._on_message(data)
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    dispatched = channel._handler.await_args.args[0]
+    assert dispatched.text == "[post]"
+    assert [attachment.local_path for attachment in dispatched.attachments] == [saved]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

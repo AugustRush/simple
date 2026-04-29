@@ -5,6 +5,8 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, TypeVar, overload
 
+from agent.core.attachments import MessageAttachment
+
 T = TypeVar("T")
 
 
@@ -20,9 +22,11 @@ class TurnInput:
     session_id: str = "default"
     channel_name: str = "cli"
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    attachments: tuple[MessageAttachment, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        object.__setattr__(self, "attachments", tuple(self.attachments))
 
     @classmethod
     def from_text(
@@ -32,12 +36,14 @@ class TurnInput:
         session_id: str = "default",
         channel_name: str = "cli",
         metadata: Mapping[str, Any] | None = None,
+        attachments: list[MessageAttachment] | tuple[MessageAttachment, ...] = (),
     ) -> "TurnInput":
         return cls(
             text=text,
             session_id=session_id,
             channel_name=channel_name,
             metadata=metadata or {},
+            attachments=tuple(attachments),
         )
 
 
@@ -133,10 +139,13 @@ class TurnRunner:
         stream_callback: Callable[[str], None] | None = None,
     ) -> TurnResult:
         agent = self._components.require("agent")
+        kwargs: dict[str, Any] = {"stream_callback": stream_callback}
+        if turn_input.attachments:
+            kwargs["attachments"] = turn_input.attachments
         result = await agent.send_message(
             ctx,
             turn_input.text,
-            stream_callback=stream_callback,
+            **kwargs,
         )
         return TurnResult.from_agent_result(result)
 

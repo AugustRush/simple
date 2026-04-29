@@ -1,5 +1,10 @@
 """Core orchestration exports."""
 
+from .attachments import (
+    MessageAttachment,
+    attachment_kind_for_mime,
+    format_attachment_context,
+)
 from .output import CliOutputSink, OutputSink
 
 __all__ = [
@@ -7,6 +12,7 @@ __all__ = [
     "AgentResult",
     "BaseAgent",
     "CliOutputSink",
+    "MessageAttachment",
     "OutputSink",
     "RalphTask",
     "RuntimeComponents",
@@ -15,6 +21,8 @@ __all__ = [
     "TurnInput",
     "TurnResult",
     "TurnRunner",
+    "attachment_kind_for_mime",
+    "format_attachment_context",
 ]
 
 

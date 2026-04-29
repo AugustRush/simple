@@ -13,6 +13,7 @@ from rich.console import Console
 
 from agent import shared
 from agent.core.output import CliOutputSink, OutputSink, _active_sink
+from agent.core.attachments import MessageAttachment
 from agent.runtime import RuntimeComponents, RuntimeSessionState, TurnInput, TurnRunner
 from agent.tools.runtime import _active_schedule_target
 
@@ -56,6 +57,10 @@ class IncomingMessage:
     session_id: str = field(default_factory=_new_id)
     channel_name: str = "cli"
     metadata: dict = field(default_factory=dict)
+    attachments: tuple[MessageAttachment, ...] = ()
+
+    def __post_init__(self) -> None:
+        self.attachments = tuple(self.attachments)
 
 
 class Channel(ABC):
@@ -280,6 +285,7 @@ class ChannelRunner:
                     session_id=session_id,
                     channel_name=msg.channel_name,
                     metadata=msg.metadata,
+                    attachments=msg.attachments,
                 )
                 result = await turn_runner.run(
                     turn_input,

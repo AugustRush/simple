@@ -7,7 +7,13 @@ from typing import Optional
 
 import agent as agent_module
 from agent import shared
-from agent.config import ModelClientFactory, _compose_system_prompt, _load_system_prompt, _resolve_output_dir
+from agent.config import (
+    ModelClientFactory,
+    _compose_system_prompt,
+    _load_system_prompt,
+    _resolve_output_dir,
+    provider_supports_vision,
+)
 from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime import TurnRunner
@@ -50,6 +56,7 @@ async def _build_components_async(cfg: dict):
     api_format = (
         cfg.get("providers", {}).get(active_provider, {}).get("api_format", "anthropic")
     )
+    supports_vision = provider_supports_vision(cfg, active_provider)
 
     registry = registry_cls(console=console)
 
@@ -173,7 +180,12 @@ async def _build_components_async(cfg: dict):
             )
 
     agent = BaseAgent(
-        client, registry, model=model, max_tokens=max_tokens, api_format=api_format
+        client,
+        registry,
+        model=model,
+        max_tokens=max_tokens,
+        api_format=api_format,
+        supports_vision=supports_vision,
     )
     agent.max_parallel_agents = max(
         1,

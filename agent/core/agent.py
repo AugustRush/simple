@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import copy
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ import anthropic
 import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt
+from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_sink
 from agent.memory.system import ContextManager, LTMEntry
 from agent.orchestration.runtime import (
@@ -152,10 +154,12 @@ class BaseAgent:
         model: str = shared.DEFAULT_MODEL,
         max_tokens: int = shared.DEFAULT_MAX_TOKENS,
         api_format: str = "anthropic",
+        supports_vision: bool = False,
     ):
         self.client = client
         self.registry = registry
         self.api_format = api_format
+        self.supports_vision = supports_vision
         self.model = model
         self.max_tokens = max_tokens
         self.context_manager: Optional[ContextManager] = None
@@ -167,6 +171,55 @@ class BaseAgent:
         self._context_stack = _TaskLocalContextStack()
         self.workspace_root: Optional[Path] = None
         self._base_system_prompt: str = ""
+
+    def _image_content_block(self, attachment: MessageAttachment) -> dict[str, Any]:
+        data = base64.b64encode(attachment.local_path.read_bytes()).decode("ascii")
+        mime_type = attachment.mime_type or "application/octet-stream"
+        if self.api_format == "anthropic":
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": data,
+                },
+            }
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime_type};base64,{data}"},
+        }
+
+    def _build_user_message_content(
+        self,
+        user_message: str,
+        attachments: tuple[MessageAttachment, ...] = (),
+    ) -> str | list[dict[str, Any]]:
+        if not attachments:
+            return user_message
+
+        direct_images: list[MessageAttachment] = []
+        fallback_attachments: list[MessageAttachment] = []
+        if self.supports_vision:
+            for attachment in attachments:
+                if attachment.kind == "image" and attachment.local_path.is_file():
+                    direct_images.append(attachment)
+                else:
+                    fallback_attachments.append(attachment)
+        else:
+            fallback_attachments = list(attachments)
+
+        fallback_context = format_attachment_context(fallback_attachments)
+        text = user_message
+        if fallback_context:
+            text = f"{user_message}\n\n{fallback_context}" if user_message else fallback_context
+        if not direct_images:
+            return text
+
+        blocks: list[dict[str, Any]] = []
+        if text.strip():
+            blocks.append({"type": "text", "text": text})
+        blocks.extend(self._image_content_block(attachment) for attachment in direct_images)
+        return blocks
 
     def _emit_subagent_event(self, event: SubAgentProgressEvent) -> None:
         sink = _active_sink.get()
@@ -1456,6 +1509,7 @@ class BaseAgent:
         ctx: "AgentContext",
         user_message: str,
         stream_callback: Optional[Callable[[str], None]] = None,
+        attachments: tuple[MessageAttachment, ...] = (),
     ) -> "AgentResult":
         # Capture original system prompt before any per-turn injections.
         original_system = ctx.system_prompt
@@ -1516,7 +1570,12 @@ class BaseAgent:
                     )
             orchestration_decision = self._plan_orchestration(ctx, user_message)
 
-            ctx.messages.append({"role": "user", "content": user_message})
+            ctx.messages.append(
+                {
+                    "role": "user",
+                    "content": self._build_user_message_content(user_message, attachments),
+                }
+            )
             self._context_stack.append(ctx)
 
             # D1: bounded tool-call loop — prevents infinite model loops
@@ -1966,6 +2025,7 @@ class BaseAgent:
             model=self.model,
             max_tokens=self.max_tokens,
             api_format=self.api_format,
+            supports_vision=self.supports_vision,
         )
         sub_agent.context_manager = self.context_manager
         sub_agent.max_parallel_agents = self.max_parallel_agents

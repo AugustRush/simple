@@ -4893,6 +4893,296 @@ def test_stream_response_supports_async_stream_callback():
     assert seen == ["hello", " world"]
 
 
+def test_turn_runner_appends_attachment_context_for_text_model(tmp_path):
+    import agent as agent_module
+    from agent.core.attachments import MessageAttachment
+    from agent.runtime import RuntimeComponents, TurnInput, TurnRunner
+
+    image = tmp_path / "photo.png"
+    image.write_bytes(b"fake")
+    observed = {}
+
+    class _FakeAgent:
+        async def send_message(
+            self, ctx, user_message, stream_callback=None, attachments=()
+        ):
+            observed["user_message"] = user_message
+            observed["attachments"] = attachments
+            return agent_module.AgentResult(agent_id="agent", content="ok")
+
+    attachment = MessageAttachment(
+        kind="image",
+        mime_type="image/png",
+        local_path=image,
+    )
+    runner = TurnRunner(RuntimeComponents({"agent": _FakeAgent()}))
+    ctx = agent_module.AgentContext(system_prompt="system")
+
+    result = asyncio.run(
+        runner.run(TurnInput.from_text("describe", attachments=[attachment]), ctx)
+    )
+
+    assert result.text == "ok"
+    assert observed["user_message"] == "describe"
+    assert observed["attachments"] == (attachment,)
+
+
+def test_base_agent_appends_attachment_context_for_non_vision_model(tmp_path):
+    import agent as agent_module
+    from agent.core.attachments import MessageAttachment
+
+    path = tmp_path / "photo.png"
+    path.write_bytes(b"fake")
+    attachment = MessageAttachment(
+        kind="image",
+        mime_type="image/png",
+        local_path=path,
+    )
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="text-model",
+        api_format="openai",
+        supports_vision=False,
+    )
+
+    content = agent._build_user_message_content("describe", (attachment,))
+
+    assert isinstance(content, str)
+    assert content.startswith("describe")
+    assert str(path) in content
+    assert "如果当前模型不能直接读取附件" in content
+
+
+def test_base_agent_builds_openai_image_content_for_vision_model(tmp_path):
+    import agent as agent_module
+    from agent.core.attachments import MessageAttachment
+
+    path = tmp_path / "photo.png"
+    path.write_bytes(b"fake image")
+    attachment = MessageAttachment(
+        kind="image",
+        mime_type="image/png",
+        local_path=path,
+    )
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="vision-model",
+        api_format="openai",
+        supports_vision=True,
+    )
+
+    content = agent._build_user_message_content("describe", (attachment,))
+
+    assert content[0] == {"type": "text", "text": "describe"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_base_agent_builds_anthropic_image_content_for_vision_model(tmp_path):
+    import agent as agent_module
+    from agent.core.attachments import MessageAttachment
+
+    path = tmp_path / "photo.png"
+    path.write_bytes(b"fake image")
+    attachment = MessageAttachment(
+        kind="image",
+        mime_type="image/png",
+        local_path=path,
+    )
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="vision-model",
+        api_format="anthropic",
+        supports_vision=True,
+    )
+
+    content = agent._build_user_message_content("describe", (attachment,))
+
+    assert content[0] == {"type": "text", "text": "describe"}
+    assert content[1]["type"] == "image"
+    assert content[1]["source"]["media_type"] == "image/png"
+    assert content[1]["source"]["type"] == "base64"
+
+
+def test_base_agent_keeps_non_image_attachments_as_context_for_vision_model(tmp_path):
+    import agent as agent_module
+    from agent.core.attachments import MessageAttachment
+
+    path = tmp_path / "report.pdf"
+    path.write_bytes(b"fake")
+    attachment = MessageAttachment(
+        kind="document",
+        mime_type="application/pdf",
+        local_path=path,
+    )
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="vision-model",
+        api_format="openai",
+        supports_vision=True,
+    )
+
+    content = agent._build_user_message_content("summarize", (attachment,))
+
+    assert isinstance(content, str)
+    assert str(path) in content
+
+
+def test_build_components_passes_provider_vision_capability(monkeypatch, tmp_path):
+    import agent as agent_module
+    import agent.bootstrap as bootstrap_module
+
+    observed = {}
+
+    class _FakeBaseAgent:
+        def __init__(self, client, registry, **kwargs):
+            observed.update(kwargs)
+            self.context_manager = None
+            self.plugin_catalog = None
+            self.workspace_root = None
+
+        def register_spawn_capability(self, *args, **kwargs):
+            pass
+
+    class _FakeMemory:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def remember(self, *args, **kwargs):
+            pass
+
+        def read_index(self):
+            return ""
+
+    class _FakeClient:
+        async def close(self):
+            pass
+
+    class _FakeMCPClient:
+        async def connect_from_config(self, *args, **kwargs):
+            pass
+
+        def status_summary(self):
+            return ""
+
+    monkeypatch.setattr(bootstrap_module, "BaseAgent", _FakeBaseAgent)
+    monkeypatch.setattr(bootstrap_module, "MemoryPalace", _FakeMemory)
+    monkeypatch.setattr(agent_module, "MCPClient", _FakeMCPClient)
+    monkeypatch.setattr(agent_module.shared, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module.shared, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module.shared, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module.shared, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module.shared, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(
+        bootstrap_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (_FakeClient(), "vision-model", 1024),
+    )
+
+    asyncio.run(
+        agent_module._build_components_async(
+            {
+                "active_provider": "custom",
+                "providers": {
+                    "custom": {
+                        "api_format": "openai",
+                        "supports_vision": True,
+                    }
+                },
+            }
+        )
+    )
+
+    assert observed["supports_vision"] is True
+
+
+def test_build_components_uses_default_provider_vision_capability_when_missing(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+    import agent.bootstrap as bootstrap_module
+
+    observed = {}
+
+    class _FakeBaseAgent:
+        def __init__(self, client, registry, **kwargs):
+            observed.update(kwargs)
+            self.context_manager = None
+            self.plugin_catalog = None
+            self.workspace_root = None
+
+        def register_spawn_capability(self, *args, **kwargs):
+            pass
+
+    class _FakeMemory:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def remember(self, *args, **kwargs):
+            pass
+
+        def read_index(self):
+            return ""
+
+    class _FakeClient:
+        async def close(self):
+            pass
+
+    class _FakeMCPClient:
+        async def connect_from_config(self, *args, **kwargs):
+            pass
+
+        def status_summary(self):
+            return ""
+
+    monkeypatch.setattr(bootstrap_module, "BaseAgent", _FakeBaseAgent)
+    monkeypatch.setattr(bootstrap_module, "MemoryPalace", _FakeMemory)
+    monkeypatch.setattr(agent_module, "MCPClient", _FakeMCPClient)
+    monkeypatch.setattr(agent_module.shared, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module.shared, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module.shared, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module.shared, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module.shared, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+    monkeypatch.setattr(
+        bootstrap_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (_FakeClient(), "gpt-4o", 1024),
+    )
+
+    asyncio.run(
+        agent_module._build_components_async(
+            {
+                "active_provider": "openai",
+                "providers": {
+                    "openai": {
+                        "api_format": "openai",
+                    }
+                },
+            }
+        )
+    )
+
+    assert observed["supports_vision"] is True
+
+
+def test_provider_supports_vision_falls_back_to_default_config():
+    from agent.config import provider_supports_vision
+
+    cfg = {
+        "providers": {
+            "openai": {"api_format": "openai"},
+            "custom": {"api_format": "openai"},
+        }
+    }
+
+    assert provider_supports_vision(cfg, "openai") is True
+    assert provider_supports_vision(cfg, "custom") is False
+
+
 def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
     monkeypatch, tmp_path
 ):

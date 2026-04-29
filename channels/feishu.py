@@ -40,6 +40,7 @@ import importlib.util
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -52,6 +53,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
 from agent import _active_sink, _fmt_tool_inputs, shared
 from agent.channels import Channel, IncomingMessage
+from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core import OutputSink, SubAgentProgressEvent
 
 if TYPE_CHECKING:
@@ -1435,6 +1437,8 @@ class FeishuChannel(Channel):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._handler: Optional[Callable] = None
         self._output_dir: Optional[Path] = None
+        self._input_dir: Path = shared.AGENT_HOME / "input" / "feishu"
+        self._input_dir_explicit = False
         # Per-chat lock: ensures messages from the same chat are processed
         # one at a time even if they arrive in rapid succession.
         self._chat_locks: dict[str, asyncio.Lock] = {}
@@ -1549,6 +1553,12 @@ class FeishuChannel(Channel):
 
     def set_output_dir(self, output_dir: Optional[Path]) -> None:
         self._output_dir = output_dir
+        if output_dir is not None and not self._input_dir_explicit:
+            self._input_dir = Path(output_dir) / "feishu-input"
+
+    def set_input_dir(self, input_dir: Path) -> None:
+        self._input_dir = Path(input_dir)
+        self._input_dir_explicit = True
 
     def create_sink(self, msg: IncomingMessage) -> FeishuOutputSink:
         assert self._client is not None, "FeishuChannel.start() not called"
@@ -1564,6 +1574,137 @@ class FeishuChannel(Channel):
             output_dir=self._output_dir,
             streaming=self._config.streaming,
         )
+
+    @staticmethod
+    def _safe_resource_filename(filename: str, fallback: str) -> str:
+        name = Path(str(filename or fallback)).name.strip()
+        return name or fallback
+
+    def _attachment_mime_type(self, path: Path, msg_type: str) -> str:
+        guessed = mimetypes.guess_type(path.name)[0]
+        if guessed:
+            return guessed
+        if msg_type == "image":
+            return "image/png"
+        if msg_type == "audio":
+            return "audio/mpeg"
+        if msg_type in ("media", "video"):
+            return "video/mp4"
+        return "application/octet-stream"
+
+    async def _extract_message_attachments(
+        self,
+        *,
+        message_id: str,
+        msg_type: str,
+        content_json: dict,
+    ) -> tuple[MessageAttachment, ...]:
+        specs: list[tuple[str, str, str]] = []
+        if msg_type == "image":
+            key = content_json.get("image_key") or content_json.get("file_key")
+            if key:
+                filename = self._safe_resource_filename(
+                    content_json.get("file_name", ""),
+                    f"{key}.png",
+                )
+                specs.append((str(key), "image", filename))
+        elif msg_type == "post":
+            _text, image_keys = _extract_post_content(content_json)
+            for key in image_keys:
+                specs.append((str(key), "image", f"{key}.png"))
+        elif msg_type in ("file", "audio", "media", "video"):
+            key = (
+                content_json.get("file_key")
+                or content_json.get("media_key")
+                or content_json.get("audio_key")
+            )
+            if key:
+                filename = self._safe_resource_filename(
+                    content_json.get("file_name", "") or content_json.get("name", ""),
+                    str(key),
+                )
+                resource_type = "file" if msg_type == "file" else msg_type
+                specs.append((str(key), resource_type, filename))
+
+        attachments: list[MessageAttachment] = []
+        for resource_key, resource_type, filename in specs:
+            path = await self._download_message_resource(
+                message_id,
+                resource_key,
+                resource_type,
+                filename,
+            )
+            if path is None:
+                continue
+            mime_type = self._attachment_mime_type(path, resource_type)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = None
+            attachments.append(
+                MessageAttachment(
+                    kind=attachment_kind_for_mime(mime_type),
+                    mime_type=mime_type,
+                    filename=path.name,
+                    local_path=path,
+                    source="feishu",
+                    source_ref=resource_key,
+                    size_bytes=size,
+                    metadata={"message_id": message_id, "resource_type": resource_type},
+                )
+            )
+        return tuple(attachments)
+
+    async def _download_message_resource(
+        self,
+        message_id: str,
+        resource_key: str,
+        resource_type: str,
+        filename: str,
+    ) -> Optional[Path]:
+        assert self._client is not None, "FeishuChannel.start() not called"
+        safe_name = self._safe_resource_filename(filename, resource_key)
+        output_dir = self._input_dir / message_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / safe_name
+
+        def _download_sync() -> Optional[bytes]:
+            from lark_oapi.api.im.v1 import GetMessageResourceRequest  # type: ignore[import]
+
+            req = (
+                GetMessageResourceRequest.builder()
+                .message_id(message_id)
+                .file_key(resource_key)
+                .type(resource_type)
+                .build()
+            )
+            resp = self._client.im.v1.message_resource.get(req)
+            success = getattr(resp, "success", None)
+            if callable(success) and not success():
+                logger.warning(
+                    "Feishu resource download failed: message_id=%s key=%s type=%s code=%s msg=%s",
+                    message_id,
+                    resource_key,
+                    resource_type,
+                    getattr(resp, "code", ""),
+                    getattr(resp, "msg", ""),
+                )
+                return None
+            body = getattr(resp, "file", None) or getattr(resp, "data", None)
+            if hasattr(body, "read"):
+                return body.read()
+            if isinstance(body, bytes):
+                return body
+            if isinstance(body, str):
+                return body.encode("utf-8")
+            return None
+
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, _download_sync)
+        if not data:
+            return None
+        path.write_bytes(data)
+        return path
 
     # ── WebSocket event handlers ──────────────────────────────────────────────
 
@@ -1638,6 +1779,11 @@ class FeishuChannel(Channel):
                 content_json = json.loads(message.content) if message.content else {}
             except json.JSONDecodeError:
                 content_json = {}
+            attachments = await self._extract_message_attachments(
+                message_id=message_id,
+                msg_type=msg_type,
+                content_json=content_json,
+            )
 
             content_parts: list[str] = []
 
@@ -1659,6 +1805,8 @@ class FeishuChannel(Channel):
                 content_parts.append(f"[{msg_type}]")
 
             content = "\n".join(content_parts).strip()
+            if not content and attachments:
+                content = f"[{msg_type}]"
             if not content:
                 return
 
@@ -1668,12 +1816,14 @@ class FeishuChannel(Channel):
             msg_obj = IncomingMessage(
                 text=content,
                 channel_name="feishu",
+                attachments=attachments,
                 metadata={
                     "sender_id": sender_id,
                     "chat_id": reply_to,
                     "chat_type": chat_type,
                     "message_id": message_id,
                     "msg_type": msg_type,
+                    "attachment_count": len(attachments),
                 },
             )
             _interaction_log(

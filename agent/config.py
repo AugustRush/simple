@@ -26,6 +26,7 @@ DEFAULT_CONFIG: dict = {
     "providers": {
         "anthropic": {
             "api_format": "anthropic",
+            "supports_vision": True,
             "api_key": "$ANTHROPIC_API_KEY",
             "default_model": "claude-opus-4-5",
             "models": ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-3-5"],
@@ -33,6 +34,7 @@ DEFAULT_CONFIG: dict = {
         },
         "openai": {
             "api_format": "openai",
+            "supports_vision": True,
             "api_key": "$OPENAI_API_KEY",
             "default_model": "gpt-4o",
             "models": ["gpt-4o", "gpt-4o-mini", "o1-preview"],
@@ -40,6 +42,7 @@ DEFAULT_CONFIG: dict = {
         },
         "deepseek": {
             "api_format": "openai",
+            "supports_vision": False,
             "api_key": "$DEEPSEEK_API_KEY",
             "base_url": "https://api.deepseek.com/v1",
             "default_model": "deepseek-chat",
@@ -48,6 +51,7 @@ DEFAULT_CONFIG: dict = {
         },
         "ollama": {
             "api_format": "openai",
+            "supports_vision": False,
             "api_key": "ollama",
             "base_url": "http://localhost:11434/v1",
             "default_model": "qwen2.5:14b",
@@ -245,6 +249,15 @@ def save_config(cfg: dict):
     shared._atomic_write_text(shared.CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False))
 
 
+def provider_supports_vision(cfg: dict, provider_name: str) -> bool:
+    providers = cfg.get("providers", {})
+    provider_cfg = providers.get(provider_name, {})
+    if "supports_vision" in provider_cfg:
+        return bool(provider_cfg.get("supports_vision"))
+    default_cfg = DEFAULT_CONFIG.get("providers", {}).get(provider_name, {})
+    return bool(default_cfg.get("supports_vision", False))
+
+
 def _first_run_setup() -> bool:
     """Interactive first-run setup wizard.
     Guides user to choose a provider, set API key / base_url, and save config.
@@ -353,6 +366,7 @@ def _first_run_setup() -> bool:
 
     p = cfg.setdefault("providers", {}).setdefault(provider_name, {})
     p["api_format"] = api_format
+    p["supports_vision"] = provider_supports_vision(cfg, provider_name)
     p["api_key"] = api_key_val
     p["default_model"] = model
     if base_url:
