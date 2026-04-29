@@ -1700,35 +1700,49 @@ class FeishuChannel(Channel):
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / safe_name
 
+        def _download_types() -> list[str]:
+            if resource_type == "audio":
+                return ["audio", "file"]
+            return [resource_type]
+
         def _download_sync() -> Optional[bytes]:
             from lark_oapi.api.im.v1 import GetMessageResourceRequest  # type: ignore[import]
 
-            req = (
-                GetMessageResourceRequest.builder()
-                .message_id(message_id)
-                .file_key(resource_key)
-                .type(resource_type)
-                .build()
-            )
-            resp = self._client.im.v1.message_resource.get(req)
-            success = getattr(resp, "success", None)
-            if callable(success) and not success():
+            last_failure: tuple[str, object, object] | None = None
+            for candidate_type in _download_types():
+                req = (
+                    GetMessageResourceRequest.builder()
+                    .message_id(message_id)
+                    .file_key(resource_key)
+                    .type(candidate_type)
+                    .build()
+                )
+                resp = self._client.im.v1.message_resource.get(req)
+                success = getattr(resp, "success", None)
+                if callable(success) and not success():
+                    last_failure = (
+                        candidate_type,
+                        getattr(resp, "code", ""),
+                        getattr(resp, "msg", ""),
+                    )
+                    continue
+                body = getattr(resp, "file", None) or getattr(resp, "data", None)
+                if hasattr(body, "read"):
+                    return body.read()
+                if isinstance(body, bytes):
+                    return body
+                if isinstance(body, str):
+                    return body.encode("utf-8")
+            if last_failure is not None:
+                failed_type, code, msg = last_failure
                 logger.warning(
                     "Feishu resource download failed: message_id=%s key=%s type=%s code=%s msg=%s",
                     message_id,
                     resource_key,
-                    resource_type,
-                    getattr(resp, "code", ""),
-                    getattr(resp, "msg", ""),
+                    failed_type,
+                    code,
+                    msg,
                 )
-                return None
-            body = getattr(resp, "file", None) or getattr(resp, "data", None)
-            if hasattr(body, "read"):
-                return body.read()
-            if isinstance(body, bytes):
-                return body
-            if isinstance(body, str):
-                return body.encode("utf-8")
             return None
 
         loop = asyncio.get_running_loop()

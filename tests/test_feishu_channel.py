@@ -263,6 +263,47 @@ def test_feishu_channel_extracts_audio_attachment_with_default_extension(
     assert attachments[0].mime_type == "audio/mpeg"
 
 
+def test_feishu_channel_audio_download_retries_as_file_on_invalid_param(tmp_path):
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    seen_types = []
+
+    class _Resp:
+        def __init__(self, *, ok, code=0, msg=""):
+            self.code = code
+            self.msg = msg
+            self.file = None
+            if ok:
+                from io import BytesIO
+
+                self.file = BytesIO(b"audio")
+
+        def success(self):
+            return self.code == 0
+
+    def fake_get(req):
+        seen_types.append(req.type)
+        if req.type == "audio":
+            return _Resp(ok=False, code=234001, msg="Invalid request param.")
+        return _Resp(ok=True)
+
+    channel._client = MagicMock()
+    channel._client.im.v1.message_resource.get.side_effect = fake_get
+    channel._input_dir = tmp_path
+
+    path = asyncio.run(
+        channel._download_message_resource(
+            "msg_1",
+            "file_v3_audio",
+            "audio",
+            "file_v3_audio.mp3",
+        )
+    )
+
+    assert seen_types == ["audio", "file"]
+    assert path == tmp_path / "msg_1" / "file_v3_audio.mp3"
+    assert path.read_bytes() == b"audio"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FeishuOutputSink — format detection
 # ─────────────────────────────────────────────────────────────────────────────
