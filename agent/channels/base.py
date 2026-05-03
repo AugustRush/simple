@@ -21,28 +21,15 @@ logger = logging.getLogger(__name__)
 
 
 def _trace_latency(stage: str, **fields: object) -> None:
-    if not shared._latency_trace_enabled():
-        return
-    payload = shared._trace_fields(**fields)
-    message = f"latency_trace component=channel_runner stage={stage}"
-    if payload:
-        message += f" {payload}"
-    logger.warning(message)
+    shared._trace_latency("channel_runner", stage, **fields)
 
 
 def _preview_text(text: object, limit: int = 80) -> str:
-    normalized = " ".join(str(text or "").split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3] + "..."
+    return shared._preview_text(text, limit=limit)
 
 
 def _interaction_log(event: str, **fields: object) -> None:
-    payload = shared._trace_fields(**fields)
-    message = f"interaction component=channel_runner event={event}"
-    if payload:
-        message += f" {payload}"
-    logger.info(message)
+    shared._interaction_log("channel_runner", event, **fields)
 
 
 def _new_id() -> str:
@@ -194,7 +181,7 @@ class ChannelRunner:
         if callable(set_output_dir):
             set_output_dir(components.get("output_dir"))
 
-        sessions: dict[str, dict] = {}
+        sessions: dict[str, RuntimeSessionState] = {}
 
         try:
             await channel.start(self._make_message_handler(sessions))

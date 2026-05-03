@@ -502,6 +502,16 @@ def _compose_system_prompt(
         lines.append(
             f"Output directory for generated files (screenshots, exports, temp): {output_dir}"
         )
+    lines.append(
+        f"Current UTC time: {_now()}. "
+        "Use the current_time tool when the user asks about local time or timezone conversions."
+    )
+    lines.append(
+        "You are a personal AI agent with long-term memory, scheduled task support, and "
+        "multi-channel delivery. When appropriate, proactively suggest setting reminders, "
+        "scheduling daily summaries, or creating recurring check-ins. "
+        "After completing significant tasks or generating files, confirm the outcome."
+    )
     composed = base_prompt.rstrip() + "\n\n" + "\n".join(lines)
     if plugin_catalog:
         composed = plugin_catalog.compose_all_prompts(composed)

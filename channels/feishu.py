@@ -78,18 +78,11 @@ def build_feishu_client(config: "FeishuConfig") -> Any:
 
 
 def _preview_text(text: object, limit: int = 80) -> str:
-    normalized = " ".join(str(text or "").split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3] + "..."
+    return shared._preview_text(text, limit=limit)
 
 
 def _interaction_log(event: str, **fields: object) -> None:
-    payload = shared._trace_fields(**fields)
-    message = f"interaction component=feishu_channel event={event}"
-    if payload:
-        message += f" {payload}"
-    logger.info(message)
+    shared._interaction_log("feishu_channel", event, **fields)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -602,6 +595,9 @@ class FeishuOutputSink(OutputSink):
         final_text = text or self._stream_buf.text or "".join(self._chunks)
         card_id = self._stream_buf.card_id
         self._stream_buf.text = final_text
+        # Clear progress buffer before final render so the completed card
+        # only shows the agent response, not tool-call progress lines.
+        self._progress_buf = _FeishuStreamBuf()
         content = self._render_primary_markdown()
 
         try:
@@ -634,6 +630,7 @@ class FeishuOutputSink(OutputSink):
         finally:
             self._stream_buf = _FeishuStreamBuf()
             self._progress_buf = _FeishuStreamBuf()
+            self._stream_flush_pending = False
             self._stream_flush_pending = False
 
     async def _finalize_progress_async(self) -> None:
@@ -1444,6 +1441,7 @@ class FeishuChannel(Channel):
         self._chat_locks: dict[str, asyncio.Lock] = {}
         # Ordered LRU cache for message-id deduplication
         self._processed_ids: OrderedDict[str, None] = OrderedDict()
+        self._stop_event: Optional[asyncio.Event] = None
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -1471,6 +1469,7 @@ class FeishuChannel(Channel):
         import lark_oapi as lark  # type: ignore[import]
 
         self._running = True
+        self._stop_event = asyncio.Event()
         self._loop = asyncio.get_running_loop()
         self._handler = handler
 
@@ -1544,11 +1543,12 @@ class FeishuChannel(Channel):
         logger.info("Feishu bot started (WebSocket long connection)")
 
         # Keep the coroutine alive until stop() is called
-        while self._running:
-            await asyncio.sleep(1)
+        await self._stop_event.wait()
 
     async def stop(self) -> None:
         self._running = False
+        if self._stop_event is not None:
+            self._stop_event.set()
         logger.info("Feishu bot stopped")
 
     def set_output_dir(self, output_dir: Optional[Path]) -> None:

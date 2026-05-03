@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -62,14 +63,26 @@ class SchedulerDelivery:
         target: DeliveryTarget,
         text: str,
         output_dir: Optional[Path] = None,
+        max_retries: int = 3,
     ) -> DeliveryResult:
-        if delivery_mode == "standalone":
-            return await self.deliver_standalone(task_id, run_id, text)
-        if delivery_mode == "channel":
-            status = await self.deliver_channel(
-                target=target,
-                text=text,
-                output_dir=output_dir,
-            )
-            return DeliveryResult(status=status)
-        raise ValueError(f"Unsupported delivery mode: {delivery_mode}")
+        last_error: Optional[Exception] = None
+        for attempt in range(max_retries + 1):
+            try:
+                if delivery_mode == "standalone":
+                    return await self.deliver_standalone(task_id, run_id, text)
+                if delivery_mode == "channel":
+                    status = await self.deliver_channel(
+                        target=target,
+                        text=text,
+                        output_dir=output_dir,
+                    )
+                    return DeliveryResult(status=status)
+                raise ValueError(f"Unsupported delivery mode: {delivery_mode}")
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    await asyncio.sleep(5.0 * (attempt + 1))
+        return DeliveryResult(
+            status="failed",
+            output_path=str(last_error) if last_error else "unknown error",
+        )

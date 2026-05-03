@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import re
+import time
 from abc import ABC
 from pathlib import Path
 from typing import Any, Optional
 
 from rich.markdown import Markdown
 from rich.markup import escape as _markup_escape
+from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 
 _TOOL_KEY_PRIORITY: dict[str, list[str]] = {
     "bash": ["command"],
@@ -84,6 +87,13 @@ class OutputSink(ABC):
     def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
         """Display structured multi-agent progress."""
 
+    def on_notification(self, title: str, body: str, *, level: str = "info") -> None:
+        """Called for proactive notifications (reminders, summaries) not tied to a user turn.
+
+        Default is a no-op. Channels override this to implement delivery
+        (e.g. Feishu sends a message, CLI prints a panel).
+        """
+
     def queue_attachment(self, path: Path) -> None:
         """Queue a file attachment for delivery with the current turn."""
 
@@ -100,29 +110,64 @@ class CliOutputSink(OutputSink):
         self._console = console
         self._streamed: list[str] = []
         self._last_batch_progress_key: tuple[int, int] | None = None
+        self._tool_count = 0
+        self._tool_start_times: dict[str, float] = {}
+        self._progress: Progress | None = None
+        self._progress_task: Any = None
 
     def on_stream_chunk(self, chunk: str) -> None:
         self._console.print(chunk, end="", markup=False)
         self._streamed.append(chunk)
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
+        if self._progress is not None:
+            self._progress.stop()
+            self._progress = None
+            self._progress_task = None
         if not self._streamed and full_text:
             self._console.print(Markdown(full_text))
+        if self._tool_count > 0:
+            self._console.print(f"[dim]({self._tool_count} tool call(s) this turn)[/dim]")
         self._console.print()
         self._streamed.clear()
+        self._tool_count = 0
 
     def on_tool_start(self, name: str, inputs: dict) -> None:
         hint = _fmt_tool_inputs(name, inputs)
         self._console.print(f"\n[cyan]→ {name}[/cyan]{hint}")
+        self._tool_start_times[name] = time.monotonic()
+        self._tool_count += 1
 
     def on_tool_end(self, name: str, result: str) -> None:
+        elapsed = ""
+        start = self._tool_start_times.pop(name, None)
+        if start is not None:
+            elapsed = f" [dim]({time.monotonic() - start:.1f}s)[/dim]"
+        try:
+            data = json.loads(result)
+            ok = data.get("ok", True)
+            indicator = "[green]✓[/green]" if ok else "[yellow]✗[/yellow]"
+        except Exception:
+            indicator = "[dim]·[/dim]"
         self._console.print(
-            f"[dim]{result[:200]}{'...' if len(result) > 200 else ''}[/dim]"
+            f"{indicator} [dim]{result[:150]}{'...' if len(result) > 150 else ''}[/dim]{elapsed}"
         )
 
     def on_tool_blocked(self, name: str, reason: str) -> None:
         self._console.print(
             f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {reason})[/yellow]"
+        )
+
+    def on_notification(self, title: str, body: str, *, level: str = "info") -> None:
+        from rich.panel import Panel
+
+        colors = {"info": "cyan", "warning": "yellow", "error": "red"}
+        self._console.print(
+            Panel(
+                Markdown(body) if body else "",
+                title=f"[bold {colors.get(level, 'cyan')}]{title}[/bold {colors.get(level, 'cyan')}]",
+                border_style=colors.get(level, "cyan"),
+            )
         )
 
     def on_info(self, content: Any) -> None:
@@ -138,13 +183,37 @@ class CliOutputSink(OutputSink):
     def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
         if event.kind == "batch_started":
             self._last_batch_progress_key = None
+            if event.total > 1:
+                self._progress = Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TimeElapsedColumn(),
+                    console=self._console,
+                )
+                self._progress_task = self._progress.add_task(
+                    event.message or "Sub-agents", total=event.total
+                )
+                self._progress.start()
+                return
         elif event.kind == "batch_progress":
             key = (event.completed, event.total)
             if self._last_batch_progress_key == key:
                 return
             self._last_batch_progress_key = key
+            if self._progress and self._progress_task is not None:
+                self._progress.update(self._progress_task, completed=event.completed)
+                return
         elif event.kind == "batch_finished":
             self._last_batch_progress_key = None
+            if self._progress is not None:
+                if self._progress_task is not None:
+                    self._progress.update(self._progress_task, completed=event.total)
+                self._progress.stop()
+                self._progress = None
+                self._progress_task = None
+                return
+
         msg = event.message or self._format_subagent_event(event)
         if not msg:
             return

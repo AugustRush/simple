@@ -1119,6 +1119,9 @@ class BuiltinTools:
                 path=path,
                 timed_out=True,
             )
+        except asyncio.CancelledError:
+            await self._terminate_process(proc)
+            raise
         except ValueError as e:
             return self._error(str(e))
         except Exception as e:
@@ -1613,26 +1616,6 @@ class MCPClient:
 
     async def close(self) -> None:
         await self._stack.aclose()
-
-
-@dataclass
-class SkillBundle:
-    id: str
-    name: str
-    description: str
-    path: Path
-    source: str
-    body: str
-    metadata: dict[str, Any] = field(default_factory=dict)
-    supporting_files: list[str] = field(default_factory=list)
-    user_invocable: bool = True
-    disable_model_invocation: bool = False
-
-
-@dataclass
-class ExplicitSkillRequest:
-    skill_ref: str
-    remaining_text: str = ""
 
 
 class _UserToolRegistryFacade:

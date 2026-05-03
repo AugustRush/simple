@@ -1,55 +1,46 @@
-# Personal Agent
+# Simple — Personal AI Agent
 
-Personal AI agent package with:
-
-- provider abstraction for Anthropic and OpenAI-compatible APIs
-- interactive chat plus single-turn CLI mode
-- tool calling for shell, files, memory, web access, and sub-agents
-- fixed-loci memory palace backed by SQLite
-- staged conversation buffering, background consolidation, and orphan-session recovery
-- skills system with hot-reload, built-in skill-manager, and progressive-disclosure design
-- plugin system with `plugin.json` manifests, skill/MCP bundling, per-plugin enable/disable, and user-override semantics
-- MCP tool ingestion, user tool plugins, and prompt-evolution utilities
+A personal AI agent with memory, tool calling, multi-agent orchestration, scheduling, skills, plugins, and multi-channel delivery.
 
 ## Requirements
 
-- Python `3.11+`
-- `uv`
+- Python 3.11+
+- [`uv`](https://docs.astral.sh/uv/)
 - At least one configured model provider
 
 Supported providers:
 
-- `anthropic`
-- `openai`
-- `deepseek`
-- `qwen`
-- `ollama`
-- any other OpenAI-compatible endpoint via `base_url`
+| Provider | Format | Notes |
+|---|---|---|
+| Anthropic | `anthropic` | Native SDK, vision support |
+| OpenAI | `openai` | Native SDK, vision support |
+| DeepSeek | `openai` | OpenAI-compatible endpoint |
+| Ollama | `openai` | Local, no API key needed |
+| Qwen | `openai` | OpenAI-compatible endpoint |
+| Custom | `openai` | Any OpenAI-compatible `base_url` |
 
-## Install
+## Quick Start
 
 ```bash
-uv sync --group dev
+# Install dependencies
+uv sync
+
+# First run — interactive setup wizard
+uv run simple
 ```
 
-Dependencies:
-
-- `anthropic`
-- `openai`
-- `typer`
-- `rich`
-- `mcp`
-- `pytest` (dev group)
+The setup wizard guides you through provider selection, API key configuration, and model choice. Config is written to `~/.agent/config.json`.
 
 ## Configuration
 
-The agent reads config from `~/.agent/config.json`.
-
-Let first run scaffold it interactively, or copy the example manually:
+Config lives at `~/.agent/config.json`. First run creates it automatically.
 
 ```bash
-mkdir -p ~/.agent
-cp config.example.json ~/.agent/config.json
+# View current config
+uv run simple config list
+
+# List configured providers
+uv run simple config models
 ```
 
 Key config sections:
@@ -60,298 +51,209 @@ Key config sections:
 | `providers.<name>.*` | API key, format, base URL, model list, max tokens |
 | `context.storage` | LTM category cap, decay factor |
 | `context.consolidation` | Token ratio, keep-last-N, idle seconds, min messages |
-| `mcp_servers` | MCP server definitions (name, command, args) |
+| `channels.feishu` | Feishu bot credentials (`app_id`, `app_secret`, `group_policy`, etc.) |
+| `audio.transcription_command` | External STT command template (`{path}`, `{language}` placeholders) |
+| `mcp_servers` | MCP server definitions (name, command, args, env) |
 | `plugins` | Per-plugin enable/disable (`{"evolution": {"enabled": false}}`) |
 | `evolution` | Enable/disable session scoring and rule learning |
-| `scheduler` | Poll/lease settings for the persistent scheduler service |
-| `tavily_api_key` | Optional Tavily search key |
+| `scheduler` | Poll/lease/concurrency settings |
+| `tavily_api_key` | Optional Tavily search API key |
 | `output_dir` | Override default `~/.agent/output` |
-| `assistant_identity` | Deterministic assistant name/role bootstrap for exact fact recall |
-| `system_prompt_file` | Load a custom system prompt from a `.md` or `.txt` file |
-
-`config.example.json` shows the full shape used by the current runtime.
+| `assistant_identity` | Deterministic assistant name/role for fact recall |
+| `system_prompt_file` | Load custom system prompt from `.md` or `.txt` |
 
 ## Usage
 
-Interactive mode:
+### Interactive mode
 
 ```bash
 uv run simple
 ```
 
-Single-turn chat:
+### Single-turn chat
 
 ```bash
 uv run simple chat "Summarize this repository"
 ```
 
-Scheduler service:
+### Multi-instance deployment
+
+Run multiple isolated instances with `--name`:
 
 ```bash
-uv run simple scheduler
+uv run simple gateway --name prod    # -> ~/.agent-prod/
+uv run simple gateway --name dev     # -> ~/.agent-dev/
+uv run simple gateway                # -> ~/.agent/ (default)
 ```
 
-Create a daily scheduled task:
+Each instance has completely independent config, memory, context database, scheduler, skills, and plugins. Also works with `--name` on any service command:
 
 ```bash
-uv run simple schedule daily daily-summary \
-  --time 09:00 \
-  --timezone Asia/Shanghai \
-  --prompt "Summarize yesterday's progress"
+uv run simple scheduler --name prod
 ```
 
-Config commands:
+### Feishu Gateway
+
+Connect to Feishu/Lark bot via WebSocket long connection:
 
 ```bash
-uv run simple config list
-uv run simple config models
-uv run simple config get providers.qwen.base_url
-```
-
-Evolution commands:
-
-```bash
-uv run simple evolve --stats
-uv run simple evolve --rewrite
-uv run simple evolve --apply-best
-```
-
-Memory commands:
-
-```bash
-uv run simple memory ls
-uv run simple memory index
-uv run simple memory show identity/user
-uv run simple memory search "preferences"
-uv run simple memory tidy
-```
-
-Install as a tool to get `simple` directly on `PATH`:
-
-```bash
-uv tool install --editable .
-```
-
-Install as a tool with Feishu support:
-
-```bash
-uv tool install --reinstall --editable . --with lark-oapi
-```
-
-## Feishu Gateway
-
-If you run from the repository, install the optional Feishu dependency into the
-project environment and start through `uv run`:
-
-```bash
+# Install Feishu dependency
 uv sync --extra feishu
+
+# Start gateway
 uv run simple gateway
 ```
 
-If you use the globally installed `simple` command from `uv tool install`, the
-tool has its own isolated Python environment. In that case, install or reinstall
-the tool with `lark-oapi` included:
+Or install globally:
 
 ```bash
 uv tool install --reinstall --editable . --with lark-oapi
 simple gateway
 ```
 
-Do not mix these two paths:
+### Scheduler service
 
-- `uv sync --extra feishu` only affects the repository `.venv`
-- `simple gateway` may use the separate `uv tool` environment on your `PATH`
+```bash
+uv run simple scheduler
+```
+
+### Scheduling tasks
+
+```bash
+# Daily
+uv run simple schedule daily daily-summary \
+  --time 09:00 --timezone Asia/Shanghai \
+  --prompt "Summarize yesterday's progress"
+
+# Once
+uv run simple schedule once reminder \
+  --at "2026-05-03T14:00:00+08:00" \
+  --prompt "Check the deploy status"
+
+# Interval
+uv run simple schedule interval health-check \
+  --every 30 --unit minutes \
+  --anchor-at "2026-05-03T00:00:00+08:00" \
+  --prompt "Verify all services are healthy"
+
+# Manage
+uv run simple schedule list
+uv run simple schedule show <id>
+uv run simple schedule pause <id>
+uv run simple schedule resume <id>
+uv run simple schedule delete <id>
+```
+
+### Evolution
+
+```bash
+uv run simple evolve --stats        # Show RL statistics
+uv run simple evolve --rewrite      # Generate improved system prompt
+uv run simple evolve --apply-best   # Apply best-scoring prompt from history
+```
+
+### Memory
+
+```bash
+uv run simple memory ls                  # Memory export summary
+uv run simple memory index               # Show memory JSONL projection
+uv run simple memory show identity/user  # Read a memory entry
+uv run simple memory search "preferences" # Search across all memory
+uv run simple memory tidy                # AI-assisted memory reorganization
+```
 
 ## Interactive Commands
 
 | Command | Description |
 |---|---|
-| `/memory` | Browse and manage the memory palace |
-| `/context` | Show context manager statistics |
-| `/evolve` | Rewrite system prompt from session history |
-| `/generate-tool <description>` | Generate and hot-load a new tool |
-| `/tools` | List all registered tools |
+| `/help` | Show all commands |
+| `/memory` | Memory export summary |
+| `/context` | LTM context manager statistics |
+| `/sessions` | List recent session history |
+| `/session <id>` | View session details |
+| `/tools` | List all available tools |
 | `/skills` | List available skills |
-| `/plugins` | List loaded plugins and their sources |
-| `/model [name]` | Show current model or switch to a different one |
-| `/ralph <goal>` | Launch an autonomous multi-iteration task loop |
-| `/quit` | End the session |
+| `/plugins` | List loaded plugins |
+| `/model [name]` | Show or switch active model (session only) |
+| `/ralph <goal>` | Launch autonomous multi-iteration task loop |
+| `/ralph list` | List all Ralph autonomous tasks |
+| `/ralph resume <id>` | Resume a paused Ralph task |
+| `/evolve` | Trigger system-prompt self-evolution |
+| `/generate-tool <desc>` | Generate a new user tool |
+| `/quit` | Exit the agent |
 
-## Scheduler Commands
-
-| Command | Description |
-|---|---|
-| `simple schedule once ...` | Create a one-shot scheduled task |
-| `simple schedule interval ...` | Create a fixed-interval scheduled task |
-| `simple schedule daily ...` | Create a daily scheduled task |
-| `simple schedule weekly ...` | Create a weekly scheduled task |
-| `simple schedule list` | List persisted scheduled tasks |
-| `simple schedule show <id>` | Show one task and its run history |
-| `simple schedule pause <id>` | Disable a scheduled task |
-| `simple schedule resume <id>` | Re-enable a scheduled task |
-| `simple schedule delete <id>` | Delete a task and its recorded runs |
-| `simple scheduler` | Run the persistent scheduler service |
-
-Invoke a skill explicitly with a slash prefix matching its ID:
-
-```
-/<skill-id> <request>
-```
-
-## Runtime Tools
-
-Built-in tools registered at startup:
+## Built-in Tools
 
 | Group | Tools |
 |---|---|
 | Time | `current_time` |
 | Shell | `shell` |
-| Files | `read_file`, `write_file`, `list_files` |
-| Memory palace | `memory_write`, `memory_read`, `memory_search`, `memory_index` |
-| Context retrieval | `context_retrieve` |
+| Files | `read_file`, `write_file`, `list_files`, `send_file` |
+| Media | `transcribe_audio` |
+| Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index` |
+| Context | `context_retrieve` |
+| Scheduling | `schedule_create`, `schedule_list`, `schedule_delete` |
 | Web | `web_search`, `web_fetch`, `tavily_search` |
-| Output cleanup | `clean_output` (when output dir is configured) |
-| Multi-agent orchestration | `spawn_agent` |
-| Skill runtime | `activate_skill`, `list_skill_files`, `read_skill_file` |
-| Skill management | `create_skill`, `update_skill`, `delete_skill`, `write_skill_file` |
+| Output | `clean_output` |
+| Orchestration | `spawn_agent` |
+| Skills | `activate_skill`, `list_skill_files`, `read_skill_file`, `create_skill`, `update_skill`, `delete_skill`, `write_skill_file` |
 
 Also registered at runtime:
 
 - MCP tools from configured `mcp_servers` and plugin-bundled MCP servers
-- User tools loaded from `~/.agent/tools`
-- Auto-generated tools created via `/generate-tool`
+- User tools loaded from `~/.agent/tools/*.py`
+- Auto-generated tools via `/generate-tool`
 
 Behaviour guarantees:
 
-- file tools are bounded to the current workspace root
-- tool payloads are structured JSON where possible
-- shell calls are timeout-bounded
-- sub-agents inherit the parent context manager but do not recursively receive `spawn_agent`
+- File tools are bounded to the workspace root
+- Tool payloads are structured JSON where possible
+- Shell calls are timeout-bounded and security-checked
+- Shell commands are validated against a blocked list (`rm`, `dd`, `mkfs`, `shred`, etc.)
 
-## Multi-Agent Orchestration Modes
+## Multi-Agent Orchestration
 
-The runtime does not primarily choose orchestration mode from user-facing
-keywords. Instead, mode selection happens when the model emits one or more
-`spawn_agent` calls in the same assistant turn.
+The agent supports four execution modes for sub-agent coordination:
 
-At the runtime level, the trigger rules are:
+### Modes
 
-- `direct`
-  - no `spawn_agent` call is emitted, or only one sub-agent is spawned
-- `parallel`
-  - multiple `spawn_agent` calls are emitted in the same turn
-  - none of them has `depends_on`
-  - none of them sets `coordination_mode="rendezvous"`
-- `pipeline`
-  - multiple `spawn_agent` calls are emitted in the same turn
-  - at least one subtask declares a non-empty `depends_on`
-- `rendezvous`
-  - multiple `spawn_agent` calls are emitted in the same turn
-  - at least one subtask sets `coordination_mode="rendezvous"`
-  - this takes precedence over `pipeline` and `parallel`
+| Mode | Trigger | Use case |
+|---|---|---|
+| **direct** | No `spawn_agent` calls, or single sub-agent | Simple questions, single-domain tasks |
+| **parallel** | Multiple `spawn_agent` calls, no dependencies | Independent perspectives, fan-out review |
+| **pipeline** | Multiple calls with `depends_on` | Sequential stages with upstream→downstream data flow |
+| **rendezvous** | Multiple calls with `coordination_mode="rendezvous"` | Multi-round debate, cross-validation, consensus building |
 
-Important constraints:
-
-- Orchestration only happens within one assistant response. If the model emits
-  one sub-agent now and another in a later turn, the runtime will not join them
-  into the same pipeline or rendezvous batch.
-- `depends_on` must point to subtask ids from the same batch.
-- `rendezvous` is bounded. The current default is two rounds.
-
-### How To Trigger Each Mode
-
-From the user side, the practical way to trigger a mode is to ask for a task
-shape that naturally leads the model to emit the matching `spawn_agent`
-structure.
-
-#### `parallel`
-
-Use when you want several independent perspectives to work at the same time.
-
-Example prompts:
+### How to trigger each mode
 
 ```text
-同时让 3 个子 agent 分别从性能、正确性、可维护性 review 这次改动，最后汇总结论。
+# Parallel — independent concurrent work
+让 3 个子 agent 分别从性能、正确性、可维护性 review 这次改动
+
+# Pipeline — sequential dependency-driven
+先让 researcher 收集事实，再让 planner 给出方案，最后让 critic 审查方案
+
+# Rendezvous — multi-round coordination
+让正方和反方分别给方案，互相回应一轮后，再收敛成最终建议
 ```
 
-```text
-并行找出这个项目里和认证、缓存、调度相关的实现风险，每个子 agent 负责一个方向。
-```
+### Constraints
 
-Expected runtime shape:
-
-- same-turn multiple `spawn_agent`
-- no `depends_on`
-
-#### `pipeline`
-
-Use when later workers should consume earlier workers' outputs.
-
-Example prompts:
-
-```text
-先让 researcher 收集事实，再让 planner 基于这些事实给出方案，最后让 critic 审查方案。
-```
-
-```text
-先分析问题根因，再生成修复方案，最后基于修复方案补测试。
-```
-
-Expected runtime shape:
-
-- same-turn multiple `spawn_agent`
-- downstream subtasks include `depends_on`
-
-#### `rendezvous`
-
-Use when you want bounded multi-round coordination rather than one-pass fan-out.
-
-Example prompts:
-
-```text
-让正方和反方分别给方案，互相回应一轮后，再收敛成最终建议。
-```
-
-```text
-让 researcher 和 critic 先各自独立判断，再进行一轮交叉校验，最后输出共识和分歧。
-```
-
-Expected runtime shape:
-
-- same-turn multiple `spawn_agent`
-- at least one subtask sets `coordination_mode="rendezvous"`
-
-### Notes For Prompting
-
-- If you want `parallel`, avoid wording that implies strict sequencing such as
-  “先…再…”.
-- If you want `pipeline`, be explicit about stage order and upstream/downstream
-  dependency.
-- If you want `rendezvous`, explicitly ask for “互相回应一轮”, “交叉校验”, or
-  “收敛共识”, because that is what encourages the model to emit coordinated
-  subtask structure instead of plain fan-out.
-- If you want deterministic testing, inspect gateway logs. The runtime emits
-  `execution_mode` in sub-agent batch events, and the gateway now also emits
-  interaction logs for message receipt, agent execution, and reply delivery.
+- Orchestration only happens within a single assistant turn
+- `depends_on` must reference subtask IDs from the same batch
+- Rendezvous is bounded (default: 2 rounds)
+- Sub-agents inherit the parent context manager but do not recursively receive `spawn_agent`
 
 ## Skills
 
-Skills are instruction bundles that extend the agent with specialized workflows. Each skill is a directory containing `SKILL.md` (required) and optional supporting files.
-
-### Discovery order
-
-1. Built-in skills: `<repo>/skills/**/SKILL.md`
-2. Plugin-bundled skills: loaded when a plugin's `plugin.json` declares a `"skills"` path
-3. User skills: `~/.agent/skills/**/SKILL.md`
-
-User skills with the same ID override built-in or plugin-bundled skills.
+Skills are instruction bundles that extend the agent with specialized workflows. Each skill is a directory containing `SKILL.md` with YAML frontmatter and markdown instructions.
 
 ### SKILL.md format
 
 ```markdown
 ---
 name: My Skill
-description: What this skill does and when to use it (used for triggering)
+description: What this skill does and when to use it
 user-invocable: true
 disable-model-invocation: false
 ---
@@ -359,47 +261,38 @@ disable-model-invocation: false
 Instructions for the agent when this skill is activated.
 ```
 
-### Resource directories
+### Discovery order
 
-| Directory | Purpose | Loaded into context |
-|---|---|---|
-| `scripts/` | Executable code for deterministic operations | Can execute without reading |
-| `references/` | Documentation, schemas, API docs | On demand |
-| `assets/` | Templates, images, boilerplate | Not loaded; used in output |
+1. Built-in skills: `agent/_builtin/skills/`
+2. Plugin-bundled skills: declared via `plugin.json` `skills` field
+3. User skills: `~/.agent/skills/`
+
+User skills with the same ID override built-in or plugin-bundled skills.
 
 ### Built-in skills
 
 | Skill | Description |
 |---|---|
-| `skill-manager` | Create, update, delete, and manage user skill bundles in the current session |
+| `daily-summary` | Generate structured daily/weekly summaries from context memory, session history, and scheduled tasks |
+| `multi-agent-orchestration` | Decide when to use parallel, pipeline, or rendezvous multi-agent execution |
+| `skill-manager` | Create, update, delete, and manage user skill bundles |
 
 ### Hot-reload
 
-After `create_skill`, `update_skill`, `delete_skill`, or `write_skill_file`, the catalog reloads automatically. The interactive loop detects the dirty flag before the next turn and recomposes the system prompt so the model sees the updated skill list immediately—no restart required.
-
-### Managing skills at runtime
-
-The `skill-manager` built-in skill exposes four tools:
-
-- **`create_skill`** — create a new skill bundle under `~/.agent/skills/`
-- **`update_skill`** — update metadata or instructions of an existing user skill
-- **`delete_skill`** — remove a user skill bundle
-- **`write_skill_file`** — write or update a supporting file inside a skill bundle
-
-The skill-manager bundle also includes `scripts/init_skill.py` and `scripts/quick_validate.py` for scaffolding and validating skill directories from the shell.
+After creating, updating, or deleting a skill, the catalog reloads automatically. The system prompt is recomposed before the next turn — no restart required.
 
 ## Plugins
 
-Plugins extend the agent with lifecycle hooks, system prompt contributions, and slash commands. Each plugin is a directory under `agent/_builtin/plugins/` (built-in) or `~/.agent/plugins/` (user).
+Plugins extend the agent with lifecycle hooks, system prompt contributions, slash commands, and bundled MCP servers or skills.
 
 ### Plugin structure
 
 ```
 my-plugin/
-├── plugin.json          # Structured manifest (optional but recommended)
-├── __init__.py          # register() entry point (required)
-├── skills/              # Bundled skills (declared in plugin.json)
-└── .mcp.json            # Bundled MCP servers (or inline in plugin.json)
+├── plugin.json       # Structured manifest (recommended)
+├── __init__.py       # register() entry point (required)
+├── skills/           # Bundled skills (declared in plugin.json)
+└── .mcp.json         # Bundled MCP servers
 ```
 
 ### plugin.json
@@ -416,21 +309,17 @@ my-plugin/
 }
 ```
 
-If `plugin.json` is absent, the runtime falls back to `name`/`version` attributes on the plugin object.
+### Lifecycle hooks (all optional, duck-typed)
 
-### Plugin interface (duck-typed)
-
-A plugin object can implement any subset of:
-
-| Method | When called |
+| Hook | When called |
 |---|---|
 | `on_session_start(components)` | Once before the interactive loop |
-| `on_turn_end(event: TurnEvent) -> HookResult` | After each assistant turn |
-| `on_session_end(event: SessionEvent)` | When the session ends |
-| `on_pre_tool(event: PreToolEvent) -> HookResult` | Before each tool call (returning `action="block"` prevents execution) |
-| `on_post_tool(event: PostToolEvent) -> HookResult` | After each tool call |
-| `compose_system_prompt(current: str) -> str` | Return a suffix to append to the composed system prompt |
-| `register_slash_commands() -> dict[str, handler]` | Expose slash commands to the interactive loop |
+| `on_turn_end(event)` | After each assistant turn |
+| `on_session_end(event)` | When the session ends |
+| `on_pre_tool(event)` | Before each tool call (return `action="block"` to veto) |
+| `on_post_tool(event)` | After each tool call |
+| `compose_system_prompt(current)` | Append rules to the system prompt |
+| `register_slash_commands()` | Expose slash commands |
 
 ### Built-in plugins
 
@@ -440,112 +329,85 @@ A plugin object can implement any subset of:
 
 ### User plugins
 
-Place a plugin directory under `~/.agent/plugins/`. User plugins with the same name as a built-in plugin override the built-in.
-
-### Enable / disable
-
-In `~/.agent/config.json`:
+Place plugins under `~/.agent/plugins/`. User plugins with the same name override built-in plugins. Disable any plugin via config:
 
 ```json
-{
-  "plugins": {
-    "evolution": {"enabled": false}
-  }
-}
+{"plugins": {"evolution": {"enabled": false}}}
 ```
 
-## MCP
+## Memory & Context Architecture
 
-MCP servers are configured in two ways:
+Four-layer memory system:
 
-1. **Config-level** — under `mcp_servers` in `~/.agent/config.json`
-2. **Plugin-bundled** — via `mcp_servers` in a plugin's `plugin.json`
+1. **Working memory** — active `ctx.messages` in RAM for the current interaction
+2. **Staging** — raw turns buffered per-session in SQLite (`palace.db`), consolidated in background
+3. **Fact storage** — exact facts (`fact_assertions` → `resolved_facts`) for identity and preferences
+4. **Long-term memory** — free-form entries in SQLite with JSONL export for inspection
 
-Connected MCP tools are injected into the runtime tool registry and appear in the composed system prompt alongside built-in tools.
+Fixed palace loci: `identity`, `projects`, `people`, `concepts`, `episodes`, `tasks`, `procedures`, `archive`
 
-## Memory And Context Architecture
-
-The context system has four layers:
-
-1. **Working memory** — active `ctx.messages` kept in RAM for the current interaction loop
-2. **Staging** — raw user/assistant turns appended to per-session buffers in `~/.agent/context/palace.db` by default, with legacy JSONL compatibility for explicit file-based staging
-3. **Fact storage** — append-only `fact_assertions` plus derived `resolved_facts` for exact beliefs such as assistant identity
-4. **Long-term memory** — free-form `memory_items` stored in `~/.agent/context/palace.db`, with user-facing JSONL export in `~/.agent/memory/memory.jsonl`
-5. **Memory palace export** — on-demand JSONL projection for inspection; SQLite remains the source of truth
-
-Fixed palace loci:
-
-- `identity`, `projects`, `people`, `concepts`, `episodes`, `tasks`, `procedures`, `archive`
-
-Legacy alias: `knowledge` → `concepts`
-
-### Consolidation
+### Consolidation lifecycle
 
 - Stage raw turns per session
-- Queue background jobs when staged volume or idle time warrants it
-- Recover orphaned staging files from interrupted sessions on next startup
-- Summarize the session into `episodes`
-- Materialize exact facts into `fact_assertions` / `resolved_facts` when the extractor emits high-precision identity content
-- Extract free-form durable memories into fixed loci
+- Queue background jobs when staged volume or idle time reaches threshold
+- Recover orphaned staging files from interrupted sessions on startup
+- Extract facts, summaries, and durable memories into LTM
 - Apply retention/decay policies
 - Compact working memory while preserving task context
 
-Consolidation is chunked: long staged conversations are split into manageable prompt chunks before extraction.
+## MCP
 
-### Retrieval
+MCP (Model Context Protocol) servers are configured via:
 
-- **Implicit prompt injection** — resolved assistant identity plus relevant long-term memory by default; current-session staging only for clear recall queries or post-compaction recovery
-- **Exact fact lookup** — resolved facts are consulted before free-form memory search for structured questions such as assistant name/role
-- **Explicit tool retrieval** — `context_retrieve` searches current-session staging, resolved facts, and long-term memory
+1. `mcp_servers` in `config.json`
+2. Plugin-bundled `mcp_servers` in `plugin.json`
 
-For recall-style queries such as "what did we just discuss", the runtime falls back to recent `episodes` summaries when keyword search alone would miss the latest session.
-
-If an exact fact key is conflicted, the runtime preserves the conflicting evidence in `fact_assertions` but suppresses implicit identity injection instead of guessing.
-
-## User Tool Plugins
-
-User tool plugins are loaded from `~/.agent/tools`. Each plugin is a Python file exporting a `register(registry)` function. The interactive `/generate-tool` flow writes generated tools to this location and reloads them into the live registry automatically.
+Connected tools are injected into the runtime registry and appear in the composed system prompt.
 
 ## Project Layout
 
 ```
 .
-├── agent/                          # Package runtime and public entrypoints
-├── config.example.json             # Full config reference
 ├── agent/
-│   ├── _builtin/
-│   │   ├── plugins/
-│   │   │   └── evolution/
-│   │   └── skills/
-│   │       └── skill-manager/
+│   ├── core/           # BaseAgent, AgentContext, attachments, output sink
+│   ├── memory/         # LTMStore, MemoryPalace, ConsolidationEngine, StagingBuffer
+│   ├── tools/          # ToolRegistry, BuiltinTools, MCPClient, UserToolCatalog
+│   ├── runtime/        # TurnInput, TurnResult, TurnRunner, RuntimeSessionState
+│   ├── orchestration/  # Parallel, pipeline, rendezvous execution
+│   ├── channels/       # Channel ABC, CliChannel, ChannelRunner
+│   ├── scheduler/      # SchedulerService, SchedulerStore, triggers, delivery
+│   ├── security/       # Shell command blocking
+│   ├── skills/         # SkillBundle, SkillCatalog, skill parsing
+│   ├── plugins/        # PluginCatalog, AgentPlugin protocol, lifecycle hooks
+│   ├── _builtin/       # Built-in plugins and skills
+│   ├── cli.py          # Typer CLI (interactive, gateway, scheduler, config, memory)
+│   ├── config.py       # Config loading, ModelClientFactory, system prompt composition
+│   ├── bootstrap.py    # Component wiring from config
+│   ├── evolution.py    # Session scoring, prompt rewriting
+│   ├── shared.py       # Paths, defaults, utility functions
+│   └── pathing.py      # Path resolution and security
+├── channels/
+│   └── feishu.py       # Feishu/Lark channel + output sink
 ├── scripts/
 │   └── benchmark_memory.py
 ├── tests/
+├── config.example.json
 ├── pyproject.toml
 └── uv.lock
 ```
 
 ## Testing
 
-Run the full suite:
-
 ```bash
+# Full suite
 uv run pytest -q
+
+# Specific area
+uv run pytest tests/test_builtin_tools.py -q
+uv run pytest tests/test_scheduler.py -q
+
+# Memory benchmark
+python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-Run the memory benchmark:
-
-```bash
-python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10 --write-runs 10
-```
-
-Save or compare benchmark output:
-
-```bash
-python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.json
-python scripts/benchmark_memory.py --sizes 1000 10000 --compare bench.json
-python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.csv
-python scripts/benchmark_memory.py --sizes 1000 10000 --output bench.jsonl
-```
-
-Latest local verification: `uv run pytest -q` → `451 passed, 1 skipped`
+Latest verification: `uv run pytest -q` → `555 passed, 1 skipped`

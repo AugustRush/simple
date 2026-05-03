@@ -3100,7 +3100,7 @@ def test_send_message_emits_latency_trace(monkeypatch, caplog):
     import agent as agent_module
 
     monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
-    caplog.set_level(logging.WARNING, logger="agent.core.agent")
+    caplog.set_level(logging.WARNING, logger="agent")
 
     registry = agent_module.ToolRegistry()
     agent = agent_module.BaseAgent(
@@ -3154,7 +3154,7 @@ def test_send_message_emits_latency_trace(monkeypatch, caplog):
 def test_send_message_emits_interaction_logs(monkeypatch, caplog):
     import agent as agent_module
 
-    caplog.set_level(logging.INFO, logger="agent.core.agent")
+    caplog.set_level(logging.INFO, logger="agent")
 
     registry = agent_module.ToolRegistry()
     agent = agent_module.BaseAgent(

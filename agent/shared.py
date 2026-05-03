@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -10,7 +11,44 @@ from pathlib import Path
 
 from rich.console import Console
 
-AGENT_HOME = Path.home() / ".agent"
+def _resolve_agent_home() -> Path:
+    raw = os.environ.get("SIMPLE_AGENT_HOME", "")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return Path.home() / ".agent"
+
+
+def _set_agent_home(home: Path) -> None:
+    """Override AGENT_HOME and all derived paths (for CLI --home support)."""
+    global AGENT_HOME, MEMORY_DIR, SKILLS_DIR, TOOLS_DIR, PACKAGE_ROOT
+    global BUILTIN_SKILLS_DIR, PROMPTS_DIR, RL_DIR, SCHEDULER_DIR
+    global SCHEDULER_DB_FILE, CONFIG_FILE, INDEX_FILE, SESSIONS_FILE
+    global DEFAULT_OUTPUT_DIR, PLUGINS_DIR, USER_PLUGINS_DIR, CONTEXT_DIR
+    global STAGING_DIR, PALACE_DB_FILE
+    resolved = Path(home).expanduser().resolve()
+    os.environ["SIMPLE_AGENT_HOME"] = str(resolved)
+    AGENT_HOME = resolved
+    MEMORY_DIR = AGENT_HOME / "memory"
+    SKILLS_DIR = AGENT_HOME / "skills"
+    TOOLS_DIR = AGENT_HOME / "tools"
+    PACKAGE_ROOT = Path(__file__).resolve().parent
+    BUILTIN_SKILLS_DIR = PACKAGE_ROOT / "_builtin" / "skills"
+    PROMPTS_DIR = AGENT_HOME / "prompts"
+    RL_DIR = AGENT_HOME / "rl"
+    SCHEDULER_DIR = AGENT_HOME / "tasks"
+    SCHEDULER_DB_FILE = SCHEDULER_DIR / "scheduler.db"
+    CONFIG_FILE = AGENT_HOME / "config.json"
+    INDEX_FILE = MEMORY_DIR / "INDEX.md"
+    SESSIONS_FILE = RL_DIR / "sessions.jsonl"
+    DEFAULT_OUTPUT_DIR = AGENT_HOME / "output"
+    PLUGINS_DIR = PACKAGE_ROOT / "_builtin" / "plugins"
+    USER_PLUGINS_DIR = AGENT_HOME / "plugins"
+    CONTEXT_DIR = AGENT_HOME / "context"
+    STAGING_DIR = CONTEXT_DIR / "_staging"
+    PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
+
+
+AGENT_HOME = _resolve_agent_home()
 MEMORY_DIR = AGENT_HOME / "memory"
 SKILLS_DIR = AGENT_HOME / "skills"
 TOOLS_DIR = AGENT_HOME / "tools"
@@ -119,6 +157,31 @@ def _trace_fields(**fields: object) -> str:
     return " ".join(parts)
 
 
+def _trace_latency(component: str, stage: str, **fields: object) -> None:
+    if not _latency_trace_enabled():
+        return
+    payload = _trace_fields(**fields)
+    message = f"latency_trace component={component} stage={stage}"
+    if payload:
+        message += f" {payload}"
+    logging.getLogger("agent").warning(message)
+
+
+def _preview_text(text: object, limit: int = 80) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + "..."
+
+
+def _interaction_log(component: str, event: str, **fields: object) -> None:
+    payload = _trace_fields(**fields)
+    message = f"interaction component={component} event={event}"
+    if payload:
+        message += f" {payload}"
+    logging.getLogger("agent").info(message)
+
+
 def _is_safe_prompt_version(version: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9_-]+", version))
 
@@ -222,10 +285,15 @@ __all__ = [
     "PALACE_LOCUS_SUMMARIES",
     "DEFAULT_ROUTE_KEYWORDS",
     "CONSOLE",
+    "_resolve_agent_home",
+    "_set_agent_home",
     "_new_id",
     "_atomic_write_text",
     "_latency_trace_enabled",
     "_trace_fields",
+    "_trace_latency",
+    "_preview_text",
+    "_interaction_log",
     "_is_safe_prompt_version",
     "_with_task_context",
     "_OAIFunc",

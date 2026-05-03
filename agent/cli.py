@@ -44,6 +44,7 @@ TurnEvent = agent_module.TurnEvent
 TriggerSpec = agent_module.TriggerSpec
 _build_gateway_channels = agent_module._build_gateway_channels
 _new_id = agent_module._new_id
+_load_ralph_task = agent_module._load_ralph_task
 _save_ralph_task = agent_module._save_ralph_task
 _with_task_context = agent_module._with_task_context
 prepare_user_message_for_skills = agent_module.prepare_user_message_for_skills
@@ -502,6 +503,8 @@ async def _interactive_loop(components: dict, cfg: dict):
                         ("/help", "Show this help"),
                         ("/memory", "Show memory export summary"),
                         ("/context", "Show LTM context manager stats"),
+                        ("/sessions", "List recent session history"),
+                        ("/session <id>", "View session details"),
                         ("/tools", "List all available tools"),
                         ("/skills", "List available skills"),
                         ("/plugins", "List loaded plugins"),
@@ -509,6 +512,8 @@ async def _interactive_loop(components: dict, cfg: dict):
                         ("/ralph <goal>", "Run Ralph autonomous task loop"),
                         ("  --max N", "  Max iterations (default 10)"),
                         ("  --verify <cmd>", "  Shell command to verify completion"),
+                        ("/ralph list", "List all Ralph autonomous tasks"),
+                        ("/ralph resume <id>", "Resume a paused Ralph task"),
                         ("/evolve", "Trigger system-prompt self-evolution"),
                         ("/generate-tool <desc>", "Generate a new user tool"),
                         ("/quit", "Exit the agent"),
@@ -562,6 +567,86 @@ async def _interactive_loop(components: dict, cfg: dict):
                         shared.CONSOLE.print(table)
                     else:
                         shared.CONSOLE.print("[yellow]Context manager not available.[/yellow]")
+                    continue
+                elif cmd == "sessions" or cmd == "history":
+                    sessions_data: list[dict] = []
+                    if shared.SESSIONS_FILE.exists():
+                        with open(shared.SESSIONS_FILE, encoding="utf-8") as f:
+                            for line in f:
+                                try:
+                                    sessions_data.append(json.loads(line.strip()))
+                                except Exception:
+                                    pass
+                    if not sessions_data:
+                        shared.CONSOLE.print("[yellow]No session history found.[/yellow]")
+                    else:
+                        table = Table(title="Recent Sessions")
+                        table.add_column("Session ID", style="cyan", no_wrap=True)
+                        table.add_column("Timestamp")
+                        table.add_column("Score")
+                        table.add_column("Summary")
+                        for s in reversed(sessions_data[-20:]):
+                            sid = str(s.get("session_id", "?"))[:12]
+                            ts = str(s.get("timestamp", "?"))[:19]
+                            score_val = s.get("objective_score") or s.get("score")
+                            score = f"{float(score_val):.1f}" if score_val is not None else "?"
+                            summary = str(s.get("task_summary", ""))[:60]
+                            table.add_row(sid, ts, score, summary or "\u2014")
+                        shared.CONSOLE.print(table)
+                    continue
+                elif cmd.startswith("session "):
+                    parts = raw_cmd.split(None, 1)
+                    if len(parts) < 2 or not parts[1].strip():
+                        shared.CONSOLE.print(
+                            "[yellow]Usage: /session <session_id_prefix>[/yellow]"
+                        )
+                    else:
+                        prefix = parts[1].strip()
+                        found = None
+                        if shared.SESSIONS_FILE.exists():
+                            with open(shared.SESSIONS_FILE, encoding="utf-8") as f:
+                                for line in f:
+                                    try:
+                                        s = json.loads(line.strip())
+                                        if str(s.get("session_id", "")).startswith(prefix):
+                                            found = s
+                                            break
+                                    except Exception:
+                                        pass
+                        if found is None and ctx_mgr and hasattr(ctx_mgr, "store"):
+                            turns_list = ctx_mgr.store.get_turns_for_session(prefix)
+                            if turns_list:
+                                shared.CONSOLE.print(
+                                    f"[cyan]Session {prefix} turns:[/cyan]"
+                                )
+                                for t in turns_list[-10:]:
+                                    shared.CONSOLE.print(
+                                        f"[dim]{t.get('role', '?')}: "
+                                        f"{str(t.get('content', ''))[:120]}[/dim]"
+                                    )
+                            else:
+                                shared.CONSOLE.print(
+                                    f"[yellow]Session not found: {prefix}[/yellow]"
+                                )
+                        elif found is not None:
+                            score_val = found.get("objective_score") or found.get("score")
+                            score = f"{float(score_val):.1f}" if score_val is not None else "?"
+                            tools = found.get("tools_used", [])
+                            details = (
+                                f"[bold]Session:[/bold] {found.get('session_id', '?')}\n"
+                                f"[bold]Timestamp:[/bold] {found.get('timestamp', '?')}\n"
+                                f"[bold]Score:[/bold] {score}\n"
+                                f"[bold]Summary:[/bold] {found.get('task_summary', '?')}\n"
+                                f"[bold]Tools Used:[/bold] {', '.join(tools) if tools else 'none'}\n"
+                                f"[bold]Corrections:[/bold] {found.get('correction_count', 0)}"
+                            )
+                            shared.CONSOLE.print(
+                                Panel(details, title="Session Details")
+                            )
+                        else:
+                            shared.CONSOLE.print(
+                                f"[yellow]Session not found: {prefix}[/yellow]"
+                            )
                     continue
                 # ── Plugin-contributed slash commands (checked before built-ins) ──
                 plugin_cmds = plugin_catalog.get_slash_commands()
@@ -656,11 +741,83 @@ async def _interactive_loop(components: dict, cfg: dict):
                     continue
                 elif cmd == "ralph" or cmd.startswith("ralph "):
                     # /ralph <goal> [--max N] [--verify <shell_cmd>]
-                    # Example: /ralph "make all tests pass" --max 15 --verify "pytest tests/"
-                    parts = raw_cmd.split(None, 1)
-                    if len(parts) < 2 or not parts[1].strip():
+                    # /ralph list
+                    # /ralph resume <task_id>
+                    sub_parts = raw_cmd.split(None, 1)
+                    sub = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+                    sub_cmd = sub.split(None, 1)[0].lower() if sub else ""
+
+                    if sub_cmd == "list":
+                        tasks_dir = shared.AGENT_HOME / "tasks"
+                        task_files = sorted(tasks_dir.glob("*.json")) if tasks_dir.is_dir() else []
+                        if not task_files:
+                            shared.CONSOLE.print("[yellow]No Ralph tasks found.[/yellow]")
+                        else:
+                            table = Table(title="Ralph Tasks")
+                            table.add_column("ID", style="cyan")
+                            table.add_column("Status")
+                            table.add_column("Goal")
+                            table.add_column("Iterations")
+                            for tf in task_files:
+                                try:
+                                    t = json.loads(tf.read_text())
+                                    sid = tf.stem[:12]
+                                    status = str(t.get("status", "?"))
+                                    goal = str(t.get("goal", ""))[:60]
+                                    iters = f"{t.get('current_iteration',0)}/{t.get('max_iterations',0)}"
+                                    status_color = "green" if status == "complete" else "yellow"
+                                    table.add_row(
+                                        sid,
+                                        f"[{status_color}]{status}[/{status_color}]",
+                                        goal,
+                                        iters,
+                                    )
+                                except Exception:
+                                    table.add_row(tf.stem[:12], "corrupt", "\u2014", "\u2014")
+                            shared.CONSOLE.print(table)
+                        continue
+
+                    if sub_cmd == "resume":
+                        resume_parts = sub.split(None, 1)
+                        if len(resume_parts) < 2:
+                            shared.CONSOLE.print("[yellow]Usage: /ralph resume <task_id>[/yellow]")
+                        else:
+                            task_id = resume_parts[1].strip()
+                            task = _load_ralph_task(task_id)
+                            if task is None:
+                                shared.CONSOLE.print(
+                                    f"[yellow]Task not found: {task_id}[/yellow]"
+                                )
+                            elif task.status == "complete":
+                                shared.CONSOLE.print(
+                                    f"[yellow]Task already complete: {task.id[:12]}[/yellow]"
+                                )
+                            else:
+                                task.status = "running"
+                                shared.CONSOLE.print(
+                                    f"[cyan]Resuming Ralph task {task.id[:12]}: {task.goal}[/cyan]"
+                                )
+                                _ralph_sink = CliOutputSink(shared.CONSOLE)
+                                _ralph_token = _active_sink.set(_ralph_sink)
+                                try:
+                                    task = await _ralph_task_loop(
+                                        agent, task, system_prompt,
+                                        skill_catalog, ctx_mgr,
+                                    )
+                                finally:
+                                    _active_sink.reset(_ralph_token)
+                                status_color = "green" if task.status == "complete" else "yellow"
+                                shared.CONSOLE.print(
+                                    f"[{status_color}]Ralph complete | status: {task.status} | "
+                                    f"iterations: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
+                                )
+                        continue
+
+                    # /ralph <goal> [--max N] [--verify <shell_cmd>]
+                    if not sub:
                         shared.CONSOLE.print(
                             "[yellow]Usage: /ralph <goal> [--max N] [--verify <cmd>][/yellow]\n"
+                            "[dim]Subcommands: list | resume <id>[/dim]\n"
                             "[dim]Example: /ralph 'make all tests pass' --max 10 --verify 'pytest tests/'[/dim]"
                         )
                         continue
@@ -869,35 +1026,24 @@ def main_callback(ctx: typer.Context):
 
 
 @app.command()
-def gateway():
+def gateway(
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Instance name for multi-tenant isolation (default: ~/.agent)"
+    ),
+):
     """Start all configured external channels (Feishu, etc.).
 
-    Reads channel configuration from ``~/.agent/config.json`` under the
-    ``channels`` key.  Runs until interrupted (Ctrl-C) or all channels
-    disconnect.
+    Reads channel configuration from the agent home directory.
+    Runs until interrupted (Ctrl-C) or all channels disconnect.
 
-    Example config for Feishu::
+    Use --name to run multiple isolated instances::
 
-        {
-          "channels": {
-            "feishu": {
-              "enabled": true,
-              "app_id": "cli_xxxx",
-              "app_secret": "xxxx"
-            }
-          }
-        }
-
-    Install Feishu dependency from the repository::
-
-        uv sync --extra feishu
-        uv run simple gateway
-
-    Or reinstall the global uv tool with Feishu support::
-
-        uv tool install --reinstall --editable . --with lark-oapi
-        simple gateway
+        simple gateway --name prod    # -> ~/.agent/prod/
+        simple gateway --name dev     # -> ~/.agent/dev/
+        simple gateway                # -> ~/.agent/
     """
+    if isinstance(name, str):
+        shared._set_agent_home(Path.home() / f".agent-{name}")
     cfg, first_run = agent_module.load_config()
     _configure_runtime_logging()
     if first_run:
@@ -1310,8 +1456,13 @@ def schedule_delete(task_id: str = typer.Argument(..., help="Task id")):
 def scheduler(
     poll_seconds: Optional[float] = typer.Option(None, "--poll-seconds", min=0.1),
     lease_seconds: Optional[int] = typer.Option(None, "--lease-seconds", min=1),
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Instance name for multi-tenant isolation (default: ~/.agent)"
+    ),
 ):
     """Run the persistent scheduler service."""
+    if isinstance(name, str):
+        shared._set_agent_home(Path.home() / f".agent-{name}")
     cfg, first_run = agent_module.load_config()
     if first_run:
         if not agent_module._first_run_setup():

@@ -295,6 +295,9 @@ class StagingBuffer:
         if self._sqlite_backed:
             self.context_dir.mkdir(parents=True, exist_ok=True)
             self._db_path = self.context_dir / "palace.db"
+            # Thread-local connections so the background memory worker can safely
+            # share the same database file as LTMStore across threads.
+            self._local = threading.local()
             self._ensure_sqlite_schema()
         else:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,9 +305,12 @@ class StagingBuffer:
         self._count = self._load_count()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        if not hasattr(self._local, "conn") or self._local.conn is None:
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn = conn
+        return self._local.conn
 
     def _ensure_sqlite_schema(self) -> None:
         with self._connect() as conn:

@@ -1711,7 +1711,7 @@ def test_feishu_channel_send_command_uses_output_dir(tmp_path):
 
 
 def test_feishu_channel_logs_received_message(caplog):
-    caplog.set_level(logging.INFO, logger="channels.feishu")
+    caplog.set_level(logging.INFO, logger="agent")
     channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
     channel._client = MagicMock()
     channel._handler = AsyncMock()

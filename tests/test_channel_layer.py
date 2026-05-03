@@ -560,7 +560,7 @@ def test_channel_runner_scopes_context_manager_per_chat():
 
 def test_channel_runner_emits_latency_trace(monkeypatch, caplog):
     monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
-    caplog.set_level(logging.WARNING, logger="agent.channels.base")
+    caplog.set_level(logging.WARNING, logger="agent")
 
     class _TracingSink(OutputSink):
         def __init__(self):
@@ -674,7 +674,7 @@ def test_channel_runner_uses_turn_runner_when_provided():
 
 
 def test_channel_runner_emits_interaction_logs(caplog):
-    caplog.set_level(logging.INFO, logger="agent.channels.base")
+    caplog.set_level(logging.INFO, logger="agent")
 
     class _TracingSink(OutputSink):
         def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
