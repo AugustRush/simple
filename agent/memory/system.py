@@ -91,6 +91,17 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+def _emit_consolidation(phase: str, **fields: Any) -> None:
+    """Emit a consolidation lifecycle event into the active EventCollector."""
+    try:
+        from agent.core.output import _active_event_collector
+        collector = _active_event_collector.get()
+        if collector is not None:
+            collector.emit(f"consolidation_{phase}", **fields)
+    except Exception:
+        pass  # never let event emission break maintenance
+
+
 def normalize_memory_chapter(chapter: str, aliases: dict[str, str]) -> str:
     chapter = str(chapter).strip().lower()
     return aliases.get(chapter, chapter)
@@ -2682,22 +2693,20 @@ class ContextManager:
         keep_last = self.consolidation.keep_last_messages
         if len(messages) <= keep_last:
             return messages
-        # Find the latest "natural" user message (plain string content, not a
-        # tool_result block) at or after position (len - keep_last).  Starting
-        # the retained window at such a boundary guarantees:
-        #   1. The sequence never begins mid-tool-use-sequence (no orphaned
-        #      tool_use blocks missing their tool_result pair).
-        #   2. Roles always alternate correctly for the Anthropic / OpenAI APIs.
-        # Preserving original task context is intentionally handled at the
-        # _interactive_loop level via _task_context injection into the system
-        # prompt, keeping that concern separate from API message formatting.
+        _before = len(messages)
         ideal = len(messages) - keep_last
         for i in range(ideal, -1, -1):
             msg = messages[i]
             if msg.get("role") == "user" and isinstance(msg.get("content"), str):
                 ideal = i
                 break
-        return messages[ideal:]
+        compacted = messages[ideal:]
+        _emit_consolidation(
+            "compaction",
+            messages_before=_before,
+            messages_after=len(compacted),
+        )
+        return compacted
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
 
@@ -3120,9 +3129,11 @@ class ContextManager:
 
         try:
             staging_buffer, is_primary_staging = self._job_staging(job)
+            reason = str(job.get("reason", "?"))
+            session_id = staging_buffer.session_id
             shared.CONSOLE.print(
-                f"[dim]💤 Context consolidation (sleep)... reason={job.get('reason', '?')} "
-                f"session={staging_buffer.session_id}[/dim]"
+                f"[dim]💤 Context consolidation (sleep)... reason={reason} "
+                f"session={session_id}[/dim]"
             )
             with self._lock:
                 staged = staging_buffer.read_all()
@@ -3131,6 +3142,9 @@ class ContextManager:
                     with self._lock:
                         self._needs_consolidation = False
                 return False
+
+            # Emit consolidation lifecycle event
+            _emit_consolidation("started", reason=reason, staged_count=len(staged))
 
             if extractor is not None:
                 entries = [
@@ -3151,6 +3165,7 @@ class ContextManager:
                 if is_primary_staging:
                     with self._lock:
                         self._needs_consolidation = False
+                _emit_consolidation("completed", entries_extracted=len(entries))
                 return True
 
             try:
@@ -3162,15 +3177,25 @@ class ContextManager:
                     staging=staging_buffer,
                 )
             except Exception as exc:
+                _emit_consolidation("failed", reason="llm_extraction_error", error=str(exc))
                 shared.CONSOLE.print(f"[dim]Sleep extraction error: {exc}[/dim]")
                 return False
             consolidated = self._coerce_consolidation_result(result)
             if not consolidated.success:
+                _emit_consolidation(
+                    "failed", reason="extraction_returned_failure", error=consolidated.error
+                )
                 return False
             if is_primary_staging:
                 with self._lock:
                     self._needs_consolidation = False
+            _emit_consolidation(
+                "completed", entries_extracted=len(getattr(consolidated, "entries", []))
+            )
             return True
+        except Exception as exc:
+            _emit_consolidation("failed", reason="exception", error=str(exc))
+            raise
         finally:
             with self._lock:
                 self._processing_job = False

@@ -155,6 +155,8 @@ class BaseAgent:
         self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self.sub_agent_retries = shared.DEFAULT_SUB_AGENT_RETRIES
         self.result_content_max_chars = shared.DEFAULT_RESULT_CONTENT_MAX_CHARS
+        self.llm_max_retries = shared.DEFAULT_LLM_MAX_RETRIES
+        self.llm_retry_base_delay = shared.DEFAULT_LLM_RETRY_BASE_DELAY
         self._context_stack = _TaskLocalContextStack()
         self.workspace_root: Optional[Path] = None
         self._base_system_prompt: str = ""
@@ -1357,6 +1359,55 @@ class BaseAgent:
         return str(exc) or exc.__class__.__name__
 
     @staticmethod
+    def _is_llm_retryable(exc: Exception) -> bool:
+        """Return True for transient errors worth retrying."""
+        # Network / timeout errors
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+            return True
+        cls_name = exc.__class__.__name__
+        error_msg = str(exc).lower()
+        # Anthropic SDK error types
+        if cls_name in (
+            "RateLimitError", "APIConnectionError", "APITimeoutError",
+            "InternalServerError", "APIStatusError",
+        ):
+            return True
+        # OpenAI SDK error types (may be imported lazily)
+        if cls_name in (
+            "RateLimitError", "APIConnectionError", "APITimeoutError",
+            "InternalServerError",
+        ):
+            return True
+        # Fallback: check error message for known transient patterns
+        retryable_keywords = (
+            "rate limit", "too many requests", "429",
+            "server error", "500", "502", "503", "504",
+            "timeout", "timed out", "connection", "network",
+            "service unavailable", "overloaded",
+        )
+        if any(kw in error_msg for kw in retryable_keywords):
+            return True
+        return False
+
+    async def _with_llm_retry(self, fn, *args, **kwargs):
+        """Call *fn* with retry on transient LLM API errors."""
+        last_exc = None
+        for attempt in range(self.llm_max_retries + 1):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self.llm_max_retries or not self._is_llm_retryable(exc):
+                    raise
+                delay = self.llm_retry_base_delay * (2 ** attempt)
+                logger.warning(
+                    "LLM API error (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1, self.llm_max_retries, delay, exc,
+                )
+                await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+    @staticmethod
     def _synthesize_tool_only_response(
         tool_history: list[tuple[str, str]]
     ) -> str:
@@ -1600,12 +1651,13 @@ class BaseAgent:
                 try:
                     response_started_at = time.perf_counter()
                     if stream_callback:
-                        # Stream for display AND use the full response for tool detection.
-                        response, streamed_text = await self._stream_response(
-                            ctx, tools, stream_callback
+                        response, streamed_text = await self._with_llm_retry(
+                            self._stream_response, ctx, tools, stream_callback
                         )
                     else:
-                        response = await self._create(ctx, tools)
+                        response = await self._with_llm_retry(
+                            self._create, ctx, tools
+                        )
                         streamed_text = ""
                     stop_reason, text, tool_uses = self._parse_response(response)
                     _trace_latency(

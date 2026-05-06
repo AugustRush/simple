@@ -212,6 +212,14 @@ async def _build_components_async(cfg: dict):
         0,
         int(orch_cfg.get("sub_agent_retries", shared.DEFAULT_SUB_AGENT_RETRIES)),
     )
+    agent.llm_max_retries = max(
+        0,
+        int(cfg.get("llm_max_retries", shared.DEFAULT_LLM_MAX_RETRIES)),
+    )
+    agent.llm_retry_base_delay = max(
+        0.1,
+        float(cfg.get("llm_retry_base_delay", shared.DEFAULT_LLM_RETRY_BASE_DELAY)),
+    )
     agent.result_content_max_chars = max(
         0,
         int(orch_cfg.get("result_content_max_chars", shared.DEFAULT_RESULT_CONTENT_MAX_CHARS)),

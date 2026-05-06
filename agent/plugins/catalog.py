@@ -603,12 +603,21 @@ class PluginCatalog:
                 meta,
             )
             for r in cmd_results:
-                if r.action == "continue":
+                if r.action != "noop":
                     _emit_plugin_event(
-                        "hook_continued",
+                        "hook_fired",
                         plugin_name=meta.name,
                         hook_name="on_turn_end",
-                        next_prompt=r.message,
+                        source="command",
+                        action=r.action,
+                        message=r.message[:200] if r.message else "",
+                    )
+                if r.context:
+                    _emit_plugin_event(
+                        "hook_context_injected",
+                        plugin_name=meta.name,
+                        hook_name="on_turn_end",
+                        source="command",
                     )
             results.extend(cmd_results)
 
@@ -621,12 +630,19 @@ class PluginCatalog:
                     timeout_seconds=self._hook_timeout(meta, "on_turn_end"),
                 )
                 if isinstance(r, HookResult):
-                    if r.action == "continue":
+                    if r.action != "noop":
                         _emit_plugin_event(
-                            "hook_continued",
+                            "hook_fired",
                             plugin_name=meta.name,
                             hook_name="on_turn_end",
-                            next_prompt=r.message,
+                            action=r.action,
+                            message=r.message[:200] if r.message else "",
+                        )
+                    if r.context:
+                        _emit_plugin_event(
+                            "hook_context_injected",
+                            plugin_name=meta.name,
+                            hook_name="on_turn_end",
                         )
                     results.append(r)
             except asyncio.TimeoutError:
