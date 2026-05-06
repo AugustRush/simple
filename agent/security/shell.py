@@ -15,15 +15,36 @@ SHELL_BLOCKED_COMMANDS: frozenset[str] = frozenset(
         "shred",
         "fdisk",
         "parted",
+        "chmod",
+        "chown",
+        "kill",
+        "pkill",
+        "killall",
+        "passwd",
+        "usermod",
+        "groupadd",
+        "eval",
+        "exec",
     }
 )
 
-# Dangerous pipe-idiom substrings checked as literal substrings.
+# Dangerous shell patterns checked as literal substrings.
 SHELL_BLOCKED_PATTERNS: tuple[str, ...] = (
+    # pipe-to-shell
     "curl | sh",
     "wget | sh",
+    "curl | bash",
+    "wget | bash",
     "wget -O- |",
     "curl -s |",
+    # inline code execution
+    "python -c",
+    "python3 -c",
+    "perl -e",
+    "ruby -e",
+    # redirect-to-device
+    "> /dev/sd",
+    "dd if=",
 )
 
 

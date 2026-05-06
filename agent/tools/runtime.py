@@ -161,6 +161,14 @@ class ToolRegistry:
             ensure_ascii=False,
         )
 
+    @staticmethod
+    def _tool_has_safe_kwargs(tool_input: dict) -> bool:
+        """Return True if all keys in *tool_input* are valid Python identifiers."""
+        return all(
+            str(k).isidentifier()
+            for k in tool_input
+        )
+
     async def call(self, tool_name: str, tool_input: dict) -> str:
         if tool_name not in self._tools:
             return self._error_payload(tool_name, f"tool '{tool_name}' not found")
@@ -175,10 +183,18 @@ class ToolRegistry:
                 merged_context.update(self._context)
                 override_registry = owner_registry
                 override_token = owner_registry._context_override.set(merged_context)
-            if asyncio.iscoroutinefunction(fn):
-                result = await fn(**tool_input)
+            if self._tool_has_safe_kwargs(tool_input):
+                if asyncio.iscoroutinefunction(fn):
+                    result = await fn(**tool_input)
+                else:
+                    result = fn(**tool_input)
             else:
-                result = fn(**tool_input)
+                # MCP tools and others with non-identifier parameter names
+                # can't use ** unpacking — pass the dict directly.
+                if asyncio.iscoroutinefunction(fn):
+                    result = await fn(tool_input)
+                else:
+                    result = fn(tool_input)
             if isinstance(result, (dict, list)):
                 return json.dumps(result, ensure_ascii=False)
             return "" if result is None else str(result)
@@ -237,6 +253,7 @@ class BuiltinTools:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.chapter_normalizer = chapter_normalizer or (lambda chapter: str(chapter))
         self._output_dir = output_dir
+        self._cached_schedule_store: Any = None
         self._register()
 
     def _register(self):
@@ -1093,7 +1110,7 @@ class BuiltinTools:
                 stderr=asyncio.subprocess.PIPE,
                 env={
                     **os.environ.copy(),
-                    "AGENT_OUTPUT_DIR": str(self._output_dir),
+                    "AGENT_OUTPUT_DIR": str(self._output_dir) if self._output_dir is not None else "",
                 },
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -1289,9 +1306,12 @@ class BuiltinTools:
         )
 
     def _schedule_store(self) -> SchedulerStore:
-        from agent.scheduler import SchedulerStore
-
-        return SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        if self._cached_schedule_store is None:
+            from agent.scheduler import SchedulerStore
+            self._cached_schedule_store = SchedulerStore(
+                db_path=shared.SCHEDULER_DB_FILE
+            )
+        return self._cached_schedule_store
 
     def _schedule_target(self, delivery_mode: Optional[str] = None):
         from agent.scheduler import DeliveryTarget
@@ -1414,21 +1434,18 @@ class BuiltinTools:
             raise ValueError(f"Unsupported action_type '{action_type}'")
 
         store = self._schedule_store()
-        try:
-            new_task = NewScheduledTask(
-                name=name,
-                kind=task_kind,
-                trigger=trigger,
-                payload=payload,
-                delivery_mode=resolved_mode,
-                delivery_target=target,
-            )
-            task = store.find_matching_task(new_task)
-            existing = task is not None
-            if task is None:
-                task = store.create_task(new_task)
-        finally:
-            store.close()
+        new_task = NewScheduledTask(
+            name=name,
+            kind=task_kind,
+            trigger=trigger,
+            payload=payload,
+            delivery_mode=resolved_mode,
+            delivery_target=target,
+        )
+        task = store.find_matching_task(new_task)
+        existing = task is not None
+        if task is None:
+            task = store.create_task(new_task)
         return self._ok(
             task={
                 "id": task.id,
@@ -1444,10 +1461,7 @@ class BuiltinTools:
 
     def _schedule_list(self) -> dict[str, Any]:
         store = self._schedule_store()
-        try:
-            tasks = store.list_tasks()
-        finally:
-            store.close()
+        tasks = store.list_tasks()
         return self._ok(
             count=len(tasks),
             items=[
@@ -1465,10 +1479,7 @@ class BuiltinTools:
 
     def _schedule_delete(self, task_id: str) -> dict[str, Any]:
         store = self._schedule_store()
-        try:
-            store.delete_task(task_id)
-        finally:
-            store.close()
+        store.delete_task(task_id)
         return self._ok(task_id=task_id, deleted=True)
 
     def _clean_output(
@@ -1580,8 +1591,11 @@ class MCPClient:
             "required": [],
         }
 
-        async def _call_mcp_tool(**kwargs):
-            result = await session.call_tool(original_name, arguments=kwargs or None)
+        async def _call_mcp_tool(tool_args: dict | None = None, **extra: Any):
+            # tool_args is the raw input dict when keys are non-identifiers;
+            # extra captures any keyword-style params from legacy callers.
+            arguments = tool_args if isinstance(tool_args, dict) else extra
+            result = await session.call_tool(original_name, arguments=arguments or None)
             text_blocks = []
             for block in getattr(result, "content", []) or []:
                 block_type = getattr(block, "type", "")
