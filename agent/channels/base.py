@@ -248,6 +248,33 @@ class ChannelRunner:
                     }
                 )
             try:
+                # ── Plugin hook: on_prompt_submit ────────────────────────────
+                plugin_catalog = components.get("plugin_catalog")
+                if plugin_catalog:
+                    submit_result = await plugin_catalog.fire_prompt_submit(
+                        msg.text,
+                        {
+                            "channel": msg.channel_name,
+                            "chat_id": msg.metadata.get("chat_id", ""),
+                            "message_id": msg.metadata.get("message_id", ""),
+                        },
+                    )
+                    if submit_result.action == "block":
+                        _interaction_log(
+                            "prompt_blocked",
+                            reason=submit_result.message,
+                            channel=msg.channel_name,
+                        )
+                        sink.on_status(
+                            f"Message blocked: {submit_result.message}",
+                            level="warning",
+                        )
+                        if hasattr(sink, "drain"):
+                            await sink.drain()
+                        return False
+                    if submit_result.context:
+                        msg.text = f"[{submit_result.context}]\n\n{msg.text}"
+
                 _interaction_log(
                     "turn_started",
                     session_id=session_id,

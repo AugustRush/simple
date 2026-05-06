@@ -901,62 +901,83 @@ async def _interactive_loop(components: dict, cfg: dict):
                 else:
                     ctx.metadata.pop("required_skills", None)
 
-            # Mark activity so idle timer resets and dirty flag is set
-            if ctx_mgr:
-                ctx_mgr.mark_activity()
+            # ── Plugin hook: on_prompt_submit ────────────────────────────────
+            submit_result = await plugin_catalog.fire_prompt_submit(
+                user_input, {"channel": "cli", "session_id": state.ctx.agent_id}
+            )
+            if submit_result.action == "block":
+                shared.CONSOLE.print(
+                    f"[yellow]Message blocked by plugin: {submit_result.message}[/yellow]"
+                )
+                continue
+            if submit_result.context:
+                user_input = f"[{submit_result.context}]\n\n{user_input}"
 
-            # Record the first non-command user message as the task context so it
-            # can be re-injected into the system prompt after compaction occurs.
-            state.ensure_task_context(user_input)
-
-            # Create a fresh per-turn sink and register it in the ContextVar so
-            # tool helpers (_run_tool_uses) can find it without param threading.
-            _turn_sink = CliOutputSink(shared.CONSOLE)
-            _sink_token = _active_sink.set(_turn_sink)
-
-            try:
-                shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
-                ctx.metadata["skill_catalog"] = skill_catalog
-
-                # Hot-reload: recompose system prompt when skill catalog was mutated
-                if skill_catalog.consume_dirty():
-                    refreshed = agent_module._compose_system_prompt(
-                        components["base_system_prompt"],
-                        components["registry"],
-                        components.get("workspace_root"),
-                        components.get("output_dir"),
-                        skill_catalog=skill_catalog,
-                        plugin_catalog=plugin_catalog,
-                    )
-                    components["system_prompt"] = refreshed
-                    ctx.system_prompt = _with_task_context(
-                        refreshed, state.task_context
+            # ── Turn loop: runs at least once; plugin continue hooks can
+            # feed a new prompt and loop again (max one extra iteration). ──
+            _turn_prompt = user_input
+            _turn_hook_results: list[Any] = []
+            for _turn_iter in range(2):  # 1 normal + 1 optional continue
+                if _turn_iter > 0:
+                    shared.CONSOLE.print(
+                        f"[dim]Plugin continue: {_turn_prompt[:80]}[/dim]"
                     )
 
-                turn_runner = _turn_runner_for_components(components)
-                turn_input = TurnInput.from_text(user_input, channel_name="cli")
-                result = await turn_runner.run(
-                    turn_input,
-                    ctx,
-                    stream_callback=_turn_sink.sync_stream_cb,
-                )
-                # on_turn_complete: renders markdown if no streaming happened,
-                # always prints trailing newline, and clears _streamed buffer.
-                tool_calls = list(result.tool_calls)
-                _turn_sink.on_turn_complete(
-                    result.text or "", tool_calls
-                )
-                if result.error:
-                    shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
+                # Mark activity so idle timer resets
+                if ctx_mgr:
+                    ctx_mgr.mark_activity()
+                state.ensure_task_context(_turn_prompt)
 
-                await turn_runner.complete_turn(turn_input, state, result)
+                _turn_sink = CliOutputSink(shared.CONSOLE)
+                _sink_token = _active_sink.set(_turn_sink)
+                try:
+                    shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+                    ctx.metadata["skill_catalog"] = skill_catalog
 
-            except Exception as e:
-                shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
-            finally:
-                # Always reset the sink ContextVar after each turn so stale
-                # references cannot bleed into the next turn.
-                _active_sink.reset(_sink_token)
+                    if skill_catalog.consume_dirty():
+                        refreshed = agent_module._compose_system_prompt(
+                            components["base_system_prompt"],
+                            components["registry"],
+                            components.get("workspace_root"),
+                            components.get("output_dir"),
+                            skill_catalog=skill_catalog,
+                            plugin_catalog=plugin_catalog,
+                        )
+                        components["system_prompt"] = refreshed
+                        ctx.system_prompt = _with_task_context(
+                            refreshed, state.task_context
+                        )
+
+                    turn_runner = _turn_runner_for_components(components)
+                    turn_input = TurnInput.from_text(_turn_prompt, channel_name="cli")
+                    result = await turn_runner.run(
+                        turn_input,
+                        ctx,
+                        stream_callback=_turn_sink.sync_stream_cb,
+                    )
+                    tool_calls = list(result.tool_calls)
+                    _turn_sink.on_turn_complete(result.text or "", tool_calls)
+                    if result.error:
+                        shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
+
+                    _turn_hook_results = await turn_runner.complete_turn(
+                        turn_input, state, result
+                    )
+                except Exception as e:
+                    shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
+                    _turn_hook_results = []
+                finally:
+                    _active_sink.reset(_sink_token)
+
+                # Check for continue
+                continued = False
+                for hr in (_turn_hook_results or []):
+                    if getattr(hr, "action", "") == "continue" and getattr(hr, "message", ""):
+                        _turn_prompt = str(hr.message)
+                        continued = True
+                        break
+                if not continued:
+                    break
 
     finally:
         if memory_worker:

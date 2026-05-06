@@ -890,6 +890,10 @@ def test_channel_runner_fires_session_end_per_chat_session():
         def fire_session_start(self, components):
             return None
 
+        async def fire_prompt_submit(self, text, metadata=None):
+            import agent as agent_module
+            return agent_module.HookResult()
+
         async def fire_turn_end(self, event):
             self.turn_events.append(event)
             return []

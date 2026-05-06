@@ -154,15 +154,17 @@ class TurnRunner:
         turn_input: TurnInput,
         state: RuntimeSessionState,
         result: TurnResult,
-    ) -> None:
+    ) -> list[Any]:
+        """Finish a turn and return hook results for continue detection."""
         import agent as agent_module
 
         tool_calls = list(result.tool_calls)
         state.record_turn(tool_calls)
 
+        hook_results: list[Any] = []
         plugin_catalog = self._components.values.get("plugin_catalog")
         if plugin_catalog:
-            await plugin_catalog.fire_turn_end(
+            hook_results = await plugin_catalog.fire_turn_end(
                 agent_module.TurnEvent(
                     user_input=turn_input.text,
                     agent_response=result.text or "",
@@ -191,3 +193,4 @@ class TurnRunner:
             system_prompt=self._components.require("system_prompt"),
             task_context=state.task_context,
         )
+        return hook_results

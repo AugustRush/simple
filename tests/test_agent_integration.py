@@ -5301,6 +5301,10 @@ def test_interactive_loop_routes_turn_through_runtime_runner(monkeypatch, tmp_pa
         async def fire_session_end(self, event):
             self.session_end = event
 
+        async def fire_prompt_submit(self, text, metadata=None):
+            import agent as agent_module
+            return agent_module.HookResult()
+
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)

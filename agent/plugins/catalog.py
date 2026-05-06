@@ -33,18 +33,28 @@ class AgentPlugin:
             Synchronous.  Called once after all core components are built.
             Use it to capture references to client, model, memory, etc.
 
+        on_prompt_submit(text: str, metadata: dict) -> Optional[HookResult]
+            Async-compatible.  Fired when the user submits a message, BEFORE the
+            agent sees it.  Return ``HookResult(action="block")`` to prevent the
+            message from being processed, or inject ``context`` to prepend
+            guidance to the prompt.
+
         on_turn_end(event: TurnEvent) -> Optional[HookResult]
             Async-compatible.  Fired after every assistant turn.
+            Return ``HookResult(action="continue")`` to automatically run another
+            turn with ``message`` as the next user prompt (agent self-feedback loop).
 
         on_session_end(event: SessionEvent) -> None
             Async-compatible.  Fired when the interactive session ends.
 
         on_pre_tool(event: PreToolEvent) -> Optional[HookResult]
             Async-compatible.  Return HookResult(action="block") to prevent
-            the tool from executing.
+            the tool from executing.  Matchers in plugin.json can scope this
+            to specific tool names.
 
         on_post_tool(event: PostToolEvent) -> Optional[HookResult]
-            Async-compatible.  Purely observational.
+            Async-compatible.  Purely observational.  Matchers in plugin.json
+            can scope this to specific tool names.
 
     Prompt contribution:
         compose_system_prompt(current_prompt: str) -> str
@@ -55,6 +65,12 @@ class AgentPlugin:
     Slash commands:
         register_slash_commands() -> dict[str, Callable]
             Return {name: async handler(raw_cmd, components)}.
+
+    Command hooks (plugin.json):
+        Hooks may also be declared in ``plugin.json`` under a ``hooks`` key as
+        external commands.  These run as subprocesses with event data on stdin
+        and a JSON HookResult shape on stdout.  Each entry supports:
+        ``matcher`` (regex), ``timeout`` (seconds), and ``command`` (shell string).
     """
 
     name: str = ""
@@ -103,11 +119,19 @@ class PostToolEvent:
 
 @dataclass
 class HookResult:
-    """Return value from plugin hook methods."""
+    """Return value from plugin hook methods.
 
-    action: str = "noop"  # "noop" | "block" | "context" | "warning"
-    message: str = ""  # human-readable message / block reason
-    context: str = ""  # extra context to surface to the agent next turn
+    Actions:
+        ``"noop"``     — no effect (default).
+        ``"block"``    — prevent the operation (tool execution, prompt delivery).
+        ``"continue"`` — (turn_end only) run another turn with ``message`` as prompt.
+        ``"context"``  — inject ``context`` into the next turn's system instructions.
+        ``"warning"``  — surface ``message`` as a user-visible warning.
+    """
+
+    action: str = "noop"
+    message: str = ""
+    context: str = ""
 
 
 # Valid characters for plugin directory names (P0-3 safety).
@@ -125,6 +149,9 @@ class PluginMeta:
     mcp_servers: list[dict] = field(default_factory=list)
     source: str = ""  # "builtin" or "user"
     enabled: bool = True
+    hooks_config: dict[str, list[dict]] = field(default_factory=dict)
+    hook_matchers: dict[str, re.Pattern] = field(default_factory=dict)
+    hook_timeouts: dict[str, float] = field(default_factory=dict)
 
 
 def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
@@ -136,7 +163,6 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
         data = json.loads(pj.read_text(encoding="utf-8"))
         mcp = data.get("mcp_servers", [])
         if isinstance(mcp, str):
-            # Path to .mcp.json file
             mcp_path = plugin_dir / mcp
             if mcp_path.exists():
                 mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
@@ -144,12 +170,36 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
                     mcp = [mcp]
             else:
                 mcp = []
+        raw_hooks: dict[str, list[dict]] = {}
+        hook_matchers: dict[str, re.Pattern] = {}
+        hook_timeouts: dict[str, float] = {}
+        hooks_cfg = data.get("hooks", {})
+        if isinstance(hooks_cfg, dict):
+            for hook_name, entries in hooks_cfg.items():
+                if not isinstance(entries, list):
+                    continue
+                raw_hooks[hook_name] = []
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    raw_hooks[hook_name].append(entry)
+                    if isinstance(entry.get("timeout"), (int, float)):
+                        hook_timeouts[hook_name] = max(0.0, float(entry["timeout"]))
+                    matcher = str(entry.get("matcher", "") or "").strip()
+                    if matcher and matcher != "*":
+                        try:
+                            hook_matchers[hook_name] = re.compile(matcher)
+                        except re.error:
+                            pass
         return PluginMeta(
             name=data.get("name", plugin_dir.name),
             version=data.get("version", ""),
             description=data.get("description", ""),
             skills=data.get("skills", ""),
             mcp_servers=mcp if isinstance(mcp, list) else [],
+            hooks_config=raw_hooks,
+            hook_matchers=hook_matchers,
+            hook_timeouts=hook_timeouts,
         )
     except Exception:
         return None
@@ -382,7 +432,125 @@ class PluginCatalog:
         """Return mapping of command name → async handler(raw_cmd, components)."""
         return dict(self._slash_commands)
 
+    # ── Hook helpers ────────────────────────────────────────────────────────────
+
+    def _hook_timeout(self, meta: PluginMeta, hook_name: str) -> float:
+        """Return the per-hook timeout override, or the global default."""
+        return meta.hook_timeouts.get(hook_name, self._turn_hook_timeout_seconds)
+
+    def _matches_tool(
+        self, meta: PluginMeta, hook_name: str, tool_name: str
+    ) -> bool:
+        """Check whether *hook_name* on *meta* has a matcher for *tool_name*.
+
+        No matcher → always matches (opt-in to filtering by declaring one).
+        """
+        matcher = meta.hook_matchers.get(hook_name)
+        if matcher is None:
+            return True
+        return bool(matcher.search(tool_name))
+
+    async def _run_command_hooks(
+        self,
+        event_name: str,
+        event_payload: dict,
+        meta: PluginMeta,
+    ) -> list[HookResult]:
+        """Execute command-type hooks declared in plugin.json for *event_name*."""
+        results: list[HookResult] = []
+        entries = meta.hooks_config.get(event_name, [])
+        for entry in entries:
+            if entry.get("type") != "command":
+                continue
+            cmd = str(entry.get("command", "") or "").strip()
+            if not cmd:
+                continue
+            timeout = max(0.0, float(entry.get("timeout", self._hook_timeout(meta, event_name))))
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdin_data = json.dumps(event_payload, ensure_ascii=False).encode("utf-8")
+                stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                    proc.communicate(stdin_data), timeout=max(1.0, timeout)
+                )
+                if proc.returncode == 2:
+                    reason = stderr_bytes.decode(errors="replace").strip() or "blocked"
+                    results.append(HookResult(action="block", message=reason))
+                    continue
+                try:
+                    raw = json.loads(stdout_bytes.decode("utf-8"))
+                    if isinstance(raw, dict):
+                        results.append(HookResult(
+                            action=str(raw.get("action", "noop")),
+                            message=str(raw.get("message", "")),
+                            context=str(raw.get("context", "")),
+                        ))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    pass
+            except asyncio.TimeoutError:
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{meta.name}' command hook '{event_name}' "
+                    f"timed out after {timeout:.2f}s[/dim]"
+                )
+            except Exception as exc:
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{meta.name}' command hook '{event_name}' "
+                    f"error: {exc}[/dim]"
+                )
+        return results
+
     # ── Lifecycle event firing ─────────────────────────────────────────────────
+
+    async def fire_prompt_submit(
+        self, text: str, metadata: Optional[dict] = None
+    ) -> HookResult:
+        """Fire before the user message reaches the agent.
+
+        Returns the first blocking result, or the last non-noop result.
+        """
+        meta_dict = metadata or {}
+        result = HookResult()
+        for plugin, meta in self._plugins.values():
+            # Command hooks for this event
+            cmd_results = await self._run_command_hooks(
+                "on_prompt_submit",
+                {"event": "on_prompt_submit", "text": text, "metadata": meta_dict},
+                meta,
+            )
+            for r in cmd_results:
+                if r.action == "block":
+                    return r
+                if r.action != "noop":
+                    result = r
+
+            # Python in-process hooks
+            if not hasattr(plugin, "on_prompt_submit"):
+                continue
+            try:
+                r = await _call_hook_with_timeout(
+                    plugin.on_prompt_submit,
+                    text,
+                    meta_dict,
+                    timeout_seconds=self._hook_timeout(meta, "on_prompt_submit"),
+                )
+                if isinstance(r, HookResult):
+                    if r.action == "block":
+                        return r
+                    if r.action != "noop":
+                        result = r
+            except asyncio.TimeoutError:
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{meta.name}' prompt_submit timed out[/dim]"
+                )
+            except Exception as exc:
+                shared.CONSOLE.print(
+                    f"[dim]Plugin prompt_submit error ({meta.name}): {exc}[/dim]"
+                )
+        return result
 
     def fire_session_start(self, components: dict) -> None:
         """Synchronous session-start notification; called before the input loop."""
@@ -395,94 +563,155 @@ class PluginCatalog:
                 shared.CONSOLE.print(f"[dim]Plugin session_start error: {exc}[/dim]")
 
     async def fire_turn_end(self, event: TurnEvent) -> list[HookResult]:
-        """Notify all plugins after each assistant turn; collect HookResults."""
+        """Notify all plugins after each assistant turn; collect HookResults.
+
+        A result with ``action="continue"`` signals the caller to run another
+        turn with ``message`` as the next user prompt.
+        """
         results: list[HookResult] = []
-        for plugin, _meta in self._plugins.values():
+        for plugin, meta in self._plugins.values():
+            cmd_results = await self._run_command_hooks(
+                "on_turn_end",
+                {
+                    "event": "on_turn_end",
+                    "user_input": event.user_input,
+                    "agent_response": event.agent_response,
+                    "tool_calls": event.tool_calls,
+                    "session_id": event.session_id,
+                    "timestamp": event.timestamp,
+                    "turn_index": event.turn_index,
+                },
+                meta,
+            )
+            results.extend(cmd_results)
+
             if not hasattr(plugin, "on_turn_end"):
                 continue
             try:
                 r = await _call_hook_with_timeout(
                     plugin.on_turn_end,
                     event,
-                    timeout_seconds=self._turn_hook_timeout_seconds,
+                    timeout_seconds=self._hook_timeout(meta, "on_turn_end"),
                 )
                 if isinstance(r, HookResult):
                     results.append(r)
             except asyncio.TimeoutError:
-                _pname = getattr(plugin, "name", "?")
                 shared.CONSOLE.print(
-                    f"[dim]Plugin '{_pname}' turn_end timed out after "
-                    f"{self._turn_hook_timeout_seconds:.2f}s[/dim]"
+                    f"[dim]Plugin '{meta.name}' turn_end timed out after "
+                    f"{self._hook_timeout(meta, 'on_turn_end'):.2f}s[/dim]"
                 )
             except Exception as exc:
-                shared.CONSOLE.print(f"[dim]Plugin turn_end error: {exc}[/dim]")
+                shared.CONSOLE.print(f"[dim]Plugin turn_end error ({meta.name}): {exc}[/dim]")
         return results
 
     async def fire_session_end(self, event: SessionEvent) -> None:
         """Notify all plugins when the interactive session ends."""
-        for plugin, _meta in self._plugins.values():
+        for plugin, meta in self._plugins.values():
+            timeout = self._hook_timeout(meta, "on_session_end")
             if not hasattr(plugin, "on_session_end"):
                 continue
             try:
                 await _call_hook_with_timeout(
                     plugin.on_session_end,
                     event,
-                    timeout_seconds=self._turn_hook_timeout_seconds,
+                    timeout_seconds=timeout,
                 )
             except asyncio.TimeoutError:
-                _pname = getattr(plugin, "name", "?")
                 shared.CONSOLE.print(
-                    f"[dim]Plugin '{_pname}' session_end timed out after "
-                    f"{self._turn_hook_timeout_seconds:.2f}s[/dim]"
+                    f"[dim]Plugin '{meta.name}' session_end timed out after "
+                    f"{timeout:.2f}s[/dim]"
                 )
             except Exception as exc:
-                shared.CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
+                shared.CONSOLE.print(
+                    f"[dim]Plugin session_end error ({meta.name}): {exc}[/dim]"
+                )
 
     async def fire_pre_tool(self, event: PreToolEvent) -> HookResult:
-        """Fire before a tool call; first blocking result short-circuits the chain."""
-        for plugin, _meta in self._plugins.values():
+        """Fire before a tool call; first blocking result short-circuits the chain.
+
+        Matchers declared in plugin.json scoped to ``on_pre_tool`` are honoured:
+        a plugin without a matcher is called for every tool; a plugin with a
+        matcher is only called when the tool name matches.
+        """
+        for plugin, meta in self._plugins.values():
+            if not self._matches_tool(meta, "on_pre_tool", event.tool_name):
+                continue
+
+            cmd_results = await self._run_command_hooks(
+                "on_pre_tool",
+                {
+                    "event": "on_pre_tool",
+                    "tool_name": event.tool_name,
+                    "tool_kwargs": event.tool_kwargs,
+                },
+                meta,
+            )
+            for r in cmd_results:
+                if r.action == "block":
+                    return r
+
             if not hasattr(plugin, "on_pre_tool"):
                 continue
             try:
                 r = await _call_hook_with_timeout(
                     plugin.on_pre_tool,
                     event,
-                    timeout_seconds=self._turn_hook_timeout_seconds,
+                    timeout_seconds=self._hook_timeout(meta, "on_pre_tool"),
                 )
                 if isinstance(r, HookResult) and r.action == "block":
                     return r
             except asyncio.TimeoutError:
-                _pname = getattr(plugin, "name", "?")
                 shared.CONSOLE.print(
-                    f"[dim]Plugin '{_pname}' pre_tool timed out after "
-                    f"{self._turn_hook_timeout_seconds:.2f}s[/dim]"
+                    f"[dim]Plugin '{meta.name}' pre_tool timed out after "
+                    f"{self._hook_timeout(meta, 'on_pre_tool'):.2f}s[/dim]"
                 )
             except Exception as exc:
-                _pname = getattr(plugin, "name", "?")
-                shared.CONSOLE.print(f"[dim]Plugin '{_pname}' pre_tool error: {exc}[/dim]")
+                shared.CONSOLE.print(
+                    f"[dim]Plugin pre_tool error ({meta.name}): {exc}[/dim]"
+                )
         return HookResult()
 
     async def fire_post_tool(self, event: PostToolEvent) -> HookResult:
-        """Fire after a tool call completes; last non-noop context wins."""
+        """Fire after a tool call completes; last non-noop context wins.
+
+        Matchers declared in plugin.json scoped to ``on_post_tool`` are honoured.
+        """
         result = HookResult()
-        for plugin, _meta in self._plugins.values():
+        for plugin, meta in self._plugins.values():
+            if not self._matches_tool(meta, "on_post_tool", event.tool_name):
+                continue
+
+            cmd_results = await self._run_command_hooks(
+                "on_post_tool",
+                {
+                    "event": "on_post_tool",
+                    "tool_name": event.tool_name,
+                    "tool_kwargs": event.tool_kwargs,
+                    "result": event.result,
+                },
+                meta,
+            )
+            for r in cmd_results:
+                if r.context:
+                    result = r
+
             if not hasattr(plugin, "on_post_tool"):
                 continue
             try:
                 r = await _call_hook_with_timeout(
                     plugin.on_post_tool,
                     event,
-                    timeout_seconds=self._turn_hook_timeout_seconds,
+                    timeout_seconds=self._hook_timeout(meta, "on_post_tool"),
                 )
                 if isinstance(r, HookResult) and r.context:
                     result = r
             except asyncio.TimeoutError:
-                _pname = getattr(plugin, "name", "?")
                 shared.CONSOLE.print(
-                    f"[dim]Plugin '{_pname}' post_tool timed out after "
-                    f"{self._turn_hook_timeout_seconds:.2f}s[/dim]"
+                    f"[dim]Plugin '{meta.name}' post_tool timed out after "
+                    f"{self._hook_timeout(meta, 'on_post_tool'):.2f}s[/dim]"
                 )
             except Exception as exc:
-                _pname = getattr(plugin, "name", "?")
-                shared.CONSOLE.print(f"[dim]Plugin '{_pname}' post_tool error: {exc}[/dim]")
+                shared.CONSOLE.print(
+                    f"[dim]Plugin post_tool error ({meta.name}): {exc}[/dim]"
+                )
         return result
