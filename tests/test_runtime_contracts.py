@@ -350,21 +350,23 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
     assert execution.iterations == 2
     assert not execution.blocked
     assert [event.name for event in execution.events] == [
+        "turn_started",
         "agent_result_ready",
         "turn_response_delivered",
         "turn_continued",
         "agent_result_ready",
         "turn_response_delivered",
     ]
-    assert execution.events[0].session_id == "session-1"
-    assert execution.events[0].channel_name == "feishu"
-    assert execution.events[0].metadata["message_id"] == "msg-1"
-    assert execution.events[0].fields["tool_calls"] == 1
-    assert execution.events[0].fields["error"] is False
-    assert execution.events[0].fields["content_len"] == len(
+    assert execution.events[0].name == "turn_started"
+    assert execution.events[1].session_id == "session-1"
+    assert execution.events[1].channel_name == "feishu"
+    assert execution.events[1].metadata["message_id"] == "msg-1"
+    assert execution.events[1].fields["tool_calls"] == 1
+    assert execution.events[1].fields["error"] is False
+    assert execution.events[1].fields["content_len"] == len(
         "reply:[runtime context]\n\nhello"
     )
-    assert execution.events[2].fields["next_prompt"] == "follow up"
+    assert execution.events[3].fields["next_prompt"] == "follow up"
     assert plugin_catalog.submitted == [
         (
             "hello",
@@ -542,11 +544,12 @@ def test_agent_core_records_error_reported_runtime_event():
     )
 
     assert [event.name for event in execution.events] == [
+        "turn_started",
         "agent_result_ready",
         "turn_response_delivered",
         "turn_error_reported",
     ]
-    assert execution.events[2].fields["error"] == "boom"
+    assert execution.events[3].fields["error"] == "boom"
 
 
 def test_agent_core_records_failed_runtime_event_when_runner_raises():
@@ -587,11 +590,14 @@ def test_agent_core_records_failed_runtime_event_when_runner_raises():
 
     assert execution.failed
     assert execution.result.error == "runner exploded"
-    assert [event.name for event in execution.events] == ["turn_failed"]
-    assert execution.events[0].session_id == "session-1"
-    assert execution.events[0].channel_name == "feishu"
-    assert execution.events[0].fields["error"] == "runner exploded"
-    assert execution.events[0].metadata["message_id"] == "msg-1"
+    assert [event.name for event in execution.events] == [
+        "turn_started",
+        "turn_failed",
+    ]
+    assert execution.events[1].session_id == "session-1"
+    assert execution.events[1].channel_name == "feishu"
+    assert execution.events[1].fields["error"] == "runner exploded"
+    assert execution.events[1].metadata["message_id"] == "msg-1"
 
 
 def test_agent_core_handles_minimal_context_without_metadata_when_no_skill_catalog():

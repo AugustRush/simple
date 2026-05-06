@@ -280,23 +280,11 @@ class ChannelRunner:
                     state,
                     sink=sink,
                 )
-                agent_duration_ms = (
-                    f"{(time.perf_counter() - agent_started_at) * 1000:.1f}"
-                )
                 if execution.blocked:
                     for event in execution.events:
                         self._log_runtime_event(event)
                     return False
                 result = execution.result
-                tool_calls = list(result.tool_calls)
-                _trace_latency(
-                    "agent_send_message_finished",
-                    session_id=session_id,
-                    message_id=msg.metadata.get("message_id"),
-                    duration_ms=agent_duration_ms,
-                    tool_calls=len(tool_calls),
-                    error=bool(result.error),
-                )
                 for event in execution.events:
                     self._log_runtime_event(event)
 

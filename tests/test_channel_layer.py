@@ -560,7 +560,7 @@ def test_channel_runner_scopes_context_manager_per_chat():
 
 def test_channel_runner_emits_latency_trace(monkeypatch, caplog):
     monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
-    caplog.set_level(logging.WARNING, logger="agent")
+    caplog.set_level(logging.INFO, logger="agent")
 
     class _TracingSink(OutputSink):
         def __init__(self):
@@ -608,8 +608,10 @@ def test_channel_runner_emits_latency_trace(monkeypatch, caplog):
     )
 
     assert "latency_trace component=channel_runner stage=message_handler_started" in caplog.text
-    assert "latency_trace component=channel_runner stage=agent_send_message_finished" in caplog.text
     assert "latency_trace component=channel_runner stage=message_handler_finished" in caplog.text
+    # agent timing is now captured in the RuntimeEvent stream, not a separate latency trace
+    assert "interaction component=channel_runner event=agent_result_ready" in caplog.text
+    assert "duration_ms=" in caplog.text
     assert "message_id=msg-123" in caplog.text
 
 

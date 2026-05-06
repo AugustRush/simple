@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -408,7 +409,11 @@ class AgentCore:
         max_continuations: int,
     ) -> TurnExecution:
         collector = _active_event_collector.get()
-        assert collector is not None  # set by handle_turn
+        if collector is None:  # defensive: caller must go through handle_turn
+            raise RuntimeError(
+                "AgentCore._handle_turn_impl called without an active EventCollector. "
+                "Use handle_turn() instead."
+            )
 
         skill_catalog = self._skill_catalog()
         ctx_metadata = self._context_metadata(state)
@@ -440,6 +445,11 @@ class AgentCore:
         state.ensure_task_context(prompt)
         if state.context_manager:
             state.context_manager.mark_activity()
+        collector.emit(
+            "turn_started",
+            text_len=len(prompt),
+            text_preview=prompt[:80].replace("\n", " "),
+        )
 
         active_sink_token = _active_sink.set(sink) if sink is not None else None
         schedule_target = self._schedule_target_for_turn(prompted_input)
@@ -470,10 +480,14 @@ class AgentCore:
                     if stream_callback is not None
                     else getattr(sink, "sync_stream_cb", None)
                 )
+                agent_started_at = time.perf_counter()
                 final_result = await self._turn_runner().run(
                     current_input,
                     state.ctx,
                     stream_callback=callback,
+                )
+                agent_duration_ms = round(
+                    (time.perf_counter() - agent_started_at) * 1000, 1
                 )
                 collector.emit(
                     "agent_result_ready",
@@ -481,6 +495,7 @@ class AgentCore:
                     error=bool(final_result.error),
                     content_len=len(final_result.text or ""),
                     content_preview=(final_result.text or "")[:80],
+                    duration_ms=agent_duration_ms,
                 )
                 if sink is not None:
                     sink.on_turn_complete(
@@ -516,7 +531,9 @@ class AgentCore:
             return TurnExecution(
                 result=final_result,
                 iterations=iterations,
-                events=self._drain_collector(current_input if iterations else turn_input),
+                events=self._drain_collector(
+                    prompted_input  # canonical turn identity
+                ),
             )
         except Exception as exc:
             collector.emit("turn_failed", error=str(exc))
