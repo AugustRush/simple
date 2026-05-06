@@ -13,10 +13,17 @@ import sys
 from typing import Any, Callable, Optional
 
 from agent import shared
+from agent.core.output import _active_event_collector
 
 CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
 USER_PLUGINS_DIR = shared.USER_PLUGINS_DIR
+
+
+def _emit_plugin_event(name: str, plugin_name: str = "", **fields: Any) -> None:
+    collector = _active_event_collector.get()
+    if collector is not None:
+        collector.emit(name, plugin_name=plugin_name, **fields)
 
 class AgentPlugin:
     """Protocol that plugin objects may implement (duck-typed).
@@ -539,7 +546,19 @@ class PluginCatalog:
                 )
                 if isinstance(r, HookResult):
                     if r.action == "block":
+                        _emit_plugin_event(
+                            "hook_blocked",
+                            plugin_name=meta.name,
+                            hook_name="on_prompt_submit",
+                            reason=r.message,
+                        )
                         return r
+                    if r.action == "context":
+                        _emit_plugin_event(
+                            "hook_context_injected",
+                            plugin_name=meta.name,
+                            hook_name="on_prompt_submit",
+                        )
                     if r.action != "noop":
                         result = r
             except asyncio.TimeoutError:
@@ -583,6 +602,14 @@ class PluginCatalog:
                 },
                 meta,
             )
+            for r in cmd_results:
+                if r.action == "continue":
+                    _emit_plugin_event(
+                        "hook_continued",
+                        plugin_name=meta.name,
+                        hook_name="on_turn_end",
+                        next_prompt=r.message,
+                    )
             results.extend(cmd_results)
 
             if not hasattr(plugin, "on_turn_end"):
@@ -594,6 +621,13 @@ class PluginCatalog:
                     timeout_seconds=self._hook_timeout(meta, "on_turn_end"),
                 )
                 if isinstance(r, HookResult):
+                    if r.action == "continue":
+                        _emit_plugin_event(
+                            "hook_continued",
+                            plugin_name=meta.name,
+                            hook_name="on_turn_end",
+                            next_prompt=r.message,
+                        )
                     results.append(r)
             except asyncio.TimeoutError:
                 shared.CONSOLE.print(
@@ -659,6 +693,13 @@ class PluginCatalog:
                     timeout_seconds=self._hook_timeout(meta, "on_pre_tool"),
                 )
                 if isinstance(r, HookResult) and r.action == "block":
+                    _emit_plugin_event(
+                        "hook_blocked",
+                        plugin_name=meta.name,
+                        hook_name="on_pre_tool",
+                        tool_name=event.tool_name,
+                        reason=r.message,
+                    )
                     return r
             except asyncio.TimeoutError:
                 shared.CONSOLE.print(

@@ -6,7 +6,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, TypeVar, overload
 
 from agent.core.attachments import MessageAttachment
-from agent.core.output import _active_sink
+from agent.core.output import EventCollector, _active_event_collector, _active_sink
 from agent.skills.catalog import prepare_user_message_for_skills
 from agent.tools.runtime import _active_schedule_target
 
@@ -359,18 +359,20 @@ class AgentCore:
             "chat_type": turn_input.metadata.get("chat_type", "p2p"),
         }
 
-    @staticmethod
-    def _runtime_event(
-        name: str,
-        turn_input: TurnInput,
-        **fields: Any,
-    ) -> RuntimeEvent:
-        return RuntimeEvent(
-            name=name,
-            session_id=turn_input.session_id,
-            channel_name=turn_input.channel_name,
-            fields=fields,
-            metadata=dict(turn_input.metadata),
+    def _drain_collector(self, turn_input: TurnInput) -> tuple[RuntimeEvent, ...]:
+        collector = _active_event_collector.get()
+        if collector is None:
+            return ()
+        raw_events = collector.drain()
+        return tuple(
+            RuntimeEvent(
+                name=e["name"],
+                session_id=turn_input.session_id,
+                channel_name=turn_input.channel_name,
+                fields=e["fields"],
+                metadata=dict(turn_input.metadata),
+            )
+            for e in raw_events
         )
 
     async def handle_turn(
@@ -382,7 +384,32 @@ class AgentCore:
         stream_callback: Callable[[str], None] | None = None,
         max_continuations: int = 1,
     ) -> TurnExecution:
-        """Run a normalized turn through hooks, tools, memory, and continuations."""
+        """Run a normalized turn through hooks, tools, memory, and continuations.
+
+        An ``EventCollector`` is activated for the duration of the turn so
+        that tool executors, plugin hooks, and maintenance operations can
+        emit ``RuntimeEvent`` facts into a single replayable stream.
+        """
+        collector = EventCollector()
+        collector_token = _active_event_collector.set(collector)
+        try:
+            return await self._handle_turn_impl(
+                turn_input, state, sink, stream_callback, max_continuations
+            )
+        finally:
+            _active_event_collector.reset(collector_token)
+
+    async def _handle_turn_impl(
+        self,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        sink: Any,
+        stream_callback: Callable[[str], None] | None,
+        max_continuations: int,
+    ) -> TurnExecution:
+        collector = _active_event_collector.get()
+        assert collector is not None  # set by handle_turn
+
         skill_catalog = self._skill_catalog()
         ctx_metadata = self._context_metadata(state)
         if skill_catalog is not None and ctx_metadata is not None:
@@ -401,18 +428,13 @@ class AgentCore:
             sink,
         )
         if blocked:
+            collector.emit("prompt_blocked", reason=prompt)
             return TurnExecution(
                 result=TurnResult(text=""),
                 iterations=0,
                 blocked=True,
                 block_reason=prompt,
-                events=(
-                    self._runtime_event(
-                        "prompt_blocked",
-                        prompted_input,
-                        reason=prompt,
-                    ),
-                ),
+                events=self._drain_collector(prompted_input),
             )
 
         state.ensure_task_context(prompt)
@@ -430,7 +452,6 @@ class AgentCore:
             final_result = TurnResult(text="")
             iteration_prompt = prompt
             iterations = 0
-            events: list[RuntimeEvent] = []
             for iteration_index in range(max(1, int(max_continuations) + 1)):
                 iterations = iteration_index + 1
                 state.ensure_task_context(iteration_prompt)
@@ -454,15 +475,12 @@ class AgentCore:
                     state.ctx,
                     stream_callback=callback,
                 )
-                events.append(
-                    self._runtime_event(
-                        "agent_result_ready",
-                        current_input,
-                        tool_calls=len(final_result.tool_calls),
-                        error=bool(final_result.error),
-                        content_len=len(final_result.text or ""),
-                        content_preview=(final_result.text or "")[:80],
-                    )
+                collector.emit(
+                    "agent_result_ready",
+                    tool_calls=len(final_result.tool_calls),
+                    error=bool(final_result.error),
+                    content_len=len(final_result.text or ""),
+                    content_preview=(final_result.text or "")[:80],
                 )
                 if sink is not None:
                     sink.on_turn_complete(
@@ -472,20 +490,9 @@ class AgentCore:
                     if final_result.error:
                         sink.on_error(final_result.error)
                     await self._drain_if_supported(sink)
-                events.append(
-                    self._runtime_event(
-                        "turn_response_delivered",
-                        current_input,
-                    )
-                )
+                collector.emit("turn_response_delivered")
                 if final_result.error:
-                    events.append(
-                        self._runtime_event(
-                            "turn_error_reported",
-                            current_input,
-                            error=final_result.error,
-                        )
-                    )
+                    collector.emit("turn_error_reported", error=final_result.error)
                 hook_results = await self._turn_runner().complete_turn(
                     current_input,
                     state,
@@ -498,12 +505,9 @@ class AgentCore:
                         and getattr(hook_result, "message", "")
                     ):
                         iteration_prompt = str(hook_result.message)
-                        events.append(
-                            self._runtime_event(
-                                "turn_continued",
-                                current_input,
-                                next_prompt=iteration_prompt,
-                            )
+                        collector.emit(
+                            "turn_continued",
+                            next_prompt=iteration_prompt,
                         )
                         continued = True
                         break
@@ -512,20 +516,14 @@ class AgentCore:
             return TurnExecution(
                 result=final_result,
                 iterations=iterations,
-                events=tuple(events),
+                events=self._drain_collector(current_input if iterations else turn_input),
             )
         except Exception as exc:
-            events.append(
-                self._runtime_event(
-                    "turn_failed",
-                    turn_input,
-                    error=str(exc),
-                )
-            )
+            collector.emit("turn_failed", error=str(exc))
             return TurnExecution(
                 result=TurnResult(text="", error=str(exc)),
                 iterations=iterations,
-                events=tuple(events),
+                events=self._drain_collector(turn_input),
             )
         finally:
             if schedule_target_token is not None:

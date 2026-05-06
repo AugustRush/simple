@@ -250,9 +250,38 @@ _active_sink: contextvars.ContextVar[Optional[OutputSink]] = contextvars.Context
 )
 
 
+class EventCollector:
+    """Append-only collector for ``RuntimeEvent`` instances, scoped to one turn.
+
+    Set via ``_active_event_collector`` ContextVar by AgentCore at turn start.
+    Components emit events into it.  When no collector is active the ContextVar
+    returns ``None`` and calls are safe no-ops.
+    """
+
+    __slots__ = ("_events",)
+
+    def __init__(self) -> None:
+        self._events: list[Any] = []
+
+    def emit(self, name: str, **fields: object) -> None:
+        self._events.append({"name": name, "fields": fields})
+
+    def drain(self) -> tuple[dict[str, object], ...]:
+        events = tuple(self._events)
+        self._events.clear()
+        return events
+
+
+_active_event_collector: contextvars.ContextVar[EventCollector | None] = (
+    contextvars.ContextVar("_active_event_collector", default=None)
+)
+
+
 __all__ = [
     "CliOutputSink",
+    "EventCollector",
     "OutputSink",
+    "_active_event_collector",
     "_active_sink",
     "_fmt_tool_inputs",
 ]

@@ -142,46 +142,20 @@ class ChannelRunner:
         return worker
 
     @staticmethod
-    def _log_runtime_event(
-        event: RuntimeEvent,
-        *,
-        duration_ms: str | None = None,
-    ) -> None:
-        fields = dict(event.fields)
-        if duration_ms is not None:
-            fields.setdefault("duration_ms", duration_ms)
+    def _log_runtime_event(event: RuntimeEvent) -> None:
+        """Convert any RuntimeEvent into a structured interaction log.
+
+        Every event name becomes the log ``event`` key.  Fields and metadata
+        are flattened into the log payload so the event stream is the single
+        source of truth — no per-event-name branching required.
+        """
+        payload: dict[str, object] = dict(event.fields)
+        payload["session_id"] = event.session_id
+        payload["channel"] = event.channel_name
         message_id = event.metadata.get("message_id")
-        if event.name == "prompt_blocked":
-            _interaction_log(
-                "prompt_blocked",
-                reason=fields.get("reason", ""),
-                channel=event.channel_name,
-                message_id=message_id,
-            )
-            return
-        if event.name == "agent_result_ready":
-            _interaction_log(
-                "agent_result_ready",
-                session_id=event.session_id,
-                message_id=message_id,
-                **fields,
-            )
-            return
-        if event.name == "turn_response_delivered":
-            _interaction_log(
-                "turn_response_delivered",
-                session_id=event.session_id,
-                message_id=message_id,
-                **fields,
-            )
-            return
-        if event.name == "turn_error_reported":
-            _interaction_log(
-                "turn_error_reported",
-                session_id=event.session_id,
-                message_id=message_id,
-                **fields,
-            )
+        if message_id:
+            payload["message_id"] = message_id
+        _interaction_log(event.name, **{k: v for k, v in payload.items() if v is not None})
 
     def _ensure_session_state(
         self, sessions: dict[str, RuntimeSessionState], session_id: str
@@ -324,7 +298,7 @@ class ChannelRunner:
                     error=bool(result.error),
                 )
                 for event in execution.events:
-                    self._log_runtime_event(event, duration_ms=agent_duration_ms)
+                    self._log_runtime_event(event)
 
             except Exception as exc:
                 _interaction_log(

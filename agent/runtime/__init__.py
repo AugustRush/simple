@@ -1,5 +1,7 @@
 """Runtime contract exports."""
 
+from agent.core.output import EventCollector, _active_event_collector
+
 from .contracts import (
     AgentCore,
     RuntimeComponents,
@@ -13,6 +15,7 @@ from .contracts import (
 
 __all__ = [
     "AgentCore",
+    "EventCollector",
     "RuntimeComponents",
     "RuntimeEvent",
     "RuntimeSessionState",
@@ -20,4 +23,5 @@ __all__ = [
     "TurnInput",
     "TurnResult",
     "TurnRunner",
+    "_active_event_collector",
 ]
