@@ -216,6 +216,106 @@ class ModelClientFactory:
         return result
 
 
+def _validate_config(cfg: dict) -> list[str]:
+    """Validate config.json structure and types. Returns list of warning messages.
+
+    Does NOT abort — warnings are printed but the agent still starts with
+    best-effort defaults so a typo doesn't brick the agent.
+    """
+    warnings: list[str] = []
+    known_sections = frozenset({
+        "active_provider", "providers", "model", "max_tokens",
+        "memory", "orchestration", "evolution", "scheduler", "audio",
+        "mcp_servers", "context", "plugins", "channels",
+        "system_prompt_file", "output_dir", "tavily_api_key",
+        "assistant_identity", "shell_blocked_commands",
+        "llm_max_retries", "llm_retry_base_delay",
+    })
+
+    # ── Top-level unknown keys ────────────────────────────────────────────
+    for key in cfg:
+        if key not in known_sections:
+            warnings.append(f"Unknown config key '{key}' — ignored")
+
+    # ── active_provider must reference a real provider ─────────────────────
+    active = cfg.get("active_provider", "")
+    providers = cfg.get("providers", {})
+    if not isinstance(providers, dict):
+        warnings.append("'providers' must be a dict")
+        providers = {}
+    if active and active not in providers:
+        warnings.append(
+            f"active_provider '{active}' not found in providers. "
+            f"Available: {', '.join(providers.keys()) or '(none)'}"
+        )
+
+    # ── Validate each provider ─────────────────────────────────────────────
+    for pname, pcfg in providers.items():
+        if not isinstance(pcfg, dict):
+            warnings.append(f"providers.{pname}: must be a dict, got {type(pcfg).__name__}")
+            continue
+        fmt = pcfg.get("api_format", "")
+        if fmt not in ("anthropic", "openai"):
+            warnings.append(
+                f"providers.{pname}.api_format: must be 'anthropic' or 'openai', got '{fmt}'"
+            )
+        if not isinstance(pcfg.get("api_key"), str):
+            warnings.append(f"providers.{pname}.api_key: must be a string")
+        if not isinstance(pcfg.get("default_model"), str) or not pcfg.get("default_model"):
+            warnings.append(f"providers.{pname}.default_model: must be a non-empty string")
+
+    # ── Numeric range checks ───────────────────────────────────────────────
+    def _check_int(key: str, min_val: int, max_val: int) -> None:
+        val = cfg.get(key)
+        if val is not None:
+            try:
+                ival = int(val)
+                if ival < min_val or ival > max_val:
+                    warnings.append(f"'{key}': {ival} out of range [{min_val}, {max_val}]")
+            except (TypeError, ValueError):
+                warnings.append(f"'{key}': must be an integer, got {val!r}")
+
+    def _check_float(key: str, min_val: float) -> None:
+        val = cfg.get(key)
+        if val is not None:
+            try:
+                fval = float(val)
+                if fval < min_val:
+                    warnings.append(f"'{key}': {fval} must be >= {min_val}")
+            except (TypeError, ValueError):
+                warnings.append(f"'{key}': must be a number, got {val!r}")
+
+    _check_int("max_tokens", 1, 2_000_000)
+    _check_int("llm_max_retries", 0, 20)
+    _check_float("llm_retry_base_delay", 0.1)
+
+    scheduler = cfg.get("scheduler", {})
+    if isinstance(scheduler, dict):
+        _check_int("scheduler.poll_seconds", 1, 3600) if "poll_seconds" in scheduler else None
+        _check_int("scheduler.lease_seconds", 1, 3600) if "lease_seconds" in scheduler else None
+        # Check inline
+        for skey, smin in (("poll_seconds", 1), ("lease_seconds", 10)):
+            sv = scheduler.get(skey)
+            if sv is not None:
+                try:
+                    if int(sv) < smin:
+                        warnings.append(f"scheduler.{skey}: must be >= {smin}")
+                except (TypeError, ValueError):
+                    warnings.append(f"scheduler.{skey}: must be an integer")
+
+    # ── channels section ───────────────────────────────────────────────────
+    channels = cfg.get("channels", {})
+    if isinstance(channels, dict):
+        feishu = channels.get("feishu", {})
+        if isinstance(feishu, dict) and feishu.get("enabled"):
+            if not feishu.get("app_id") or not feishu.get("app_secret"):
+                warnings.append(
+                    "channels.feishu is enabled but app_id or app_secret is missing"
+                )
+
+    return warnings
+
+
 def load_config() -> tuple[dict, bool]:
     """Load config from disk, creating it on first run.
 
@@ -242,6 +342,10 @@ def load_config() -> tuple[dict, bool]:
         ):
             if section not in raw and section in DEFAULT_CONFIG:
                 raw[section] = DEFAULT_CONFIG[section]
+        # Validate and warn (never block startup)
+        config_warnings = _validate_config(raw)
+        for w in config_warnings:
+            shared.CONSOLE.print(f"[yellow]Config: {w}[/yellow]")
         return raw, first_run
     except Exception as e:
         shared.CONSOLE.print(f"[yellow]Config parse error: {e} — using defaults[/yellow]")

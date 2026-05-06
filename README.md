@@ -31,9 +31,273 @@ uv run simple
 
 The setup wizard guides you through provider selection, API key configuration, and model choice. Config is written to `~/.agent/config.json`.
 
+## Examples
+
+### Multi-instance deployment
+
+```bash
+# Production instance
+uv run simple gateway --name prod    # -> ~/.agent-prod/{config.json,palace.db,...}
+
+# Development instance with its own config
+uv run simple gateway --name dev     # -> ~/.agent-dev/
+
+# Default (no --name)
+uv run simple gateway                # -> ~/.agent/
+```
+
+Each named instance has independent config, memory, context database, scheduler, skills, and plugins.
+
+### Feishu Gateway
+
+```bash
+# Install Feishu dependency
+uv sync --extra feishu
+
+# Start gateway
+uv run simple gateway
+
+# Production instance with Feishu
+uv run simple gateway --name prod
+```
+
+Configure in `~/.agent/config.json`:
+```json
+{
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "app_id": "cli_xxxx",
+      "app_secret": "xxxx",
+      "group_policy": "mention",
+      "streaming": true
+    }
+  }
+}
+```
+
+### Scheduling tasks
+
+```bash
+# Daily summary at 9 AM Shanghai time
+uv run simple schedule daily morning-summary \
+  --time 09:00 --timezone Asia/Shanghai \
+  --prompt "Summarize yesterday's progress and list today's schedule"
+
+# One-shot reminder
+uv run simple schedule once deploy-reminder \
+  --at "2026-05-05T16:00:00+08:00" --timezone Asia/Shanghai \
+  --prompt "Check if the production deploy completed successfully"
+
+# Every-30-minutes health check
+uv run simple schedule interval health-check \
+  --every 30 --unit minutes \
+  --anchor-at "2026-05-05T00:00:00+08:00" \
+  --prompt "Verify all services are healthy"
+
+# Deliver to Feishu chat
+uv run simple schedule daily standup \
+  --time 09:00 --timezone Asia/Shanghai \
+  --prompt "Generate standup notes from yesterday's activity" \
+  --delivery-mode channel --chat-id ou_xxxxxx
+
+# Manage tasks
+uv run simple schedule list
+uv run simple schedule show <task-id>
+uv run simple schedule pause <task-id>
+uv run simple schedule delete <task-id>
+```
+
+### Creating a skill
+
+```bash
+# Skill "code-review" in ~/.agent/skills/code-review/SKILL.md
+mkdir -p ~/.agent/skills/code-review
+cat > ~/.agent/skills/code-review/SKILL.md << 'EOF'
+---
+name: Code Review
+description: Review code changes for correctness, security, and style.
+user-invocable: true
+---
+
+## Steps
+1. Read the changed files with `read_file`
+2. Check for: security issues, edge cases, error handling gaps
+3. Format findings as a table: Severity | File | Issue | Suggestion
+4. Summarize with an overall recommendation (approve / changes requested)
+EOF
+```
+
+The skill is hot-reloaded. Next turn the agent will see it and can activate it:
+
+```
+You: /code-review Review my last PR changes
+```
+
+### Writing a plugin
+
+Plugins are Python modules in `~/.agent/plugins/`. Minimal example:
+
+```bash
+mkdir -p ~/.agent/plugins/hello
+```
+
+**`~/.agent/plugins/hello/plugin.json`:**
+```json
+{
+  "name": "hello",
+  "version": "1.0.0",
+  "description": "Greet the user on session start",
+  "hooks": {
+    "on_pre_tool": [
+      {"matcher": "^shell$", "timeout": 5.0}
+    ]
+  }
+}
+```
+
+**`~/.agent/plugins/hello/__init__.py`:**
+```python
+def register():
+    return HelloPlugin()
+
+class HelloPlugin:
+    name = "hello"
+    version = "1.0.0"
+
+    def on_session_start(self, components):
+        print("Hello! Plugin loaded.")
+
+    async def on_prompt_submit(self, text, metadata):
+        # Block messages containing secrets
+        from agent.plugins.catalog import HookResult
+        if "API_KEY" in text:
+            return HookResult(action="block", message="Message contains secret")
+        return HookResult()
+
+    async def on_turn_end(self, event):
+        from agent.plugins.catalog import HookResult
+        if "error" in event.agent_response.lower():
+            return HookResult(
+                action="continue",
+                message="The previous response contained an error. Please fix it."
+            )
+        return HookResult()
+
+    def compose_system_prompt(self, current):
+        return "Always sign your responses with: — your personal agent"
+
+    def register_slash_commands(self):
+        return {"hello": self._handle_hello}
+
+    async def _handle_hello(self, raw_cmd, components):
+        print("Hello from slash command!")
+```
+
+Plugin hooks:
+| Hook | When | Can do |
+|------|------|--------|
+| `on_session_start` | Startup | Capture components (client, model, memory) |
+| `on_prompt_submit` | Before agent sees message | Block, inject context |
+| `on_pre_tool` | Before tool execution | Block tools (with matchers) |
+| `on_post_tool` | After tool execution | Observe results |
+| `on_turn_end` | After each turn | Continue loop, inject context |
+| `on_session_end` | Shutdown | Score session, persist analytics |
+| `compose_system_prompt` | System prompt build | Append behavior rules |
+| `register_slash_commands` | Startup | Register /commands |
+
+### Memory management
+
+```bash
+# Browse memory
+uv run simple memory index
+
+# Read a memory entry
+uv run simple memory show identity/user
+
+# Search
+uv run simple memory search "preferences"
+
+# AI-assisted tidy (reorganize and deduplicate)
+uv run simple memory tidy
+```
+
+In-session commands:
+```
+/memory     — memory export summary
+/context    — LTM stats (categories, staged turns, idle time)
+/sessions   — recent session history with scores
+/session abcd1234  — details of a specific session
+```
+
+### Multi-agent orchestration
+
+```text
+# Parallel — 3 independent reviewers
+You: 让 3 个子 agent 分别从性能、正确性、可维护性 review 这次改动
+
+# Pipeline — sequential dependency
+You: 先让 researcher 收集事实，再让 planner 给出方案，最后让 critic 审查方案
+
+# Rendezvous — multi-round debate
+You: 让正方和反方分别给方案，互相回应一轮后，再收敛成最终建议
+```
+
+### Autonomous task loop (Ralph)
+
+```text
+You: /ralph "make all tests pass in this project" --max 15 --verify "pytest tests/"
+
+# List tasks
+You: /ralph list
+
+# Resume interrupted task
+You: /ralph resume abc123def456
+```
+
+### Evolution
+
+```bash
+# View scores and session history
+uv run simple evolve --stats
+
+# Let the agent rewrite its own system prompt from session feedback
+uv run simple evolve --rewrite
+
+# Apply the best-scoring prompt from history
+uv run simple evolve --apply-best
+```
+
+### Model switching
+
+```text
+You: /model              # list available models
+You: /model deepseek-chat  # switch session to DeepSeek
+```
+
+### Working with MCP tools
+
+```json
+{
+  "mcp_servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@anthropic-ai/mcp-server-filesystem", "/path/to/allowed/dir"]
+    }
+  ]
+}
+```
+
+MCP tools appear alongside built-in tools and are listed in `compose_system_prompt`. Plugins can also bundle MCP servers via `plugin.json` `mcp_servers` field.
+
+---
+
 ## Configuration
 
 Config lives at `~/.agent/config.json`. First run creates it automatically.
+
+Config validation runs at startup — warnings are printed for unknown keys or invalid values, but the agent still starts with best-effort defaults.
 
 ```bash
 # View current config

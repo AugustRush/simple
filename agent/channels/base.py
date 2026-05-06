@@ -181,10 +181,14 @@ class ChannelRunner:
         tasks = [asyncio.create_task(self._run_channel(ch)) for ch in self._channels]
         try:
             await asyncio.gather(*tasks)
-        except Exception:
+        finally:
             for t in tasks:
                 t.cancel()
-            raise
+            for ch in self._channels:
+                try:
+                    await ch.stop()
+                except Exception:
+                    pass
 
     async def _run_channel(self, channel: Channel) -> None:
         import agent as agent_module

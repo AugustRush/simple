@@ -1537,7 +1537,7 @@ class FeishuChannel(Channel):
                 ws_loop.close()
 
         self._ws_thread = threading.Thread(
-            target=_run_ws, daemon=True, name="feishu-ws"
+            target=_run_ws, daemon=False, name="feishu-ws"
         )
         self._ws_thread.start()
         logger.info("Feishu bot started (WebSocket long connection)")
@@ -1546,9 +1546,17 @@ class FeishuChannel(Channel):
         await self._stop_event.wait()
 
     async def stop(self) -> None:
+        """Stop the WebSocket connection gracefully with draining."""
         self._running = False
         if self._stop_event is not None:
             self._stop_event.set()
+        if self._ws_thread is not None and self._ws_thread.is_alive():
+            self._ws_thread.join(timeout=5.0)
+            if self._ws_thread.is_alive():
+                logger.warning(
+                    "Feishu WebSocket thread did not exit within timeout "
+                    "(ws_client.start() still blocking)"
+                )
         logger.info("Feishu bot stopped")
 
     def set_output_dir(self, output_dir: Optional[Path]) -> None:
