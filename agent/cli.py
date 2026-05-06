@@ -18,7 +18,7 @@ from rich.table import Table
 import agent as agent_module
 from agent import shared
 from agent.core.output import CliOutputSink, _active_sink
-from agent.runtime import RuntimeComponents, RuntimeSessionState, TurnInput, TurnRunner
+from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 
 AgentContext = agent_module.AgentContext
 BaseAgent = agent_module.BaseAgent
@@ -46,8 +46,6 @@ _build_gateway_channels = agent_module._build_gateway_channels
 _new_id = agent_module._new_id
 _load_ralph_task = agent_module._load_ralph_task
 _save_ralph_task = agent_module._save_ralph_task
-_with_task_context = agent_module._with_task_context
-prepare_user_message_for_skills = agent_module.prepare_user_message_for_skills
 
 app = typer.Typer(
     name="agent",
@@ -66,11 +64,11 @@ _INTERACTION_LOGGER_NAMES = (
 )
 
 
-def _turn_runner_for_components(components: dict):
-    turn_runner = components.get("turn_runner")
-    if turn_runner is None or isinstance(turn_runner, TurnRunner):
-        return TurnRunner(RuntimeComponents(components))
-    return turn_runner
+def _agent_core_for_components(components: dict):
+    agent_core = components.get("agent_core")
+    if agent_core is None or isinstance(agent_core, AgentCore):
+        return AgentCore(RuntimeComponents(components))
+    return agent_core
 
 
 def _configure_runtime_logging() -> None:
@@ -350,16 +348,16 @@ async def _build_scheduler_service(
     )
 
     async def _agent_executor(task, run):
-        skill_catalog: SkillCatalog = components["skill_catalog"]
         ctx = AgentContext(system_prompt=components["system_prompt"])
-        ctx.metadata["skill_catalog"] = skill_catalog
+        state = RuntimeSessionState(ctx=ctx)
         prompt = str(task.payload.get("prompt", "")).strip()
         if not prompt:
             raise RuntimeError(f"Scheduled task '{task.name}' has no prompt")
-        result = await _turn_runner_for_components(components).run(
+        execution = await _agent_core_for_components(components).handle_turn(
             TurnInput.from_text(prompt, channel_name="scheduler"),
-            ctx,
+            state,
         )
+        result = execution.result
         if result.error:
             raise RuntimeError(result.error)
         content = result.text or ""
@@ -881,103 +879,18 @@ async def _interactive_loop(components: dict, cfg: dict):
                         f"iterations: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
                     )
                     continue
-                else:
-                    normalized_input, required_skills = prepare_user_message_for_skills(
-                        user_input, skill_catalog
-                    )
-                    if required_skills:
-                        user_input = normalized_input
-                        ctx.metadata["required_skills"] = required_skills
-                    else:
-                        shared.CONSOLE.print(f"[yellow]Unknown command: {user_input}[/yellow]")
-                        continue
-            else:
-                normalized_input, required_skills = prepare_user_message_for_skills(
-                    user_input, skill_catalog
+
+            _turn_sink = CliOutputSink(shared.CONSOLE)
+            try:
+                shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+                ctx.metadata["skill_catalog"] = skill_catalog
+                await _agent_core_for_components(components).handle_turn(
+                    TurnInput.from_text(user_input, channel_name="cli"),
+                    state,
+                    sink=_turn_sink,
                 )
-                if required_skills:
-                    user_input = normalized_input
-                    ctx.metadata["required_skills"] = required_skills
-                else:
-                    ctx.metadata.pop("required_skills", None)
-
-            # ── Plugin hook: on_prompt_submit ────────────────────────────────
-            submit_result = await plugin_catalog.fire_prompt_submit(
-                user_input, {"channel": "cli", "session_id": state.ctx.agent_id}
-            )
-            if submit_result.action == "block":
-                shared.CONSOLE.print(
-                    f"[yellow]Message blocked by plugin: {submit_result.message}[/yellow]"
-                )
-                continue
-            if submit_result.context:
-                user_input = f"[{submit_result.context}]\n\n{user_input}"
-
-            # ── Turn loop: runs at least once; plugin continue hooks can
-            # feed a new prompt and loop again (max one extra iteration). ──
-            _turn_prompt = user_input
-            _turn_hook_results: list[Any] = []
-            for _turn_iter in range(2):  # 1 normal + 1 optional continue
-                if _turn_iter > 0:
-                    shared.CONSOLE.print(
-                        f"[dim]Plugin continue: {_turn_prompt[:80]}[/dim]"
-                    )
-
-                # Mark activity so idle timer resets
-                if ctx_mgr:
-                    ctx_mgr.mark_activity()
-                state.ensure_task_context(_turn_prompt)
-
-                _turn_sink = CliOutputSink(shared.CONSOLE)
-                _sink_token = _active_sink.set(_turn_sink)
-                try:
-                    shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
-                    ctx.metadata["skill_catalog"] = skill_catalog
-
-                    if skill_catalog.consume_dirty():
-                        refreshed = agent_module._compose_system_prompt(
-                            components["base_system_prompt"],
-                            components["registry"],
-                            components.get("workspace_root"),
-                            components.get("output_dir"),
-                            skill_catalog=skill_catalog,
-                            plugin_catalog=plugin_catalog,
-                        )
-                        components["system_prompt"] = refreshed
-                        ctx.system_prompt = _with_task_context(
-                            refreshed, state.task_context
-                        )
-
-                    turn_runner = _turn_runner_for_components(components)
-                    turn_input = TurnInput.from_text(_turn_prompt, channel_name="cli")
-                    result = await turn_runner.run(
-                        turn_input,
-                        ctx,
-                        stream_callback=_turn_sink.sync_stream_cb,
-                    )
-                    tool_calls = list(result.tool_calls)
-                    _turn_sink.on_turn_complete(result.text or "", tool_calls)
-                    if result.error:
-                        shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
-
-                    _turn_hook_results = await turn_runner.complete_turn(
-                        turn_input, state, result
-                    )
-                except Exception as e:
-                    shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
-                    _turn_hook_results = []
-                finally:
-                    _active_sink.reset(_sink_token)
-
-                # Check for continue
-                continued = False
-                for hr in (_turn_hook_results or []):
-                    if getattr(hr, "action", "") == "continue" and getattr(hr, "message", ""):
-                        _turn_prompt = str(hr.message)
-                        continued = True
-                        break
-                if not continued:
-                    break
+            except Exception as e:
+                shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
 
     finally:
         if memory_worker:
@@ -1132,22 +1045,16 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
     async def _run():
         components = await agent_module._build_components_async(cfg)
         ctx = AgentContext(system_prompt=components["system_prompt"])
-        skill_catalog: SkillCatalog = components["skill_catalog"]
-        normalized_question, required_skills = prepare_user_message_for_skills(
-            question, skill_catalog
-        )
-        if required_skills:
-            ctx.metadata["required_skills"] = required_skills
-        ctx.metadata["skill_catalog"] = skill_catalog
+        state = RuntimeSessionState(ctx=ctx)
         shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+        sink = CliOutputSink(shared.CONSOLE)
         try:
-            result = await _turn_runner_for_components(components).run(
-                TurnInput.from_text(normalized_question, channel_name="cli"),
-                ctx,
-                stream_callback=lambda chunk: shared.CONSOLE.print(
-                    chunk, end="", markup=False
-                ),
+            execution = await _agent_core_for_components(components).handle_turn(
+                TurnInput.from_text(question, channel_name="cli"),
+                state,
+                sink=sink,
             )
+            result = execution.result
             shared.CONSOLE.print()
             if result.error:
                 shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")

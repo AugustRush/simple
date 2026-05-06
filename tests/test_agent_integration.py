@@ -5341,6 +5341,163 @@ def test_interactive_loop_routes_turn_through_runtime_runner(monkeypatch, tmp_pa
     assert turn_runner.complete_calls[0][1].turn_count == 1
 
 
+def test_interactive_loop_delegates_turn_to_agent_core(monkeypatch, tmp_path):
+    import agent as agent_module
+    from agent.runtime import TurnExecution, TurnResult
+
+    class _ExplodingAgent:
+        api_format = "openai"
+        max_tokens = 1024
+        model = "fake-model"
+
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            raise AssertionError("interactive loop should call AgentCore")
+
+    class _FakeMemory:
+        def read_index(self):
+            return ""
+
+    class _FakeEvolution:
+        pass
+
+    class _FakeSkillCatalog:
+        def list_skills(self):
+            return []
+
+        def consume_dirty(self):
+            raise AssertionError("AgentCore owns skill refresh during turns")
+
+    class _FakeUserToolCatalog:
+        pass
+
+    class _FakePluginCatalog:
+        def __init__(self):
+            self.prompt_submit_calls = 0
+
+        def fire_session_start(self, components):
+            return None
+
+        async def fire_session_end(self, event):
+            self.session_end = event
+
+        async def fire_prompt_submit(self, text, metadata=None):
+            self.prompt_submit_calls += 1
+            return agent_module.HookResult()
+
+    class _FakeAgentCore:
+        def __init__(self):
+            self.calls = []
+
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            self.calls.append((turn_input, state, sink, kwargs))
+            if sink:
+                sink.on_turn_complete("core reply", ["bash"])
+            state.record_turn(["bash"])
+            return TurnExecution(
+                result=TurnResult(text="core reply", tool_calls=("bash",))
+            )
+
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
+    answers = iter(["hello", "/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+
+    plugin_catalog = _FakePluginCatalog()
+    agent_core = _FakeAgentCore()
+    components = {
+        "agent": _ExplodingAgent(),
+        "memory": _FakeMemory(),
+        "evolution": _FakeEvolution(),
+        "system_prompt": "system",
+        "base_system_prompt": "system",
+        "skill_catalog": _FakeSkillCatalog(),
+        "user_tool_catalog": _FakeUserToolCatalog(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path / "output",
+        "plugin_catalog": plugin_catalog,
+        "agent_core": agent_core,
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    assert plugin_catalog.prompt_submit_calls == 0
+    assert len(agent_core.calls) == 1
+    turn_input, state, sink, kwargs = agent_core.calls[0]
+    assert turn_input.text == "hello"
+    assert turn_input.channel_name == "cli"
+    assert state.turn_count == 1
+    assert sink is not None
+    assert kwargs == {}
+
+
+def test_interactive_loop_passes_unknown_slash_input_to_agent_core(monkeypatch, tmp_path):
+    import agent as agent_module
+    from agent.runtime import TurnExecution, TurnResult
+
+    class _FakeAgent:
+        api_format = "openai"
+        max_tokens = 1024
+        model = "fake-model"
+
+    class _FakeMemory:
+        def read_index(self):
+            return ""
+
+    class _FakeSkillCatalog:
+        def list_skills(self):
+            return []
+
+    class _FakePluginCatalog:
+        def fire_session_start(self, components):
+            return None
+
+        def get_slash_commands(self):
+            return {}
+
+        async def fire_session_end(self, event):
+            return None
+
+    class _FakeAgentCore:
+        def __init__(self):
+            self.calls = []
+
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            self.calls.append((turn_input, state, sink, kwargs))
+            state.record_turn([])
+            return TurnExecution(result=TurnResult(text="ok"))
+
+    answers = iter(["/skill quality/review tighten", "/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+    agent_core = _FakeAgentCore()
+    components = {
+        "agent": _FakeAgent(),
+        "memory": _FakeMemory(),
+        "evolution": None,
+        "system_prompt": "system",
+        "base_system_prompt": "system",
+        "skill_catalog": _FakeSkillCatalog(),
+        "user_tool_catalog": object(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path / "output",
+        "plugin_catalog": _FakePluginCatalog(),
+        "agent_core": agent_core,
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    assert len(agent_core.calls) == 1
+    assert agent_core.calls[0][0].text == "/skill quality/review tighten"
+
+
 def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
     import agent as agent_module
     import agent.cli as cli_module
@@ -5362,6 +5519,10 @@ def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
             self.calls.append((turn_input, ctx, stream_callback))
             return TurnResult(text="chat reply")
 
+        async def complete_turn(self, turn_input, state, result):
+            state.record_turn(list(result.tool_calls))
+            return []
+
     turn_runner = _FakeTurnRunner()
     components = {
         "agent": _ExplodingAgent(),
@@ -5380,11 +5541,6 @@ def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
 
     monkeypatch.setattr(agent_module, "_build_components_async", fake_build_components_async)
     monkeypatch.setattr(agent_module, "_close_components", fake_close_components)
-    monkeypatch.setattr(
-        cli_module,
-        "prepare_user_message_for_skills",
-        lambda text, _catalog: (text, []),
-    )
 
     result = CliRunner().invoke(cli_module.app, ["chat", "hello"])
 
@@ -5394,6 +5550,61 @@ def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
     assert turn_input.text == "hello"
     assert turn_input.channel_name == "cli"
     assert callable(stream_callback)
+
+
+def test_chat_command_delegates_turn_to_agent_core(monkeypatch):
+    import agent as agent_module
+    import agent.cli as cli_module
+    from agent.runtime import TurnExecution, TurnResult
+    from typer.testing import CliRunner
+
+    class _ExplodingAgent:
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            raise AssertionError("chat command should call AgentCore")
+
+    class _FakeSkillCatalog:
+        pass
+
+    class _FakeAgentCore:
+        def __init__(self):
+            self.calls = []
+
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            self.calls.append((turn_input, state, sink, kwargs))
+            if sink:
+                sink.on_turn_complete("chat core reply", [])
+            state.record_turn([])
+            return TurnExecution(result=TurnResult(text="chat core reply"))
+
+    agent_core = _FakeAgentCore()
+    components = {
+        "agent": _ExplodingAgent(),
+        "system_prompt": "system",
+        "skill_catalog": _FakeSkillCatalog(),
+        "agent_core": agent_core,
+    }
+
+    monkeypatch.setattr(agent_module, "load_config", lambda: (_minimal_cfg(), False))
+
+    async def fake_build_components_async(cfg):
+        return components
+
+    async def fake_close_components(components):
+        return None
+
+    monkeypatch.setattr(agent_module, "_build_components_async", fake_build_components_async)
+    monkeypatch.setattr(agent_module, "_close_components", fake_close_components)
+
+    result = CliRunner().invoke(cli_module.app, ["chat", "hello"])
+
+    assert result.exit_code == 0
+    assert len(agent_core.calls) == 1
+    turn_input, state, sink, kwargs = agent_core.calls[0]
+    assert turn_input.text == "hello"
+    assert turn_input.channel_name == "cli"
+    assert state.turn_count == 1
+    assert sink is not None
+    assert kwargs == {}
 
 
 def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch, tmp_path):
@@ -5413,6 +5624,10 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
         async def run(self, turn_input, ctx, stream_callback=None):
             self.calls.append((turn_input, ctx, stream_callback))
             return TurnResult(text="scheduled reply\nsecond line")
+
+        async def complete_turn(self, turn_input, state, result):
+            state.record_turn(list(result.tool_calls))
+            return []
 
     class _FakeService:
         def __init__(self, **kwargs):
@@ -5452,6 +5667,73 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
     turn_input, _ctx, _stream_callback = turn_runner.calls[0]
     assert turn_input.text == "hello"
     assert turn_input.channel_name == "scheduler"
+
+
+def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_path):
+    import types
+
+    import agent.cli as cli_module
+    from agent.runtime import TurnExecution, TurnResult
+
+    class _ExplodingAgent:
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            raise AssertionError("scheduler agent executor should call AgentCore")
+
+    class _FakeAgentCore:
+        def __init__(self):
+            self.calls = []
+
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            self.calls.append((turn_input, state, sink, kwargs))
+            state.record_turn(["search"])
+            return TurnExecution(
+                result=TurnResult(text="scheduled core reply\nsecond line")
+            )
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            self.agent_executor = kwargs["agent_executor"]
+
+    class _FakeStore:
+        pass
+
+    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
+    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+
+    agent_core = _FakeAgentCore()
+    components = {
+        "agent": _ExplodingAgent(),
+        "system_prompt": "system",
+        "skill_catalog": object(),
+        "agent_core": agent_core,
+        "output_dir": tmp_path,
+    }
+
+    service, _store, _components = asyncio.run(
+        cli_module._build_scheduler_service(
+            _minimal_cfg(),
+            poll_seconds=1,
+            lease_seconds=30,
+            max_concurrent_runs=1,
+            components=components,
+        )
+    )
+    task = types.SimpleNamespace(
+        name="daily",
+        payload={"prompt": "scheduled prompt"},
+    )
+
+    result = asyncio.run(service.agent_executor(task, object()))
+
+    assert result.text_output == "scheduled core reply\nsecond line"
+    assert result.summary == "scheduled core reply"
+    assert len(agent_core.calls) == 1
+    turn_input, state, sink, kwargs = agent_core.calls[0]
+    assert turn_input.text == "scheduled prompt"
+    assert turn_input.channel_name == "scheduler"
+    assert state.turn_count == 1
+    assert sink is None
+    assert kwargs == {}
 
 
 def test_interactive_loop_context_command_uses_dynamic_category_stats(

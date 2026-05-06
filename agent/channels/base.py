@@ -12,10 +12,15 @@ from typing import Any, Callable
 from rich.console import Console
 
 from agent import shared
-from agent.core.output import CliOutputSink, OutputSink, _active_sink
+from agent.core.output import CliOutputSink, OutputSink
 from agent.core.attachments import MessageAttachment
-from agent.runtime import RuntimeComponents, RuntimeSessionState, TurnInput, TurnRunner
-from agent.tools.runtime import _active_schedule_target
+from agent.runtime import (
+    AgentCore,
+    RuntimeComponents,
+    RuntimeEvent,
+    RuntimeSessionState,
+    TurnInput,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +141,48 @@ class ChannelRunner:
         worker.start()
         return worker
 
+    @staticmethod
+    def _log_runtime_event(
+        event: RuntimeEvent,
+        *,
+        duration_ms: str | None = None,
+    ) -> None:
+        fields = dict(event.fields)
+        if duration_ms is not None:
+            fields.setdefault("duration_ms", duration_ms)
+        message_id = event.metadata.get("message_id")
+        if event.name == "prompt_blocked":
+            _interaction_log(
+                "prompt_blocked",
+                reason=fields.get("reason", ""),
+                channel=event.channel_name,
+                message_id=message_id,
+            )
+            return
+        if event.name == "agent_result_ready":
+            _interaction_log(
+                "agent_result_ready",
+                session_id=event.session_id,
+                message_id=message_id,
+                **fields,
+            )
+            return
+        if event.name == "turn_response_delivered":
+            _interaction_log(
+                "turn_response_delivered",
+                session_id=event.session_id,
+                message_id=message_id,
+                **fields,
+            )
+            return
+        if event.name == "turn_error_reported":
+            _interaction_log(
+                "turn_error_reported",
+                session_id=event.session_id,
+                message_id=message_id,
+                **fields,
+            )
+
     def _ensure_session_state(
         self, sessions: dict[str, RuntimeSessionState], session_id: str
     ) -> RuntimeSessionState:
@@ -216,65 +263,18 @@ class ChannelRunner:
         self, sessions: dict[str, RuntimeSessionState]
     ) -> Callable[["IncomingMessage", OutputSink], Any]:
         components = self._components
-        turn_runner = components.get("turn_runner")
-        if turn_runner is None:
-            turn_runner = TurnRunner(RuntimeComponents(components))
+        agent_core = components.get("agent_core")
+        if agent_core is None:
+            agent_core = AgentCore(RuntimeComponents(components))
 
         async def _handle(msg: IncomingMessage, sink: OutputSink) -> bool:
-            import agent as agent_module
-
             turn_started_at = time.perf_counter()
             session_id = msg.metadata.get("chat_id") or msg.session_id
             skill_catalog = components["skill_catalog"]
             state = self._ensure_session_state(sessions, session_id)
             ctx = state.ctx
-            ctx_mgr = state.context_manager
             ctx.metadata["skill_catalog"] = skill_catalog
-
-            state.ensure_task_context(msg.text)
-
-            if ctx_mgr:
-                ctx_mgr.mark_activity()
-
-            token = _active_sink.set(sink)
-            schedule_target_token = None
-            if msg.channel_name == "feishu" and msg.metadata.get("chat_id"):
-                schedule_target_token = _active_schedule_target.set(
-                    {
-                        "delivery_mode": "channel",
-                        "target_type": "feishu_chat",
-                        "chat_id": msg.metadata["chat_id"],
-                        "chat_type": msg.metadata.get("chat_type", "p2p"),
-                    }
-                )
             try:
-                # ── Plugin hook: on_prompt_submit ────────────────────────────
-                plugin_catalog = components.get("plugin_catalog")
-                if plugin_catalog:
-                    submit_result = await plugin_catalog.fire_prompt_submit(
-                        msg.text,
-                        {
-                            "channel": msg.channel_name,
-                            "chat_id": msg.metadata.get("chat_id", ""),
-                            "message_id": msg.metadata.get("message_id", ""),
-                        },
-                    )
-                    if submit_result.action == "block":
-                        _interaction_log(
-                            "prompt_blocked",
-                            reason=submit_result.message,
-                            channel=msg.channel_name,
-                        )
-                        sink.on_status(
-                            f"Message blocked: {submit_result.message}",
-                            level="warning",
-                        )
-                        if hasattr(sink, "drain"):
-                            await sink.drain()
-                        return False
-                    if submit_result.context:
-                        msg.text = f"[{submit_result.context}]\n\n{msg.text}"
-
                 _interaction_log(
                     "turn_started",
                     session_id=session_id,
@@ -301,67 +301,30 @@ class ChannelRunner:
                     metadata=msg.metadata,
                     attachments=msg.attachments,
                 )
-                result = await turn_runner.run(
+                execution = await agent_core.handle_turn(
                     turn_input,
-                    ctx,
-                    stream_callback=sink.sync_stream_cb,
+                    state,
+                    sink=sink,
                 )
+                agent_duration_ms = (
+                    f"{(time.perf_counter() - agent_started_at) * 1000:.1f}"
+                )
+                if execution.blocked:
+                    for event in execution.events:
+                        self._log_runtime_event(event)
+                    return False
+                result = execution.result
                 tool_calls = list(result.tool_calls)
                 _trace_latency(
                     "agent_send_message_finished",
                     session_id=session_id,
                     message_id=msg.metadata.get("message_id"),
-                    duration_ms=f"{(time.perf_counter() - agent_started_at) * 1000:.1f}",
+                    duration_ms=agent_duration_ms,
                     tool_calls=len(tool_calls),
                     error=bool(result.error),
                 )
-                _interaction_log(
-                    "agent_result_ready",
-                    session_id=session_id,
-                    message_id=msg.metadata.get("message_id"),
-                    duration_ms=f"{(time.perf_counter() - agent_started_at) * 1000:.1f}",
-                    tool_calls=len(tool_calls),
-                    error=bool(result.error),
-                    content_len=len(result.text or ""),
-                    content_preview=_preview_text(result.text or ""),
-                )
-                sink_started_at = time.perf_counter()
-                sink.on_turn_complete(result.text or "", tool_calls)
-                if hasattr(sink, "drain"):
-                    await sink.drain()
-                _trace_latency(
-                    "sink_turn_complete_finished",
-                    session_id=session_id,
-                    message_id=msg.metadata.get("message_id"),
-                    duration_ms=f"{(time.perf_counter() - sink_started_at) * 1000:.1f}",
-                )
-                _interaction_log(
-                    "turn_response_delivered",
-                    session_id=session_id,
-                    message_id=msg.metadata.get("message_id"),
-                    duration_ms=f"{(time.perf_counter() - sink_started_at) * 1000:.1f}",
-                )
-
-                if result.error:
-                    error_started_at = time.perf_counter()
-                    sink.on_error(result.error)
-                    if hasattr(sink, "drain"):
-                        await sink.drain()
-                    _trace_latency(
-                        "sink_error_finished",
-                        session_id=session_id,
-                        message_id=msg.metadata.get("message_id"),
-                        duration_ms=f"{(time.perf_counter() - error_started_at) * 1000:.1f}",
-                    )
-                    _interaction_log(
-                        "turn_error_reported",
-                        session_id=session_id,
-                        message_id=msg.metadata.get("message_id"),
-                        duration_ms=f"{(time.perf_counter() - error_started_at) * 1000:.1f}",
-                        error=result.error,
-                    )
-
-                await turn_runner.complete_turn(turn_input, state, result)
+                for event in execution.events:
+                    self._log_runtime_event(event, duration_ms=agent_duration_ms)
 
             except Exception as exc:
                 _interaction_log(
@@ -383,9 +346,6 @@ class ChannelRunner:
                     duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
                     turn_count=state.turn_count,
                 )
-                _active_sink.reset(token)
-                if schedule_target_token is not None:
-                    _active_schedule_target.reset(schedule_target_token)
 
             return True
 

@@ -9,6 +9,7 @@ from .output import CliOutputSink, OutputSink
 
 __all__ = [
     "AgentContext",
+    "AgentCore",
     "AgentResult",
     "BaseAgent",
     "CliOutputSink",
@@ -16,8 +17,10 @@ __all__ = [
     "OutputSink",
     "RalphTask",
     "RuntimeComponents",
+    "RuntimeEvent",
     "RuntimeSessionState",
     "SubAgentProgressEvent",
+    "TurnExecution",
     "TurnInput",
     "TurnResult",
     "TurnRunner",
@@ -41,8 +44,11 @@ def __getattr__(name: str):
 
         return agent_module.RalphTask
     if name in {
+        "AgentCore",
         "RuntimeComponents",
+        "RuntimeEvent",
         "RuntimeSessionState",
+        "TurnExecution",
         "TurnInput",
         "TurnResult",
         "TurnRunner",

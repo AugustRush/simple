@@ -16,7 +16,7 @@ from agent.config import (
 )
 from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
-from agent.runtime import TurnRunner
+from agent.runtime import AgentCore, TurnRunner
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import BuiltinTools, MCPClient, ToolRegistry, UserToolCatalog
 
@@ -298,6 +298,7 @@ async def _build_components_async(cfg: dict):
         "mcp_status": mcp_status,
     }
     components["turn_runner"] = TurnRunner(components)
+    components["agent_core"] = AgentCore(components)
     return components
 
 

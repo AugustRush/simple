@@ -673,6 +673,126 @@ def test_channel_runner_uses_turn_runner_when_provided():
     assert callable(stream_callback)
 
 
+def test_channel_runner_delegates_message_turn_to_agent_core():
+    from agent.runtime import TurnExecution, TurnResult
+
+    class _RecordingSink(OutputSink):
+        def __init__(self):
+            self.turns = []
+
+        def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
+            self.turns.append((full_text, tool_calls))
+
+    class _FakeAgentCore:
+        def __init__(self):
+            self.calls = []
+
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            self.calls.append((turn_input, state, sink, kwargs))
+            if sink:
+                sink.on_turn_complete("core reply", ["search"])
+            state.record_turn(["search"])
+            return TurnExecution(
+                result=TurnResult(text="core reply", tool_calls=("search",))
+            )
+
+    core = _FakeAgentCore()
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": object(),
+            "agent_core": core,
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+    sink = _RecordingSink()
+
+    asyncio.run(
+        handler(
+            IncomingMessage(
+                text="hello",
+                channel_name="feishu",
+                metadata={"chat_id": "chat-a", "message_id": "msg-1"},
+            ),
+            sink,
+        )
+    )
+
+    assert sink.turns == [("core reply", ["search"])]
+    assert len(core.calls) == 1
+    turn_input, state, observed_sink, kwargs = core.calls[0]
+    assert turn_input.text == "hello"
+    assert turn_input.session_id == "chat-a"
+    assert turn_input.channel_name == "feishu"
+    assert turn_input.metadata["message_id"] == "msg-1"
+    assert state.turn_count == 1
+    assert observed_sink is sink
+    assert kwargs == {}
+
+
+def test_channel_runner_logs_blocked_turn_without_response_delivery(caplog):
+    from agent.runtime import RuntimeEvent, TurnExecution, TurnResult
+
+    caplog.set_level(logging.INFO, logger="agent")
+
+    class _FakeAgentCore:
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            return TurnExecution(
+                result=TurnResult(text=""),
+                iterations=0,
+                blocked=True,
+                block_reason="policy",
+                events=(
+                    RuntimeEvent(
+                        name="prompt_blocked",
+                        session_id=turn_input.session_id,
+                        channel_name=turn_input.channel_name,
+                        fields={"reason": "event-policy"},
+                        metadata=turn_input.metadata,
+                    ),
+                ),
+            )
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": object(),
+            "agent_core": _FakeAgentCore(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler({})
+
+    delivered = asyncio.run(
+        handler(
+            IncomingMessage(
+                text="hello",
+                channel_name="feishu",
+                metadata={"chat_id": "chat-a", "message_id": "msg-1"},
+            ),
+            OutputSink(),
+        )
+    )
+
+    assert delivered is False
+    assert "interaction component=channel_runner event=prompt_blocked" in caplog.text
+    assert "reason=event-policy" in caplog.text
+    assert "interaction component=channel_runner event=agent_result_ready" not in caplog.text
+    assert (
+        "interaction component=channel_runner event=turn_response_delivered"
+        not in caplog.text
+    )
+
+
 def test_channel_runner_emits_interaction_logs(caplog):
     caplog.set_level(logging.INFO, logger="agent")
 
