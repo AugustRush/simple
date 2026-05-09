@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import contextvars
+from dataclasses import dataclass, field
 import json
 import re
 import time
 from abc import ABC
 from pathlib import Path
-from typing import Any, Optional
+from types import MappingProxyType
+from typing import Any, Mapping, Optional
 
 from rich.markdown import Markdown
 from rich.markup import escape as _markup_escape
@@ -250,6 +252,21 @@ _active_sink: contextvars.ContextVar[Optional[OutputSink]] = contextvars.Context
 )
 
 
+@dataclass(frozen=True)
+class RuntimeEvent:
+    """Canonical lifecycle fact emitted by runtime services."""
+
+    name: str
+    session_id: str = ""
+    channel_name: str = ""
+    fields: Mapping[str, Any] = field(default_factory=dict)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "fields", MappingProxyType(dict(self.fields)))
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+
+
 class EventCollector:
     """Append-only collector for ``RuntimeEvent`` instances, scoped to one turn.
 
@@ -261,12 +278,12 @@ class EventCollector:
     __slots__ = ("_events",)
 
     def __init__(self) -> None:
-        self._events: list[Any] = []
+        self._events: list[RuntimeEvent] = []
 
     def emit(self, name: str, **fields: object) -> None:
-        self._events.append({"name": name, "fields": fields})
+        self._events.append(RuntimeEvent(name=name, fields=dict(fields)))
 
-    def drain(self) -> tuple[dict[str, object], ...]:
+    def drain(self) -> tuple[RuntimeEvent, ...]:
         events = tuple(self._events)
         self._events.clear()
         return events
@@ -281,6 +298,7 @@ __all__ = [
     "CliOutputSink",
     "EventCollector",
     "OutputSink",
+    "RuntimeEvent",
     "_active_event_collector",
     "_active_sink",
     "_fmt_tool_inputs",

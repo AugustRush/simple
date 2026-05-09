@@ -1442,6 +1442,7 @@ class FeishuChannel(Channel):
         # Ordered LRU cache for message-id deduplication
         self._processed_ids: OrderedDict[str, None] = OrderedDict()
         self._stop_event: Optional[asyncio.Event] = None
+        self._active_sinks: list[FeishuOutputSink] = []
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -1550,6 +1551,13 @@ class FeishuChannel(Channel):
         self._running = False
         if self._stop_event is not None:
             self._stop_event.set()
+        # Drain all active sinks so in-flight messages are delivered
+        for sink in self._active_sinks:
+            try:
+                await sink.drain()
+            except Exception:
+                pass
+        self._active_sinks.clear()
         if self._ws_thread is not None and self._ws_thread.is_alive():
             self._ws_thread.join(timeout=5.0)
             if self._ws_thread.is_alive():
@@ -1573,7 +1581,7 @@ class FeishuChannel(Channel):
         chat_id = msg.metadata["chat_id"]
         chat_type = msg.metadata.get("chat_type", "p2p")
         receive_id_type = "chat_id" if _is_group_chat_type(chat_type) else "open_id"
-        return FeishuOutputSink(
+        sink = FeishuOutputSink(
             client=self._client,
             receive_id_type=receive_id_type,
             receive_id=chat_id,
@@ -1582,6 +1590,8 @@ class FeishuChannel(Channel):
             output_dir=self._output_dir,
             streaming=self._config.streaming,
         )
+        self._active_sinks.append(sink)
+        return sink
 
     @staticmethod
     def _safe_resource_filename(filename: str, fallback: str) -> str:

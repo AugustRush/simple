@@ -1,11 +1,10 @@
 """Runtime contract exports."""
 
-from agent.core.output import EventCollector, _active_event_collector
+from agent.core.output import EventCollector, RuntimeEvent, _active_event_collector
 
 from .contracts import (
     AgentCore,
     RuntimeComponents,
-    RuntimeEvent,
     RuntimeSessionState,
     TurnExecution,
     TurnInput,

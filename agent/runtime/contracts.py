@@ -7,7 +7,12 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping, TypeVar, overload
 
 from agent.core.attachments import MessageAttachment
-from agent.core.output import EventCollector, _active_event_collector, _active_sink
+from agent.core.output import (
+    EventCollector,
+    RuntimeEvent,
+    _active_event_collector,
+    _active_sink,
+)
 from agent.skills.catalog import prepare_user_message_for_skills
 from agent.tools.runtime import _active_schedule_target
 
@@ -348,14 +353,17 @@ class AgentCore:
                 await result
 
     def _schedule_target_for_turn(self, turn_input: TurnInput) -> dict[str, Any] | None:
-        if turn_input.channel_name != "feishu":
-            return None
+        """Derive a schedule delivery target from turn metadata.
+
+        Channel-agnostic: any transport that provides ``chat_id`` in metadata
+        can use channel delivery for scheduled tasks.
+        """
         chat_id = turn_input.metadata.get("chat_id")
         if not chat_id:
             return None
         return {
             "delivery_mode": "channel",
-            "target_type": "feishu_chat",
+            "target_type": turn_input.metadata.get("target_type", "feishu_chat"),
             "chat_id": chat_id,
             "chat_type": turn_input.metadata.get("chat_type", "p2p"),
         }
@@ -364,16 +372,15 @@ class AgentCore:
         collector = _active_event_collector.get()
         if collector is None:
             return ()
-        raw_events = collector.drain()
         return tuple(
             RuntimeEvent(
-                name=e["name"],
+                name=e.name,
                 session_id=turn_input.session_id,
                 channel_name=turn_input.channel_name,
-                fields=e["fields"],
+                fields=dict(e.fields),
                 metadata=dict(turn_input.metadata),
             )
-            for e in raw_events
+            for e in collector.drain()
         )
 
     async def handle_turn(
