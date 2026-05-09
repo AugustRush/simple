@@ -18,7 +18,8 @@ from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, Con
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime import AgentCore, TurnRunner
 from agent.skills.catalog import SkillCatalog
-from agent.tools.runtime import BuiltinTools, MCPClient, ToolRegistry, UserToolCatalog
+from agent.tools.builtin_tools import BuiltinTools
+from agent.tools.runtime import MCPClient, ToolRegistry, UserToolCatalog
 
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine

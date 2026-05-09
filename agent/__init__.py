@@ -234,7 +234,8 @@ from .skills.catalog import (
     parse_explicit_skill_request,
     prepare_user_message_for_skills,
 )
-from .tools.runtime import BuiltinTools, MCPClient, ToolDef, ToolRegistry, UserToolCatalog
+from .tools.builtin_tools import BuiltinTools
+from .tools.runtime import MCPClient, ToolDef, ToolRegistry, UserToolCatalog
 
 
 # ─────────────────────────────────────────────────────────────────────────────
