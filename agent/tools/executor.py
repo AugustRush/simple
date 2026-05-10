@@ -8,7 +8,13 @@ from typing import Any
 from agent import shared
 from agent.core.output import _active_sink, _fmt_tool_inputs
 from agent.plugins.catalog import PostToolEvent, PreToolEvent
-from agent.core.output import _active_event_collector
+from agent.core.output import _active_assistant_text, _active_event_collector
+
+# Capabilities that require the assistant to declare intent before acting.
+# Pure "read" tools are excluded — observation needs no explanation.
+_INTENT_REQUIRED_CAPABILITIES = frozenset(
+    {"workspace_write", "output_write", "shell", "state_write", "side_effect"}
+)
 
 
 class RegularToolExecutor:
@@ -40,6 +46,39 @@ class RegularToolExecutor:
         if collector is not None:
             collector.emit(event_name, **fields)
 
+    def _check_intent(self, tool_name: str) -> str:
+        """Return an error message if intent is undeclared, or "" if OK.
+
+        Only tools with write/shell/state/side_effect capabilities are
+        checked.  Pure read tools are exempt — observation needs no
+        prior explanation.
+        """
+        # Look up the tool's capabilities; exempt if registry is not introspectable
+        tools = getattr(self._registry, "_tools", None)
+        cap = tools.get(tool_name) if isinstance(tools, dict) else None
+        if cap is None:
+            return ""  # can't determine capability — skip check
+        if not (getattr(cap, "capabilities", frozenset()) & _INTENT_REQUIRED_CAPABILITIES):
+            return ""
+        intent = _active_assistant_text.get()
+        if not intent or len(intent.strip()) < 10:
+            return (
+                f"Intent required: before using '{tool_name}', explain what you "
+                "are about to do and why. Add a sentence describing the action, "
+                "then call the tool again."
+            )
+        # Shell requires explicit mention — the highest-risk tool
+        if tool_name == "shell":
+            signal_words = ("shell", "command", "run ", "execute", "exec ", "bash",
+                            "运行", "执行", "命令")
+            if not any(w in intent.lower() for w in signal_words):
+                return (
+                    "Intent declaration too vague for shell. Explicitly state "
+                    "that you are about to run a shell command, what it does, "
+                    "and why it is necessary. Then call the tool again."
+                )
+        return ""
+
     async def run(self, tool_use: dict) -> str:
         name = tool_use["name"]
         inputs = tool_use["input"]
@@ -67,6 +106,18 @@ class RegularToolExecutor:
             sink.on_tool_start(name, inputs)
         else:
             shared.CONSOLE.print(f"\n[cyan]→ {name}[/cyan]{_fmt_tool_inputs(name, inputs)}")
+
+        # ── Intent-before-action protocol ───────────────────────────────────
+        # Tools with side effects must be preceded by a declared intent.
+        intent_blocked = self._check_intent(name)
+        if intent_blocked:
+            result = json.dumps(
+                {"ok": False, "error": intent_blocked, "intent_required": True}
+            )
+            if sink:
+                sink.on_tool_blocked(name, intent_blocked)
+            self._emit("tool_blocked", tool_name=name, reason=intent_blocked)
+            return result
 
         started_at = time.monotonic()
         try:

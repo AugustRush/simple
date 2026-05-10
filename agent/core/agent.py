@@ -1679,18 +1679,24 @@ class BaseAgent:
                         )
 
                     if stop_reason == "tool_use" and tool_uses:
-                        # M4: only update result_text from the parsed text field;
-                        # do not allow streamed_text from a prior iteration to bleed in.
                         if text:
                             result_text = text
                         ctx.messages.append(self._assistant_message(response, text))
 
+                        # Set intent context so tool executors can enforce
+                        # the intent-before-action protocol.
+                        import agent.core.output as _out
+
+                        _intent_token = _out._active_assistant_text.set(
+                            text or streamed_text or ""
+                        )
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
                         tool_use_started_at = time.perf_counter()
                         results = await self._run_tool_uses(
                             tool_uses,
                             orchestration_decision=orchestration_decision,
                         )
+                        _out._active_assistant_text.reset(_intent_token)
                         _trace_latency(
                             "tool_uses_finished",
                             agent_id=ctx.agent_id,

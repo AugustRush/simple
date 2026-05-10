@@ -293,6 +293,13 @@ _active_event_collector: contextvars.ContextVar[EventCollector | None] = (
     contextvars.ContextVar("_active_event_collector", default=None)
 )
 
+# Set by BaseAgent.send_message before tool execution: the assistant's
+# most recent text response.  Used by RegularToolExecutor to enforce
+# the intent-before-action protocol.
+_active_assistant_text: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_active_assistant_text", default=""
+)
+
 
 __all__ = [
     "CliOutputSink",
@@ -300,6 +307,7 @@ __all__ = [
     "OutputSink",
     "RuntimeEvent",
     "_active_event_collector",
+    "_active_assistant_text",
     "_active_sink",
     "_fmt_tool_inputs",
 ]
