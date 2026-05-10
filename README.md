@@ -552,7 +552,6 @@ User skills with the same ID override built-in or plugin-bundled skills.
 | Skill | Description |
 |---|---|
 | `daily-summary` | Generate structured daily/weekly summaries from context memory, session history, and scheduled tasks |
-| `multi-agent-orchestration` | Decide when to use parallel, pipeline, or rendezvous multi-agent execution |
 | `remote-agent` | Delegate tasks to remote AI agents (Codex, Claude Code) on other machines via SSH |
 | `skill-manager` | Create, update, delete, and manage user skill bundles |
 
