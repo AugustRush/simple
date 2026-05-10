@@ -140,6 +140,7 @@ async def _build_components_async(cfg: dict):
 
     # Share output_dir with skills via registry context
     registry.set_context("output_dir", str(output_dir))
+    registry.set_context("supports_vision", supports_vision)
     registry.set_context(
         "shell_blocked_commands",
         list(cfg.get("shell_blocked_commands", [])),

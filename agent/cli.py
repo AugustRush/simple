@@ -503,6 +503,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                         ("/context", "Show LTM context manager stats"),
                         ("/sessions", "List recent session history"),
                         ("/session <id>", "View session details"),
+                        ("/export", "Export current session to markdown file"),
                         ("/tools", "List all available tools"),
                         ("/skills", "List available skills"),
                         ("/plugins", "List loaded plugins"),
@@ -645,6 +646,37 @@ async def _interactive_loop(components: dict, cfg: dict):
                             shared.CONSOLE.print(
                                 f"[yellow]Session not found: {prefix}[/yellow]"
                             )
+                    continue
+                elif cmd == "export":
+                    messages = ctx.messages
+                    if not messages:
+                        shared.CONSOLE.print("[yellow]No messages to export.[/yellow]")
+                    else:
+                        out_dir = components.get("output_dir") or shared.DEFAULT_OUTPUT_DIR
+                        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                        path = out_dir / f"session_{ts}.md"
+                        lines_out: list[str] = [
+                            f"# Session Export — {ts}",
+                            "",
+                        ]
+                        for m in messages:
+                            role = str(m.get("role", "?")).upper()
+                            content = m.get("content", "")
+                            if isinstance(content, list):
+                                # Vision content blocks — extract text parts
+                                text_parts = [
+                                    b.get("text", "") for b in content
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                ]
+                                content = "\n".join(text_parts) or "[media content]"
+                            lines_out.append(f"## {role}")
+                            lines_out.append("")
+                            lines_out.append(str(content))
+                            lines_out.append("")
+                        path.write_text("\n".join(lines_out), encoding="utf-8")
+                        shared.CONSOLE.print(
+                            f"[green]Exported {len(messages)} messages to {path}[/green]"
+                        )
                     continue
                 # ── Plugin-contributed slash commands (checked before built-ins) ──
                 plugin_cmds = plugin_catalog.get_slash_commands()

@@ -606,6 +606,11 @@ def _compose_system_prompt(
         lines.append(
             f"Output directory for generated files (screenshots, exports, temp): {output_dir}"
         )
+    if registry.get_context("supports_vision"):
+        lines.append(
+            "This agent supports vision. When the user sends images, you can see and "
+            "analyze them directly — describe what you observe before taking action."
+        )
     lines.append(
         f"Current UTC time: {_now()}. "
         "Use the current_time tool when the user asks about local time or timezone conversions."
