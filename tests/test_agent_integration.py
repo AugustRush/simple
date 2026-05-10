@@ -1455,7 +1455,7 @@ def test_build_components_applies_orchestration_limits(monkeypatch, tmp_path):
     assert components["agent"].sub_agent_timeout_seconds == 9
 
 
-def test_build_components_exposes_multi_agent_orchestration_skill(monkeypatch, tmp_path):
+def test_orchestration_planner_defaults_without_orchestration_skill(monkeypatch, tmp_path):
     import agent as agent_module
 
     cfg = _minimal_cfg()
@@ -1475,11 +1475,7 @@ def test_build_components_exposes_multi_agent_orchestration_skill(monkeypatch, t
     skill_catalog = components["skill_catalog"]
     bundle = skill_catalog.get("multi-agent-orchestration")
 
-    assert bundle is not None
-    assert bundle.source == "builtin"
-    assert "parallel" in bundle.body.lower()
-    assert "rendezvous" in bundle.body.lower()
-    assert "multi-agent-orchestration" in "\n".join(skill_catalog.summary_lines())
+    assert bundle is None  # skill was removed — planner uses defaults
 
 
 def test_system_prompt_keeps_spawn_agent_as_only_public_delegation_tool(
@@ -3456,7 +3452,7 @@ def test_base_agent_runs_internal_parallel_orchestration_without_public_tool_exp
     assert "run_rendezvous_round" not in registry.list_tools()
 
 
-def test_build_components_marks_multi_agent_orchestration_skill_non_model_invocable(
+def test_remote_agent_skill_is_loaded_by_default(
     monkeypatch, tmp_path
 ):
     import agent as agent_module
@@ -3475,10 +3471,12 @@ def test_build_components_marks_multi_agent_orchestration_skill_non_model_invoca
     monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
     components = agent_module._build_components(cfg)
-    bundle = components["skill_catalog"].get("multi-agent-orchestration")
+    bundle = components["skill_catalog"].get("remote-agent")
 
     assert bundle is not None
-    assert bundle.disable_model_invocation is True
+    assert bundle is not None
+    assert bundle.source == "builtin"
+    assert "ssh" in bundle.body.lower()
 
 
 def test_base_agent_runs_internal_pipeline_with_summary_only(monkeypatch):
