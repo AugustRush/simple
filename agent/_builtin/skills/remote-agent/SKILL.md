@@ -38,32 +38,44 @@ ssh <host> "cd <workdir> && claude -p '<task>' --output-format text"
 
 ## Chaining agents
 
-The output of one remote agent can feed directly into another —
-a Codex review becomes Claude's implementation prompt.
+When the user asks for a multi-phase workflow (review → implement,
+generate → review, etc.), ask them which agent should handle each phase
+and on which host. Never assume — the user knows their tools best.
 
 ```bash
-# Phase 1: Codex reviews (strength: code analysis)
-ssh dev "cd /project && codex -p 'find bugs, security issues, and style problems in the PR'"
-# → Codex returns a detailed review
-
-# Phase 2: Claude implements (strength: execution)
-ssh dev "cd /project && claude -p 'fix all issues from this review: <paste Codex output>'"
-# → Claude applies all the fixes
+# Pattern: output of phase 1 feeds into phase 2
+ssh <host> "<agent1> -p '<phase 1 task>'"
+ssh <host> "<agent2> -p '<phase 2 task>: <output from phase 1>'"
 ```
 
-Other patterns:
+Example: user says "Claude review my code, then Codex implement the fixes"
 
 ```bash
-# Review-reviewer: Claude checks Codex's work
-ssh dev "codex -p 'generate tests for api.py' > /tmp/tests.py"
-ssh dev "claude -p 'review /tmp/tests.py for edge cases and missing coverage'"
+ssh dev "claude -p 'review the PR for bugs, security, and style issues'"
+# → Claude returns review
 
-# Parallel then synthesize: Codex + Claude in parallel, then merge
-ssh dev "codex -p 'security review'" &    # parallel
-ssh dev "claude -p 'performance review'" & # parallel
-# Wait for both, then:
-ssh dev "codex -p 'merge these two reviews: <security> <performance>'"
+ssh dev "codex -p 'implement all fixes from this review: <paste Claude output>'"
+# → Codex applies fixes
 ```
+
+Other patterns — same idea, different agents:
+
+```bash
+# Codex generates tests → Claude reviews them
+ssh dev "codex -p 'generate unit tests for api.py' > /tmp/tests.py"
+ssh dev "claude -p 'review /tmp/tests.py for missing edge cases'"
+
+# Two agents in parallel → third synthesizes
+ssh host-a "<agent1> -p '<task>'" &
+ssh host-b "<agent2> -p '<task>'" &
+# wait for both, then:
+ssh host-c "<agent3> -p 'synthesize: <output1> <output2>'"
+```
+
+Before starting a multi-phase workflow, confirm with the user:
+
+1. Which agent for each phase? (`codex` / `claude`)
+2. Which host for each phase? (can be same or different machines)
 
 ## Tips
 
