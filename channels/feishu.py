@@ -388,7 +388,13 @@ class FeishuOutputSink(OutputSink):
     def on_tool_end(self, name: str, result: str) -> None:
         return
 
+    # Reasons that indicate an internal recoverable block — the LLM will
+    # retry on its own; no user-visible card needed.
+    _SILENT_BLOCK_REASONS = ("Intent required", "Intent declaration too vague")
+
     def on_tool_blocked(self, name: str, reason: str) -> None:
+        if any(prefix in reason for prefix in self._SILENT_BLOCK_REASONS):
+            return  # recoverable: LLM handles internally, no user-visible card
         self._schedule(
             self._send_plain_async(f"🚫 Tool `{name}` blocked: {reason}"),
             label="send_blocked_notice",
