@@ -6,9 +6,13 @@ import time
 from typing import Any
 
 from agent import shared
-from agent.core.output import _active_sink, _fmt_tool_inputs
+from agent.core.output import (
+    _active_assistant_text,
+    _active_event_collector,
+    _active_sink,
+    _fmt_tool_inputs,
+)
 from agent.plugins.catalog import PostToolEvent, PreToolEvent
-from agent.core.output import _active_assistant_text, _active_event_collector
 
 # Capabilities that require the assistant to declare intent before acting.
 # Pure "read" tools are excluded — observation needs no explanation.
