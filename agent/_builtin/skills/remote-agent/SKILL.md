@@ -36,18 +36,33 @@ ssh <host> "cd <workdir> && claude -p '<task>' --output-format text"
 - The remote host is not accessible via SSH
 - You don't have a clear task description to delegate
 
-## Examples
+## Chaining agents
+
+The output of one remote agent can feed directly into another —
+a Codex review becomes Claude's implementation prompt.
 
 ```bash
-# Review a PR on the CI server
-ssh ci-server "cd /app && codex -p 'review the latest PR changes'"
+# Phase 1: Codex reviews (strength: code analysis)
+ssh dev "cd /project && codex -p 'find bugs, security issues, and style problems in the PR'"
+# → Codex returns a detailed review
 
-# Fix a build failure on the build box
-ssh build-box "cd /project && claude -p 'diagnose and fix the build error'"
+# Phase 2: Claude implements (strength: execution)
+ssh dev "cd /project && claude -p 'fix all issues from this review: <paste Codex output>'"
+# → Claude applies all the fixes
+```
 
-# Parallel: security review on dev, style check on staging
-ssh dev-box "cd /src && codex -p 'find security vulnerabilities'"
-ssh staging "cd /src && claude -p 'check code style and best practices'"
+Other patterns:
+
+```bash
+# Review-reviewer: Claude checks Codex's work
+ssh dev "codex -p 'generate tests for api.py' > /tmp/tests.py"
+ssh dev "claude -p 'review /tmp/tests.py for edge cases and missing coverage'"
+
+# Parallel then synthesize: Codex + Claude in parallel, then merge
+ssh dev "codex -p 'security review'" &    # parallel
+ssh dev "claude -p 'performance review'" & # parallel
+# Wait for both, then:
+ssh dev "codex -p 'merge these two reviews: <security> <performance>'"
 ```
 
 ## Tips
