@@ -256,7 +256,7 @@ class EvolutionPlugin:
         _console().print("[dim]Generating tool...[/dim]")
         await self._engine.generate_tool(description, components["registry"])
         user_tool_catalog = components.get("user_tool_catalog")
-        if user_tool_catalog is not None:
+        if user_tool_catalog is not None and components.get("user_tools_enabled", False):
             user_tool_catalog.load_into_registry(components["registry"])
         import agent as _agent_mod
 

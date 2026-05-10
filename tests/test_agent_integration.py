@@ -1247,6 +1247,7 @@ def test_build_components_loads_user_tool_plugins(monkeypatch, tmp_path):
     import agent as agent_module
 
     cfg = _minimal_cfg()
+    cfg["user_tools"] = {"enabled": True}
     user_tools_root = tmp_path / "tools"
     user_tools_root.mkdir()
     (user_tools_root / "demo_tool.py").write_text(
@@ -1288,6 +1289,44 @@ def register(registry):
         asyncio.run(components["registry"].call("demo_tool", {"name": "codex"}))
     )
     assert payload == {"ok": True, "message": "hello codex"}
+
+
+def test_build_components_does_not_load_user_tool_plugins_by_default(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    user_tools_root = tmp_path / "tools"
+    user_tools_root.mkdir()
+    marker = tmp_path / "executed"
+    (user_tools_root / "demo_tool.py").write_text(
+        f"""
+from pathlib import Path
+Path({str(marker)!r}).write_text("executed", encoding="utf-8")
+
+def register(registry):
+    registry.register("demo_tool", "demo", {{"type": "object"}}, lambda: "ok")
+""".strip(),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "TOOLS_DIR", user_tools_root)
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert "demo_tool" not in components["registry"].list_tools()
+    assert not marker.exists()
 
 
 def test_build_components_exposes_mcp_status_and_prints_summary(monkeypatch, tmp_path):
@@ -5246,6 +5285,35 @@ def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
     asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
 
     assert evolution.calls == 0
+
+
+def test_generate_tool_does_not_reload_user_tools_when_disabled():
+    import asyncio
+    import agent as agent_module
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+
+    plugin = EvolutionPlugin()
+
+    class _FakeEvolution:
+        async def generate_tool(self, description, registry):
+            return "generated"
+
+    class _ReloadShouldNotRun:
+        def load_into_registry(self, registry):
+            raise AssertionError("user tools are disabled")
+
+    plugin._engine = _FakeEvolution()
+    components = {
+        "registry": agent_module.ToolRegistry(),
+        "user_tool_catalog": _ReloadShouldNotRun(),
+        "user_tools_enabled": False,
+        "base_system_prompt": "system",
+        "output_dir": "/tmp",
+        "skill_catalog": None,
+        "plugin_catalog": None,
+    }
+
+    asyncio.run(plugin._handle_generate_tool("/generate-tool demo", components))
 
 
 def test_interactive_loop_routes_turn_through_runtime_runner(monkeypatch, tmp_path):

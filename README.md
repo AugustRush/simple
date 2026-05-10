@@ -329,9 +329,10 @@ Key config sections:
 | `context.storage` | LTM category cap, decay factor |
 | `context.consolidation` | Token ratio, keep-last-N, idle seconds, min messages |
 | `channels.feishu` | Feishu bot credentials (`app_id`, `app_secret`, `group_policy`, etc.) |
-| `audio.transcription_command` | External STT command template (`{path}`, `{language}` placeholders) |
+| `audio.transcription_command` | External STT argv-style command template (`{path}`, `{language}` placeholders; shell operators are rejected) |
 | `mcp_servers` | MCP server definitions (name, command, args, env) |
 | `plugins` | Per-plugin enable/disable (`{"evolution": {"enabled": false}}`) |
+| `user_tools.enabled` | Opt in to trusted Python tools from `~/.agent/tools/*.py` |
 | `evolution` | Enable/disable session scoring and rule learning |
 | `scheduler` | Poll/lease/concurrency settings |
 | `tavily_api_key` | Optional Tavily search API key |
@@ -479,12 +480,16 @@ uv run simple memory tidy                # AI-assisted memory reorganization
 Also registered at runtime:
 
 - MCP tools from configured `mcp_servers` and plugin-bundled MCP servers
-- User tools loaded from `~/.agent/tools/*.py`
+- Trusted user tools from `~/.agent/tools/*.py` when `user_tools.enabled=true`
 - Auto-generated tools via `/generate-tool`
 
 Behaviour guarantees:
 
 - File tools are bounded to the workspace root
+- Shell commands are risk-classified: high-risk commands are rejected, restricted commands return a confirmation token before they may run
+- Shell working-directory changes must use the tool `cwd` parameter; inline `cd`/shell control operators are rejected
+- Audio transcription commands are executed as argv, not via shell string interpolation
+- User Python tools are not loaded by default; enabling them trusts and executes local Python code in-process
 - Tool payloads are structured JSON where possible
 - Shell calls are timeout-bounded and security-checked
 - Shell commands are validated against a blocked list (`rm`, `dd`, `mkfs`, `shred`, etc.)

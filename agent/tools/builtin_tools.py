@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 from agent import shared
 from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
+from agent.security.shell import shell_command_uses_shell_features
 
 from .runtime import ToolRegistry
 
@@ -99,6 +100,10 @@ class BuiltinTools:
                     "cwd": {
                         "type": "string",
                         "description": "Optional working directory inside the workspace or output directory. Use this for downloads and generated artifacts.",
+                    },
+                    "confirmation_token": {
+                        "type": "string",
+                        "description": "Confirmation token returned by a previous rejected restricted command. Must be used with the exact same command.",
                     },
                 },
                 "required": ["command"],
@@ -779,7 +784,11 @@ class BuiltinTools:
         )
 
     async def _shell(
-        self, command: str, timeout: int = 30, cwd: Optional[str] = None
+        self,
+        command: str,
+        timeout: int = 30,
+        cwd: Optional[str] = None,
+        confirmation_token: str = "",
     ) -> dict[str, Any]:
         # Security: block dangerous commands before spawning any subprocess.
         extra_blocked: list[str] = (
@@ -787,11 +796,26 @@ class BuiltinTools:
         )
         import agent as agent_module
 
-        _shell_command_is_blocked = agent_module._shell_command_is_blocked
-        block_reason = _shell_command_is_blocked(command, extra_blocked)
-        if block_reason:
+        if confirmation_token:
+            from agent.security.shell import shell_command_confirm
+
+            shell_command_confirm(str(confirmation_token), command)
+
+        _shell_command_check = agent_module._shell_command_check
+        safety = _shell_command_check(command, extra_blocked)
+        if not safety.allowed:
+            if safety.requires_confirmation:
+                return self._error(
+                    f"Shell command requires confirmation: {safety.reason}",
+                    command=command,
+                    risk_level=safety.risk_level,
+                    requires_confirmation=True,
+                    confirmation_token=safety.confirmation_token,
+                )
             return self._error(
-                f"Shell command rejected: {block_reason}", command=command
+                f"Shell command rejected: {safety.reason}",
+                command=command,
+                risk_level=safety.risk_level,
             )
 
         proc = None
@@ -882,6 +906,36 @@ class BuiltinTools:
             return str(raw)
         return os.environ.get("SIMPLE_AUDIO_TRANSCRIBE_COMMAND", "")
 
+    def _build_audio_transcription_argv(
+        self, command_template: str, audio_path: Path, language: str
+    ) -> list[str]:
+        if shell_command_uses_shell_features(command_template):
+            raise ValueError(
+                "unsafe audio transcription command: shell operators are not allowed"
+            )
+        try:
+            template_parts = shlex.split(command_template)
+        except ValueError as e:
+            raise ValueError(
+                f"unsafe audio transcription command: invalid quoting ({e})"
+            ) from e
+        if not template_parts:
+            raise ValueError("unsafe audio transcription command: empty command")
+
+        path_was_used = False
+        argv: list[str] = []
+        for part in template_parts:
+            if "{path}" in part:
+                path_was_used = True
+                part = part.replace("{path}", str(audio_path))
+            if "{language}" in part:
+                part = part.replace("{language}", language)
+            if part:
+                argv.append(part)
+        if not path_was_used:
+            argv.append(str(audio_path))
+        return argv
+
     async def _transcribe_audio(
         self,
         path: str,
@@ -903,19 +957,13 @@ class BuiltinTools:
                     path=str(resolved),
                 )
             language = str(language or "").strip()
-            replacements = {
-                "{path}": shlex.quote(str(resolved)),
-                "{language}": shlex.quote(language) if language else "",
-            }
-            command = command_template
-            for needle, value in replacements.items():
-                command = command.replace(needle, value)
-            if "{path}" not in command_template:
-                command = f"{command} {shlex.quote(str(resolved))}"
+            argv = self._build_audio_transcription_argv(
+                command_template, resolved, language
+            )
             timeout = max(1, min(int(timeout), 900))
             proc = None
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={
@@ -1338,5 +1386,3 @@ class BuiltinTools:
         if errors:
             result["errors"] = errors[:10]
         return result
-
-

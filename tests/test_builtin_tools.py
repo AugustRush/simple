@@ -11,6 +11,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_scheduler_state(monkeypatch, tmp_path):
     import agent.shared as shared_module
+    from agent.security.shell import shell_session_allowlist_clear
 
     agent_home = tmp_path / ".agent"
     monkeypatch.setattr(shared_module, "AGENT_HOME", agent_home)
@@ -21,6 +22,7 @@ def _isolate_scheduler_state(monkeypatch, tmp_path):
         "SCHEDULER_DB_FILE",
         agent_home / "tasks" / "scheduler.db",
     )
+    shell_session_allowlist_clear()
 
 
 def make_builtin_tools(tmp_path):
@@ -398,12 +400,138 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
     assert captured["cwd"] == str(output_dir.resolve())
 
 
+def test_shell_returns_confirmation_request_for_restricted_command(tmp_path):
+    tools, _, _ = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(tools._shell("mv a b", timeout=1))
+
+    assert result["ok"] is False
+    assert result["requires_confirmation"] is True
+    assert result["risk_level"] == "medium"
+    assert result["confirmation_token"]
+    assert "requires confirmation" in result["error"].lower()
+
+
+def test_shell_runs_restricted_command_after_matching_confirmation(
+    tmp_path, monkeypatch
+):
+    from agent.security.shell import shell_command_confirm
+
+    tools, _, _ = make_builtin_tools(tmp_path)
+    first = asyncio.run(tools._shell("mv a b", timeout=1))
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_shell(*args, **kwargs):
+        captured["command"] = args[0]
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+
+    assert shell_command_confirm(first["confirmation_token"], "mv a b") is True
+    result = asyncio.run(tools._shell("mv a b", timeout=1))
+
+    assert result["ok"] is True
+    assert captured["command"] == "mv a b"
+
+
+def test_shell_runs_restricted_command_with_confirmation_token(
+    tmp_path, monkeypatch
+):
+    tools, _, _ = make_builtin_tools(tmp_path)
+    first = asyncio.run(tools._shell("mv a b", timeout=1))
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_shell(*args, **kwargs):
+        captured["command"] = args[0]
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+
+    result = asyncio.run(
+        tools._shell(
+            "mv a b",
+            timeout=1,
+            confirmation_token=first["confirmation_token"],
+        )
+    )
+
+    assert result["ok"] is True
+    assert captured["command"] == "mv a b"
+
+
+def test_shell_rejects_mismatched_confirmation_token(tmp_path):
+    tools, _, _ = make_builtin_tools(tmp_path)
+    first = asyncio.run(tools._shell("mv a b", timeout=1))
+
+    result = asyncio.run(
+        tools._shell(
+            "mv c d",
+            timeout=1,
+            confirmation_token=first["confirmation_token"],
+        )
+    )
+
+    assert result["ok"] is False
+    assert result["requires_confirmation"] is True
+
+
+def test_shell_confirmation_is_exact_command_only(tmp_path):
+    from agent.security.shell import shell_command_confirm
+
+    tools, _, _ = make_builtin_tools(tmp_path)
+    first = asyncio.run(tools._shell("mv a b", timeout=1))
+
+    assert shell_command_confirm(first["confirmation_token"], "mv a b") is True
+    result = asyncio.run(tools._shell("mv c d", timeout=1))
+
+    assert result["ok"] is False
+    assert result["requires_confirmation"] is True
+
+
+def test_shell_rejects_inline_cwd_escape(tmp_path):
+    tools, _, _ = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(tools._shell("cd /tmp && echo ok", timeout=1))
+
+    assert result["ok"] is False
+    assert result["risk_level"] == "high"
+    assert "cwd" in result["error"].lower()
+
+
+def test_transcribe_audio_rejects_shell_control_in_template(tmp_path):
+    tools, reg, workspace = make_builtin_tools(tmp_path)
+    audio = workspace / "sample.wav"
+    audio.write_bytes(b"RIFF")
+    reg.set_context(
+        "audio_transcription_command",
+        "python transcribe.py {path}; touch /tmp/pwned",
+    )
+
+    result = asyncio.run(tools._transcribe_audio("sample.wav", timeout=1))
+
+    assert result["ok"] is False
+    assert "unsafe audio transcription command" in result["error"].lower()
+
+
 @pytest.mark.parametrize(
     "command",
     [
         "sudo rm -rf tmp",
         "FOO=1 rm -rf tmp",
         "env rm -rf tmp",
+        "shutdown now",
     ],
 )
 def test_shell_blocks_wrapped_dangerous_commands(tmp_path, command):
@@ -412,7 +540,9 @@ def test_shell_blocks_wrapped_dangerous_commands(tmp_path, command):
     result = asyncio.run(tools._shell(command, timeout=1))
 
     assert result["ok"] is False
-    assert "rejected" in result["error"].lower()
+    assert "rejected" in result["error"].lower() or result.get(
+        "requires_confirmation"
+    )
 
 
 def test_tavily_search_requires_api_key(tmp_path):

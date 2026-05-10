@@ -226,10 +226,22 @@ async def _build_components_async(cfg: dict):
         0,
         int(orch_cfg.get("result_content_max_chars", shared.DEFAULT_RESULT_CONTENT_MAX_CHARS)),
     )
-    loaded_user_tools = user_tool_catalog.load_into_registry(registry)
-    if loaded_user_tools:
+    user_tools_cfg = cfg.get("user_tools", {})
+    user_tools_enabled = (
+        bool(user_tools_cfg.get("enabled", False))
+        if isinstance(user_tools_cfg, dict)
+        else False
+    )
+    loaded_user_tools: list[str] = []
+    if user_tools_enabled:
+        loaded_user_tools = user_tool_catalog.load_into_registry(registry)
+        if loaded_user_tools:
+            console.print(
+                "[green]User tools loaded:[/green] " + ", ".join(loaded_user_tools)
+            )
+    else:
         console.print(
-            "[green]User tools loaded:[/green] " + ", ".join(loaded_user_tools)
+            "[dim]User Python tools disabled; set user_tools.enabled=true to load trusted ~/.agent/tools/*.py[/dim]"
         )
     agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
     base_system_prompt = system_prompt
@@ -260,6 +272,7 @@ async def _build_components_async(cfg: dict):
         "evolution": evolution,
         "skill_catalog": skill_catalog,
         "user_tool_catalog": user_tool_catalog,
+        "user_tools_enabled": user_tools_enabled,
         "output_dir": output_dir,
         "workspace_root": workspace_root,
         "cfg": cfg,

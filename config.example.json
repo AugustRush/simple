@@ -140,6 +140,7 @@
     "_readme": [
       "Optional speech-to-text command used by the built-in transcribe_audio tool.",
       "Use {path} for the local audio file path and optional {language} for a language hint.",
+      "This is parsed as argv and shell operators such as ;, &&, |, and redirection are rejected.",
       "Example: python /Users/you/bin/transcribe_audio.py {path}"
     ],
     "transcription_command": "$SIMPLE_AUDIO_TRANSCRIBE_COMMAND"
@@ -148,6 +149,11 @@
   "plugins": {
     "_readme": "Per-plugin enable/disable. Use the plugin name as key. Set enabled=false to disable a plugin without removing it.",
     "_example_disabled": { "enabled": false }
+  },
+
+  "user_tools": {
+    "_readme": "Disabled by default because ~/.agent/tools/*.py is trusted Python code executed in-process during startup. Set enabled=true only for tools you trust.",
+    "enabled": false
   },
 
   "system_prompt_file": null,
