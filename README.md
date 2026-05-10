@@ -31,6 +31,19 @@ uv run simple
 
 The setup wizard guides you through provider selection, API key configuration, and model choice. Config is written to `~/.agent/config.json`.
 
+### Key capabilities at a glance
+
+| Capability | How |
+|---|---|
+| **Intent-before-action** | Write/shell tools require the assistant to declare what it will do before executing |
+| **Unified event stream** | Every tool call, hook, and lifecycle fact is a replayable `RuntimeEvent` |
+| **LLM retry** | Transient API errors (rate limit, 5xx) retried 3x with exponential backoff |
+| **Config validation** | Startup warnings for typos and invalid values — never blocks startup |
+| **Multi-instance** | `--name prod` for isolated instances with independent config and data |
+| **Plugin hooks** | 8 lifecycle hooks: prompt submit, tool matchers, command hooks, continue loop |
+| **Vision** | Image attachments sent directly to vision-capable models (Anthropic, OpenAI) |
+| **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
+
 ## Examples
 
 ### Multi-instance deployment
@@ -442,6 +455,7 @@ uv run simple memory tidy                # AI-assisted memory reorganization
 | `/ralph <goal>` | Launch autonomous multi-iteration task loop |
 | `/ralph list` | List all Ralph autonomous tasks |
 | `/ralph resume <id>` | Resume a paused Ralph task |
+| `/export` | Export current session as markdown |
 | `/evolve` | Trigger system-prompt self-evolution |
 | `/generate-tool <desc>` | Generate a new user tool |
 | `/quit` | Exit the agent |
@@ -575,15 +589,39 @@ my-plugin/
 
 ### Lifecycle hooks (all optional, duck-typed)
 
-| Hook | When called |
-|---|---|
-| `on_session_start(components)` | Once before the interactive loop |
-| `on_turn_end(event)` | After each assistant turn |
-| `on_session_end(event)` | When the session ends |
-| `on_pre_tool(event)` | Before each tool call (return `action="block"` to veto) |
-| `on_post_tool(event)` | After each tool call |
-| `compose_system_prompt(current)` | Append rules to the system prompt |
-| `register_slash_commands()` | Expose slash commands |
+| Hook | When called | Key capability |
+|---|---|---|
+| `on_session_start(components)` | Once before the interactive loop | Capture client, model, memory references |
+| `on_prompt_submit(text, metadata)` | Before agent sees user message | Block messages, inject context |
+| `on_pre_tool(event)` | Before each tool call | Veto execution with `action="block"`; scoped by matcher |
+| `on_post_tool(event)` | After each tool call | Observe results; scoped by matcher |
+| `on_turn_end(event)` | After each assistant turn | Return `action="continue"` to auto-loop |
+| `on_session_end(event)` | When the session ends | Score, persist analytics |
+| `compose_system_prompt(current)` | System prompt build | Append behavior rules |
+| `register_slash_commands()` | Startup | Register `/commands` |
+
+### Hook configuration (plugin.json)
+
+```json
+{
+  "hooks": {
+    "on_pre_tool": [
+      {"matcher": "^shell$", "timeout": 5.0}
+    ],
+    "on_turn_end": [
+      {
+        "type": "command",
+        "command": "python3 ~/.agent/plugins/audit/hook.py",
+        "timeout": 10.0
+      }
+    ]
+  }
+}
+```
+
+- **`matcher`** — regex to scope hooks to specific tool names. No matcher = all tools.
+- **`timeout`** — per-hook override (default: 2s global).
+- **`type: "command"`** — external script hooks via stdin/stdout JSON. Exit code 2 = block.
 
 ### Built-in plugins
 
@@ -598,6 +636,32 @@ Place plugins under `~/.agent/plugins/`. User plugins with the same name overrid
 ```json
 {"plugins": {"evolution": {"enabled": false}}}
 ```
+
+## Runtime Architecture
+
+```
+Transport (CLI / Feishu / Scheduler)
+        │
+        ▼
+AgentCore.handle_turn(TurnInput, RuntimeSessionState)
+        │
+        ├── on_prompt_submit hooks (block / inject context)
+        ├── skill parsing & hot-reload
+        ├── TurnRunner.run() → BaseAgent.send_message()
+        │       ├── LLM retry (3x exponential backoff on transient errors)
+        │       ├── Tool execution (RegularToolExecutor)
+        │       │       ├── Intent-before-action protocol
+        │       │       └── Plugin pre/post hooks
+        │       └── EventCollector (ContextVar-scoped)
+        ├── complete_turn() → plugin hooks, staging, consolidation
+        └── TurnExecution { result, iterations, events: tuple[RuntimeEvent, ...] }
+```
+
+Key properties:
+- **Transport-neutral**: same turn boundary for CLI and Feishu
+- **Replayable event stream**: every tool call, hook, and lifecycle fact is a `RuntimeEvent`
+- **Intent-before-action**: write/shell tools require the assistant to declare intent first
+- **LLM retry**: transient API errors (rate limits, 5xx) retried with exponential backoff
 
 ## Memory & Context Architecture
 
@@ -633,23 +697,23 @@ Connected tools are injected into the runtime registry and appear in the compose
 ```
 .
 ├── agent/
-│   ├── core/           # BaseAgent, AgentContext, attachments, output sink
+│   ├── core/           # BaseAgent, AgentContext, OutputSink, RuntimeEvent, EventCollector
 │   ├── memory/         # LTMStore, MemoryPalace, ConsolidationEngine, StagingBuffer
-│   ├── tools/          # ToolRegistry, BuiltinTools, MCPClient, UserToolCatalog
-│   ├── runtime/        # TurnInput, TurnResult, TurnRunner, RuntimeSessionState
-│   ├── orchestration/  # Parallel, pipeline, rendezvous execution
+│   ├── tools/          # ToolRegistry, BuiltinTools, MCPClient, UserToolCatalog, executor
+│   ├── runtime/        # AgentCore, TurnInput, TurnResult, TurnExecution, TurnRunner
+│   ├── orchestration/  # OrchestrationPlanner, parallel/pipeline/rendezvous execution
 │   ├── channels/       # Channel ABC, CliChannel, ChannelRunner
 │   ├── scheduler/      # SchedulerService, SchedulerStore, triggers, delivery
-│   ├── security/       # Shell command blocking
-│   ├── skills/         # SkillBundle, SkillCatalog, skill parsing
-│   ├── plugins/        # PluginCatalog, AgentPlugin protocol, lifecycle hooks
-│   ├── _builtin/       # Built-in plugins and skills
+│   ├── security/       # Shell command blocking (chmod/kill/eval/python -c)
+│   ├── skills/         # SkillBundle, SkillCatalog, skill parsing, hot-reload
+│   ├── plugins/        # PluginCatalog, AgentPlugin protocol, HookResult, lifecycle
+│   ├── _builtin/       # Built-in plugins (evolution) and skills (daily-summary, etc.)
 │   ├── cli.py          # Typer CLI (interactive, gateway, scheduler, config, memory)
-│   ├── config.py       # Config loading, ModelClientFactory, system prompt composition
+│   ├── config.py       # Config loading, validation, ModelClientFactory, system prompt
 │   ├── bootstrap.py    # Component wiring from config
-│   ├── evolution.py    # Session scoring, prompt rewriting
-│   ├── shared.py       # Paths, defaults, utility functions
-│   └── pathing.py      # Path resolution and security
+│   ├── evolution.py    # Session scoring, prompt rewriting, tool generation
+│   ├── shared.py       # Paths, defaults, tracing, multi-instance support
+│   └── pathing.py      # Path resolution and workspace containment
 ├── channels/
 │   └── feishu.py       # Feishu/Lark channel + output sink
 ├── scripts/
@@ -674,4 +738,4 @@ uv run pytest tests/test_scheduler.py -q
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-Latest verification: `uv run pytest -q` → `555 passed, 1 skipped`
+Latest verification: `uv run pytest -q` → `569 passed, 1 skipped`
