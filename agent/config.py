@@ -599,10 +599,6 @@ def _compose_system_prompt(
             )
         if "shell" in builtin_names:
             lines.append(
-                "For shell commands that generate files, direct outputs into the configured output directory "
-                "using command-specific output flags or the shell tool's `cwd` parameter."
-            )
-            lines.append(
                 "Every shell tool call must include an `intent` input that explains what that exact command "
                 "will do and why it is necessary. Do not rely on surrounding prose as the shell intent."
             )

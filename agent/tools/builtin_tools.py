@@ -804,13 +804,30 @@ class BuiltinTools:
             output_dir=self._output_dir,
         )
 
+    def _resolve_output_path(self, path: str) -> tuple[Path, str]:
+        """Resolve relative paths against the output directory.
+
+        Generated/downloaded files belong in output_dir, not the
+        workspace (repo).  Absolute paths and paths already inside the
+        workspace are still accepted.
+        """
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            output_dir = self._process_output_dir()
+            path = str(output_dir / candidate)
+        return resolve_workspace_path(
+            path,
+            workspace_root=self.workspace_root,
+            output_dir=self._process_output_dir(),
+        )
+
     def _ensure_within_write_scope(self, path: Path) -> None:
         scope_entries = self.registry.get_context("write_scope") or []
         if not scope_entries:
             return
         allowed: list[str] = []
         for entry in scope_entries:
-            scope_path, _root_kind = self._resolve_tool_path(str(entry))
+            scope_path, _root_kind = self._resolve_output_path(str(entry))
             allowed.append(str(scope_path))
             if path_contains(scope_path, path):
                 return
@@ -863,7 +880,7 @@ class BuiltinTools:
             env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
             resolved_cwd = output_dir
             if cwd:
-                resolved_cwd, _root_kind = self._resolve_tool_path(cwd)
+                resolved_cwd, _root_kind = self._resolve_output_path(cwd)
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
@@ -929,7 +946,7 @@ class BuiltinTools:
 
     def _send_file(self, path: str) -> dict[str, Any]:
         try:
-            resolved, _root_kind = self._resolve_tool_path(path)
+            resolved, _root_kind = self._resolve_output_path(path)
             if not resolved.exists():
                 return self._error(f"'{path}' does not exist", path=str(resolved))
             if not resolved.is_file():
@@ -1152,7 +1169,7 @@ class BuiltinTools:
         max_bytes: int = TOOL_DEFAULT_MAX_WRITE_BYTES,
     ) -> dict[str, Any]:
         try:
-            p, _root_kind = self._resolve_tool_path(path)
+            p, _root_kind = self._resolve_output_path(path)
             self._ensure_within_write_scope(p)
             p.parent.mkdir(parents=True, exist_ok=True)
             payload = content.encode("utf-8")
