@@ -1183,6 +1183,106 @@ def test_feishu_sink_tool_start_never_appends_to_summary_card():
         loop.close()
 
 
+def test_feishu_sink_tool_start_keeps_streamed_text_as_stable_prefix():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    updates: list[str] = []
+
+    def _record_update(_card_id: str, content: str, _sequence: int) -> bool:
+        updates.append(content)
+        return True
+
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_create_streaming_card_sync",
+                return_value="card_stream",
+            ), patch.object(
+                sink,
+                "_stream_update_text_sync",
+                side_effect=_record_update,
+            ):
+                sink.on_stream_chunk("Summary draft")
+                await sink.drain()
+                sink.on_tool_start("bash", {"command": "ls"})
+                await sink.drain()
+
+            assert updates[0] == "Summary draft"
+            assert updates[1].startswith(updates[0])
+            assert "**Tool Call**" in updates[1]
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_tool_progress_updates_stable_progress_section():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(
+                sink,
+                "_flush_progress_async",
+                new=AsyncMock(),
+            ) as mock_flush:
+                sink.on_tool_progress(
+                    "web_fetch",
+                    {
+                        "operation_id": "op_1",
+                        "status": "downloading",
+                        "current": 50,
+                        "total": 100,
+                        "bytes_done": 1024,
+                        "bytes_total": 2048,
+                    },
+                )
+                await sink.drain()
+                mock_flush.assert_awaited_once()
+
+            content = sink._render_primary_markdown()
+            assert "## Tool Progress" in content
+            assert "- **web_fetch**: downloading 50% (1.0KB/2.0KB)" in content
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+
+def test_feishu_sink_tool_progress_replaces_existing_operation_line():
+    sink = _make_feishu_sink()
+    sink.streaming = True
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _run():
+            with patch.object(sink, "_flush_progress_async", new=AsyncMock()):
+                sink.on_tool_progress(
+                    "web_fetch",
+                    {"operation_id": "op_1", "status": "downloading", "bytes_done": 1024},
+                )
+                sink.on_tool_progress(
+                    "web_fetch",
+                    {"operation_id": "op_1", "status": "downloading", "bytes_done": 2048},
+                )
+                await sink.drain()
+
+        loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    content = sink._render_primary_markdown()
+
+    assert "1.0KB" not in content
+    assert "2.0KB" in content
+    assert content.count("**web_fetch**") == 1
+
+
 def test_feishu_sink_turn_complete_uses_single_primary_surface_for_progress_and_final():
     sink = _make_feishu_sink()
     sink.streaming = True

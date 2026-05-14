@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import agent as agent_module
 from agent import shared
@@ -23,6 +23,79 @@ from agent.tools.runtime import MCPClient, ToolRegistry, UserToolCatalog
 
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
+
+
+def _bounded_int(
+    value: object,
+    *,
+    default: int,
+    min_value: int,
+    max_value: int,
+) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, min_value), max_value)
+
+
+def _empty_mcp_status(configured_servers: int = 0) -> dict[str, int]:
+    return {
+        "configured_servers": configured_servers,
+        "connected_servers": 0,
+        "failed_servers": 0,
+        "registered_tools": 0,
+    }
+
+
+def _refresh_components_system_prompt(components: dict) -> str:
+    refreshed = _compose_system_prompt(
+        components.get("base_system_prompt", ""),
+        components.get("registry"),
+        components.get("workspace_root"),
+        components.get("output_dir"),
+        skill_catalog=components.get("skill_catalog"),
+        plugin_catalog=components.get("plugin_catalog"),
+    )
+    components["system_prompt"] = refreshed
+    ctx = components.get("ctx")
+    if ctx is not None:
+        ctx.system_prompt = refreshed
+    return refreshed
+
+
+async def _connect_mcp_in_background(
+    components: dict,
+    mcp_client: Any,
+    mcp_config: dict,
+    *,
+    extra_env: dict[str, str],
+) -> None:
+    try:
+        await mcp_client.connect_from_config(mcp_config, extra_env=extra_env)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        shared.CONSOLE.print(f"[yellow]MCP background connect failed: {exc}[/yellow]")
+    finally:
+        status = mcp_client.status_summary()
+        components["mcp_status"].clear()
+        components["mcp_status"].update(status)
+        if status.get("registered_tools", 0):
+            _refresh_components_system_prompt(components)
+        if status.get("connected_servers", 0):
+            shared.CONSOLE.print(
+                "[green]MCP active:[/green] "
+                f"{status['connected_servers']} server(s), "
+                f"{status['registered_tools']} tool(s) registered"
+            )
+        elif status.get("configured_servers", 0):
+            shared.CONSOLE.print(
+                "[yellow]MCP configured, but no servers connected successfully.[/yellow]"
+            )
+
 
 async def _build_components_async(cfg: dict):
     """Build all components from config using ModelClientFactory."""
@@ -170,27 +243,14 @@ async def _build_components_async(cfg: dict):
     user_tool_catalog = user_tool_catalog_cls()
 
     mcp_client = None
-    mcp_status = {
-        "configured_servers": 0,
-        "connected_servers": 0,
-        "failed_servers": 0,
-        "registered_tools": 0,
-    }
-    if cfg.get("mcp_servers"):
+    mcp_server_configs = list(cfg.get("mcp_servers", []) or [])
+    mcp_status = _empty_mcp_status(len(mcp_server_configs))
+    if mcp_server_configs:
         mcp_client = mcp_client_cls(registry)
-        mcp_extra_env = {"AGENT_OUTPUT_DIR": str(output_dir)}
-        await mcp_client.connect_from_config(cfg, extra_env=mcp_extra_env)
-        mcp_status = mcp_client.status_summary()
-        if mcp_status["connected_servers"]:
-            console.print(
-                "[green]MCP active:[/green] "
-                f"{mcp_status['connected_servers']} server(s), "
-                f"{mcp_status['registered_tools']} tool(s) registered"
-            )
-        else:
-            console.print(
-                "[yellow]MCP configured, but no servers connected successfully.[/yellow]"
-            )
+        console.print(
+            "[dim]MCP connecting in background: "
+            f"{len(mcp_server_configs)} configured server(s)[/dim]"
+        )
 
     agent = BaseAgent(
         client,
@@ -213,6 +273,12 @@ async def _build_components_async(cfg: dict):
     agent.sub_agent_retries = max(
         0,
         int(orch_cfg.get("sub_agent_retries", shared.DEFAULT_SUB_AGENT_RETRIES)),
+    )
+    agent.max_tool_call_iterations = _bounded_int(
+        cfg.get("max_tool_call_iterations", shared.MAX_TOOL_CALL_ITERATIONS),
+        default=shared.MAX_TOOL_CALL_ITERATIONS,
+        min_value=1,
+        max_value=shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
     )
     agent.llm_max_retries = max(
         0,
@@ -288,13 +354,11 @@ async def _build_components_async(cfg: dict):
 
     # Connect MCP servers bundled by plugins
     bundled_mcp = plugin_catalog.get_bundled_mcp()
+    if bundled_mcp:
+        mcp_server_configs.extend(server_cfg for _, server_cfg in bundled_mcp)
+        mcp_status = _empty_mcp_status(len(mcp_server_configs))
     if bundled_mcp and mcp_client is None:
         mcp_client = mcp_client_cls(registry)
-    if bundled_mcp and mcp_client is not None:
-        bundled_cfg = {"mcp_servers": [cfg for _, cfg in bundled_mcp]}
-        mcp_extra_env = {"AGENT_OUTPUT_DIR": str(output_dir)}
-        await mcp_client.connect_from_config(bundled_cfg, extra_env=mcp_extra_env)
-        mcp_status = mcp_client.status_summary()
 
     agent.plugin_catalog = plugin_catalog
 
@@ -319,9 +383,20 @@ async def _build_components_async(cfg: dict):
         "context_manager": ctx_manager,
         "mcp_client": mcp_client,
         "mcp_status": mcp_status,
+        "mcp_task": None,
     }
     components["turn_runner"] = TurnRunner(components)
     components["agent_core"] = AgentCore(components)
+    if mcp_client is not None and mcp_server_configs:
+        components["mcp_task"] = asyncio.create_task(
+            _connect_mcp_in_background(
+                components,
+                mcp_client,
+                {"mcp_servers": mcp_server_configs},
+                extra_env={"AGENT_OUTPUT_DIR": str(output_dir)},
+            ),
+            name="mcp-connect",
+        )
     return components
 
 

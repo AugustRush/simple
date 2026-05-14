@@ -317,6 +317,7 @@ class FeishuOutputSink(OutputSink):
         self._progress_buf = _FeishuStreamBuf()
         self._progress_flush_pending = False
         self._progress_fail_count = 0
+        self._tool_progress_lines: OrderedDict[str, str] = OrderedDict()
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._attachments: list[Path] = []
         self._attachment_keys: set[str] = set()
@@ -365,6 +366,7 @@ class FeishuOutputSink(OutputSink):
             or self._output_dir is not None
             or self._progress_buf.card_id
             or self._progress_buf.text.strip()
+            or self._tool_progress_lines
         ):
             self._schedule(self._finish_turn_async(text), label="finish_turn")
 
@@ -387,6 +389,20 @@ class FeishuOutputSink(OutputSink):
 
     def on_tool_end(self, name: str, result: str) -> None:
         return
+
+    def on_tool_progress(self, name: str, progress: dict[str, Any]) -> None:
+        if name in self._SUPPRESSED_TOOL_HINTS:
+            return
+        if not self.streaming or self._progress_fail_count >= 3:
+            return
+        operation_id = str(progress.get("operation_id") or name)
+        self._tool_progress_lines[operation_id] = self._format_tool_progress_line(
+            name,
+            progress,
+        )
+        if not self._progress_flush_pending:
+            self._progress_flush_pending = True
+            self._schedule(self._flush_progress_async(), label="flush_progress")
 
     # Reasons that indicate an internal recoverable block — the LLM will
     # retry on its own; no user-visible card needed.
@@ -527,19 +543,25 @@ class FeishuOutputSink(OutputSink):
             )
             self._progress_fail_count = 0
             self._last_batch_progress_key = None
+            self._tool_progress_lines = OrderedDict()
             self._attachments = []
             self._attachment_keys = set()
 
     def _render_primary_markdown(self) -> str:
         parts: list[str] = []
-        progress = self._progress_buf.text.strip()
         final_text = self._stream_buf.text.strip()
-        if progress and self._progress_fail_count < 3:
-            parts.append(progress)
         if final_text:
+            parts.append(final_text)
+        progress = self._progress_buf.text.strip()
+        if progress and self._progress_fail_count < 3:
             if parts:
                 parts.append("---")
-            parts.append(final_text)
+            parts.append(progress)
+        if self._tool_progress_lines and self._progress_fail_count < 3:
+            if parts:
+                parts.append("---")
+            lines = "\n".join(self._tool_progress_lines.values())
+            parts.append("## Tool Progress\n\n" + lines)
         return "\n\n".join(parts).strip()
 
     async def _ensure_primary_surface_card(self) -> str | None:
@@ -604,6 +626,7 @@ class FeishuOutputSink(OutputSink):
         # Clear progress buffer before final render so the completed card
         # only shows the agent response, not tool-call progress lines.
         self._progress_buf = _FeishuStreamBuf()
+        self._tool_progress_lines = OrderedDict()
         content = self._render_primary_markdown()
 
         try:
@@ -636,6 +659,7 @@ class FeishuOutputSink(OutputSink):
         finally:
             self._stream_buf = _FeishuStreamBuf()
             self._progress_buf = _FeishuStreamBuf()
+            self._tool_progress_lines = OrderedDict()
             self._stream_flush_pending = False
             self._stream_flush_pending = False
 
@@ -766,6 +790,38 @@ class FeishuOutputSink(OutputSink):
     async def _send_attachments_async(self) -> None:
         for path in self._attachments:
             await self._send_file_async(path)
+
+    @staticmethod
+    def _format_byte_count(value: Any) -> str | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        size = float(value)
+        units = ("B", "KB", "MB", "GB")
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                return f"{size:.1f}{unit}" if unit != "B" else f"{int(size)}B"
+            size /= 1024
+        return None
+
+    def _format_tool_progress_line(self, name: str, progress: dict[str, Any]) -> str:
+        status = str(progress.get("status") or "running").replace("_", " ")
+        message = str(progress.get("message") or "").strip()
+        current = progress.get("current")
+        total = progress.get("total")
+        suffix = ""
+        if isinstance(current, (int, float)) and isinstance(total, (int, float)) and total:
+            suffix = f" {float(current) / float(total) * 100:.0f}%"
+
+        bytes_done = self._format_byte_count(progress.get("bytes_done"))
+        bytes_total = self._format_byte_count(progress.get("bytes_total"))
+        byte_part = ""
+        if bytes_done and bytes_total:
+            byte_part = f" ({bytes_done}/{bytes_total})"
+        elif bytes_done:
+            byte_part = f" ({bytes_done})"
+
+        detail = f" - {message}" if message else ""
+        return f"- **{name}**: {status}{suffix}{byte_part}{detail}"
 
     # ── Synchronous Feishu API calls (run in thread-pool) ─────────────────────
 

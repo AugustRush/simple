@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from datetime import datetime, timezone
 from pathlib import Path
 import json
@@ -70,6 +72,9 @@ DEFAULT_CONFIG: dict = {
         "sub_agent_timeout_seconds": shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
         "turn_hook_timeout_seconds": shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
     },
+    # ── Runtime guardrails ────────────────────────────────────────────────
+    # Maximum model/tool exchange rounds in one turn before treating it as a loop.
+    "max_tool_call_iterations": shared.MAX_TOOL_CALL_ITERATIONS,
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
     # ── Evolution / self-improvement ──────────────────────────────────────
@@ -229,7 +234,7 @@ def _validate_config(cfg: dict) -> list[str]:
         "mcp_servers", "context", "plugins", "channels", "user_tools",
         "system_prompt_file", "output_dir", "tavily_api_key",
         "assistant_identity", "shell_blocked_commands",
-        "llm_max_retries", "llm_retry_base_delay",
+        "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
     })
 
     # ── Top-level unknown keys ────────────────────────────────────────────
@@ -286,6 +291,11 @@ def _validate_config(cfg: dict) -> list[str]:
                 warnings.append(f"'{key}': must be a number, got {val!r}")
 
     _check_int("max_tokens", 1, 2_000_000)
+    _check_int(
+        "max_tool_call_iterations",
+        1,
+        shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
+    )
     _check_int("llm_max_retries", 0, 20)
     _check_float("llm_retry_base_delay", 0.1)
 
@@ -628,6 +638,11 @@ def _compose_system_prompt(
 
 
 async def _close_components(components: dict) -> None:
+    mcp_task = components.get("mcp_task")
+    if mcp_task is not None and not mcp_task.done():
+        mcp_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await mcp_task
     mcp_client = components.get("mcp_client")
     if mcp_client is not None:
         await mcp_client.close()

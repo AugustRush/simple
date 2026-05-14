@@ -661,6 +661,60 @@ def test_web_fetch_uses_asyncio_to_thread(tmp_path, monkeypatch):
     assert called["args"] == ("https://example.com",)
 
 
+def test_web_fetch_reports_download_progress(tmp_path, monkeypatch):
+    import urllib.request
+
+    from agent.core.output import EventCollector, _active_event_collector
+    from agent.tools.executor import RegularToolExecutor
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    class _FakeResponse:
+        headers = {"Content-Length": "11"}
+
+        def __init__(self):
+            self._chunks = [b"<p>hello ", b"world</p>", b""]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self, _size):
+            return self._chunks.pop(0)
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: _FakeResponse(),
+    )
+
+    async def run():
+        collector = EventCollector()
+        token = _active_event_collector.set(collector)
+        try:
+            result = await RegularToolExecutor(registry, timeout_seconds=1).run(
+                {"name": "web_fetch", "input": {"url": "https://example.com"}}
+            )
+        finally:
+            _active_event_collector.reset(token)
+        return json.loads(result), collector.drain()
+
+    result, events = asyncio.run(run())
+
+    assert result["ok"] is True
+    assert "hello world" in result["content"]
+    progress = [
+        event for event in events
+        if event.name == "tool_progress"
+        and event.fields.get("status") == "downloading"
+    ]
+    assert progress
+    assert progress[-1].fields["bytes_done"] == 18
+    assert progress[-1].fields["operation_id"] == events[0].fields["operation_id"]
+
+
 def test_tavily_search_uses_asyncio_to_thread(tmp_path, monkeypatch):
     from agent import BuiltinTools
 

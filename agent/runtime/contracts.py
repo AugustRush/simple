@@ -344,6 +344,22 @@ class AgentCore:
             state.task_context,
         )
 
+    def _refresh_component_prompt_if_needed(
+        self,
+        state: RuntimeSessionState,
+    ) -> None:
+        prompt = self._components.values.get("system_prompt")
+        if not isinstance(prompt, str) or not prompt:
+            return
+        import agent as agent_module
+
+        refreshed = agent_module._with_task_context(prompt, state.task_context)
+        if getattr(state.ctx, "system_prompt", None) != refreshed:
+            try:
+                state.ctx.system_prompt = refreshed
+            except AttributeError:
+                return
+
     @staticmethod
     async def _drain_if_supported(sink: Any) -> None:
         drain = getattr(sink, "drain", None)
@@ -472,6 +488,7 @@ class AgentCore:
             for iteration_index in range(max(1, int(max_continuations) + 1)):
                 iterations = iteration_index + 1
                 state.ensure_task_context(iteration_prompt)
+                self._refresh_component_prompt_if_needed(state)
                 self._refresh_skill_prompt_if_needed(state)
                 current_input = TurnInput(
                     text=iteration_prompt,

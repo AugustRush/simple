@@ -239,6 +239,35 @@ def test_turn_runner_complete_turn_uses_live_component_updates():
     assert maintenance_calls[0]["system_prompt"] == "new"
 
 
+def test_agent_core_uses_live_component_prompt_for_existing_session():
+    observed = {}
+
+    class _Ctx:
+        system_prompt = "old"
+        metadata = {}
+
+    class _FakeTurnRunner:
+        async def run(self, turn_input, ctx, stream_callback=None):
+            observed["system_prompt"] = ctx.system_prompt
+            return TurnResult(text="reply")
+
+        async def complete_turn(self, turn_input, state, result):
+            return []
+
+    core = AgentCore(
+        {
+            "system_prompt": "new",
+            "turn_runner": _FakeTurnRunner(),
+        }
+    )
+    state = RuntimeSessionState(ctx=_Ctx())
+
+    asyncio.run(core.handle_turn(TurnInput.from_text("hello"), state))
+
+    assert observed["system_prompt"].startswith("new")
+    assert "Current Task Context" in observed["system_prompt"]
+
+
 def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
     class _Ctx:
         agent_id = "ctx-1"

@@ -20,6 +20,7 @@ from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
 from agent.security.shell import shell_command_uses_shell_features
 
+from .executor import report_tool_progress
 from .runtime import ToolRegistry
 
 
@@ -583,7 +584,27 @@ class BuiltinTools:
             },
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read(WEB_FETCH_MAX_BYTES)
+            total_raw = resp.headers.get("Content-Length") if resp.headers else None
+            try:
+                total = int(total_raw) if total_raw else None
+            except (TypeError, ValueError):
+                total = None
+            chunks: list[bytes] = []
+            bytes_done = 0
+            while bytes_done < WEB_FETCH_MAX_BYTES:
+                chunk = resp.read(min(64 * 1024, WEB_FETCH_MAX_BYTES - bytes_done))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                bytes_done += len(chunk)
+                report_tool_progress(
+                    status="downloading",
+                    current=bytes_done,
+                    total=total,
+                    bytes_done=bytes_done,
+                    bytes_total=total,
+                )
+            return b"".join(chunks)
 
     @staticmethod
     def _make_tavily_request(

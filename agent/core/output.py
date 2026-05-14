@@ -74,6 +74,9 @@ class OutputSink(ABC):
     def on_tool_end(self, name: str, result: str) -> None:
         """Called immediately after a tool returns its result."""
 
+    def on_tool_progress(self, name: str, progress: Mapping[str, Any]) -> None:
+        """Called when a running tool reports progress."""
+
     def on_tool_blocked(self, name: str, reason: str) -> None:
         """Called when a plugin vetoes a tool call before execution."""
 
@@ -159,6 +162,20 @@ class CliOutputSink(OutputSink):
         self._console.print(
             f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {reason})[/yellow]"
         )
+
+    def on_tool_progress(self, name: str, progress: Mapping[str, Any]) -> None:
+        status = str(progress.get("status") or "running")
+        message = str(progress.get("message") or "").strip()
+        current = progress.get("current")
+        total = progress.get("total")
+        suffix = ""
+        if current is not None and total:
+            try:
+                suffix = f" {float(current) / float(total) * 100:.0f}%"
+            except Exception:
+                suffix = f" {current}/{total}"
+        detail = f" - {message}" if message else ""
+        self._console.print(f"[dim]↻ {name}: {status}{suffix}{detail}[/dim]")
 
     def on_notification(self, title: str, body: str, *, level: str = "info") -> None:
         from rich.panel import Panel

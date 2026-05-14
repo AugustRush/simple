@@ -57,6 +57,9 @@
     }
   },
 
+  "max_tool_call_iterations": 40,
+  "_max_tool_call_iterations_readme": "Maximum model/tool exchange rounds in one turn before stopping as a possible loop. Values above the runtime cap are clamped; long workflows should make progress visible instead of raising this limit.",
+
   "memory": {
     "_readme": "tidy_interval_seconds: how often (in seconds) the agent auto-reorganises memory. tidy_file_threshold: minimum number of new memory files before a tidy is triggered.",
     "tidy_interval_seconds": 3600,

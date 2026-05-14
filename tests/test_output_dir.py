@@ -232,6 +232,7 @@ def test_build_components_wires_audio_transcription_command(monkeypatch, tmp_pat
 
 def test_build_components_passes_output_dir_to_mcp_env(monkeypatch, tmp_path):
     """MCP servers receive AGENT_OUTPUT_DIR in their environment."""
+    import asyncio
     import agent as agent_module
 
     class _CaptureMCPClient:
@@ -269,7 +270,11 @@ def test_build_components_passes_output_dir_to_mcp_env(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
     monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
-    agent_module._build_components(cfg)
+    async def run():
+        components = await agent_module._build_components_async(cfg)
+        await components["mcp_task"]
+
+    asyncio.run(run())
 
     client = _CaptureMCPClient.instances[-1]
     assert client.extra_env["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")

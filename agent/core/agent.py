@@ -6,6 +6,7 @@ import contextvars
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import inspect
 import json
 import logging
@@ -128,6 +129,8 @@ class BaseAgent:
     """Core agent: streams Claude, handles tool_use loop."""
 
     _MAX_TRUNCATION_CONTINUATIONS = 2
+    _TOOL_LOOP_REPEAT_THRESHOLD = 3
+    _TOOL_LOOP_UNPRODUCTIVE_THRESHOLD = 4
     _CONTINUE_PROMPT = (
         "Continue exactly from where you left off. "
         "Do not repeat previous text. "
@@ -154,6 +157,7 @@ class BaseAgent:
         self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
         self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self.sub_agent_retries = shared.DEFAULT_SUB_AGENT_RETRIES
+        self.max_tool_call_iterations = shared.MAX_TOOL_CALL_ITERATIONS
         self.result_content_max_chars = shared.DEFAULT_RESULT_CONTENT_MAX_CHARS
         self.llm_max_retries = shared.DEFAULT_LLM_MAX_RETRIES
         self.llm_retry_base_delay = shared.DEFAULT_LLM_RETRY_BASE_DELAY
@@ -1425,6 +1429,219 @@ class BaseAgent:
                 return summary_text
         return ""
 
+    @staticmethod
+    def _stable_tool_loop_key(value: Any) -> str:
+        try:
+            raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            raw = repr(value)
+        if len(raw) <= 600:
+            return raw
+        return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
+
+    @classmethod
+    def _tool_use_signature(cls, tool_uses: list[dict]) -> str:
+        return cls._stable_tool_loop_key(
+            [
+                {
+                    "name": str(tool_use.get("name", "")),
+                    "input": tool_use.get("input", {}),
+                }
+                for tool_use in tool_uses
+            ]
+        )
+
+    @classmethod
+    def _normalized_tool_result(cls, raw_result: str) -> Any:
+        text = str(raw_result or "").strip()
+        if not text:
+            return {"empty": True}
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return text[:600]
+        if not isinstance(payload, dict):
+            return payload
+
+        interesting_keys = (
+            "ok",
+            "error",
+            "reason",
+            "blocked",
+            "requires_confirmation",
+            "status",
+            "exit_code",
+            "path",
+            "url",
+            "bytes_done",
+            "bytes_read",
+            "bytes_total",
+            "count",
+            "queued",
+            "completed",
+            "total",
+            "message",
+            "stdout",
+            "stderr",
+        )
+        normalized = {key: payload[key] for key in interesting_keys if key in payload}
+        return normalized or payload
+
+    @classmethod
+    def _tool_result_signature(cls, results: list[str]) -> str:
+        return cls._stable_tool_loop_key(
+            [cls._normalized_tool_result(result) for result in results]
+        )
+
+    @staticmethod
+    def _tool_result_looks_unproductive(raw_result: str) -> bool:
+        text = str(raw_result or "").strip()
+        if not text:
+            return True
+        try:
+            payload = json.loads(text)
+        except Exception:
+            lower = text.lower()
+            return any(
+                marker in lower
+                for marker in (
+                    "timed out",
+                    "timeout",
+                    "not found",
+                    "permission denied",
+                    "requires confirmation",
+                    "blocked",
+                    "error",
+                )
+            )
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("requires_confirmation") is True:
+            return True
+        if payload.get("blocked") is True:
+            return True
+        if payload.get("ok") is False:
+            return True
+        if payload.get("error") and payload.get("ok") is not True:
+            return True
+        meaningful_values = [
+            value for value in payload.values() if value not in (None, "", [], {})
+        ]
+        return not meaningful_values
+
+    @classmethod
+    def _tool_results_look_unproductive(cls, results: list[str]) -> bool:
+        if not results:
+            return True
+        return all(cls._tool_result_looks_unproductive(result) for result in results)
+
+    @staticmethod
+    def _looks_like_chinese(text: str) -> bool:
+        return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+    @classmethod
+    def _tool_result_preview(cls, results: list[str], limit: int = 220) -> str:
+        previews: list[str] = []
+        for raw_result in results[:3]:
+            normalized = cls._normalized_tool_result(raw_result)
+            if isinstance(normalized, dict):
+                for key in (
+                    "error",
+                    "reason",
+                    "message",
+                    "status",
+                    "stderr",
+                    "stdout",
+                ):
+                    value = normalized.get(key)
+                    if value:
+                        previews.append(_preview_text(value, limit=limit))
+                        break
+                else:
+                    previews.append(_preview_text(normalized, limit=limit))
+            else:
+                previews.append(_preview_text(normalized, limit=limit))
+        return " | ".join(previews)[:limit]
+
+    @classmethod
+    def _build_tool_loop_stuck_response(
+        cls,
+        *,
+        user_message: str,
+        reason: str,
+        tool_uses: list[dict],
+        results: list[str],
+    ) -> str:
+        tool_names = ", ".join(str(tool_use.get("name", "")) for tool_use in tool_uses)
+        result_preview = cls._tool_result_preview(results)
+        if cls._looks_like_chinese(user_message):
+            reason_text = {
+                "same_pair": "同一个工具请求连续产生相同结果",
+                "same_result": "工具结果重复且没有新信息",
+                "unproductive_rounds": "连续多轮工具调用失败或没有有效输出",
+                "same_batch_unproductive": "同一批工具持续返回无效结果",
+            }.get(reason, reason)
+            lines = [
+                (
+                    "我先停一下：我检测到本轮已经连续多次调用工具，"
+                    "但结果没有继续推进；继续自动尝试大概率只会耗到系统上限。"
+                ),
+                "",
+                (
+                    f"当前观察：最近一轮工具是 `{tool_names or 'unknown'}`；"
+                    f"触发原因是 {reason_text}。"
+                ),
+            ]
+            if result_preview:
+                lines.append(f"最近结果：{result_preview}")
+            lines.extend(
+                [
+                    "",
+                    "你可以直接回复选择下一步：",
+                    "1. 提供新的路径、权限、凭据或搜索方向后继续",
+                    "2. 让我基于已有结果先总结",
+                    "3. 告诉我该在几个可选方案里选哪个",
+                    "4. 停止这个任务",
+                ]
+            )
+            return "\n".join(lines)
+
+        reason_text = {
+            "same_pair": "the same tool request produced the same result repeatedly",
+            "same_result": "the tool results repeated without new information",
+            "unproductive_rounds": (
+                "several consecutive tool rounds failed or returned no useful output"
+            ),
+            "same_batch_unproductive": (
+                "the same tool batch kept returning unproductive results"
+            ),
+        }.get(reason, reason)
+        lines = [
+            (
+                "I am pausing here because the tool loop is no longer making "
+                "clear progress; continuing automatically would likely just "
+                "hit the hard iteration limit."
+            ),
+            "",
+            (
+                f"Current signal: latest tool batch was `{tool_names or 'unknown'}`; "
+                f"trigger was {reason_text}."
+            ),
+        ]
+        if result_preview:
+            lines.append(f"Latest result: {result_preview}")
+        lines.extend(
+            [
+                "",
+                "Please choose the next step:",
+                "1. Continue with a new path, permission, credential, or search direction",
+                "2. Summarize what we have so far",
+                "3. Tell me which option to pick",
+                "4. Stop this task",
+            ]
+        )
+        return "\n".join(lines)
+
     async def _run_tool_uses(
         self,
         tool_uses: list[dict],
@@ -1554,6 +1771,12 @@ class BaseAgent:
         tool_calls_made: list[str] = []
         tool_result_history: list[tuple[str, str]] = []
         result_text = ""
+        tool_batch_counts: dict[str, int] = {}
+        last_tool_pair_signature = ""
+        last_tool_result_signature = ""
+        consecutive_same_tool_pair = 0
+        consecutive_same_tool_result = 0
+        consecutive_unproductive_tool_rounds = 0
         turn_started_at = time.perf_counter()
         trace_status = "ok"
         trace_error: str | None = None
@@ -1617,12 +1840,13 @@ class BaseAgent:
             self._context_stack.append(ctx)
 
             # D1: bounded tool-call loop — prevents infinite model loops
-            for _iteration in range(shared.MAX_TOOL_CALL_ITERATIONS + 1):
+            max_tool_call_iterations = max(1, int(self.max_tool_call_iterations))
+            for _iteration in range(max_tool_call_iterations + 1):
                 trace_iterations = _iteration + 1
-                if _iteration == shared.MAX_TOOL_CALL_ITERATIONS:
+                if _iteration == max_tool_call_iterations:
                     trace_status = "tool_loop_exceeded"
                     trace_error = (
-                        f"Tool-call loop exceeded {shared.MAX_TOOL_CALL_ITERATIONS} "
+                        f"Tool-call loop exceeded {max_tool_call_iterations} "
                         "iterations; possible model loop detected."
                     )
                     return AgentResult(
@@ -1723,6 +1947,86 @@ class BaseAgent:
                         ctx.messages.extend(
                             self._tool_result_messages(tool_uses, results)
                         )
+
+                        tool_batch_signature = self._tool_use_signature(tool_uses)
+                        tool_result_signature = self._tool_result_signature(results)
+                        tool_pair_signature = (
+                            f"{tool_batch_signature}\n{tool_result_signature}"
+                        )
+                        tool_batch_counts[tool_batch_signature] = (
+                            tool_batch_counts.get(tool_batch_signature, 0) + 1
+                        )
+                        if tool_pair_signature == last_tool_pair_signature:
+                            consecutive_same_tool_pair += 1
+                        else:
+                            consecutive_same_tool_pair = 1
+                            last_tool_pair_signature = tool_pair_signature
+                        if tool_result_signature == last_tool_result_signature:
+                            consecutive_same_tool_result += 1
+                        else:
+                            consecutive_same_tool_result = 1
+                            last_tool_result_signature = tool_result_signature
+
+                        unproductive = self._tool_results_look_unproductive(results)
+                        if (
+                            unproductive
+                            or consecutive_same_tool_pair
+                            >= self._TOOL_LOOP_REPEAT_THRESHOLD
+                        ):
+                            consecutive_unproductive_tool_rounds += 1
+                        else:
+                            consecutive_unproductive_tool_rounds = 0
+
+                        stuck_reason = ""
+                        if (
+                            consecutive_same_tool_pair
+                            >= self._TOOL_LOOP_REPEAT_THRESHOLD
+                        ):
+                            stuck_reason = "same_pair"
+                        elif (
+                            unproductive
+                            and consecutive_same_tool_result
+                            >= self._TOOL_LOOP_REPEAT_THRESHOLD
+                        ):
+                            stuck_reason = "same_result"
+                        elif (
+                            consecutive_unproductive_tool_rounds
+                            >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD
+                        ):
+                            stuck_reason = "unproductive_rounds"
+                        elif (
+                            unproductive
+                            and tool_batch_counts[tool_batch_signature]
+                            >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD
+                        ):
+                            stuck_reason = "same_batch_unproductive"
+
+                        if stuck_reason:
+                            result_text = self._build_tool_loop_stuck_response(
+                                user_message=user_message,
+                                reason=stuck_reason,
+                                tool_uses=tool_uses,
+                                results=results,
+                            )
+                            ctx.messages.append(
+                                {"role": "assistant", "content": result_text}
+                            )
+                            trace_status = "tool_loop_stuck"
+                            _interaction_log(
+                                "tool_loop_watchdog_stopped",
+                                agent_id=ctx.agent_id,
+                                iteration=_iteration + 1,
+                                reason=stuck_reason,
+                                tool_uses=len(tool_uses),
+                                tool_names=",".join(
+                                    tu["name"] for tu in tool_uses[:5]
+                                ),
+                            )
+                            return AgentResult(
+                                agent_id=ctx.agent_id,
+                                content=result_text,
+                                tool_calls_made=tool_calls_made,
+                            )
                         continue
                     else:
                         # Prefer the parsed text; fall back to streamed text for
@@ -2076,6 +2380,7 @@ class BaseAgent:
         sub_agent.max_parallel_agents = self.max_parallel_agents
         sub_agent.sub_agent_timeout_seconds = self.sub_agent_timeout_seconds
         sub_agent.sub_agent_retries = self.sub_agent_retries
+        sub_agent.max_tool_call_iterations = self.max_tool_call_iterations
         sub_agent.result_content_max_chars = self.result_content_max_chars
         return sub_agent
 

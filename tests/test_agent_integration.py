@@ -1217,6 +1217,7 @@ def test_build_components_registers_skill_management_tools(monkeypatch, tmp_path
 
 
 def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path):
+    import asyncio
     import agent as agent_module
 
     cfg = _minimal_cfg()
@@ -1234,11 +1235,91 @@ def test_build_components_connects_mcp_and_registers_tools(monkeypatch, tmp_path
     monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
     monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
-    components = agent_module._build_components(cfg)
+    async def run():
+        components = await agent_module._build_components_async(cfg)
+        assert _FakeMCPClient.instances[-1].connected is False
+        assert "mcp_demo_echo" not in components["registry"].list_tools()
+        await components["mcp_task"]
+        return components
+
+    components = asyncio.run(run())
 
     assert _FakeMCPClient.instances[-1].connected is True
     assert "mcp_demo_echo" in components["registry"].list_tools()
     assert components["mcp_client"] is _FakeMCPClient.instances[-1]
+
+
+def test_build_components_does_not_wait_for_slow_mcp_connect(monkeypatch, tmp_path):
+    import asyncio
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["mcp_servers"] = [{"name": "demo", "command": "fake"}]
+
+    async def run():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class _SlowMCPClient:
+            def __init__(self, registry):
+                self.registry = registry
+                self.connected = False
+
+            async def connect_from_config(self, config, extra_env=None):
+                started.set()
+                await release.wait()
+                self.registry.register(
+                    "mcp_demo_echo",
+                    "Echo from MCP",
+                    {"type": "object", "properties": {}, "required": []},
+                    lambda: {"ok": True},
+                    source="mcp:demo",
+                )
+                self.connected = True
+
+            def status_summary(self):
+                return {
+                    "configured_servers": 1,
+                    "connected_servers": 1 if self.connected else 0,
+                    "failed_servers": 0,
+                    "registered_tools": 1 if self.connected else 0,
+                }
+
+            async def close(self):
+                pass
+
+        monkeypatch.setattr(
+            agent_module.ModelClientFactory,
+            "from_config",
+            lambda cfg: (object(), "fake-model", 1024),
+        )
+        monkeypatch.setattr(agent_module, "MCPClient", _SlowMCPClient)
+        monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+        monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+        monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+        monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+        monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+        components = await agent_module._build_components_async(cfg)
+        assert components["mcp_status"] == {
+            "configured_servers": 1,
+            "connected_servers": 0,
+            "failed_servers": 0,
+            "registered_tools": 0,
+        }
+        assert "mcp_demo_echo" not in components["registry"].list_tools()
+        assert "mcp_demo_echo" not in components["system_prompt"]
+
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert "mcp_demo_echo" not in components["registry"].list_tools()
+
+        release.set()
+        await components["mcp_task"]
+
+        assert "mcp_demo_echo" in components["registry"].list_tools()
+        assert "mcp_demo_echo" in components["system_prompt"]
+
+    asyncio.run(run())
 
 
 def test_build_components_loads_user_tool_plugins(monkeypatch, tmp_path):
@@ -1330,6 +1411,7 @@ def register(registry):
 
 
 def test_build_components_exposes_mcp_status_and_prints_summary(monkeypatch, tmp_path):
+    import asyncio
     import agent as agent_module
 
     cfg = _minimal_cfg()
@@ -1355,7 +1437,18 @@ def test_build_components_exposes_mcp_status_and_prints_summary(monkeypatch, tmp
         ),
     )
 
-    components = agent_module._build_components(cfg)
+    async def run():
+        components = await agent_module._build_components_async(cfg)
+        assert components["mcp_status"] == {
+            "configured_servers": 1,
+            "connected_servers": 0,
+            "failed_servers": 0,
+            "registered_tools": 0,
+        }
+        await components["mcp_task"]
+        return components
+
+    components = asyncio.run(run())
 
     assert components["mcp_status"] == {
         "configured_servers": 1,
@@ -1367,6 +1460,7 @@ def test_build_components_exposes_mcp_status_and_prints_summary(monkeypatch, tmp
 
 
 def test_system_prompt_reflects_registered_capabilities(monkeypatch, tmp_path):
+    import asyncio
     import agent as agent_module
 
     cfg = _minimal_cfg()
@@ -1384,7 +1478,14 @@ def test_system_prompt_reflects_registered_capabilities(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
     monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
-    components = agent_module._build_components(cfg)
+    async def run():
+        components = await agent_module._build_components_async(cfg)
+        initial_prompt = components["system_prompt"]
+        assert "mcp_demo_echo" not in initial_prompt
+        await components["mcp_task"]
+        return components
+
+    components = asyncio.run(run())
     prompt = components["system_prompt"]
 
     assert "shell" in prompt
@@ -1418,9 +1519,12 @@ def test_async_component_lifecycle_keeps_mcp_on_one_event_loop(monkeypatch, tmp_
 
     async def run():
         components = await agent_module._build_components_async(cfg)
-        payload = json.loads(await components["registry"].call("mcp_demo_ping", {}))
-        await agent_module._close_components(components)
-        return components, payload
+        try:
+            await components["mcp_task"]
+            payload = json.loads(await components["registry"].call("mcp_demo_ping", {}))
+            return components, payload
+        finally:
+            await agent_module._close_components(components)
 
     components, payload = asyncio.run(run())
 
@@ -1451,6 +1555,7 @@ def test_real_mcp_smoke_registers_tools_from_config():
     async def run():
         components = await agent_module._build_components_async(cfg)
         try:
+            await components["mcp_task"]
             mcp_tools = [
                 name
                 for name in components["registry"].list_tools()
@@ -1472,6 +1577,7 @@ def test_build_components_applies_orchestration_limits(monkeypatch, tmp_path):
     import agent as agent_module
 
     cfg = _minimal_cfg()
+    cfg["max_tool_call_iterations"] = 37
     cfg["orchestration"] = {
         "max_parallel_agents": 2,
         "sub_agent_timeout_seconds": 9,
@@ -1492,6 +1598,132 @@ def test_build_components_applies_orchestration_limits(monkeypatch, tmp_path):
 
     assert components["agent"].max_parallel_agents == 2
     assert components["agent"].sub_agent_timeout_seconds == 9
+    assert components["agent"].max_tool_call_iterations == 37
+
+
+@pytest.mark.parametrize(
+    ("configured_value", "expected_value"),
+    [
+        ("large", 40),
+        (100_000, 40),
+    ],
+)
+def test_build_components_bounds_invalid_tool_call_iteration_limit(
+    monkeypatch, tmp_path, configured_value, expected_value
+):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["max_tool_call_iterations"] = configured_value
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert components["agent"].max_tool_call_iterations == expected_value
+
+
+def test_send_message_uses_configurable_tool_call_iteration_limit(monkeypatch):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent.max_tool_call_iterations = 2
+    calls = 0
+
+    async def fake_create(ctx, tools):
+        nonlocal calls
+        calls += 1
+        return agent_module._OAIResponse(
+            [
+                agent_module._OAIChoice(
+                    "tool_calls",
+                    agent_module._OAIMsg(
+                        "",
+                        [
+                            agent_module._OAITC(
+                                f"call-{calls}",
+                                agent_module._OAIFunc("noop", "{}"),
+                            )
+                        ],
+                    ),
+                )
+            ]
+        )
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        return [json.dumps({"ok": True}) for _ in tool_uses]
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+
+    result = asyncio.run(
+        agent.send_message(agent_module.AgentContext(system_prompt="system"), "do it")
+    )
+
+    assert calls == 2
+    assert result.error == (
+        "Tool-call loop exceeded 2 iterations; possible model loop detected."
+    )
+    assert result.tool_calls_made == ["noop", "noop"]
+
+
+def test_send_message_stops_repeated_tool_loop_with_user_options(monkeypatch):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent.max_tool_call_iterations = 40
+    calls = 0
+
+    async def fake_create(ctx, tools):
+        nonlocal calls
+        calls += 1
+        return agent_module._OAIResponse(
+            [
+                agent_module._OAIChoice(
+                    "tool_calls",
+                    agent_module._OAIMsg(
+                        "",
+                        [
+                            agent_module._OAITC(
+                                f"call-{calls}",
+                                agent_module._OAIFunc("noop", "{}"),
+                            )
+                        ],
+                    ),
+                )
+            ]
+        )
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        return [json.dumps({"ok": False, "error": "not found"}) for _ in tool_uses]
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    result = asyncio.run(agent.send_message(ctx, "do it"))
+
+    assert calls == 3
+    assert result.error is None
+    assert result.tool_calls_made == ["noop", "noop", "noop"]
+    assert "pausing here" in result.content
+    assert "Please choose the next step" in result.content
+    assert "not found" in result.content
+    assert ctx.messages[-1]["role"] == "assistant"
+    assert ctx.messages[-1]["content"] == result.content
 
 
 def test_orchestration_planner_defaults_without_orchestration_skill(monkeypatch, tmp_path):
