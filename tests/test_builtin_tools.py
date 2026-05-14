@@ -364,6 +364,7 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
 
     async def fake_create_subprocess_shell(*args, **kwargs):
         captured["env"] = kwargs.get("env")
+        captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
     monkeypatch.setattr(
@@ -374,6 +375,37 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
 
     assert result["ok"] is True
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
+    assert captured["env"]["AGENT_WORKSPACE_ROOT"]
+    assert captured["cwd"] == str((tmp_path / "output").resolve())
+
+
+def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch):
+    import agent.shared as shared_module
+
+    tools, _reg, workspace = make_builtin_tools(tmp_path)
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_shell(*args, **kwargs):
+        captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = kwargs.get("env")
+        return FakeProc()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+    )
+
+    result = asyncio.run(tools._shell("echo ok", timeout=1))
+
+    assert result["ok"] is True
+    assert captured["cwd"] == str(shared_module.DEFAULT_OUTPUT_DIR.resolve())
+    assert captured["cwd"] != str(workspace.resolve())
+    assert captured["env"]["AGENT_OUTPUT_DIR"] == captured["cwd"]
 
 
 def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
@@ -955,6 +987,41 @@ def test_transcribe_audio_uses_configured_command(tmp_path):
     assert payload["ok"] is True
     assert payload["transcript"].strip() == "TRANSCRIPT:voice.mp3"
     assert payload["path"] == str(target.resolve())
+
+
+def test_transcribe_audio_runs_in_agent_output_dir(tmp_path, monkeypatch):
+    import agent.shared as shared_module
+
+    _tools, registry, workspace = make_builtin_tools(tmp_path)
+    target = workspace / "voice.mp3"
+    target.write_bytes(b"audio")
+    registry.set_context("audio_transcription_command", "fake-transcriber {path}")
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"transcript", b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["argv"] = args
+        captured["cwd"] = kwargs.get("cwd")
+        captured["env"] = kwargs.get("env")
+        return FakeProc()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    result = asyncio.run(registry.call("transcribe_audio", {"path": str(target)}))
+    payload = json.loads(result)
+
+    assert payload["ok"] is True
+    assert captured["argv"][0] == "fake-transcriber"
+    assert captured["cwd"] == str(shared_module.DEFAULT_OUTPUT_DIR.resolve())
+    assert captured["env"]["AGENT_OUTPUT_DIR"] == captured["cwd"]
+    assert captured["env"]["AGENT_WORKSPACE_ROOT"] == str(workspace.resolve())
 
 
 def test_schedule_create_supports_agent_task_action_type(tmp_path):

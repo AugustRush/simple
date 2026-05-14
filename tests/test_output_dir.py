@@ -280,6 +280,54 @@ def test_build_components_passes_output_dir_to_mcp_env(monkeypatch, tmp_path):
     assert client.extra_env["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
 
 
+def test_mcp_client_defaults_server_cwd_to_output_dir(monkeypatch, tmp_path):
+    """MCP stdio servers default to AGENT_OUTPUT_DIR instead of the project cwd."""
+    import asyncio
+
+    from agent.tools import runtime as runtime_module
+
+    output_dir = tmp_path / "output"
+    captured = {}
+
+    class _AsyncContext:
+        def __init__(self, value):
+            self.value = value
+
+        async def __aenter__(self):
+            return self.value
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeSession:
+        async def initialize(self):
+            pass
+
+        async def list_tools(self):
+            return type("ToolsResult", (), {"tools": []})()
+
+    def fake_stdio_client(params):
+        captured["params"] = params
+        return _AsyncContext(("read", "write"))
+
+    monkeypatch.setattr(runtime_module.mcp, "stdio_client", fake_stdio_client)
+    monkeypatch.setattr(
+        runtime_module.mcp,
+        "ClientSession",
+        lambda read, write: _AsyncContext(_FakeSession()),
+    )
+
+    client = runtime_module.MCPClient(runtime_module.ToolRegistry())
+    asyncio.run(
+        client.connect_from_config(
+            {"mcp_servers": [{"name": "demo", "command": "fake"}]},
+            extra_env={"AGENT_OUTPUT_DIR": str(output_dir)},
+        )
+    )
+
+    assert captured["params"].cwd == str(output_dir)
+
+
 def test_build_components_bootstraps_assistant_identity_fact(monkeypatch, tmp_path):
     import agent as agent_module
 

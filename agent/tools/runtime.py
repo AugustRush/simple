@@ -269,11 +269,12 @@ class MCPClient:
         merged_env = (
             {**self._extra_env, **server_env} if self._extra_env or server_env else None
         )
+        cwd = cfg.get("cwd") or self._extra_env.get("AGENT_OUTPUT_DIR")
         params = mcp.StdioServerParameters(
             command=command,
             args=list(cfg.get("args", []) or []),
             env=merged_env or None,
-            cwd=cfg.get("cwd"),
+            cwd=str(cwd) if cwd else None,
         )
         read_stream, write_stream = await self._stack.enter_async_context(
             mcp.stdio_client(params)

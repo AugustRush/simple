@@ -62,6 +62,17 @@ class BuiltinTools:
         self._cached_schedule_store: Any = None
         self._register()
 
+    def _process_output_dir(self) -> Path:
+        raw = self.registry.get_context("output_dir")
+        if raw:
+            output_dir = Path(str(raw)).expanduser().resolve(strict=False)
+        elif self._output_dir is not None:
+            output_dir = Path(self._output_dir).expanduser().resolve(strict=False)
+        else:
+            output_dir = shared.DEFAULT_OUTPUT_DIR.expanduser().resolve(strict=False)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        return output_dir
+
     def _register(self):
         r = self.registry
 
@@ -100,7 +111,7 @@ class BuiltinTools:
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Optional working directory inside the workspace or output directory. Use this for downloads and generated artifacts.",
+                        "description": "Optional working directory inside the workspace or output directory. Defaults to the agent output directory so downloads and generated artifacts do not pollute the workspace.",
                     },
                     "confirmation_token": {
                         "type": "string",
@@ -842,10 +853,10 @@ class BuiltinTools:
         proc = None
         try:
             env = os.environ.copy()
-            output_dir = self.registry.get_context("output_dir")
-            if output_dir:
-                env["AGENT_OUTPUT_DIR"] = str(output_dir)
-            resolved_cwd = None
+            output_dir = self._process_output_dir()
+            env["AGENT_OUTPUT_DIR"] = str(output_dir)
+            env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
+            resolved_cwd = output_dir
             if cwd:
                 resolved_cwd, _root_kind = self._resolve_tool_path(cwd)
             proc = await asyncio.create_subprocess_shell(
@@ -983,14 +994,17 @@ class BuiltinTools:
             )
             timeout = max(1, min(int(timeout), 900))
             proc = None
+            output_dir = self._process_output_dir()
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env={
                     **os.environ.copy(),
-                    "AGENT_OUTPUT_DIR": str(self._output_dir) if self._output_dir is not None else "",
+                    "AGENT_OUTPUT_DIR": str(output_dir),
+                    "AGENT_WORKSPACE_ROOT": str(self.workspace_root),
                 },
+                cwd=str(output_dir),
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             transcript = stdout.decode(errors="replace").strip()
