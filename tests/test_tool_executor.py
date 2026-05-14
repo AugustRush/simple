@@ -5,6 +5,7 @@ import json
 
 from agent.core.output import EventCollector, _active_event_collector, _active_sink
 from agent.tools.executor import RegularToolExecutor, report_tool_progress
+from agent.tools.runtime import ToolRegistry
 
 
 class _FakeRegistry:
@@ -58,7 +59,7 @@ def test_regular_tool_executor_calls_registry_and_sink():
     events = collector.drain()
     assert [event.name for event in events] == ["tool_started", "tool_completed"]
     assert events[0].fields["operation_id"] == events[1].fields["operation_id"]
-    assert events[0].fields["timeout_seconds"] == 120
+    assert events[0].fields["timeout_seconds"] == 1800
 
 
 def test_regular_tool_executor_honors_plugin_block():
@@ -91,6 +92,101 @@ def test_regular_tool_executor_honors_plugin_block():
     assert json.loads(result) == {"ok": False, "blocked": True, "reason": "nope"}
     assert plugin_catalog.pre_event.tool_name == "shell"
     assert sink.events == [("blocked", "shell", "nope")]
+
+
+def test_regular_tool_executor_requires_structured_shell_intent():
+    registry = ToolRegistry()
+    called = []
+
+    async def shell(**kwargs):
+        called.append(kwargs)
+        return {"ok": True}
+
+    registry.register(
+        "shell",
+        "Shell",
+        {"type": "object", "properties": {}, "required": []},
+        shell,
+        source="builtin",
+    )
+
+    result = asyncio.run(
+        RegularToolExecutor(registry).run(
+            {"name": "shell", "input": {"command": "echo ok"}}
+        )
+    )
+    payload = json.loads(result)
+
+    assert payload["ok"] is False
+    assert payload["intent_required"] is True
+    assert "Shell intent required" in payload["error"]
+    assert called == []
+
+
+def test_regular_tool_executor_accepts_structured_shell_intent_without_prose():
+    registry = ToolRegistry()
+    called = []
+
+    async def shell(**kwargs):
+        called.append(kwargs)
+        return {"ok": True}
+
+    registry.register(
+        "shell",
+        "Shell",
+        {"type": "object", "properties": {}, "required": []},
+        shell,
+        source="builtin",
+    )
+
+    result = asyncio.run(
+        RegularToolExecutor(registry).run(
+            {
+                "name": "shell",
+                "input": {
+                    "command": "git status --short",
+                    "intent": "检查当前仓库是否还有未提交变更。",
+                },
+            }
+        )
+    )
+
+    assert json.loads(result) == {"ok": True}
+    assert called == [
+        {
+            "command": "git status --short",
+            "intent": "检查当前仓库是否还有未提交变更。",
+        }
+    ]
+
+
+def test_regular_tool_executor_rejects_vague_shell_intent():
+    registry = ToolRegistry()
+    called = []
+
+    async def shell(**kwargs):
+        called.append(kwargs)
+        return {"ok": True}
+
+    registry.register(
+        "shell",
+        "Shell",
+        {"type": "object", "properties": {}, "required": []},
+        shell,
+        source="builtin",
+    )
+
+    result = asyncio.run(
+        RegularToolExecutor(registry).run(
+            {"name": "shell", "input": {"command": "echo ok", "intent": "执行命令"}}
+        )
+    )
+    payload = json.loads(result)
+
+    assert payload["ok"] is False
+    assert payload["intent_required"] is True
+    assert "too vague" in payload["error"]
+    assert called == []
 
 
 def test_regular_tool_executor_emits_running_progress_for_slow_tool():

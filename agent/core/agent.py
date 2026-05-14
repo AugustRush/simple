@@ -1469,6 +1469,7 @@ class BaseAgent:
             "reason",
             "blocked",
             "requires_confirmation",
+            "intent_required",
             "status",
             "exit_code",
             "path",
@@ -1536,6 +1537,29 @@ class BaseAgent:
         return all(cls._tool_result_looks_unproductive(result) for result in results)
 
     @staticmethod
+    def _tool_results_are_intent_required(results: list[str]) -> bool:
+        if not results:
+            return False
+        for raw_result in results:
+            raw_text = str(raw_result or "")
+            try:
+                payload = json.loads(raw_text)
+            except Exception:
+                lower = raw_text.lower()
+                if "intent required" in lower or "intent declaration too vague" in lower:
+                    continue
+                return False
+            if isinstance(payload, dict) and payload.get("intent_required") is True:
+                continue
+            if (
+                isinstance(payload, dict)
+                and "intent" in str(payload.get("error", "")).lower()
+            ):
+                continue
+            return False
+        return True
+
+    @staticmethod
     def _looks_like_chinese(text: str) -> bool:
         return any("\u4e00" <= char <= "\u9fff" for char in text)
 
@@ -1575,6 +1599,22 @@ class BaseAgent:
         tool_names = ", ".join(str(tool_use.get("name", "")) for tool_use in tool_uses)
         result_preview = cls._tool_result_preview(results)
         if cls._looks_like_chinese(user_message):
+            if reason == "intent_required":
+                return "\n".join(
+                    [
+                        (
+                            "我先停一下：这次卡住的不是路径、权限或下载问题，"
+                            "而是内部工具安全规则没有被满足。"
+                        ),
+                        "",
+                        (
+                            f"当前观察：模型连续尝试调用 `{tool_names or 'unknown'}`，"
+                            "但 shell 调用没有带合格的结构化 `intent`，所以工具被安全拦截。"
+                        ),
+                        "",
+                        "合理的下一步是重新规划这一步：每个 shell 调用都应在 `intent` 里说明命令会做什么、为什么需要运行；如果目标本身不明确，我应该先向你确认，而不是继续空转。",
+                    ]
+                )
             reason_text = {
                 "same_pair": "同一个工具请求连续产生相同结果",
                 "same_result": "工具结果重复且没有新信息",
@@ -1606,6 +1646,29 @@ class BaseAgent:
             )
             return "\n".join(lines)
 
+        if reason == "intent_required":
+            return "\n".join(
+                [
+                    (
+                        "I am pausing because the loop is blocked by the internal "
+                        "tool safety protocol, not by a missing path, permission, "
+                        "or credential."
+                    ),
+                    "",
+                    (
+                        f"Current signal: the model repeatedly tried to call "
+                        f"`{tool_names or 'unknown'}` without a specific structured "
+                        "`intent` input, so the tool calls were blocked."
+                    ),
+                    "",
+                    (
+                        "The right next step is to re-plan this action: each shell "
+                        "call should include an `intent` explaining what the command "
+                        "does and why it is needed, or ask you for clarification if "
+                        "the goal is ambiguous."
+                    ),
+                ]
+            )
         reason_text = {
             "same_pair": "the same tool request produced the same result repeatedly",
             "same_result": "the tool results repeated without new information",
@@ -1968,6 +2031,7 @@ class BaseAgent:
                             last_tool_result_signature = tool_result_signature
 
                         unproductive = self._tool_results_look_unproductive(results)
+                        intent_required = self._tool_results_are_intent_required(results)
                         if (
                             unproductive
                             or consecutive_same_tool_pair
@@ -1979,6 +2043,12 @@ class BaseAgent:
 
                         stuck_reason = ""
                         if (
+                            intent_required
+                            and consecutive_same_tool_result
+                            >= self._TOOL_LOOP_REPEAT_THRESHOLD
+                        ):
+                            stuck_reason = "intent_required"
+                        elif (
                             consecutive_same_tool_pair
                             >= self._TOOL_LOOP_REPEAT_THRESHOLD
                         ):

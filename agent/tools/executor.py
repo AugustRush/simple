@@ -121,6 +121,14 @@ class RegularToolExecutor:
 
         return _report
 
+    @staticmethod
+    def _tool_timeout(inputs: dict) -> float | None:
+        """Extract a tool-declared timeout from its input dict."""
+        value = inputs.get("timeout")
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+        return None
+
     async def _await_tool_result(
         self,
         *,
@@ -129,9 +137,15 @@ class RegularToolExecutor:
         inputs: dict,
         started_at: float,
         progress_state: dict[str, Any],
+        effective_timeout: float | None = None,
     ) -> str:
+        timeout = (
+            effective_timeout
+            if effective_timeout is not None
+            else self._timeout_seconds
+        )
         call_task = asyncio.create_task(self._registry.call(tool_name, inputs))
-        deadline = started_at + self._timeout_seconds
+        deadline = started_at + timeout
 
         while True:
             remaining = max(0.0, deadline - time.monotonic())
@@ -214,37 +228,71 @@ class RegularToolExecutor:
                     },
                 )
 
-    def _check_intent(self, tool_name: str) -> str:
+    @staticmethod
+    def _intent_text_is_specific(intent: str) -> bool:
+        text = str(intent or "").strip()
+        if not text:
+            return False
+        compact = "".join(ch for ch in text.lower() if ch.isalnum())
+        vague = {
+            "run",
+            "runshell",
+            "execute",
+            "executecommand",
+            "check",
+            "doit",
+            "执行",
+            "运行",
+            "命令",
+            "执行命令",
+            "运行命令",
+            "检查",
+            "查看",
+            "处理",
+        }
+        if compact in vague:
+            return False
+        cjk_count = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+        if cjk_count >= 4:
+            return True
+        return len(text) >= 12
+
+    @staticmethod
+    def _shell_structured_intent(inputs: dict) -> str:
+        for key in ("intent", "purpose", "reason"):
+            value = inputs.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _check_intent(self, tool_name: str, inputs: dict) -> str:
         """Return an error message if intent is undeclared, or "" if OK.
 
-        Only tools with write/shell/state/side_effect capabilities are
-        checked.  Pure read tools are exempt — observation needs no
-        prior explanation.
+        Only shell commands require an explicit intent declaration — the
+        command string alone can be opaque.  All other write tools
+        (write_file, memory_write, schedule_create, etc.) are
+        self-declaring through their structured parameters (path,
+        content, name, etc.).
         """
-        # Look up the tool's capabilities; exempt if registry is not introspectable
         tools = getattr(self._registry, "_tools", None)
         cap = tools.get(tool_name) if isinstance(tools, dict) else None
         if cap is None:
-            return ""  # can't determine capability — skip check
+            return ""
         if not (getattr(cap, "capabilities", frozenset()) & _INTENT_REQUIRED_CAPABILITIES):
             return ""
-        intent = _active_assistant_text.get()
-        if not intent or len(intent.strip()) < 10:
+        if tool_name != "shell":
+            return ""
+        structured_intent = self._shell_structured_intent(inputs)
+        if not structured_intent:
             return (
-                f"Intent required: before using '{tool_name}', explain what you "
-                "are about to do and why. Add a sentence describing the action, "
-                "then call the tool again."
+                "Shell intent required: include input.intent explaining what "
+                "this exact command will do and why it is necessary."
             )
-        # Shell requires explicit mention — the highest-risk tool
-        if tool_name == "shell":
-            signal_words = ("shell", "command", "run ", "execute", "exec ", "bash",
-                            "运行", "执行", "命令")
-            if not any(w in intent.lower() for w in signal_words):
-                return (
-                    "Intent declaration too vague for shell. Explicitly state "
-                    "that you are about to run a shell command, what it does, "
-                    "and why it is necessary. Then call the tool again."
-                )
+        if not self._intent_text_is_specific(structured_intent):
+            return (
+                "Shell intent too vague: input.intent must describe the "
+                "specific command purpose and expected outcome."
+            )
         return ""
 
     async def run(self, tool_use: dict) -> str:
@@ -275,11 +323,18 @@ class RegularToolExecutor:
                     {"ok": False, "blocked": True, "reason": pre.message}
                 )
 
+        declared_timeout = self._tool_timeout(inputs)
+        effective_timeout = (
+            max(declared_timeout, self._timeout_seconds)
+            if declared_timeout is not None
+            else self._timeout_seconds
+        )
+
         self._emit(
             "tool_started",
             operation_id=operation_id,
             tool_name=name,
-            timeout_seconds=self._timeout_seconds,
+            timeout_seconds=effective_timeout,
             stale_timeout_seconds=self._stale_timeout_seconds,
         )
         if sink:
@@ -289,7 +344,7 @@ class RegularToolExecutor:
 
         # ── Intent-before-action protocol ───────────────────────────────────
         # Tools with side effects must be preceded by a declared intent.
-        intent_blocked = self._check_intent(name)
+        intent_blocked = self._check_intent(name, inputs)
         if intent_blocked:
             result = json.dumps(
                 {"ok": False, "error": intent_blocked, "intent_required": True}
@@ -334,6 +389,7 @@ class RegularToolExecutor:
                 inputs=inputs,
                 started_at=started_at,
                 progress_state=progress_state,
+                effective_timeout=effective_timeout,
             )
         except asyncio.TimeoutError:
             stale_for = time.monotonic() - float(progress_state["last_progress_at"])
@@ -341,7 +397,7 @@ class RegularToolExecutor:
                 "tool_timed_out",
                 operation_id=operation_id,
                 tool_name=name,
-                timeout_seconds=self._timeout_seconds,
+                timeout_seconds=effective_timeout,
                 stale_timeout_seconds=self._stale_timeout_seconds,
                 explicit_progress_count=progress_state["explicit_progress_count"],
                 stale_for_ms=round(stale_for * 1000, 1),
@@ -349,7 +405,7 @@ class RegularToolExecutor:
             result = json.dumps(
                 {
                     "ok": False,
-                    "error": f"tool '{name}' timed out after {self._timeout_seconds}s",
+                    "error": f"tool '{name}' timed out after {effective_timeout:.0f}s",
                 }
             )
         finally:

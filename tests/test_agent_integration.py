@@ -1726,6 +1726,71 @@ def test_send_message_stops_repeated_tool_loop_with_user_options(monkeypatch):
     assert ctx.messages[-1]["content"] == result.content
 
 
+def test_send_message_stuck_response_sanitizes_intent_required_loop(monkeypatch):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    calls = 0
+
+    async def fake_create(ctx, tools):
+        nonlocal calls
+        calls += 1
+        return agent_module._OAIResponse(
+            [
+                agent_module._OAIChoice(
+                    "tool_calls",
+                    agent_module._OAIMsg(
+                        "",
+                        [
+                            agent_module._OAITC(
+                                f"call-{calls}",
+                                agent_module._OAIFunc(
+                                    "shell",
+                                    json.dumps({"command": "echo ok"}),
+                                ),
+                            )
+                        ],
+                    ),
+                )
+            ]
+        )
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        return [
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": (
+                        "Intent required: before using 'shell', explain what you "
+                        "are about to do and why. Add a sentence describing the "
+                        "action, then call the tool again."
+                    ),
+                    "intent_required": True,
+                }
+            )
+            for _ in tool_uses
+        ]
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+
+    result = asyncio.run(
+        agent.send_message(
+            agent_module.AgentContext(system_prompt="system"),
+            "检查项目状态",
+        )
+    )
+
+    assert calls == 3
+    assert result.error is None
+    assert "内部工具安全规则" in result.content
+    assert "结构化 `intent`" in result.content
+    assert "Add a sentence" not in result.content
+    assert "Intent required" not in result.content
+
+
 def test_orchestration_planner_defaults_without_orchestration_skill(monkeypatch, tmp_path):
     import agent as agent_module
 

@@ -104,10 +104,14 @@ class BuiltinTools:
                         "type": "string",
                         "description": "The shell command to execute",
                     },
+                    "intent": {
+                        "type": "string",
+                        "description": "Required. Explain what this exact command will do and why running it is necessary for the user's task.",
+                    },
                     "timeout": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default 30)",
-                        "default": 30,
+                        "description": "Timeout in seconds (default 300, max 3600). Use 600+ for large downloads or long builds.",
+                        "default": 300,
                     },
                     "cwd": {
                         "type": "string",
@@ -118,7 +122,7 @@ class BuiltinTools:
                         "description": "Confirmation token returned by a previous rejected restricted command. Must be used with the exact same command.",
                     },
                 },
-                "required": ["command"],
+                "required": ["command", "intent"],
             },
             self._shell,
             source="builtin",
@@ -818,7 +822,8 @@ class BuiltinTools:
     async def _shell(
         self,
         command: str,
-        timeout: int = 30,
+        intent: str = "",
+        timeout: int = 300,
         cwd: Optional[str] = None,
         confirmation_token: str = "",
     ) -> dict[str, Any]:
@@ -867,7 +872,30 @@ class BuiltinTools:
                 env=env,
                 cwd=str(resolved_cwd) if resolved_cwd is not None else None,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            # Heartbeat keeps the executor's stale-timeout mechanism alive
+            # during long-running commands that produce no output (downloads, etc.)
+            async def _heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(10)
+                    try:
+                        report_tool_progress(
+                            status="running",
+                            message="shell command in progress",
+                        )
+                    except Exception:
+                        pass
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
             out = stdout.decode(errors="replace")
             err = stderr.decode(errors="replace")
             result = ""
