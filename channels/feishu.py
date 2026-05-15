@@ -377,12 +377,12 @@ class FeishuOutputSink(OutputSink):
         if self.streaming:
             if self._progress_fail_count >= 3:
                 return
-            self._append_progress_text(f"**Tool Call**\n\n```text\n{hint}\n```")
-            if not self._progress_flush_pending:
-                self._progress_flush_pending = True
+            self._stream_buf.text += f"\n\n**Tool Call**\n\n```text\n{hint}\n```\n\n"
+            if not self._stream_flush_pending:
+                self._stream_flush_pending = True
                 self._schedule(
-                    self._flush_progress_async(force=True),
-                    label="flush_progress",
+                    self._flush_stream_async(force=True),
+                    label="flush_stream",
                 )
             return
         self._schedule(self._send_tool_hint_async(hint), label="send_tool_hint")

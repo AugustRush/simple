@@ -855,8 +855,13 @@ class BuiltinTools:
 
             shell_command_confirm(str(confirmation_token), command)
 
+        output_dir = self._process_output_dir()
         _shell_command_check = agent_module._shell_command_check
-        safety = _shell_command_check(command, extra_blocked)
+        safety = _shell_command_check(
+            command,
+            extra_blocked,
+            allowed_roots=frozenset({self.workspace_root, output_dir}),
+        )
         if not safety.allowed:
             if safety.requires_confirmation:
                 return self._error(
@@ -875,7 +880,6 @@ class BuiltinTools:
         proc = None
         try:
             env = os.environ.copy()
-            output_dir = self._process_output_dir()
             env["AGENT_OUTPUT_DIR"] = str(output_dir)
             env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
             resolved_cwd = output_dir

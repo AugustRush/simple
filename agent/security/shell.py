@@ -5,6 +5,7 @@ import re
 import shlex
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 # ── Risk-level classification ────────────────────────────────────────────────
@@ -288,13 +289,34 @@ def _find_shell_operator(command: str) -> Optional[str]:
     return None
 
 
-def _has_absolute_path_token(tokens: list[str]) -> bool:
+def _has_absolute_path_token(
+    tokens: list[str],
+    *,
+    allowed_roots: frozenset[Path] | None = None,
+) -> bool:
+    """Return True when *tokens* contain an absolute path outside *allowed_roots*.
+
+    Absolute paths that resolve inside any allowed root are safe — they
+    reference the same files a relative path would, so no confirmation
+    is needed.  When *allowed_roots* is ``None`` (legacy callers), every
+    absolute path is treated as potentially out-of-bound.
+    """
     for token in tokens:
         if token == "--":
             continue
         if token.startswith("-"):
             continue
         if token.startswith("/"):
+            if allowed_roots is not None:
+                try:
+                    resolved = Path(token).resolve(strict=False)
+                except Exception:
+                    return True
+                if any(
+                    resolved == root or root in resolved.parents
+                    for root in allowed_roots
+                ):
+                    continue
             return True
     return False
 
@@ -317,26 +339,38 @@ def _command_requires_shell_operator_block(command: str) -> Optional[str]:
 
 
 def shell_command_is_blocked(
-    command: str, extra_blocked: Optional[list[str]] = None
+    command: str,
+    extra_blocked: Optional[list[str]] = None,
+    *,
+    allowed_roots: frozenset[Path] | None = None,
 ) -> Optional[str]:
     """Return a human-readable block reason if *command* is unsafe.
 
     Backward-compatible wrapper around ``shell_command_check``.
     Returns None if allowed, a reason string if blocked.
     """
-    result = shell_command_check(command, extra_blocked=extra_blocked)
+    result = shell_command_check(
+        command, extra_blocked=extra_blocked, allowed_roots=allowed_roots
+    )
     if result.allowed:
         return None
     return result.reason
 
 
 def shell_command_check(
-    command: str, extra_blocked: Optional[list[str]] = None
+    command: str,
+    extra_blocked: Optional[list[str]] = None,
+    *,
+    allowed_roots: frozenset[Path] | None = None,
 ) -> ShellCheckResult:
     """Classify *command* by risk level and determine whether it may run.
 
     Returns a ``ShellCheckResult`` with risk level, reason, and
     confirmation requirements.
+
+    *allowed_roots*, when provided, exempts absolute-path arguments
+    that resolve inside one of those directories from the usual
+    "absolute path" checkpoint.
     """
     extra = frozenset(extra_blocked or [])
 
@@ -409,7 +443,7 @@ def shell_command_check(
                 reason=f"command '{argv0}' is high risk: disk/system destruction",
             )
 
-    if _has_absolute_path_token(tokens):
+    if _has_absolute_path_token(tokens, allowed_roots=allowed_roots):
         token = str(uuid.uuid4())
         _pending_tokens[token] = command
         return ShellCheckResult(

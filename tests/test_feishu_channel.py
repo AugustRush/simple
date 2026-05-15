@@ -1090,9 +1090,9 @@ def test_feishu_sink_tool_start_always_uses_progress_card_when_streaming():
             ) as mock_stream:
                 sink.on_tool_start("bash", {"command": "ls"})
                 await sink.drain()
-                mock_progress.assert_awaited_once()
+                mock_progress.assert_not_called()
                 mock_hint.assert_not_called()
-                mock_stream.assert_not_called()
+                mock_stream.assert_awaited_once()
 
         loop.run_until_complete(_run())
     finally:
@@ -1139,7 +1139,7 @@ def test_feishu_sink_tool_start_uses_process_card_when_progress_active():
         async def _run():
             with patch.object(
                 sink,
-                "_flush_progress_async",
+                "_flush_stream_async",
                 new=AsyncMock(),
             ) as mock_flush, patch.object(
                 sink,
@@ -1156,27 +1156,22 @@ def test_feishu_sink_tool_start_uses_process_card_when_progress_active():
         loop.close()
 
 
-def test_feishu_sink_tool_start_never_appends_to_summary_card():
+def test_feishu_sink_tool_start_appends_inline_to_stream_buf_for_chronological_order():
     sink = _make_feishu_sink()
     sink.streaming = True
-    sink._stream_buf.text = "Summary draft"
     loop = asyncio.new_event_loop()
     try:
 
         async def _run():
-            with patch.object(
-                sink,
-                "_flush_progress_async",
-                new=AsyncMock(),
-            ) as mock_progress, patch.object(
-                sink,
-                "_flush_stream_async",
-                new=AsyncMock(),
-            ) as mock_stream:
-                sink.on_tool_start("bash", {"command": "ls"})
-                await sink.drain()
-                mock_progress.assert_awaited_once()
-                mock_stream.assert_not_called()
+            sink.on_stream_chunk("Some text")
+            await sink.drain()
+            sink.on_tool_start("bash", {"command": "ls"})
+            await sink.drain()
+            # Tool calls now go inline into _stream_buf.text so they
+            # appear in chronological order between text chunks.
+            assert "Some text" in sink._stream_buf.text
+            assert "**Tool Call**" in sink._stream_buf.text
+            assert sink._stream_buf.text.index("Some text") < sink._stream_buf.text.index("**Tool Call**")
 
         loop.run_until_complete(_run())
     finally:
@@ -1317,9 +1312,9 @@ def test_feishu_sink_drain_preserves_progress_before_final_answer_order():
     sink.streaming = True
     events: list[str] = []
 
-    async def _slow_flush_progress(*args, **kwargs):
+    async def _slow_flush_stream(*args, **kwargs):
         await asyncio.sleep(0.01)
-        events.append("flush_progress")
+        events.append("flush_stream")
 
     async def _send_response(text):
         events.append(f"final:{text}")
@@ -1330,8 +1325,8 @@ def test_feishu_sink_drain_preserves_progress_before_final_answer_order():
         async def _run():
             with patch.object(
                 sink,
-                "_flush_progress_async",
-                new=_slow_flush_progress,
+                "_flush_stream_async",
+                new=_slow_flush_stream,
             ), patch.object(
                 sink,
                 "_send_response_async",
@@ -1341,7 +1336,7 @@ def test_feishu_sink_drain_preserves_progress_before_final_answer_order():
                 sink.on_turn_complete("done", [])
                 await sink.drain()
 
-            assert events == ["flush_progress", "final:done"]
+            assert events == ["flush_stream", "final:done"]
 
         loop.run_until_complete(_run())
     finally:
