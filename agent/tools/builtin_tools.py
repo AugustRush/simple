@@ -73,6 +73,18 @@ class BuiltinTools:
         output_dir.mkdir(parents=True, exist_ok=True)
         return output_dir
 
+    def _sandbox_dir(self) -> Path:
+        """Dedicated scratch directory for shell commands.
+
+        Isolated from both the workspace (repo) and the output directory so
+        that downloads, clones, and other generated artifacts never pollute
+        the project workspace.
+        """
+        output_dir = self._process_output_dir()
+        sandbox = output_dir / "sandbox"
+        sandbox.mkdir(parents=True, exist_ok=True)
+        return sandbox
+
     def _register(self):
         r = self.registry
 
@@ -115,7 +127,7 @@ class BuiltinTools:
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Optional working directory inside the workspace or output directory. Defaults to the agent output directory so downloads and generated artifacts do not pollute the workspace.",
+                        "description": "Optional working directory. Defaults to an isolated sandbox directory (AGENT_SANDBOX_DIR) so downloads, clones, and generated artifacts never pollute the workspace. Only set this when you specifically need to operate inside the workspace or output directory.",
                     },
                     "confirmation_token": {
                         "type": "string",
@@ -856,6 +868,7 @@ class BuiltinTools:
             shell_command_confirm(str(confirmation_token), command)
 
         output_dir = self._process_output_dir()
+        sandbox_dir = self._sandbox_dir()
         _shell_command_check = agent_module._shell_command_check
         safety = _shell_command_check(
             command,
@@ -882,7 +895,8 @@ class BuiltinTools:
             env = os.environ.copy()
             env["AGENT_OUTPUT_DIR"] = str(output_dir)
             env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
-            resolved_cwd = output_dir
+            env["AGENT_SANDBOX_DIR"] = str(sandbox_dir)
+            resolved_cwd = sandbox_dir
             if cwd:
                 resolved_cwd, _root_kind = self._resolve_output_path(cwd)
             proc = await asyncio.create_subprocess_shell(

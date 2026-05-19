@@ -376,7 +376,8 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
     assert result["ok"] is True
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
     assert captured["env"]["AGENT_WORKSPACE_ROOT"]
-    assert captured["cwd"] == str((tmp_path / "output").resolve())
+    assert captured["cwd"] == str((tmp_path / "output" / "sandbox").resolve())
+    assert captured["env"]["AGENT_SANDBOX_DIR"] == str((tmp_path / "output" / "sandbox").resolve())
 
 
 def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch):
@@ -403,9 +404,9 @@ def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch)
     result = asyncio.run(tools._shell("echo ok", timeout=1))
 
     assert result["ok"] is True
-    assert captured["cwd"] == str(shared_module.DEFAULT_OUTPUT_DIR.resolve())
+    assert captured["cwd"] == str((shared_module.DEFAULT_OUTPUT_DIR / "sandbox").resolve())
     assert captured["cwd"] != str(workspace.resolve())
-    assert captured["env"]["AGENT_OUTPUT_DIR"] == captured["cwd"]
+    assert captured["env"]["AGENT_OUTPUT_DIR"] == str(shared_module.DEFAULT_OUTPUT_DIR.resolve())
 
 
 def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):

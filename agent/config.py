@@ -602,6 +602,17 @@ def _compose_system_prompt(
                 "Every shell tool call must include an `intent` input that explains what that exact command "
                 "will do and why it is necessary. Do not rely on surrounding prose as the shell intent."
             )
+            sandbox_hint = (
+                f"{output_dir}/sandbox"
+                if output_dir is not None
+                else f"{shared.DEFAULT_OUTPUT_DIR}/sandbox"
+            )
+            lines.append(
+                "Shell commands run in an isolated sandbox directory by default "
+                f"({sandbox_hint}), NOT the workspace root ({workspace_root}). "
+                "Downloads, clones, and generated artifacts go there automatically. "
+                "Only set cwd explicitly when you need to operate on workspace files."
+            )
         if "send_file" in builtin_names:
             lines.append(
                 "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "

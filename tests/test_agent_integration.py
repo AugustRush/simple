@@ -1604,8 +1604,8 @@ def test_build_components_applies_orchestration_limits(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("configured_value", "expected_value"),
     [
-        ("large", 40),
-        (100_000, 40),
+        ("large", 200),
+        (100_000, 500),
     ],
 )
 def test_build_components_bounds_invalid_tool_call_iteration_limit(
