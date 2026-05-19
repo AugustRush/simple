@@ -136,6 +136,7 @@ class RuntimeSessionState:
     task_context: str = ""
     context_manager: Any = None
     memory_worker: Any = None
+    cancel_token: Any = None  # CancelToken | None
 
     def ensure_task_context(self, text: str) -> None:
         if not self.task_context:
@@ -485,73 +486,112 @@ class AgentCore:
             final_result = TurnResult(text="")
             iteration_prompt = prompt
             iterations = 0
-            for iteration_index in range(max(1, int(max_continuations) + 1)):
-                iterations = iteration_index + 1
-                state.ensure_task_context(iteration_prompt)
-                self._refresh_component_prompt_if_needed(state)
-                self._refresh_skill_prompt_if_needed(state)
-                current_input = TurnInput(
-                    text=iteration_prompt,
-                    session_id=turn_input.session_id,
-                    channel_name=turn_input.channel_name,
-                    metadata=turn_input.metadata,
-                    attachments=(
-                        turn_input.attachments if iteration_index == 0 else ()
-                    ),
-                )
-                callback = (
-                    stream_callback
-                    if stream_callback is not None
-                    else getattr(sink, "sync_stream_cb", None)
-                )
-                agent_started_at = time.perf_counter()
-                final_result = await self._turn_runner().run(
-                    current_input,
-                    state.ctx,
-                    stream_callback=callback,
-                )
-                agent_duration_ms = round(
-                    (time.perf_counter() - agent_started_at) * 1000, 1
+            cancelled_by_user = False
+            # Publish the session cancel token so send_message() can check it
+            # at every tool-loop boundary.
+            if state.cancel_token is not None:
+                state.ctx.metadata["cancel_token"] = state.cancel_token
+            try:
+                for iteration_index in range(max(1, int(max_continuations) + 1)):
+                    iterations = iteration_index + 1
+                    state.ensure_task_context(iteration_prompt)
+                    self._refresh_component_prompt_if_needed(state)
+                    self._refresh_skill_prompt_if_needed(state)
+                    current_input = TurnInput(
+                        text=iteration_prompt,
+                        session_id=turn_input.session_id,
+                        channel_name=turn_input.channel_name,
+                        metadata=turn_input.metadata,
+                        attachments=(
+                            turn_input.attachments if iteration_index == 0 else ()
+                        ),
+                    )
+                    callback = (
+                        stream_callback
+                        if stream_callback is not None
+                        else getattr(sink, "sync_stream_cb", None)
+                    )
+                    agent_started_at = time.perf_counter()
+                    final_result = await self._turn_runner().run(
+                        current_input,
+                        state.ctx,
+                        stream_callback=callback,
+                    )
+                    agent_duration_ms = round(
+                        (time.perf_counter() - agent_started_at) * 1000, 1
+                    )
+                    collector.emit(
+                        "agent_result_ready",
+                        tool_calls=len(final_result.tool_calls),
+                        error=bool(final_result.error),
+                        content_len=len(final_result.text or ""),
+                        content_preview=(final_result.text or "")[:80],
+                        duration_ms=agent_duration_ms,
+                    )
+                    if sink is not None:
+                        sink.on_turn_complete(
+                            final_result.text or "",
+                            list(final_result.tool_calls),
+                        )
+                        if final_result.error:
+                            sink.on_error(final_result.error)
+                        await self._drain_if_supported(sink)
+                    collector.emit("turn_response_delivered")
+                    if final_result.error:
+                        collector.emit("turn_error_reported", error=final_result.error)
+                    hook_results = await self._turn_runner().complete_turn(
+                        current_input,
+                        state,
+                        final_result,
+                    )
+                    continued = False
+                    for hook_result in hook_results or []:
+                        if (
+                            getattr(hook_result, "action", "") == "continue"
+                            and getattr(hook_result, "message", "")
+                        ):
+                            iteration_prompt = str(hook_result.message)
+                            collector.emit(
+                                "turn_continued",
+                                next_prompt=iteration_prompt,
+                            )
+                            continued = True
+                            break
+                    if not continued:
+                        break
+            except KeyboardInterrupt:
+                if state.cancel_token is not None:
+                    state.cancel_token.cancel()
+                cancelled_by_user = True
+                final_result = TurnResult(
+                    text="[任务已被用户中断]",
+                    error="cancelled_by_user",
                 )
                 collector.emit(
                     "agent_result_ready",
                     tool_calls=len(final_result.tool_calls),
-                    error=bool(final_result.error),
-                    content_len=len(final_result.text or ""),
-                    content_preview=(final_result.text or "")[:80],
-                    duration_ms=agent_duration_ms,
+                    error=True,
+                    content_len=len(final_result.text),
+                    content_preview=final_result.text,
                 )
-                if sink is not None:
-                    sink.on_turn_complete(
-                        final_result.text or "",
-                        list(final_result.tool_calls),
-                    )
-                    if final_result.error:
-                        sink.on_error(final_result.error)
-                    await self._drain_if_supported(sink)
-                collector.emit("turn_response_delivered")
-                if final_result.error:
-                    collector.emit("turn_error_reported", error=final_result.error)
-                hook_results = await self._turn_runner().complete_turn(
-                    current_input,
+                # Run post-turn maintenance so the interrupted turn is
+                # recorded in staging and not lost.
+                await self._turn_runner().complete_turn(
+                    TurnInput(
+                        text=iteration_prompt,
+                        session_id=turn_input.session_id,
+                        channel_name=turn_input.channel_name,
+                        metadata=turn_input.metadata,
+                    ),
                     state,
                     final_result,
                 )
-                continued = False
-                for hook_result in hook_results or []:
-                    if (
-                        getattr(hook_result, "action", "") == "continue"
-                        and getattr(hook_result, "message", "")
-                    ):
-                        iteration_prompt = str(hook_result.message)
-                        collector.emit(
-                            "turn_continued",
-                            next_prompt=iteration_prompt,
-                        )
-                        continued = True
-                        break
-                if not continued:
-                    break
+                if sink is not None:
+                    sink.on_turn_complete(
+                        final_result.text,
+                        list(final_result.tool_calls),
+                    )
+                    await self._drain_if_supported(sink)
             return TurnExecution(
                 result=final_result,
                 iterations=iterations,
@@ -567,6 +607,8 @@ class AgentCore:
                 events=self._drain_collector(turn_input),
             )
         finally:
+            if state.cancel_token is not None:
+                state.ctx.metadata.pop("cancel_token", None)
             if schedule_target_token is not None:
                 _active_schedule_target.reset(schedule_target_token)
             if active_sink_token is not None:

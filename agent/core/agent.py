@@ -1920,6 +1920,20 @@ class BaseAgent:
                     )
                 tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
 
+                # Cooperative cancellation: check at every tool-loop boundary
+                # so the running turn can be interrupted cleanly without
+                # orphaning subprocesses or losing the turn record.
+                cancel_token = ctx.metadata.get("cancel_token")
+                if cancel_token is not None and cancel_token.is_cancelled:
+                    trace_status = "cancelled"
+                    trace_error = "Turn cancelled by user"
+                    return AgentResult(
+                        agent_id=ctx.agent_id,
+                        content=result_text or "[任务已被用户中断]",
+                        tool_calls_made=tool_calls_made,
+                        error=trace_error,
+                    )
+
                 # Keep working memory bounded for sub-agents (the main
                 # interactive loop compacts between turns, but sub-agents
                 # only call send_message() once and may hit the token limit

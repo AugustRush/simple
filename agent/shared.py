@@ -127,6 +127,26 @@ DEFAULT_ROUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "concepts": ("概念", "是什么", "what is", "define", "知识"),
 }
 
+class CancelToken:
+    """Cooperative cancellation token checked at tool-loop boundaries.
+
+    Setting ``cancel()`` signals the running turn to finish at the next
+    safe checkpoint (after the current tool call completes).  This avoids
+    the broken state that asyncio task cancellation would produce (orphan
+    subprocesses, half-written files).
+    """
+
+    def __init__(self) -> None:
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self._cancelled
+
+
 CONSOLE = Console()
 
 

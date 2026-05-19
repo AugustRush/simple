@@ -12,6 +12,7 @@ from typing import Any, Callable
 from rich.console import Console
 
 from agent import shared
+from agent.shared import CancelToken
 from agent.core.output import CliOutputSink, OutputSink
 from agent.core.attachments import MessageAttachment
 from agent.runtime import (
@@ -173,6 +174,7 @@ class ChannelRunner:
             ),
             context_manager=session_ctx_mgr,
             memory_worker=self._build_session_memory_worker(session_ctx_mgr),
+            cancel_token=CancelToken(),
         )
         sessions[session_id] = state
         return state
@@ -252,6 +254,17 @@ class ChannelRunner:
             state = self._ensure_session_state(sessions, session_id)
             ctx = state.ctx
             ctx.metadata["skill_catalog"] = skill_catalog
+
+            # /cancel arrives asynchronously in channel mode — cancel the
+            # running turn so the next tool-loop boundary stops it cleanly.
+            if msg.text.strip().lower() in ("/cancel", "cancel"):
+                if state.cancel_token is not None:
+                    state.cancel_token.cancel()
+                sink.on_status("已发送取消信号，当前任务将在下一个安全点停止", level="warning")
+                return True
+
+            # Fresh token for each turn so stale cancellations don't leak.
+            state.cancel_token = CancelToken()
             try:
                 _interaction_log(
                     "turn_started",

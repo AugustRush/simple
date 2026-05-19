@@ -19,6 +19,7 @@ import agent as agent_module
 from agent import shared
 from agent.core.output import CliOutputSink, _active_sink
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
+from agent.shared import CancelToken
 
 AgentContext = agent_module.AgentContext
 BaseAgent = agent_module.BaseAgent
@@ -437,6 +438,7 @@ async def _interactive_loop(components: dict, cfg: dict):
         ctx=ctx,
         context_manager=ctx_mgr,
         memory_worker=memory_worker,
+        cancel_token=CancelToken(),
     )
 
     # Queue orphaned staging files from previous sessions for background
@@ -499,6 +501,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                     _help_table.add_column("Description")
                     for _hcmd, _hdesc in [
                         ("/help", "Show this help"),
+                        ("/cancel", "Cancel the currently running task (Ctrl+C also works)"),
                         ("/memory", "Show memory export summary"),
                         ("/context", "Show LTM context manager stats"),
                         ("/sessions", "List recent session history"),
@@ -519,6 +522,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                     ]:
                         _help_table.add_row(_hcmd, _hdesc)
                     shared.CONSOLE.print(_help_table)
+                    continue
+                elif cmd == "cancel":
+                    state.cancel_token.cancel()
+                    shared.CONSOLE.print(
+                        "[yellow]已发送取消信号。在 CLI 模式下请使用 Ctrl+C 打断正在运行的任务。[/yellow]"
+                    )
                     continue
                 elif cmd == "memory":
                     lines = [
@@ -914,6 +923,9 @@ async def _interactive_loop(components: dict, cfg: dict):
 
             _turn_sink = CliOutputSink(shared.CONSOLE)
             try:
+                # Fresh cancel token for each turn — any stale cancellation
+                # from a previous turn must not affect this one.
+                state.cancel_token = CancelToken()
                 shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
                 ctx.metadata["skill_catalog"] = skill_catalog
                 await _agent_core_for_components(components).handle_turn(
