@@ -530,7 +530,10 @@ class BaseAgent:
             summary_lines.append(
                 f"- {result.id} ({status}): {detail}".rstrip()
             )
-        return "\n".join(summary_lines)
+        return RendezvousDirective(
+            summary="\n".join(summary_lines),
+            summary_quality="concatenation",
+        )
 
     @staticmethod
     def _with_expected_output_contract(task: str, expected_output: str) -> str:

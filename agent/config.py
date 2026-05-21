@@ -542,6 +542,13 @@ def _load_system_prompt(cfg: dict) -> str:
     return DEFAULT_SYSTEM_PROMPT
 
 
+# Module-level cache for static portion of system prompt.
+# The cache key captures all inputs that affect the static block;
+# time-dependent and plugin-injected content is always recomputed.
+_system_prompt_cache_key: tuple = ()
+_system_prompt_cache_value: str = ""
+
+
 def _compose_system_prompt(
     base_prompt: str,
     registry: ToolRegistry,
@@ -550,102 +557,119 @@ def _compose_system_prompt(
     skill_catalog: Optional[SkillCatalog] = None,
     plugin_catalog: Optional[PluginCatalog] = None,
 ) -> str:
-    groups: dict[str, list[tuple[str, str]]] = {
-        "builtin": [],
-        "mcp": [],
-        "runtime": [],
-    }
-    for name, tool in sorted(registry._tools.items()):
-        source = tool.source
-        if source == "builtin":
-            groups["builtin"].append((name, tool.description))
-        elif source.startswith("mcp:"):
-            groups["mcp"].append((name, tool.description))
-        else:
-            groups["runtime"].append((name, tool.description))
+    global _system_prompt_cache_key, _system_prompt_cache_value
 
-    def _format_group(items: list[tuple[str, str]]) -> str:
-        return "; ".join(f"{name}: {description}" for name, description in items)
-
-    lines = [
-        "## Active Capabilities",
-        "Use only tools that are actually listed for this agent instance.",
-        "When the user asks what you can do, what tools you have, or what capabilities are available, explicitly summarize the active tools below by name and purpose. Mention MCP tools when present.",
-    ]
-    if groups["builtin"]:
-        lines.append("Built-in tools: " + _format_group(groups["builtin"]))
-    if groups["mcp"]:
-        lines.append("Connected MCP tools: " + _format_group(groups["mcp"]))
-    if groups["runtime"]:
-        lines.append("Runtime tools: " + _format_group(groups["runtime"]))
-    if skill_catalog:
-        lines.extend(skill_catalog.summary_lines())
-    if workspace_root:
-        builtin_names = {n for n, _ in groups["builtin"]}
-        if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
-            lines.append(
-                f"Workspace root for read_file/write_file/list_files only: {workspace_root}"
-            )
-        if "schedule_create" in builtin_names:
-            lines.append(
-                "If the user asks for a reminder, delayed follow-up, or recurring future message, "
-                "use the schedule tools instead of saying you cannot act in the future."
-            )
-            lines.append(
-                "Use `action_type=message` for literal future messages, "
-                "`action_type=agent_task` for future work to execute later, and "
-                "`action_type=system_job` for internal maintenance. "
-                "Do not pretend the scheduled action has already run."
-            )
-        if "shell" in builtin_names:
-            lines.append(
-                "Every shell tool call must include an `intent` input that explains what that exact command "
-                "will do and why it is necessary. Do not rely on surrounding prose as the shell intent."
-            )
-            sandbox_hint = (
-                f"{output_dir}/sandbox"
-                if output_dir is not None
-                else f"{shared.DEFAULT_OUTPUT_DIR}/sandbox"
-            )
-            lines.append(
-                "Shell commands run in an isolated sandbox directory by default "
-                f"({sandbox_hint}), NOT the workspace root ({workspace_root}). "
-                "Downloads, clones, and generated artifacts go there automatically. "
-                "Only set cwd explicitly when you need to operate on workspace files."
-            )
-        if "send_file" in builtin_names:
-            lines.append(
-                "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "
-                "instead of claiming file delivery is unsupported."
-            )
-    lines.append(
-        "Agent-managed paths are separate from the workspace root: "
-        f"user tools live in {shared.TOOLS_DIR}, "
-        f"user skills live in {shared.SKILLS_DIR}."
+    # Build cache key from all stable inputs
+    cache_key = (
+        base_prompt,
+        getattr(registry, '_prompt_generation', 0),
+        getattr(skill_catalog, '_prompt_generation', 0) if skill_catalog is not None else 0,
+        workspace_root,
+        output_dir,
     )
-    if output_dir:
+
+    # Rebuild static block only when cache key changes
+    if cache_key != _system_prompt_cache_key:
+        groups: dict[str, list[tuple[str, str]]] = {
+            "builtin": [],
+            "mcp": [],
+            "runtime": [],
+        }
+        for name, tool in sorted(registry._tools.items()):
+            source = tool.source
+            if source == "builtin":
+                groups["builtin"].append((name, tool.description))
+            elif source.startswith("mcp:"):
+                groups["mcp"].append((name, tool.description))
+            else:
+                groups["runtime"].append((name, tool.description))
+
+        def _format_group(items: list[tuple[str, str]]) -> str:
+            return "; ".join(f"{name}: {description}" for name, description in items)
+
+        lines = [
+            "## Active Capabilities",
+            "Use only tools that are actually listed for this agent instance.",
+            "When the user asks what you can do, what tools you have, or what capabilities are available, explicitly summarize the active tools below by name and purpose. Mention MCP tools when present.",
+        ]
+        if groups["builtin"]:
+            lines.append("Built-in tools: " + _format_group(groups["builtin"]))
+        if groups["mcp"]:
+            lines.append("Connected MCP tools: " + _format_group(groups["mcp"]))
+        if groups["runtime"]:
+            lines.append("Runtime tools: " + _format_group(groups["runtime"]))
+        if skill_catalog:
+            lines.extend(skill_catalog.summary_lines())
+        if workspace_root:
+            builtin_names = {n for n, _ in groups["builtin"]}
+            if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
+                lines.append(
+                    f"Workspace root for read_file/write_file/list_files only: {workspace_root}"
+                )
+            if "schedule_create" in builtin_names:
+                lines.append(
+                    "If the user asks for a reminder, delayed follow-up, or recurring future message, "
+                    "use the schedule tools instead of saying you cannot act in the future."
+                )
+                lines.append(
+                    "Use `action_type=message` for literal future messages, "
+                    "`action_type=agent_task` for future work to execute later, and "
+                    "`action_type=system_job` for internal maintenance. "
+                    "Do not pretend the scheduled action has already run."
+                )
+            if "shell" in builtin_names:
+                lines.append(
+                    "Every shell tool call must include an `intent` input that explains what that exact command "
+                    "will do and why it is necessary. Do not rely on surrounding prose as the shell intent."
+                )
+                sandbox_hint = (
+                    f"{output_dir}/sandbox"
+                    if output_dir is not None
+                    else f"{shared.DEFAULT_OUTPUT_DIR}/sandbox"
+                )
+                lines.append(
+                    "Shell commands run in an isolated sandbox directory by default "
+                    f"({sandbox_hint}), NOT the workspace root ({workspace_root}). "
+                    "Downloads, clones, and generated artifacts go there automatically. "
+                    "Only set cwd explicitly when you need to operate on workspace files."
+                )
+            if "send_file" in builtin_names:
+                lines.append(
+                    "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "
+                    "instead of claiming file delivery is unsupported."
+                )
         lines.append(
-            f"Output directory for generated files (screenshots, exports, temp): {output_dir}"
+            "Agent-managed paths are separate from the workspace root: "
+            f"user tools live in {shared.TOOLS_DIR}, "
+            f"user skills live in {shared.SKILLS_DIR}."
         )
-    if registry.get_context("supports_vision"):
-        lines.append(
-            "This agent supports vision. When the user sends images, you can see and "
-            "analyze them directly — describe what you observe before taking action."
-        )
-    lines.append(
+        if output_dir:
+            lines.append(
+                f"Output directory for generated files (screenshots, exports, temp): {output_dir}"
+            )
+        if registry.get_context("supports_vision"):
+            lines.append(
+                "This agent supports vision. When the user sends images, you can see and "
+                "analyze them directly — describe what you observe before taking action."
+            )
+        _system_prompt_cache_value = base_prompt.rstrip() + "\n\n" + "\n".join(lines)
+        _system_prompt_cache_key = cache_key
+
+    # Always recompute dynamic footer (time-dependent content)
+    result = _system_prompt_cache_value
+    result += "\n" + (
         f"Current UTC time: {_now()}. "
         "Use the current_time tool when the user asks about local time or timezone conversions."
     )
-    lines.append(
+    result += "\n" + (
         "You are a personal AI agent with long-term memory, scheduled task support, and "
         "multi-channel delivery. When appropriate, proactively suggest setting reminders, "
         "scheduling daily summaries, or creating recurring check-ins. "
         "After completing significant tasks or generating files, confirm the outcome."
     )
-    composed = base_prompt.rstrip() + "\n\n" + "\n".join(lines)
     if plugin_catalog:
-        composed = plugin_catalog.compose_all_prompts(composed)
-    return composed
+        result = plugin_catalog.compose_all_prompts(result)
+    return result
 
 
 async def _close_components(components: dict) -> None:

@@ -22,6 +22,8 @@ class SubtaskSpec:
     capability_profile: str = "full"
     handoff: dict[str, Any] = field(default_factory=dict)
     early_exit: bool = False
+    timeout_seconds: float = 0
+    continue_on_failure: bool = False
 
 
 @dataclass
@@ -42,6 +44,7 @@ class RendezvousDirective:
     structured_context: dict[str, Any] | None = None
     continue_with: list[str] | None = None
     stop: bool = False
+    summary_quality: str = "llm"
 
 
 RuntimeProgressCallback = Callable[[str, dict[str, Any]], None]
@@ -114,7 +117,18 @@ async def run_parallel_subtasks(
                     error="cancelled: another agent triggered early exit",
                 )
             try:
-                result = await executor(spec)
+                if spec.timeout_seconds and spec.timeout_seconds > 0:
+                    result = await asyncio.wait_for(executor(spec), timeout=spec.timeout_seconds)
+                else:
+                    result = await executor(spec)
+            except asyncio.TimeoutError:
+                result = SubtaskResult(
+                    id=spec.id,
+                    ok=False,
+                    content="",
+                    tool_calls_made=[],
+                    error=f"subtask timed out after {spec.timeout_seconds}s",
+                )
             except asyncio.CancelledError:
                 if early_exit_event.is_set():
                     return index, SubtaskResult(
@@ -248,6 +262,10 @@ async def run_pipeline_subtasks(
             results.append(result)
             pending.pop(spec_id)
             if not result.ok:
+                if spec.continue_on_failure:
+                    summaries[spec.id] = f"[failed] {result.error or 'unknown error'}"
+                    successful_results[spec.id] = result
+                    continue
                 stage_failed = True
                 continue
             summaries[spec.id] = result.summary

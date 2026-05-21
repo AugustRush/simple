@@ -75,6 +75,7 @@ class ToolRegistry:
 
     def __init__(self, console: Optional[Any] = None):
         self._tools: dict[str, ToolDef] = {}
+        self._prompt_generation: int = 0
         self._context: dict[str, Any] = {}
         self._context_override: contextvars.ContextVar[Optional[dict[str, Any]]] = (
             contextvars.ContextVar("tool_registry_context_override", default=None)
@@ -112,6 +113,7 @@ class ToolRegistry:
             source=source,
             capabilities=self._coerce_capabilities(name, source, capabilities),
         )
+        self._prompt_generation += 1
 
     @classmethod
     def _coerce_capabilities(
@@ -220,6 +222,7 @@ class ToolRegistry:
             n for n, tool in self._tools.items() if tool.source.startswith(prefix)
         ]:
             self._tools.pop(name, None)
+        self._prompt_generation += 1
 
 
 

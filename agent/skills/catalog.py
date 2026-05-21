@@ -152,6 +152,7 @@ class SkillCatalog:
         self._aliases: dict[str, str] = {}
         self._registry: Optional[ToolRegistry] = None
         self._dirty: bool = False
+        self._prompt_generation: int = 0
 
     def load_all(self) -> None:
         self.user_root.mkdir(parents=True, exist_ok=True)
@@ -220,6 +221,7 @@ class SkillCatalog:
     def reload(self) -> None:
         self.load_all()
         self._dirty = True
+        self._prompt_generation += 1
 
     def consume_dirty(self) -> bool:
         """Return True and clear if the catalog was mutated since last check."""
