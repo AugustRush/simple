@@ -37,9 +37,20 @@ from agent.plugins.catalog import PluginCatalog
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry
+from agent.security.content_filter import (
+    ContentFilter,
+    default_model_path,
+    filter_tool_results,
+    summarize_tool_result,
+)
 
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
+
+# Context variable so built-in tools can access the active AgentContext
+_active_agent_context: contextvars.ContextVar[Optional["AgentContext"]] = (
+    contextvars.ContextVar("active_agent_context", default=None)
+)
 
 _OPENAI_MESSAGE_RESERVED_FIELDS = frozenset(
     {
@@ -164,6 +175,8 @@ class BaseAgent:
         self._context_stack = _TaskLocalContextStack()
         self.workspace_root: Optional[Path] = None
         self._base_system_prompt: str = ""
+        self.content_filter: ContentFilter = ContentFilter.load(default_model_path())
+        self._content_filter_threshold: float = 0.7
 
     def _image_content_block(self, attachment: MessageAttachment) -> dict[str, Any]:
         data = base64.b64encode(attachment.local_path.read_bytes()).decode("ascii")
@@ -1358,6 +1371,29 @@ class BaseAgent:
                 for tc, r in zip(tool_calls, results)
             ]
 
+    @staticmethod
+    def _clear_context_restart_message(
+        tool_calls: list[dict],
+        results: list[str],
+    ) -> str | None:
+        """Return a deferred clear-context restart message from a tool batch."""
+        for tool_call, raw_result in zip(tool_calls, results):
+            if tool_call.get("name") != "clear_context":
+                continue
+            try:
+                payload = json.loads(str(raw_result or ""))
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("ok") is False:
+                continue
+            if payload.get("clear_context_requested") is True:
+                restart_message = str(payload.get("restart_message", "")).strip()
+                if restart_message:
+                    return restart_message
+        return None
+
     def _format_agent_error(self, exc: Exception) -> str:
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             return "Model request timed out"
@@ -1395,6 +1431,93 @@ class BaseAgent:
         if any(kw in error_msg for kw in retryable_keywords):
             return True
         return False
+
+    @staticmethod
+    def _is_content_filter_block(exc: Exception) -> bool:
+        """Return True when the provider rejected the request due to content policy."""
+        error_msg = str(exc).lower()
+        return "content exists risk" in error_msg or "content filter" in error_msg
+
+    @staticmethod
+    def _build_summarized_tool_results(
+        tool_uses: list[dict],
+        results: list[str],
+    ) -> str:
+        """Build a text summary of tool results for recovery after content filter block."""
+        lines = ["[Tool results summarized — original output triggered content filter]\n"]
+        for tu, res in zip(tool_uses, results):
+            summary = summarize_tool_result(
+                tu["name"], res, include_preview=False
+            )
+            lines.append(f"- {tu['name']}: {str(summary)[:400]}")
+        return "\n".join(lines)
+
+    async def _recover_from_content_filter(
+        self,
+        ctx: "AgentContext",
+        tool_uses: list[dict] | None,
+        results: list[str] | None,
+    ) -> Any | None:
+        """Attempt recovery after a content filter rejection.
+
+        Strategy: roll back the last round of messages from ctx.messages,
+        replace the offending tool results with safe summaries, and retry
+        the API call once. If it still fails, return None.
+        """
+        # Learn from the actual rejection only when attribution is unambiguous.
+        # A provider rejection is request-level; labeling every result in a
+        # multi-tool batch as risky poisons unrelated outputs.
+        if tool_uses and results:
+            if len(results) == 1:
+                self.content_filter.learn(results[0], is_risky=True)
+                await asyncio.to_thread(
+                    self.content_filter.save, default_model_path()
+                )
+            else:
+                logger.info(
+                    "Content filter recovery skipped classifier learning for "
+                    "ambiguous multi-tool batch of %d results",
+                    len(results),
+                )
+
+        # Roll back: remove the last assistant message and its tool results.
+        # The last message(s) in ctx.messages are the tool_result entries,
+        # preceded by the assistant tool_use message.
+        messages_before = len(ctx.messages)
+        if tool_uses:
+            # Calculate how many tool_result messages were appended
+            if self.api_format == "anthropic":
+                result_msg_count = 1  # single user msg with content list
+            else:
+                result_msg_count = len(tool_uses)  # one tool msg per call
+            # Remove tool_result messages + the preceding assistant message
+            del ctx.messages[-(result_msg_count + 1):]
+
+        # Append a summarized user message instead
+        if tool_uses and results:
+            summary = self._build_summarized_tool_results(tool_uses, results)
+            ctx.messages.append({"role": "user", "content": summary})
+            logger.info(
+                "Content filter recovery: rolled back %d messages, "
+                "replaced with summarized tool results",
+                messages_before - len(ctx.messages) + 1,
+            )
+
+        # Retry once with the cleaned messages
+        try:
+            tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
+            return await self._create(ctx, tools)
+        except Exception as retry_exc:
+            if self._is_content_filter_block(retry_exc):
+                logger.warning(
+                    "Content filter recovery retry also blocked — "
+                    "summarized results still triggered filter"
+                )
+            else:
+                logger.warning(
+                    "Content filter recovery retry failed: %s", retry_exc
+                )
+            return None
 
     async def _with_llm_retry(self, fn, *args, **kwargs):
         """Call *fn* with retry on transient LLM API errors."""
@@ -1487,6 +1610,8 @@ class BaseAgent:
             "message",
             "stdout",
             "stderr",
+            "recoverable_by_agent",
+            "recovery_hint",
         )
         normalized = {key: payload[key] for key in interesting_keys if key in payload}
         return normalized or payload
@@ -1573,6 +1698,7 @@ class BaseAgent:
             normalized = cls._normalized_tool_result(raw_result)
             if isinstance(normalized, dict):
                 for key in (
+                    "recovery_hint",
                     "error",
                     "reason",
                     "message",
@@ -1843,6 +1969,9 @@ class BaseAgent:
         consecutive_same_tool_pair = 0
         consecutive_same_tool_result = 0
         consecutive_unproductive_tool_rounds = 0
+        content_filter_recovered_response: Any | None = None
+        content_filter_submitted_tool_uses: list[dict] | None = None
+        content_filter_submitted_results: list[str] | None = None
         turn_started_at = time.perf_counter()
         trace_status = "ok"
         trace_error: str | None = None
@@ -1866,6 +1995,9 @@ class BaseAgent:
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
         try:
+            # Set the active agent context so built-in tools (e.g. clear_context)
+            # can access the current ctx.messages.
+            _active_ctx_token = _active_agent_context.set(ctx)
             # Inject relevant context into system prompt for this turn.
             # retrieve_context() includes both:
             #   1. Recent staging buffer turns (current session, not yet consolidated)
@@ -1907,7 +2039,8 @@ class BaseAgent:
 
             # D1: bounded tool-call loop — prevents infinite model loops
             max_tool_call_iterations = max(1, int(self.max_tool_call_iterations))
-            for _iteration in range(max_tool_call_iterations + 1):
+            _iteration = 0
+            while True:
                 trace_iterations = _iteration + 1
                 if _iteration == max_tool_call_iterations:
                     trace_status = "tool_loop_exceeded"
@@ -1954,7 +2087,11 @@ class BaseAgent:
 
                 try:
                     response_started_at = time.perf_counter()
-                    if stream_callback:
+                    if content_filter_recovered_response is not None:
+                        response = content_filter_recovered_response
+                        content_filter_recovered_response = None
+                        streamed_text = ""
+                    elif stream_callback:
                         response, streamed_text = await self._with_llm_retry(
                             self._stream_response, ctx, tools, stream_callback
                         )
@@ -1963,6 +2100,8 @@ class BaseAgent:
                             self._create, ctx, tools
                         )
                         streamed_text = ""
+                    content_filter_submitted_tool_uses = None
+                    content_filter_submitted_results = None
                     stop_reason, text, tool_uses = self._parse_response(response)
                     _trace_latency(
                         "model_response_received",
@@ -2024,9 +2163,43 @@ class BaseAgent:
                         tool_result_history.extend(
                             (tu["name"], res) for tu, res in zip(tool_uses, results)
                         )
-                        ctx.messages.extend(
-                            self._tool_result_messages(tool_uses, results)
+                        # Content filter: screen tool results before API submission.
+                        # Flagged results get summarized to avoid triggering provider
+                        # content policy filters on subsequent API calls.
+                        filtered_results, risky_indices = filter_tool_results(
+                            self.content_filter,
+                            tool_uses,
+                            results,
+                            threshold=self._content_filter_threshold,
                         )
+                        if risky_indices:
+                            for i in risky_indices:
+                                self.content_filter.learn(results[i], is_risky=True)
+                            await asyncio.to_thread(
+                                self.content_filter.save, default_model_path()
+                            )
+                            logger.info(
+                                "Content filter flagged %d/%d tool results as risky: %s",
+                                len(risky_indices), len(results),
+                                [tool_uses[i]["name"] for i in risky_indices],
+                            )
+                        restart_message = self._clear_context_restart_message(
+                            tool_uses, results
+                        )
+                        if restart_message is not None:
+                            ctx.messages[:] = [
+                                {"role": "user", "content": restart_message}
+                            ]
+                            content_filter_submitted_tool_uses = None
+                            content_filter_submitted_results = None
+                            _iteration += 1
+                            continue
+
+                        ctx.messages.extend(
+                            self._tool_result_messages(tool_uses, filtered_results)
+                        )
+                        content_filter_submitted_tool_uses = list(tool_uses)
+                        content_filter_submitted_results = list(results)
 
                         tool_batch_signature = self._tool_use_signature(tool_uses)
                         tool_result_signature = self._tool_result_signature(results)
@@ -2114,6 +2287,7 @@ class BaseAgent:
                                 content=result_text,
                                 tool_calls_made=tool_calls_made,
                             )
+                        _iteration += 1
                         continue
                     else:
                         # Prefer the parsed text; fall back to streamed text for
@@ -2167,6 +2341,39 @@ class BaseAgent:
                         break
 
                 except Exception as e:
+                    if self._is_content_filter_block(e):
+                        # Recovery: rollback last assistant+tool_result messages,
+                        # summarize the blocked content, and retry.
+                        recovered_response = await self._recover_from_content_filter(
+                            ctx,
+                            content_filter_submitted_tool_uses,
+                            content_filter_submitted_results,
+                        )
+                        if recovered_response is not None:
+                            content_filter_recovered_response = recovered_response
+                            content_filter_submitted_tool_uses = None
+                            content_filter_submitted_results = None
+                            trace_status = "content_filter_recovered"
+                            _interaction_log(
+                                "content_filter_recovered",
+                                agent_id=ctx.agent_id,
+                                iteration=_iteration + 1,
+                            )
+                            continue
+                        # Recovery failed — let the error propagate
+                        trace_status = "content_filter_unrecoverable"
+                        trace_error = (
+                            "Content filter blocked the request and recovery failed. "
+                            "Consider switching to a different provider "
+                            "(e.g. /model anthropic or /model openai) for "
+                            "this task."
+                        )
+                        result_text = trace_error
+                        ctx.messages.append(
+                            {"role": "assistant", "content": trace_error}
+                        )
+                        break
+
                     trace_status = "exception"
                     trace_error = self._format_agent_error(e)
                     return AgentResult(
@@ -2176,6 +2383,7 @@ class BaseAgent:
                         error=trace_error,
                     )
         finally:
+            _active_agent_context.reset(_active_ctx_token)
             _interaction_log(
                 "turn_finished",
                 agent_id=ctx.agent_id,

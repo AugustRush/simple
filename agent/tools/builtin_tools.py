@@ -127,7 +127,7 @@ class BuiltinTools:
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Optional working directory. Defaults to an isolated sandbox directory (AGENT_SANDBOX_DIR) so downloads, clones, and generated artifacts never pollute the workspace. Only set this when you specifically need to operate inside the workspace or output directory.",
+                        "description": "Optional working directory. Defaults to an isolated sandbox directory (AGENT_SANDBOX_DIR) so downloads, clones, and generated artifacts never pollute the workspace. For current project files, set cwd to the workspace root and use relative command arguments; for external clones/downloads, keep the default cwd and use relative paths.",
                     },
                     "confirmation_token": {
                         "type": "string",
@@ -578,6 +578,28 @@ class BuiltinTools:
                 source="builtin",
             )
 
+        r.register(
+            "clear_context",
+            "Reset the conversation context to just the current user request. "
+            "Use this when the conversation history has grown too large or "
+            "triggered a content policy filter. The current task will be "
+            "preserved as a summary, and the agent will restart with a clean "
+            "context.",
+            {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "A brief summary of the original request and what has been done so far (optional, auto-generated if empty).",
+                        "default": "",
+                    },
+                },
+                "required": [],
+            },
+            self._clear_context,
+            source="builtin",
+        )
+
     # ── Web tools ──────────────────────────────────────────────────────────────
 
     @staticmethod
@@ -848,6 +870,40 @@ class BuiltinTools:
             f"Allowed paths: {', '.join(allowed)}"
         )
 
+    def _shell_recovery_hint(
+        self,
+        *,
+        reason: str,
+        output_dir: Path,
+        sandbox_dir: Path,
+    ) -> dict[str, Any] | None:
+        if "absolute path arguments outside the tool cwd boundary" not in reason:
+            return None
+        return {
+            "summary": (
+                "Avoid external absolute path arguments. Re-run with a safe cwd "
+                "and relative command arguments instead of asking the user first."
+            ),
+            "workspace_cwd": str(self.workspace_root),
+            "sandbox_cwd": str(sandbox_dir),
+            "output_dir": str(output_dir),
+            "patterns": [
+                (
+                    "For current project files: set cwd to workspace_cwd and "
+                    "use relative paths in the command."
+                ),
+                (
+                    "For downloads, clones, and generated artifacts: keep the "
+                    "default cwd (sandbox_cwd) and use relative paths, e.g. "
+                    "git clone <url> repo-name."
+                ),
+                (
+                    "Only use confirmation_token if the external absolute path "
+                    "is truly required."
+                ),
+            ],
+        }
+
     async def _shell(
         self,
         command: str,
@@ -877,12 +933,22 @@ class BuiltinTools:
         )
         if not safety.allowed:
             if safety.requires_confirmation:
+                recovery_hint = self._shell_recovery_hint(
+                    reason=safety.reason,
+                    output_dir=output_dir,
+                    sandbox_dir=sandbox_dir,
+                )
+                extra: dict[str, Any] = {}
+                if recovery_hint is not None:
+                    extra["recoverable_by_agent"] = True
+                    extra["recovery_hint"] = recovery_hint
                 return self._error(
                     f"Shell command requires confirmation: {safety.reason}",
                     command=command,
                     risk_level=safety.risk_level,
                     requires_confirmation=True,
                     confirmation_token=safety.confirmation_token,
+                    **extra,
                 )
             return self._error(
                 f"Shell command rejected: {safety.reason}",
@@ -1484,3 +1550,77 @@ class BuiltinTools:
         if errors:
             result["errors"] = errors[:10]
         return result
+
+    def _clear_context(self, summary: str = "") -> dict[str, Any]:
+        """Request a context reset after the current tool batch finishes.
+
+        The agent loop applies the reset after all concurrently requested tools
+        return. Mutating ctx.messages from inside one concurrent tool would
+        leave sibling tool results detached from their assistant tool-call.
+        """
+        try:
+            from agent.core.agent import _active_agent_context
+
+            ctx = _active_agent_context.get()
+            if ctx is None or not ctx.messages:
+                return self._error(
+                    "No active agent context available to clear. "
+                    "This tool must be used during an active conversation."
+                )
+
+            def _text_from_user_message(msg: dict[str, Any]) -> str:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    # Anthropic tool results are represented as role=user
+                    # messages too; skip those when finding the active task.
+                    if any(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in content
+                    ):
+                        return ""
+                    return "\n".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                return str(content or "")
+
+            # Find the latest real user request. In a multi-turn conversation,
+            # the first user message may belong to an old task.
+            current_user = None
+            for msg in reversed(ctx.messages):
+                if msg.get("role") == "user":
+                    content = _text_from_user_message(msg).strip()
+                    if content and str(content).strip():
+                        current_user = str(content).strip()
+                        break
+
+            if not current_user:
+                return self._error("No current user message found in context.")
+
+            # Build a clean context with the summary and current task.
+            summary_text = str(summary or "").strip()
+            restart_message = (
+                "[Context has been cleared to reduce token usage.]\n\n"
+            )
+            if summary_text:
+                restart_message += (
+                    f"## Summary of work so far\n{summary_text}\n\n"
+                )
+            restart_message += (
+                f"## Current request\n{current_user}\n\n"
+                "Please continue from where you left off, using the summary "
+                "above as context for what has already been done."
+            )
+
+            return self._ok(
+                clear_context_requested=True,
+                restart_message=restart_message,
+                current_request=current_user[:500],
+                summary_provided=bool(summary_text),
+            )
+        except ImportError:
+            return self._error(
+                "clear_context is not available — agent runtime not accessible."
+            )
+        except Exception as e:
+            return self._error(f"Failed to clear context: {e}")

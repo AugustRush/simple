@@ -633,6 +633,13 @@ def _compose_system_prompt(
                     "Downloads, clones, and generated artifacts go there automatically. "
                     "Only set cwd explicitly when you need to operate on workspace files."
                 )
+                lines.append(
+                    "Avoid absolute path arguments in shell commands. For current project files, "
+                    f"set shell cwd to the workspace root ({workspace_root}) and use relative paths. "
+                    "For external repos, downloads, and build artifacts, keep the default sandbox cwd "
+                    "and use relative targets such as `git clone <url> repo-name`; run follow-up "
+                    "commands with cwd set to the cloned directory under the sandbox/output directory."
+                )
             if "send_file" in builtin_names:
                 lines.append(
                     "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "

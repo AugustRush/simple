@@ -1791,6 +1791,162 @@ def test_send_message_stuck_response_sanitizes_intent_required_loop(monkeypatch)
     assert "Intent required" not in result.content
 
 
+def test_send_message_content_filter_recovery_continues_tool_loop(monkeypatch):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent.llm_max_retries = 0
+    monkeypatch.setattr(agent.content_filter, "save", lambda path: None)
+
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls",
+                        agent_module._OAIMsg(
+                            "",
+                            [
+                                agent_module._OAITC(
+                                    "call-1",
+                                    agent_module._OAIFunc("noop", "{}"),
+                                )
+                            ],
+                        ),
+                    )
+                ]
+            ),
+            RuntimeError("Content Exists Risk"),
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls",
+                        agent_module._OAIMsg(
+                            "",
+                            [
+                                agent_module._OAITC(
+                                    "call-2",
+                                    agent_module._OAIFunc("noop_after_recovery", "{}"),
+                                )
+                            ],
+                        ),
+                    )
+                ]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        return [f"raw result from {tool_use['name']}" for tool_use in tool_uses]
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+
+    result = asyncio.run(
+        agent.send_message(agent_module.AgentContext(system_prompt="system"), "do it")
+    )
+
+    assert result.error is None
+    assert result.content == "final"
+    assert result.tool_calls_made == ["noop", "noop_after_recovery"]
+
+
+def test_clear_context_is_applied_after_tool_batch_and_uses_current_request(
+    monkeypatch,
+    tmp_path,
+):
+    import agent as agent_module
+
+    class _FakeMemory:
+        def write(self, *args, **kwargs):
+            return None
+
+        def read(self, *args, **kwargs):
+            return ""
+
+        def search(self, *args, **kwargs):
+            return []
+
+        def read_index(self):
+            return ""
+
+    registry = agent_module.ToolRegistry()
+    agent_module.BuiltinTools(_FakeMemory(), registry, workspace_root=tmp_path)
+    registry.register(
+        "noop",
+        "No-op test tool",
+        {"type": "object", "properties": {}, "required": []},
+        lambda: {"ok": True, "value": "sibling result"},
+        source="test",
+    )
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    observed_messages = []
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls",
+                        agent_module._OAIMsg(
+                            "I will clear context before continuing.",
+                            [
+                                agent_module._OAITC(
+                                    "call-clear",
+                                    agent_module._OAIFunc(
+                                        "clear_context",
+                                        json.dumps({"summary": "summary so far"}),
+                                    ),
+                                ),
+                                agent_module._OAITC(
+                                    "call-noop",
+                                    agent_module._OAIFunc("noop", "{}"),
+                                ),
+                            ],
+                        ),
+                    )
+                ]
+            ),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("continued", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        observed_messages.append(list(ctx.messages))
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    ctx.messages.append({"role": "user", "content": "old task"})
+    ctx.messages.append({"role": "assistant", "content": "old answer"})
+
+    result = asyncio.run(agent.send_message(ctx, "current task"))
+
+    assert result.error is None
+    assert result.content == "continued"
+    assert len(observed_messages) == 2
+    assert observed_messages[1][0]["role"] == "user"
+    assert "current task" in observed_messages[1][0]["content"]
+    assert "old task" not in observed_messages[1][0]["content"]
+    assert all(message["role"] != "tool" for message in observed_messages[1])
+
+
 def test_orchestration_planner_defaults_without_orchestration_skill(monkeypatch, tmp_path):
     import agent as agent_module
 

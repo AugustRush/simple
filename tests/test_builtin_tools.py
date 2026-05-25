@@ -445,6 +445,21 @@ def test_shell_returns_confirmation_request_for_restricted_command(tmp_path):
     assert "requires confirmation" in result["error"].lower()
 
 
+def test_shell_returns_recovery_hint_for_external_absolute_path(tmp_path):
+    tools, _, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
+
+    result = asyncio.run(tools._shell("cat /etc/passwd", timeout=1))
+
+    assert result["ok"] is False
+    assert result["requires_confirmation"] is True
+    assert result["recoverable_by_agent"] is True
+    hint = result["recovery_hint"]
+    assert hint["workspace_cwd"] == str(workspace.resolve())
+    assert hint["sandbox_cwd"] == str((output_dir / "sandbox").resolve())
+    assert "relative command arguments" in hint["summary"]
+    assert any("git clone <url> repo-name" in item for item in hint["patterns"])
+
+
 def test_shell_runs_restricted_command_after_matching_confirmation(
     tmp_path, monkeypatch
 ):
