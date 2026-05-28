@@ -162,14 +162,38 @@ class PluginMeta:
 
 
 def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
-    """Read plugin.json from a plugin directory. Returns None if absent."""
-    pj = plugin_dir / "plugin.json"
+    """Read plugin.json from a plugin directory.  Returns None if absent.
+
+    Detects either layout:
+      - ``<plugin>/plugin.json``                 (this project's original format)
+      - ``<plugin>/.claude-plugin/plugin.json``  (Claude Code / Codex format)
+
+    Accepts both ``mcp_servers`` (snake_case) and ``mcpServers`` (camelCase).
+    Skills default to the ``skills`` subdirectory when it exists, so a
+    Claude Code plugin needs no manifest entry to expose its skills.
+    """
+    cc_pj = plugin_dir / ".claude-plugin" / "plugin.json"
+    bare_pj = plugin_dir / "plugin.json"
+    pj = cc_pj if cc_pj.exists() else bare_pj
     if not pj.exists():
-        return None
+        # No manifest at all — synthesise minimal meta if any standard
+        # subdir exists (so claude-plugin packages without a plugin.json
+        # still expose their skills/commands/agents).
+        if not (plugin_dir / "skills").is_dir() and not (plugin_dir / "commands").is_dir():
+            return None
+        return PluginMeta(name=plugin_dir.name)
     try:
         data = json.loads(pj.read_text(encoding="utf-8"))
-        mcp = data.get("mcp_servers", [])
-        if isinstance(mcp, str):
+        mcp = data.get("mcp_servers")
+        if mcp is None:
+            mcp = data.get("mcpServers", [])
+        if isinstance(mcp, dict):
+            # Claude Code marketplace ``mcpServers`` block is a dict
+            # keyed by server name.  Flatten into a list while
+            # preserving the key as the canonical name.
+            mcp = [{"name": k, **(v if isinstance(v, dict) else {})}
+                   for k, v in mcp.items()]
+        elif isinstance(mcp, str):
             mcp_path = plugin_dir / mcp
             if mcp_path.exists():
                 mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
@@ -198,11 +222,16 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
                             hook_matchers[hook_name] = re.compile(matcher)
                         except re.error:
                             pass
+        # Skills path defaults to ``skills`` subdir when not declared and
+        # the directory exists — matches Claude Code's convention-over-config.
+        skills_field = data.get("skills", "")
+        if not skills_field and (plugin_dir / "skills").is_dir():
+            skills_field = "skills"
         return PluginMeta(
             name=data.get("name", plugin_dir.name),
             version=data.get("version", ""),
             description=data.get("description", ""),
-            skills=data.get("skills", ""),
+            skills=skills_field,
             mcp_servers=mcp if isinstance(mcp, list) else [],
             hooks_config=raw_hooks,
             hook_matchers=hook_matchers,
@@ -210,6 +239,39 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
         )
     except Exception:
         return None
+
+
+def _read_marketplace_manifest(dir_path: Path) -> Optional[list[tuple[Path, str]]]:
+    """Read ``.claude-plugin/marketplace.json`` if present.
+
+    A Claude Code marketplace is a repo whose root holds
+    ``.claude-plugin/marketplace.json`` listing one or more plugins by
+    relative ``source`` path.  Returns ``[(plugin_dir, plugin_name), ...]``
+    when a marketplace is found, ``None`` otherwise.
+    """
+    mp = dir_path / ".claude-plugin" / "marketplace.json"
+    if not mp.exists():
+        return None
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    plugins = data.get("plugins")
+    if not isinstance(plugins, list):
+        return None
+    out: list[tuple[Path, str]] = []
+    for entry in plugins:
+        if not isinstance(entry, dict):
+            continue
+        source = str(entry.get("source", "") or "").strip()
+        if not source:
+            continue
+        plugin_dir = (dir_path / source).resolve()
+        if not plugin_dir.is_dir():
+            continue
+        name = str(entry.get("name", "") or plugin_dir.name)
+        out.append((plugin_dir, name))
+    return out
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -297,6 +359,15 @@ class PluginCatalog:
     def discover_and_load(self) -> list[str]:
         """Scan plugin directories and load all valid plugins.
 
+        Supports three on-disk layouts:
+        1. Native: ``<dir>/plugin.json`` + ``__init__.py`` with ``register()``.
+        2. Claude Code: ``<dir>/.claude-plugin/plugin.json`` + standard
+           subdirectories (skills/ commands/ agents/ hooks/).  No Python
+           required — declarative-only plugins are fully supported.
+        3. Marketplace: ``<dir>/.claude-plugin/marketplace.json`` listing
+           multiple plugins via ``plugins[].source``.  Each entry is expanded
+           into its own plugin load.
+
         Failures in individual plugins are reported but do not abort startup.
         Returns a list of successfully loaded plugin names.
         """
@@ -318,89 +389,135 @@ class PluginCatalog:
         for search_dir, source in search_dirs:
             if not search_dir or not search_dir.is_dir():
                 continue
-            for plugin_dir in sorted(search_dir.iterdir()):
-                if not plugin_dir.is_dir():
+            for entry_dir in sorted(search_dir.iterdir()):
+                if not entry_dir.is_dir():
                     continue
-                # P0-3: reject directory names that could collide with real modules.
-                if not _SAFE_PLUGIN_NAME.match(plugin_dir.name):
-                    shared.CONSOLE.print(
-                        f"[yellow]Plugin '{plugin_dir.name}': unsafe name — skipped[/yellow]"
-                    )
-                    continue
-                init_file = plugin_dir / "__init__.py"
-                if not init_file.exists():
-                    continue
-
-                # Read plugin.json metadata (optional)
-                meta = _read_plugin_json(plugin_dir)
-                plugin_name = meta.name if meta else plugin_dir.name
-
-                # Check enable/disable in config
-                if not self._is_plugin_enabled(plugin_name):
-                    continue
-
-                mod_name = f"_agent_plugin_{plugin_dir.name}"
-                try:
-                    spec = importlib.util.spec_from_file_location(
-                        mod_name,
-                        init_file,
-                        submodule_search_locations=[str(plugin_dir)],
-                    )
-                    if spec is None or spec.loader is None:
-                        continue
-                    mod = importlib.util.module_from_spec(spec)
-                    sys.modules[mod_name] = mod
-                    spec.loader.exec_module(mod)  # type: ignore[union-attr]
-                    if not hasattr(mod, "register"):
-                        shared.CONSOLE.print(
-                            f"[yellow]Plugin '{plugin_dir.name}': no register() — skipped[/yellow]"
-                        )
-                        continue
-                    plugin = mod.register()
-
-                    # Build meta from plugin attributes if no plugin.json
-                    if meta is None:
-                        meta = PluginMeta(
-                            name=getattr(plugin, "name", plugin_dir.name),
-                            version=getattr(plugin, "version", ""),
-                            description=getattr(plugin, "description", ""),
-                        )
-                    meta.source = source
-
-                    # Slash commands with conflict detection
-                    if hasattr(plugin, "register_slash_commands"):
-                        for cmd_key, handler in (
-                            plugin.register_slash_commands() or {}
-                        ).items():
-                            if cmd_key in self._slash_commands:
-                                existing_owner = _slash_command_owners.get(cmd_key, "?")
-                                shared.CONSOLE.print(
-                                    f"[yellow]Plugin '{plugin_name}': slash command "
-                                    f"'/{cmd_key}' conflicts with plugin "
-                                    f"'{existing_owner}' — overriding[/yellow]"
-                                )
-                            self._slash_commands[cmd_key] = handler
-                            _slash_command_owners[cmd_key] = plugin_name
-
-                    # Store (user overrides builtin with same name)
-                    self._plugins[plugin_name] = (plugin, meta)
-
-                    # Collect bundled skills
-                    if meta.skills:
-                        skills_path = (plugin_dir / meta.skills).resolve()
-                        if skills_path.is_dir():
-                            self._bundled_skills.append((plugin_name, skills_path))
-
-                    # Collect bundled MCP configs
-                    for mcp_cfg in meta.mcp_servers:
-                        if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
-                            self._bundled_mcp.append((plugin_name, mcp_cfg))
-
-                except Exception as exc:
-                    shared.CONSOLE.print(
-                        f"[yellow]Plugin '{plugin_dir.name}' failed to load: {exc}[/yellow]"
+                for plugin_dir, plugin_name_hint in self._expand_marketplace(entry_dir):
+                    self._load_one_plugin(
+                        plugin_dir,
+                        source=source,
+                        name_hint=plugin_name_hint,
+                        slash_command_owners=_slash_command_owners,
                     )
         return [name for name in self._plugins]
+
+    @staticmethod
+    def _expand_marketplace(entry_dir: Path) -> list[tuple[Path, str]]:
+        """Yield (plugin_dir, name_hint) entries.
+
+        For a marketplace dir, returns one entry per declared sub-plugin.
+        For a plain plugin dir, returns ``[(entry_dir, entry_dir.name)]``.
+        """
+        market = _read_marketplace_manifest(entry_dir)
+        if market is not None:
+            return market
+        return [(entry_dir, entry_dir.name)]
+
+    def _load_one_plugin(
+        self,
+        plugin_dir: Path,
+        *,
+        source: str,
+        name_hint: str,
+        slash_command_owners: dict[str, str],
+    ) -> None:
+        # P0-3: reject directory names that could collide with real modules.
+        if not _SAFE_PLUGIN_NAME.match(name_hint):
+            shared.CONSOLE.print(
+                f"[yellow]Plugin '{name_hint}': unsafe name — skipped[/yellow]"
+            )
+            return
+
+        init_file = plugin_dir / "__init__.py"
+        has_python = init_file.exists()
+        meta = _read_plugin_json(plugin_dir)
+
+        # Nothing recognisable here — neither a manifest, declarative assets,
+        # nor a Python entry point.  Quietly skip.
+        if meta is None and not has_python:
+            return
+
+        plugin_name = (meta.name if meta else "") or name_hint
+
+        # Check enable/disable in config
+        if not self._is_plugin_enabled(plugin_name):
+            return
+
+        plugin: Any = None
+        python_failed = False
+        if has_python:
+            mod_name = f"_agent_plugin_{name_hint}"
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    mod_name,
+                    init_file,
+                    submodule_search_locations=[str(plugin_dir)],
+                )
+                if spec is None or spec.loader is None:
+                    return
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[mod_name] = mod
+                spec.loader.exec_module(mod)  # type: ignore[union-attr]
+                if hasattr(mod, "register"):
+                    plugin = mod.register()
+                elif meta is None:
+                    shared.CONSOLE.print(
+                        f"[yellow]Plugin '{name_hint}': has __init__.py but no "
+                        "register() and no declarative assets — skipped[/yellow]"
+                    )
+                    return
+            except Exception as exc:
+                python_failed = True
+                shared.CONSOLE.print(
+                    f"[yellow]Plugin '{name_hint}' Python load failed: {exc} "
+                    "(declarative assets still loaded if any)[/yellow]"
+                )
+
+        # If Python load failed AND we have no real manifest, nothing
+        # useful is left — skip registration entirely (matches the
+        # pre-refactor behavior for python-only plugins that crash).
+        if python_failed and meta is None:
+            return
+
+        # Synthesise meta from Python attributes if no manifest was present.
+        if meta is None:
+            meta = PluginMeta(
+                name=getattr(plugin, "name", "") or plugin_name,
+                version=getattr(plugin, "version", "") if plugin else "",
+                description=getattr(plugin, "description", "") if plugin else "",
+            )
+            plugin_name = meta.name
+        meta.source = source
+
+        # Slash commands contributed by the Python plugin (declarative
+        # commands/*.md registration arrives in commit 2).
+        if plugin is not None and hasattr(plugin, "register_slash_commands"):
+            for cmd_key, handler in (
+                plugin.register_slash_commands() or {}
+            ).items():
+                if cmd_key in self._slash_commands:
+                    existing_owner = slash_command_owners.get(cmd_key, "?")
+                    shared.CONSOLE.print(
+                        f"[yellow]Plugin '{plugin_name}': slash command "
+                        f"'/{cmd_key}' conflicts with plugin "
+                        f"'{existing_owner}' — overriding[/yellow]"
+                    )
+                self._slash_commands[cmd_key] = handler
+                slash_command_owners[cmd_key] = plugin_name
+
+        # Record (user overrides builtin with the same plugin name).
+        self._plugins[plugin_name] = (plugin, meta)
+
+        # Bundled skills (declarative — works for both formats).
+        if meta.skills:
+            skills_path = (plugin_dir / meta.skills).resolve()
+            if skills_path.is_dir():
+                self._bundled_skills.append((plugin_name, skills_path))
+
+        # Bundled MCP configs.
+        for mcp_cfg in meta.mcp_servers:
+            if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
+                self._bundled_mcp.append((plugin_name, mcp_cfg))
 
     def get_bundled_skills(self) -> list[tuple[str, Path]]:
         """Return list of (plugin_name, skills_root_path) for bundled skills."""

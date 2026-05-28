@@ -1140,3 +1140,91 @@ def test_evolution_plugin_engine_none_is_safe():
         messages=[{"role": "user", "content": "hi"}], tools_used=[]
     )
     asyncio.run(catalog.fire_session_end(session_event))
+
+
+# ─── Claude Code / Codex compatibility ────────────────────────────────────────
+
+
+def test_discover_loads_claude_plugin_without_python(tmp_path):
+    """A plugin with only .claude-plugin/plugin.json (no __init__.py) loads."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "cc-plugin"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "cc-plugin", "version": "1.0", "description": "claude plugin"}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = catalog.discover_and_load()
+
+    assert loaded == ["cc-plugin"]
+
+
+def test_discover_auto_finds_skills_subdir(tmp_path):
+    """A plugin with a skills/ subdir is registered as bundled skills."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "with-skills"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "with-skills"}', encoding="utf-8"
+    )
+    (plugin_dir / "skills").mkdir()
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    bundled = catalog.get_bundled_skills()
+    assert len(bundled) == 1
+    assert bundled[0][0] == "with-skills"
+    assert bundled[0][1] == (plugin_dir / "skills").resolve()
+
+
+def test_discover_loads_marketplace_with_subplugins(tmp_path):
+    """A marketplace dir expands to all its sub-plugins."""
+    from agent import PluginCatalog
+
+    market_dir = tmp_path / "my-market"
+    (market_dir / ".claude-plugin").mkdir(parents=True)
+    (market_dir / ".claude-plugin" / "marketplace.json").write_text(
+        '{"name": "my-market", "plugins": ['
+        '{"name": "alpha", "source": "./alpha"}, '
+        '{"name": "beta", "source": "./beta"}'
+        ']}',
+        encoding="utf-8",
+    )
+    for sub in ("alpha", "beta"):
+        sub_dir = market_dir / sub / ".claude-plugin"
+        sub_dir.mkdir(parents=True)
+        (sub_dir / "plugin.json").write_text(
+            f'{{"name": "{sub}"}}', encoding="utf-8"
+        )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = catalog.discover_and_load()
+
+    assert sorted(loaded) == ["alpha", "beta"]
+
+
+def test_discover_accepts_mcpServers_camelcase(tmp_path):
+    """Claude Code's camelCase mcpServers is normalised."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "mcp-plugin"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "mcp-plugin", "mcpServers": '
+        '{"my-server": {"command": "/bin/echo", "args": ["hi"]}}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    bundled = catalog.get_bundled_mcp()
+    assert len(bundled) == 1
+    assert bundled[0][0] == "mcp-plugin"
+    assert bundled[0][1]["name"] == "my-server"
+    assert bundled[0][1]["command"] == "/bin/echo"
