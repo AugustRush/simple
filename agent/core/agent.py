@@ -1317,13 +1317,29 @@ class BaseAgent:
         )
 
     # Fields whose values are typically large or vary across otherwise-identical
-    # calls (file content, search hits, raw bodies, base64 blobs).  Including
-    # them in a tool-loop signature would mask genuine repetition.
+    # calls (file content, search hits, raw bodies, base64 blobs, random ids,
+    # timestamps).  Including any of these in a tool-loop signature would
+    # either bloat it or — for varying values — make every call's signature
+    # unique and blind stuck-detection to genuine loops.
     _SIGNATURE_NOISY_KEYS = frozenset({
+        # Bulky payloads
         "content", "text", "body", "data", "bytes", "raw", "raw_bytes",
         "preview", "summary_text", "full_content", "result_preview",
+        # Free-running identifiers / timestamps the agent does not control
+        "timestamp", "elapsed", "elapsed_ms", "elapsed_seconds",
+        "duration_ms", "duration_seconds",
     })
+    # Suffixes that mark a field as a varying identifier or timestamp
+    # (e.g. ``task_id``, ``next_run_at``, ``started_at``, ``created_time``).
+    _SIGNATURE_NOISY_SUFFIXES = ("_id", "_at", "_time", "_ms", "_ns", "_us",
+                                 "_timestamp", "_uuid")
     _SIGNATURE_VALUE_LIMIT = 200
+
+    @classmethod
+    def _signature_keep(cls, key: str) -> bool:
+        if key in cls._SIGNATURE_NOISY_KEYS:
+            return False
+        return not any(key.endswith(suffix) for suffix in cls._SIGNATURE_NOISY_SUFFIXES)
 
     @classmethod
     def _signature_value(cls, value: Any) -> Any:
@@ -1340,7 +1356,7 @@ class BaseAgent:
 
         Deny-list rather than allow-list: any structured field a tool adds
         in the future is automatically included in dedup signatures unless
-        it appears in ``_SIGNATURE_NOISY_KEYS``.
+        it matches a known noisy key or noisy-suffix pattern.
         """
         text = str(raw_result or "").strip()
         if not text:
@@ -1354,7 +1370,7 @@ class BaseAgent:
         return {
             key: cls._signature_value(value)
             for key, value in payload.items()
-            if key not in cls._SIGNATURE_NOISY_KEYS
+            if cls._signature_keep(key)
         } or payload
 
     @classmethod
