@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextvars
-import copy
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
@@ -13,9 +12,7 @@ import logging
 from pathlib import Path
 import re
 import time
-from typing import Any, Callable, Optional
-
-import anthropic
+from typing import Any, Awaitable, Callable, Optional
 
 import agent as agent_module
 from agent import shared
@@ -51,11 +48,6 @@ logger = logging.getLogger(__name__)
 _active_agent_context: contextvars.ContextVar[Optional["AgentContext"]] = (
     contextvars.ContextVar("active_agent_context", default=None)
 )
-
-_OPENAI_MESSAGE_RESERVED_FIELDS = frozenset()
-_SKIP_OPENAI_EXTRA = object()
-# ^ Kept as module-level sentinels so any external monkey-patches survive;
-#   real OpenAI-extras logic lives in agent.core.transport.OpenAITransport.
 
 
 def _trace_latency(stage: str, **fields: object) -> None:
@@ -114,6 +106,9 @@ class _TaskLocalContextStack:
         return False
 
 
+_ = _TaskLocalContextStack  # publicly importable for any third-party caller
+
+
 class BaseAgent:
     """Core agent: streams Claude, handles tool_use loop."""
 
@@ -149,6 +144,7 @@ class BaseAgent:
         self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self.sub_agent_retries = shared.DEFAULT_SUB_AGENT_RETRIES
         self.max_tool_call_iterations = shared.MAX_TOOL_CALL_ITERATIONS
+        self.max_rendezvous_rounds = 2  # Mirrors OrchestrationDecision default.
         self.result_content_max_chars = shared.DEFAULT_RESULT_CONTENT_MAX_CHARS
         self.llm_max_retries = shared.DEFAULT_LLM_MAX_RETRIES
         self.llm_retry_base_delay = shared.DEFAULT_LLM_RETRY_BASE_DELAY
@@ -649,6 +645,9 @@ class BaseAgent:
             contract.get("required_keys")
         )
         if requires_json:
+            # requires_json ⇒ requires_deliverable (see _output_contract_requires_deliverable),
+            # so we've already returned earlier if deliverable is None.
+            assert deliverable is not None
             try:
                 parsed = json.loads(deliverable)
             except Exception:
@@ -1737,12 +1736,14 @@ class BaseAgent:
             message_len=len(user_message),
         )
 
+        # Set the active agent context so built-in tools (e.g. clear_context)
+        # can access the current ctx.messages.  Done before the try so the
+        # token is always bound when the finally clause reaches reset().
+        _active_ctx_token = _active_agent_context.set(ctx)
+
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
         try:
-            # Set the active agent context so built-in tools (e.g. clear_context)
-            # can access the current ctx.messages.
-            _active_ctx_token = _active_agent_context.set(ctx)
             # Inject relevant context into system prompt for this turn.
             # retrieve_context() includes both:
             #   1. Recent staging buffer turns (current session, not yet consolidated)
@@ -2437,6 +2438,7 @@ class BaseAgent:
             retries = 0
         max_attempts = max(0, retries) + 1
         result = None
+        started_at = time.monotonic()  # overwritten per attempt; init for type-checker
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
                 # Fresh sub-agent and context for each retry to avoid state
@@ -2537,6 +2539,9 @@ class BaseAgent:
                 )
                 return payload
 
+        # If we reach here, the for-loop hit `break` after a successful attempt;
+        # all failure paths return inside the loop body above.
+        assert result is not None
         payload: dict[str, Any] = {
             "ok": result.error is None,
             "role": role,
