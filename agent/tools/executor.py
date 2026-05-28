@@ -145,14 +145,47 @@ class RegularToolExecutor:
         )
         call_task = asyncio.create_task(self._registry.call(tool_name, inputs))
         deadline = started_at + timeout
+        next_heartbeat_at = started_at + self._HEARTBEAT_INTERVAL_SECONDS
 
         while True:
-            remaining = max(0.0, deadline - time.monotonic())
-            done, _pending = await asyncio.wait({call_task}, timeout=remaining)
+            now = time.monotonic()
+            remaining = max(0.0, deadline - now)
+            until_heartbeat = max(0.0, next_heartbeat_at - now)
+            # Wake whichever comes first: the deadline or the next heartbeat.
+            # No extra task — fast tools (< heartbeat interval) finish on the
+            # first iteration and never pay for an unused heartbeat coroutine.
+            wait_seconds = remaining if remaining < until_heartbeat else until_heartbeat
+            done, _pending = await asyncio.wait({call_task}, timeout=wait_seconds)
             if done:
                 return await call_task
 
             now = time.monotonic()
+            # Heartbeat tick fired before the deadline — emit and continue waiting.
+            if now < deadline:
+                elapsed = now - started_at
+                self._emit(
+                    "tool_progress",
+                    operation_id=operation_id,
+                    tool_name=tool_name,
+                    status="running",
+                    elapsed_ms=round(elapsed * 1000, 1),
+                    stale_after_seconds=self._stale_timeout_seconds,
+                )
+                self._notify_sink_progress(
+                    _active_sink.get(),
+                    tool_name,
+                    {
+                        "operation_id": operation_id,
+                        "tool_name": tool_name,
+                        "status": "running",
+                        "elapsed_ms": round(elapsed * 1000, 1),
+                        "stale_after_seconds": self._stale_timeout_seconds,
+                    },
+                )
+                next_heartbeat_at = now + self._HEARTBEAT_INTERVAL_SECONDS
+                continue
+
+            # Deadline crossed.  Honour explicit-progress extensions.
             last_progress_at = float(progress_state["last_progress_at"])
             stale_for = now - last_progress_at
             explicit_progress_count = int(progress_state["explicit_progress_count"])
@@ -162,6 +195,7 @@ class RegularToolExecutor:
                 and stale_for <= self._stale_timeout_seconds
             ):
                 deadline = now + self._stale_timeout_seconds
+                next_heartbeat_at = now + self._HEARTBEAT_INTERVAL_SECONDS
                 self._emit(
                     "tool_progress",
                     operation_id=operation_id,
@@ -205,34 +239,11 @@ class RegularToolExecutor:
         started_at: float,
         done: asyncio.Event,
     ) -> None:
-        while True:
-            try:
-                await asyncio.wait_for(
-                    done.wait(),
-                    timeout=self._HEARTBEAT_INTERVAL_SECONDS,
-                )
-                return
-            except asyncio.TimeoutError:
-                elapsed = time.monotonic() - started_at
-                self._emit(
-                    "tool_progress",
-                    operation_id=operation_id,
-                    tool_name=tool_name,
-                    status="running",
-                    elapsed_ms=round(elapsed * 1000, 1),
-                    stale_after_seconds=self._stale_timeout_seconds,
-                )
-                self._notify_sink_progress(
-                    _active_sink.get(),
-                    tool_name,
-                    {
-                        "operation_id": operation_id,
-                        "tool_name": tool_name,
-                        "status": "running",
-                        "elapsed_ms": round(elapsed * 1000, 1),
-                        "stale_after_seconds": self._stale_timeout_seconds,
-                    },
-                )
+        """Deprecated: heartbeat ticks are now emitted inline by
+        ``_await_tool_result``'s wait loop — no extra task per call.
+        Kept as a no-op so any external monkey-patching test still works.
+        """
+        await done.wait()
 
     @staticmethod
     def _intent_text_is_specific(intent: str) -> bool:
@@ -377,14 +388,6 @@ class RegularToolExecutor:
                 sink=sink,
             )
         )
-        heartbeat_task = asyncio.create_task(
-            self._emit_heartbeats(
-                operation_id=operation_id,
-                tool_name=name,
-                started_at=started_at,
-                done=done,
-            )
-        )
         try:
             result = await self._await_tool_result(
                 operation_id=operation_id,
@@ -413,12 +416,7 @@ class RegularToolExecutor:
             )
         finally:
             _active_tool_progress.reset(progress_token)
-            done.set()
-            heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
+            done.set()  # signals the deprecated _emit_heartbeats shim
 
         duration_ms = (time.monotonic() - started_at) * 1000
         try:

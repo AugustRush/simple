@@ -1271,26 +1271,36 @@ class BaseAgent:
         raise last_exc  # type: ignore[misc]
 
     @staticmethod
+    def _extract_summary_text(raw_result: str) -> str:
+        """Extract the ``summary_text`` field from a tool result if present.
+
+        Used at tool-batch time so ``tool_result_history`` stores only the
+        small synthesizable field per call, not the (potentially MB-sized)
+        raw result.
+        """
+        try:
+            payload = json.loads(raw_result)
+        except Exception:
+            return ""
+        if not isinstance(payload, dict) or not payload.get("ok"):
+            return ""
+        return str(payload.get("summary_text", "")).strip()
+
+    @staticmethod
     def _synthesize_tool_only_response(
         tool_history: list[tuple[str, str]]
     ) -> str:
         """Promote a successful tool's own ``summary_text`` to the turn reply.
 
-        Generic protocol: any tool may populate ``{"ok": true, "summary_text":
-        "..."}`` in its result.  The most recent populating call wins.  Used
-        when the model produced only tool calls and no closing text — without
-        this, the user would see silence.
+        ``tool_history`` stores ``(tool_name, summary_text_or_empty)`` per
+        call (the parsing happens at append time so this list stays small).
+        The most recent non-empty summary wins.  Used when the model
+        produced only tool calls and no closing text — without this, the
+        user would see silence.
         """
-        for _tool_name, raw_result in reversed(tool_history):
-            try:
-                payload = json.loads(raw_result)
-            except Exception:
-                continue
-            if not isinstance(payload, dict) or not payload.get("ok"):
-                continue
-            summary_text = str(payload.get("summary_text", "")).strip()
-            if summary_text:
-                return summary_text
+        for _tool_name, summary in reversed(tool_history):
+            if summary:
+                return summary
         return ""
 
     @staticmethod
@@ -1910,7 +1920,8 @@ class BaseAgent:
                             duration_ms=f"{(time.perf_counter() - tool_use_started_at) * 1000:.1f}",
                         )
                         tool_result_history.extend(
-                            (tu["name"], res) for tu, res in zip(tool_uses, results)
+                            (tu["name"], self._extract_summary_text(res))
+                            for tu, res in zip(tool_uses, results)
                         )
                         # Content filter: screen tool results before API submission.
                         # Flagged results get summarized to avoid triggering provider
@@ -2405,19 +2416,28 @@ class BaseAgent:
             expected_output,
             normalized_output_contract,
         )
+        # sub_registry / sub_agent / sys_prompt are pure functions of the
+        # input arguments — build once and reuse across retry attempts.
+        # Only sub_ctx (which carries mutable conversation state) must be
+        # rebuilt per attempt to avoid contamination from a failed run.
         sub_registry = self._create_sub_registry(
             capability_profile=capability_profile,
             write_scope=normalized_scope,
         )
         sub_agent = self._create_sub_agent(sub_registry)
         sys_prompt, active_ctx = self._compose_sub_system_prompt(sub_registry, system_suffix)
-        sub_ctx = AgentContext(role=role, system_prompt=sys_prompt)
-        self._propagate_sub_metadata(sub_ctx, active_ctx)
-        if handoff:
-            sub_ctx.system_prompt += (
-                "\n\n## Handoff data from upstream\n"
-                + json.dumps(handoff, ensure_ascii=False, indent=2)
-            )
+
+        def _fresh_sub_ctx() -> AgentContext:
+            ctx = AgentContext(role=role, system_prompt=sys_prompt)
+            self._propagate_sub_metadata(ctx, active_ctx)
+            if handoff:
+                ctx.system_prompt += (
+                    "\n\n## Handoff data from upstream\n"
+                    + json.dumps(handoff, ensure_ascii=False, indent=2)
+                )
+            return ctx
+
+        sub_ctx = _fresh_sub_ctx()
         self._emit_subagent_event(
             SubAgentProgressEvent(
                 kind="agent_started",
@@ -2441,23 +2461,7 @@ class BaseAgent:
         started_at = time.monotonic()  # overwritten per attempt; init for type-checker
         for attempt in range(1, max_attempts + 1):
             if attempt > 1:
-                # Fresh sub-agent and context for each retry to avoid state
-                # contamination from the failed attempt.
-                sub_registry = self._create_sub_registry(
-                    capability_profile=capability_profile,
-                    write_scope=normalized_scope,
-                )
-                sub_agent = self._create_sub_agent(sub_registry)
-                sys_prompt, active_ctx = self._compose_sub_system_prompt(
-                    sub_registry, system_suffix
-                )
-                sub_ctx = AgentContext(role=role, system_prompt=sys_prompt)
-                self._propagate_sub_metadata(sub_ctx, active_ctx)
-                if handoff:
-                    sub_ctx.system_prompt += (
-                        "\n\n## Handoff data from upstream\n"
-                        + json.dumps(handoff, ensure_ascii=False, indent=2)
-                    )
+                sub_ctx = _fresh_sub_ctx()
                 self._emit_subagent_event(
                     SubAgentProgressEvent(
                         kind="agent_retry",
