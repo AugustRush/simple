@@ -1705,6 +1705,163 @@ class BaseAgent:
 
         return results
 
+    # ── Tool-loop stuck detection ────────────────────────────────────────
+
+    @staticmethod
+    def _new_watchdog_state() -> dict[str, Any]:
+        """Per-turn dedup state for tool-loop stuck-detection."""
+        return {
+            "last_pair_sig": "",
+            "last_result_sig": "",
+            "same_pair": 0,
+            "same_result": 0,
+            "unproductive_rounds": 0,
+            "batch_counts": {},
+        }
+
+    def _check_tool_loop_stuck(
+        self,
+        state: dict[str, Any],
+        tool_uses: list[dict],
+        results: list[str],
+    ) -> str:
+        """Update watchdog state and return a stuck-reason string, or ''.
+
+        Pure single-pass over the new batch:
+        - compute batch + result signatures
+        - update run-length counters and per-signature occurrence counts
+        - test the threshold rules in priority order
+
+        Extracted from send_message so the body of the tool loop reads as
+        intent (a function call) instead of mechanism (60 lines of counters).
+        """
+        batch_sig = self._tool_use_signature(tool_uses)
+        result_sig = self._tool_result_signature(results)
+        pair_sig = (batch_sig, result_sig)
+
+        state["batch_counts"][batch_sig] = state["batch_counts"].get(batch_sig, 0) + 1
+
+        if pair_sig == state["last_pair_sig"]:
+            state["same_pair"] += 1
+        else:
+            state["same_pair"] = 1
+            state["last_pair_sig"] = pair_sig
+        if result_sig == state["last_result_sig"]:
+            state["same_result"] += 1
+        else:
+            state["same_result"] = 1
+            state["last_result_sig"] = result_sig
+
+        unproductive = self._tool_results_look_unproductive(results)
+        intent_required = self._tool_results_are_intent_required(results)
+        if unproductive or state["same_pair"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
+            state["unproductive_rounds"] += 1
+        else:
+            state["unproductive_rounds"] = 0
+
+        if intent_required and state["same_result"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
+            return "intent_required"
+        if state["same_pair"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
+            return "same_pair"
+        if unproductive and state["same_result"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
+            return "same_result"
+        if state["unproductive_rounds"] >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD:
+            return "unproductive_rounds"
+        if unproductive and state["batch_counts"][batch_sig] >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD:
+            return "same_batch_unproductive"
+        return ""
+
+    def _prepare_turn(
+        self,
+        ctx: "AgentContext",
+        user_message: str,
+        attachments: tuple[MessageAttachment, ...],
+    ) -> OrchestrationDecision:
+        """Mutate ctx for one turn: inject LTM context, activate skills, plan
+        orchestration, and append the user message.  Returns the orchestration
+        decision so the loop can route spawn calls correctly.
+
+        Caller is responsible for restoring ``ctx.system_prompt`` afterwards
+        (send_message captures ``original_system`` before calling this).
+        """
+        # retrieve_implicit_context() covers both recent staging-buffer turns
+        # (not yet consolidated) and historical LTM hits.  Skipping the
+        # staging side would let recently-compacted turns drop from view.
+        if self.context_manager:
+            retrieved = self.context_manager.retrieve_implicit_context(
+                user_message,
+                current_messages=ctx.messages,
+            )
+            if retrieved:
+                ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
+        skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
+        required_skills: list[str] = list(ctx.metadata.get("required_skills", []))
+        if skill_catalog and required_skills:
+            active_blocks = []
+            for skill_ref in required_skills:
+                activation = skill_catalog.activation_text(skill_ref, explicit=True)
+                if activation:
+                    active_blocks.append(activation)
+            if active_blocks:
+                ctx.system_prompt = (
+                    ctx.system_prompt
+                    + "\n\n## Active Skills\n"
+                    + "\n\n".join(active_blocks)
+                )
+        decision = self._plan_orchestration(ctx, user_message)
+        ctx.messages.append(
+            {
+                "role": "user",
+                "content": self._build_user_message_content(user_message, attachments),
+            }
+        )
+        return decision
+
+    async def _handle_end_turn(
+        self,
+        ctx: "AgentContext",
+        response: Any,
+        text: str,
+        streamed_text: str,
+        prior_text: str,
+        tool_result_history: list[tuple[str, str]],
+    ) -> tuple[str, Optional[str]]:
+        """Finalize a non-tool-use response and return (result_text, continuation_error).
+
+        Picks the best text (parsed > streamed > prior), promotes a tool's
+        ``summary_text`` if the model returned nothing, appends the assistant
+        entry, attempts truncation continuation when the transport reports
+        one, and falls back to an apology when the response is entirely
+        empty.  ``continuation_error`` is non-None only when continuation
+        still failed; caller propagates it.
+        """
+        result_text = text or streamed_text or prior_text
+        if not result_text and tool_result_history:
+            result_text = self._synthesize_tool_only_response(tool_result_history)
+        ctx.messages.append(self._transport.build_final_message(response, result_text))
+
+        completion_error = self._response_completion_error(response)
+        if completion_error:
+            result_text, continuation_error = (
+                await self._continue_truncated_response(ctx, result_text)
+            )
+            ctx.messages[-1] = self._transport.build_final_message(
+                response, result_text
+            )
+            return result_text, continuation_error
+
+        # Silent stop with no text and no tool history is almost always a
+        # safety-filtered or malformed response; speak up so the user isn't
+        # left wondering whether anything happened.
+        if not result_text and not tool_result_history:
+            result_text = (
+                "I received your message but was unable to "
+                "generate a response. Please try rephrasing "
+                "your request or checking if it triggered a "
+                "content policy filter."
+            )
+        return result_text, None
+
     async def send_message(
         self,
         ctx: "AgentContext",
@@ -1717,12 +1874,7 @@ class BaseAgent:
         tool_calls_made: list[str] = []
         tool_result_history: list[tuple[str, str]] = []
         result_text = ""
-        tool_batch_counts: dict[str, int] = {}
-        last_tool_pair_signature = ""
-        last_tool_result_signature = ""
-        consecutive_same_tool_pair = 0
-        consecutive_same_tool_result = 0
-        consecutive_unproductive_tool_rounds = 0
+        watchdog = self._new_watchdog_state()
         content_filter_recovered_response: Any | None = None
         content_filter_submitted_tool_uses: list[dict] | None = None
         content_filter_submitted_results: list[str] | None = None
@@ -1754,43 +1906,7 @@ class BaseAgent:
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
         try:
-            # Inject relevant context into system prompt for this turn.
-            # retrieve_context() includes both:
-            #   1. Recent staging buffer turns (current session, not yet consolidated)
-            #   2. LTM search results (historical sessions)
-            # Using retrieve_ltm_context() alone would miss any conversation from
-            # the current session that has been compacted out of ctx.messages but
-            # not yet consolidated into LTM, causing the agent to "forget" recent
-            # turns when asked about them.
-            if self.context_manager:
-                retrieved = self.context_manager.retrieve_implicit_context(
-                    user_message,
-                    current_messages=ctx.messages,
-                )
-                if retrieved:
-                    ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
-            skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
-            required_skills: list[str] = list(ctx.metadata.get("required_skills", []))
-            if skill_catalog and required_skills:
-                active_blocks = []
-                for skill_ref in required_skills:
-                    activation = skill_catalog.activation_text(skill_ref, explicit=True)
-                    if activation:
-                        active_blocks.append(activation)
-                if active_blocks:
-                    ctx.system_prompt = (
-                        ctx.system_prompt
-                        + "\n\n## Active Skills\n"
-                        + "\n\n".join(active_blocks)
-                    )
-            orchestration_decision = self._plan_orchestration(ctx, user_message)
-
-            ctx.messages.append(
-                {
-                    "role": "user",
-                    "content": self._build_user_message_content(user_message, attachments),
-                }
-            )
+            orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
 
             # D1: bounded tool-call loop — prevents infinite model loops
             max_tool_call_iterations = max(1, int(self.max_tool_call_iterations))
@@ -1959,66 +2075,9 @@ class BaseAgent:
                         content_filter_submitted_tool_uses = list(tool_uses)
                         content_filter_submitted_results = list(results)
 
-                        tool_batch_signature = self._tool_use_signature(tool_uses)
-                        tool_result_signature = self._tool_result_signature(results)
-                        tool_pair_signature = (
-                            f"{tool_batch_signature}\n{tool_result_signature}"
+                        stuck_reason = self._check_tool_loop_stuck(
+                            watchdog, tool_uses, results,
                         )
-                        tool_batch_counts[tool_batch_signature] = (
-                            tool_batch_counts.get(tool_batch_signature, 0) + 1
-                        )
-                        if tool_pair_signature == last_tool_pair_signature:
-                            consecutive_same_tool_pair += 1
-                        else:
-                            consecutive_same_tool_pair = 1
-                            last_tool_pair_signature = tool_pair_signature
-                        if tool_result_signature == last_tool_result_signature:
-                            consecutive_same_tool_result += 1
-                        else:
-                            consecutive_same_tool_result = 1
-                            last_tool_result_signature = tool_result_signature
-
-                        unproductive = self._tool_results_look_unproductive(results)
-                        intent_required = self._tool_results_are_intent_required(results)
-                        if (
-                            unproductive
-                            or consecutive_same_tool_pair
-                            >= self._TOOL_LOOP_REPEAT_THRESHOLD
-                        ):
-                            consecutive_unproductive_tool_rounds += 1
-                        else:
-                            consecutive_unproductive_tool_rounds = 0
-
-                        stuck_reason = ""
-                        if (
-                            intent_required
-                            and consecutive_same_tool_result
-                            >= self._TOOL_LOOP_REPEAT_THRESHOLD
-                        ):
-                            stuck_reason = "intent_required"
-                        elif (
-                            consecutive_same_tool_pair
-                            >= self._TOOL_LOOP_REPEAT_THRESHOLD
-                        ):
-                            stuck_reason = "same_pair"
-                        elif (
-                            unproductive
-                            and consecutive_same_tool_result
-                            >= self._TOOL_LOOP_REPEAT_THRESHOLD
-                        ):
-                            stuck_reason = "same_result"
-                        elif (
-                            consecutive_unproductive_tool_rounds
-                            >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD
-                        ):
-                            stuck_reason = "unproductive_rounds"
-                        elif (
-                            unproductive
-                            and tool_batch_counts[tool_batch_signature]
-                            >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD
-                        ):
-                            stuck_reason = "same_batch_unproductive"
-
                         if stuck_reason:
                             result_text = self._build_tool_loop_stuck_response(
                                 user_message=user_message,
@@ -2048,24 +2107,11 @@ class BaseAgent:
                         _iteration += 1
                         continue
                     else:
-                        # Prefer the parsed text; fall back to streamed text for
-                        # the final turn (streaming accumulates what the user saw).
-                        result_text = text or streamed_text or result_text
-                        if not result_text and tool_result_history:
-                            result_text = self._synthesize_tool_only_response(
-                                tool_result_history
-                            )
-                        ctx.messages.append(
-                            self._transport.build_final_message(response, result_text)
+                        result_text, continuation_error = await self._handle_end_turn(
+                            ctx, response, text, streamed_text,
+                            result_text, tool_result_history,
                         )
-                        completion_error = self._response_completion_error(response)
-                        if completion_error:
-                            result_text, continuation_error = (
-                                await self._continue_truncated_response(ctx, result_text)
-                            )
-                            ctx.messages[-1] = self._transport.build_final_message(
-                                response, result_text
-                            )
+                        if continuation_error is not None:
                             trace_status = "continuation_error"
                             trace_error = continuation_error
                             return AgentResult(
@@ -2073,17 +2119,6 @@ class BaseAgent:
                                 content=result_text,
                                 tool_calls_made=tool_calls_made,
                                 error=continuation_error,
-                            )
-                        # Guard against silent empty responses: when the model
-                        # returns stop with no text and no tool calls (often a
-                        # safety-filtered or malformed response), produce a
-                        # visible fallback so the user is not left with silence.
-                        if not result_text and not tool_result_history:
-                            result_text = (
-                                "I received your message but was unable to "
-                                "generate a response. Please try rephrasing "
-                                "your request or checking if it triggered a "
-                                "content policy filter."
                             )
                         break
 
