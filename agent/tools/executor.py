@@ -189,6 +189,13 @@ class RegularToolExecutor:
             call_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await call_task
+            # Race guard: the task may have completed between the wait()
+            # timeout and the cancel() above.  If so, return the real
+            # result instead of fabricating a TimeoutError.
+            if call_task.done() and not call_task.cancelled():
+                exc = call_task.exception()
+                if exc is None:
+                    return call_task.result()
             raise asyncio.TimeoutError
 
     async def _emit_heartbeats(

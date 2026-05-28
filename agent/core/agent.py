@@ -4,7 +4,7 @@ import asyncio
 import base64
 import contextvars
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
 import inspect
@@ -52,21 +52,10 @@ _active_agent_context: contextvars.ContextVar[Optional["AgentContext"]] = (
     contextvars.ContextVar("active_agent_context", default=None)
 )
 
-_OPENAI_MESSAGE_RESERVED_FIELDS = frozenset(
-    {
-        "role",
-        "content",
-        "tool_calls",
-        "function_call",
-        "name",
-        "refusal",
-        "audio",
-        "annotations",
-        "parsed",
-        "model_extra",
-    }
-)
+_OPENAI_MESSAGE_RESERVED_FIELDS = frozenset()
 _SKIP_OPENAI_EXTRA = object()
+# ^ Kept as module-level sentinels so any external monkey-patches survive;
+#   real OpenAI-extras logic lives in agent.core.transport.OpenAITransport.
 
 
 def _trace_latency(stage: str, **fields: object) -> None:
@@ -112,28 +101,17 @@ class SubAgentProgressEvent:
 
 
 class _TaskLocalContextStack:
-    """List-like context stack backed by ContextVar for per-task isolation."""
+    """Deprecated: kept only as a no-op shim for any third-party caller.
 
-    def __init__(self) -> None:
-        self._stack: contextvars.ContextVar[tuple[AgentContext, ...]] = (
-            contextvars.ContextVar("agent_context_stack", default=())
-        )
-
-    def append(self, ctx: AgentContext) -> None:
-        self._stack.set((*self._stack.get(), ctx))
-
-    def pop(self) -> AgentContext:
-        stack = self._stack.get()
-        if not stack:
-            raise IndexError("pop from empty context stack")
-        self._stack.set(stack[:-1])
-        return stack[-1]
+    The runtime no longer maintains a context stack — ``_active_agent_context``
+    (a ContextVar) is the single source of truth for the current
+    AgentContext.  Sub-agents run in their own BaseAgent instance with
+    their own ContextVar, so a per-agent stack was always degenerate
+    (at most one item).
+    """
 
     def __bool__(self) -> bool:
-        return bool(self._stack.get())
-
-    def __getitem__(self, index: int) -> AgentContext:
-        return self._stack.get()[index]
+        return False
 
 
 class BaseAgent:
@@ -163,6 +141,8 @@ class BaseAgent:
         self.supports_vision = supports_vision
         self.model = model
         self.max_tokens = max_tokens
+        from agent.core.transport import build_transport
+        self._transport = build_transport(api_format, client)
         self.context_manager: Optional[ContextManager] = None
         self.plugin_catalog: Optional["PluginCatalog"] = None
         self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
@@ -172,7 +152,6 @@ class BaseAgent:
         self.result_content_max_chars = shared.DEFAULT_RESULT_CONTENT_MAX_CHARS
         self.llm_max_retries = shared.DEFAULT_LLM_MAX_RETRIES
         self.llm_retry_base_delay = shared.DEFAULT_LLM_RETRY_BASE_DELAY
-        self._context_stack = _TaskLocalContextStack()
         self.workspace_root: Optional[Path] = None
         self._base_system_prompt: str = ""
         self.content_filter: ContentFilter = ContentFilter.load(default_model_path())
@@ -181,19 +160,7 @@ class BaseAgent:
     def _image_content_block(self, attachment: MessageAttachment) -> dict[str, Any]:
         data = base64.b64encode(attachment.local_path.read_bytes()).decode("ascii")
         mime_type = attachment.mime_type or "application/octet-stream"
-        if self.api_format == "anthropic":
-            return {
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": mime_type,
-                    "data": data,
-                },
-            }
-        return {
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime_type};base64,{data}"},
-        }
+        return self._transport.image_content_block(mime_type, data)
 
     def _build_user_message_content(
         self,
@@ -334,7 +301,7 @@ class BaseAgent:
         self.model = model
 
     def current_context(self) -> Optional["AgentContext"]:
-        return self._context_stack[-1] if self._context_stack else None
+        return _active_agent_context.get()
 
     def _plan_orchestration(
         self,
@@ -426,18 +393,7 @@ class BaseAgent:
             "Upstream structured results:",
             structured_lines,
         )
-        return SubtaskSpec(
-            id=spec.id,
-            role=spec.role,
-            task=task,
-            depends_on=list(spec.depends_on),
-            expected_output=spec.expected_output,
-            output_contract=dict(spec.output_contract),
-            write_scope=list(spec.write_scope),
-            capability_profile=spec.capability_profile,
-            handoff=handoff,
-            early_exit=spec.early_exit,
-        )
+        return replace(spec, task=task, handoff=handoff)
 
     def _with_lead_summary(
         self,
@@ -463,18 +419,7 @@ class BaseAgent:
         handoff: dict[str, Any] = dict(spec.handoff)
         for dep, value in (lead_structured_context or {}).items():
             handoff[dep] = value
-        return SubtaskSpec(
-            id=spec.id,
-            role=spec.role,
-            task=task,
-            depends_on=list(spec.depends_on),
-            expected_output=spec.expected_output,
-            output_contract=dict(spec.output_contract),
-            write_scope=list(spec.write_scope),
-            capability_profile=spec.capability_profile,
-            handoff=handoff,
-            early_exit=spec.early_exit,
-        )
+        return replace(spec, task=task, handoff=handoff)
 
     async def _summarize_rendezvous_round(
         self, results: list[SubtaskResult]
@@ -511,7 +456,7 @@ class BaseAgent:
             f"- continue_with: null to keep all agents, or a list of agent IDs to "
             f"select specific agents for the next round"
         )
-        try:
+        with shared._suppress_with_log("rendezvous LLM synthesis failed; using string-concat fallback"):
             resp_text = await self._call_llm(
                 prompt,
                 system="You are a precise synthesis coordinator. Always respond with valid JSON.",
@@ -533,8 +478,6 @@ class BaseAgent:
                         else None
                     ),
                 )
-        except Exception:
-            pass
         # Fallback: original string concatenation
         summary_lines = []
         for result in results:
@@ -1073,208 +1016,23 @@ class BaseAgent:
 
     def _tools_for_api(self, tools: list[dict]) -> Any:
         """Convert tools to the right format; return NOT_GIVEN/None if empty."""
-        if not tools:
-            return anthropic.NOT_GIVEN if self.api_format == "anthropic" else None
-        if self.api_format == "openai":
-            # Convert Anthropic tool schema → OpenAI function-calling format
-            return [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": t["name"],
-                        "description": t.get("description", ""),
-                        "parameters": t.get("input_schema", {}),
-                    },
-                }
-                for t in tools
-            ]
-        return tools  # anthropic format as-is
-
-    def _inject_system(self, messages: list[dict], system_prompt: str) -> list[dict]:
-        """For OpenAI format, prepend system as first message."""
-        if self.api_format == "openai":
-            return [{"role": "system", "content": system_prompt}] + messages
-        return messages  # Anthropic passes system separately
+        return self._transport.convert_tools(tools)
 
     async def _create(self, ctx: "AgentContext", tools: list[dict]) -> Any:
         """Non-streaming API call, returns a normalised response object."""
-        if self.api_format == "anthropic":
-            return await self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=ctx.system_prompt,
-                messages=ctx.messages,
-                tools=self._tools_for_api(tools),
-            )
-        else:
-            # OpenAI-compatible
-            kwargs: dict = dict(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                messages=self._inject_system(ctx.messages, ctx.system_prompt),
-            )
-            api_tools = self._tools_for_api(tools)
-            if api_tools:
-                kwargs["tools"] = api_tools
-            return await self.client.chat.completions.create(**kwargs)
+        return await self._transport.create(
+            model=self.model,
+            max_tokens=self.max_tokens,
+            system=ctx.system_prompt,
+            messages=ctx.messages,
+            tools=tools,
+        )
 
     def _parse_response(self, response: Any) -> tuple[str, str, list[dict]]:
-        """
-        Parse a response object into (stop_reason, text, tool_calls).
-        tool_calls: list of {"name": ..., "id": ..., "input": {...}}
-        """
-        if self.api_format == "anthropic":
-            stop_reason = response.stop_reason  # "end_turn" | "tool_use"
-            text_blocks = [b for b in response.content if hasattr(b, "text")]
-            text = " ".join(b.text for b in text_blocks)
-            tool_calls = [
-                {"name": b.name, "id": b.id, "input": b.input}
-                for b in response.content
-                if b.type == "tool_use"
-            ]
-            return stop_reason, text, tool_calls
-        else:
-            # OpenAI
-            choice = response.choices[0]
-            finish = choice.finish_reason  # "stop" | "tool_calls"
-            msg = choice.message
-            text = msg.content or ""
-            if finish == "tool_calls" and msg.tool_calls:
-                tool_calls = []
-                for tc in msg.tool_calls:
-                    try:
-                        inp = json.loads(tc.function.arguments)
-                    except Exception:
-                        inp = {}
-                    tool_calls.append(
-                        {"name": tc.function.name, "id": tc.id, "input": inp}
-                    )
-                return "tool_use", text, tool_calls
-            return "end_turn", text, []
+        return self._transport.parse_response(response)
 
     def _response_completion_error(self, response: Any) -> Optional[str]:
-        """Classify provider completion states that should not be treated as clean ends."""
-        if self.api_format != "openai":
-            return None
-        try:
-            finish = response.choices[0].finish_reason
-        except Exception:
-            return None
-        if finish == "length":
-            return "Model response was truncated (finish_reason=length)"
-        return None
-
-    @staticmethod
-    def _openai_message_extras(message: Any) -> dict[str, Any]:
-        """Extract provider-specific fields from OpenAI-compatible messages/deltas."""
-        if message is None:
-            return {}
-
-        extras: dict[str, Any] = {}
-
-        if isinstance(message, dict):
-            for key, value in message.items():
-                if key in _OPENAI_MESSAGE_RESERVED_FIELDS:
-                    continue
-                sanitized = BaseAgent._sanitize_openai_extra_value(value)
-                if sanitized is not _SKIP_OPENAI_EXTRA:
-                    extras[key] = sanitized
-            model_extra = message.get("model_extra")
-            if isinstance(model_extra, dict):
-                for key, value in model_extra.items():
-                    if key in _OPENAI_MESSAGE_RESERVED_FIELDS:
-                        continue
-                    sanitized = BaseAgent._sanitize_openai_extra_value(value)
-                    if sanitized is not _SKIP_OPENAI_EXTRA:
-                        extras[key] = sanitized
-            return extras
-
-        raw_fields = getattr(message, "__dict__", None)
-        if isinstance(raw_fields, dict):
-            for key, value in raw_fields.items():
-                if key.startswith("_") or key in _OPENAI_MESSAGE_RESERVED_FIELDS:
-                    continue
-                sanitized = BaseAgent._sanitize_openai_extra_value(value)
-                if sanitized is not _SKIP_OPENAI_EXTRA:
-                    extras[key] = sanitized
-
-        model_extra = getattr(message, "model_extra", None)
-        if isinstance(model_extra, dict):
-            for key, value in model_extra.items():
-                if key in _OPENAI_MESSAGE_RESERVED_FIELDS:
-                    continue
-                sanitized = BaseAgent._sanitize_openai_extra_value(value)
-                if sanitized is not _SKIP_OPENAI_EXTRA:
-                    extras[key] = sanitized
-        return extras
-
-    @classmethod
-    def _sanitize_openai_extra_value(cls, value: Any) -> Any:
-        """Keep only JSON-safe provider extras that can be sent back to the API."""
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, dict):
-            cleaned: dict[str, Any] = {}
-            for key, item in value.items():
-                if not isinstance(key, str):
-                    continue
-                sanitized = cls._sanitize_openai_extra_value(item)
-                if sanitized is _SKIP_OPENAI_EXTRA:
-                    continue
-                cleaned[key] = sanitized
-            return cleaned
-        if isinstance(value, (list, tuple)):
-            cleaned_list: list[Any] = []
-            for item in value:
-                sanitized = cls._sanitize_openai_extra_value(item)
-                if sanitized is _SKIP_OPENAI_EXTRA:
-                    continue
-                cleaned_list.append(sanitized)
-            return cleaned_list
-        model_dump = getattr(value, "model_dump", None)
-        if callable(model_dump):
-            try:
-                return cls._sanitize_openai_extra_value(model_dump(mode="python"))
-            except Exception:
-                return _SKIP_OPENAI_EXTRA
-        return _SKIP_OPENAI_EXTRA
-
-    @classmethod
-    def _merge_openai_extra_value(cls, current: Any, incoming: Any) -> Any:
-        """Merge streamed provider extras while preserving chunked text fields."""
-        incoming = cls._sanitize_openai_extra_value(incoming)
-        if incoming is _SKIP_OPENAI_EXTRA:
-            return copy.deepcopy(current)
-        current = cls._sanitize_openai_extra_value(current)
-        if current is _SKIP_OPENAI_EXTRA:
-            current = None
-        if current is None:
-            return copy.deepcopy(incoming)
-        if incoming is None:
-            return copy.deepcopy(current)
-        if isinstance(current, str) and isinstance(incoming, str):
-            if incoming == current:
-                return current
-            if incoming.startswith(current):
-                return incoming
-            if current.startswith(incoming) or current.endswith(incoming):
-                return current
-            return current + incoming
-        if isinstance(current, dict) and isinstance(incoming, dict):
-            merged = copy.deepcopy(current)
-            for key, value in incoming.items():
-                merged[key] = cls._merge_openai_extra_value(merged.get(key), value)
-            return merged
-        return copy.deepcopy(incoming)
-
-    @classmethod
-    def _merge_openai_message_extras(
-        cls, current: dict[str, Any], incoming: dict[str, Any]
-    ) -> dict[str, Any]:
-        merged = copy.deepcopy(current)
-        for key, value in incoming.items():
-            merged[key] = cls._merge_openai_extra_value(merged.get(key), value)
-        return merged
+        return self._transport.completion_error(response)
 
     @staticmethod
     def _merge_continuation_text(prefix: str, continuation: str) -> str:
@@ -1329,47 +1087,13 @@ class BaseAgent:
 
     def _assistant_message(self, response: Any, text: str) -> dict:
         """Build the assistant history entry after a tool_use stop."""
-        if self.api_format == "anthropic":
-            return {"role": "assistant", "content": response.content}
-        else:
-            # For OpenAI we store the raw message object (or a dict)
-            msg = response.choices[0].message
-            entry: dict = {"role": "assistant", "content": text}
-            entry.update(self._openai_message_extras(msg))
-            if msg.tool_calls:
-                entry["tool_calls"] = [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in msg.tool_calls
-                ]
-            return entry
+        return self._transport.build_assistant_message(response, text)
 
     def _tool_result_messages(
         self, tool_calls: list[dict], results: list[str]
     ) -> list[dict]:
         """Build tool-result history entries for both formats."""
-        if self.api_format == "anthropic":
-            return [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "tool_result", "tool_use_id": tc["id"], "content": r}
-                        for tc, r in zip(tool_calls, results)
-                    ],
-                }
-            ]
-        else:
-            # OpenAI: one message per tool result
-            return [
-                {"role": "tool", "tool_call_id": tc["id"], "content": r}
-                for tc, r in zip(tool_calls, results)
-            ]
+        return self._transport.build_tool_result_messages(tool_calls, results)
 
     @staticmethod
     def _clear_context_restart_message(
@@ -1401,36 +1125,52 @@ class BaseAgent:
             return f"Invalid model request: {exc}"
         return str(exc) or exc.__class__.__name__
 
-    @staticmethod
-    def _is_llm_retryable(exc: Exception) -> bool:
-        """Return True for transient errors worth retrying."""
-        # Network / timeout errors
-        if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+    _retryable_llm_classes_cache: tuple[type[BaseException], ...] | None = None
+
+    @classmethod
+    def _retryable_llm_classes(cls) -> tuple[type[BaseException], ...]:
+        """Lazy-import SDK error classes once and cache as an isinstance tuple."""
+        if cls._retryable_llm_classes_cache is not None:
+            return cls._retryable_llm_classes_cache
+        classes: list[type[BaseException]] = [
+            asyncio.TimeoutError, TimeoutError, ConnectionError,
+        ]
+        for module_name, names in (
+            ("anthropic", ("APIConnectionError", "APITimeoutError",
+                           "RateLimitError", "InternalServerError")),
+            ("openai", ("APIConnectionError", "APITimeoutError",
+                        "RateLimitError", "InternalServerError")),
+        ):
+            try:
+                module = __import__(module_name)
+            except ImportError:
+                continue
+            for name in names:
+                klass = getattr(module, name, None)
+                if isinstance(klass, type) and issubclass(klass, BaseException):
+                    classes.append(klass)
+        cls._retryable_llm_classes_cache = tuple(classes)
+        return cls._retryable_llm_classes_cache
+
+    @classmethod
+    def _is_llm_retryable(cls, exc: Exception) -> bool:
+        """Return True for transient errors worth retrying.
+
+        Primary: isinstance against known SDK error classes (anthropic / openai).
+        Fallback: match unambiguous HTTP-error tokens for third-party providers
+        whose errors don't inherit from those SDK classes (DeepSeek, Ollama, etc.).
+        Avoids matching ambiguous words like "timeout" or "connection" that
+        can appear inside non-transient error messages.
+        """
+        if isinstance(exc, cls._retryable_llm_classes()):
             return True
-        cls_name = exc.__class__.__name__
         error_msg = str(exc).lower()
-        # Anthropic SDK error types
-        if cls_name in (
-            "RateLimitError", "APIConnectionError", "APITimeoutError",
-            "InternalServerError", "APIStatusError",
-        ):
-            return True
-        # OpenAI SDK error types (may be imported lazily)
-        if cls_name in (
-            "RateLimitError", "APIConnectionError", "APITimeoutError",
-            "InternalServerError",
-        ):
-            return True
-        # Fallback: check error message for known transient patterns
-        retryable_keywords = (
-            "rate limit", "too many requests", "429",
-            "server error", "500", "502", "503", "504",
-            "timeout", "timed out", "connection", "network",
+        retryable_tokens = (
+            " 429", " 500", " 502", " 503", " 504",
+            "rate limit", "too many requests",
             "service unavailable", "overloaded",
         )
-        if any(kw in error_msg for kw in retryable_keywords):
-            return True
-        return False
+        return any(token in error_msg for token in retryable_tokens)
 
     @staticmethod
     def _is_content_filter_block(exc: Exception) -> bool:
@@ -1469,10 +1209,7 @@ class BaseAgent:
         # multi-tool batch as risky poisons unrelated outputs.
         if tool_uses and results:
             if len(results) == 1:
-                self.content_filter.learn(results[0], is_risky=True)
-                await asyncio.to_thread(
-                    self.content_filter.save, default_model_path()
-                )
+                await self.content_filter.learn_and_persist([results[0]])
             else:
                 logger.info(
                     "Content filter recovery skipped classifier learning for "
@@ -1485,12 +1222,9 @@ class BaseAgent:
         # preceded by the assistant tool_use message.
         messages_before = len(ctx.messages)
         if tool_uses:
-            # Calculate how many tool_result messages were appended
-            if self.api_format == "anthropic":
-                result_msg_count = 1  # single user msg with content list
-            else:
-                result_msg_count = len(tool_uses)  # one tool msg per call
-            # Remove tool_result messages + the preceding assistant message
+            # The transport knows how many trailing tool-result messages it
+            # appended for this batch; +1 for the preceding assistant turn.
+            result_msg_count = self._transport.tool_result_rollback_count(len(tool_uses))
             del ctx.messages[-(result_msg_count + 1):]
 
         # Append a summarized user message instead
@@ -1687,9 +1421,7 @@ class BaseAgent:
             return False
         return True
 
-    @staticmethod
-    def _looks_like_chinese(text: str) -> bool:
-        return any("\u4e00" <= char <= "\u9fff" for char in text)
+    _looks_like_chinese = staticmethod(shared._looks_like_chinese)
 
     @classmethod
     def _tool_result_preview(cls, results: list[str], limit: int = 220) -> str:
@@ -1839,9 +1571,11 @@ class BaseAgent:
         tool_uses: list[dict],
         orchestration_decision: OrchestrationDecision | None = None,
     ) -> list[str]:
-        # M2: use a sentinel so we can distinguish "tool not run" from "tool returned empty"
-        _MISSING = object()
-        results: list[Any] = [_MISSING] * len(tool_uses)
+        # Contract: regular_calls ⊎ spawn_calls partition tool_uses by index,
+        # and both branches assign every slot they own before returning.
+        # No sentinel — if a slot is unset, that's a programming error caller
+        # should see as a missing item, not silently masked.
+        results: list[str] = [""] * len(tool_uses)
 
         regular_calls = [
             (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] != "spawn_agent"
@@ -1872,9 +1606,6 @@ class BaseAgent:
             # _run_orchestrated_spawn_calls, which routes to the
             # appropriate runtime (parallel, pipeline, rendezvous) or
             # executes directly for a single unorchestrated spawn.
-            # The separate inline semaphore+heartbeat path that used to
-            # live here has been removed — its functionality is now
-            # handled by the runtime functions.
             execution_mode = self._derive_execution_mode_from_spawn_calls(spawn_calls)
             total_spawns = len(spawn_calls)
             roles = ", ".join(tu["input"].get("role", "?") for _, tu in spawn_calls)
@@ -1936,20 +1667,8 @@ class BaseAgent:
                 )
             for (idx, _tu), outcome in zip(spawn_calls, raw_spawn):
                 results[idx] = outcome
-            return [
-                r
-                if r is not _MISSING
-                else json.dumps({"ok": False, "error": "tool result missing"})
-                for r in results
-            ]
 
-        # M2: replace any slot that was never assigned (programming error guard)
-        return [
-            r
-            if r is not _MISSING
-            else json.dumps({"ok": False, "error": "tool result missing"})
-            for r in results
-        ]
+        return results
 
     async def send_message(
         self,
@@ -2035,7 +1754,6 @@ class BaseAgent:
                     "content": self._build_user_message_content(user_message, attachments),
                 }
             )
-            self._context_stack.append(ctx)
 
             # D1: bounded tool-call loop — prevents infinite model loops
             max_tool_call_iterations = max(1, int(self.max_tool_call_iterations))
@@ -2065,7 +1783,7 @@ class BaseAgent:
                     trace_error = "Turn cancelled by user"
                     return AgentResult(
                         agent_id=ctx.agent_id,
-                        content=result_text or "[任务已被用户中断]",
+                        content=result_text or shared._cancelled_by_user_text(user_message),
                         tool_calls_made=tool_calls_made,
                         error=trace_error,
                     )
@@ -2135,11 +1853,13 @@ class BaseAgent:
                         )
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
                         tool_use_started_at = time.perf_counter()
-                        results = await self._run_tool_uses(
-                            tool_uses,
-                            orchestration_decision=orchestration_decision,
-                        )
-                        _out._active_assistant_text.reset(_intent_token)
+                        try:
+                            results = await self._run_tool_uses(
+                                tool_uses,
+                                orchestration_decision=orchestration_decision,
+                            )
+                        finally:
+                            _out._active_assistant_text.reset(_intent_token)
                         _trace_latency(
                             "tool_uses_finished",
                             agent_id=ctx.agent_id,
@@ -2173,10 +1893,8 @@ class BaseAgent:
                             threshold=self._content_filter_threshold,
                         )
                         if risky_indices:
-                            for i in risky_indices:
-                                self.content_filter.learn(results[i], is_risky=True)
-                            await asyncio.to_thread(
-                                self.content_filter.save, default_model_path()
+                            await self.content_filter.learn_and_persist(
+                                [results[i] for i in risky_indices]
                             )
                             logger.info(
                                 "Content filter flagged %d/%d tool results as risky: %s",
@@ -2297,28 +2015,17 @@ class BaseAgent:
                             result_text = self._synthesize_tool_only_response(
                                 tool_result_history
                             )
-                        if self.api_format == "openai":
-                            ctx.messages.append(
-                                self._assistant_message(response, result_text)
-                            )
-                        else:
-                            ctx.messages.append(
-                                {"role": "assistant", "content": result_text}
-                            )
+                        ctx.messages.append(
+                            self._transport.build_final_message(response, result_text)
+                        )
                         completion_error = self._response_completion_error(response)
                         if completion_error:
                             result_text, continuation_error = (
                                 await self._continue_truncated_response(ctx, result_text)
                             )
-                            if self.api_format == "openai":
-                                ctx.messages[-1] = self._assistant_message(
-                                    response, result_text
-                                )
-                            else:
-                                ctx.messages[-1] = {
-                                    "role": "assistant",
-                                    "content": result_text,
-                                }
+                            ctx.messages[-1] = self._transport.build_final_message(
+                                response, result_text
+                            )
                             trace_status = "continuation_error"
                             trace_error = continuation_error
                             return AgentResult(
@@ -2404,10 +2111,10 @@ class BaseAgent:
                 tool_calls=len(tool_calls_made),
                 duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
             )
-            # Always restore the original system prompt and pop the context stack.
+            # Always restore the original system prompt.  The current ctx
+            # is published via the _active_agent_context ContextVar; that
+            # token is reset above, so no extra stack bookkeeping is needed.
             ctx.system_prompt = original_system
-            if self._context_stack and self._context_stack[-1] is ctx:
-                self._context_stack.pop()
 
         return AgentResult(
             agent_id=ctx.agent_id,
@@ -2471,109 +2178,19 @@ class BaseAgent:
         tools: list[dict],
         callback: Callable[[str], Any],
     ) -> tuple[Any, str]:
-        """Stream response text chunk-by-chunk and return (full_response, collected_text).
+        """Stream response and return (full_response, collected_text).
 
-        ``callback`` may be a plain sync function or an async coroutine function;
-        both are handled transparently.
-
-        For Anthropic: uses stream.get_final_message() to obtain the complete response.
-        For OpenAI: accumulates tool_call deltas and rebuilds a synthetic response.
+        ``callback`` may be a plain sync function or an async coroutine
+        function; the transport handles both.
         """
-        collected: list[str] = []
-        if self.api_format == "anthropic":
-            async with self.client.messages.stream(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                system=ctx.system_prompt,
-                messages=ctx.messages,
-                tools=self._tools_for_api(tools),
-            ) as stream:
-                async for text in stream.text_stream:
-                    collected.append(text)
-                    _r = callback(text)
-                    if inspect.isawaitable(_r):
-                        await _r
-                response = await stream.get_final_message()
-            return response, "".join(collected)
-
-        # OpenAI streaming — accumulate tool_call deltas as well
-        kwargs: dict = dict(
+        return await self._transport.stream(
             model=self.model,
             max_tokens=self.max_tokens,
-            messages=self._inject_system(ctx.messages, ctx.system_prompt),
-            stream=True,
+            system=ctx.system_prompt,
+            messages=ctx.messages,
+            tools=tools,
+            callback=callback,
         )
-        api_tools = self._tools_for_api(tools)
-        if api_tools:
-            kwargs["tools"] = api_tools
-        finish_reason = "stop"
-        tool_calls_acc: dict[int, dict] = {}  # index -> {id, name, arguments}
-        provider_extras_acc: dict[str, Any] = {}
-        # AsyncOpenAI.chat.completions.create() is a coroutine; await it to get
-        # the AsyncStream object, then iterate the stream chunk by chunk.
-        # Do NOT remove the `await` — create() returns a coroutine, not an
-        # async iterable, so `async for chunk in create(...)` raises TypeError.
-        async for chunk in await self.client.chat.completions.create(**kwargs):
-            if not chunk.choices:
-                continue
-            choice = chunk.choices[0]
-            delta = choice.delta
-            if delta.content:
-                collected.append(delta.content)
-                _r = callback(delta.content)
-                if inspect.isawaitable(_r):
-                    await _r
-            delta_extras = self._openai_message_extras(delta)
-            if delta_extras:
-                provider_extras_acc = self._merge_openai_message_extras(
-                    provider_extras_acc, delta_extras
-                )
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {
-                            "id": tc_delta.id or "",
-                            "name": (
-                                tc_delta.function.name if tc_delta.function else ""
-                            )
-                            or "",
-                            "arguments": "",
-                        }
-                    acc = tool_calls_acc[idx]
-                    if tc_delta.id:
-                        acc["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            acc["name"] = tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            acc["arguments"] += tc_delta.function.arguments
-            if choice.finish_reason:
-                finish_reason = choice.finish_reason
-
-        # Build a synthetic response object using module-level dataclasses
-        oi_tool_calls = (
-            [
-                shared._OAITC(v["id"], shared._OAIFunc(v["name"], v["arguments"]))
-                for _, v in sorted(tool_calls_acc.items())
-            ]
-            if tool_calls_acc
-            else None
-        )
-
-        response = shared._OAIResponse(
-            [
-                shared._OAIChoice(
-                    finish_reason,
-                    shared._OAIMsg(
-                        "".join(collected),
-                        oi_tool_calls,
-                        provider_extras_acc or None,
-                    ),
-                )
-            ]
-        )
-        return response, "".join(collected)
 
     # ── Sub-agent construction helpers (used by _execute_agent and
     # register_spawn_capability) ───────────────────────────────────────
@@ -2689,33 +2306,15 @@ class BaseAgent:
         """Make a lightweight, tool-free LLM call.
 
         Returns the response text, or None if the call fails.  Used by
-        _summarize_text and _summarize_rendezvous_round to avoid
-        duplicated Anthropic / OpenAI dispatch logic.
+        _summarize_text and _summarize_rendezvous_round.  Dispatch lives
+        in the transport — provider-specific dispatch is not the agent's job.
         """
-        try:
-            if self.api_format == "anthropic":
-                resp = await self.client.messages.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    system=system,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                if resp.content and hasattr(resp.content[0], "text"):
-                    return resp.content[0].text.strip()
-            else:
-                resp = await self.client.chat.completions.create(
-                    model=self.model,
-                    max_tokens=max_tokens,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                if resp.choices and resp.choices[0].message.content:
-                    return resp.choices[0].message.content.strip()
-        except Exception:
-            pass
-        return None
+        return await self._transport.simple_chat(
+            model=self.model,
+            max_tokens=max_tokens,
+            system=system,
+            prompt=prompt,
+        )
 
     async def _summarize_text(
         self, text: str, role: str, task: str
@@ -2968,7 +2567,7 @@ class BaseAgent:
         # conversation turns; sub-agent traces must not be mixed in or
         # consolidation will extract them as user-visible episodes.
         if self.context_manager and payload["ok"]:
-            try:
+            with shared._suppress_with_log("LTM write for sub-agent result failed; turn continues"):
                 content_to_store = full_content
                 entry_id = shared._new_id()
                 now = datetime.now(timezone.utc).strftime(
@@ -2995,8 +2594,6 @@ class BaseAgent:
                         updated_at=now,
                     )
                 )
-            except Exception:
-                pass  # storage failure must not break the parent turn
         return payload
 
     def register_spawn_capability(

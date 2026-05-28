@@ -143,6 +143,27 @@ class ContentFilter:
         for text in texts:
             self.learn(text, is_risky)
 
+    async def learn_and_persist(
+        self,
+        risky_texts: list[str],
+        *,
+        path: "Path | None" = None,
+    ) -> None:
+        """Atomically update the classifier with risky examples and persist.
+
+        Combines the two steps every caller needs (``learn`` + ``save``)
+        and offloads disk I/O to a thread.  Empty input is a no-op so the
+        caller can pass a filtered list without a guard.
+        """
+        if not risky_texts:
+            return
+        import asyncio
+
+        for text in risky_texts:
+            self.learn(text, is_risky=True)
+        target = path or default_model_path()
+        await asyncio.to_thread(self.save, target)
+
     # ── persistence ──────────────────────────────────────────────────────────
 
     def to_dict(self) -> dict[str, Any]:

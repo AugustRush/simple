@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -195,6 +196,31 @@ def _preview_text(text: object, limit: int = 80) -> str:
     if len(normalized) <= limit:
         return normalized
     return normalized[: limit - 3] + "..."
+
+
+def _looks_like_chinese(text: object) -> bool:
+    return any("一" <= ch <= "鿿" for ch in str(text or ""))
+
+
+def _cancelled_by_user_text(reference_text: object = "") -> str:
+    """Localized fallback shown when a turn is cancelled by the user."""
+    if _looks_like_chinese(reference_text):
+        return "[任务已被用户中断]"
+    return "[Task cancelled by user]"
+
+
+@contextlib.contextmanager
+def _suppress_with_log(reason: str, *, logger_name: str = "agent", level: int = logging.WARNING):
+    """Swallow exceptions but always leave a debuggable trace.
+
+    First-principles replacement for bare ``except Exception: pass``.
+    Forces every silent-failure site to articulate why and what is being lost,
+    so a future operator can grep the log instead of grepping for ``pass``.
+    """
+    try:
+        yield
+    except Exception:
+        logging.getLogger(logger_name).log(level, "suppressed: %s", reason, exc_info=True)
 
 
 def _interaction_log(component: str, event: str, **fields: object) -> None:

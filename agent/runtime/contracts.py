@@ -84,21 +84,6 @@ class TurnResult:
 
 
 @dataclass(frozen=True)
-class RuntimeEvent:
-    """Canonical lifecycle fact emitted by runtime services."""
-
-    name: str
-    session_id: str
-    channel_name: str
-    fields: Mapping[str, Any] = field(default_factory=dict)
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "fields", MappingProxyType(dict(self.fields)))
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
-
-
-@dataclass(frozen=True)
 class RuntimeComponents:
     """Typed access wrapper for bootstrapped runtime dependencies."""
 
@@ -563,8 +548,10 @@ class AgentCore:
                 if state.cancel_token is not None:
                     state.cancel_token.cancel()
                 cancelled_by_user = True
+                from agent import shared as _shared
+
                 final_result = TurnResult(
-                    text="[任务已被用户中断]",
+                    text=_shared._cancelled_by_user_text(turn_input.text),
                     error="cancelled_by_user",
                 )
                 collector.emit(

@@ -2565,7 +2565,8 @@ def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
     parent_ctx = agent_module.AgentContext(system_prompt="augmented prompt")
     parent_ctx.metadata["skill_catalog"] = "catalog"
     parent_ctx.metadata["required_skills"] = ["quality/review"]
-    parent._context_stack.append(parent_ctx)
+    from agent.core.agent import _active_agent_context
+    _ctx_token = _active_agent_context.set(parent_ctx)
 
     observed = {}
 
@@ -2592,7 +2593,7 @@ def test_spawn_agent_surfaces_error_and_inherits_parent_context(monkeypatch):
         )
     )
 
-    parent._context_stack.pop()
+    _active_agent_context.reset(_ctx_token)
 
     assert observed["context_manager"] is sentinel_context_manager
     assert observed["required_skills"] == ["quality/review"]
