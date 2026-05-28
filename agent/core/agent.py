@@ -313,7 +313,7 @@ class BaseAgent:
         return planner.decide(
             user_message,
             tools_enabled=ctx.tools_enabled,
-            has_spawn_agent="spawn_agent" in self.registry.list_tools(),
+            has_spawn_agent=bool(self.registry.tools_with_capability("orchestration")),
         )
 
     async def _execute_subtask_spec(self, spec: SubtaskSpec) -> SubtaskResult:
@@ -1275,9 +1275,14 @@ class BaseAgent:
     def _synthesize_tool_only_response(
         tool_history: list[tuple[str, str]]
     ) -> str:
-        for tool_name, raw_result in reversed(tool_history):
-            if tool_name != "schedule_create":
-                continue
+        """Promote a successful tool's own ``summary_text`` to the turn reply.
+
+        Generic protocol: any tool may populate ``{"ok": true, "summary_text":
+        "..."}`` in its result.  The most recent populating call wins.  Used
+        when the model produced only tool calls and no closing text — without
+        this, the user would see silence.
+        """
+        for _tool_name, raw_result in reversed(tool_history):
             try:
                 payload = json.loads(raw_result)
             except Exception:
@@ -1311,8 +1316,32 @@ class BaseAgent:
             ]
         )
 
+    # Fields whose values are typically large or vary across otherwise-identical
+    # calls (file content, search hits, raw bodies, base64 blobs).  Including
+    # them in a tool-loop signature would mask genuine repetition.
+    _SIGNATURE_NOISY_KEYS = frozenset({
+        "content", "text", "body", "data", "bytes", "raw", "raw_bytes",
+        "preview", "summary_text", "full_content", "result_preview",
+    })
+    _SIGNATURE_VALUE_LIMIT = 200
+
+    @classmethod
+    def _signature_value(cls, value: Any) -> Any:
+        """Shrink large values so they don't dominate a tool-loop signature."""
+        if isinstance(value, str) and len(value) > cls._SIGNATURE_VALUE_LIMIT:
+            return {"truncated": True, "len": len(value)}
+        if isinstance(value, (list, tuple)) and len(value) > 16:
+            return {"truncated": True, "count": len(value)}
+        return value
+
     @classmethod
     def _normalized_tool_result(cls, raw_result: str) -> Any:
+        """Strip noisy fields and cap large values so equal results compare equal.
+
+        Deny-list rather than allow-list: any structured field a tool adds
+        in the future is automatically included in dedup signatures unless
+        it appears in ``_SIGNATURE_NOISY_KEYS``.
+        """
         text = str(raw_result or "").strip()
         if not text:
             return {"empty": True}
@@ -1322,33 +1351,11 @@ class BaseAgent:
             return text[:600]
         if not isinstance(payload, dict):
             return payload
-
-        interesting_keys = (
-            "ok",
-            "error",
-            "reason",
-            "blocked",
-            "requires_confirmation",
-            "intent_required",
-            "status",
-            "exit_code",
-            "path",
-            "url",
-            "bytes_done",
-            "bytes_read",
-            "bytes_total",
-            "count",
-            "queued",
-            "completed",
-            "total",
-            "message",
-            "stdout",
-            "stderr",
-            "recoverable_by_agent",
-            "recovery_hint",
-        )
-        normalized = {key: payload[key] for key in interesting_keys if key in payload}
-        return normalized or payload
+        return {
+            key: cls._signature_value(value)
+            for key, value in payload.items()
+            if key not in cls._SIGNATURE_NOISY_KEYS
+        } or payload
 
     @classmethod
     def _tool_result_signature(cls, results: list[str]) -> str:
@@ -1577,8 +1584,11 @@ class BaseAgent:
         # should see as a missing item, not silently masked.
         results: list[str] = [""] * len(tool_uses)
 
+        def _is_orchestration(tu: dict) -> bool:
+            return "orchestration" in self.registry.tool_capabilities(tu["name"])
+
         regular_calls = [
-            (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] != "spawn_agent"
+            (idx, tu) for idx, tu in enumerate(tool_uses) if not _is_orchestration(tu)
         ]
         if regular_calls:
             regular_executor = RegularToolExecutor(
@@ -1599,7 +1609,7 @@ class BaseAgent:
                     results[idx] = outcome
 
         spawn_calls = [
-            (idx, tu) for idx, tu in enumerate(tool_uses) if tu["name"] == "spawn_agent"
+            (idx, tu) for idx, tu in enumerate(tool_uses) if _is_orchestration(tu)
         ]
         if spawn_calls:
             # All spawn calls go through a single dispatch path via
@@ -1866,10 +1876,12 @@ class BaseAgent:
                             iteration=_iteration + 1,
                             total_tool_uses=len(tool_uses),
                             spawn_calls=sum(
-                                1 for tool_use in tool_uses if tool_use["name"] == "spawn_agent"
+                                1 for tool_use in tool_uses
+                                if "orchestration" in self.registry.tool_capabilities(tool_use["name"])
                             ),
                             regular_calls=sum(
-                                1 for tool_use in tool_uses if tool_use["name"] != "spawn_agent"
+                                1 for tool_use in tool_uses
+                                if "orchestration" not in self.registry.tool_capabilities(tool_use["name"])
                             ),
                             duration_ms=f"{(time.perf_counter() - tool_use_started_at) * 1000:.1f}",
                         )
@@ -2212,7 +2224,9 @@ class BaseAgent:
             if write_scope:
                 allowed_capabilities.add("workspace_write")
         for name, tool_def in tools_snapshot.items():
-            if name == "spawn_agent":
+            # Sub-agents must never spawn further sub-agents — exclude any
+            # orchestration-capable tool by capability, not by name.
+            if "orchestration" in tool_def.capabilities:
                 continue
             if allowed_capabilities is not None:
                 if not tool_def.capabilities:

@@ -17,11 +17,10 @@ from agent.core.output import (
 )
 from agent.plugins.catalog import PostToolEvent, PreToolEvent
 
-# Capabilities that require the assistant to declare intent before acting.
-# Pure "read" tools are excluded — observation needs no explanation.
-_INTENT_REQUIRED_CAPABILITIES = frozenset(
-    {"workspace_write", "output_write", "shell", "state_write", "side_effect"}
-)
+# Tools opt into the intent-before-action protocol by declaring the
+# ``requires_intent`` capability.  Today only ``shell`` does (its command
+# string is opaque); other write tools self-declare via structured params.
+_INTENT_REQUIRED_CAPABILITY = "requires_intent"
 
 _active_tool_progress: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "active_tool_progress",
@@ -265,7 +264,7 @@ class RegularToolExecutor:
         return len(text) >= 12
 
     @staticmethod
-    def _shell_structured_intent(inputs: dict) -> str:
+    def _structured_intent(inputs: dict) -> str:
         for key in ("intent", "purpose", "reason"):
             value = inputs.get(key)
             if isinstance(value, str) and value.strip():
@@ -275,30 +274,27 @@ class RegularToolExecutor:
     def _check_intent(self, tool_name: str, inputs: dict) -> str:
         """Return an error message if intent is undeclared, or "" if OK.
 
-        Only shell commands require an explicit intent declaration — the
-        command string alone can be opaque.  All other write tools
-        (write_file, memory_write, schedule_create, etc.) are
-        self-declaring through their structured parameters (path,
-        content, name, etc.).
+        A tool opts into intent enforcement by declaring the
+        ``requires_intent`` capability.  The check is generic — every such
+        tool must accept an ``intent`` / ``purpose`` / ``reason`` input
+        and the value must be a specific, non-vague phrase.
         """
-        tools = getattr(self._registry, "_tools", None)
-        cap = tools.get(tool_name) if isinstance(tools, dict) else None
-        if cap is None:
+        caps = self._registry.tool_capabilities(tool_name) if hasattr(
+            self._registry, "tool_capabilities"
+        ) else frozenset()
+        if _INTENT_REQUIRED_CAPABILITY not in caps:
             return ""
-        if not (getattr(cap, "capabilities", frozenset()) & _INTENT_REQUIRED_CAPABILITIES):
-            return ""
-        if tool_name != "shell":
-            return ""
-        structured_intent = self._shell_structured_intent(inputs)
+        structured_intent = self._structured_intent(inputs)
+        label = tool_name[:1].upper() + tool_name[1:] if tool_name else "Tool"
         if not structured_intent:
             return (
-                "Shell intent required: include input.intent explaining what "
-                "this exact command will do and why it is necessary."
+                f"{label} intent required: include input.intent explaining "
+                "what this exact call will do and why it is necessary."
             )
         if not self._intent_text_is_specific(structured_intent):
             return (
-                "Shell intent too vague: input.intent must describe the "
-                "specific command purpose and expected outcome."
+                f"{label} intent too vague: input.intent must describe the "
+                "specific purpose and expected outcome."
             )
         return ""
 

@@ -58,7 +58,7 @@ class ToolRegistry:
         ("builtin", "write_file"): frozenset({"workspace_write"}),
         ("builtin", "clean_output"): frozenset({"output_write"}),
         ("builtin", "clear_context"): frozenset({"state_write"}),
-        ("builtin", "shell"): frozenset({"shell"}),
+        ("builtin", "shell"): frozenset({"shell", "requires_intent"}),
         ("builtin", "transcribe_audio"): frozenset({"read"}),
         ("builtin", "send_file"): frozenset({"side_effect"}),
         ("builtin", "memory_write"): frozenset({"state_write"}),
@@ -71,6 +71,7 @@ class ToolRegistry:
         ("runtime:skill", "update_skill"): frozenset({"state_write"}),
         ("runtime:skill", "delete_skill"): frozenset({"state_write"}),
         ("runtime:skill", "write_skill_file"): frozenset({"state_write"}),
+        ("runtime:spawn", "spawn_agent"): frozenset({"orchestration"}),
     }
 
     def __init__(self, console: Optional[Any] = None):
@@ -207,6 +208,14 @@ class ToolRegistry:
 
     def list_tools(self) -> list[str]:
         return list(self._tools.keys())
+
+    def tool_capabilities(self, name: str) -> frozenset[str]:
+        """Capabilities declared by a registered tool (empty if unknown)."""
+        tool = self._tools.get(name)
+        return tool.capabilities if tool is not None else frozenset()
+
+    def tools_with_capability(self, capability: str) -> list[str]:
+        return [name for name, t in self._tools.items() if capability in t.capabilities]
 
     def set_context(self, key: str, value: Any) -> None:
         self._context[key] = value

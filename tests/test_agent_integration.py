@@ -3288,6 +3288,7 @@ def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch
         object(), registry, model="fake-model", api_format="openai"
     )
     agent.max_parallel_agents = 1
+    agent.register_spawn_capability("system")
 
     spawn_tool_calls = [
         agent_module._OAITC(
@@ -3366,6 +3367,7 @@ def test_send_message_emits_spawn_batch_events(monkeypatch):
         object(), registry, model="fake-model", api_format="openai"
     )
     agent.max_parallel_agents = 2
+    agent.register_spawn_capability("system")
 
     spawn_tool_calls = [
         agent_module._OAITC(
@@ -3437,6 +3439,7 @@ def test_send_message_emits_structured_orchestration_metrics(monkeypatch):
         object(), registry, model="fake-model", api_format="openai"
     )
     agent.max_parallel_agents = 2
+    agent.register_spawn_capability("system")
 
     spawn_tool_calls = [
         agent_module._OAITC(
@@ -3520,6 +3523,7 @@ def test_send_message_emits_parallel_batch_progress_for_orchestrated_spawn_calls
         object(), registry, model="fake-model", api_format="openai"
     )
     agent.max_parallel_agents = 2
+    agent.register_spawn_capability("system")
 
     spawn_tool_calls = [
         agent_module._OAITC(
@@ -3758,6 +3762,7 @@ def test_send_message_batches_excess_parallel_spawn_calls(monkeypatch):
         object(), registry, model="fake-model", api_format="openai"
     )
     agent.max_parallel_agents = 2
+    agent.register_spawn_capability("system")
 
     spawn_tool_calls = [
         agent_module._OAITC(
