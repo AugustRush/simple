@@ -7,6 +7,7 @@ from functools import partial
 import importlib.util
 import inspect
 import json
+import os
 from pathlib import Path
 import re
 import sys
@@ -159,6 +160,95 @@ class PluginMeta:
     hooks_config: dict[str, list[dict]] = field(default_factory=dict)
     hook_matchers: dict[str, re.Pattern] = field(default_factory=dict)
     hook_timeouts: dict[str, float] = field(default_factory=dict)
+    path: Optional[Path] = None  # plugin directory on disk (for CLAUDE_PLUGIN_ROOT)
+
+
+# ── Claude Code compatibility maps ──────────────────────────────────────────
+
+# Event names: Claude Code (PascalCase) → internal (snake_case w/ on_ prefix).
+_CC_EVENT_MAP = {
+    "PreToolUse": "on_pre_tool",
+    "PostToolUse": "on_post_tool",
+    "UserPromptSubmit": "on_prompt_submit",
+    "SessionStart": "on_session_start",
+    "SessionEnd": "on_session_end",
+    "Stop": "on_turn_end",
+}
+# Reverse + ignored events surfaced as warnings.
+_CC_EVENT_IGNORED = {"Notification", "SubagentStop", "PreCompact"}
+
+# Tool name translation: our tool name → Claude Code tool name.
+# Used when matching a Claude Code matcher pattern against our tools.
+_OUR_TO_CC_TOOL_NAME = {
+    "shell": "Bash",
+    "read_file": "Read",
+    "write_file": "Write",
+    "list_files": "Glob",
+    "memory_read": "Read",
+    "memory_search": "Grep",
+    "web_search": "WebSearch",
+    "web_fetch": "WebFetch",
+}
+
+
+def _read_claude_hooks_json(plugin_dir: Path) -> dict[str, list[dict]]:
+    """Read ``hooks/hooks.json`` and translate to the internal hook shape.
+
+    Claude Code's structure nests once more than ours:
+        {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", ...}]}]}
+    Our internal shape is flat:
+        {"on_pre_tool": [{"matcher": "Bash", "type": "command", "command": ..., "timeout": ...}]}
+    Event names are translated via _CC_EVENT_MAP; ignored events emit a warning.
+    """
+    hf = plugin_dir / "hooks" / "hooks.json"
+    if not hf.exists():
+        return {}
+    try:
+        data = json.loads(hf.read_text(encoding="utf-8"))
+    except Exception as exc:
+        shared.CONSOLE.print(
+            f"[yellow]Plugin '{plugin_dir.name}': hooks.json unreadable: {exc}[/yellow]"
+        )
+        return {}
+    cc_hooks = data.get("hooks", {})
+    if not isinstance(cc_hooks, dict):
+        return {}
+    out: dict[str, list[dict]] = {}
+    for cc_event, entries in cc_hooks.items():
+        if cc_event in _CC_EVENT_IGNORED:
+            shared.CONSOLE.print(
+                f"[yellow]Plugin '{plugin_dir.name}': ignoring unsupported "
+                f"Claude Code event '{cc_event}'[/yellow]"
+            )
+            continue
+        internal_event = _CC_EVENT_MAP.get(cc_event)
+        if internal_event is None or not isinstance(entries, list):
+            continue
+        flat: list[dict] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            matcher = entry.get("matcher", "")
+            nested = entry.get("hooks", [])
+            if not isinstance(nested, list):
+                continue
+            for inner in nested:
+                if not isinstance(inner, dict):
+                    continue
+                if inner.get("type") != "command":
+                    continue
+                cmd = str(inner.get("command", "") or "").strip()
+                if not cmd:
+                    continue
+                flat.append({
+                    "type": "command",
+                    "matcher": matcher,
+                    "command": cmd,
+                    "timeout": float(inner.get("timeout", 60.0)),
+                })
+        if flat:
+            out[internal_event] = flat
+    return out
 
 
 def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
@@ -575,6 +665,16 @@ class PluginCatalog:
         self._load_command_files(plugin_dir, plugin_name, slash_command_owners)
         self._load_agent_files(plugin_dir, plugin_name)
 
+        # Merge Claude Code's hooks/hooks.json (if present) into hooks_config.
+        # Existing plugin.json hooks win on the same event key.
+        cc_hooks = _read_claude_hooks_json(plugin_dir)
+        for event_name, entries in cc_hooks.items():
+            existing = meta.hooks_config.setdefault(event_name, [])
+            existing.extend(entries)
+            # Compile matchers per-entry below; the legacy per-event matcher
+            # cache is not used for CC-style multi-entry events.
+        meta.path = plugin_dir
+
     # ── Declarative commands / agents (Claude Code convention) ──────────
 
     def _load_command_files(
@@ -725,11 +825,56 @@ class PluginCatalog:
         """Check whether *hook_name* on *meta* has a matcher for *tool_name*.
 
         No matcher → always matches (opt-in to filtering by declaring one).
+        Honors both our snake_case names and Claude Code PascalCase names
+        when a CC plugin's matcher targets the latter.
         """
         matcher = meta.hook_matchers.get(hook_name)
         if matcher is None:
             return True
-        return bool(matcher.search(tool_name))
+        if matcher.search(tool_name):
+            return True
+        cc_name = _OUR_TO_CC_TOOL_NAME.get(tool_name)
+        return bool(cc_name and matcher.search(cc_name))
+
+    @staticmethod
+    def _entry_matches_tool(entry: dict, tool_name: str) -> bool:
+        """Per-entry matcher check (used for Claude Code hook entries that
+        carry their own matcher string instead of a per-event compiled one)."""
+        matcher_str = str(entry.get("matcher", "") or "").strip()
+        if not matcher_str or matcher_str == "*":
+            return True
+        try:
+            pattern = re.compile(matcher_str)
+        except re.error:
+            return matcher_str == tool_name or matcher_str == _OUR_TO_CC_TOOL_NAME.get(tool_name)
+        if pattern.search(tool_name):
+            return True
+        cc_name = _OUR_TO_CC_TOOL_NAME.get(tool_name)
+        return bool(cc_name and pattern.search(cc_name))
+
+    def _hook_env(self, meta: PluginMeta, event_payload: dict) -> dict[str, str]:
+        """Build Claude Code-compatible environment variables for hook exec."""
+        env = dict(os.environ)
+        if meta.path is not None:
+            env["CLAUDE_PLUGIN_ROOT"] = str(meta.path)
+        # Workspace = current cwd; matches what CC reports.
+        env["CLAUDE_PROJECT_DIR"] = os.getcwd()
+        tool_name = str(event_payload.get("tool_name", "") or "")
+        if tool_name:
+            env["TOOL_NAME"] = _OUR_TO_CC_TOOL_NAME.get(tool_name, tool_name)
+        tool_kwargs = event_payload.get("tool_kwargs")
+        if tool_kwargs is not None:
+            try:
+                env["TOOL_INPUT"] = json.dumps(tool_kwargs, ensure_ascii=False)
+            except Exception:
+                env["TOOL_INPUT"] = str(tool_kwargs)
+        result = event_payload.get("result")
+        if result is not None:
+            env["TOOL_OUTPUT"] = str(result)
+        text = event_payload.get("text")
+        if text is not None and event_payload.get("event") == "on_prompt_submit":
+            env["CLAUDE_USER_PROMPT"] = str(text)
+        return env
 
     async def _run_command_hooks(
         self,
@@ -740,8 +885,15 @@ class PluginCatalog:
         """Execute command-type hooks declared in plugin.json for *event_name*."""
         results: list[HookResult] = []
         entries = meta.hooks_config.get(event_name, [])
+        tool_name = str(event_payload.get("tool_name", "") or "")
+        env = self._hook_env(meta, event_payload)
         for entry in entries:
             if entry.get("type") != "command":
+                continue
+            # Per-entry matcher (Claude Code style).  Legacy entries with no
+            # matcher field always pass and remain compatible with the older
+            # per-event matcher cache on PluginMeta.
+            if tool_name and "matcher" in entry and not self._entry_matches_tool(entry, tool_name):
                 continue
             cmd = str(entry.get("command", "") or "").strip()
             if not cmd:
@@ -753,6 +905,7 @@ class PluginCatalog:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    env=env,
                 )
                 stdin_data = json.dumps(event_payload, ensure_ascii=False).encode("utf-8")
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(

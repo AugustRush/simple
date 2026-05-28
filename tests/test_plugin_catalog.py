@@ -1301,3 +1301,82 @@ def test_agents_md_registered_under_namespaced_role(tmp_path):
     assert defn is not None
     assert defn["name"] == "deep-research"
     assert "methodical researcher" in defn["body"]
+
+
+def test_cc_hooks_json_translates_to_internal_hooks_config(tmp_path):
+    """hooks/hooks.json with PreToolUse becomes on_pre_tool entries."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "hooked"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "hooked"}', encoding="utf-8"
+    )
+    (plugin_dir / "hooks").mkdir()
+    (plugin_dir / "hooks" / "hooks.json").write_text(
+        '{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": ['
+        '{"type": "command", "command": "echo pre"}]}]}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    plugin_obj, meta = catalog._plugins["hooked"]
+    assert "on_pre_tool" in meta.hooks_config
+    assert meta.hooks_config["on_pre_tool"][0]["matcher"] == "Bash"
+    assert meta.hooks_config["on_pre_tool"][0]["command"] == "echo pre"
+
+
+def test_cc_hook_fires_on_translated_tool_name(tmp_path):
+    """A CC PreToolUse(Bash) hook fires when our 'shell' tool runs."""
+    from agent import PluginCatalog
+    from agent.plugins.catalog import PreToolEvent
+
+    plugin_dir = tmp_path / "hooked"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "hooked"}', encoding="utf-8"
+    )
+    (plugin_dir / "hooks").mkdir()
+    out_file = tmp_path / "hook_fired.txt"
+    (plugin_dir / "hooks" / "hooks.json").write_text(
+        '{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": ['
+        '{"type": "command", "command": "echo $TOOL_NAME > ' + str(out_file) + '"}]}]}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    # Fire pre_tool for our `shell` tool — the hook's matcher is "Bash"
+    # (CC name); translation should still let it match.
+    event = PreToolEvent(tool_name="shell", tool_kwargs={"command": "ls"})
+    asyncio.run(catalog.fire_pre_tool(event))
+
+    # Wait a beat for the subprocess write
+    time.sleep(0.2)
+    assert out_file.read_text(encoding="utf-8").strip() == "Bash"
+
+
+def test_cc_ignored_event_emits_no_hooks(tmp_path):
+    """Unsupported CC events (e.g. Notification) are dropped silently."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "ignored-evt"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "ignored-evt"}', encoding="utf-8"
+    )
+    (plugin_dir / "hooks").mkdir()
+    (plugin_dir / "hooks" / "hooks.json").write_text(
+        '{"hooks": {"Notification": [{"hooks": ['
+        '{"type": "command", "command": "echo nope"}]}]}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    plugin_obj, meta = catalog._plugins["ignored-evt"]
+    assert meta.hooks_config == {}
