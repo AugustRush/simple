@@ -281,6 +281,53 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+def _substitute_command_args(body: str, args_text: str) -> str:
+    """Replace ``$ARGUMENTS`` and ``$1`` .. ``$N`` placeholders.
+
+    Mirrors Claude Code's command argument convention.  ``args_text`` is the
+    full string after the command name (preserves quoting); positional
+    ``$1`` etc. use whitespace-split tokens.
+    """
+    if not body:
+        return body
+    out = body.replace("$ARGUMENTS", args_text)
+    tokens = args_text.split()
+    # Replace highest-index first so $10 doesn't get mangled by $1's substitution.
+    for i in range(len(tokens), 0, -1):
+        out = out.replace(f"${i}", tokens[i - 1])
+    return out
+
+
+def _make_markdown_command_handler(
+    *,
+    plugin_name: str,
+    cmd_key: str,
+    body: str,
+    description: str,
+) -> Callable:
+    """Build a slash-command handler that injects the substituted body
+    as the next user input.
+
+    Handlers that return a non-empty string from the CLI dispatch loop are
+    treated as "use this as the next user_input" — the loop then runs a
+    normal turn with that body.  No tools are invoked here; the body itself
+    drives the agent.
+    """
+    async def _handler(raw_cmd: str, components: dict) -> str:
+        # raw_cmd is "cmd_key arg1 arg2" — strip the command prefix.
+        if raw_cmd.startswith(cmd_key):
+            args_text = raw_cmd[len(cmd_key):].lstrip()
+        else:
+            parts = raw_cmd.split(maxsplit=1)
+            args_text = parts[1] if len(parts) > 1 else ""
+        return _substitute_command_args(body, args_text)
+
+    _handler.__plugin_name__ = plugin_name  # type: ignore[attr-defined]
+    _handler.__cmd_key__ = cmd_key  # type: ignore[attr-defined]
+    _handler.__doc__ = description or f"Run /{cmd_key}"
+    return _handler
+
+
 async def _maybe_await_with_timeout(value: Any, timeout_seconds: float) -> Any:
     if timeout_seconds > 0:
         return await asyncio.wait_for(_maybe_await(value), timeout=timeout_seconds)
@@ -346,6 +393,10 @@ class PluginCatalog:
         self._bundled_skills: list[tuple[str, Path]] = []
         # MCP configs bundled by plugins: list of (plugin_name, server_config_dict)
         self._bundled_mcp: list[tuple[str, dict]] = []
+        # Agent definitions discovered from <plugin>/agents/*.md.
+        # Key format: "plugin:<plugin>:<agent>".  Value: dict with keys
+        # ``name``, ``description``, ``body``, ``plugin``, ``path``.
+        self._agent_defs: dict[str, dict[str, Any]] = {}
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
@@ -375,6 +426,7 @@ class PluginCatalog:
         self._slash_commands.clear()
         self._bundled_skills.clear()
         self._bundled_mcp.clear()
+        self._agent_defs.clear()
         _slash_command_owners: dict[str, str] = {}  # cmd_key → owning plugin name
 
         # Auto-create user plugins directory
@@ -518,6 +570,111 @@ class PluginCatalog:
         for mcp_cfg in meta.mcp_servers:
             if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
                 self._bundled_mcp.append((plugin_name, mcp_cfg))
+
+        # Declarative commands and agents (Claude Code / Codex convention).
+        self._load_command_files(plugin_dir, plugin_name, slash_command_owners)
+        self._load_agent_files(plugin_dir, plugin_name)
+
+    # ── Declarative commands / agents (Claude Code convention) ──────────
+
+    def _load_command_files(
+        self,
+        plugin_dir: Path,
+        plugin_name: str,
+        slash_command_owners: dict[str, str],
+    ) -> None:
+        """Register every ``commands/*.md`` as a namespaced slash command.
+
+        The command key is always ``<plugin>:<stem>`` (matches Claude Code's
+        ``/plugin:command`` namespace).  The handler returns a string built
+        from the markdown body with ``$ARGUMENTS`` / ``$1``..``$N`` placeholders
+        substituted; the CLI loop treats a returned string as the next user
+        input, so the agent processes the command body as a turn.
+        """
+        commands_dir = plugin_dir / "commands"
+        if not commands_dir.is_dir():
+            return
+        from agent.skills.catalog import parse_skill_markdown
+
+        for cmd_file in sorted(commands_dir.rglob("*.md")):
+            if cmd_file.name.lower() == "readme.md":
+                continue
+            stem = cmd_file.stem
+            # Strip a ``.prompt`` suffix (Claude Code marketplace convention).
+            if stem.endswith(".prompt"):
+                stem = stem[: -len(".prompt")]
+            cmd_key = f"{plugin_name}:{stem}"
+
+            try:
+                raw = cmd_file.read_text(encoding="utf-8")
+            except Exception as exc:
+                shared.CONSOLE.print(
+                    f"[yellow]Plugin '{plugin_name}': command {cmd_file.name} "
+                    f"unreadable: {exc}[/yellow]"
+                )
+                continue
+            metadata, body = parse_skill_markdown(raw)
+            handler = _make_markdown_command_handler(
+                plugin_name=plugin_name,
+                cmd_key=cmd_key,
+                body=body,
+                description=str(metadata.get("description", "") or ""),
+            )
+
+            if cmd_key in self._slash_commands:
+                existing_owner = slash_command_owners.get(cmd_key, "?")
+                shared.CONSOLE.print(
+                    f"[yellow]Plugin '{plugin_name}': slash command "
+                    f"'/{cmd_key}' conflicts with plugin "
+                    f"'{existing_owner}' — overriding[/yellow]"
+                )
+            self._slash_commands[cmd_key] = handler
+            slash_command_owners[cmd_key] = plugin_name
+
+    def _load_agent_files(self, plugin_dir: Path, plugin_name: str) -> None:
+        """Register every ``agents/*.md`` as a named role for spawn_agent.
+
+        The role identifier is ``plugin:<plugin>:<agent>``; the body of the
+        markdown is used as ``system_suffix`` when spawn_agent dispatches.
+        """
+        agents_dir = plugin_dir / "agents"
+        if not agents_dir.is_dir():
+            return
+        from agent.skills.catalog import parse_skill_markdown
+
+        for agent_file in sorted(agents_dir.rglob("*.md")):
+            if agent_file.name.lower() == "readme.md":
+                continue
+            stem = agent_file.stem
+            try:
+                raw = agent_file.read_text(encoding="utf-8")
+            except Exception as exc:
+                shared.CONSOLE.print(
+                    f"[yellow]Plugin '{plugin_name}': agent {agent_file.name} "
+                    f"unreadable: {exc}[/yellow]"
+                )
+                continue
+            metadata, body = parse_skill_markdown(raw)
+            key = f"plugin:{plugin_name}:{stem}"
+            self._agent_defs[key] = {
+                "plugin": plugin_name,
+                "name": str(metadata.get("name", "") or stem),
+                "description": str(metadata.get("description", "") or ""),
+                "body": body,
+                "path": agent_file,
+            }
+
+    def get_agent_definition(self, ref: str) -> Optional[dict]:
+        """Lookup an agent definition by ``plugin:<plugin>:<agent>`` key.
+
+        Returns ``None`` if the ref does not match a declared agent.  Used by
+        BaseAgent._execute_agent when the requested role names a plugin agent.
+        """
+        return self._agent_defs.get(ref)
+
+    def list_agent_definitions(self) -> list[dict[str, Any]]:
+        """Snapshot of all registered agent definitions (for /agents listing)."""
+        return [dict(value, key=key) for key, value in self._agent_defs.items()]
 
     def get_bundled_skills(self) -> list[tuple[str, Path]]:
         """Return list of (plugin_name, skills_root_path) for bundled skills."""

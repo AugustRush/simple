@@ -695,8 +695,15 @@ async def _interactive_loop(components: dict, cfg: dict):
                         matched_plugin_key = _key
                         break
                 if matched_plugin_key is not None:
-                    await plugin_cmds[matched_plugin_key](raw_cmd, components)
-                    continue
+                    _cmd_result = await plugin_cmds[matched_plugin_key](raw_cmd, components)
+                    if isinstance(_cmd_result, str) and _cmd_result.strip():
+                        # Markdown command body — feed as next user input so
+                        # the agent runs a normal turn with the substituted
+                        # body. No `continue` here; we fall through to the
+                        # turn dispatch below.
+                        user_input = _cmd_result
+                    else:
+                        continue
                 elif cmd == "tools":
                     _tool_list = components["registry"].list_tools()
                     _tools_table = Table(title="Available Tools")

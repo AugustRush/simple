@@ -2446,6 +2446,19 @@ class BaseAgent:
         """
         normalized_scope = [str(item) for item in (write_scope or []) if str(item).strip()]
         normalized_output_contract = self._normalize_output_contract(output_contract)
+        # If the role names a plugin-declared agent (``plugin:<P>:<A>``),
+        # prepend its markdown body to system_suffix so the sub-agent inherits
+        # the plugin author's role definition.
+        if role.startswith("plugin:") and self.plugin_catalog is not None:
+            defn = self.plugin_catalog.get_agent_definition(role)
+            if defn is not None:
+                agent_body = str(defn.get("body", "")).strip()
+                if agent_body:
+                    system_suffix = (
+                        f"{agent_body}\n\n{system_suffix}".strip()
+                        if system_suffix
+                        else agent_body
+                    )
         shaped_task = self._with_output_contract(
             task,
             expected_output,

@@ -1228,3 +1228,76 @@ def test_discover_accepts_mcpServers_camelcase(tmp_path):
     assert bundled[0][0] == "mcp-plugin"
     assert bundled[0][1]["name"] == "my-server"
     assert bundled[0][1]["command"] == "/bin/echo"
+
+
+def test_commands_md_registered_as_slash_command(tmp_path):
+    """commands/<name>.md becomes a namespaced slash command."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "git-helper"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "git-helper"}', encoding="utf-8"
+    )
+    cmd_dir = plugin_dir / "commands"
+    cmd_dir.mkdir()
+    (cmd_dir / "cherry-pick-to.prompt.md").write_text(
+        '---\ndescription: cherry-pick to target\n---\n'
+        'Cherry-pick the latest commit to $1 (full args: $ARGUMENTS).',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    cmds = catalog.get_slash_commands()
+    assert "git-helper:cherry-pick-to" in cmds
+
+
+def test_commands_md_handler_substitutes_arguments(tmp_path):
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "git-helper"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "git-helper"}', encoding="utf-8"
+    )
+    cmd_dir = plugin_dir / "commands"
+    cmd_dir.mkdir()
+    (cmd_dir / "ck.md").write_text(
+        "Branch: $1; All: $ARGUMENTS", encoding="utf-8"
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+    handler = catalog.get_slash_commands()["git-helper:ck"]
+
+    result = asyncio.run(handler("git-helper:ck develop alpha", {}))
+    assert "Branch: develop" in result
+    assert "All: develop alpha" in result
+
+
+def test_agents_md_registered_under_namespaced_role(tmp_path):
+    """agents/<name>.md becomes a plugin:<P>:<A> role definition."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "researcher-pack"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "researcher-pack"}', encoding="utf-8"
+    )
+    ag_dir = plugin_dir / "agents"
+    ag_dir.mkdir()
+    (ag_dir / "deep-research.md").write_text(
+        '---\nname: deep-research\ndescription: Multi-step research agent\n---\n'
+        'You are a methodical researcher.',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    defn = catalog.get_agent_definition("plugin:researcher-pack:deep-research")
+    assert defn is not None
+    assert defn["name"] == "deep-research"
+    assert "methodical researcher" in defn["body"]
