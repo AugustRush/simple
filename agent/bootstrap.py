@@ -387,6 +387,12 @@ async def _build_components_async(cfg: dict):
     }
     components["turn_runner"] = TurnRunner(components)
     components["agent_core"] = AgentCore(components)
+    # Stash references so builtin tools (install_plugin / uninstall_plugin /
+    # list_installed_plugins) can trigger hot-reload through the registry
+    # context.  Same dict so reload sees subsequent updates in place.
+    registry.set_context("plugin_catalog", plugin_catalog)
+    registry.set_context("components", components)
+    registry.set_context("mcp_client", mcp_client)
     if mcp_client is not None and mcp_server_configs:
         components["mcp_task"] = asyncio.create_task(
             _connect_mcp_in_background(

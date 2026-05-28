@@ -1380,3 +1380,91 @@ def test_cc_ignored_event_emits_no_hooks(tmp_path):
 
     plugin_obj, meta = catalog._plugins["ignored-evt"]
     assert meta.hooks_config == {}
+
+
+def test_reload_picks_up_new_plugin_on_disk(tmp_path):
+    """A plugin dropped on disk after startup appears after reload()."""
+    from agent import PluginCatalog
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    assert catalog.discover_and_load() == []
+
+    # Drop a plugin in after initial load.
+    plugin_dir = tmp_path / "new-comer"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "new-comer"}', encoding="utf-8"
+    )
+
+    components = {}  # no skill_catalog/mcp_client wired — reload still works
+    result = asyncio.run(catalog.reload(components))
+
+    assert result["ok"] is True
+    assert "new-comer" in result["added_plugins"]
+    assert "new-comer" in catalog._plugins
+
+
+def test_reload_drops_removed_plugin(tmp_path):
+    """A plugin directory removed from disk drops out of the catalog on reload."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "transient"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "transient"}', encoding="utf-8"
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+    assert "transient" in catalog._plugins
+
+    # Remove the plugin directory and reload.
+    import shutil
+    shutil.rmtree(plugin_dir)
+    result = asyncio.run(catalog.reload({}))
+
+    assert "transient" in result["removed_plugins"]
+    assert "transient" not in catalog._plugins
+
+
+def test_install_plugin_from_local_path_and_reload(tmp_path, monkeypatch):
+    """End-to-end: install_plugin tool copies a local plugin and hot-reloads."""
+    from agent import PluginCatalog
+    from agent import shared as _shared
+    from agent.tools.runtime import ToolRegistry
+    from agent.tools.builtin_tools import BuiltinTools
+
+    # Redirect USER_PLUGINS_DIR to tmp_path/installed.
+    user_plugins = tmp_path / "installed"
+    monkeypatch.setattr(_shared, "USER_PLUGINS_DIR", user_plugins)
+
+    # Source plugin lives in tmp_path/sources.
+    src = tmp_path / "sources" / "sample-plugin"
+    (src / ".claude-plugin").mkdir(parents=True)
+    (src / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "sample-plugin", "description": "demo"}', encoding="utf-8"
+    )
+
+    # Build registry + tool + catalog wired together.
+    registry = ToolRegistry()
+    BuiltinTools(memory=None, registry=registry)
+    catalog = PluginCatalog(builtin_dir=tmp_path / "empty", user_dir=user_plugins)
+    catalog.discover_and_load()
+    components = {"plugin_catalog": catalog}
+    registry.set_context("plugin_catalog", catalog)
+    registry.set_context("components", components)
+
+    # Install via the tool.
+    result_json = asyncio.run(
+        registry.call(
+            "install_plugin",
+            {"source": str(src), "intent": "install demo plugin for test"},
+        )
+    )
+    import json as _json
+    result = _json.loads(result_json)
+
+    assert result["ok"] is True
+    assert (user_plugins / "sample-plugin").is_dir()
+    assert "sample-plugin" in result["reload"]["added_plugins"]
+    assert "sample-plugin" in catalog._plugins

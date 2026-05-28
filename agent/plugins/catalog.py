@@ -776,6 +776,99 @@ class PluginCatalog:
         """Snapshot of all registered agent definitions (for /agents listing)."""
         return [dict(value, key=key) for key, value in self._agent_defs.items()]
 
+    # ── Hot reload ───────────────────────────────────────────────────────
+
+    async def reload(self, components: dict) -> dict:
+        """Re-scan plugin directories and apply diffs in place.
+
+        Re-imports Python plugins (sys.modules cache cleared), re-registers
+        all slash commands, agent definitions, and bundled assets, and adds
+        any newly-declared MCP servers to the running ``mcp_client``.
+
+        Limitations (v1):
+        - Cannot disconnect an MCP stdio process for a removed plugin —
+          its tools are unregistered from the ToolRegistry so the model
+          no longer sees them, but the subprocess stays alive until the
+          agent shuts down.
+        - Plugin ``on_session_end`` hooks are NOT fired on eviction; reload
+          is a developer-facing notification, not a clean shutdown.
+
+        Returns a summary dict suitable for surfacing to the user.
+        """
+        # Snapshot pre-reload state.
+        old_plugin_names = set(self._plugins.keys())
+        old_mcp = {
+            (pname, cfg.get("name", "?"))
+            for pname, cfg in self._bundled_mcp
+        }
+        # Drop sys.modules entries so re-imported Python plugins pick up
+        # any code changes on disk.  Safe to drop for plugins that were
+        # never python-only (no-op).
+        for name in old_plugin_names:
+            sys.modules.pop(f"_agent_plugin_{name}", None)
+
+        # Re-discover.  This clears all internal state and rebuilds it.
+        loaded = self.discover_and_load()
+        new_plugin_names = set(loaded)
+        added = new_plugin_names - old_plugin_names
+        removed = old_plugin_names - new_plugin_names
+
+        # Reload skill catalog: clear and rewalk both user/builtin trees,
+        # then re-attach every plugin's bundled skills root.
+        skill_catalog = components.get("skill_catalog")
+        if skill_catalog is not None:
+            try:
+                skill_catalog.load_all()
+                for pname, sroot in self._bundled_skills:
+                    skill_catalog._load_root(sroot, source=f"plugin:{pname}")
+                if hasattr(skill_catalog, "_rebuild_aliases"):
+                    skill_catalog._rebuild_aliases()
+                # Mark dirty so the next turn rebuilds the system prompt.
+                if hasattr(skill_catalog, "_prompt_generation"):
+                    skill_catalog._prompt_generation += 1
+            except Exception as exc:
+                shared.CONSOLE.print(
+                    f"[yellow]Plugin reload: skill catalog refresh failed: {exc}[/yellow]"
+                )
+
+        # MCP: connect newly-declared servers; unregister tools belonging
+        # to plugins that were removed.  We cannot kill the stdio process
+        # for the latter — see the docstring limitation.
+        mcp_client = components.get("mcp_client")
+        registry = components.get("registry")
+        new_mcp_servers: list[dict] = [
+            cfg for pname, cfg in self._bundled_mcp
+            if (pname, cfg.get("name", "?")) not in old_mcp
+        ]
+        connected_mcp_names: list[str] = []
+        if new_mcp_servers and mcp_client is not None:
+            try:
+                await mcp_client.connect_from_config(
+                    {"mcp_servers": new_mcp_servers}
+                )
+                connected_mcp_names = [
+                    str(c.get("name", "?")) for c in new_mcp_servers
+                ]
+            except Exception as exc:
+                shared.CONSOLE.print(
+                    f"[yellow]Plugin reload: MCP connect failed: {exc}[/yellow]"
+                )
+        if removed and registry is not None:
+            # Unregister tools whose source prefix matches removed plugins'
+            # bundled MCP server names.  Best-effort: requires us to have
+            # tracked the (plugin → server name) mapping before clearing.
+            for pname, server_name in old_mcp:
+                if pname in removed and hasattr(registry, "unregister_by_source_prefix"):
+                    registry.unregister_by_source_prefix(f"mcp:{server_name}")
+
+        return {
+            "ok": True,
+            "added_plugins": sorted(added),
+            "removed_plugins": sorted(removed),
+            "newly_connected_mcp": connected_mcp_names,
+            "total_loaded": len(loaded),
+        }
+
     def get_bundled_skills(self) -> list[tuple[str, Path]]:
         """Return list of (plugin_name, skills_root_path) for bundled skills."""
         return list(self._bundled_skills)

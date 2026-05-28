@@ -600,6 +600,218 @@ class BuiltinTools:
             source="builtin",
         )
 
+        r.register(
+            "install_plugin",
+            (
+                "Install a plugin from a git URL or local path into ~/.agent/plugins/<name>/. "
+                "Supports Claude Code / Codex layouts (with .claude-plugin/plugin.json) and "
+                "marketplaces (a repo with .claude-plugin/marketplace.json listing multiple "
+                "plugins).  Hot-reloads after install so the plugin's skills, commands, agents, "
+                "MCP servers and hooks become available immediately without restart."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Git URL (https://, git@) or absolute local path.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional target directory name. Default: derived from source.",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "Required. Why this plugin is being installed.",
+                    },
+                },
+                "required": ["source", "intent"],
+            },
+            self._install_plugin,
+            source="builtin",
+            capabilities=("state_write", "requires_intent"),
+        )
+
+        r.register(
+            "uninstall_plugin",
+            (
+                "Remove a user-installed plugin directory and hot-reload the catalog. "
+                "Note: MCP server subprocesses connected by the plugin remain running until "
+                "the next agent restart; only their tool registrations are dropped."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Plugin directory name under ~/.agent/plugins/.",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "Required. Why this plugin is being removed.",
+                    },
+                },
+                "required": ["name", "intent"],
+            },
+            self._uninstall_plugin,
+            source="builtin",
+            capabilities=("state_write", "requires_intent"),
+        )
+
+        r.register(
+            "list_installed_plugins",
+            (
+                "List all plugins installed under ~/.agent/plugins/ and which are currently "
+                "loaded.  Use to verify install state or inspect available extensions."
+            ),
+            {"type": "object", "properties": {}, "required": []},
+            self._list_installed_plugins,
+            source="builtin",
+        )
+
+    # ── Plugin install / uninstall implementations ────────────────────────
+
+    async def _install_plugin(
+        self, source: str, intent: str = "", name: str = ""
+    ) -> dict:
+        import re as _re
+        import shutil
+        import urllib.parse as _urlparse
+
+        if not source.strip():
+            return {"ok": False, "error": "source is required"}
+
+        user_plugins_dir = shared.USER_PLUGINS_DIR
+        user_plugins_dir.mkdir(parents=True, exist_ok=True)
+
+        # Derive name from URL or path when not provided.
+        if not name.strip():
+            raw = source.rstrip("/")
+            if raw.endswith(".git"):
+                raw = raw[:-4]
+            # Take the last URL/path segment as the slug.
+            slug = _urlparse.urlparse(raw).path.rsplit("/", 1)[-1] if "://" in raw else Path(raw).name
+            slug = slug or "plugin"
+            name = _re.sub(r"[^a-zA-Z0-9_-]", "-", slug).strip("-") or "plugin"
+
+        target = user_plugins_dir / name
+        if target.exists():
+            return {
+                "ok": False,
+                "error": f"plugin '{name}' already exists at {target}",
+                "recovery_hint": "use uninstall_plugin first if you want to replace it",
+            }
+
+        is_url = source.startswith(("http://", "https://", "git@", "git://"))
+        if is_url:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "clone", "--depth", "1", source, str(target),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                return {
+                    "ok": False,
+                    "error": f"git clone failed: {stderr.decode(errors='replace').strip()}",
+                }
+        else:
+            src_path = Path(source).expanduser().resolve()
+            if not src_path.is_dir():
+                return {"ok": False, "error": f"source path not found: {source}"}
+            try:
+                shutil.copytree(src_path, target)
+            except Exception as exc:
+                return {"ok": False, "error": f"copy failed: {exc}"}
+
+        # Hot-reload the catalog so the new plugin's assets are live.
+        reload_result = await self._reload_plugins()
+        return {
+            "ok": True,
+            "installed_at": str(target),
+            "name": name,
+            "reload": reload_result,
+            "summary_text": (
+                f"Installed plugin '{name}' from {source}. "
+                f"Added: {', '.join(reload_result.get('added_plugins', [])) or 'none'}; "
+                f"connected MCP: {', '.join(reload_result.get('newly_connected_mcp', [])) or 'none'}."
+            ),
+        }
+
+    async def _uninstall_plugin(self, name: str, intent: str = "") -> dict:
+        import shutil
+
+        if not name.strip():
+            return {"ok": False, "error": "name is required"}
+
+        target = (shared.USER_PLUGINS_DIR / name).resolve()
+        # Guard: only allow removal inside the user plugins directory.
+        if shared.USER_PLUGINS_DIR.resolve() not in target.parents:
+            return {
+                "ok": False,
+                "error": "refusing to remove paths outside USER_PLUGINS_DIR",
+            }
+        if not target.is_dir():
+            return {"ok": False, "error": f"plugin '{name}' not found at {target}"}
+
+        try:
+            shutil.rmtree(target)
+        except Exception as exc:
+            return {"ok": False, "error": f"rmtree failed: {exc}"}
+
+        reload_result = await self._reload_plugins()
+        return {
+            "ok": True,
+            "removed_from": str(target),
+            "reload": reload_result,
+            "summary_text": (
+                f"Uninstalled plugin '{name}'. "
+                f"Removed: {', '.join(reload_result.get('removed_plugins', [])) or 'none'}."
+            ),
+        }
+
+    def _list_installed_plugins(self) -> dict:
+        plugin_catalog = self.registry.get_context("plugin_catalog")
+        loaded_names: set[str] = set()
+        if plugin_catalog is not None and hasattr(plugin_catalog, "list_plugins"):
+            try:
+                loaded_names = {
+                    getattr(p, "name", "") for p in plugin_catalog.list_plugins()
+                }
+            except Exception:
+                loaded_names = set()
+
+        on_disk: list[dict] = []
+        if shared.USER_PLUGINS_DIR.is_dir():
+            for entry in sorted(shared.USER_PLUGINS_DIR.iterdir()):
+                if not entry.is_dir():
+                    continue
+                on_disk.append({
+                    "name": entry.name,
+                    "path": str(entry),
+                    "loaded": entry.name in loaded_names,
+                })
+        return {
+            "ok": True,
+            "user_plugins_dir": str(shared.USER_PLUGINS_DIR),
+            "plugins": on_disk,
+            "loaded_count": len(loaded_names),
+        }
+
+    async def _reload_plugins(self) -> dict:
+        """Trigger PluginCatalog.reload using the components dict stashed on the registry context."""
+        plugin_catalog = self.registry.get_context("plugin_catalog")
+        components = self.registry.get_context("components")
+        if plugin_catalog is None or components is None:
+            return {
+                "ok": False,
+                "error": "plugin_catalog/components not wired into registry context",
+            }
+        try:
+            return await plugin_catalog.reload(components)
+        except Exception as exc:
+            return {"ok": False, "error": f"reload failed: {exc}"}
+
     # ── Web tools ──────────────────────────────────────────────────────────────
 
     @staticmethod
