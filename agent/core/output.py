@@ -92,6 +92,31 @@ class OutputSink(ABC):
     def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
         """Display structured multi-agent progress."""
 
+    def on_heartbeat(
+        self,
+        *,
+        elapsed_seconds: float,
+        current_op: str,
+        op_detail: str = "",
+        pending_messages: int = 0,
+    ) -> None:
+        """Periodic 'agent is alive' tick during long-running operations.
+
+        Fired every few seconds by the per-turn heartbeat coroutine while
+        any LLM call, tool, or sub-agent batch is in flight.  Sinks that
+        support live UI (Feishu cards, future TUI) override this to keep
+        the user informed that the agent is working — not stuck.
+
+        Default is a no-op so non-live sinks (file logs, CLI prints)
+        ignore the tick.
+
+        Args:
+            elapsed_seconds: time since the current op started
+            current_op: short label like "shell", "LLM", "sub-agent batch"
+            op_detail: secondary info ("git clone https://...", "3/5 done")
+            pending_messages: count of un-drained mailbox entries (0 = empty)
+        """
+
     def on_notification(self, title: str, body: str, *, level: str = "info") -> None:
         """Called for proactive notifications (reminders, summaries) not tied to a user turn.
 

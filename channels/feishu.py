@@ -404,6 +404,44 @@ class FeishuOutputSink(OutputSink):
             self._progress_flush_pending = True
             self._schedule(self._flush_progress_async(), label="flush_progress")
 
+    def on_heartbeat(
+        self,
+        *,
+        elapsed_seconds: float,
+        current_op: str,
+        op_detail: str = "",
+        pending_messages: int = 0,
+    ) -> None:
+        """Per-turn alive-tick — patch the card so the user sees agent is working.
+
+        Renders as a single line in the streaming card's progress section,
+        always under the fixed key ``__heartbeat__`` so it updates in place
+        rather than accumulating.  Colour indicator escalates with elapsed
+        time (🟢/🟡/🔴) so a long wait is visually obvious.
+        """
+        if not self.streaming or self._progress_fail_count >= 3:
+            return
+        if elapsed_seconds < 30:
+            mark = "🟢"
+        elif elapsed_seconds < 90:
+            mark = "🟡"
+        else:
+            mark = "🔴"
+        secs = int(elapsed_seconds)
+        if secs >= 60:
+            elapsed_str = f"{secs // 60}m {secs % 60}s"
+        else:
+            elapsed_str = f"{secs}s"
+        line = f"{mark} {elapsed_str} — {current_op}"
+        if op_detail:
+            line += f" · {op_detail[:80]}"
+        if pending_messages:
+            line += f" · 📬 {pending_messages} 待处理"
+        self._tool_progress_lines["__heartbeat__"] = line
+        if not self._progress_flush_pending:
+            self._progress_flush_pending = True
+            self._schedule(self._flush_progress_async(), label="flush_progress")
+
     # Reasons that indicate an internal recoverable block — the LLM will
     # retry on its own; no user-visible card needed.
     _SILENT_BLOCK_REASONS = ("Intent required", "Intent declaration too vague")

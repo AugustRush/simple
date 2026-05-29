@@ -1723,3 +1723,17 @@ def test_inject_skips_blank_text_entries():
     assert "real msg" in ctx.messages[0]["content"]
     # Blank entry produces no block
     assert ctx.messages[0]["content"].count("<user_interjection") == 1
+
+
+
+def test_heartbeat_sink_default_is_no_op():
+    """OutputSink base class on_heartbeat must be a no-op so non-live
+    sinks don't crash when send_message ticks."""
+    from agent.core.output import OutputSink
+
+    sink = OutputSink()
+    # Must not raise.
+    sink.on_heartbeat(
+        elapsed_seconds=12.5, current_op="LLM",
+        op_detail="opus", pending_messages=0,
+    )

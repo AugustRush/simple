@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import contextvars
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -1936,6 +1937,16 @@ class BaseAgent:
         tool_result_history: list[tuple[str, str]] = []
         result_text = ""
         watchdog = self._new_watchdog_state()
+        # Per-turn heartbeat state — updated as we move between LLM calls,
+        # tool batches, and sub-agent dispatch.  A background task reads
+        # this every few seconds and fires sink.on_heartbeat so live UIs
+        # (Feishu cards) can show "agent is alive, elapsed N seconds on X".
+        heartbeat_state: dict[str, Any] = {
+            "op": "starting",
+            "detail": "",
+            "started_at": time.monotonic(),
+            "active": True,
+        }
         content_filter_recovered_response: Any | None = None
         content_filter_submitted_tool_uses: list[dict] | None = None
         content_filter_submitted_results: list[str] | None = None
@@ -1972,6 +1983,40 @@ class BaseAgent:
 
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
+        # Start the per-turn heartbeat task here so it sees the active sink.
+        from agent.core.output import _active_sink as _hb_sink_var
+        _hb_interval = 5.0
+
+        async def _heartbeat_tick() -> None:
+            while heartbeat_state["active"]:
+                try:
+                    await asyncio.sleep(_hb_interval)
+                except asyncio.CancelledError:
+                    return
+                if not heartbeat_state["active"]:
+                    return
+                sink = _hb_sink_var.get()
+                if sink is None:
+                    continue
+                fn = getattr(sink, "on_heartbeat", None)
+                if not callable(fn):
+                    continue
+                elapsed = max(0.0, time.monotonic() - float(heartbeat_state["started_at"]))
+                # Don't tick for super-fast ops — most LLM calls finish in <5s
+                # and the first tick would land right as we're handing back.
+                if elapsed < _hb_interval - 0.5:
+                    continue
+                pending = ctx.metadata.get("pending_messages") or []
+                with shared._suppress_with_log("sink.on_heartbeat raised"):
+                    fn(
+                        elapsed_seconds=elapsed,
+                        current_op=str(heartbeat_state["op"]),
+                        op_detail=str(heartbeat_state["detail"]),
+                        pending_messages=len(pending),
+                    )
+
+        _heartbeat_task = asyncio.create_task(_heartbeat_tick())
+
         try:
             orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
 
@@ -2036,6 +2081,9 @@ class BaseAgent:
 
                 try:
                     response_started_at = time.perf_counter()
+                    heartbeat_state["op"] = "LLM"
+                    heartbeat_state["detail"] = self.model
+                    heartbeat_state["started_at"] = time.monotonic()
                     if content_filter_recovered_response is not None:
                         response = content_filter_recovered_response
                         content_filter_recovered_response = None
@@ -2109,6 +2157,11 @@ class BaseAgent:
                         )
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
                         tool_use_started_at = time.perf_counter()
+                        heartbeat_state["op"] = "tools"
+                        heartbeat_state["detail"] = ", ".join(
+                            tu["name"] for tu in tool_uses[:3]
+                        ) + (f" +{len(tool_uses) - 3}" if len(tool_uses) > 3 else "")
+                        heartbeat_state["started_at"] = time.monotonic()
                         try:
                             results = await self._run_tool_uses(
                                 tool_uses,
@@ -2270,6 +2323,10 @@ class BaseAgent:
         finally:
             _active_agent_context.reset(_active_ctx_token)
             shared._active_cancel_token.reset(_cancel_token_token)
+            heartbeat_state["active"] = False
+            _heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await _heartbeat_task
             _interaction_log(
                 "turn_finished",
                 agent_id=ctx.agent_id,
