@@ -1151,11 +1151,21 @@ class BuiltinTools:
                     sandbox_dir=sandbox_dir,
                 )
                 extra: dict[str, Any] = {}
+                # Lift the recovery summary into the error string so the LLM
+                # sees the actionable guidance immediately, not buried inside
+                # a nested dict.  The structured dict stays in `recovery_hint`
+                # for callers that want the full detail.
+                error_message = f"Shell command requires confirmation: {safety.reason}"
                 if recovery_hint is not None:
                     extra["recoverable_by_agent"] = True
                     extra["recovery_hint"] = recovery_hint
+                    hint_summary = str(recovery_hint.get("summary", "") or "").strip()
+                    if hint_summary:
+                        error_message = (
+                            f"{error_message}. RECOVERY: {hint_summary}"
+                        )
                 return self._error(
-                    f"Shell command requires confirmation: {safety.reason}",
+                    error_message,
                     command=command,
                     risk_level=safety.risk_level,
                     requires_confirmation=True,

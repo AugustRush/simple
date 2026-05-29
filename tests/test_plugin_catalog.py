@@ -1553,3 +1553,55 @@ def test_evolution_plugin_survives_reload(tmp_path, monkeypatch):
     assert hasattr(plugin_obj, "compose_system_prompt")
     suffix = plugin_obj.compose_system_prompt("base prompt")
     assert isinstance(suffix, str)
+
+
+
+def test_recoverable_by_agent_not_flagged_unproductive():
+    """A tool that signals recoverable_by_agent: true must not count as
+    unproductive — otherwise watchdog fires after 3-4 retries instead of
+    letting the LLM read the recovery_hint and adjust."""
+    import json as _json
+    from agent.core.agent import BaseAgent
+
+    result_with_recoverable = _json.dumps({
+        "ok": False,
+        "error": "Shell command requires confirmation: ...",
+        "requires_confirmation": True,
+        "recoverable_by_agent": True,
+        "recovery_hint": {"summary": "use cwd + relative path"},
+    })
+    assert BaseAgent._tool_result_looks_unproductive(result_with_recoverable) is False
+
+    # Same payload WITHOUT recovery signals is still unproductive (regression
+    # guard — we are not turning every ok:false into productive).
+    plain_error = _json.dumps({"ok": False, "error": "truly failed"})
+    assert BaseAgent._tool_result_looks_unproductive(plain_error) is True
+
+
+def test_recovery_hint_appears_in_error_message_for_shell_confirmation(tmp_path):
+    """The shell tool lifts recovery_hint.summary into the error string so
+    the LLM sees the actionable guidance immediately, not just in a nested
+    JSON field."""
+    import json as _json
+    from agent.tools.runtime import ToolRegistry
+    from agent.tools.builtin_tools import BuiltinTools
+
+    registry = ToolRegistry()
+    BuiltinTools(memory=None, registry=registry, workspace_root=tmp_path)
+
+    # Force the absolute-path-outside branch.
+    result_json = asyncio.run(
+        registry.call(
+            "shell",
+            {
+                "command": "ls /tmp/some-external-path/file",
+                "intent": "list a file outside the workspace for verification",
+            },
+        )
+    )
+    payload = _json.loads(result_json)
+    assert payload["ok"] is False
+    assert payload.get("recoverable_by_agent") is True
+    # The hint summary should be in the error string, not only nested.
+    assert "RECOVERY:" in payload["error"]
+    assert "safe cwd" in payload["error"] or "relative" in payload["error"]

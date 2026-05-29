@@ -1411,6 +1411,19 @@ class BaseAgent:
             )
         if not isinstance(payload, dict):
             return False
+        # First-principles: a tool that explicitly signals "this is a soft
+        # error and you can recover" (via `recoverable_by_agent: true` or by
+        # attaching a non-empty `recovery_hint`) is NOT an unproductive result
+        # — the tool author has guaranteed the agent has enough information
+        # to adjust.  Treating those as failures collapses the entire grace
+        # the recovery_hint protocol is meant to provide and trips the
+        # watchdog after only 3-4 honest retries.
+        # `same_pair` (literally identical input + result) still catches the
+        # case where the agent ignores the hint and repeats verbatim.
+        if payload.get("recoverable_by_agent") is True:
+            return False
+        if payload.get("recovery_hint"):
+            return False
         if payload.get("requires_confirmation") is True:
             return True
         if payload.get("blocked") is True:
