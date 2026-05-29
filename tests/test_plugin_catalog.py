@@ -1468,3 +1468,88 @@ def test_install_plugin_from_local_path_and_reload(tmp_path, monkeypatch):
     assert (user_plugins / "sample-plugin").is_dir()
     assert "sample-plugin" in result["reload"]["added_plugins"]
     assert "sample-plugin" in catalog._plugins
+
+
+
+def test_reload_marks_skill_catalog_dirty(tmp_path):
+    """After reload, next turn must rebuild prompt — verify _dirty is set."""
+    from agent import PluginCatalog
+
+    class _FakeSkillCatalog:
+        def __init__(self):
+            self._dirty = False
+            self._prompt_generation = 0
+        def load_all(self):
+            pass
+        def _load_root(self, *a, **k):
+            pass
+        def _rebuild_aliases(self):
+            pass
+
+    plugin_dir = tmp_path / "dummy"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "dummy"}', encoding="utf-8"
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    fake = _FakeSkillCatalog()
+    asyncio.run(catalog.reload({"skill_catalog": fake}))
+
+    assert fake._dirty is True, "consume_dirty() gate won't fire next turn"
+    assert fake._prompt_generation > 0
+
+
+def test_reload_fires_on_session_start_for_reinstantiated_plugins(tmp_path):
+    """After reload, on_session_start must fire on freshly-imported plugins."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "lifecycle"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.json").write_text(
+        '{"name": "lifecycle"}', encoding="utf-8"
+    )
+    (plugin_dir / "__init__.py").write_text(textwrap.dedent("""
+        class P:
+            name = "lifecycle"
+            session_start_calls = 0
+            def on_session_start(self, components):
+                P.session_start_calls += 1
+        def register():
+            return P()
+    """), encoding="utf-8")
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+    catalog.fire_session_start({})
+
+    plugin_obj, _ = catalog._plugins["lifecycle"]
+    type_before = type(plugin_obj)
+    assert type_before.session_start_calls == 1
+
+    asyncio.run(catalog.reload({}))
+
+    new_plugin_obj, _ = catalog._plugins["lifecycle"]
+    assert new_plugin_obj is not plugin_obj
+    assert type(new_plugin_obj).session_start_calls >= 1
+
+
+def test_evolution_plugin_survives_reload(tmp_path, monkeypatch):
+    """Bundled evolution plugin still functional after a no-op reload."""
+    from agent import PluginCatalog
+    import agent.shared as _shared
+
+    monkeypatch.setattr(_shared, "USER_PLUGINS_DIR", tmp_path / "user")
+
+    catalog = PluginCatalog(
+        builtin_dir=_shared.PLUGINS_DIR, user_dir=tmp_path / "user"
+    )
+    catalog.discover_and_load()
+    assert "evolution" in catalog._plugins
+
+    asyncio.run(catalog.reload({}))
+    assert "evolution" in catalog._plugins
+    plugin_obj, _ = catalog._plugins["evolution"]
+
+    assert hasattr(plugin_obj, "compose_system_prompt")
+    suffix = plugin_obj.compose_system_prompt("base prompt")
+    assert isinstance(suffix, str)

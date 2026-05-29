@@ -823,7 +823,11 @@ class PluginCatalog:
                     skill_catalog._load_root(sroot, source=f"plugin:{pname}")
                 if hasattr(skill_catalog, "_rebuild_aliases"):
                     skill_catalog._rebuild_aliases()
-                # Mark dirty so the next turn rebuilds the system prompt.
+                # Mark dirty AND bump generation so the next turn's
+                # _refresh_skill_prompt_if_needed actually rebuilds — the
+                # consume_dirty() gate checks _dirty, not the generation
+                # counter, so we must set both.
+                skill_catalog._dirty = True
                 if hasattr(skill_catalog, "_prompt_generation"):
                     skill_catalog._prompt_generation += 1
             except Exception as exc:
@@ -860,6 +864,13 @@ class PluginCatalog:
             for pname, server_name in old_mcp:
                 if pname in removed and hasattr(registry, "unregister_by_source_prefix"):
                     registry.unregister_by_source_prefix(f"mcp:{server_name}")
+
+        # Re-fire on_session_start for every plugin: discover_and_load
+        # re-instantiates them all (via fresh sys.modules import + register()),
+        # so even pre-existing plugins received a new object that has never
+        # seen the session-start signal.  Without this, e.g. the evolution
+        # plugin's engine reference would be None until next restart.
+        self.fire_session_start(components)
 
         return {
             "ok": True,
