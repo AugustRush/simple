@@ -1664,3 +1664,62 @@ def test_cancel_token_late_registration_fires_immediately():
     token.register_cleanup("late", lambda level: fired.append(level))
 
     assert fired == ["force"]
+
+
+
+# ─── Interjection mailbox ────────────────────────────────────────────────────
+
+
+def test_inject_pending_interjections_drains_and_clears_in_place():
+    """Mailbox entries become a user_interjection block; original list is
+    cleared in place so the channel handler's next append starts fresh."""
+    import time as _t
+    from agent.core.agent import BaseAgent, AgentContext
+
+    ctx = AgentContext(system_prompt="sys")
+    pending = [
+        {"text": "actually use ssh", "from_user": "alice",
+         "arrived_at": _t.time(), "urgency": "normal"},
+        {"text": "wait, change dir", "from_user": "alice",
+         "arrived_at": _t.time(), "urgency": "now"},
+    ]
+
+    BaseAgent._inject_pending_interjections(ctx, pending)
+
+    assert pending == []  # cleared in place
+    assert len(ctx.messages) == 1
+    msg = ctx.messages[0]
+    assert msg["role"] == "user"
+    body = msg["content"]
+    assert "<user_interjection" in body
+    assert "actually use ssh" in body
+    assert "wait, change dir" in body
+    assert 'urgency="now"' in body
+    assert 'urgency="normal"' in body
+    # Instruction footer present so LLM knows what to do.
+    assert "acknowledge" in body.lower() or "continue" in body.lower()
+
+
+def test_inject_pending_interjections_skips_empty_mailbox():
+    """No mailbox entries → no message appended."""
+    from agent.core.agent import BaseAgent, AgentContext
+
+    ctx = AgentContext(system_prompt="sys")
+    BaseAgent._inject_pending_interjections(ctx, [])
+    assert ctx.messages == []
+
+
+def test_inject_skips_blank_text_entries():
+    """Blank-text entries don't pollute the block."""
+    from agent.core.agent import BaseAgent, AgentContext
+
+    ctx = AgentContext(system_prompt="sys")
+    pending = [
+        {"text": "   ", "from_user": "", "urgency": "normal"},
+        {"text": "real msg", "from_user": "", "urgency": "normal"},
+    ]
+    BaseAgent._inject_pending_interjections(ctx, pending)
+    assert len(ctx.messages) == 1
+    assert "real msg" in ctx.messages[0]["content"]
+    # Blank entry produces no block
+    assert ctx.messages[0]["content"].count("<user_interjection") == 1

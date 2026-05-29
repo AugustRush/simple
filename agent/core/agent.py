@@ -1784,6 +1784,54 @@ class BaseAgent:
             return "same_batch_unproductive"
         return ""
 
+    @staticmethod
+    def _inject_pending_interjections(
+        ctx: "AgentContext", pending: list[dict]
+    ) -> None:
+        """Drain the per-session mailbox into ctx.messages as a user_interjection.
+
+        ``pending`` is shared mutable state owned by RuntimeSessionState — we
+        list-copy then ``clear()`` in place so the channel handler's
+        subsequent appends only see fresh entries.  Each entry contributes
+        one ``<user_interjection>`` block; an instruction footer tells the
+        LLM how to handle it (continue, adjust, summarize, stop).
+        """
+        drained = list(pending)
+        pending.clear()
+        if not drained:
+            return
+        blocks: list[str] = []
+        for entry in drained:
+            text = str(entry.get("text", "") or "").strip()
+            if not text:
+                continue
+            who = str(entry.get("from_user", "") or "user")
+            urgency = str(entry.get("urgency", "normal") or "normal")
+            arrived = entry.get("arrived_at")
+            when = ""
+            if isinstance(arrived, (int, float)):
+                from datetime import datetime as _dt
+                when = _dt.fromtimestamp(arrived).strftime("%H:%M:%S")
+            attrs = f' from="{who}" urgency="{urgency}"'
+            if when:
+                attrs += f' at="{when}"'
+            blocks.append(f"<user_interjection{attrs}>\n{text}\n</user_interjection>")
+        if not blocks:
+            return
+        footer = (
+            "\n\nThe user interjected during your in-progress task. "
+            "Briefly acknowledge what you heard, then decide: continue / "
+            "adjust direction / pause and ask for clarification / stop and "
+            "summarize what you have so far.  Treat urgency=\"now\" as "
+            "explicit interruption (read and respond first); urgency="
+            "\"normal\" as info added in passing (acknowledge and "
+            "incorporate when sensible)."
+        )
+        ctx.messages.append({
+            "role": "user",
+            "content": "\n\n".join(blocks) + footer,
+        })
+
     def _prepare_turn(
         self,
         ctx: "AgentContext",
@@ -1945,6 +1993,17 @@ class BaseAgent:
                         error=trace_error,
                     )
                 tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
+
+                # Drain the interjection mailbox: any user messages that
+                # arrived during the previous step get folded in as a
+                # <user_interjection> block so the next LLM call sees them
+                # alongside the original task.  Channel handler appends to
+                # this list; we drain in place so future iterations see
+                # only fresh entries.  Sub-agents have no mailbox (key is
+                # absent), so this is a no-op for them.
+                pending = ctx.metadata.get("pending_messages")
+                if pending:
+                    self._inject_pending_interjections(ctx, pending)
 
                 # Cooperative cancellation: check at every tool-loop boundary
                 # so the running turn can be interrupted cleanly without

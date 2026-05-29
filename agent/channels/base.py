@@ -278,8 +278,49 @@ class ChannelRunner:
                 )
                 return True
 
+            # ── Interjection mailbox ──────────────────────────────────────
+            # If a turn is currently running for this session, NEW user
+            # messages go into a mailbox.  send_message drains the mailbox
+            # at every tool-loop boundary and injects the entries as a
+            # <user_interjection> block — the LLM decides what to do.
+            #
+            # /now <msg> is the same path but marks urgency="now" so the
+            # LLM knows the user actively interrupted vs casually adding
+            # info.  v1 does NOT abort the current step on /now — the
+            # message is read at the next natural boundary (typically
+            # 5-15s).  For instant abort, the user can /cancel then
+            # send a new message; that starts a fresh turn.
+            is_now_command = False
+            mailbox_text = msg.text
+            stripped = msg.text.strip()
+            if stripped.startswith("/now"):
+                is_now_command = True
+                mailbox_text = stripped[len("/now"):].lstrip()
+                if not mailbox_text:
+                    sink.on_status(
+                        "/now 命令需要带消息，例如：/now 改用 ssh 别用 https",
+                        level="warning",
+                    )
+                    return True
+
+            if state.turn_in_progress:
+                state.pending_messages.append({
+                    "text": mailbox_text,
+                    "from_user": msg.metadata.get("user_id", "") or msg.metadata.get("sender", ""),
+                    "arrived_at": time.time(),
+                    "urgency": "now" if is_now_command else "normal",
+                })
+                tag = "/now，下个边界优先读" if is_now_command else "下个边界处理"
+                sink.on_status(
+                    f"📬 已收到（{tag}）：{mailbox_text[:60]}",
+                    level="info",
+                )
+                return True
+
+            # No turn in progress — proceed with normal turn dispatch.
             # Fresh token for each turn so stale cancellations don't leak.
             state.cancel_token = CancelToken()
+            state.turn_in_progress = True
             try:
                 _interaction_log(
                     "turn_started",
@@ -340,6 +381,7 @@ class ChannelRunner:
                     duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
                     turn_count=state.turn_count,
                 )
+                state.turn_in_progress = False
 
             return True
 

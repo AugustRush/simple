@@ -122,6 +122,16 @@ class RuntimeSessionState:
     context_manager: Any = None
     memory_worker: Any = None
     cancel_token: Any = None  # CancelToken | None
+    # User messages that arrived while a turn was in progress.  The channel
+    # handler appends here when state.cancel_token is set + non-cancelled
+    # (meaning: a turn is running for this session).  send_message drains
+    # this at every tool-loop iteration and injects the messages as a
+    # <user_interjection> block in ctx — the LLM then decides what to do.
+    pending_messages: list[dict] = field(default_factory=list)
+    # True while send_message is actively running for this session.  The
+    # channel handler uses this to decide "queue → mailbox" vs "start new
+    # turn".  Set/cleared inside the turn dispatch path.
+    turn_in_progress: bool = False
 
     def ensure_task_context(self, text: str) -> None:
         if not self.task_context:
@@ -476,6 +486,12 @@ class AgentCore:
             # at every tool-loop boundary.
             if state.cancel_token is not None:
                 state.ctx.metadata["cancel_token"] = state.cancel_token
+            # Publish a shared reference to the mailbox so send_message's
+            # tool-loop can drain it at every iteration without taking
+            # a dependency on RuntimeSessionState.  Bare-object test
+            # contexts (no .metadata attribute) skip this.
+            if hasattr(state.ctx, "metadata"):
+                state.ctx.metadata["pending_messages"] = state.pending_messages
             try:
                 for iteration_index in range(max(1, int(max_continuations) + 1)):
                     iterations = iteration_index + 1
