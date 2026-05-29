@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -9,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Optional
 
 from rich.console import Console
 
@@ -129,23 +131,101 @@ DEFAULT_ROUTE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 class CancelToken:
-    """Cooperative cancellation token checked at tool-loop boundaries.
+    """Per-turn cancellation token with two-level cleanup callbacks.
 
-    Setting ``cancel()`` signals the running turn to finish at the next
-    safe checkpoint (after the current tool call completes).  This avoids
-    the broken state that asyncio task cancellation would produce (orphan
-    subprocesses, half-written files).
+    A bare ``cancel()`` is *graceful*: cleanups run (e.g. SIGTERM to a
+    shell subprocess), the current step gets a chance to finish whatever
+    it can, and the next tool-loop boundary picks up the signal cleanly.
+    ``cancel(level="force")`` is *hard*: cleanups run in force mode
+    (SIGKILL, asyncio.Task.cancel), abandoning in-flight work.
+
+    Tools register themselves via ``register_cleanup(name, fn)`` and MUST
+    call the returned deregister callback when they finish normally —
+    otherwise the cancel handler would try to clean up a stale resource.
+
+    Reading ``is_cancelled`` is the existing cooperative-cancel API and
+    still works at every tool-loop boundary.
     """
 
     def __init__(self) -> None:
         self._cancelled = False
+        self._level = "none"  # "none" | "graceful" | "force"
+        # Insertion-ordered list of (name, callback) entries so cleanups
+        # fire in registration order — innermost (most-recent) op cleans
+        # first, then unwinds outward.
+        self._cleanups: list[tuple[str, "Callable[[str], None]"]] = []
 
-    def cancel(self) -> None:
+    def cancel(self, level: str = "graceful") -> None:
+        """Mark the token cancelled and fire all registered cleanups.
+
+        Re-calling with a higher level (``"force"`` after ``"graceful"``)
+        upgrades the signal: cleanups fire again in force mode so e.g. a
+        process that ignored SIGTERM now gets SIGKILL.
+        """
+        was_cancelled = self._cancelled
         self._cancelled = True
+        if level not in ("graceful", "force"):
+            level = "graceful"
+        # Upgrade only forward (graceful → force; never force → graceful).
+        if not was_cancelled or (level == "force" and self._level != "force"):
+            self._level = level
+            # Iterate over a snapshot so cleanups can deregister themselves.
+            for name, cb in list(self._cleanups):
+                try:
+                    cb(level)
+                except Exception as exc:
+                    logging.getLogger("agent").warning(
+                        "CancelToken cleanup '%s' raised: %s", name, exc
+                    )
 
     @property
     def is_cancelled(self) -> bool:
         return self._cancelled
+
+    @property
+    def level(self) -> str:
+        return self._level
+
+    def register_cleanup(
+        self, name: str, callback: "Callable[[str], None]"
+    ) -> "Callable[[], None]":
+        """Register a cleanup fired when ``cancel()`` is called.
+
+        ``callback`` receives the cancel level (``"graceful"`` or
+        ``"force"``) and should be **fast** and **non-throwing** — typical
+        impl is sending a signal to a subprocess or cancelling an
+        asyncio.Task.
+
+        Returns a deregister function the caller MUST call when the
+        resource completes normally (use try/finally).  If the token is
+        already cancelled when registering, the callback fires immediately.
+        """
+        entry = (name, callback)
+        if self._cancelled:
+            try:
+                callback(self._level)
+            except Exception as exc:
+                logging.getLogger("agent").warning(
+                    "CancelToken late cleanup '%s' raised: %s", name, exc
+                )
+            return lambda: None
+        self._cleanups.append(entry)
+
+        def _deregister() -> None:
+            try:
+                self._cleanups.remove(entry)
+            except ValueError:
+                pass
+
+        return _deregister
+
+
+# Published via ContextVar so any tool deep in the call stack can grab
+# the active cancellation token and register a cleanup without us having
+# to thread the token through every API.
+_active_cancel_token: contextvars.ContextVar[Optional[CancelToken]] = (
+    contextvars.ContextVar("active_cancel_token", default=None)
+)
 
 
 CONSOLE = Console()

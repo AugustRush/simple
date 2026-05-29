@@ -256,11 +256,26 @@ class ChannelRunner:
             ctx.metadata["skill_catalog"] = skill_catalog
 
             # /cancel arrives asynchronously in channel mode — cancel the
-            # running turn so the next tool-loop boundary stops it cleanly.
-            if msg.text.strip().lower() in ("/cancel", "cancel"):
+            # running turn.  Plain /cancel is graceful (lets the current
+            # tool complete, runs SIGTERM/cleanups, picks up at next safe
+            # point).  /cancel force is hard (SIGKILL shell processes,
+            # aborts LLM HTTP request mid-stream).
+            cancel_text = msg.text.strip().lower()
+            if cancel_text in ("/cancel", "cancel"):
                 if state.cancel_token is not None:
                     state.cancel_token.cancel()
-                sink.on_status("已发送取消信号，当前任务将在下一个安全点停止", level="warning")
+                sink.on_status(
+                    "已发送取消信号，当前任务将在下一个安全点停止",
+                    level="warning",
+                )
+                return True
+            if cancel_text in ("/cancel force", "/cancel -f", "/kill"):
+                if state.cancel_token is not None:
+                    state.cancel_token.cancel("force")
+                sink.on_status(
+                    "已发送强制取消（SIGKILL 进程 + 中断 LLM 请求）",
+                    level="warning",
+                )
                 return True
 
             # Fresh token for each turn so stale cancellations don't leak.

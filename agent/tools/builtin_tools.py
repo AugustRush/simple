@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import json
 import os
@@ -1195,6 +1196,31 @@ class BuiltinTools:
                 env=env,
                 cwd=str(resolved_cwd) if resolved_cwd is not None else None,
             )
+
+            # Register a cleanup so the active CancelToken can kill this
+            # subprocess (and its process group, since we used
+            # start_new_session=True) on /cancel or /now.  Graceful → SIGTERM
+            # to the group; force → SIGKILL.  Without this, /cancel has to
+            # wait for the shell command to complete before taking effect.
+            def _cancel_proc(level: str) -> None:
+                pgid_func = getattr(os, "killpg", None)
+                getpgid = getattr(os, "getpgid", None)
+                sig = signal.SIGKILL if level == "force" else signal.SIGTERM
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    if pgid_func is not None and getpgid is not None:
+                        pgid_func(getpgid(proc.pid), sig)
+                    else:
+                        proc.send_signal(sig)
+
+            active_token = shared._active_cancel_token.get()
+            _deregister_proc = (
+                active_token.register_cleanup(
+                    f"shell:{command[:60]}", _cancel_proc
+                )
+                if active_token is not None
+                else (lambda: None)
+            )
+
             # Heartbeat keeps the executor's stale-timeout mechanism alive
             # during long-running commands that produce no output (downloads, etc.)
             async def _heartbeat() -> None:
@@ -1214,6 +1240,7 @@ class BuiltinTools:
                     proc.communicate(), timeout=timeout
                 )
             finally:
+                _deregister_proc()
                 heartbeat_task.cancel()
                 try:
                     await heartbeat_task

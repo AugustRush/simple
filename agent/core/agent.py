@@ -1915,6 +1915,12 @@ class BaseAgent:
         # can access the current ctx.messages.  Done before the try so the
         # token is always bound when the finally clause reaches reset().
         _active_ctx_token = _active_agent_context.set(ctx)
+        # Publish the cancel token via ContextVar so any tool deep in the
+        # call stack (shell subprocess, LLM transport) can register a cleanup
+        # without us having to thread the token through every API.
+        _cancel_token_token = shared._active_cancel_token.set(
+            ctx.metadata.get("cancel_token")
+        )
 
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
@@ -1975,15 +1981,40 @@ class BaseAgent:
                         response = content_filter_recovered_response
                         content_filter_recovered_response = None
                         streamed_text = ""
-                    elif stream_callback:
-                        response, streamed_text = await self._with_llm_retry(
-                            self._stream_response, ctx, tools, stream_callback
-                        )
                     else:
-                        response = await self._with_llm_retry(
-                            self._create, ctx, tools
+                        # Wrap the LLM call as a task and register a cleanup
+                        # so /now (force-cancel) aborts the HTTP request mid-flight.
+                        # Graceful cancel waits for the call to finish naturally.
+                        if stream_callback:
+                            llm_task = asyncio.create_task(
+                                self._with_llm_retry(
+                                    self._stream_response, ctx, tools, stream_callback
+                                )
+                            )
+                        else:
+                            llm_task = asyncio.create_task(
+                                self._with_llm_retry(self._create, ctx, tools)
+                            )
+
+                        def _abort_llm(level: str) -> None:
+                            if level == "force":
+                                llm_task.cancel()
+
+                        active_token = shared._active_cancel_token.get()
+                        _llm_deregister = (
+                            active_token.register_cleanup("llm_call", _abort_llm)
+                            if active_token is not None
+                            else (lambda: None)
                         )
-                        streamed_text = ""
+                        try:
+                            llm_result = await llm_task
+                        finally:
+                            _llm_deregister()
+                        if stream_callback:
+                            response, streamed_text = llm_result
+                        else:
+                            response = llm_result
+                            streamed_text = ""
                     content_filter_submitted_tool_uses = None
                     content_filter_submitted_results = None
                     stop_reason, text, tool_uses = self._parse_response(response)
@@ -2179,6 +2210,7 @@ class BaseAgent:
                     )
         finally:
             _active_agent_context.reset(_active_ctx_token)
+            shared._active_cancel_token.reset(_cancel_token_token)
             _interaction_log(
                 "turn_finished",
                 agent_id=ctx.agent_id,

@@ -1605,3 +1605,62 @@ def test_recovery_hint_appears_in_error_message_for_shell_confirmation(tmp_path)
     # The hint summary should be in the error string, not only nested.
     assert "RECOVERY:" in payload["error"]
     assert "safe cwd" in payload["error"] or "relative" in payload["error"]
+
+
+
+# ─── CancelToken cleanup behaviour ────────────────────────────────────────────
+
+
+def test_cancel_token_fires_cleanups_in_registration_order():
+    from agent.shared import CancelToken
+
+    token = CancelToken()
+    fired = []
+    token.register_cleanup("first", lambda level: fired.append(("first", level)))
+    token.register_cleanup("second", lambda level: fired.append(("second", level)))
+
+    token.cancel()
+
+    assert fired == [("first", "graceful"), ("second", "graceful")]
+    assert token.is_cancelled
+    assert token.level == "graceful"
+
+
+def test_cancel_token_force_upgrade_refires_cleanups():
+    from agent.shared import CancelToken
+
+    token = CancelToken()
+    fired = []
+    token.register_cleanup("x", lambda level: fired.append(level))
+
+    token.cancel()
+    token.cancel("force")
+
+    assert fired == ["graceful", "force"]
+    assert token.level == "force"
+
+
+def test_cancel_token_deregister_prevents_callback():
+    from agent.shared import CancelToken
+
+    token = CancelToken()
+    fired = []
+    deregister = token.register_cleanup("transient", lambda level: fired.append(level))
+    deregister()
+
+    token.cancel()
+
+    assert fired == []
+
+
+def test_cancel_token_late_registration_fires_immediately():
+    """Registering after cancel() must still fire — otherwise a late shell
+    subprocess that started right as /cancel arrived would leak."""
+    from agent.shared import CancelToken
+
+    token = CancelToken()
+    token.cancel("force")
+    fired = []
+    token.register_cleanup("late", lambda level: fired.append(level))
+
+    assert fired == ["force"]
