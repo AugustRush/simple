@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import difflib
 from pathlib import Path
 import re
 import shutil
@@ -223,6 +224,11 @@ class SkillCatalog:
         self._dirty = True
         self._prompt_generation += 1
 
+    def invalidate(self) -> None:
+        """Signal that external mutations (e.g. plugin reload) require a prompt rebuild."""
+        self._dirty = True
+        self._prompt_generation += 1
+
     def consume_dirty(self) -> bool:
         """Return True and clear if the catalog was mutated since last check."""
         if self._dirty:
@@ -281,7 +287,21 @@ class SkillCatalog:
         async def activate_skill(skill_name: str) -> dict[str, Any]:
             bundle = self.get(skill_name)
             if bundle is None:
-                return {"ok": False, "error": f"Skill '{skill_name}' not found"}
+                available = list(self._skills.keys())
+                query = skill_name.strip()
+                candidates = (
+                    difflib.get_close_matches(query, available, n=8, cutoff=0.6)
+                    if query
+                    else []
+                )
+                error = f"Skill '{skill_name}' not found"
+                if candidates:
+                    error = f"{error}. Did you mean: {', '.join(candidates)}"
+                return {
+                    "ok": False,
+                    "error": error,
+                    "candidates": candidates,
+                }
             if bundle.disable_model_invocation:
                 return {
                     "ok": False,

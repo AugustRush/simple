@@ -41,6 +41,17 @@ WEB_USER_AGENT = (
     "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
 )
 
+
+def _looks_like_plugin(dir_path: Path) -> bool:
+    """Return True if *dir_path* contains at least one recognisable plugin marker."""
+    if (dir_path / "plugin.json").exists() or (dir_path / ".claude-plugin" / "plugin.json").exists():
+        return True
+    if (dir_path / "__init__.py").exists():
+        return True
+    if (dir_path / "skills").is_dir() or (dir_path / "commands").is_dir():
+        return True
+    return False
+
 from .runtime import _active_schedule_target  # noqa: E402
 class BuiltinTools:
     """Built-in tools with bounded file access and structured responses."""
@@ -725,6 +736,18 @@ class BuiltinTools:
             except Exception as exc:
                 return {"ok": False, "error": f"copy failed: {exc}"}
 
+        # Validate that the installed directory looks like a plugin.
+        if not _looks_like_plugin(target):
+            shutil.rmtree(target, ignore_errors=True)
+            return {
+                "ok": False,
+                "error": (
+                    f"Installed directory does not appear to be a valid plugin. "
+                    f"Expected one of: plugin.json, .claude-plugin/plugin.json, "
+                    f"__init__.py, skills/, or commands/."
+                ),
+            }
+
         # Hot-reload the catalog so the new plugin's assets are live.
         reload_result = await self._reload_plugins()
         return {
@@ -783,20 +806,28 @@ class BuiltinTools:
                 loaded_names = set()
 
         on_disk: list[dict] = []
+        user_dir_loaded_count = 0
         if shared.USER_PLUGINS_DIR.is_dir():
             for entry in sorted(shared.USER_PLUGINS_DIR.iterdir()):
                 if not entry.is_dir():
                     continue
+                is_loaded = entry.name in loaded_names
+                if is_loaded:
+                    user_dir_loaded_count += 1
                 on_disk.append({
                     "name": entry.name,
                     "path": str(entry),
-                    "loaded": entry.name in loaded_names,
+                    "loaded": is_loaded,
                 })
         return {
             "ok": True,
             "user_plugins_dir": str(shared.USER_PLUGINS_DIR),
             "plugins": on_disk,
-            "loaded_count": len(loaded_names),
+            # Count of loaded plugins present in the user plugin directory listing.
+            "loaded_count": user_dir_loaded_count,
+            # Total count across all loaded plugins (builtin + user + others).
+            # Useful when loaded plugins exist outside USER_PLUGINS_DIR.
+            "global_loaded_count": len(loaded_names),
         }
 
     async def _reload_plugins(self) -> dict:

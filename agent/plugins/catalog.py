@@ -21,6 +21,14 @@ PLUGINS_DIR = shared.PLUGINS_DIR
 USER_PLUGINS_DIR = shared.USER_PLUGINS_DIR
 
 
+def _safe_float(value: Any, default: float) -> float:
+    """Parse *value* as float, returning *default* on failure."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _emit_plugin_event(name: str, plugin_name: str = "", **fields: Any) -> None:
     collector = _active_event_collector.get()
     if collector is not None:
@@ -244,7 +252,7 @@ def _read_claude_hooks_json(plugin_dir: Path) -> dict[str, list[dict]]:
                     "type": "command",
                     "matcher": matcher,
                     "command": cmd,
-                    "timeout": float(inner.get("timeout", 60.0)),
+                    "timeout": _safe_float(inner.get("timeout", 60.0), 60.0),
                 })
         if flat:
             out[internal_event] = flat
@@ -305,7 +313,7 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
                         continue
                     raw_hooks[hook_name].append(entry)
                     if isinstance(entry.get("timeout"), (int, float)):
-                        hook_timeouts[hook_name] = max(0.0, float(entry["timeout"]))
+                        hook_timeouts[hook_name] = max(0.0, _safe_float(entry["timeout"], 60.0))
                     matcher = str(entry.get("matcher", "") or "").strip()
                     if matcher and matcher != "*":
                         try:
@@ -428,6 +436,7 @@ async def _call_hook_with_timeout(
     hook: Callable,
     *args: Any,
     timeout_seconds: float,
+    executor: Optional[ThreadPoolExecutor] = None,
 ) -> Any:
     """Call a plugin hook with timeout covering sync and async hooks."""
     if timeout_seconds <= 0:
@@ -439,12 +448,12 @@ async def _call_hook_with_timeout(
         )
 
     loop = asyncio.get_running_loop()
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="agent-plugin-hook")
     future = loop.run_in_executor(executor, partial(hook, *args))
     try:
         result = await asyncio.wait_for(future, timeout=timeout_seconds)
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    except asyncio.TimeoutError:
+        future.cancel()
+        raise
     return await _maybe_await_with_timeout(result, timeout_seconds)
 
 
@@ -476,6 +485,9 @@ class PluginCatalog:
         self._user_dir = user_dir
         self._plugin_config = plugin_config or {}
         self._turn_hook_timeout_seconds = max(0.0, float(turn_hook_timeout_seconds))
+        self._hook_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="agent-plugin-hook"
+        )
         # name → (plugin_object, PluginMeta)
         self._plugins: dict[str, tuple[Any, PluginMeta]] = {}
         self._slash_commands: dict[str, Callable] = {}
@@ -823,13 +835,13 @@ class PluginCatalog:
                     skill_catalog._load_root(sroot, source=f"plugin:{pname}")
                 if hasattr(skill_catalog, "_rebuild_aliases"):
                     skill_catalog._rebuild_aliases()
-                # Mark dirty AND bump generation so the next turn's
-                # _refresh_skill_prompt_if_needed actually rebuilds — the
-                # consume_dirty() gate checks _dirty, not the generation
-                # counter, so we must set both.
-                skill_catalog._dirty = True
-                if hasattr(skill_catalog, "_prompt_generation"):
-                    skill_catalog._prompt_generation += 1
+                if hasattr(skill_catalog, "invalidate"):
+                    skill_catalog.invalidate()
+                else:
+                    # Fallback for test fakes / old catalogs without invalidate().
+                    skill_catalog._dirty = True  # noqa: SLF001
+                    if hasattr(skill_catalog, "_prompt_generation"):
+                        skill_catalog._prompt_generation += 1
             except Exception as exc:
                 shared.CONSOLE.print(
                     f"[yellow]Plugin reload: skill catalog refresh failed: {exc}[/yellow]"
@@ -992,17 +1004,15 @@ class PluginCatalog:
         tool_name = str(event_payload.get("tool_name", "") or "")
         env = self._hook_env(meta, event_payload)
         for entry in entries:
-            if entry.get("type") != "command":
+            cmd = str(entry.get("command", "") or "").strip()
+            if not cmd:
                 continue
             # Per-entry matcher (Claude Code style).  Legacy entries with no
             # matcher field always pass and remain compatible with the older
             # per-event matcher cache on PluginMeta.
             if tool_name and "matcher" in entry and not self._entry_matches_tool(entry, tool_name):
                 continue
-            cmd = str(entry.get("command", "") or "").strip()
-            if not cmd:
-                continue
-            timeout = max(0.0, float(entry.get("timeout", self._hook_timeout(meta, event_name))))
+            timeout = max(0.0, _safe_float(entry.get("timeout"), self._hook_timeout(meta, event_name)))
             try:
                 proc = await asyncio.create_subprocess_shell(
                     cmd,
@@ -1074,6 +1084,7 @@ class PluginCatalog:
                     text,
                     meta_dict,
                     timeout_seconds=self._hook_timeout(meta, "on_prompt_submit"),
+                    executor=self._hook_executor,
                 )
                 if isinstance(r, HookResult):
                     if r.action == "block":
@@ -1159,6 +1170,7 @@ class PluginCatalog:
                     plugin.on_turn_end,
                     event,
                     timeout_seconds=self._hook_timeout(meta, "on_turn_end"),
+                    executor=self._hook_executor,
                 )
                 if isinstance(r, HookResult):
                     if r.action != "noop":
@@ -1196,6 +1208,7 @@ class PluginCatalog:
                     plugin.on_session_end,
                     event,
                     timeout_seconds=timeout,
+                    executor=self._hook_executor,
                 )
             except asyncio.TimeoutError:
                 shared.CONSOLE.print(
@@ -1238,6 +1251,7 @@ class PluginCatalog:
                     plugin.on_pre_tool,
                     event,
                     timeout_seconds=self._hook_timeout(meta, "on_pre_tool"),
+                    executor=self._hook_executor,
                 )
                 if isinstance(r, HookResult) and r.action == "block":
                     _emit_plugin_event(
@@ -1290,6 +1304,7 @@ class PluginCatalog:
                     plugin.on_post_tool,
                     event,
                     timeout_seconds=self._hook_timeout(meta, "on_post_tool"),
+                    executor=self._hook_executor,
                 )
                 if isinstance(r, HookResult) and r.context:
                     result = r

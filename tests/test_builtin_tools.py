@@ -129,6 +129,41 @@ def test_registry_call_json_encodes_structured_results():
     assert json.loads(result) == {"ok": True, "items": ["a", "b"]}
 
 
+def test_list_installed_plugins_counts_only_listed_user_plugins(tmp_path, monkeypatch):
+    import agent.shared as shared_module
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    user_plugins = tmp_path / "user-plugins"
+    user_plugins.mkdir()
+    (user_plugins / "webwright").mkdir()
+
+    monkeypatch.setattr(shared_module, "USER_PLUGINS_DIR", user_plugins)
+
+    class _Meta:
+        def __init__(self, name):
+            self.name = name
+
+    class _Catalog:
+        def list_plugins(self):
+            # Simulate one loaded builtin + one loaded user plugin.
+            return [_Meta("builtin_only"), _Meta("webwright")]
+
+    registry.set_context("plugin_catalog", _Catalog())
+
+    result = tools._list_installed_plugins()
+
+    assert result["ok"] is True
+    assert result["loaded_count"] == 1
+    assert result["global_loaded_count"] == 2
+    assert result["plugins"] == [
+        {
+            "name": "webwright",
+            "path": str(user_plugins / "webwright"),
+            "loaded": True,
+        }
+    ]
+
+
 def test_read_file_truncates_large_content(tmp_path):
     tools, _, workspace = make_builtin_tools(tmp_path)
     path = workspace / "large.txt"

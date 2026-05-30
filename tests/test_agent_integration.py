@@ -261,6 +261,72 @@ user-invocable: true
     assert "use `send_file` with the resolved file path" in prompt
 
 
+def test_activate_skill_returns_candidates_for_namespaced_match(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    user_root = tmp_path / "user-skills"
+    builtin_root = tmp_path / "builtin-skills"
+    plugin_skill_root = tmp_path / "plugin-skills"
+    skill_body = "Use this skill."
+
+    _write_skill_bundle(
+        plugin_skill_root,
+        "webwright",
+        f"""---
+name: Webwright
+description: Browser automation workflow
+user-invocable: true
+---
+{skill_body}
+""",
+    )
+
+    cfg = _minimal_cfg()
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", user_root)
+    monkeypatch.setattr(agent_module, "BUILTIN_SKILLS_DIR", builtin_root)
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    class _PluginCatalog:
+        def get_bundled_skills(self):
+            return [("webwright", plugin_skill_root)]
+
+        def get_bundled_mcp(self):
+            return []
+
+        def discover_and_load(self):
+            return []
+
+        def compose_all_prompts(self, base):
+            return base
+
+    import agent.bootstrap as bootstrap_mod
+
+    monkeypatch.setattr(
+        bootstrap_mod,
+        "PluginCatalog",
+        lambda *args, **kwargs: _PluginCatalog(),
+    )
+
+    components = agent_module._build_components(cfg)
+    registry = components["registry"]
+
+    payload = json.loads(asyncio.run(registry.call("activate_skill", {"skill_name": "webwrightx"})))
+
+    assert payload["ok"] is False
+    assert "not found" in payload["error"]
+    assert "Did you mean" in payload["error"]
+    assert "webwright" in payload.get("candidates", [])
+
+
 def test_orchestration_planner_exposes_policy_from_skill_metadata(tmp_path):
     from agent.orchestration.planner import OrchestrationPlanner
     from agent.skills.catalog import SkillCatalog
