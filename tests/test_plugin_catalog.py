@@ -1208,6 +1208,64 @@ def test_discover_loads_marketplace_with_subplugins(tmp_path):
     assert sorted(loaded) == ["alpha", "beta"]
 
 
+def test_plugin_root_with_marketplace_manifest_still_loads_root_plugin(tmp_path):
+    """Installed Claude plugin repos may include marketplace metadata too.
+
+    Webwright has both .claude-plugin/plugin.json and
+    .claude-plugin/marketplace.json at the repo root.  Once installed into the
+    user plugin directory, that root must load as the plugin instead of being
+    treated only as a marketplace container.
+    """
+    from agent import PluginCatalog
+    from agent.skills.catalog import SkillCatalog
+
+    plugin_dir = tmp_path / "Webwright"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "webwright", "skills": "./skills", '
+        '"commands": "./skills/webwright/commands"}',
+        encoding="utf-8",
+    )
+    (plugin_dir / ".claude-plugin" / "marketplace.json").write_text(
+        '{"name": "webwright-marketplace", "plugins": ['
+        '{"name": "webwright", "source": {'
+        '"source": "github", "repo": "microsoft/Webwright"}}'
+        ']}',
+        encoding="utf-8",
+    )
+    skill_dir = plugin_dir / "skills" / "webwright"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: webwright\ndescription: browser automation\n---\nRun browser.",
+        encoding="utf-8",
+    )
+    command_dir = skill_dir / "commands"
+    command_dir.mkdir()
+    (command_dir / "run.md").write_text(
+        "---\ndescription: run browser task\n---\nRun $ARGUMENTS.",
+        encoding="utf-8",
+    )
+
+    plugin_catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = plugin_catalog.discover_and_load()
+
+    assert "webwright" in loaded
+    assert plugin_catalog.get_loaded_names_for_directory("Webwright") == {"webwright"}
+    assert [name for name, _ in plugin_catalog.get_bundled_skills()] == ["webwright"]
+    assert "webwright:run" in plugin_catalog.get_slash_commands()
+
+    skill_catalog = SkillCatalog(
+        user_root=tmp_path / "user-skills",
+        builtin_root=tmp_path / "builtin-skills",
+    )
+    skill_catalog.load_all()
+    for plugin_name, skills_root in plugin_catalog.get_bundled_skills():
+        skill_catalog._load_root(skills_root, source=f"plugin:{plugin_name}")
+    skill_catalog._rebuild_aliases()
+
+    assert skill_catalog.get("webwright:webwright") is not None
+
+
 def test_discover_accepts_mcpServers_camelcase(tmp_path):
     """Claude Code's camelCase mcpServers is normalised."""
     from agent import PluginCatalog
@@ -1359,27 +1417,31 @@ def test_cc_hook_fires_on_translated_tool_name(tmp_path):
     assert out_file.read_text(encoding="utf-8").strip() == "Bash"
 
 
-def test_cc_ignored_event_emits_no_hooks(tmp_path):
-    """Unsupported CC events (e.g. Notification) are dropped silently."""
+def test_unrecognised_event_passthrough(tmp_path):
+    """Unrecognised CC events are stored under their PascalCase name so they
+    fire when/if dispatch support is added later."""
     from agent import PluginCatalog
 
-    plugin_dir = tmp_path / "ignored-evt"
+    plugin_dir = tmp_path / "unknown-evt"
     (plugin_dir / ".claude-plugin").mkdir(parents=True)
     (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
-        '{"name": "ignored-evt"}', encoding="utf-8"
+        '{"name": "unknown-evt"}', encoding="utf-8"
     )
     (plugin_dir / "hooks").mkdir()
     (plugin_dir / "hooks" / "hooks.json").write_text(
-        '{"hooks": {"Notification": [{"hooks": ['
-        '{"type": "command", "command": "echo nope"}]}]}}',
+        '{"hooks": {"SomeFutureEvent": [{"hooks": ['
+        '{"type": "command", "command": "echo hello"}]}]}}',
         encoding="utf-8",
     )
 
     catalog = PluginCatalog(builtin_dir=tmp_path)
     catalog.discover_and_load()
 
-    plugin_obj, meta = catalog._plugins["ignored-evt"]
-    assert meta.hooks_config == {}
+    plugin_obj, meta = catalog._plugins["unknown-evt"]
+    # Previously unknown events were dropped; now they are stored as-is.
+    assert "SomeFutureEvent" in meta.hooks_config
+    assert len(meta.hooks_config["SomeFutureEvent"]) == 1
+    assert meta.hooks_config["SomeFutureEvent"][0]["command"] == "echo hello"
 
 
 def test_reload_picks_up_new_plugin_on_disk(tmp_path):
@@ -1737,3 +1799,230 @@ def test_heartbeat_sink_default_is_no_op():
         elapsed_seconds=12.5, current_op="LLM",
         op_detail="opus", pending_messages=0,
     )
+
+
+def test_claude_plugin_skills_are_namespaced_and_do_not_collide(tmp_path):
+    """Claude Code plugin skills must be invoked as /plugin:skill."""
+    from agent import PluginCatalog
+    from agent.skills.catalog import SkillCatalog
+
+    for plugin_name, body in (
+        ("alpha", "Alpha instructions"),
+        ("beta", "Beta instructions"),
+    ):
+        plugin_dir = tmp_path / "plugins" / plugin_name
+        (plugin_dir / ".claude-plugin").mkdir(parents=True)
+        (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+            f'{{"name": "{plugin_name}"}}',
+            encoding="utf-8",
+        )
+        skill_dir = plugin_dir / "skills" / "hello"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\ndescription: {plugin_name} greeting\n---\n{body}",
+            encoding="utf-8",
+        )
+
+    plugin_catalog = PluginCatalog(builtin_dir=tmp_path / "plugins")
+    plugin_catalog.discover_and_load()
+    skill_catalog = SkillCatalog(
+        user_root=tmp_path / "user-skills",
+        builtin_root=tmp_path / "builtin-skills",
+    )
+    skill_catalog.load_all()
+    for plugin_name, skills_root in plugin_catalog.get_bundled_skills():
+        skill_catalog._load_root(skills_root, source=f"plugin:{plugin_name}")
+    skill_catalog._rebuild_aliases()
+
+    assert skill_catalog.get("alpha:hello") is not None
+    assert skill_catalog.get("beta:hello") is not None
+    assert skill_catalog.get("alpha:hello").body == "Alpha instructions"
+    assert skill_catalog.get("beta:hello").body == "Beta instructions"
+    assert skill_catalog.get("hello") is None
+
+
+def test_manifest_hooks_path_uses_claude_hook_shape(tmp_path):
+    """plugin.json hooks paths should accept standard Claude Code hooks JSON."""
+    from agent import PluginCatalog
+    from agent.plugins.catalog import PreToolEvent
+
+    plugin_dir = tmp_path / "manifest-hooked"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "manifest-hooked", "hooks": "./config/hooks.json"}',
+        encoding="utf-8",
+    )
+    (plugin_dir / "config").mkdir()
+    out_file = tmp_path / "manifest_hook_fired.txt"
+    (plugin_dir / "config" / "hooks.json").write_text(
+        '{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": ['
+        '{"type": "command", "command": "echo manifest > ' + str(out_file) + '"}]}]}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    asyncio.run(catalog.fire_pre_tool(PreToolEvent(tool_name="shell", tool_kwargs={})))
+
+    assert out_file.read_text(encoding="utf-8").strip() == "manifest"
+
+
+def test_pre_tool_hook_specific_output_denies_tool(tmp_path):
+    """Claude Code PreToolUse JSON decisions should block matching tools."""
+    import json
+
+    from agent import PluginCatalog
+    from agent.plugins.catalog import PreToolEvent
+
+    plugin_dir = tmp_path / "json-deny"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "json-deny"}',
+        encoding="utf-8",
+    )
+    (plugin_dir / "hooks").mkdir()
+    hook_output = json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "no shell",
+        }
+    })
+    (plugin_dir / "hooks" / "hooks.json").write_text(
+        json.dumps({
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {"type": "command", "command": f"printf '%s' {json.dumps(hook_output)}"}
+                        ],
+                    }
+                ]
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    result = asyncio.run(
+        catalog.fire_pre_tool(PreToolEvent(tool_name="shell", tool_kwargs={}))
+    )
+
+    assert result.action == "block"
+    assert result.message == "no shell"
+
+
+def test_stop_hook_top_level_decision_continues_turn(tmp_path):
+    """Claude Code Stop hooks use top-level decision=block/reason."""
+    import json
+
+    from agent import PluginCatalog
+    from agent.plugins.catalog import TurnEvent
+
+    plugin_dir = tmp_path / "stopper"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "stopper"}',
+        encoding="utf-8",
+    )
+    (plugin_dir / "hooks").mkdir()
+    hook_output = json.dumps({"decision": "block", "reason": "keep working"})
+    (plugin_dir / "hooks" / "hooks.json").write_text(
+        json.dumps({
+            "hooks": {
+                "Stop": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": f"printf '%s' {json.dumps(hook_output)}"}
+                        ]
+                    }
+                ]
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    results = asyncio.run(
+        catalog.fire_turn_end(
+            TurnEvent(user_input="do it", agent_response="done", tool_calls=[])
+        )
+    )
+
+    assert any(r.action == "continue" and r.message == "keep working" for r in results)
+
+
+def test_plugin_mcp_config_expands_claude_plugin_paths(tmp_path):
+    """Bundled MCP configs should resolve Claude Code plugin path variables."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "mcp-paths"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "mcp-paths"}',
+        encoding="utf-8",
+    )
+    (plugin_dir / ".mcp.json").write_text(
+        '{"mcpServers": {"demo": {'
+        '"command": "${CLAUDE_PLUGIN_ROOT}/bin/server", '
+        '"args": ["--data", "${CLAUDE_PLUGIN_DATA}"], '
+        '"cwd": "${CLAUDE_PROJECT_DIR}", '
+        '"env": {"PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}"}}}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    bundled = catalog.get_bundled_mcp()
+    assert len(bundled) == 1
+    cfg = bundled[0][1]
+    assert cfg["command"] == str(plugin_dir / "bin" / "server")
+    assert cfg["args"][1].endswith("/mcp-paths")
+    assert cfg["cwd"] == str(Path.cwd())
+    assert cfg["env"]["CLAUDE_PLUGIN_ROOT"] == str(plugin_dir)
+    assert cfg["env"]["PLUGIN_ROOT"] == str(plugin_dir)
+
+
+def test_manifest_component_paths_for_skills_commands_agents(tmp_path):
+    """Claude Code custom component paths should be loaded from plugin.json."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "custom-paths"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "custom-paths", '
+        '"skills": ["./extra-skills"], '
+        '"commands": ["./extra-commands/deploy.md"], '
+        '"agents": ["./extra-agents/reviewer.md"]}',
+        encoding="utf-8",
+    )
+    skill_dir = plugin_dir / "extra-skills" / "audit"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\ndescription: audit\n---\nAudit.",
+        encoding="utf-8",
+    )
+    (plugin_dir / "extra-commands").mkdir()
+    (plugin_dir / "extra-commands" / "deploy.md").write_text(
+        "---\ndescription: deploy\n---\nDeploy $ARGUMENTS.",
+        encoding="utf-8",
+    )
+    (plugin_dir / "extra-agents").mkdir()
+    (plugin_dir / "extra-agents" / "reviewer.md").write_text(
+        "---\nname: reviewer\ndescription: Reviews\n---\nReview carefully.",
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    assert [name for name, _ in catalog.get_bundled_skills()] == ["custom-paths"]
+    assert "custom-paths:deploy" in catalog.get_slash_commands()
+    assert catalog.get_agent_definition("plugin:custom-paths:reviewer") is not None

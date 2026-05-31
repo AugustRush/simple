@@ -161,7 +161,9 @@ class PluginMeta:
     name: str
     version: str = ""
     description: str = ""
-    skills: str = ""  # relative path to skills dir
+    skills: list[str] = field(default_factory=list)  # relative paths to skills dirs
+    commands: list[str] = field(default_factory=list)
+    agents: list[str] = field(default_factory=list)
     mcp_servers: list[dict] = field(default_factory=list)
     source: str = ""  # "builtin" or "user"
     enabled: bool = True
@@ -175,28 +177,191 @@ class PluginMeta:
 
 # Event names: Claude Code (PascalCase) → internal (snake_case w/ on_ prefix).
 _CC_EVENT_MAP = {
-    "PreToolUse": "on_pre_tool",
-    "PostToolUse": "on_post_tool",
-    "UserPromptSubmit": "on_prompt_submit",
+    # Lifecycle
     "SessionStart": "on_session_start",
     "SessionEnd": "on_session_end",
+    "Setup": "on_setup",
+    # Prompt flow
+    "UserPromptSubmit": "on_prompt_submit",
+    "UserPromptExpansion": "on_prompt_expansion",
+    # Tool lifecycle
+    "PreToolUse": "on_pre_tool",
+    "PostToolUse": "on_post_tool",
+    "PostToolUseFailure": "on_post_tool_failure",
+    "PostToolBatch": "on_post_tool_batch",
+    "PermissionRequest": "on_permission_request",
+    "PermissionDenied": "on_permission_denied",
+    # Turn lifecycle
     "Stop": "on_turn_end",
+    "StopFailure": "on_turn_failure",
+    "PreCompact": "on_pre_compact",
+    "PostCompact": "on_post_compact",
+    # Notifications & display
+    "Notification": "on_notification",
+    "MessageDisplay": "on_message_display",
+    # Sub-agents
+    "SubagentStart": "on_subagent_start",
+    "SubagentStop": "on_subagent_stop",
+    # Tasks
+    "TaskCreated": "on_task_created",
+    "TaskCompleted": "on_task_completed",
+    # Reactive events
+    "ConfigChange": "on_config_change",
+    "CwdChanged": "on_cwd_changed",
+    "FileChanged": "on_file_changed",
+    "InstructionsLoaded": "on_instructions_loaded",
+    # Worktree lifecycle
+    "WorktreeCreate": "on_worktree_create",
+    "WorktreeRemove": "on_worktree_remove",
+    # Agent teams
+    "TeammateIdle": "on_teammate_idle",
+    # MCP elicitation
+    "Elicitation": "on_elicitation",
+    "ElicitationResult": "on_elicitation_result",
 }
-# Reverse + ignored events surfaced as warnings.
-_CC_EVENT_IGNORED = {"Notification", "SubagentStop", "PreCompact"}
 
 # Tool name translation: our tool name → Claude Code tool name.
 # Used when matching a Claude Code matcher pattern against our tools.
 _OUR_TO_CC_TOOL_NAME = {
-    "shell": "Bash",
+    # File tools
     "read_file": "Read",
     "write_file": "Write",
     "list_files": "Glob",
+    # Shell
+    "shell": "Bash",
+    # Memory & context
     "memory_read": "Read",
+    "memory_write": "Write",
     "memory_search": "Grep",
+    # Web
     "web_search": "WebSearch",
     "web_fetch": "WebFetch",
+    # Plugin management
+    "install_plugin": "Bash",
+    "uninstall_plugin": "Bash",
+    # Skills
+    "activate_skill": "Skill",
+    "create_skill": "Write",
+    "update_skill": "Write",
+    "delete_skill": "Bash",
+    # Scheduling
+    "schedule_create": "Task",
+    "schedule_list": "Read",
+    "schedule_delete": "Bash",
+    # Agent
+    "spawn_agent": "Task",
+    "send_message": "Bash",
 }
+
+
+def _as_path_list(value: Any) -> list[str]:
+    """Normalize Claude Code manifest path fields to a list of strings."""
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, str) and item.strip()]
+    return []
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in paths:
+        key = raw.strip().rstrip("/")
+        if key.startswith("./"):
+            key = key[2:]
+        if key in {"", "."}:
+            key = "."
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(raw)
+    return out
+
+
+def _plugin_data_dir(plugin_name: str) -> Path:
+    """Claude Code-compatible persistent data directory for a plugin."""
+    safe_name = re.sub(r"[^0-9A-Za-z_-]+", "-", plugin_name).strip("-") or "plugin"
+    return shared.AGENT_HOME / "plugins" / "data" / safe_name
+
+
+def _plugin_substitution_env(plugin_dir: Path, plugin_name: str) -> dict[str, str]:
+    return {
+        "CLAUDE_PLUGIN_ROOT": str(plugin_dir),
+        "CLAUDE_PLUGIN_DATA": str(_plugin_data_dir(plugin_name)),
+        "CLAUDE_PROJECT_DIR": str(Path.cwd()),
+    }
+
+
+def _substitute_plugin_vars(value: Any, env: dict[str, str]) -> Any:
+    """Recursively substitute Claude Code plugin placeholders in configs."""
+    if isinstance(value, str):
+        out = value
+        for key, replacement in env.items():
+            out = out.replace("${" + key + "}", replacement)
+        return out
+    if isinstance(value, list):
+        return [_substitute_plugin_vars(item, env) for item in value]
+    if isinstance(value, dict):
+        return {key: _substitute_plugin_vars(item, env) for key, item in value.items()}
+    return value
+
+
+def _normalize_claude_hook_entries(
+    plugin_name: str,
+    event_name: str,
+    entries: Any,
+) -> tuple[str, list[dict]]:
+    """Translate Claude Code hook matcher groups to internal flat entries."""
+    internal_event = _CC_EVENT_MAP.get(event_name, event_name)
+    if not isinstance(entries, list):
+        return internal_event, []
+    flat: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        matcher = entry.get("matcher", "")
+        nested = entry.get("hooks")
+        if isinstance(nested, list):
+            for inner in nested:
+                if not isinstance(inner, dict):
+                    continue
+                if inner.get("type", "command") != "command":
+                    continue
+                cmd = str(inner.get("command", "") or "").strip()
+                if not cmd:
+                    continue
+                normalized = dict(inner)
+                normalized["type"] = "command"
+                normalized["matcher"] = matcher
+                normalized["command"] = cmd
+                normalized["timeout"] = _safe_float(inner.get("timeout", 60.0), 60.0)
+                flat.append(normalized)
+            continue
+        if entry.get("type", "command") != "command":
+            continue
+        cmd = str(entry.get("command", "") or "").strip()
+        if not cmd:
+            continue
+        normalized = dict(entry)
+        normalized["type"] = "command"
+        normalized["command"] = cmd
+        normalized["timeout"] = _safe_float(entry.get("timeout", 60.0), 60.0)
+        flat.append(normalized)
+    return internal_event, flat
+
+
+def _merge_hooks_block(
+    plugin_name: str,
+    source: dict[str, Any],
+    into: dict[str, list[dict]],
+) -> None:
+    for event_name, entries in source.items():
+        internal_event, flat = _normalize_claude_hook_entries(plugin_name, event_name, entries)
+        if flat:
+            into.setdefault(internal_event, []).extend(flat)
 
 
 def _read_claude_hooks_json(plugin_dir: Path) -> dict[str, list[dict]]:
@@ -222,40 +387,63 @@ def _read_claude_hooks_json(plugin_dir: Path) -> dict[str, list[dict]]:
     if not isinstance(cc_hooks, dict):
         return {}
     out: dict[str, list[dict]] = {}
-    for cc_event, entries in cc_hooks.items():
-        if cc_event in _CC_EVENT_IGNORED:
-            shared.CONSOLE.print(
-                f"[yellow]Plugin '{plugin_dir.name}': ignoring unsupported "
-                f"Claude Code event '{cc_event}'[/yellow]"
-            )
-            continue
-        internal_event = _CC_EVENT_MAP.get(cc_event)
-        if internal_event is None or not isinstance(entries, list):
-            continue
-        flat: list[dict] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            matcher = entry.get("matcher", "")
-            nested = entry.get("hooks", [])
-            if not isinstance(nested, list):
-                continue
-            for inner in nested:
-                if not isinstance(inner, dict):
-                    continue
-                if inner.get("type") != "command":
-                    continue
-                cmd = str(inner.get("command", "") or "").strip()
-                if not cmd:
-                    continue
-                flat.append({
-                    "type": "command",
-                    "matcher": matcher,
-                    "command": cmd,
-                    "timeout": _safe_float(inner.get("timeout", 60.0), 60.0),
-                })
-        if flat:
-            out[internal_event] = flat
+    _merge_hooks_block(plugin_dir.name, cc_hooks, out)
+    return out
+
+
+def _merge_hooks_from_file(
+    plugin_dir: Path, hooks_path: str, into: dict[str, list[dict]]
+) -> None:
+    """Read a hooks JSON file and merge its entries into *into*."""
+    resolved = (plugin_dir / hooks_path).resolve()
+    if not resolved.exists() or not resolved.is_file():
+        return
+    try:
+        data = json.loads(resolved.read_text(encoding="utf-8"))
+    except Exception as exc:
+        shared.CONSOLE.print(
+            f"[yellow]Plugin '{plugin_dir.name}': hooks file '{hooks_path}' "
+            f"unreadable: {exc}[/yellow]"
+        )
+        return
+    hooks_block = data if isinstance(data, dict) else {}
+    # Handle both {"hooks": {...}} and bare {"EventName": [...]}
+    source = hooks_block.get("hooks", hooks_block)
+    if not isinstance(source, dict):
+        return
+    _merge_hooks_block(plugin_dir.name, source, into)
+
+
+def _read_mcp_json(plugin_dir: Path, plugin_name: str | None = None) -> list[dict]:
+    """Read ``.mcp.json`` at the plugin root and return MCP server configs.
+
+    Claude Code's standard location for MCP servers bundled by a plugin.
+    Format is ``{"mcpServers": {"name": {...}, ...}}`` — a dict keyed by
+    server name.  Returns a flat list of configs each with ``"name"`` set.
+    """
+    mf = plugin_dir / ".mcp.json"
+    if not mf.exists():
+        return []
+    try:
+        data = json.loads(mf.read_text(encoding="utf-8"))
+    except Exception as exc:
+        shared.CONSOLE.print(
+            f"[yellow]Plugin '{plugin_dir.name}': .mcp.json unreadable: {exc}[/yellow]"
+        )
+        return []
+    servers = data.get("mcpServers", data)
+    if not isinstance(servers, dict):
+        return []
+    env = _plugin_substitution_env(plugin_dir, plugin_name or plugin_dir.name)
+    out: list[dict] = []
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            cfg = {}
+        normalized = {"name": name, **cfg}
+        normalized = _substitute_plugin_vars(normalized, env)
+        server_env = dict(normalized.get("env", {}) or {})
+        normalized["env"] = {**env, **server_env}
+        out.append(normalized)
     return out
 
 
@@ -277,11 +465,28 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
         # No manifest at all — synthesise minimal meta if any standard
         # subdir exists (so claude-plugin packages without a plugin.json
         # still expose their skills/commands/agents).
-        if not (plugin_dir / "skills").is_dir() and not (plugin_dir / "commands").is_dir():
+        if (
+            not (plugin_dir / "skills").is_dir()
+            and not (plugin_dir / "commands").is_dir()
+            and not (plugin_dir / "agents").is_dir()
+            and not (plugin_dir / "SKILL.md").is_file()
+        ):
             return None
-        return PluginMeta(name=plugin_dir.name)
+        skills = ["skills"] if (plugin_dir / "skills").is_dir() else []
+        if not skills and (plugin_dir / "SKILL.md").is_file():
+            skills = ["."]
+        commands = ["commands"] if (plugin_dir / "commands").is_dir() else []
+        agents = ["agents"] if (plugin_dir / "agents").is_dir() else []
+        return PluginMeta(
+            name=plugin_dir.name,
+            skills=skills,
+            commands=commands,
+            agents=agents,
+        )
     try:
         data = json.loads(pj.read_text(encoding="utf-8"))
+        plugin_name = str(data.get("name", plugin_dir.name) or plugin_dir.name)
+        plugin_env = _plugin_substitution_env(plugin_dir, plugin_name)
         mcp = data.get("mcp_servers")
         if mcp is None:
             mcp = data.get("mcpServers", [])
@@ -296,40 +501,88 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
             if mcp_path.exists():
                 mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
                 if isinstance(mcp, dict):
-                    mcp = [mcp]
+                    servers = mcp.get("mcpServers", mcp)
+                    if isinstance(servers, dict):
+                        mcp = [
+                            {"name": k, **(v if isinstance(v, dict) else {})}
+                            for k, v in servers.items()
+                        ]
+                    else:
+                        mcp = [mcp]
             else:
                 mcp = []
+        elif isinstance(mcp, list):
+            normalized_mcp = []
+            for item in mcp:
+                if isinstance(item, str):
+                    mcp_path = plugin_dir / item
+                    if not mcp_path.exists():
+                        continue
+                    loaded = json.loads(mcp_path.read_text(encoding="utf-8"))
+                    servers = loaded.get("mcpServers", loaded) if isinstance(loaded, dict) else {}
+                    if isinstance(servers, dict):
+                        normalized_mcp.extend(
+                            {"name": k, **(v if isinstance(v, dict) else {})}
+                            for k, v in servers.items()
+                        )
+                elif isinstance(item, dict):
+                    normalized_mcp.append(item)
+            mcp = normalized_mcp
+        if isinstance(mcp, list):
+            substituted_mcp = []
+            for item in mcp:
+                if not isinstance(item, dict):
+                    continue
+                normalized = _substitute_plugin_vars(item, plugin_env)
+                server_env = dict(normalized.get("env", {}) or {})
+                normalized["env"] = {**plugin_env, **server_env}
+                substituted_mcp.append(normalized)
+            mcp = substituted_mcp
         raw_hooks: dict[str, list[dict]] = {}
         hook_matchers: dict[str, re.Pattern] = {}
         hook_timeouts: dict[str, float] = {}
-        hooks_cfg = data.get("hooks", {})
-        if isinstance(hooks_cfg, dict):
-            for hook_name, entries in hooks_cfg.items():
-                if not isinstance(entries, list):
-                    continue
-                raw_hooks[hook_name] = []
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    raw_hooks[hook_name].append(entry)
-                    if isinstance(entry.get("timeout"), (int, float)):
-                        hook_timeouts[hook_name] = max(0.0, _safe_float(entry["timeout"], 60.0))
-                    matcher = str(entry.get("matcher", "") or "").strip()
-                    if matcher and matcher != "*":
-                        try:
-                            hook_matchers[hook_name] = re.compile(matcher)
-                        except re.error:
-                            pass
+        hooks_cfg = data.get("hooks")
+        if isinstance(hooks_cfg, str):
+            # Path string: "hooks": "./hooks/hooks.json" or "./my-hooks.json"
+            _merge_hooks_from_file(plugin_dir, hooks_cfg, raw_hooks)
+        elif isinstance(hooks_cfg, list):
+            # Array of paths: "hooks": ["./a.json", "./b.json"]
+            for hook_path in hooks_cfg:
+                if isinstance(hook_path, str):
+                    _merge_hooks_from_file(plugin_dir, hook_path, raw_hooks)
+        elif isinstance(hooks_cfg, dict):
+            _merge_hooks_block(plugin_name, hooks_cfg, raw_hooks)
+        for hook_name, entries in raw_hooks.items():
+            for entry in entries:
+                if isinstance(entry.get("timeout"), (int, float)):
+                    hook_timeouts[hook_name] = max(0.0, _safe_float(entry["timeout"], 60.0))
+                matcher = str(entry.get("matcher", "") or "").strip()
+                if matcher and matcher != "*":
+                    try:
+                        hook_matchers[hook_name] = re.compile(matcher)
+                    except re.error:
+                        pass
         # Skills path defaults to ``skills`` subdir when not declared and
         # the directory exists — matches Claude Code's convention-over-config.
-        skills_field = data.get("skills", "")
-        if not skills_field and (plugin_dir / "skills").is_dir():
-            skills_field = "skills"
+        skills_field = _as_path_list(data.get("skills"))
+        if (plugin_dir / "skills").is_dir():
+            skills_field.insert(0, "skills")
+        if not skills_field and (plugin_dir / "SKILL.md").is_file():
+            skills_field = ["."]
+        skills_field = _dedupe_paths(skills_field)
+        commands_field = _as_path_list(data.get("commands"))
+        if not commands_field and (plugin_dir / "commands").is_dir():
+            commands_field = ["commands"]
+        agents_field = _as_path_list(data.get("agents"))
+        if not agents_field and (plugin_dir / "agents").is_dir():
+            agents_field = ["agents"]
         return PluginMeta(
-            name=data.get("name", plugin_dir.name),
+            name=plugin_name,
             version=data.get("version", ""),
             description=data.get("description", ""),
             skills=skills_field,
+            commands=commands_field,
+            agents=agents_field,
             mcp_servers=mcp if isinstance(mcp, list) else [],
             hooks_config=raw_hooks,
             hook_matchers=hook_matchers,
@@ -347,6 +600,10 @@ def _read_marketplace_manifest(dir_path: Path) -> Optional[list[tuple[Path, str]
     relative ``source`` path.  Returns ``[(plugin_dir, plugin_name), ...]``
     when a marketplace is found, ``None`` otherwise.
     """
+    if (dir_path / ".claude-plugin" / "plugin.json").exists() or (
+        dir_path / "plugin.json"
+    ).exists():
+        return None
     mp = dir_path / ".claude-plugin" / "marketplace.json"
     if not mp.exists():
         return None
@@ -394,6 +651,48 @@ def _substitute_command_args(body: str, args_text: str) -> str:
     for i in range(len(tokens), 0, -1):
         out = out.replace(f"${i}", tokens[i - 1])
     return out
+
+
+def _hook_result_from_json(raw: dict[str, Any], event_name: str) -> Optional[HookResult]:
+    """Translate Claude Code hook JSON output to the local HookResult shape."""
+    if raw.get("continue") is False:
+        return HookResult(
+            action="block",
+            message=str(raw.get("stopReason", "") or "stopped by hook"),
+        )
+    decision = str(raw.get("decision", "") or "")
+    if decision == "block":
+        reason = str(raw.get("reason", "") or raw.get("message", "") or "blocked")
+        if event_name == "on_turn_end":
+            return HookResult(action="continue", message=reason)
+        return HookResult(action="block", message=reason)
+    specific = raw.get("hookSpecificOutput")
+    if not isinstance(specific, dict):
+        if any(key in raw for key in ("action", "message", "context")):
+            return HookResult(
+                action=str(raw.get("action", "noop")),
+                message=str(raw.get("message", "")),
+                context=str(raw.get("context", "")),
+            )
+        return None
+    additional_context = str(specific.get("additionalContext", "") or "")
+    if event_name == "on_pre_tool":
+        permission = str(specific.get("permissionDecision", "") or "")
+        if permission in {"deny", "block"}:
+            return HookResult(
+                action="block",
+                message=str(
+                    specific.get("permissionDecisionReason", "")
+                    or specific.get("reason", "")
+                    or "blocked"
+                ),
+            )
+        if additional_context:
+            return HookResult(action="context", context=additional_context)
+    if event_name in {"on_post_tool", "on_prompt_submit", "on_turn_end"}:
+        if additional_context:
+            return HookResult(action="context", context=additional_context)
+    return None
 
 
 def _make_markdown_command_handler(
@@ -495,6 +794,9 @@ class PluginCatalog:
         self._bundled_skills: list[tuple[str, Path]] = []
         # MCP configs bundled by plugins: list of (plugin_name, server_config_dict)
         self._bundled_mcp: list[tuple[str, dict]] = []
+        # plugin_name → source directory entry name (the directory under
+        # USER_PLUGINS_DIR or PLUGINS_DIR that this plugin was loaded from).
+        self._plugin_source_dirs: dict[str, str] = {}
         # Agent definitions discovered from <plugin>/agents/*.md.
         # Key format: "plugin:<plugin>:<agent>".  Value: dict with keys
         # ``name``, ``description``, ``body``, ``plugin``, ``path``.
@@ -529,6 +831,7 @@ class PluginCatalog:
         self._bundled_skills.clear()
         self._bundled_mcp.clear()
         self._agent_defs.clear()
+        self._plugin_source_dirs.clear()
         _slash_command_owners: dict[str, str] = {}  # cmd_key → owning plugin name
 
         # Auto-create user plugins directory
@@ -551,6 +854,7 @@ class PluginCatalog:
                         plugin_dir,
                         source=source,
                         name_hint=plugin_name_hint,
+                        source_dir_name=entry_dir.name,
                         slash_command_owners=_slash_command_owners,
                     )
         return [name for name in self._plugins]
@@ -573,6 +877,7 @@ class PluginCatalog:
         *,
         source: str,
         name_hint: str,
+        source_dir_name: str = "",
         slash_command_owners: dict[str, str],
     ) -> None:
         # P0-3: reject directory names that could collide with real modules.
@@ -661,21 +966,26 @@ class PluginCatalog:
 
         # Record (user overrides builtin with the same plugin name).
         self._plugins[plugin_name] = (plugin, meta)
+        if source_dir_name:
+            self._plugin_source_dirs[plugin_name] = source_dir_name
 
         # Bundled skills (declarative — works for both formats).
-        if meta.skills:
-            skills_path = (plugin_dir / meta.skills).resolve()
+        for skills_rel in meta.skills:
+            skills_path = (plugin_dir / skills_rel).resolve()
             if skills_path.is_dir():
                 self._bundled_skills.append((plugin_name, skills_path))
 
-        # Bundled MCP configs.
+        # Bundled MCP configs — from plugin.json and .mcp.json.
         for mcp_cfg in meta.mcp_servers:
+            if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
+                self._bundled_mcp.append((plugin_name, mcp_cfg))
+        for mcp_cfg in _read_mcp_json(plugin_dir, plugin_name):
             if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
                 self._bundled_mcp.append((plugin_name, mcp_cfg))
 
         # Declarative commands and agents (Claude Code / Codex convention).
-        self._load_command_files(plugin_dir, plugin_name, slash_command_owners)
-        self._load_agent_files(plugin_dir, plugin_name)
+        self._load_command_files(plugin_dir, plugin_name, slash_command_owners, meta.commands)
+        self._load_agent_files(plugin_dir, plugin_name, meta.agents)
 
         # Merge Claude Code's hooks/hooks.json (if present) into hooks_config.
         # Existing plugin.json hooks win on the same event key.
@@ -694,6 +1004,7 @@ class PluginCatalog:
         plugin_dir: Path,
         plugin_name: str,
         slash_command_owners: dict[str, str],
+        command_paths: list[str] | None = None,
     ) -> None:
         """Register every ``commands/*.md`` as a namespaced slash command.
 
@@ -703,12 +1014,21 @@ class PluginCatalog:
         substituted; the CLI loop treats a returned string as the next user
         input, so the agent processes the command body as a turn.
         """
-        commands_dir = plugin_dir / "commands"
-        if not commands_dir.is_dir():
+        paths = command_paths if command_paths else (
+            ["commands"] if (plugin_dir / "commands").is_dir() else []
+        )
+        if not paths:
             return
         from agent.skills.catalog import parse_skill_markdown
 
-        for cmd_file in sorted(commands_dir.rglob("*.md")):
+        cmd_files: list[Path] = []
+        for rel in paths:
+            target = (plugin_dir / rel).resolve()
+            if target.is_file() and target.suffix == ".md":
+                cmd_files.append(target)
+            elif target.is_dir():
+                cmd_files.extend(sorted(target.rglob("*.md")))
+        for cmd_file in sorted(set(cmd_files)):
             if cmd_file.name.lower() == "readme.md":
                 continue
             stem = cmd_file.stem
@@ -743,18 +1063,27 @@ class PluginCatalog:
             self._slash_commands[cmd_key] = handler
             slash_command_owners[cmd_key] = plugin_name
 
-    def _load_agent_files(self, plugin_dir: Path, plugin_name: str) -> None:
-        """Register every ``agents/*.md`` as a named role for spawn_agent.
-
-        The role identifier is ``plugin:<plugin>:<agent>``; the body of the
-        markdown is used as ``system_suffix`` when spawn_agent dispatches.
-        """
-        agents_dir = plugin_dir / "agents"
-        if not agents_dir.is_dir():
+    def _load_agent_files(
+        self,
+        plugin_dir: Path,
+        plugin_name: str,
+        agent_paths: list[str] | None = None,
+    ) -> None:
+        paths = agent_paths if agent_paths else (
+            ["agents"] if (plugin_dir / "agents").is_dir() else []
+        )
+        if not paths:
             return
         from agent.skills.catalog import parse_skill_markdown
 
-        for agent_file in sorted(agents_dir.rglob("*.md")):
+        agent_files: list[Path] = []
+        for rel in paths:
+            target = (plugin_dir / rel).resolve()
+            if target.is_file() and target.suffix == ".md":
+                agent_files.append(target)
+            elif target.is_dir():
+                agent_files.extend(sorted(target.rglob("*.md")))
+        for agent_file in sorted(set(agent_files)):
             if agent_file.name.lower() == "readme.md":
                 continue
             stem = agent_file.stem
@@ -890,6 +1219,13 @@ class PluginCatalog:
             "removed_plugins": sorted(removed),
             "newly_connected_mcp": connected_mcp_names,
             "total_loaded": len(loaded),
+        }
+
+    def get_loaded_names_for_directory(self, dir_name: str) -> set[str]:
+        """Return the set of loaded plugin names that originate from *dir_name*."""
+        return {
+            name for name, src_dir in self._plugin_source_dirs.items()
+            if src_dir == dir_name
         }
 
     def get_bundled_skills(self) -> list[tuple[str, Path]]:
@@ -1032,11 +1368,9 @@ class PluginCatalog:
                 try:
                     raw = json.loads(stdout_bytes.decode("utf-8"))
                     if isinstance(raw, dict):
-                        results.append(HookResult(
-                            action=str(raw.get("action", "noop")),
-                            message=str(raw.get("message", "")),
-                            context=str(raw.get("context", "")),
-                        ))
+                        parsed_result = _hook_result_from_json(raw, event_name)
+                        if parsed_result is not None:
+                            results.append(parsed_result)
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
             except asyncio.TimeoutError:

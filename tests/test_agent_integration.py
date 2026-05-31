@@ -324,7 +324,7 @@ user-invocable: true
     assert payload["ok"] is False
     assert "not found" in payload["error"]
     assert "Did you mean" in payload["error"]
-    assert "webwright" in payload.get("candidates", [])
+    assert "webwright:webwright" in payload.get("candidates", [])
 
 
 def test_orchestration_planner_exposes_policy_from_skill_metadata(tmp_path):

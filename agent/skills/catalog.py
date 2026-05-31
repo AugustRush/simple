@@ -185,7 +185,14 @@ class SkillCatalog:
         bundle_dir = skill_file.parent
         bundle_id = bundle_dir.relative_to(root).as_posix()
         if not bundle_id or bundle_id == ".":
-            bundle_id = bundle_dir.name
+            if source.startswith("plugin:") and metadata.get("name"):
+                bundle_id = str(metadata.get("name"))
+            else:
+                bundle_id = bundle_dir.name
+        if source.startswith("plugin:"):
+            plugin_name = source.split(":", 1)[1]
+            if plugin_name and not bundle_id.startswith(f"{plugin_name}:"):
+                bundle_id = f"{plugin_name}:{bundle_id}"
         supporting_files = sorted(
             p.relative_to(bundle_dir).as_posix()
             for p in bundle_dir.rglob("*")
@@ -215,9 +222,11 @@ class SkillCatalog:
         for skill_id, bundle in self._skills.items():
             self._aliases[skill_id] = skill_id
             leaf = skill_id.rsplit("/", 1)[-1]
-            if counts.get(leaf, 0) == 1:
+            is_plugin_skill = bundle.source.startswith("plugin:")
+            if counts.get(leaf, 0) == 1 and not is_plugin_skill:
                 self._aliases[leaf] = skill_id
-            self._aliases[bundle.name] = skill_id
+            if not is_plugin_skill:
+                self._aliases[bundle.name] = skill_id
 
     def reload(self) -> None:
         self.load_all()
@@ -259,7 +268,7 @@ class SkillCatalog:
         lines = [
             "## Available Skills",
             "Available skills:",
-            "Skills are instruction bundles loaded on demand. Use activate_skill only when a skill is relevant.",
+            "Skills are instruction bundles loaded on demand. When a user's task matches a skill's description, use activate_skill to load it instead of reimplementing its functionality yourself. Never write manual scripts to replicate what an available skill already does.",
         ]
         for bundle in self.list_skills():
             lines.append(
