@@ -256,27 +256,56 @@ class ChannelRunner:
             ctx.metadata["skill_catalog"] = skill_catalog
 
             # /cancel arrives asynchronously in channel mode — cancel the
-            # running turn.  Plain /cancel is graceful (lets the current
-            # tool complete, runs SIGTERM/cleanups, picks up at next safe
-            # point).  /cancel force is hard (SIGKILL shell processes,
-            # aborts LLM HTTP request mid-stream).
-            cancel_text = msg.text.strip().lower()
-            if cancel_text in ("/cancel", "cancel"):
-                if state.cancel_token is not None:
-                    state.cancel_token.cancel()
-                sink.on_status(
-                    "已发送取消信号，当前任务将在下一个安全点停止",
-                    level="warning",
-                )
-                return True
-            if cancel_text in ("/cancel force", "/cancel -f", "/kill"):
-                if state.cancel_token is not None:
+            # running turn.  Default is force-cancel (aborts LLM mid-flight,
+            # SIGKILL subprocesses) for instant feedback.  Add "graceful" for
+            # the old safe-point behaviour.
+            stripped = msg.text.strip()
+            cancel_lower = stripped.lower()
+            if cancel_lower == "/cancel" or cancel_lower == "cancel":
+                if state.turn_in_progress and state.cancel_token is not None:
                     state.cancel_token.cancel("force")
-                sink.on_status(
-                    "已发送强制取消（SIGKILL 进程 + 中断 LLM 请求）",
-                    level="warning",
-                )
+                    sink.on_status(
+                        "已强制取消当前任务（中断 LLM + 终止子进程）",
+                        level="warning",
+                    )
+                else:
+                    sink.on_status("当前没有正在运行的任务", level="info")
                 return True
+            if cancel_lower in ("/cancel graceful", "cancel graceful"):
+                if state.turn_in_progress and state.cancel_token is not None:
+                    state.cancel_token.cancel()
+                    sink.on_status(
+                        "已发送取消信号，当前任务将在下一个安全点停止",
+                        level="warning",
+                    )
+                else:
+                    sink.on_status("当前没有正在运行的任务", level="info")
+                return True
+            # /cancel <message> — cancel + restart with a new task in one message.
+            if cancel_lower.startswith("/cancel ") or cancel_lower.startswith("cancel "):
+                payload = stripped.split(None, 1)[1] if len(stripped.split(None, 1)) > 1 else ""
+                if not payload:
+                    sink.on_status(
+                        "/cancel <任务描述> 可以取消当前任务并立即开始新任务",
+                        level="warning",
+                    )
+                    return True
+                if state.turn_in_progress and state.cancel_token is not None:
+                    state.cancel_token.cancel("force")
+                    state.pending_messages.append({
+                        "text": payload,
+                        "from_user": msg.metadata.get("user_id", "") or msg.metadata.get("sender", ""),
+                        "arrived_at": time.time(),
+                        "urgency": "now",
+                    })
+                    sink.on_status(
+                        f"已取消当前任务，将在取消完成后开始：{payload[:60]}",
+                        level="warning",
+                    )
+                    return True
+                # No turn running — treat payload as a normal message.
+                msg.text = payload
+                # Fall through to normal turn dispatch.
 
             # ── Interjection mailbox ──────────────────────────────────────
             # If a turn is currently running for this session, NEW user
@@ -318,70 +347,86 @@ class ChannelRunner:
                 return True
 
             # No turn in progress — proceed with normal turn dispatch.
-            # Fresh token for each turn so stale cancellations don't leak.
-            state.cancel_token = CancelToken()
-            state.turn_in_progress = True
-            try:
-                _interaction_log(
-                    "turn_started",
-                    session_id=session_id,
-                    channel=msg.channel_name,
-                    message_id=msg.metadata.get("message_id"),
-                    chat_id=msg.metadata.get("chat_id"),
-                    text_len=len(msg.text),
-                    text_preview=_preview_text(msg.text),
-                )
-                _trace_latency(
-                    "message_handler_started",
-                    session_id=session_id,
-                    channel=msg.channel_name,
-                    message_id=msg.metadata.get("message_id"),
-                    chat_id=msg.metadata.get("chat_id"),
-                    sink=type(sink).__name__,
-                    text_len=len(msg.text),
-                )
-                agent_started_at = time.perf_counter()
-                turn_input = TurnInput.from_text(
-                    msg.text,
-                    session_id=session_id,
-                    channel_name=msg.channel_name,
-                    metadata=msg.metadata,
-                    attachments=msg.attachments,
-                )
-                execution = await agent_core.handle_turn(
-                    turn_input,
-                    state,
-                    sink=sink,
-                )
-                if execution.blocked:
+            # Wrap turn processing in a small loop so that after a cancelled
+            # turn, pending restart messages (from /cancel <msg>) are picked
+            # up and processed as a new turn without the user needing to send
+            # another message.
+            turn_text = msg.text
+            while True:
+                # Fresh token for each turn so stale cancellations don't leak.
+                state.cancel_token = CancelToken()
+                state.turn_in_progress = True
+                try:
+                    _interaction_log(
+                        "turn_started",
+                        session_id=session_id,
+                        channel=msg.channel_name,
+                        message_id=msg.metadata.get("message_id"),
+                        chat_id=msg.metadata.get("chat_id"),
+                        text_len=len(turn_text),
+                        text_preview=_preview_text(turn_text),
+                    )
+                    _trace_latency(
+                        "message_handler_started",
+                        session_id=session_id,
+                        channel=msg.channel_name,
+                        message_id=msg.metadata.get("message_id"),
+                        chat_id=msg.metadata.get("chat_id"),
+                        sink=type(sink).__name__,
+                        text_len=len(turn_text),
+                    )
+                    agent_started_at = time.perf_counter()
+                    turn_input = TurnInput.from_text(
+                        turn_text,
+                        session_id=session_id,
+                        channel_name=msg.channel_name,
+                        metadata=msg.metadata,
+                        attachments=msg.attachments,
+                    )
+                    execution = await agent_core.handle_turn(
+                        turn_input,
+                        state,
+                        sink=sink,
+                    )
+                    if execution.blocked:
+                        for event in execution.events:
+                            self._log_runtime_event(event)
+                        return False
+                    result = execution.result
                     for event in execution.events:
                         self._log_runtime_event(event)
-                    return False
-                result = execution.result
-                for event in execution.events:
-                    self._log_runtime_event(event)
 
-            except Exception as exc:
-                _interaction_log(
-                    "turn_failed",
-                    session_id=session_id,
-                    channel=msg.channel_name,
-                    message_id=msg.metadata.get("message_id"),
-                    error=str(exc),
-                )
-                sink.on_error(str(exc))
-                if hasattr(sink, "drain"):
-                    await sink.drain()
-            finally:
-                _trace_latency(
-                    "message_handler_finished",
-                    session_id=session_id,
-                    channel=msg.channel_name,
-                    message_id=msg.metadata.get("message_id"),
-                    duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
-                    turn_count=state.turn_count,
-                )
-                state.turn_in_progress = False
+                except Exception as exc:
+                    _interaction_log(
+                        "turn_failed",
+                        session_id=session_id,
+                        channel=msg.channel_name,
+                        message_id=msg.metadata.get("message_id"),
+                        error=str(exc),
+                    )
+                    sink.on_error(str(exc))
+                    if hasattr(sink, "drain"):
+                        await sink.drain()
+                finally:
+                    _trace_latency(
+                        "message_handler_finished",
+                        session_id=session_id,
+                        channel=msg.channel_name,
+                        message_id=msg.metadata.get("message_id"),
+                        duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
+                        turn_count=state.turn_count,
+                    )
+                    state.turn_in_progress = False
+
+                # After a cancelled turn, drain a pending restart message and
+                # loop to process it as a fresh turn.  Only one auto-restart
+                # is performed per handler invocation to prevent runaway loops.
+                if state.pending_messages:
+                    next_entry = state.pending_messages.pop(0)
+                    turn_text = next_entry["text"]
+                    if next_entry.get("urgency") == "now":
+                        continue
+                break
 
             return True
 

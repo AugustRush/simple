@@ -4,8 +4,10 @@ import asyncio
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import re
+import signal
 import sys
 from typing import Any, Optional
 
@@ -389,6 +391,41 @@ async def _build_scheduler_service(
     return service, store, components if owned_components else None
 
 
+# ── CLI SIGINT handler (Ctrl+C → cancel turn, not exit process) ──────────
+# Module-level state so the signal handler can reach the current token.
+_current_cancel_token: Optional[CancelToken] = None
+_sigint_count = 0
+
+
+def _cli_sigint_handler(signum: int, frame: Any) -> None:
+    """Convert SIGINT to CancelToken.cancel() when a turn is running.
+
+    First  Ctrl+C: graceful cancel (SIGTERM to subprocesses, cooperative check).
+    Second Ctrl+C: force cancel (SIGKILL, abort LLM HTTP request).
+    Third  Ctrl+C: restore default handler and exit.
+    """
+    global _sigint_count
+    _sigint_count += 1
+    token = _current_cancel_token
+    if token is None:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+        return
+    if _sigint_count == 1:
+        token.cancel()
+        shared.CONSOLE.print(
+            "\n[yellow](Ctrl+C) 正在取消当前任务… (再按一次 Ctrl+C 强制取消)[/yellow]"
+        )
+    elif _sigint_count == 2:
+        token.cancel("force")
+        shared.CONSOLE.print(
+            "\n[red](Ctrl+C) 已强制取消 (SIGKILL + 中断 LLM 请求)[/red]"
+        )
+    else:
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)
+
+
 async def _interactive_loop(components: dict, cfg: dict):
     """Main interactive chat loop."""
     agent: BaseAgent = components["agent"]
@@ -474,6 +511,7 @@ async def _interactive_loop(components: dict, cfg: dict):
     # Notify all plugins that the session has started.
     plugin_catalog.fire_session_start(components)
 
+    old_sigint = signal.signal(signal.SIGINT, _cli_sigint_handler)
     try:
         while True:
             try:
@@ -933,6 +971,9 @@ async def _interactive_loop(components: dict, cfg: dict):
                 # Fresh cancel token for each turn — any stale cancellation
                 # from a previous turn must not affect this one.
                 state.cancel_token = CancelToken()
+                global _current_cancel_token, _sigint_count
+                _current_cancel_token = state.cancel_token
+                _sigint_count = 0
                 shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
                 ctx.metadata["skill_catalog"] = skill_catalog
                 await _agent_core_for_components(components).handle_turn(
@@ -942,8 +983,11 @@ async def _interactive_loop(components: dict, cfg: dict):
                 )
             except Exception as e:
                 shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
+            finally:
+                _current_cancel_token = None
 
     finally:
+        signal.signal(signal.SIGINT, old_sigint)
         if memory_worker:
             memory_worker.stop()
             await memory_worker.wait()

@@ -44,7 +44,10 @@ WEB_USER_AGENT = (
 
 def _looks_like_plugin(dir_path: Path) -> bool:
     """Return True if *dir_path* contains at least one recognisable plugin marker."""
-    if (dir_path / "plugin.json").exists() or (dir_path / ".claude-plugin" / "plugin.json").exists():
+    cc_plugin = dir_path / ".claude-plugin"
+    if (dir_path / "plugin.json").exists() or (cc_plugin / "plugin.json").exists():
+        return True
+    if (cc_plugin / "marketplace.json").exists():
         return True
     if (dir_path / "__init__.py").exists():
         return True
@@ -721,7 +724,45 @@ class BuiltinTools:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            _, stderr = await proc.communicate()
+
+            # Register cleanup so /cancel kills the clone.
+            def _cancel_clone(level: str) -> None:
+                sig = signal.SIGKILL if level == "force" else signal.SIGTERM
+                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                    proc.send_signal(sig)
+
+            active_token = shared._active_cancel_token.get()
+            _deregister_proc = (
+                active_token.register_cleanup(
+                    f"git-clone:{source[:60]}", _cancel_clone
+                )
+                if active_token is not None
+                else (lambda: None)
+            )
+
+            # Heartbeat to keep the watchdog alive during long clones.
+            async def _heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(10)
+                    try:
+                        report_tool_progress(
+                            status="cloning",
+                            message=f"git clone {source[:80]} in progress",
+                        )
+                    except Exception:
+                        pass
+
+            heartbeat_task = asyncio.create_task(_heartbeat())
+            try:
+                _, stderr = await proc.communicate()
+            finally:
+                _deregister_proc()
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
             if proc.returncode != 0:
                 return {
                     "ok": False,
@@ -797,6 +838,7 @@ class BuiltinTools:
     def _list_installed_plugins(self) -> dict:
         plugin_catalog = self.registry.get_context("plugin_catalog")
         loaded_names: set[str] = set()
+        has_marketplace_support = hasattr(plugin_catalog, "get_loaded_names_for_directory")
         if plugin_catalog is not None and hasattr(plugin_catalog, "list_plugins"):
             try:
                 loaded_names = {
@@ -811,7 +853,12 @@ class BuiltinTools:
             for entry in sorted(shared.USER_PLUGINS_DIR.iterdir()):
                 if not entry.is_dir():
                     continue
+                # Check if the directory name matches a loaded plugin, OR
+                # if it's a marketplace directory, check its sub-plugins.
                 is_loaded = entry.name in loaded_names
+                if not is_loaded and has_marketplace_support:
+                    sub_names = plugin_catalog.get_loaded_names_for_directory(entry.name)
+                    is_loaded = bool(sub_names)
                 if is_loaded:
                     user_dir_loaded_count += 1
                 on_disk.append({
