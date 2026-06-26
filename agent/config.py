@@ -604,7 +604,9 @@ def _compose_system_prompt(
             builtin_names = {n for n, _ in groups["builtin"]}
             if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
                 lines.append(
-                    f"Workspace root for read_file/write_file/list_files only: {workspace_root}"
+                    f"Workspace root for read_file/list_files only: {workspace_root}. "
+                    "write_file writes generated files to output_dir by default; "
+                    "workspace writes require an explicit write_scope."
                 )
             if "schedule_create" in builtin_names:
                 lines.append(
@@ -631,7 +633,8 @@ def _compose_system_prompt(
                     "Shell commands run in an isolated sandbox directory by default "
                     f"({sandbox_hint}), NOT the workspace root ({workspace_root}). "
                     "Downloads, clones, and generated artifacts go there automatically. "
-                    "Only set cwd explicitly when you need to operate on workspace files."
+                    "Only set cwd explicitly when you need to operate on workspace files; "
+                    "new files accidentally created in the workspace are moved to output_dir."
                 )
                 lines.append(
                     "Avoid absolute path arguments in shell commands. For current project files, "

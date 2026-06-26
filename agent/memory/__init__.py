@@ -2,6 +2,7 @@
 
 from .system import (
     BackgroundMemoryWorker,
+    AgentRuntimeEvent,
     ConsolidationEngine,
     ContextManager,
     ConversationTurn,
@@ -12,12 +13,14 @@ from .system import (
     LocalRetriever,
     MemoryPalace,
     ResolvedFact,
+    SessionWorkingState,
     StagingBuffer,
     normalize_memory_chapter,
 )
 
 __all__ = [
     "BackgroundMemoryWorker",
+    "AgentRuntimeEvent",
     "ConsolidationEngine",
     "ContextManager",
     "ConversationTurn",
@@ -28,6 +31,7 @@ __all__ = [
     "LocalRetriever",
     "MemoryPalace",
     "ResolvedFact",
+    "SessionWorkingState",
     "StagingBuffer",
     "normalize_memory_chapter",
 ]

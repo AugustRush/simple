@@ -32,6 +32,7 @@ from agent.orchestration.runtime import (
 from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlanner
 from agent.pathing import canonicalize_user_path, resolve_workspace_path
 from agent.plugins.catalog import PluginCatalog
+from agent.runtime.heartbeat import HeartbeatWriter
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry
@@ -604,6 +605,10 @@ class BaseAgent:
     def _resolve_output_contract_path(self, raw_path: str) -> Path:
         output_dir_str = self.registry.get_context("output_dir")
         output_dir = Path(output_dir_str) if output_dir_str else None
+        if output_dir is not None:
+            candidate = Path(raw_path).expanduser()
+            if not candidate.is_absolute():
+                return (output_dir / candidate).resolve(strict=False)
         workspace_root = self.workspace_root or Path.cwd()
         resolved, _root_kind = resolve_workspace_path(
             raw_path,
@@ -1946,6 +1951,7 @@ class BaseAgent:
             "detail": "",
             "started_at": time.monotonic(),
             "active": True,
+            "current_tool": None,
         }
         content_filter_recovered_response: Any | None = None
         content_filter_submitted_tool_uses: list[dict] | None = None
@@ -1985,9 +1991,34 @@ class BaseAgent:
         # inside the try/finally so they are always cleaned up on error.
         # Start the per-turn heartbeat task here so it sees the active sink.
         from agent.core.output import _active_sink as _hb_sink_var
-        _hb_interval = 5.0
+        _hb_interval = float(ctx.metadata.get("heartbeat_interval", 5.0) or 5.0)
+        if _hb_interval <= 0:
+            _hb_interval = 5.0
+        heartbeat_writer: HeartbeatWriter | None = None
+        if ctx.metadata.get("heartbeat_enabled", True) is not False:
+            heartbeat_writer = HeartbeatWriter(
+                session_id=str(ctx.metadata.get("session_id") or ctx.agent_id),
+                agent_id=ctx.agent_id,
+                path=ctx.metadata.get("heartbeat_path"),
+            )
+
+        def _write_runtime_heartbeat(*, status: str = "running", active: bool = True) -> None:
+            if heartbeat_writer is None:
+                return
+            pending = ctx.metadata.get("pending_messages") or []
+            with shared._suppress_with_log("heartbeat writer failed"):
+                heartbeat_writer.write(
+                    state=str(heartbeat_state["op"]),
+                    detail=str(heartbeat_state["detail"]),
+                    current_tool=heartbeat_state.get("current_tool"),
+                    turn_id=str(ctx.metadata.get("turn_id") or ""),
+                    pending_messages=len(pending),
+                    active=active,
+                    status=status,
+                )
 
         async def _heartbeat_tick() -> None:
+            _write_runtime_heartbeat()
             while heartbeat_state["active"]:
                 try:
                     await asyncio.sleep(_hb_interval)
@@ -1995,6 +2026,7 @@ class BaseAgent:
                     return
                 if not heartbeat_state["active"]:
                     return
+                _write_runtime_heartbeat()
                 sink = _hb_sink_var.get()
                 if sink is None:
                     continue
@@ -2084,6 +2116,10 @@ class BaseAgent:
                     heartbeat_state["op"] = "LLM"
                     heartbeat_state["detail"] = self.model
                     heartbeat_state["started_at"] = time.monotonic()
+                    heartbeat_state["current_tool"] = None
+                    if heartbeat_writer is not None:
+                        heartbeat_writer.mark_progress()
+                    _write_runtime_heartbeat()
                     if content_filter_recovered_response is not None:
                         response = content_filter_recovered_response
                         content_filter_recovered_response = None
@@ -2162,6 +2198,10 @@ class BaseAgent:
                             tu["name"] for tu in tool_uses[:3]
                         ) + (f" +{len(tool_uses) - 3}" if len(tool_uses) > 3 else "")
                         heartbeat_state["started_at"] = time.monotonic()
+                        heartbeat_state["current_tool"] = heartbeat_state["detail"]
+                        if heartbeat_writer is not None:
+                            heartbeat_writer.mark_progress()
+                        _write_runtime_heartbeat()
                         try:
                             results = await self._run_tool_uses(
                                 tool_uses,
@@ -2323,6 +2363,13 @@ class BaseAgent:
         finally:
             _active_agent_context.reset(_active_ctx_token)
             shared._active_cancel_token.reset(_cancel_token_token)
+            heartbeat_state["op"] = "finished"
+            heartbeat_state["detail"] = trace_status
+            heartbeat_state["current_tool"] = None
+            _write_runtime_heartbeat(
+                status=trace_status if trace_status != "ok" else "finished",
+                active=False,
+            )
             heartbeat_state["active"] = False
             _heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2371,6 +2418,7 @@ class BaseAgent:
         memory_worker: Any = None,
         system_prompt: str = "",
         task_context: str = "",
+        error: str = "",
     ) -> None:
         """Shared turn-post-processing: staging, compaction, consolidation.
 
@@ -2387,6 +2435,18 @@ class BaseAgent:
                 channel=channel,
                 **record_kwargs,
             )
+            record_runtime_event = getattr(ctx_mgr, "record_runtime_event", None)
+            if callable(record_runtime_event):
+                record_runtime_event(
+                    "turn_finished",
+                    {
+                        "user_content": user_content,
+                        "assistant_content": assistant_content or "",
+                        "error": error or "",
+                        "channel": channel,
+                        "metadata": record_kwargs,
+                    },
+                )
             ctx_mgr.staging.append("user", user_content)
             if assistant_content:
                 ctx_mgr.staging.append("assistant", assistant_content)

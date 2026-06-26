@@ -2892,6 +2892,9 @@ def test_spawn_agent_validates_required_output_files(monkeypatch, tmp_path):
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    registry.set_context("output_dir", str(output_dir))
     parent = agent_module.BaseAgent(
         object(), registry, model="fake-model", api_format="openai"
     )
@@ -2931,13 +2934,16 @@ def test_spawn_agent_accepts_file_only_output_contract_without_deliverable(
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    registry.set_context("output_dir", str(output_dir))
     parent = agent_module.BaseAgent(
         object(), registry, model="fake-model", api_format="openai"
     )
     parent.register_spawn_capability("base system prompt", workspace_root=tmp_path)
 
     async def fake_send_message(self, ctx, user_message, stream_callback=None):
-        (tmp_path / "artifact.json").write_text('{"ok": true}', encoding="utf-8")
+        (output_dir / "artifact.json").write_text('{"ok": true}', encoding="utf-8")
         return agent_module.AgentResult(
             agent_id="sub",
             content="artifact written",
@@ -2971,13 +2977,16 @@ def test_spawn_agent_requires_deliverable_when_json_and_files_are_both_requested
     import agent as agent_module
 
     registry = agent_module.ToolRegistry()
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    registry.set_context("output_dir", str(output_dir))
     parent = agent_module.BaseAgent(
         object(), registry, model="fake-model", api_format="openai"
     )
     parent.register_spawn_capability("base system prompt", workspace_root=tmp_path)
 
     async def fake_send_message(self, ctx, user_message, stream_callback=None):
-        (tmp_path / "artifact.json").write_text("{}", encoding="utf-8")
+        (output_dir / "artifact.json").write_text("{}", encoding="utf-8")
         return agent_module.AgentResult(
             agent_id="sub",
             content="artifact written without deliverable block",
@@ -4638,6 +4647,193 @@ def test_send_message_preserves_reasoning_content_for_openai_tool_loop(monkeypat
     assert assistant_message["content"] == "我来查一下"
     assert assistant_message["reasoning_content"] == "先判断是否需要工具，再调用时间工具。"
     assert assistant_message["tool_calls"][0]["function"]["name"] == "current_time"
+
+
+def test_send_message_writes_runtime_heartbeat_without_polluting_messages(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    tool_calls = [
+        agent_module._OAITC(
+            "call-1",
+            agent_module._OAIFunc("current_time", json.dumps({})),
+        )
+    ]
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "tool_calls",
+                        agent_module.shared._OAIMsg("checking", tool_calls),
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop",
+                        agent_module.shared._OAIMsg("done", None),
+                    )
+                ]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_call(tool_name, tool_input):
+        assert tool_name == "current_time"
+        return json.dumps({"ok": True, "local_time": "2026-06-05T12:00:00+00:00"})
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(registry, "call", fake_call)
+
+    heartbeat_path = tmp_path / "health" / "session-a.json"
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={
+            "session_id": "session-a",
+            "turn_id": "turn-a",
+            "heartbeat_path": heartbeat_path,
+            "heartbeat_interval": 0.01,
+        },
+    )
+
+    result = asyncio.run(agent.send_message(ctx, "现在几点"))
+    payload = json.loads(heartbeat_path.read_text(encoding="utf-8"))
+
+    assert result.content == "done"
+    assert payload["session_id"] == "session-a"
+    assert payload["turn_id"] == "turn-a"
+    assert payload["agent_id"] == ctx.agent_id
+    assert payload["heartbeat_seq"] >= 3
+    assert payload["state"] == "finished"
+    assert payload["status"] == "finished"
+    assert payload["active"] is False
+    assert all(message.get("role") in {"user", "assistant", "tool"} for message in ctx.messages)
+    assert not any("heartbeat" in json.dumps(message).lower() for message in ctx.messages)
+
+
+def test_openai_transport_recovers_malformed_tool_arguments():
+    import agent as agent_module
+    from agent.core.transport import OpenAITransport
+
+    transport = OpenAITransport(object())
+    response = agent_module.shared._OAIResponse(
+        [
+            agent_module.shared._OAIChoice(
+                "tool_calls",
+                agent_module.shared._OAIMsg(
+                    "",
+                    [
+                        agent_module.shared._OAITC(
+                            "call-1",
+                            agent_module.shared._OAIFunc(
+                                "shell",
+                                '{"command":"echo ok",',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+
+    stop_reason, text, tool_calls = transport.parse_response(response)
+
+    assert stop_reason == "tool_use"
+    assert text == ""
+    assert tool_calls == [
+        {
+            "name": "shell",
+            "id": "call-1",
+            "input": {"_malformed_arguments": '{"command":"echo ok",'},
+        }
+    ]
+
+
+def test_openai_transport_sanitizes_malformed_tool_call_history_before_request():
+    import json
+
+    from agent.core.transport import OpenAITransport
+
+    transport = OpenAITransport(object())
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command":"echo ok",',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": '{"ok": false}'},
+    ]
+
+    kwargs = transport._create_kwargs(
+        model="fake-model",
+        max_tokens=100,
+        system="system",
+        messages=messages,
+        tools=[],
+    )
+
+    sent_arguments = kwargs["messages"][1]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(sent_arguments) == {
+        "_malformed_arguments": '{"command":"echo ok",'
+    }
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == (
+        '{"command":"echo ok",'
+    )
+
+
+def test_openai_transport_sanitizes_malformed_tool_call_when_storing_history():
+    import json
+
+    import agent as agent_module
+    from agent.core.transport import OpenAITransport
+
+    transport = OpenAITransport(object())
+    response = agent_module.shared._OAIResponse(
+        [
+            agent_module.shared._OAIChoice(
+                "tool_calls",
+                agent_module.shared._OAIMsg(
+                    "",
+                    [
+                        agent_module.shared._OAITC(
+                            "call-1",
+                            agent_module.shared._OAIFunc(
+                                "shell",
+                                '{"command":"echo ok",',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+
+    message = transport.build_assistant_message(response, "")
+    arguments = message["tool_calls"][0]["function"]["arguments"]
+
+    assert json.loads(arguments) == {
+        "_malformed_arguments": '{"command":"echo ok",'
+    }
 
 
 def test_send_message_preserves_generic_provider_extras_for_openai_tool_loop(

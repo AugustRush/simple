@@ -212,8 +212,31 @@ def test_turn_runner_complete_turn_records_state_and_maintenance():
             "memory_worker": state.memory_worker,
             "system_prompt": "system",
             "task_context": "original task",
+            "error": "",
         }
     ]
+
+
+def test_turn_runner_complete_turn_passes_error_to_maintenance():
+    maintenance_calls = []
+    runner = TurnRunner(
+        {
+            "agent": object(),
+            "system_prompt": "system",
+            "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
+        }
+    )
+    state = RuntimeSessionState(ctx=object())
+
+    asyncio.run(
+        runner.complete_turn(
+            TurnInput.from_text("hello"),
+            state,
+            TurnResult(text="", error="model response truncated"),
+        )
+    )
+
+    assert maintenance_calls[0]["error"] == "model response truncated"
 
 
 def test_turn_runner_complete_turn_uses_live_component_updates():
@@ -463,6 +486,58 @@ def test_agent_core_prompt_submit_metadata_uses_canonical_turn_identity():
             "session_id": "session-1",
         }
     ]
+
+
+def test_agent_core_publishes_runtime_heartbeat_identity(tmp_path):
+    class _Ctx:
+        agent_id = "ctx-1"
+
+        def __init__(self):
+            self.metadata = {}
+            self.messages = []
+            self.system_prompt = "system"
+
+    class _FakeTurnRunner:
+        def __init__(self):
+            self.metadata_seen = None
+
+        async def run(self, turn_input, ctx, stream_callback=None):
+            self.metadata_seen = dict(ctx.metadata)
+            return TurnResult(text="ok")
+
+        async def complete_turn(self, turn_input, state, result):
+            state.record_turn(list(result.tool_calls))
+            return []
+
+    runner = _FakeTurnRunner()
+    core = AgentCore(
+        {
+            "agent": object(),
+            "system_prompt": "system",
+            "turn_runner": runner,
+            "output_dir": tmp_path / "output",
+        }
+    )
+
+    asyncio.run(
+        core.handle_turn(
+            TurnInput.from_text(
+                "hello",
+                session_id="chat/a",
+                channel_name="feishu",
+                metadata={"message_id": "msg-1", "heartbeat_interval": 0.25},
+            ),
+            RuntimeSessionState(ctx=_Ctx()),
+        )
+    )
+
+    assert runner.metadata_seen["session_id"] == "chat/a"
+    assert runner.metadata_seen["channel_name"] == "feishu"
+    assert runner.metadata_seen["turn_id"] == "msg-1"
+    assert runner.metadata_seen["heartbeat_interval"] == 0.25
+    assert runner.metadata_seen["heartbeat_path"] == (
+        tmp_path / "output" / "runtime" / "health" / "chat_a.json"
+    )
 
 
 def test_agent_core_returns_blocked_execution_with_reason_without_running_turn():

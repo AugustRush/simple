@@ -214,6 +214,7 @@ TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
 TOOL_DEFAULT_MAX_LIST_RESULTS = 100
 
 from .memory.system import (
+    AgentRuntimeEvent,
     BackgroundMemoryWorker,
     ConsolidationEngine,
     ContextManager,
@@ -225,6 +226,7 @@ from .memory.system import (
     LocalRetriever,
     MemoryPalace,
     ResolvedFact,
+    SessionWorkingState,
     StagingBuffer,
     normalize_memory_chapter,
 )

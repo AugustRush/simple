@@ -261,9 +261,11 @@ class OpenAITransport(ModelTransport):
             for t in tools
         ]
 
-    @staticmethod
-    def _inject_system(messages: list[dict], system_prompt: str) -> list[dict]:
-        return [{"role": "system", "content": system_prompt}] + messages
+    @classmethod
+    def _inject_system(cls, messages: list[dict], system_prompt: str) -> list[dict]:
+        return [{"role": "system", "content": system_prompt}] + cls._sanitize_messages(
+            messages
+        )
 
     def _create_kwargs(self, *, model, max_tokens, system, messages, tools, stream=False):
         kwargs: dict = dict(
@@ -378,10 +380,7 @@ class OpenAITransport(ModelTransport):
         if finish == "tool_calls" and msg.tool_calls:
             tool_calls = []
             for tc in msg.tool_calls:
-                try:
-                    inp = json.loads(tc.function.arguments)
-                except Exception:
-                    inp = {}
+                inp = self._parse_tool_arguments(tc.function.arguments)
                 tool_calls.append(
                     {"name": tc.function.name, "id": tc.id, "input": inp}
                 )
@@ -403,14 +402,16 @@ class OpenAITransport(ModelTransport):
         entry.update(self._message_extras(msg))
         if msg.tool_calls:
             entry["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
+                self._sanitize_tool_call(
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                )
                 for tc in msg.tool_calls
             ]
         return entry
@@ -433,6 +434,48 @@ class OpenAITransport(ModelTransport):
             "type": "image_url",
             "image_url": {"url": f"data:{mime_type};base64,{base64_data}"},
         }
+
+    # ── Tool-call argument hardening ────────────────────────────────────
+
+    @classmethod
+    def _parse_tool_arguments(cls, arguments: Any) -> dict[str, Any]:
+        if isinstance(arguments, dict):
+            return copy.deepcopy(arguments)
+        raw = "" if arguments is None else str(arguments)
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {"_malformed_arguments": raw}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"_malformed_arguments": raw}
+
+    @classmethod
+    def _sanitize_tool_call(cls, tool_call: Any) -> Any:
+        if not isinstance(tool_call, dict):
+            return tool_call
+        cleaned = copy.deepcopy(tool_call)
+        function = cleaned.get("function")
+        if not isinstance(function, dict):
+            return cleaned
+        arguments = function.get("arguments")
+        parsed = cls._parse_tool_arguments(arguments)
+        function["arguments"] = json.dumps(parsed, ensure_ascii=False)
+        return cleaned
+
+    @classmethod
+    def _sanitize_messages(cls, messages: list[dict]) -> list[dict]:
+        sanitized = copy.deepcopy(messages)
+        for message in sanitized:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") != "assistant":
+                continue
+            tool_calls = message.get("tool_calls")
+            if not isinstance(tool_calls, list):
+                continue
+            message["tool_calls"] = [cls._sanitize_tool_call(tc) for tc in tool_calls]
+        return sanitized
 
     # ── Provider-extras handling (model_extra fields the API echoes back) ──
 

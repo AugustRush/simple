@@ -278,11 +278,12 @@ class FeishuOutputSink(OutputSink):
         ".xlsx": "xls",
         ".ppt": "ppt",
         ".pptx": "ppt",
-    }
+   }
     _STREAM_EDIT_INTERVAL = 0.2
 
     _TEXT_MAX_LEN = 200  # plain-text ceiling; longer → post
     _POST_MAX_LEN = 2000  # post ceiling; longer → interactive card
+    _MD_ELEMENT_CHAR_LIMIT = 5000  # Feishu card markdown element char limit
     _SUPPRESSED_TOOL_HINTS = {
         "current_time",
         "schedule_create",
@@ -600,7 +601,17 @@ class FeishuOutputSink(OutputSink):
                 parts.append("---")
             lines = "\n".join(self._tool_progress_lines.values())
             parts.append("## Tool Progress\n\n" + lines)
-        return "\n\n".join(parts).strip()
+        result = "\n\n".join(parts).strip()
+        # Streaming card has a single markdown element; cap at Feishu's limit
+        # so the streaming update doesn't fail with a parse error.  The final
+        # response (via _send_response_async) will be properly split across
+        # multiple card messages.
+        if len(result) > self._MD_ELEMENT_CHAR_LIMIT:
+            result = (
+                result[: self._MD_ELEMENT_CHAR_LIMIT - 40]
+                + "\n\n...（内容过长，完成时将在新消息中完整展示）"
+            )
+        return result
 
     async def _ensure_primary_surface_card(self) -> str | None:
         if self._stream_buf.card_id is not None:
@@ -1475,7 +1486,74 @@ class FeishuOutputSink(OutputSink):
         remaining = content[last_end:]
         if remaining.strip():
             elements.extend(self._split_headings(remaining))
-        return elements or [{"tag": "markdown", "content": content}]
+        # Split any markdown elements that exceed the Feishu char limit
+        result: list[dict] = []
+        for el in (elements or [{"tag": "markdown", "content": content}]):
+            if el.get("tag") == "markdown" and len(el.get("content", "")) > self._MD_ELEMENT_CHAR_LIMIT:
+                chunks = self._split_long_markdown_text(
+                    el["content"], self._MD_ELEMENT_CHAR_LIMIT
+                )
+                for chunk in chunks:
+                    result.append({"tag": "markdown", "content": chunk})
+            else:
+                result.append(el)
+        return result
+
+    @staticmethod
+    def _split_long_markdown_text(text: str, limit: int) -> list[str]:
+        """Split a long markdown string into chunks ≤ *limit* chars.
+
+        Splits at double-newline (paragraph) boundaries first, then at
+        single-newline boundaries within oversized paragraphs, and finally
+        at sentence boundaries as a last resort.
+        """
+        if len(text) <= limit:
+            return [text]
+
+        # Split at paragraph boundaries first
+        paragraphs = re.split(r"\n\n+", text)
+        chunks: list[str] = []
+        for para in paragraphs:
+            if len(para) <= limit:
+                if chunks and len(chunks[-1]) + len(para) + 2 <= limit:
+                    chunks[-1] += "\n\n" + para
+                else:
+                    chunks.append(para)
+            else:
+                # Paragraph too long — split at line boundaries
+                lines = para.split("\n")
+                for line in lines:
+                    if len(line) <= limit:
+                       if chunks and len(chunks[-1]) + len(line) + 1 <= limit:
+                           chunks[-1] += "\n" + line
+                       else:
+                           chunks.append(line)
+                    else:
+                       # Single line too long — hard split at sentence or word boundaries
+                       # Try sentence boundaries first
+                       sentences = re.split(r"(?<=[.。!！?？])\s+", line)
+                       for sent in sentences:
+                           if len(sent) <= limit:
+                               if chunks and len(chunks[-1]) + len(sent) + 1 <= limit:
+                                   chunks[-1] += " " + sent
+                               else:
+                                   chunks.append(sent)
+                           else:
+                               # Hard split at word boundaries
+                               start = 0
+                               while start < len(sent):
+                                   if chunks and chunks[-1]:
+                                       sep = " "
+                                       avail = limit - len(chunks[-1]) - 1
+                                       if avail >= 20:
+                                           chunk = sent[start:start + avail]
+                                           chunks[-1] += sep + chunk
+                                           start += avail
+                                           continue
+                                   end = min(start + limit, len(sent))
+                                   chunks.append(sent[start:end])
+                                   start = end
+        return [c.strip() for c in chunks if c.strip()]
 
     @staticmethod
     def _split_elements_by_table_limit(

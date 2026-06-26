@@ -11,10 +11,12 @@ from .contracts import (
     TurnResult,
     TurnRunner,
 )
+from .heartbeat import HeartbeatWriter, heartbeat_path_for_session
 
 __all__ = [
     "AgentCore",
     "EventCollector",
+    "HeartbeatWriter",
     "RuntimeComponents",
     "RuntimeEvent",
     "RuntimeSessionState",
@@ -22,5 +24,6 @@ __all__ = [
     "TurnInput",
     "TurnResult",
     "TurnRunner",
+    "heartbeat_path_for_session",
     "_active_event_collector",
 ]

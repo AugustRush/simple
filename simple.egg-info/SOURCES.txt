@@ -36,6 +36,7 @@ agent/plugins/__init__.py
 agent/plugins/catalog.py
 agent/runtime/__init__.py
 agent/runtime/contracts.py
+agent/runtime/heartbeat.py
 agent/scheduler/__init__.py
 agent/scheduler/delivery.py
 agent/scheduler/models.py
@@ -68,6 +69,7 @@ tests/test_content_filter.py
 tests/test_evolution.py
 tests/test_fact_store.py
 tests/test_feishu_channel.py
+tests/test_heartbeat.py
 tests/test_lexical.py
 tests/test_ltm_store.py
 tests/test_memory_benchmark.py

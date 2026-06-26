@@ -554,6 +554,44 @@ class ConversationTurn:
         }
 
 
+@dataclass(frozen=True)
+class SessionWorkingState:
+    """Durable, model-readable working context for one channel session."""
+
+    session_id: str
+    state: dict[str, Any]
+    updated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "session_id": self.session_id,
+            "state": self.state,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True)
+class AgentRuntimeEvent:
+    """Append-only runtime fact for one channel session."""
+
+    id: int
+    session_id: str
+    event_type: str
+    payload: dict[str, Any]
+    turn_id: str = ""
+    created_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "event_type": self.event_type,
+            "payload": self.payload,
+            "created_at": self.created_at,
+        }
+
+
 @dataclass
 class FactAssertion:
     """An append-only normalized fact claim derived from some evidence source."""
@@ -744,6 +782,21 @@ class LTMStore:
                     ON conversation_turns(session_id, id);
                 CREATE INDEX IF NOT EXISTS idx_conversation_turns_created_at
                     ON conversation_turns(created_at);
+                CREATE TABLE IF NOT EXISTS session_working_state (
+                    session_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS agent_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL DEFAULT '',
+                    event_type TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_agent_events_session_id
+                    ON agent_events(session_id, id);
                 CREATE TABLE IF NOT EXISTS fact_assertions (
                     id TEXT PRIMARY KEY,
                     subject TEXT NOT NULL,
@@ -905,6 +958,37 @@ class LTMStore:
             message_id=row["message_id"],
             reply_to_id=row["reply_to_id"],
             metadata=metadata,
+            created_at=row["created_at"],
+        )
+
+    @staticmethod
+    def _row_to_session_working_state(row: sqlite3.Row) -> SessionWorkingState:
+        try:
+            state = json.loads(row["state_json"] or "{}")
+        except Exception:
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        return SessionWorkingState(
+            session_id=row["session_id"],
+            state=state,
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _row_to_agent_runtime_event(row: sqlite3.Row) -> AgentRuntimeEvent:
+        try:
+            payload = json.loads(row["payload_json"] or "{}")
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        return AgentRuntimeEvent(
+            id=int(row["id"]),
+            session_id=row["session_id"],
+            turn_id=row["turn_id"],
+            event_type=row["event_type"],
+            payload=payload,
             created_at=row["created_at"],
         )
 
@@ -1385,6 +1469,103 @@ class LTMStore:
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_conversation_turn(row) for row in reversed(rows)]
+
+    def load_session_working_state(
+        self,
+        session_id: str,
+    ) -> Optional[SessionWorkingState]:
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_working_state WHERE session_id = ?",
+                (clean_session_id,),
+            ).fetchone()
+        return self._row_to_session_working_state(row) if row else None
+
+    def save_session_working_state(
+        self,
+        session_id: str,
+        state: dict[str, Any],
+        *,
+        updated_at: Optional[str] = None,
+    ) -> SessionWorkingState:
+        clean_session_id = str(session_id or "").strip() or "default"
+        clean_state = state if isinstance(state, dict) else {"value": state}
+        ts = updated_at or _now()
+        payload = json.dumps(clean_state, ensure_ascii=False, sort_keys=True)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO session_working_state (session_id, state_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+                """,
+                (clean_session_id, payload, ts),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_working_state WHERE session_id = ?",
+                (clean_session_id,),
+            ).fetchone()
+        return self._row_to_session_working_state(row)
+
+    def append_agent_event(
+        self,
+        *,
+        session_id: str,
+        event_type: str,
+        payload: Optional[dict[str, Any]] = None,
+        turn_id: str = "",
+        created_at: Optional[str] = None,
+    ) -> AgentRuntimeEvent:
+        clean_session_id = str(session_id or "").strip() or "default"
+        clean_event_type = str(event_type or "").strip() or "event"
+        clean_payload = payload if isinstance(payload, dict) else {}
+        ts = created_at or _now()
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO agent_events (
+                    session_id, turn_id, event_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_session_id,
+                    str(turn_id or ""),
+                    clean_event_type,
+                    json.dumps(clean_payload, ensure_ascii=False, sort_keys=True),
+                    ts,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM agent_events WHERE id = ?",
+                (cur.lastrowid,),
+            ).fetchone()
+        return self._row_to_agent_runtime_event(row)
+
+    def recent_agent_events(
+        self,
+        *,
+        session_id: str,
+        limit: int = 20,
+    ) -> list[AgentRuntimeEvent]:
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            return []
+        limit = max(1, min(int(limit), 100))
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM agent_events
+                WHERE session_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (clean_session_id, limit),
+            ).fetchall()
+        return [self._row_to_agent_runtime_event(row) for row in reversed(rows)]
 
     @staticmethod
     def _fact_assertion_core_score(assertion: FactAssertion) -> tuple[int, float, str]:
@@ -2923,7 +3104,21 @@ class ContextManager:
         """Return the most recent staged turns for explicit current-session recall."""
         staged = self.staging.read_all()
         if not staged:
-            return ""
+            # Staging may be empty after a restart (sleep archived turns to
+            # conversation_turns).  Fall back to the durable store so the
+            # agent still sees recent conversation history.
+            turns = self.store.recent_conversation_turns(
+                session_id=self.staging.session_id,
+                limit=limit,
+            )
+            if not turns:
+                return ""
+            lines = ["## Previous Session (restored from history)"]
+            for turn in turns:
+                content = turn.content.strip()
+                if content:
+                    lines.append(f"- {turn.role.upper()}: {content}")
+            return "\n".join(lines) if len(lines) > 1 else ""
         lines = ["## Current Session (not yet consolidated)"]
         for msg in staged[-limit:]:
             role = str(msg.get("role", "unknown")).upper()
@@ -3025,6 +3220,178 @@ class ContextManager:
                 lines.append(f"- {content}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
+    @staticmethod
+    def _format_working_state_text(state: dict[str, Any]) -> str:
+        if not isinstance(state, dict) or not state:
+            return ""
+        fields = [
+            ("active_goal", "Active goal"),
+            ("status", "Status"),
+            ("progress", "Progress"),
+            ("next_action", "Next action"),
+            ("last_error", "Last error"),
+        ]
+        lines = ["## Restored Working Context"]
+        lines.append(
+            "A prior working context exists for this session. Use it when relevant; "
+            "if the user's new message is unrelated, do not force the old task."
+        )
+        for key, label in fields:
+            value = str(state.get(key, "") or "").strip()
+            if value:
+                lines.append(f"- {label}: {value}")
+        artifacts = state.get("artifacts")
+        if isinstance(artifacts, list):
+            clean_artifacts = [str(item).strip() for item in artifacts if str(item).strip()]
+            if clean_artifacts:
+                lines.append("- Artifacts: " + ", ".join(clean_artifacts[:8]))
+        recent_turns = state.get("recent_turns")
+        if isinstance(recent_turns, list) and recent_turns:
+            lines.append("- Recent turns:")
+            for turn in recent_turns[-4:]:
+                if not isinstance(turn, dict):
+                    continue
+                role = str(turn.get("role", "") or "").upper()
+                content = str(turn.get("content", "") or "").strip()
+                if role and content:
+                    lines.append(f"  - {role}: {content}")
+        return "\n".join(lines) if len(lines) > 2 else ""
+
+    def working_state_context(self) -> str:
+        snapshot = self.store.load_session_working_state(self.staging.session_id)
+        if snapshot is None:
+            return ""
+        text = self._format_working_state_text(snapshot.state)
+        events = self.store.recent_agent_events(
+            session_id=self.staging.session_id,
+            limit=5,
+        )
+        event_lines = []
+        for event in events[-5:]:
+            detail = str(
+                event.payload.get("error")
+                or event.payload.get("content_preview")
+                or event.payload.get("user_content")
+                or ""
+            ).strip()
+            if detail:
+                detail = self._clip_working_state_text(detail, 160)
+                event_lines.append(f"- {event.event_type}: {detail}")
+            else:
+                event_lines.append(f"- {event.event_type}")
+        if text and event_lines:
+            text += "\n- Recent runtime events:\n" + "\n".join(
+                f"  {line}" for line in event_lines
+            )
+        return text
+
+    @staticmethod
+    def _clip_working_state_text(text: str, limit: int = 800) -> str:
+        clean = re.sub(r"\s+", " ", str(text or "").strip())
+        if len(clean) <= limit:
+            return clean
+        return clean[: limit - 1].rstrip() + "…"
+
+    @staticmethod
+    def _merge_artifacts(*groups: Any, limit: int = 12) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            if not isinstance(group, list):
+                continue
+            for item in group:
+                value = str(item or "").strip()
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                merged.append(value)
+                if len(merged) >= limit:
+                    return merged
+        return merged
+
+    def _project_working_state_from_event(
+        self,
+        *,
+        event_type: str,
+        payload: dict[str, Any],
+        created_at: str,
+    ) -> SessionWorkingState:
+        previous = self.store.load_session_working_state(self.staging.session_id)
+        prior_state = previous.state if previous is not None else {}
+        payload = payload if isinstance(payload, dict) else {}
+        user_content = str(payload.get("user_content", "") or "")
+        assistant_content = str(payload.get("assistant_content", "") or "")
+        error = str(payload.get("error", "") or "")
+        clean_user = self._clip_working_state_text(user_content, 1000)
+        clean_assistant = self._clip_working_state_text(assistant_content, 1000)
+        clean_error = self._clip_working_state_text(error, 1000)
+
+        recent_turns = list(prior_state.get("recent_turns", [])) if isinstance(prior_state.get("recent_turns"), list) else []
+        if clean_user:
+            recent_turns.append({"role": "user", "content": clean_user})
+        if clean_assistant:
+            recent_turns.append({"role": "assistant", "content": clean_assistant})
+        recent_turns = recent_turns[-8:]
+
+        status = "failed" if clean_error else "active"
+        if clean_assistant and not clean_error:
+            status = "updated"
+        progress = clean_assistant or str(prior_state.get("progress", "") or "")
+        next_action = str(prior_state.get("next_action", "") or "")
+        if clean_error:
+            next_action = "Recover from the last error and continue the active goal if the user's next message is related."
+        elif clean_assistant:
+            next_action = "Use this working context only when it is relevant to the user's next message."
+
+        artifacts = self._merge_artifacts(
+            payload.get("artifacts"),
+            prior_state.get("artifacts"),
+        )
+        state = {
+            "active_goal": clean_user or str(prior_state.get("active_goal", "") or ""),
+            "status": status,
+            "progress": progress,
+            "next_action": next_action,
+            "last_error": clean_error,
+            "artifacts": artifacts,
+            "recent_turns": recent_turns,
+            "last_event_type": event_type,
+            "updated_at": created_at,
+        }
+        return self.store.save_session_working_state(
+            self.staging.session_id,
+            state,
+            updated_at=created_at,
+        )
+
+    def record_runtime_event(
+        self,
+        event_type: str,
+        payload: Optional[dict[str, Any]] = None,
+        *,
+        turn_id: str = "",
+    ) -> AgentRuntimeEvent:
+        """Record a runtime fact and update the model-readable projection.
+
+        This is the single path for recoverable runtime context: append the
+        factual event first, then derive ``session_working_state`` from it.
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        created_at = _now()
+        event = self.store.append_agent_event(
+            session_id=self.staging.session_id,
+            event_type=event_type,
+            payload=payload,
+            turn_id=turn_id,
+            created_at=created_at,
+        )
+        self._project_working_state_from_event(
+            event_type=event.event_type,
+            payload=event.payload,
+            created_at=event.created_at,
+        )
+        return event
+
     def retrieve_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
         """Return explicit context lookup results across active session and LTM."""
         plan = self._plan_query(query)
@@ -3065,6 +3432,9 @@ class ContextManager:
         assistant_identity = self._assistant_identity_context()
         if assistant_identity:
             sections.append(assistant_identity)
+        working_state = self.working_state_context()
+        if working_state:
+            sections.append(working_state)
         if "episodes" in self._route_categories(query):
             recent = self._recent_session_context()
             if recent:

@@ -292,16 +292,28 @@ def _plugin_substitution_env(plugin_dir: Path, plugin_name: str) -> dict[str, st
         "CLAUDE_PLUGIN_ROOT": str(plugin_dir),
         "CLAUDE_PLUGIN_DATA": str(_plugin_data_dir(plugin_name)),
         "CLAUDE_PROJECT_DIR": str(Path.cwd()),
+        "CODEX_PLUGIN_ROOT": str(plugin_dir),
+        "CODEX_PLUGIN_DATA": str(_plugin_data_dir(plugin_name)),
+        "CODEX_PROJECT_DIR": str(Path.cwd()),
     }
 
 
+_PLUGIN_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
 def _substitute_plugin_vars(value: Any, env: dict[str, str]) -> Any:
-    """Recursively substitute Claude Code plugin placeholders in configs."""
+    """Recursively substitute Claude/Codex plugin placeholders in configs."""
     if isinstance(value, str):
-        out = value
-        for key, replacement in env.items():
-            out = out.replace("${" + key + "}", replacement)
-        return out
+        def _replace(match: re.Match[str]) -> str:
+            key = match.group(1)
+            default = match.group(2)
+            if key in env:
+                return env[key]
+            if key in os.environ:
+                return os.environ[key]
+            return default if default is not None else match.group(0)
+
+        return _PLUGIN_VAR_RE.sub(_replace, value)
     if isinstance(value, list):
         return [_substitute_plugin_vars(item, env) for item in value]
     if isinstance(value, dict):
@@ -452,16 +464,20 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
 
     Detects either layout:
       - ``<plugin>/plugin.json``                 (this project's original format)
-      - ``<plugin>/.claude-plugin/plugin.json``  (Claude Code / Codex format)
+      - ``<plugin>/.claude-plugin/plugin.json``  (Claude Code format)
+      - ``<plugin>/.codex-plugin/plugin.json``   (Codex format)
 
     Accepts both ``mcp_servers`` (snake_case) and ``mcpServers`` (camelCase).
     Skills default to the ``skills`` subdirectory when it exists, so a
     Claude Code plugin needs no manifest entry to expose its skills.
     """
-    cc_pj = plugin_dir / ".claude-plugin" / "plugin.json"
-    bare_pj = plugin_dir / "plugin.json"
-    pj = cc_pj if cc_pj.exists() else bare_pj
-    if not pj.exists():
+    manifest_candidates = [
+        plugin_dir / ".codex-plugin" / "plugin.json",
+        plugin_dir / ".claude-plugin" / "plugin.json",
+        plugin_dir / "plugin.json",
+    ]
+    pj = next((candidate for candidate in manifest_candidates if candidate.exists()), None)
+    if pj is None:
         # No manifest at all — synthesise minimal meta if any standard
         # subdir exists (so claude-plugin packages without a plugin.json
         # still expose their skills/commands/agents).
@@ -592,20 +608,50 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
         return None
 
 
-def _read_marketplace_manifest(dir_path: Path) -> Optional[list[tuple[Path, str]]]:
-    """Read ``.claude-plugin/marketplace.json`` if present.
+def _has_plugin_manifest(dir_path: Path) -> bool:
+    return any(
+        candidate.exists()
+        for candidate in (
+            dir_path / ".codex-plugin" / "plugin.json",
+            dir_path / ".claude-plugin" / "plugin.json",
+            dir_path / "plugin.json",
+        )
+    )
 
-    A Claude Code marketplace is a repo whose root holds
-    ``.claude-plugin/marketplace.json`` listing one or more plugins by
-    relative ``source`` path.  Returns ``[(plugin_dir, plugin_name), ...]``
-    when a marketplace is found, ``None`` otherwise.
+
+def _local_marketplace_source_path(entry: dict[str, Any]) -> str:
+    source = entry.get("source", "")
+    if isinstance(source, str):
+        return source.strip()
+    if not isinstance(source, dict):
+        return ""
+    source_kind = str(source.get("source", "") or "").strip().lower()
+    if source_kind and source_kind != "local":
+        return ""
+    return str(source.get("path", "") or "").strip()
+
+
+def _read_marketplace_manifest(dir_path: Path) -> Optional[list[tuple[Path, str]]]:
+    """Read a supported marketplace manifest if present.
+
+    Supports Claude Code's ``.claude-plugin/marketplace.json`` and Codex's
+    root ``marketplace.json``.  Only local relative plugin sources are expanded;
+    remote marketplace entries belong to the installer, not the runtime loader.
     """
-    if (dir_path / ".claude-plugin" / "plugin.json").exists() or (
-        dir_path / "plugin.json"
-    ).exists():
+    if _has_plugin_manifest(dir_path):
         return None
-    mp = dir_path / ".claude-plugin" / "marketplace.json"
-    if not mp.exists():
+    mp = next(
+        (
+            candidate
+            for candidate in (
+                dir_path / ".claude-plugin" / "marketplace.json",
+                dir_path / "marketplace.json",
+            )
+            if candidate.exists()
+        ),
+        None,
+    )
+    if mp is None:
         return None
     try:
         data = json.loads(mp.read_text(encoding="utf-8"))
@@ -618,7 +664,7 @@ def _read_marketplace_manifest(dir_path: Path) -> Optional[list[tuple[Path, str]
     for entry in plugins:
         if not isinstance(entry, dict):
             continue
-        source = str(entry.get("source", "") or "").strip()
+        source = _local_marketplace_source_path(entry)
         if not source:
             continue
         plugin_dir = (dir_path / source).resolve()
@@ -627,6 +673,19 @@ def _read_marketplace_manifest(dir_path: Path) -> Optional[list[tuple[Path, str]
         name = str(entry.get("name", "") or plugin_dir.name)
         out.append((plugin_dir, name))
     return out
+
+
+def _is_plugin_container(dir_path: Path) -> bool:
+    """Return True when *dir_path* itself is a plugin or marketplace root."""
+    if _has_plugin_manifest(dir_path):
+        return True
+    return any(
+        candidate.exists()
+        for candidate in (
+            dir_path / ".claude-plugin" / "marketplace.json",
+            dir_path / "marketplace.json",
+        )
+    )
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -846,9 +905,12 @@ class PluginCatalog:
         for search_dir, source in search_dirs:
             if not search_dir or not search_dir.is_dir():
                 continue
-            for entry_dir in sorted(search_dir.iterdir()):
-                if not entry_dir.is_dir():
-                    continue
+            entry_dirs = [search_dir] if _is_plugin_container(search_dir) else [
+                entry_dir
+                for entry_dir in sorted(search_dir.iterdir())
+                if entry_dir.is_dir()
+            ]
+            for entry_dir in entry_dirs:
                 for plugin_dir, plugin_name_hint in self._expand_marketplace(entry_dir):
                     self._load_one_plugin(
                         plugin_dir,

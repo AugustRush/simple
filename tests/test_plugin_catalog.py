@@ -1162,6 +1162,28 @@ def test_discover_loads_claude_plugin_without_python(tmp_path):
     assert loaded == ["cc-plugin"]
 
 
+def test_discover_loads_codex_plugin_without_python(tmp_path):
+    """A plugin with .codex-plugin/plugin.json uses the shared manifest path."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "codex-workflow"
+    (plugin_dir / ".codex-plugin").mkdir(parents=True)
+    (plugin_dir / ".codex-plugin" / "plugin.json").write_text(
+        '{"name": "codex-workflow", "version": "1.0", '
+        '"description": "codex plugin", "skills": "./skills"}',
+        encoding="utf-8",
+    )
+    (plugin_dir / "skills").mkdir()
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = catalog.discover_and_load()
+
+    assert loaded == ["codex-workflow"]
+    assert catalog.get_bundled_skills() == [
+        ("codex-workflow", (plugin_dir / "skills").resolve())
+    ]
+
+
 def test_discover_auto_finds_skills_subdir(tmp_path):
     """A plugin with a skills/ subdir is registered as bundled skills."""
     from agent import PluginCatalog
@@ -1206,6 +1228,106 @@ def test_discover_loads_marketplace_with_subplugins(tmp_path):
     loaded = catalog.discover_and_load()
 
     assert sorted(loaded) == ["alpha", "beta"]
+
+
+def test_discover_loads_codex_marketplace_with_local_subplugins(tmp_path):
+    """Codex marketplace.json expands local source.path plugin entries."""
+    from agent import PluginCatalog
+
+    market_dir = tmp_path / "codex-market"
+    market_dir.mkdir()
+    (market_dir / "marketplace.json").write_text(
+        '{"name": "personal", "plugins": ['
+        '{"name": "alpha", "source": {"source": "local", "path": "./plugins/alpha"}}, '
+        '{"name": "beta", "source": "./plugins/beta"}'
+        ']}',
+        encoding="utf-8",
+    )
+    for sub in ("alpha", "beta"):
+        sub_dir = market_dir / "plugins" / sub / ".codex-plugin"
+        sub_dir.mkdir(parents=True)
+        (sub_dir / "plugin.json").write_text(
+            f'{{"name": "{sub}"}}', encoding="utf-8"
+        )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = catalog.discover_and_load()
+
+    assert sorted(loaded) == ["alpha", "beta"]
+
+
+def test_discover_accepts_marketplace_directory_as_builtin_root(tmp_path):
+    """builtin_dir may point directly at a marketplace repository root."""
+    from agent import PluginCatalog
+
+    market_dir = tmp_path / "market"
+    market_dir.mkdir()
+    (market_dir / "marketplace.json").write_text(
+        '{"name": "personal", "plugins": ['
+        '{"name": "alpha", "source": {"source": "local", "path": "./plugins/alpha"}}'
+        ']}',
+        encoding="utf-8",
+    )
+    plugin_manifest = market_dir / "plugins" / "alpha" / ".codex-plugin"
+    plugin_manifest.mkdir(parents=True)
+    (plugin_manifest / "plugin.json").write_text(
+        '{"name": "alpha"}', encoding="utf-8"
+    )
+
+    catalog = PluginCatalog(builtin_dir=market_dir)
+    loaded = catalog.discover_and_load()
+
+    assert loaded == ["alpha"]
+
+
+def test_codex_plugin_root_with_marketplace_manifest_still_loads_root_plugin(tmp_path):
+    """A Codex plugin root with marketplace metadata remains a plugin root."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "root-plugin"
+    (plugin_dir / ".codex-plugin").mkdir(parents=True)
+    (plugin_dir / ".codex-plugin" / "plugin.json").write_text(
+        '{"name": "root-plugin"}', encoding="utf-8"
+    )
+    (plugin_dir / "marketplace.json").write_text(
+        '{"name": "personal", "plugins": ['
+        '{"name": "root-plugin", '
+        '"source": {"source": "local", "path": "./plugins/root-plugin"}}'
+        ']}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    loaded = catalog.discover_and_load()
+
+    assert loaded == ["root-plugin"]
+    assert catalog.get_loaded_names_for_directory("root-plugin") == {"root-plugin"}
+
+
+def test_discover_accepts_plugin_directory_as_builtin_root(tmp_path):
+    """builtin_dir may point directly at a plugin repository root."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "direct-plugin"
+    (plugin_dir / ".codex-plugin").mkdir(parents=True)
+    (plugin_dir / ".codex-plugin" / "plugin.json").write_text(
+        '{"name": "direct-plugin", "skills": "./codex/skills"}',
+        encoding="utf-8",
+    )
+    skill_dir = plugin_dir / "codex" / "skills" / "direct"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: direct\ndescription: direct plugin skill\n---\nUse it.",
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=plugin_dir)
+    loaded = catalog.discover_and_load()
+
+    assert loaded == ["direct-plugin"]
+    assert catalog.get_bundled_skills() == [
+        ("direct-plugin", (plugin_dir / "codex" / "skills").resolve())
+    ]
 
 
 def test_plugin_root_with_marketplace_manifest_still_loads_root_plugin(tmp_path):
@@ -1988,6 +2110,34 @@ def test_plugin_mcp_config_expands_claude_plugin_paths(tmp_path):
     assert cfg["cwd"] == str(Path.cwd())
     assert cfg["env"]["CLAUDE_PLUGIN_ROOT"] == str(plugin_dir)
     assert cfg["env"]["PLUGIN_ROOT"] == str(plugin_dir)
+
+
+def test_plugin_mcp_config_expands_default_env_values(tmp_path):
+    """Claude/Codex MCP configs may use ${VAR:-default} placeholders."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "mcp-defaults"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "mcp-defaults"}',
+        encoding="utf-8",
+    )
+    (plugin_dir / ".mcp.json").write_text(
+        '{"mcpServers": {"demo": {'
+        '"command": "${MISSING_BIN:-node}", '
+        '"args": ["${MISSING_SCRIPT:-server.js}", "${CODEX_PLUGIN_ROOT}"], '
+        '"env": {"MODE": "${MISSING_MODE:-local}"}}}}',
+        encoding="utf-8",
+    )
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    cfg = catalog.get_bundled_mcp()[0][1]
+    assert cfg["command"] == "node"
+    assert cfg["args"] == ["server.js", str(plugin_dir)]
+    assert cfg["env"]["MODE"] == "local"
+    assert cfg["env"]["CODEX_PLUGIN_ROOT"] == str(plugin_dir)
 
 
 def test_manifest_component_paths_for_skills_commands_agents(tmp_path):

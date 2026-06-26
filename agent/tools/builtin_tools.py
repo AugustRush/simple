@@ -6,6 +6,7 @@ import html
 import json
 import os
 import re
+import shutil
 import shlex
 import signal
 import time
@@ -1133,8 +1134,8 @@ class BuiltinTools:
         """Resolve relative paths against the output directory.
 
         Generated/downloaded files belong in output_dir, not the
-        workspace (repo).  Absolute paths and paths already inside the
-        workspace are still accepted.
+        workspace (repo).  Absolute paths are accepted when they are already
+        inside an allowed root.
         """
         candidate = Path(path).expanduser()
         if not candidate.is_absolute():
@@ -1146,13 +1147,32 @@ class BuiltinTools:
             output_dir=self._process_output_dir(),
         )
 
+    def _path_is_inside_workspace(self, path: Path) -> bool:
+        return path_contains(
+            self.workspace_root.expanduser().resolve(strict=False),
+            path.expanduser().resolve(strict=False),
+        )
+
+    def _path_is_inside_output_dir(self, path: Path) -> bool:
+        return path_contains(
+            self._process_output_dir(),
+            path.expanduser().resolve(strict=False),
+        )
+
+    def _has_write_scope(self) -> bool:
+        return bool(self.registry.get_context("write_scope") or [])
+
     def _ensure_within_write_scope(self, path: Path) -> None:
         scope_entries = self.registry.get_context("write_scope") or []
         if not scope_entries:
             return
         allowed: list[str] = []
         for entry in scope_entries:
-            scope_path, _root_kind = self._resolve_output_path(str(entry))
+            scope_path = (
+                self.workspace_root / Path(str(entry)).expanduser()
+            ).resolve(strict=False)
+            if not self._path_is_inside_workspace(scope_path):
+                scope_path, _root_kind = self._resolve_output_path(str(entry))
             allowed.append(str(scope_path))
             if path_contains(scope_path, path):
                 return
@@ -1160,6 +1180,101 @@ class BuiltinTools:
             f"Path '{path}' is outside the sub-agent write scope. "
             f"Allowed paths: {', '.join(allowed)}"
         )
+
+    def _scoped_workspace_write_path(self, path: str) -> Path | None:
+        """Return a workspace path when an explicit write_scope allows it."""
+        if not self._has_write_scope():
+            return None
+        try:
+            candidate = (self.workspace_root / Path(path).expanduser()).resolve(
+                strict=False
+            )
+        except ValueError:
+            return None
+        if not self._path_is_inside_workspace(candidate):
+            return None
+        try:
+            self._ensure_within_write_scope(candidate)
+        except ValueError:
+            return None
+        return candidate
+
+    def _resolve_write_file_path(self, path: str) -> tuple[Path, str]:
+        """Resolve write_file targets without polluting the workspace.
+
+        For normal assistant-generated files, even workspace-looking absolute
+        paths are redirected to the output directory. Scoped implementation
+        sub-agents keep explicit workspace writes so code-editing workflows can
+        still target project files deliberately.
+        """
+        candidate = Path(path).expanduser()
+        scoped_workspace_path = self._scoped_workspace_write_path(path)
+        if scoped_workspace_path is not None:
+            return scoped_workspace_path, "workspace"
+        if candidate.is_absolute() and self._path_is_inside_output_dir(candidate):
+            return self._resolve_output_path(path)
+
+        output_dir = self._process_output_dir()
+        if candidate.is_absolute() and self._path_is_inside_workspace(candidate):
+            relative = candidate.resolve(strict=False).relative_to(
+                self.workspace_root.expanduser().resolve(strict=False)
+            )
+            return self._resolve_output_path(str(relative))
+        return self._resolve_output_path(path)
+
+    def _workspace_file_snapshot(self) -> set[Path]:
+        """Return files currently in the workspace, ignoring agent outputs."""
+        files: set[Path] = set()
+        workspace_root = self.workspace_root.expanduser().resolve(strict=False)
+        output_dir = self._process_output_dir()
+        if not workspace_root.exists():
+            return files
+        for path in workspace_root.rglob("*"):
+            resolved = path.resolve(strict=False)
+            if path.is_dir():
+                if path.name in {".git", "__pycache__", ".pytest_cache"}:
+                    continue
+                continue
+            if path_contains(output_dir, resolved):
+                continue
+            files.add(resolved)
+        return files
+
+    def _move_new_workspace_files_to_output_dir(
+        self,
+        *,
+        before: set[Path],
+        cwd: Path,
+    ) -> list[dict[str, str]]:
+        output_dir = self._process_output_dir()
+        workspace_root = self.workspace_root.expanduser().resolve(strict=False)
+        moved: list[dict[str, str]] = []
+        for path in sorted(self._workspace_file_snapshot() - before):
+            if not path.is_file() or path_contains(output_dir, path):
+                continue
+            try:
+                relative = path.relative_to(workspace_root)
+            except ValueError:
+                relative = path.name
+            dest = output_dir / "workspace-artifacts" / relative
+            if dest.exists():
+                dest = dest.with_name(f"{dest.stem}-{uuid.uuid4().hex[:8]}{dest.suffix}")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(dest))
+            moved.append({"from": str(path), "to": str(dest)})
+
+            # Clean up empty directories left by nested generated artifacts,
+            # stopping at cwd/workspace boundaries.
+            parent = path.parent
+            stop_dirs = {workspace_root, cwd.resolve(strict=False)}
+            while parent not in stop_dirs and parent != parent.parent:
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+        return moved
+
 
     def _shell_recovery_hint(
         self,
@@ -1266,6 +1381,9 @@ class BuiltinTools:
             resolved_cwd = sandbox_dir
             if cwd:
                 resolved_cwd, _root_kind = self._resolve_output_path(cwd)
+            workspace_before: set[Path] | None = None
+            if self._path_is_inside_workspace(resolved_cwd):
+                workspace_before = self._workspace_file_snapshot()
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
@@ -1332,10 +1450,23 @@ class BuiltinTools:
             if err:
                 result += f"STDERR:\n{err}"
             result += f"\nExit code: {proc.returncode}"
+            moved_artifacts: list[dict[str, str]] = []
+            if workspace_before is not None:
+                moved_artifacts = self._move_new_workspace_files_to_output_dir(
+                    before=workspace_before,
+                    cwd=resolved_cwd,
+                )
+                if moved_artifacts:
+                    result += "\nMoved generated workspace artifacts to output_dir:"
+                    for item in moved_artifacts[:20]:
+                        result += f"\n- {item['from']} -> {item['to']}"
+                    if len(moved_artifacts) > 20:
+                        result += f"\n- ... {len(moved_artifacts) - 20} more"
             return self._ok(
                 command=command,
                 output=result or "(no output)",
                 exit_code=proc.returncode,
+                moved_artifacts=moved_artifacts,
             )
         except asyncio.TimeoutError:
             await self._terminate_process(proc)
@@ -1580,7 +1711,7 @@ class BuiltinTools:
         max_bytes: int = TOOL_DEFAULT_MAX_WRITE_BYTES,
     ) -> dict[str, Any]:
         try:
-            p, _root_kind = self._resolve_output_path(path)
+            p, _root_kind = self._resolve_write_file_path(path)
             self._ensure_within_write_scope(p)
             p.parent.mkdir(parents=True, exist_ok=True)
             payload = content.encode("utf-8")

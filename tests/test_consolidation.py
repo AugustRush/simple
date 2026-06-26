@@ -75,6 +75,135 @@ def test_conversation_history_survives_staging_clear(tmp_path):
     assert [turn.content for turn in turns] == ["这个会进入 durable history"]
 
 
+def test_agent_runtime_event_persists_and_projects_working_state(tmp_path):
+    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager, StagingBuffer
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
+    )
+
+    event = ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "创建生态环境相关文件",
+            "assistant_content": "已创建目录，但文件写入未完成",
+            "error": "飞书卡片 markdown 内容过长",
+            "artifacts": ["/tmp/生态环境"],
+        },
+    )
+
+    reloaded = LTMStore(context_dir=context_dir)
+    events = reloaded.recent_agent_events(session_id="session-1", limit=10)
+    snapshot = reloaded.load_session_working_state("session-1")
+
+    assert event.event_type == "turn_finished"
+    assert [item.event_type for item in events] == ["turn_finished"]
+    assert snapshot is not None
+    assert snapshot.state["active_goal"] == "创建生态环境相关文件"
+    assert snapshot.state["last_error"] == "飞书卡片 markdown 内容过长"
+    assert snapshot.state["artifacts"] == ["/tmp/生态环境"]
+
+
+def test_session_working_state_store_api_persists_and_reloads(tmp_path):
+    from agent import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context")
+
+    store.save_session_working_state(
+        "session-1",
+        {
+            "active_goal": "创建生态环境相关文件",
+            "status": "failed",
+            "progress": "已创建目录，但文件写入未完成",
+            "next_action": "继续写入文件",
+            "last_error": "飞书卡片 markdown 内容过长",
+            "artifacts": ["/tmp/生态环境"],
+        },
+    )
+
+    reloaded = LTMStore(context_dir=tmp_path / "context")
+    snapshot = reloaded.load_session_working_state("session-1")
+
+    assert snapshot is not None
+    assert snapshot.state["active_goal"] == "创建生态环境相关文件"
+    assert snapshot.state["last_error"] == "飞书卡片 markdown 内容过长"
+    assert snapshot.state["artifacts"] == ["/tmp/生态环境"]
+
+
+def test_retrieve_implicit_context_includes_working_state_after_restart(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "创建生态环境相关文件",
+            "assistant_content": "已创建 /Users/me/生态环境 目录",
+            "error": "模型响应过长导致飞书发送失败",
+        },
+    )
+    reloaded_store = LTMStore(context_dir=context_dir)
+    reloaded_ctx = ContextManager(
+        store=reloaded_store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=reloaded_store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+
+    result = reloaded_ctx.retrieve_implicit_context("重试一次")
+
+    assert "Restored Working Context" in result
+    assert "创建生态环境相关文件" in result
+    assert "Use it when relevant" in result
+
+
+def test_retrieve_implicit_context_does_not_fallback_to_history_for_plain_query(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    store.append_conversation_turn(
+        session_id="chat-1",
+        role="user",
+        content="上一轮任务里提到了 payroll",
+    )
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+
+    result = ctx_mgr.retrieve_implicit_context("请解释 Python decorators")
+
+    assert "Previous Session" not in result
+    assert "payroll" not in result
+
+
 def test_retrieve_context_prefers_conversation_turns_for_event_recall(tmp_path):
     ctx_mgr = make_ctx_manager(tmp_path)
     ctx_mgr.record_turn(

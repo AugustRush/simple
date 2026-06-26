@@ -260,13 +260,35 @@ def test_list_files_allows_output_dir(tmp_path):
 
 
 def test_write_file_rejects_paths_outside_workspace(tmp_path):
-    tools, _, workspace = make_builtin_tools(tmp_path)
+    tools, _, _workspace = make_builtin_tools(tmp_path)
     outside = tmp_path / "outside.txt"
 
     result = tools._write_file(str(outside), "secret")
 
     assert result["ok"] is False
     assert "outside the workspace" in result["error"].lower()
+
+
+def test_write_file_redirects_workspace_paths_to_output_dir(tmp_path):
+    tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
+
+    result = tools._write_file(str(workspace / "report.md"), "generated")
+
+    assert result["ok"] is True
+    assert Path(result["path"]) == (output_dir / "report.md").resolve()
+    assert not (workspace / "report.md").exists()
+    assert (output_dir / "report.md").read_text(encoding="utf-8") == "generated"
+
+
+def test_write_file_allows_scoped_workspace_write(tmp_path):
+    tools, reg, workspace, _output_dir = make_builtin_tools_with_output_dir(tmp_path)
+    reg.set_context("write_scope", ["src/app.py"])
+
+    result = tools._write_file("src/app.py", "print('ok')\n")
+
+    assert result["ok"] is True
+    assert Path(result["path"]) == (workspace / "src" / "app.py").resolve()
+    assert (workspace / "src" / "app.py").read_text(encoding="utf-8") == "print('ok')\n"
 
 
 def test_registry_call_returns_structured_builtin_payloads(tmp_path):
@@ -466,6 +488,35 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
 
     assert result["ok"] is True
     assert captured["cwd"] == str(output_dir.resolve())
+
+
+def test_shell_moves_new_workspace_files_to_output_dir(tmp_path):
+    tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
+    script = workspace / "make_report.py"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        "Path('report.html').write_text('generated', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    result = asyncio.run(
+        tools._shell("./make_report.py", timeout=1, cwd=str(workspace))
+    )
+
+    moved = result["moved_artifacts"]
+    assert result["ok"] is True
+    assert len(moved) == 1
+    assert moved[0]["from"] == str((workspace / "report.html").resolve())
+    assert Path(moved[0]["to"]) == (
+        output_dir / "workspace-artifacts" / "report.html"
+    ).resolve()
+    assert not (workspace / "report.html").exists()
+    assert (workspace / "make_report.py").exists()
+    assert (
+        output_dir / "workspace-artifacts" / "report.html"
+    ).read_text(encoding="utf-8") == "generated"
 
 
 def test_shell_returns_confirmation_request_for_restricted_command(tmp_path):

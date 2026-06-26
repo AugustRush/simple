@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, TypeVar, overload
 
@@ -13,6 +14,7 @@ from agent.core.output import (
     _active_event_collector,
     _active_sink,
 )
+from agent.runtime.heartbeat import heartbeat_path_for_session
 from agent.skills.catalog import prepare_user_message_for_skills
 from agent.tools.runtime import _active_schedule_target
 
@@ -213,6 +215,7 @@ class TurnRunner:
             memory_worker=state.memory_worker,
             system_prompt=self._components.require("system_prompt"),
             task_context=state.task_context,
+            error=result.error or "",
         )
         return hook_results
 
@@ -380,6 +383,37 @@ class AgentCore:
             "chat_type": turn_input.metadata.get("chat_type", "p2p"),
         }
 
+    def _publish_turn_runtime_metadata(
+        self,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+    ) -> None:
+        ctx_metadata = self._context_metadata(state)
+        if ctx_metadata is None:
+            return
+
+        metadata = dict(turn_input.metadata)
+        ctx_metadata["session_id"] = turn_input.session_id
+        ctx_metadata["channel_name"] = turn_input.channel_name
+        ctx_metadata["turn_id"] = str(
+            metadata.get("turn_id")
+            or metadata.get("message_id")
+            or f"{turn_input.session_id}:{state.turn_count + 1}"
+        )
+        for key in ("heartbeat_enabled", "heartbeat_interval", "heartbeat_path"):
+            if key in metadata:
+                ctx_metadata[key] = metadata[key]
+
+        if "heartbeat_path" not in ctx_metadata:
+            output_dir = self._components.values.get("output_dir")
+            if output_dir:
+                ctx_metadata["heartbeat_path"] = (
+                    Path(output_dir)
+                    / "runtime"
+                    / "health"
+                    / heartbeat_path_for_session(turn_input.session_id).name
+                )
+
     def _drain_collector(self, turn_input: TurnInput) -> tuple[RuntimeEvent, ...]:
         collector = _active_event_collector.get()
         if collector is None:
@@ -469,6 +503,7 @@ class AgentCore:
             text_len=len(prompt),
             text_preview=prompt[:80].replace("\n", " "),
         )
+        self._publish_turn_runtime_metadata(prompted_input, state)
 
         active_sink_token = _active_sink.set(sink) if sink is not None else None
         schedule_target = self._schedule_target_for_turn(prompted_input)
