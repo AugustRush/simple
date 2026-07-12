@@ -239,6 +239,56 @@ def test_turn_runner_complete_turn_passes_error_to_maintenance():
     assert maintenance_calls[0]["error"] == "model response truncated"
 
 
+def test_post_turn_maintenance_records_runtime_event_turn_id():
+    from agent.core.agent import BaseAgent
+
+    events = []
+
+    class _CtxMgr:
+        class _Staging:
+            def append(self, role, content):
+                pass
+
+        staging = _Staging()
+
+        def record_turn(self, **kwargs):
+            pass
+
+        def record_runtime_event(self, event_type, payload=None, *, turn_id=""):
+            events.append(
+                {
+                    "event_type": event_type,
+                    "payload": payload,
+                    "turn_id": turn_id,
+                }
+            )
+
+        def should_enqueue_consolidation(self):
+            return False
+
+        def should_compact_messages(self, messages, max_tokens):
+            return False
+
+    class _Agent:
+        max_tokens = 1000
+
+    class _Ctx:
+        messages = []
+
+    BaseAgent._post_turn_maintenance(
+        ctx_mgr=_CtxMgr(),
+        agent=_Agent(),
+        ctx=_Ctx(),
+        user_content="hello",
+        assistant_content="reply",
+        channel="feishu",
+        record_kwargs={"message_id": "msg-123", "metadata": {"message_id": "msg-123"}},
+    )
+
+    assert events[0]["event_type"] == "turn_finished"
+    assert events[0]["turn_id"] == "msg-123"
+
+
 def test_turn_runner_complete_turn_uses_live_component_updates():
     maintenance_calls = []
     values = {
@@ -657,6 +707,8 @@ def test_agent_core_records_error_reported_runtime_event():
 
 
 def test_agent_core_records_failed_runtime_event_when_runner_raises():
+    completed = []
+
     class _Ctx:
         agent_id = "ctx-1"
 
@@ -670,7 +722,15 @@ def test_agent_core_records_failed_runtime_event_when_runner_raises():
             raise RuntimeError("runner exploded")
 
         async def complete_turn(self, turn_input, state, result):
-            raise AssertionError("failed turns must not complete")
+            completed.append(
+                {
+                    "text": turn_input.text,
+                    "session_id": turn_input.session_id,
+                    "error": result.error,
+                }
+            )
+            state.record_turn(list(result.tool_calls))
+            return []
 
     core = AgentCore(
         {
@@ -702,6 +762,71 @@ def test_agent_core_records_failed_runtime_event_when_runner_raises():
     assert execution.events[1].channel_name == "feishu"
     assert execution.events[1].fields["error"] == "runner exploded"
     assert execution.events[1].metadata["message_id"] == "msg-1"
+    assert completed == [
+        {
+            "text": "hello",
+            "session_id": "session-1",
+            "error": "runner exploded",
+        }
+    ]
+
+
+def test_agent_core_does_not_complete_turn_twice_when_completion_raises():
+    completed = []
+
+    class _Ctx:
+        agent_id = "ctx-1"
+
+        def __init__(self):
+            self.metadata = {}
+            self.messages = []
+            self.system_prompt = "system"
+
+    class _FakeTurnRunner:
+        async def run(self, turn_input, ctx, stream_callback=None):
+            return TurnResult(text="reply", tool_calls=("bash",))
+
+        async def complete_turn(self, turn_input, state, result):
+            completed.append(
+                {
+                    "text": turn_input.text,
+                    "error": result.error,
+                    "tool_calls": list(result.tool_calls),
+                }
+            )
+            state.record_turn(list(result.tool_calls))
+            raise RuntimeError("maintenance failed")
+
+    core = AgentCore(
+        {
+            "agent": object(),
+            "system_prompt": "system",
+            "base_system_prompt": "system",
+            "registry": object(),
+            "turn_runner": _FakeTurnRunner(),
+        }
+    )
+
+    execution = asyncio.run(
+        core.handle_turn(
+            TurnInput.from_text(
+                "hello",
+                session_id="session-1",
+                channel_name="feishu",
+                metadata={"message_id": "msg-1"},
+            ),
+            RuntimeSessionState(ctx=_Ctx()),
+        )
+    )
+
+    assert execution.result.error == "maintenance failed"
+    assert completed == [
+        {
+            "text": "hello",
+            "error": None,
+            "tool_calls": ["bash"],
+        }
+    ]
 
 
 def test_agent_core_handles_minimal_context_without_metadata_when_no_skill_catalog():

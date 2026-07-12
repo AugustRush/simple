@@ -364,9 +364,74 @@ Policy body.
         has_spawn_agent=True,
     )
 
-    assert decision.mode == "rendezvous"
-    assert "辩论" in decision.reason
+    assert decision.mode == "explicit"
+    assert "rendezvous" in decision.guidance
+    assert "辩论" in decision.guidance
     assert decision.max_rendezvous_rounds == 2
+
+
+def test_channel_runner_processes_unconsumed_pending_message_as_next_turn():
+    from agent.channels.base import ChannelRunner, IncomingMessage
+    from agent.runtime import RuntimeSessionState, TurnExecution, TurnResult
+    import agent as agent_module
+
+    class _SkillCatalog:
+        pass
+
+    class _FakeCore:
+        def __init__(self):
+            self.calls = []
+
+        async def handle_turn(self, turn_input, state, sink=None):
+            self.calls.append(turn_input.text)
+            return TurnExecution(result=TurnResult(text=f"reply:{turn_input.text}"))
+
+    class _Sink:
+        def on_status(self, *_args, **_kwargs):
+            pass
+
+        def on_error(self, *_args, **_kwargs):
+            pass
+
+    core = _FakeCore()
+    state = RuntimeSessionState(
+        ctx=agent_module.AgentContext(system_prompt="system"),
+    )
+    state.pending_messages.append(
+        {
+            "text": "queued normal followup",
+            "from_user": "user-1",
+            "arrived_at": 1.0,
+            "urgency": "normal",
+        }
+    )
+    sessions = {"chat-1": state}
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "system_prompt": "system",
+            "skill_catalog": _SkillCatalog(),
+            "agent_core": core,
+        },
+        cfg={},
+    )
+
+    handler = runner._make_message_handler(sessions)
+    handled = asyncio.run(
+        handler(
+            IncomingMessage(
+                text="first",
+                session_id="chat-1",
+                metadata={"chat_id": "chat-1", "message_id": "msg-1"},
+                channel_name="feishu",
+            ),
+            _Sink(),
+        )
+    )
+
+    assert handled is True
+    assert core.calls == ["first", "queued normal followup"]
+    assert state.pending_messages == []
 
 
 def test_send_message_executes_parallel_spawn_calls_via_internal_runtime(
@@ -1792,6 +1857,68 @@ def test_send_message_stops_repeated_tool_loop_with_user_options(monkeypatch):
     assert ctx.messages[-1]["content"] == result.content
 
 
+def test_tool_loop_classification_reports_structured_outcomes():
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+
+    productive = agent._classify_tool_results(
+        [
+            json.dumps(
+                {
+                    "ok": True,
+                    "artifact": "/tmp/report.md",
+                    "summary_text": "wrote report",
+                }
+            )
+        ]
+    )
+    needs_user = agent._classify_tool_results(
+        [json.dumps({"ok": False, "requires_confirmation": True})]
+    )
+    retryable = agent._classify_tool_results(
+        [
+            json.dumps(
+                {
+                    "ok": False,
+                    "recoverable_by_agent": True,
+                    "recovery_hint": "try a narrower query",
+                }
+            )
+        ]
+    )
+
+    assert productive.progress_made is True
+    assert productive.artifact_changed is True
+    assert productive.unproductive is False
+    assert needs_user.needs_user is True
+    assert needs_user.unproductive is True
+    assert retryable.retryable is True
+    assert retryable.unproductive is False
+
+
+def test_tool_loop_watchdog_records_last_structured_outcome():
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    state = agent._new_watchdog_state()
+
+    reason = agent._check_tool_loop_stuck(
+        state,
+        [{"name": "noop", "input": {}}],
+        [json.dumps({"ok": False, "error": "not found"})],
+    )
+
+    assert reason == ""
+    assert state["last_outcome"]["progress_made"] is False
+    assert state["last_outcome"]["unproductive"] is True
+    assert state["last_outcome"]["fatal"] is True
+
+
 def test_send_message_stuck_response_sanitizes_intent_required_loop(monkeypatch):
     import agent as agent_module
 
@@ -1926,6 +2053,62 @@ def test_send_message_content_filter_recovery_continues_tool_loop(monkeypatch):
     assert result.error is None
     assert result.content == "final"
     assert result.tool_calls_made == ["noop", "noop_after_recovery"]
+
+
+def test_send_message_unrecoverable_content_filter_returns_error(monkeypatch):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent.llm_max_retries = 0
+    monkeypatch.setattr(agent.content_filter, "save", lambda path: None)
+
+    responses = iter(
+        [
+            agent_module._OAIResponse(
+                [
+                    agent_module._OAIChoice(
+                        "tool_calls",
+                        agent_module._OAIMsg(
+                            "",
+                            [
+                                agent_module._OAITC(
+                                    "call-1",
+                                    agent_module._OAIFunc("noop", "{}"),
+                                )
+                            ],
+                        ),
+                    )
+                ]
+            ),
+            RuntimeError("Content Exists Risk"),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        return ["blocked raw result"]
+
+    async def fake_recover(ctx, tool_uses, results):
+        return None
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+    monkeypatch.setattr(agent, "_recover_from_content_filter", fake_recover)
+
+    result = asyncio.run(
+        agent.send_message(agent_module.AgentContext(system_prompt="system"), "do it")
+    )
+
+    assert result.error
+    assert "Content filter blocked the request" in result.error
+    assert result.content == result.error
 
 
 def test_clear_context_is_applied_after_tool_batch_and_uses_current_request(

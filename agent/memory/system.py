@@ -4,6 +4,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -2525,6 +2526,7 @@ class ContextManager:
         self._lock = threading.RLock()
         self._jobs: deque[dict[str, Any]] = deque()
         self._processing_job = False
+        self.last_working_state_recovery_trace: dict[str, Any] = {}
 
     @staticmethod
     def _coerce_consolidation_result(result: Any) -> ConsolidationResult:
@@ -3257,11 +3259,185 @@ class ContextManager:
                     lines.append(f"  - {role}: {content}")
         return "\n".join(lines) if len(lines) > 2 else ""
 
-    def working_state_context(self) -> str:
+    @staticmethod
+    def _working_state_terms(state: dict[str, Any]) -> set[str]:
+        parts: list[str] = []
+        for key in ("active_goal", "progress"):
+            value = str(state.get(key, "") or "").strip()
+            if value:
+                parts.append(value)
+        artifacts = state.get("artifacts")
+        if isinstance(artifacts, list):
+            parts.extend(str(item or "").strip() for item in artifacts)
+        recent_turns = state.get("recent_turns")
+        if isinstance(recent_turns, list):
+            for turn in recent_turns:
+                if isinstance(turn, dict):
+                    content = str(turn.get("content", "") or "").strip()
+                    if content:
+                        parts.append(content)
+        return set(_lexical_terms(" ".join(parts)))
+
+    @staticmethod
+    def _weighted_term_overlap(
+        query_terms: set[str],
+        value: Any,
+        *,
+        weight: float,
+    ) -> float:
+        terms = set(_lexical_terms(str(value or "")))
+        if not terms:
+            return 0.0
+        return len(query_terms & terms) * weight
+
+    def _working_state_relevance_score(self, state: dict[str, Any], query: str) -> float:
+        query_terms = set(_lexical_terms(query))
+        if not query_terms:
+            return 0.0
+
+        score = 0.0
+        score += self._weighted_term_overlap(
+            query_terms, state.get("active_goal"), weight=2.0
+        )
+        score += self._weighted_term_overlap(
+            query_terms, state.get("progress"), weight=1.0
+        )
+        score += self._weighted_term_overlap(
+            query_terms, state.get("last_error"), weight=0.35
+        )
+        artifacts = state.get("artifacts")
+        if isinstance(artifacts, list):
+            for artifact in artifacts:
+                score += self._weighted_term_overlap(query_terms, artifact, weight=2.5)
+        recent_turns = state.get("recent_turns")
+        if isinstance(recent_turns, list):
+            for turn in recent_turns:
+                if not isinstance(turn, dict):
+                    continue
+                role = str(turn.get("role", "") or "").strip().lower()
+                weight = 1.5 if role == "user" else 0.75
+                score += self._weighted_term_overlap(
+                    query_terms,
+                    turn.get("content", ""),
+                    weight=weight,
+                )
+        return score
+
+    @staticmethod
+    def _working_state_is_complete(state: dict[str, Any]) -> bool:
+        status = str(state.get("status", "") or "").strip().lower()
+        return status in {"completed", "updated", "done", "success"}
+
+    def _working_state_candidates(self, state: dict[str, Any]) -> list[dict[str, Any]]:
+        tasks = state.get("tasks")
+        if isinstance(tasks, list):
+            candidates = [task for task in tasks if isinstance(task, dict)]
+            if candidates:
+                return candidates
+        return [state] if isinstance(state, dict) and state else []
+
+    def _select_working_state(
+        self,
+        state: dict[str, Any],
+        query: str,
+        *,
+        include_completed: bool = False,
+    ) -> dict[str, Any] | None:
+        decision = self._working_state_recovery_decision(
+            state,
+            query,
+            include_completed=include_completed,
+        )
+        selected_task_id = str(decision.get("selected_task_id", "") or "")
+        if not selected_task_id:
+            return None
+        for candidate in self._working_state_candidates(state):
+            if str(candidate.get("task_id", "") or "") == selected_task_id:
+                return candidate
+        return None
+
+    def _working_state_recovery_decision(
+        self,
+        state: dict[str, Any],
+        query: str,
+        *,
+        include_completed: bool = False,
+    ) -> dict[str, Any]:
+        threshold = 2.0
+        candidates: list[dict[str, Any]] = []
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for candidate in self._working_state_candidates(state):
+            complete = self._working_state_is_complete(candidate)
+            score = self._working_state_relevance_score(candidate, query)
+            eligible = include_completed or not complete
+            candidate_trace = {
+                "task_id": str(candidate.get("task_id", "") or ""),
+                "status": str(candidate.get("status", "") or ""),
+                "score": round(score, 3),
+                "eligible": bool(eligible),
+                "active_goal": self._clip_working_state_text(
+                    candidate.get("active_goal", ""), 120
+                ),
+            }
+            candidates.append(candidate_trace)
+            if eligible and score >= threshold:
+                scored.append((score, candidate))
+        selected: dict[str, Any] | None = None
+        if not scored:
+            selected = None
+        else:
+            scored.sort(
+                key=lambda item: (
+                    item[0],
+                    str(item[1].get("updated_at", "")),
+                    str(item[1].get("task_id", "")),
+                ),
+                reverse=True,
+            )
+            selected = scored[0][1]
+        selected_score = (
+            self._working_state_relevance_score(selected, query)
+            if selected is not None
+            else 0.0
+        )
+        return {
+            "query": query,
+            "threshold": threshold,
+            "selected": selected is not None,
+            "selected_task_id": str((selected or {}).get("task_id", "") or ""),
+            "selected_goal": str((selected or {}).get("active_goal", "") or ""),
+            "selected_status": str((selected or {}).get("status", "") or ""),
+            "selected_score": round(selected_score, 3),
+            "candidates": candidates,
+        }
+
+    def _should_include_working_state(self, state: dict[str, Any], query: str) -> bool:
+        if not isinstance(state, dict) or not state:
+            return False
+        return self._select_working_state(state, query) is not None
+
+    def working_state_context(self, query: str = "") -> str:
         snapshot = self.store.load_session_working_state(self.staging.session_id)
         if snapshot is None:
+            self.last_working_state_recovery_trace = {
+                "query": query,
+                "threshold": 2.0,
+                "selected": False,
+                "selected_task_id": "",
+                "selected_goal": "",
+                "selected_status": "",
+                "selected_score": 0.0,
+                "candidates": [],
+            }
             return ""
-        text = self._format_working_state_text(snapshot.state)
+        self.last_working_state_recovery_trace = self._working_state_recovery_decision(
+            snapshot.state,
+            query,
+        )
+        selected_state = self._select_working_state(snapshot.state, query)
+        if selected_state is None:
+            return ""
+        text = self._format_working_state_text(selected_state)
         events = self.store.recent_agent_events(
             session_id=self.staging.session_id,
             limit=5,
@@ -3326,18 +3502,75 @@ class ContextManager:
         clean_assistant = self._clip_working_state_text(assistant_content, 1000)
         clean_error = self._clip_working_state_text(error, 1000)
 
-        recent_turns = list(prior_state.get("recent_turns", [])) if isinstance(prior_state.get("recent_turns"), list) else []
-        if clean_user:
-            recent_turns.append({"role": "user", "content": clean_user})
-        if clean_assistant:
-            recent_turns.append({"role": "assistant", "content": clean_assistant})
-        recent_turns = recent_turns[-8:]
+        error_lower = clean_error.lower()
+        if clean_error and "cancel" in error_lower:
+            status = "cancelled"
+        elif clean_error:
+            status = "failed"
+        elif clean_assistant:
+            status = "completed"
+        else:
+            status = "in_progress"
 
-        status = "failed" if clean_error else "active"
-        if clean_assistant and not clean_error:
-            status = "updated"
-        progress = clean_assistant or str(prior_state.get("progress", "") or "")
-        next_action = str(prior_state.get("next_action", "") or "")
+        prior_tasks = [
+            dict(task)
+            for task in self._working_state_candidates(prior_state)
+            if isinstance(task, dict) and task
+        ]
+        if (
+            prior_state
+            and not isinstance(prior_state.get("tasks"), list)
+            and str(prior_state.get("active_goal", "") or "").strip()
+        ):
+            prior_tasks = [dict(prior_state)]
+
+        matched_task: dict[str, Any] | None = None
+        if clean_user and prior_tasks:
+            scored_matches = [
+                (self._working_state_relevance_score(task, clean_user), task)
+                for task in prior_tasks
+                if not self._working_state_is_complete(task)
+            ]
+            scored_matches = [
+                (score, task) for score, task in scored_matches if score >= 2.0
+            ]
+            if scored_matches:
+                scored_matches.sort(
+                    key=lambda item: (
+                        item[0],
+                        str(item[1].get("updated_at", "")),
+                        str(item[1].get("task_id", "")),
+                    ),
+                    reverse=True,
+                )
+                matched_task = dict(scored_matches[0][1])
+        elif prior_tasks:
+            open_tasks = [
+                task for task in prior_tasks if not self._working_state_is_complete(task)
+            ]
+            if open_tasks:
+                matched_task = dict(open_tasks[-1])
+
+        task_fingerprint = hashlib.sha1(
+            f"{self.staging.session_id}\0{clean_user}\0{created_at}".encode("utf-8")
+        ).hexdigest()[:12]
+        task_id = str(
+            (matched_task or {}).get("task_id")
+            or f"task-{task_fingerprint}"
+        )
+        task_recent_turns = (
+            list((matched_task or {}).get("recent_turns", []))
+            if isinstance((matched_task or {}).get("recent_turns"), list)
+            else []
+        )
+        if clean_user:
+            task_recent_turns.append({"role": "user", "content": clean_user})
+        if clean_assistant:
+            task_recent_turns.append({"role": "assistant", "content": clean_assistant})
+        task_recent_turns = task_recent_turns[-8:]
+
+        progress = clean_assistant or str((matched_task or {}).get("progress", "") or "")
+        next_action = str((matched_task or {}).get("next_action", "") or "")
         if clean_error:
             next_action = "Recover from the last error and continue the active goal if the user's next message is related."
         elif clean_assistant:
@@ -3345,19 +3578,35 @@ class ContextManager:
 
         artifacts = self._merge_artifacts(
             payload.get("artifacts"),
-            prior_state.get("artifacts"),
+            (matched_task or {}).get("artifacts"),
         )
-        state = {
-            "active_goal": clean_user or str(prior_state.get("active_goal", "") or ""),
+        current_task = {
+            "task_id": task_id,
+            "active_goal": clean_user
+            or str((matched_task or {}).get("active_goal", "") or ""),
             "status": status,
             "progress": progress,
             "next_action": next_action,
             "last_error": clean_error,
             "artifacts": artifacts,
-            "recent_turns": recent_turns,
+            "recent_turns": task_recent_turns,
             "last_event_type": event_type,
             "updated_at": created_at,
         }
+        tasks_by_id: dict[str, dict[str, Any]] = {}
+        for task in prior_tasks:
+            existing_id = str(task.get("task_id") or "")
+            if not existing_id:
+                existing_id = f"legacy-{len(tasks_by_id)}"
+                task["task_id"] = existing_id
+            tasks_by_id[existing_id] = task
+        tasks_by_id[task_id] = current_task
+        tasks = sorted(
+            tasks_by_id.values(),
+            key=lambda task: str(task.get("updated_at", "")),
+        )[-12:]
+        state = dict(current_task)
+        state["tasks"] = tasks
         return self.store.save_session_working_state(
             self.staging.session_id,
             state,
@@ -3432,7 +3681,7 @@ class ContextManager:
         assistant_identity = self._assistant_identity_context()
         if assistant_identity:
             sections.append(assistant_identity)
-        working_state = self.working_state_context()
+        working_state = self.working_state_context(query)
         if working_state:
             sections.append(working_state)
         if "episodes" in self._route_categories(query):

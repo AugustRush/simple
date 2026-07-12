@@ -418,14 +418,13 @@ class ChannelRunner:
                     )
                     state.turn_in_progress = False
 
-                # After a cancelled turn, drain a pending restart message and
-                # loop to process it as a fresh turn.  Only one auto-restart
-                # is performed per handler invocation to prevent runaway loops.
+                # If a pending message was not drained as an interjection before
+                # the turn ended, process it as the next turn instead of losing
+                # it.  This also covers /cancel <message> restart requests.
                 if state.pending_messages:
                     next_entry = state.pending_messages.pop(0)
                     turn_text = next_entry["text"]
-                    if next_entry.get("urgency") == "now":
-                        continue
+                    continue
                 break
 
             return True

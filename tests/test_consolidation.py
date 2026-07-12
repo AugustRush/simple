@@ -168,11 +168,238 @@ def test_retrieve_implicit_context_includes_working_state_after_restart(tmp_path
         staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
     )
 
-    result = reloaded_ctx.retrieve_implicit_context("重试一次")
+    result = reloaded_ctx.retrieve_implicit_context("生态环境文件还是没完成")
 
     assert "Restored Working Context" in result
     assert "创建生态环境相关文件" in result
     assert "Use it when relevant" in result
+
+
+def test_successful_working_state_not_injected_for_unrelated_query(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "帮我修复 payroll 导入脚本",
+            "assistant_content": "已经修复并通过测试",
+            "error": "",
+        },
+    )
+
+    result = ctx_mgr.retrieve_implicit_context(
+        "请解释 Python decorators",
+        current_messages=[],
+    )
+
+    assert "Restored Working Context" not in result
+    assert "payroll" not in result
+
+
+def test_failed_working_state_not_injected_for_generic_retry_query(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "帮我修复 payroll 导入脚本",
+            "assistant_content": "",
+            "error": "模型响应被截断",
+        },
+    )
+
+    result = ctx_mgr.retrieve_implicit_context(
+        "重试一次",
+        current_messages=[],
+    )
+
+    assert "Restored Working Context" not in result
+    assert "payroll" not in result
+
+
+def test_failed_working_state_injected_for_relevant_query(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "帮我修复 payroll 导入脚本",
+            "assistant_content": "",
+            "error": "模型响应被截断",
+        },
+    )
+
+    result = ctx_mgr.retrieve_implicit_context(
+        "payroll 导入脚本还是失败",
+        current_messages=[],
+    )
+
+    assert "Restored Working Context" in result
+    assert "payroll" in result
+    assert "模型响应被截断" in result
+
+
+def test_failed_working_state_survives_unrelated_successful_turn(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "帮我修复 payroll 导入脚本",
+            "assistant_content": "",
+            "error": "模型响应被截断",
+        },
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "请解释 Python decorators",
+            "assistant_content": "装饰器解释完成",
+            "error": "",
+        },
+    )
+
+    result = ctx_mgr.retrieve_implicit_context(
+        "payroll 导入脚本还是失败",
+        current_messages=[],
+    )
+
+    assert "Restored Working Context" in result
+    assert "payroll" in result
+    assert "模型响应被截断" in result
+    assert "装饰器解释完成" not in result
+
+
+def test_working_state_recovery_trace_explains_selection(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "帮我修复 payroll 导入脚本",
+            "assistant_content": "",
+            "error": "模型响应被截断",
+        },
+    )
+    ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {
+            "user_content": "请解释 Python decorators",
+            "assistant_content": "装饰器解释完成",
+            "error": "",
+        },
+    )
+
+    ctx_mgr.retrieve_implicit_context("payroll 导入脚本还是失败", current_messages=[])
+
+    trace = ctx_mgr.last_working_state_recovery_trace
+    assert trace["selected"] is True
+    assert trace["selected_score"] >= trace["threshold"]
+    assert "payroll" in trace["selected_goal"]
+    assert len(trace["candidates"]) == 2
+    assert any(
+        candidate["status"] == "completed" and not candidate["eligible"]
+        for candidate in trace["candidates"]
+    )
+
+
+def test_runtime_event_records_turn_id_in_event_log(tmp_path):
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    ctx_mgr = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="chat-1"),
+    )
+
+    event = ctx_mgr.record_runtime_event(
+        "turn_finished",
+        {"user_content": "hello"},
+        turn_id="msg-123",
+    )
+
+    events = store.recent_agent_events(session_id="chat-1", limit=1)
+    assert event.turn_id == "msg-123"
+    assert events[0].turn_id == "msg-123"
 
 
 def test_retrieve_implicit_context_does_not_fallback_to_history_for_plain_query(tmp_path):

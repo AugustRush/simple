@@ -94,6 +94,28 @@ class SubAgentProgressEvent:
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ToolLoopOutcome:
+    progress_made: bool = False
+    artifact_changed: bool = False
+    needs_user: bool = False
+    retryable: bool = False
+    fatal: bool = False
+    unproductive: bool = True
+    intent_required: bool = False
+
+    def to_dict(self) -> dict[str, bool]:
+        return {
+            "progress_made": self.progress_made,
+            "artifact_changed": self.artifact_changed,
+            "needs_user": self.needs_user,
+            "retryable": self.retryable,
+            "fatal": self.fatal,
+            "unproductive": self.unproductive,
+            "intent_required": self.intent_required,
+        }
+
+
 class _TaskLocalContextStack:
     """Deprecated: kept only as a no-op shim for any third-party caller.
 
@@ -1396,14 +1418,18 @@ class BaseAgent:
 
     @staticmethod
     def _tool_result_looks_unproductive(raw_result: str) -> bool:
+        return BaseAgent._classify_tool_result(raw_result).unproductive
+
+    @staticmethod
+    def _classify_tool_result(raw_result: str) -> ToolLoopOutcome:
         text = str(raw_result or "").strip()
         if not text:
-            return True
+            return ToolLoopOutcome(unproductive=True)
         try:
             payload = json.loads(text)
         except Exception:
             lower = text.lower()
-            return any(
+            unproductive = any(
                 marker in lower
                 for marker in (
                     "timed out",
@@ -1415,39 +1441,91 @@ class BaseAgent:
                     "error",
                 )
             )
+            retryable = "timeout" in lower or "timed out" in lower
+            return ToolLoopOutcome(
+                progress_made=not unproductive,
+                retryable=retryable,
+                fatal=unproductive and not retryable,
+                unproductive=unproductive,
+            )
         if not isinstance(payload, dict):
-            return False
-        # First-principles: a tool that explicitly signals "this is a soft
-        # error and you can recover" (via `recoverable_by_agent: true` or by
-        # attaching a non-empty `recovery_hint`) is NOT an unproductive result
-        # — the tool author has guaranteed the agent has enough information
-        # to adjust.  Treating those as failures collapses the entire grace
-        # the recovery_hint protocol is meant to provide and trips the
-        # watchdog after only 3-4 honest retries.
-        # `same_pair` (literally identical input + result) still catches the
-        # case where the agent ignores the hint and repeats verbatim.
-        if payload.get("recoverable_by_agent") is True:
-            return False
-        if payload.get("recovery_hint"):
-            return False
-        if payload.get("requires_confirmation") is True:
-            return True
-        if payload.get("blocked") is True:
-            return True
-        if payload.get("ok") is False:
-            return True
-        if payload.get("error") and payload.get("ok") is not True:
-            return True
+            return ToolLoopOutcome(progress_made=True, unproductive=False)
+        recoverable = payload.get("recoverable_by_agent") is True or bool(
+            payload.get("recovery_hint")
+        )
+        intent_required = payload.get("intent_required") is True or (
+            "intent" in str(payload.get("error", "")).lower()
+        )
+        needs_user = (
+            payload.get("requires_confirmation") is True
+            or intent_required
+        )
+        artifact_changed = any(
+            payload.get(key) not in (None, "", [], {})
+            for key in (
+                "artifact",
+                "artifacts",
+                "file",
+                "files",
+                "path",
+                "paths",
+                "written_files",
+                "created",
+                "updated",
+            )
+        )
+        if recoverable:
+            return ToolLoopOutcome(
+                progress_made=True,
+                artifact_changed=artifact_changed,
+                retryable=True,
+                unproductive=False,
+                intent_required=intent_required,
+            )
+        blocked = payload.get("blocked") is True
+        failed = payload.get("ok") is False or (
+            bool(payload.get("error")) and payload.get("ok") is not True
+        )
+        if needs_user or blocked or failed:
+            return ToolLoopOutcome(
+                artifact_changed=artifact_changed,
+                needs_user=needs_user,
+                fatal=not recoverable,
+                unproductive=True,
+                intent_required=intent_required,
+            )
         meaningful_values = [
             value for value in payload.values() if value not in (None, "", [], {})
         ]
-        return not meaningful_values
+        progress_made = bool(meaningful_values)
+        return ToolLoopOutcome(
+            progress_made=progress_made,
+            artifact_changed=artifact_changed,
+            unproductive=not progress_made,
+            intent_required=intent_required,
+        )
+
+    @classmethod
+    def _classify_tool_results(cls, results: list[str]) -> ToolLoopOutcome:
+        if not results:
+            return ToolLoopOutcome(unproductive=True)
+        outcomes = [cls._classify_tool_result(result) for result in results]
+        unproductive = all(outcome.unproductive for outcome in outcomes)
+        return ToolLoopOutcome(
+            progress_made=any(outcome.progress_made for outcome in outcomes),
+            artifact_changed=any(outcome.artifact_changed for outcome in outcomes),
+            needs_user=any(outcome.needs_user for outcome in outcomes),
+            retryable=any(outcome.retryable for outcome in outcomes),
+            fatal=all(outcome.fatal for outcome in outcomes if outcome.unproductive)
+            if unproductive
+            else any(outcome.fatal for outcome in outcomes),
+            unproductive=unproductive,
+            intent_required=all(outcome.intent_required for outcome in outcomes),
+        )
 
     @classmethod
     def _tool_results_look_unproductive(cls, results: list[str]) -> bool:
-        if not results:
-            return True
-        return all(cls._tool_result_looks_unproductive(result) for result in results)
+        return cls._classify_tool_results(results).unproductive
 
     @staticmethod
     def _tool_results_are_intent_required(results: list[str]) -> bool:
@@ -1736,6 +1814,7 @@ class BaseAgent:
             "same_result": 0,
             "unproductive_rounds": 0,
             "batch_counts": {},
+            "last_outcome": {},
         }
 
     def _check_tool_loop_stuck(
@@ -1771,8 +1850,10 @@ class BaseAgent:
             state["same_result"] = 1
             state["last_result_sig"] = result_sig
 
-        unproductive = self._tool_results_look_unproductive(results)
-        intent_required = self._tool_results_are_intent_required(results)
+        outcome = self._classify_tool_results(results)
+        state["last_outcome"] = outcome.to_dict()
+        unproductive = outcome.unproductive
+        intent_required = outcome.intent_required
         if unproductive or state["same_pair"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
             state["unproductive_rounds"] += 1
         else:
@@ -2294,6 +2375,7 @@ class BaseAgent:
                                 tool_names=",".join(
                                     tu["name"] for tu in tool_uses[:5]
                                 ),
+                                tool_outcome=watchdog.get("last_outcome", {}),
                             )
                             return AgentResult(
                                 agent_id=ctx.agent_id,
@@ -2403,6 +2485,7 @@ class BaseAgent:
             agent_id=ctx.agent_id,
             content=result_text,
             tool_calls_made=tool_calls_made,
+            error=trace_error,
         )
 
     @staticmethod
@@ -2437,6 +2520,19 @@ class BaseAgent:
             )
             record_runtime_event = getattr(ctx_mgr, "record_runtime_event", None)
             if callable(record_runtime_event):
+                metadata = (
+                    record_kwargs.get("metadata", {})
+                    if isinstance(record_kwargs, dict)
+                    else {}
+                )
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                turn_id = str(
+                    record_kwargs.get("message_id")
+                    or metadata.get("turn_id")
+                    or metadata.get("message_id")
+                    or ""
+                )
                 record_runtime_event(
                     "turn_finished",
                     {
@@ -2446,6 +2542,7 @@ class BaseAgent:
                         "channel": channel,
                         "metadata": record_kwargs,
                     },
+                    turn_id=turn_id,
                 )
             ctx_mgr.staging.append("user", user_content)
             if assistant_content:

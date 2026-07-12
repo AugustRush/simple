@@ -74,31 +74,29 @@ class OrchestrationPlanner:
         if not tools_enabled or not has_spawn_agent:
             return OrchestrationDecision(mode="direct", reason="spawn unavailable")
         lowered = user_message.lower()
-        if self.rendezvous_keywords and self._contains_any(lowered, self.rendezvous_keywords):
-            return OrchestrationDecision(
-                mode="rendezvous",
-                reason=f"user message matched rendezvous keywords: "
-                       f"{self._matched_keywords(lowered, self.rendezvous_keywords)}",
-                max_rendezvous_rounds=self.max_rendezvous_rounds,
+        guidance_parts: list[str] = []
+        rendezvous_hits = self._matched_keywords(lowered, self.rendezvous_keywords)
+        if rendezvous_hits:
+            guidance_parts.append(
+                f"rendezvous may fit coordination cues: {rendezvous_hits}"
             )
         pipeline_hits = self._matched_keywords(
             lowered,
             self.pipeline_keywords + self.pipeline_leading_keywords + self.pipeline_followup_keywords,
         )
         if pipeline_hits:
-            return OrchestrationDecision(
-                mode="pipeline",
-                reason=f"user message matched pipeline keywords: {pipeline_hits}",
+            guidance_parts.append(
+                f"pipeline may fit ordering cues: {pipeline_hits}"
             )
-        if self.parallel_keywords and self._contains_any(lowered, self.parallel_keywords):
-            return OrchestrationDecision(
-                mode="parallel",
-                reason=f"user message matched parallel keywords: "
-                       f"{self._matched_keywords(lowered, self.parallel_keywords)}",
+        parallel_hits = self._matched_keywords(lowered, self.parallel_keywords)
+        if parallel_hits:
+            guidance_parts.append(
+                f"parallel may fit independence cues: {parallel_hits}"
             )
         return OrchestrationDecision(
             mode="explicit",
-            reason="no keyword match; runtime derives mode from explicit subtask plan",
+            reason="runtime derives mode from explicit subtask plan",
+            guidance="; ".join(guidance_parts),
             max_rendezvous_rounds=self.max_rendezvous_rounds,
         )
 

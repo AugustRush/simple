@@ -517,6 +517,7 @@ class AgentCore:
             iteration_prompt = prompt
             iterations = 0
             cancelled_by_user = False
+            completion_attempted = False
             # Publish the session cancel token so send_message() can check it
             # at every tool-loop boundary.
             if state.cancel_token is not None:
@@ -530,6 +531,7 @@ class AgentCore:
             try:
                 for iteration_index in range(max(1, int(max_continuations) + 1)):
                     iterations = iteration_index + 1
+                    completion_attempted = False
                     state.ensure_task_context(iteration_prompt)
                     self._refresh_component_prompt_if_needed(state)
                     self._refresh_skill_prompt_if_needed(state)
@@ -575,6 +577,7 @@ class AgentCore:
                     collector.emit("turn_response_delivered")
                     if final_result.error:
                         collector.emit("turn_error_reported", error=final_result.error)
+                    completion_attempted = True
                     hook_results = await self._turn_runner().complete_turn(
                         current_input,
                         state,
@@ -638,9 +641,23 @@ class AgentCore:
                 ),
             )
         except Exception as exc:
+            failed_result = TurnResult(text="", error=str(exc))
             collector.emit("turn_failed", error=str(exc))
+            failed_input = locals().get("current_input")
+            if isinstance(failed_input, TurnInput) and not completion_attempted:
+                try:
+                    await self._turn_runner().complete_turn(
+                        failed_input,
+                        state,
+                        failed_result,
+                    )
+                except Exception as maintenance_exc:
+                    collector.emit(
+                        "turn_completion_failed",
+                        error=str(maintenance_exc),
+                    )
             return TurnExecution(
-                result=TurnResult(text="", error=str(exc)),
+                result=failed_result,
                 iterations=iterations,
                 events=self._drain_collector(turn_input),
             )
