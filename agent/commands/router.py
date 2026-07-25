@@ -26,6 +26,8 @@ class CommandClassification:
     source: CommandSource | None = None
     skill_id: str | None = None
     skill_args: str = ""
+    skill_ref: str | None = None
+    skill_error: Literal["unknown", "ambiguous"] | None = None
     suggestions: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -61,6 +63,13 @@ def parse_command(
 
 def _in_scope(descriptor: CommandDescriptor, channel_name: str) -> bool:
     return "all" in descriptor.scopes or channel_name.casefold() in descriptor.scopes
+
+
+class _AmbiguousSkillReference(Exception):
+    def __init__(self, skill_ref: str, candidates: tuple[str, ...]) -> None:
+        self.skill_ref = skill_ref
+        self.candidates = candidates
+        super().__init__(skill_ref)
 
 
 class CommandRouter:
@@ -143,7 +152,19 @@ class CommandRouter:
         if parsed is None:
             return None
         skill_ref = parsed.skill_ref if request.name == "skill" else request.name
-        bundle = self._skill_catalog.get(skill_ref)
+        candidates = sorted(
+            (
+                bundle
+                for bundle in self._skill_catalog.list_skills()
+                if bundle.id.casefold() == skill_ref.casefold()
+            ),
+            key=lambda bundle: bundle.id,
+        )
+        if len(candidates) > 1:
+            raise _AmbiguousSkillReference(
+                skill_ref, tuple(bundle.id for bundle in candidates)
+            )
+        bundle = candidates[0] if candidates else self._skill_catalog.get(skill_ref)
         if bundle is None or not bundle.user_invocable:
             return None
         return bundle.id, parsed.remaining_text
@@ -160,11 +181,33 @@ class CommandRouter:
                 for bundle in self._skill_catalog.list_skills()
                 if bundle.user_invocable
             )
-        return tuple(
-            difflib.get_close_matches(
-                name.casefold(), sorted(candidates), n=3, cutoff=0.6
-            )
+        return self._close_matches(name, candidates)
+
+    def _skill_suggestions(self, skill_ref: str) -> tuple[str, ...]:
+        if self._skill_catalog is None:
+            return ()
+        return self._close_matches(
+            skill_ref,
+            (
+                bundle.id
+                for bundle in self._skill_catalog.list_skills()
+                if bundle.user_invocable
+            ),
         )
+
+    @staticmethod
+    def _close_matches(name: str, candidates: Iterable[str]) -> tuple[str, ...]:
+        by_casefold: dict[str, list[str]] = {}
+        for candidate in sorted(set(candidates)):
+            by_casefold.setdefault(candidate.casefold(), []).append(candidate)
+        matches = difflib.get_close_matches(
+            name.casefold(), sorted(by_casefold), n=3, cutoff=0.6
+        )
+        return tuple(
+            candidate
+            for match in matches
+            for candidate in by_casefold[match]
+        )[:3]
 
     def classify(
         self,
@@ -209,7 +252,17 @@ class CommandRouter:
                 suggestions=self._suggestions(request.name, request.channel_name),
             )
 
-        skill = self._explicit_skill(request)
+        try:
+            skill = self._explicit_skill(request)
+        except _AmbiguousSkillReference as exc:
+            return CommandClassification(
+                kind="unknown_slash",
+                text=text,
+                request=request,
+                skill_ref=exc.skill_ref,
+                skill_error="ambiguous",
+                suggestions=exc.candidates,
+            )
         if skill is not None:
             skill_id, skill_args = skill
             return CommandClassification(
@@ -221,12 +274,20 @@ class CommandRouter:
             )
 
         parsed_skill = parse_explicit_skill_request(request.original_text)
-        unknown_name = parsed_skill.skill_ref if parsed_skill is not None else request.name
+        if request.name == "skill" and parsed_skill is not None:
+            return CommandClassification(
+                kind="unknown_slash",
+                text=text,
+                request=request,
+                skill_ref=parsed_skill.skill_ref,
+                skill_error="unknown",
+                suggestions=self._skill_suggestions(parsed_skill.skill_ref),
+            )
         return CommandClassification(
             kind="unknown_slash",
             text=text,
             request=request,
-            suggestions=self._suggestions(unknown_name, request.channel_name),
+            suggestions=self._suggestions(request.name, request.channel_name),
         )
 
     async def execute(
@@ -248,24 +309,41 @@ class CommandRouter:
                 if not isinstance(result, CommandResult):
                     raise TypeError("command handler must return CommandResult")
                 return result
-            except Exception as exc:
+            except Exception:
                 logger.exception(
                     "command execution failed: command=%s session_id=%s",
                     classification.descriptor.name,
                     classification.request.session_id,
                 )
+                failure_message = (
+                    f"Command /{classification.descriptor.name} failed."
+                )
                 return CommandResult(
-                    response_text=(
-                        f"Command /{classification.descriptor.name} failed: {exc}"
-                    ),
+                    response_text=failure_message,
                     level="error",
-                    error=str(exc),
+                    error=failure_message,
                 )
 
         if classification.kind == "skill":
             return CommandResult(forward_text=classification.text)
         if classification.kind == "text":
             return CommandResult(handled=False, forward_text=classification.text)
+
+        if classification.skill_error == "ambiguous":
+            matches = ", ".join(classification.suggestions)
+            response = (
+                f"Ambiguous skill invocation '{classification.skill_ref}'. "
+                f"Matches: {matches}."
+            )
+            return CommandResult(response_text=response, level="error")
+        if classification.skill_error == "unknown":
+            response = f"Unknown skill '{classification.skill_ref}'."
+            if classification.suggestions:
+                choices = ", ".join(
+                    f"/skill {name}" for name in classification.suggestions
+                )
+                response += f" Did you mean {choices}?"
+            return CommandResult(response_text=response, level="error")
 
         request_name = (
             classification.request.name if classification.request is not None else ""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,6 +54,33 @@ def test_parse_command_carries_transport_identity_and_immutable_metadata() -> No
     assert request.metadata == {"message_id": "m-1"}
     with pytest.raises(TypeError):
         request.metadata["new"] = "value"  # type: ignore[index]
+
+
+@pytest.mark.parametrize("contract", ["request", "context"])
+def test_command_metadata_is_recursively_frozen_and_detached(contract: str) -> None:
+    metadata = {
+        "nested": {
+            "items": [{"value": "original"}],
+            "labels": {"alpha"},
+        }
+    }
+    value = (
+        CommandRequest("/help", "help", metadata=metadata)
+        if contract == "request"
+        else CommandContext({}, {}, object(), object(), metadata=metadata)
+    )
+
+    metadata["nested"]["items"][0]["value"] = "changed"
+    metadata["nested"]["items"].append({"value": "new"})
+    metadata["nested"]["labels"].add("beta")
+
+    nested = value.metadata["nested"]
+    assert nested["items"] == ({"value": "original"},)
+    assert nested["labels"] == frozenset({"alpha"})
+    with pytest.raises(TypeError):
+        nested["new"] = True
+    with pytest.raises(AttributeError):
+        nested["items"].append({"value": "new"})
 
 
 def test_command_contracts_are_immutable_and_normalize_collections() -> None:
@@ -107,6 +135,35 @@ def test_descriptor_rejects_invalid_scope() -> None:
         CommandDescriptor(
             name="status", handler=_noop_handler, scopes=frozenset({"web"})
         )
+
+
+@pytest.mark.parametrize(
+    ("name", "aliases"),
+    [
+        ("/help", ()),
+        ("two words", ()),
+        (" help", ()),
+        ("help", ("/h",)),
+        ("help", ("two words",)),
+        ("help", ("h\talias",)),
+    ],
+)
+def test_descriptor_rejects_unreachable_names_and_aliases(
+    name: str, aliases: tuple[str, ...]
+) -> None:
+    with pytest.raises(ValueError, match="command (name|alias)"):
+        CommandDescriptor(name=name, handler=_noop_handler, aliases=aliases)
+
+
+def test_descriptor_accepts_reachable_plugin_name_conventions() -> None:
+    descriptor = CommandDescriptor(
+        name="Git-Helper:Deploy.V2",
+        handler=_noop_handler,
+        aliases=("GH:Deploy-V2",),
+    )
+
+    assert descriptor.name == "git-helper:deploy.v2"
+    assert descriptor.aliases == ("gh:deploy-v2",)
 
 
 def _skill_catalog(tmp_path, *skills: tuple[str, bool]) -> SkillCatalog:
@@ -169,6 +226,27 @@ def test_execute_invokes_only_the_classified_command() -> None:
     assert result == CommandResult(response_text="args=Mixed CASE")
 
 
+def test_execute_does_not_expose_handler_exception_details() -> None:
+    secret = "token=super-secret at /private/path"
+
+    async def handler(
+        request: CommandRequest, context: CommandContext
+    ) -> CommandResult:
+        raise RuntimeError(secret)
+
+    router = CommandRouter(core_commands=[CommandDescriptor("explode", handler)])
+    route = router.classify("/explode")
+
+    result = asyncio.run(
+        router.execute(route, CommandContext({}, {}, object(), object()))
+    )
+
+    assert result.response_text == "Command /explode failed."
+    assert result.error == "Command /explode failed."
+    assert secret not in result.response_text
+    assert secret not in result.error
+
+
 def test_core_alias_is_classified_as_core_command() -> None:
     descriptor = CommandDescriptor("status", _noop_handler, aliases=("st",))
     router = CommandRouter(core_commands=[descriptor])
@@ -228,6 +306,58 @@ def test_direct_skill_invocation_is_case_insensitive_for_namespaced_id(
     assert route.skill_args == "Keep THIS Case"
 
 
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        "/QUALITY/REVIEW Keep THIS Case",
+        "/quality/review Keep THIS Case",
+        "/skill quality/review Keep THIS Case",
+    ],
+)
+def test_skill_invocation_preserves_uppercase_canonical_id_and_argument_case(
+    tmp_path, invocation: str
+) -> None:
+    router = CommandRouter(
+        skill_catalog=_skill_catalog(tmp_path, ("Quality/Review", True))
+    )
+
+    route = router.classify(invocation)
+
+    assert route.kind == "skill"
+    assert route.skill_id == "Quality/Review"
+    assert route.skill_args == "Keep THIS Case"
+
+
+def test_casefold_colliding_skill_ids_are_ambiguous() -> None:
+    bundles = [
+        SimpleNamespace(id="Quality/Review", user_invocable=True),
+        SimpleNamespace(id="quality/review", user_invocable=True),
+    ]
+
+    class CollisionCatalog:
+        def get(self, skill_ref: str):
+            return next((bundle for bundle in bundles if bundle.id == skill_ref), None)
+
+        def list_skills(self):
+            return list(reversed(bundles))
+
+    router = CommandRouter(skill_catalog=CollisionCatalog())
+
+    route = router.classify("/quality/review Task")
+
+    assert route.kind == "unknown_slash"
+    assert route.skill_id is None
+    assert route.skill_error == "ambiguous"
+    assert route.skill_ref == "quality/review"
+    result = asyncio.run(
+        router.execute(route, CommandContext({}, {}, object(), object()))
+    )
+    assert result.response_text == (
+        "Ambiguous skill invocation 'quality/review'. "
+        "Matches: Quality/Review, quality/review."
+    )
+
+
 @pytest.mark.parametrize("invocation", ["/internal", "/skill internal task"])
 def test_non_user_invocable_skill_is_an_unknown_slash(
     tmp_path, invocation: str
@@ -254,6 +384,24 @@ def test_unknown_slash_has_close_command_suggestions() -> None:
     assert result.level == "error"
     assert result.response_text is not None
     assert "/help" in result.response_text
+
+
+def test_unknown_explicit_skill_reports_ref_and_skill_suggestion(tmp_path) -> None:
+    router = CommandRouter(
+        skill_catalog=_skill_catalog(tmp_path, ("review", True))
+    )
+
+    route = router.classify("/skill revie Keep Case")
+
+    assert route.kind == "unknown_slash"
+    assert route.skill_ref == "revie"
+    assert route.suggestions == ("review",)
+    result = asyncio.run(
+        router.execute(route, CommandContext({}, {}, object(), object()))
+    )
+    assert result.response_text == (
+        "Unknown skill 'revie'. Did you mean /skill review?"
+    )
 
 
 def test_ordinary_text_falls_through_without_becoming_a_command() -> None:

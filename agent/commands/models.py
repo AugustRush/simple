@@ -18,6 +18,28 @@ def _immutable_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     return MappingProxyType(dict(value))
 
 
+def _freeze_metadata(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_metadata(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_metadata(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_metadata(item) for item in value)
+    return value
+
+
+def _normalize_command_token(value: str, *, label: str) -> str:
+    if not value:
+        raise ValueError(f"command {label} cannot be empty")
+    if value.startswith("/") or any(character.isspace() for character in value):
+        raise ValueError(
+            f"command {label} must not start with '/' or contain whitespace"
+        )
+    return value.casefold()
+
+
 @dataclass(frozen=True)
 class CommandRequest:
     """A parsed command plus its transport identity."""
@@ -32,7 +54,7 @@ class CommandRequest:
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", self.name.strip().casefold())
         object.__setattr__(self, "args", self.args.strip())
-        object.__setattr__(self, "metadata", _immutable_mapping(self.metadata))
+        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
 
 
 @dataclass(frozen=True)
@@ -51,7 +73,7 @@ class CommandContext:
     def __post_init__(self) -> None:
         object.__setattr__(self, "components", _immutable_mapping(self.components))
         object.__setattr__(self, "config", _immutable_mapping(self.config))
-        object.__setattr__(self, "metadata", _immutable_mapping(self.metadata))
+        object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
 
 
 @dataclass(frozen=True)
@@ -97,13 +119,11 @@ class CommandDescriptor:
     accepts_interjections: bool = False
 
     def __post_init__(self) -> None:
-        name = self.name.strip().lstrip("/").casefold()
-        aliases = tuple(alias.strip().lstrip("/").casefold() for alias in self.aliases)
+        name = _normalize_command_token(self.name, label="name")
+        aliases = tuple(
+            _normalize_command_token(alias, label="alias") for alias in self.aliases
+        )
         scopes = frozenset(str(scope).casefold() for scope in self.scopes)
-        if not name:
-            raise ValueError("command name cannot be empty")
-        if any(not alias for alias in aliases):
-            raise ValueError("command aliases cannot be empty")
         invalid_scopes = scopes - _VALID_SCOPES
         if invalid_scopes:
             invalid = ", ".join(sorted(invalid_scopes))
