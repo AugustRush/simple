@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
 import asyncio
+import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,6 +16,7 @@ from agent.commands import (
     CommandResult,
     CommandRouter,
     parse_command,
+    register_builtin_commands,
 )
 from agent.runtime import RuntimeSessionState, TurnInput, TurnResult
 from agent.shared import CancelToken
@@ -522,6 +525,347 @@ def test_help_is_generated_from_descriptors_and_filtered_by_scope() -> None:
     assert "/help - Show commands" in feishu_help
     assert "/send <path> - Send a file" in feishu_help
     assert "/quit" not in feishu_help
+
+
+class _BuiltinSink:
+    def __init__(self) -> None:
+        self.attachments: list[Path] = []
+
+    def queue_attachment(self, path: Path) -> None:
+        self.attachments.append(path)
+
+
+def _builtin_router() -> CommandRouter:
+    router = CommandRouter()
+    register_builtin_commands(router)
+    return router
+
+
+def _run_builtin(
+    router: CommandRouter,
+    command: str,
+    *,
+    channel_name: str = "cli",
+    components: dict | None = None,
+    config: dict | None = None,
+    state: object | None = None,
+) -> CommandResult:
+    route = router.classify(command, channel_name=channel_name, session_id="s-1")
+    assert route.kind == "command"
+    context = CommandContext(
+        components or {},
+        config or {},
+        state or SimpleNamespace(ctx=SimpleNamespace(messages=[]), model_override=None),
+        _BuiltinSink(),
+        channel_name=channel_name,
+        session_id="s-1",
+    )
+    return asyncio.run(router.execute(route, context))
+
+
+def test_builtin_registration_defines_portable_scope_and_concurrency() -> None:
+    router = _builtin_router()
+
+    expected = {
+        "help": ("anytime", frozenset({"all"})),
+        "memory": ("anytime", frozenset({"all"})),
+        "context": ("anytime", frozenset({"all"})),
+        "sessions": ("anytime", frozenset({"all"})),
+        "session": ("anytime", frozenset({"all"})),
+        "export": ("idle_only", frozenset({"all"})),
+        "tools": ("anytime", frozenset({"all"})),
+        "skills": ("anytime", frozenset({"all"})),
+        "plugins": ("anytime", frozenset({"all"})),
+        "model": ("anytime", frozenset({"all"})),
+        "quit": ("anytime", frozenset({"cli"})),
+        "send": ("anytime", frozenset({"feishu"})),
+        "cancel": ("interrupt", frozenset({"all"})),
+        "now": ("interrupt", frozenset({"all"})),
+    }
+
+    for name, policy in expected.items():
+        route = router.classify(f"/{name}", channel_name="feishu" if name == "send" else "cli")
+        assert route.kind == "command"
+        assert route.descriptor is not None
+        assert (route.descriptor.concurrency, route.descriptor.scopes) == policy
+    assert router.classify("/exit", channel_name="cli").descriptor.name == "quit"
+    assert router.classify("/q", channel_name="cli").descriptor.name == "quit"
+    assert router.classify("/history", channel_name="cli").descriptor.name == "sessions"
+    assert router.classify("/ralph", channel_name="cli").kind == "unknown_slash"
+
+
+def test_builtin_help_uses_live_descriptors_and_channel_scope() -> None:
+    router = _builtin_router()
+
+    cli_help = _run_builtin(router, "/help").response_text
+    feishu_help = _run_builtin(router, "/help", channel_name="feishu").response_text
+
+    assert cli_help is not None
+    assert "/quit" in cli_help
+    assert "/send <path>" not in cli_help
+    assert "Ctrl+C" in cli_help
+    assert feishu_help is not None
+    assert "/send <path>" in feishu_help
+    assert "/quit" not in feishu_help
+
+
+def test_builtin_memory_and_context_render_read_only_summaries() -> None:
+    class Memory:
+        def read_index(self) -> str:
+            return '{"one": 1}\n\n{"two": 2}\n'
+
+    class ContextManager:
+        def stats(self) -> dict:
+            return {
+                "dynamic_categories": 2,
+                "max_categories": 8,
+                "total_categories": 3,
+                "total_entries": 11,
+                "category_names": ["work", "people"],
+                "staged_turns": 4,
+                "needs_consolidation": True,
+                "idle_elapsed_s": 9,
+                "idle_threshold_s": 60,
+            }
+
+    router = _builtin_router()
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(messages=[]),
+        context_manager=ContextManager(),
+        model_override=None,
+    )
+    memory = _run_builtin(
+        router, "/memory", components={"memory": Memory()}, state=state
+    )
+    context = _run_builtin(router, "/context", state=state)
+
+    assert memory.response_text is not None
+    assert "Memory Export" in memory.response_text
+    assert "Entries: 2" in memory.response_text
+    assert context.response_text is not None
+    assert "Dynamic Categories: 2/8" in context.response_text
+    assert "Needs Consolidation: yes" in context.response_text
+
+
+def test_builtin_memory_and_context_report_unavailable_dependencies() -> None:
+    router = _builtin_router()
+
+    memory = _run_builtin(router, "/memory")
+    context = _run_builtin(router, "/context")
+
+    assert memory.level == "error"
+    assert memory.response_text == "Memory is not available."
+    assert context.level == "error"
+    assert context.response_text == "Context manager is not available."
+
+
+def test_builtin_sessions_and_session_prefix_lookup(tmp_path) -> None:
+    sessions_file = tmp_path / "sessions.jsonl"
+    sessions = [
+        {
+            "session_id": "abc123-first",
+            "timestamp": "2026-07-25T10:00:00Z",
+            "objective_score": 8.5,
+            "task_summary": "First task",
+            "tools_used": ["Read", "Write"],
+            "correction_count": 1,
+        },
+        {
+            "session_id": "def456-second",
+            "timestamp": "2026-07-25T11:00:00Z",
+            "score": 7,
+            "task_summary": "Second task",
+        },
+    ]
+    sessions_file.write_text(
+        "not-json\n" + "\n".join(json.dumps(item) for item in sessions),
+        encoding="utf-8",
+    )
+    router = _builtin_router()
+    components = {"sessions_file": sessions_file}
+
+    history = _run_builtin(router, "/history", components=components)
+    detail = _run_builtin(router, "/session abc", components=components)
+    usage = _run_builtin(router, "/session", components=components)
+    missing = _run_builtin(router, "/session missing", components=components)
+
+    assert history.response_text is not None
+    assert "Recent Sessions" in history.response_text
+    assert history.response_text.index("def456-secon") < history.response_text.index("abc123-first")
+    assert detail.response_text is not None
+    assert "abc123-first" in detail.response_text
+    assert "Score: 8.5" in detail.response_text
+    assert "Tools Used: Read, Write" in detail.response_text
+    assert usage.response_text == "Usage: /session <session_id_prefix>"
+    assert usage.level == "error"
+    assert missing.response_text == "Session not found: missing"
+    assert missing.level == "error"
+
+
+def test_builtin_export_writes_markdown_and_returns_attachment(tmp_path) -> None:
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(
+            messages=[
+                {"role": "user", "content": "Hello"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "Here it is"},
+                        {"type": "image_url", "image_url": {"url": "data:..."}},
+                    ],
+                },
+            ]
+        ),
+        model_override=None,
+    )
+    router = _builtin_router()
+
+    result = _run_builtin(
+        router,
+        "/export",
+        components={"output_dir": tmp_path},
+        state=state,
+    )
+
+    assert result.level == "info"
+    assert len(result.attachments) == 1
+    path = result.attachments[0]
+    assert isinstance(path, Path)
+    assert path.parent == tmp_path
+    assert result.response_text == f"Exported 2 messages to {path}"
+    content = path.read_text(encoding="utf-8")
+    assert "## USER\n\nHello" in content
+    assert "Here it is" in content
+    assert "[media content]" in content
+
+
+def test_builtin_export_rejects_arguments_and_empty_session(tmp_path) -> None:
+    router = _builtin_router()
+
+    usage = _run_builtin(router, "/export extra", components={"output_dir": tmp_path})
+    empty = _run_builtin(router, "/export", components={"output_dir": tmp_path})
+
+    assert usage.response_text == "Usage: /export"
+    assert usage.level == "error"
+    assert empty.response_text == "No messages to export."
+    assert empty.level == "warning"
+
+
+def test_builtin_tools_skills_and_plugins_render_catalogs() -> None:
+    registry = SimpleNamespace(list_tools=lambda: ["Read", "Write"])
+    skill_catalog = SimpleNamespace(
+        list_skills=lambda: [
+            SimpleNamespace(id="review", source="user", description="Review code")
+        ]
+    )
+    plugin_catalog = SimpleNamespace(
+        list_plugins=lambda: [
+            SimpleNamespace(
+                name="stats", version="1.2", source="builtin", description="Metrics"
+            )
+        ]
+    )
+    router = _builtin_router()
+    components = {
+        "registry": registry,
+        "skill_catalog": skill_catalog,
+        "plugin_catalog": plugin_catalog,
+    }
+
+    tools = _run_builtin(router, "/tools", components=components)
+    skills = _run_builtin(router, "/skills", components=components)
+    plugins = _run_builtin(router, "/plugins", components=components)
+
+    assert tools.response_text == "## Available Tools\n\n- Read\n- Write"
+    assert skills.response_text is not None
+    assert "review | user | Review code" in skills.response_text
+    assert plugins.response_text is not None
+    assert "stats | 1.2 | builtin | Metrics" in plugins.response_text
+
+
+def test_builtin_model_lists_validates_and_updates_session_override() -> None:
+    router = _builtin_router()
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(messages=[]),
+        model_override=None,
+    )
+    config = {
+        "active_provider": "test",
+        "providers": {
+            "test": {"default_model": "model-a", "models": ["model-a", "model-b"]}
+        },
+    }
+    components = {"agent": SimpleNamespace(model="model-a")}
+
+    listed = _run_builtin(router, "/model", config=config, components=components, state=state)
+    switched = _run_builtin(
+        router, "/model model-b", config=config, components=components, state=state
+    )
+    rejected = _run_builtin(
+        router, "/model unknown", config=config, components=components, state=state
+    )
+
+    assert listed.response_text is not None
+    assert "model-a (active)" in listed.response_text
+    assert switched.response_text == "Switched to model: model-b (session only)"
+    assert state.model_override == "model-b"
+    assert rejected.response_text == "Unknown model: unknown. Available models: model-a, model-b"
+    assert rejected.level == "error"
+    assert state.model_override == "model-b"
+
+
+def test_builtin_quit_is_cli_only_and_returns_exit_action() -> None:
+    router = _builtin_router()
+
+    result = _run_builtin(router, "/q", channel_name="cli")
+
+    assert result.action == "exit_cli"
+    assert router.classify("/quit", channel_name="feishu").kind == "unknown_slash"
+
+
+def test_builtin_send_queues_only_existing_files_inside_output_dir(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    inside = output_dir / "report.txt"
+    inside.write_text("report", encoding="utf-8")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    router = _builtin_router()
+    components = {"output_dir": output_dir}
+
+    sent = _run_builtin(
+        router, "/send report.txt", channel_name="feishu", components=components
+    )
+    traversal = _run_builtin(
+        router, "/send ../secret.txt", channel_name="feishu", components=components
+    )
+    absolute = _run_builtin(
+        router, f"/send {outside}", channel_name="feishu", components=components
+    )
+    missing = _run_builtin(
+        router, "/send absent.txt", channel_name="feishu", components=components
+    )
+    usage = _run_builtin(
+        router, "/send", channel_name="feishu", components=components
+    )
+
+    assert sent.attachments == (inside.resolve(),)
+    assert sent.response_text == f"Sending file: {inside.resolve()}"
+    assert traversal.response_text == "File is outside the output directory."
+    assert traversal.level == "error"
+    assert absolute.response_text == "File is outside the output directory."
+    assert missing.response_text == "File not found: absent.txt"
+    assert usage.response_text == "Usage: /send <path>"
+    assert router.classify("/send report.txt", channel_name="cli").kind == "unknown_slash"
+
+
+def test_builtin_interrupt_handlers_are_defensive_when_called_directly() -> None:
+    router = _builtin_router()
+
+    for command in ("/cancel", "/now urgent"):
+        result = _run_builtin(router, command)
+        assert result.level == "error"
+        assert "coordinator" in result.response_text.lower()
 
 
 def test_command_coordinator_is_exported_from_commands_package() -> None:

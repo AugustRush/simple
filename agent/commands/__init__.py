@@ -1,5 +1,6 @@
 """Transport-neutral command contracts and deterministic routing."""
 
+from .builtin import register_builtin_commands
 from .coordinator import CommandCoordinator
 
 from .models import (
@@ -37,4 +38,5 @@ __all__ = [
     "CommandSource",
     "ClassificationKind",
     "parse_command",
+    "register_builtin_commands",
 ]
