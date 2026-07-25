@@ -214,6 +214,20 @@ def test_classify_recognizes_explicit_user_invocable_skill(
     assert route.skill_args == "Focus HERE"
 
 
+def test_direct_skill_invocation_is_case_insensitive_for_namespaced_id(
+    tmp_path,
+) -> None:
+    router = CommandRouter(
+        skill_catalog=_skill_catalog(tmp_path, ("quality/review", True))
+    )
+
+    route = router.classify("/Quality/ReView Keep THIS Case")
+
+    assert route.kind == "skill"
+    assert route.skill_id == "quality/review"
+    assert route.skill_args == "Keep THIS Case"
+
+
 @pytest.mark.parametrize("invocation", ["/internal", "/skill internal task"])
 def test_non_user_invocable_skill_is_an_unknown_slash(
     tmp_path, invocation: str

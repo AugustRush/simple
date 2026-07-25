@@ -142,7 +142,8 @@ class CommandRouter:
         parsed = parse_explicit_skill_request(request.original_text)
         if parsed is None:
             return None
-        bundle = self._skill_catalog.get(parsed.skill_ref)
+        skill_ref = parsed.skill_ref if request.name == "skill" else request.name
+        bundle = self._skill_catalog.get(skill_ref)
         if bundle is None or not bundle.user_invocable:
             return None
         return bundle.id, parsed.remaining_text
