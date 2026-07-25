@@ -217,7 +217,16 @@ For active sessions:
   `/cancel <new task>`, `/now <message>`);
 - `anytime` read-only commands may respond immediately on their own sink;
 - `idle_only` commands return a clear busy error and do not enter the mailbox;
-- ordinary text enters the per-session mailbox.
+- explicit skill invocations are model-turn requests and return the same busy
+  error rather than entering the active operation;
+- unknown slash commands return the deterministic unknown-command error and
+  never enter a queue or reach the model;
+- ordinary text enters the current operation only when that operation declares
+  interjection support; otherwise it queues as a later turn.
+
+Slash/skill classification therefore always happens before state-based queue
+routing. The fail-closed unknown-command rule applies in `idle`, `active`, and
+`cancelling` states.
 
 Cancellation semantics are fixed:
 
@@ -236,8 +245,9 @@ sink. The original operation emits at most one final cancellation result when
 its execution unwinds. A queued restart begins only after that unwind and the
 coordinator's cleanup completes.
 
-`/now <message>` adds an urgent interjection when active. When idle it forwards
-the payload as an ordinary new turn.
+`/now <message>` adds an urgent interjection when an interjection-capable
+operation is active. During a non-interjection command it queues the payload as
+the next turn. When idle it forwards the payload as an ordinary new turn.
 
 ## Command Inventory
 
@@ -335,6 +345,22 @@ arrival order. Urgency is metadata and does not reorder entries. Entries that
 arrive after the state becomes `cancelling` go to `restart_queue`, never back
 into the operation being stopped.
 
+Every active operation also declares `accepts_interjections`:
+
+- normal model turns and Ralph runs set it to `true` and drain the same
+  `pending_interjections` collection at model/tool or Ralph iteration
+  boundaries;
+- deterministic commands set it to `false`, so ordinary messages received
+  during the command append to `restart_queue` and run afterward.
+
+On a normal operation unwind, any interjections that arrived after the final
+drain are moved to the front of `restart_queue` in original arrival order. They
+become later turns and cannot leak into a future context silently. On a
+cancellation unwind, undrained interjections are cleared and the cancellation
+result reports how many were not applied; cancellation intentionally invalidates
+updates to the stopped task. An explicit `/cancel <text>` keeps its replacement
+restart queue and is not overwritten by those discarded interjections.
+
 The coordinator state transitions are:
 
 | State | Input | Action | Next state |
@@ -342,12 +368,17 @@ The coordinator state transitions are:
 | `idle` | ordinary text or idle-only command | create token and dispatch | `active` |
 | `idle` | `/now <text>` | dispatch `<text>` as an ordinary turn | `active` |
 | `idle` | any `/cancel` form | report no active operation; `/cancel <text>` dispatches `<text>` | `idle` or `active` |
-| `active` | ordinary text | append to `pending_interjections` | `active` |
-| `active` | `/now <text>` | append urgent interjection | `active` |
+| any | unknown slash | return deterministic error; never enqueue | unchanged |
+| `active` | explicit skill invocation | return busy error | `active` |
+| `active` | ordinary text, interjection-capable operation | append to `pending_interjections` | `active` |
+| `active` | ordinary text, non-interjection command | append to `restart_queue` | `active` |
+| `active` | `/now <text>`, interjection-capable operation | append urgent interjection | `active` |
+| `active` | `/now <text>`, non-interjection command | append payload to `restart_queue` | `active` |
 | `active` | `/cancel` or graceful form | signal token and acknowledge | `cancelling` |
 | `active` | `/cancel <text>` | force signal; replace restart queue with `<text>` | `cancelling` |
 | `active` | anytime command | execute on its own sink | `active` |
 | `active` | idle-only command | return busy error | `active` |
+| `cancelling` | explicit skill invocation | return busy error | `cancelling` |
 | `cancelling` | ordinary text | append to `restart_queue` | `cancelling` |
 | `cancelling` | `/cancel <text>` | replace restart queue with `<text>` | `cancelling` |
 | `cancelling` | other cancellation | upgrade or acknowledge idempotently | `cancelling` |
@@ -366,7 +397,8 @@ marking a new operation active:
 2. route interrupt/anytime commands;
 3. apply the state-transition table, including interjection versus restart
    ownership;
-4. otherwise mark the operation active and create a fresh cancel token;
+4. otherwise mark the operation active, record its interjection capability, and
+   create a fresh cancel token;
 5. dispatch a command or model turn;
 6. clear active state in `finally`;
 7. process the next queued restart message, if present.
@@ -555,6 +587,8 @@ Tests are written before implementation changes.
 - generated help is filtered by channel;
 - exact precedence: core, plugin, skill, unknown slash, ordinary text;
 - unknown commands include close matches and never reach `AgentCore`;
+- unknown slash and explicit skill behavior remains deterministic while active
+  or cancelling;
 - handler exceptions become failed command results.
 
 ### Cross-Transport Integration Tests
@@ -570,6 +604,10 @@ Tests are written before implementation changes.
 - a second same-chat `/cancel` reaches `ChannelRunner` while the first turn is
   blocked and triggers the active cancel token;
 - `/now` and ordinary follow-up messages enter the active mailbox;
+- late undrained interjections become subsequent turns after normal completion
+  and are explicitly reported as unapplied after cancellation;
+- ordinary messages received during non-interjection commands queue as later
+  turns;
 - idle-only commands receive a busy response;
 - different chats remain independent;
 - removing the handler-wide lock does not duplicate normal turns.
