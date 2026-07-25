@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import secrets
+import stat
 from typing import Any, Mapping
 
 from agent import shared
@@ -29,6 +31,14 @@ def _field(value: Any, name: str, default: Any = "") -> Any:
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
+
+
+def _markdown_inline(value: Any) -> str:
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ")
+    text = text.replace("\\", "\\\\")
+    for character in ("`", "*", "[", "]", "<", ">", "#", "|"):
+        text = text.replace(character, f"\\{character}")
+    return text
 
 
 def _require_no_args(request: CommandRequest, usage: str) -> CommandResult | None:
@@ -116,7 +126,9 @@ async def _context_handler(
     try:
         stats = stats_method()
         categories = stats.get("category_names", ())
-        category_names = ", ".join(str(item) for item in categories) or "none"
+        category_names = (
+            ", ".join(_markdown_inline(item) for item in categories) or "none"
+        )
         needs_consolidation = "yes" if stats.get("needs_consolidation") else "no"
         text = (
             "## Context Manager (LTM)\n\n"
@@ -147,9 +159,9 @@ async def _sessions_handler(
     lines = ["## Recent Sessions", "", "Session ID | Timestamp | Score | Summary"]
     lines.append("--- | --- | --- | ---")
     for session in reversed(sessions[-20:]):
-        session_id = str(session.get("session_id", "?"))[:12]
-        timestamp = str(session.get("timestamp", "?"))[:19]
-        summary = str(session.get("task_summary", ""))[:60] or "-"
+        session_id = _markdown_inline(str(session.get("session_id", "?"))[:12])
+        timestamp = _markdown_inline(str(session.get("timestamp", "?"))[:19])
+        summary = _markdown_inline(str(session.get("task_summary", ""))[:60]) or "-"
         lines.append(f"{session_id} | {timestamp} | {_score(session)} | {summary}")
     return CommandResult(response_text="\n".join(lines))
 
@@ -188,24 +200,24 @@ async def _session_handler(
         lines = [
             "## Session Details",
             "",
-            f"- Session: {found.get('session_id', '?')}",
-            f"- Timestamp: {found.get('timestamp', '?')}",
+            f"- Session: {_markdown_inline(found.get('session_id', '?'))}",
+            f"- Timestamp: {_markdown_inline(found.get('timestamp', '?'))}",
             f"- Score: {_score(found)}",
-            f"- Summary: {found.get('task_summary', '?')}",
-            f"- Tools Used: {', '.join(str(tool) for tool in tools) or 'none'}",
-            f"- Corrections: {found.get('correction_count', 0)}",
+            f"- Summary: {_markdown_inline(found.get('task_summary', '?'))}",
+            f"- Tools Used: {', '.join(_markdown_inline(tool) for tool in tools) or 'none'}",
+            f"- Corrections: {_markdown_inline(found.get('correction_count', 0))}",
         ]
         return CommandResult(response_text="\n".join(lines))
 
     turns = _session_turns(context, prefix)
     if turns:
-        lines = [f"## Session {prefix} Turns", ""]
+        lines = [f"## Session {_markdown_inline(prefix)} Turns", ""]
         for turn in turns[-10:]:
-            role = str(_field(turn, "role", "?"))
-            content = str(_field(turn, "content", ""))[:120]
+            role = _markdown_inline(_field(turn, "role", "?"))
+            content = _markdown_inline(str(_field(turn, "content", ""))[:120])
             lines.append(f"- **{role}:** {content}")
         return CommandResult(response_text="\n".join(lines))
-    return _error(f"Session not found: {prefix}")
+    return _error(f"Session not found: {_markdown_inline(prefix)}")
 
 
 def _message_content_text(content: Any) -> str:
@@ -225,6 +237,28 @@ def _message_content_text(content: Any) -> str:
     return "\n".join(parts) or "[media content]"
 
 
+def _write_unique_export(output_dir: Path, stem: str, content: str) -> Path:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    for collision_index in range(10_000):
+        suffix = "" if collision_index == 0 else f"_{collision_index}"
+        path = output_dir / f"{stem}{suffix}.md"
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+        return path
+    raise OSError("unable to reserve a unique export filename")
+
+
 async def _export_handler(
     request: CommandRequest, context: CommandContext
 ) -> CommandResult:
@@ -235,21 +269,25 @@ async def _export_handler(
     messages = getattr(session_context, "messages", None)
     if not messages:
         return _warning("No messages to export.")
-    output_dir = _component(context, "output_dir") or shared.DEFAULT_OUTPUT_DIR
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    path = Path(output_dir).expanduser().resolve(strict=False) / f"session_{timestamp}.md"
     lines = [f"# Session Export - {timestamp}", ""]
     try:
         for message in messages:
-            role = str(_field(message, "role", "?")).upper()
+            role = _markdown_inline(str(_field(message, "role", "?")).upper())
             content = _message_content_text(_field(message, "content", ""))
             lines.extend((f"## {role}", "", content, ""))
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("\n".join(lines), encoding="utf-8")
+        configured_dir = _component(context, "output_dir") or shared.DEFAULT_OUTPUT_DIR
+        output_dir = Path(configured_dir).expanduser().resolve(strict=False)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = _write_unique_export(
+            output_dir,
+            f"session_{timestamp}",
+            "\n".join(lines),
+        )
     except Exception:
         return _error("Unable to export session.")
     return CommandResult(
-        response_text=f"Exported {len(messages)} messages to {path}",
+        response_text=f"Exported {len(messages)} messages to {_markdown_inline(path)}",
         attachments=(path,),
     )
 
@@ -269,7 +307,10 @@ async def _tools_handler(
         return _error("Tool registry is not available.")
     if not tools:
         return _warning("No tools found.")
-    return CommandResult(response_text="## Available Tools\n\n" + "\n".join(f"- {tool}" for tool in tools))
+    return CommandResult(
+        response_text="## Available Tools\n\n"
+        + "\n".join(f"- {_markdown_inline(tool)}" for tool in tools)
+    )
 
 
 async def _skills_handler(
@@ -290,8 +331,9 @@ async def _skills_handler(
     lines = ["## Available Skills", "", "ID | Source | Description", "--- | --- | ---"]
     for skill in skills:
         lines.append(
-            f"{_field(skill, 'id', '?')} | {_field(skill, 'source', '-')} | "
-            f"{_field(skill, 'description', '') or '-'}"
+            f"{_markdown_inline(_field(skill, 'id', '?'))} | "
+            f"{_markdown_inline(_field(skill, 'source', '-'))} | "
+            f"{_markdown_inline(_field(skill, 'description', '') or '-')}"
         )
     return CommandResult(response_text="\n".join(lines))
 
@@ -319,8 +361,10 @@ async def _plugins_handler(
     ]
     for plugin in plugins:
         lines.append(
-            f"{_field(plugin, 'name', '?')} | {_field(plugin, 'version', '') or '-'} | "
-            f"{_field(plugin, 'source', '-')} | {_field(plugin, 'description', '') or '-'}"
+            f"{_markdown_inline(_field(plugin, 'name', '?'))} | "
+            f"{_markdown_inline(_field(plugin, 'version', '') or '-')} | "
+            f"{_markdown_inline(_field(plugin, 'source', '-'))} | "
+            f"{_markdown_inline(_field(plugin, 'description', '') or '-')}"
         )
     return CommandResult(response_text="\n".join(lines))
 
@@ -346,7 +390,9 @@ def _configured_models(context: CommandContext) -> list[str]:
 def _active_model(context: CommandContext, models: list[str]) -> str:
     override = getattr(context.session_state, "model_override", None)
     agent = _component(context, "agent")
-    return str(override or getattr(agent, "model", None) or (models[0] if models else ""))
+    return str(
+        override or getattr(agent, "model", None) or (models[0] if models else "")
+    )
 
 
 async def _model_handler(
@@ -359,17 +405,24 @@ async def _model_handler(
             return _warning("No models configured for the active provider.")
         lines = ["## Models", ""]
         for model in models:
-            lines.append(f"- {model}{' (active)' if model == active else ''}")
+            lines.append(
+                f"- {_markdown_inline(model)}{' (active)' if model == active else ''}"
+            )
         return CommandResult(response_text="\n".join(lines))
     requested = request.args.strip()
     if requested not in models:
         available = ", ".join(models) or "none"
-        return _error(f"Unknown model: {requested}. Available models: {available}")
+        return _error(
+            f"Unknown model: {_markdown_inline(requested)}. "
+            f"Available models: {_markdown_inline(available)}"
+        )
     try:
         context.session_state.model_override = requested
     except Exception:
         return _error("Session model selection is not available.")
-    return CommandResult(response_text=f"Switched to model: {requested} (session only)")
+    return CommandResult(
+        response_text=f"Switched to model: {_markdown_inline(requested)} (session only)"
+    )
 
 
 async def _quit_handler(
@@ -379,6 +432,74 @@ async def _quit_handler(
     if invalid is not None:
         return invalid
     return CommandResult(action="exit_cli")
+
+
+def _copy_file_descriptor(source: int, destination: int) -> None:
+    while True:
+        chunk = os.read(source, 1024 * 1024)
+        if not chunk:
+            break
+        remaining = memoryview(chunk)
+        while remaining:
+            written = os.write(destination, remaining)
+            if written <= 0:
+                raise OSError("unable to write file snapshot")
+            remaining = remaining[written:]
+    os.fsync(destination)
+
+
+def _snapshot_send_file(source: Path, output_root: Path) -> Path:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise NotImplementedError("secure file snapshots require O_NOFOLLOW")
+    common_flags = nofollow | getattr(os, "O_CLOEXEC", 0)
+    source_descriptor = os.open(source, os.O_RDONLY | common_flags)
+    try:
+        if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+            raise ValueError("source is not a regular file")
+
+        spool_dir = output_root / "spool"
+        spool_dir.mkdir(mode=0o700, exist_ok=True)
+        spool_metadata = spool_dir.lstat()
+        if not stat.S_ISDIR(spool_metadata.st_mode):
+            raise ValueError("spool path is not a directory")
+        if not path_contains(output_root, spool_dir.resolve(strict=False)):
+            raise ValueError("spool directory is outside output directory")
+
+        directory_flags = os.O_RDONLY | common_flags | getattr(os, "O_DIRECTORY", 0)
+        spool_descriptor = os.open(spool_dir, directory_flags)
+        try:
+            if not stat.S_ISDIR(os.fstat(spool_descriptor).st_mode):
+                raise ValueError("spool path is not a directory")
+            os.fchmod(spool_descriptor, 0o700)
+            destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            destination_flags |= getattr(os, "O_CLOEXEC", 0)
+            for _attempt in range(100):
+                snapshot_name = f"send_{secrets.token_hex(16)}{source.suffix}"
+                try:
+                    destination_descriptor = os.open(
+                        snapshot_name,
+                        destination_flags,
+                        0o600,
+                        dir_fd=spool_descriptor,
+                    )
+                except FileExistsError:
+                    continue
+                try:
+                    os.fchmod(destination_descriptor, 0o600)
+                    _copy_file_descriptor(source_descriptor, destination_descriptor)
+                except Exception:
+                    os.close(destination_descriptor)
+                    os.unlink(snapshot_name, dir_fd=spool_descriptor)
+                    raise
+                else:
+                    os.close(destination_descriptor)
+                    return spool_dir / snapshot_name
+            raise OSError("unable to reserve a unique spool filename")
+        finally:
+            os.close(spool_descriptor)
+    finally:
+        os.close(source_descriptor)
 
 
 async def _send_handler(
@@ -398,15 +519,28 @@ async def _send_handler(
         return _error("Invalid file path.")
     if not path_contains(output_root, path):
         return _error("File is outside the output directory.")
-    if not path.is_file():
-        return _error(f"File not found: {raw_path}")
-    return CommandResult(response_text=f"Sending file: {path}", attachments=(path,))
+    try:
+        snapshot = _snapshot_send_file(path, output_root)
+    except FileNotFoundError:
+        return _error(f"File not found: {_markdown_inline(raw_path)}")
+    except NotImplementedError:
+        return _error("Secure file sending is not supported on this platform.")
+    except ValueError:
+        return _error(f"File is not a regular file: {_markdown_inline(raw_path)}")
+    except OSError:
+        return _error(f"Unable to send file: {_markdown_inline(raw_path)}")
+    return CommandResult(
+        response_text=f"Sending file: {_markdown_inline(path)}",
+        attachments=(snapshot,),
+    )
 
 
 async def _coordinator_owned_handler(
     request: CommandRequest, context: CommandContext
 ) -> CommandResult:
-    return _error(f"Command /{request.name} must be handled by the command coordinator.")
+    return _error(
+        f"Command /{request.name} must be handled by the command coordinator."
+    )
 
 
 def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]:
@@ -527,8 +661,7 @@ def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]
 def register_builtin_commands(router: CommandRouter) -> CommandRouter:
     """Register transport-neutral built-ins on one router instance."""
 
-    for descriptor in _builtin_descriptors(router):
-        router.register_core(descriptor)
+    router.register_core_batch(_builtin_descriptors(router))
     return router
 
 

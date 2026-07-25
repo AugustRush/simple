@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 import asyncio
+from datetime import datetime as RealDatetime
 import json
+import os
 from pathlib import Path
+import stat
 from types import SimpleNamespace
 
 import pytest
 
+import agent.commands.builtin as builtin_commands
 from agent.commands import (
     CommandCoordinator,
     CommandContext,
@@ -281,14 +286,14 @@ def test_plugin_command_takes_precedence_over_same_named_skill(tmp_path) -> None
     assert route.request.args == "Production"
 
 
-@pytest.mark.parametrize("invocation", ["/review Focus HERE", "/skill review Focus HERE"])
+@pytest.mark.parametrize(
+    "invocation", ["/review Focus HERE", "/skill review Focus HERE"]
+)
 def test_classify_recognizes_explicit_user_invocable_skill(
     tmp_path, invocation: str
 ) -> None:
     router = CommandRouter(
-        skill_catalog=_skill_catalog(
-            tmp_path, ("review", True), ("internal", False)
-        )
+        skill_catalog=_skill_catalog(tmp_path, ("review", True), ("internal", False))
     )
 
     route = router.classify(invocation)
@@ -377,11 +382,7 @@ def test_non_invocable_casefold_collision_does_not_shadow_public_skill(
     class CollisionCatalog:
         def get(self, skill_ref: str):
             return next(
-                (
-                    bundle
-                    for bundle in (internal, public)
-                    if bundle.id == skill_ref
-                ),
+                (bundle for bundle in (internal, public) if bundle.id == skill_ref),
                 None,
             )
 
@@ -402,17 +403,13 @@ def test_non_invocable_casefold_collision_does_not_shadow_public_skill(
 def test_non_user_invocable_skill_is_an_unknown_slash(
     tmp_path, invocation: str
 ) -> None:
-    router = CommandRouter(
-        skill_catalog=_skill_catalog(tmp_path, ("internal", False))
-    )
+    router = CommandRouter(skill_catalog=_skill_catalog(tmp_path, ("internal", False)))
 
     assert router.classify(invocation).kind == "unknown_slash"
 
 
 def test_unknown_slash_has_close_command_suggestions() -> None:
-    router = CommandRouter(
-        core_commands=[CommandDescriptor("help", _noop_handler)]
-    )
+    router = CommandRouter(core_commands=[CommandDescriptor("help", _noop_handler)])
 
     route = router.classify("/hep")
 
@@ -427,9 +424,7 @@ def test_unknown_slash_has_close_command_suggestions() -> None:
 
 
 def test_unknown_explicit_skill_reports_ref_and_skill_suggestion(tmp_path) -> None:
-    router = CommandRouter(
-        skill_catalog=_skill_catalog(tmp_path, ("review", True))
-    )
+    router = CommandRouter(skill_catalog=_skill_catalog(tmp_path, ("review", True)))
 
     route = router.classify("/skill revie Keep Case")
 
@@ -461,15 +456,15 @@ def test_core_command_names_and_aliases_are_reserved() -> None:
     with pytest.raises(ValueError, match="reserved core command"):
         router.register_plugin(CommandDescriptor("HELP", _noop_handler))
     with pytest.raises(ValueError, match="reserved core command"):
-        router.register_plugin(CommandDescriptor("other", _noop_handler, aliases=("h",)))
+        router.register_plugin(
+            CommandDescriptor("other", _noop_handler, aliases=("h",))
+        )
 
 
 def test_out_of_scope_core_name_cannot_be_shadowed_by_direct_skill(tmp_path) -> None:
     router = CommandRouter(
         core_commands=[
-            CommandDescriptor(
-                "quit", _noop_handler, scopes=frozenset({"cli"})
-            )
+            CommandDescriptor("quit", _noop_handler, scopes=frozenset({"cli"}))
         ],
         skill_catalog=_skill_catalog(tmp_path, ("quit", True)),
     )
@@ -487,7 +482,9 @@ def test_duplicate_plugin_names_and_aliases_are_rejected() -> None:
     with pytest.raises(ValueError, match="duplicate plugin command"):
         router.register_plugin(CommandDescriptor("DEPLOY", _noop_handler))
     with pytest.raises(ValueError, match="duplicate plugin command"):
-        router.register_plugin(CommandDescriptor("debug", _noop_handler, aliases=("d",)))
+        router.register_plugin(
+            CommandDescriptor("debug", _noop_handler, aliases=("d",))
+        )
 
 
 def test_help_is_generated_from_descriptors_and_filtered_by_scope() -> None:
@@ -525,6 +522,27 @@ def test_help_is_generated_from_descriptors_and_filtered_by_scope() -> None:
     assert "/help - Show commands" in feishu_help
     assert "/send <path> - Send a file" in feishu_help
     assert "/quit" not in feishu_help
+
+
+def test_help_escapes_external_descriptor_markdown() -> None:
+    router = CommandRouter(
+        plugin_commands=[
+            CommandDescriptor(
+                "report",
+                _noop_handler,
+                usage="/report | admin\n# forged",
+                description="desc\\tail\n## forged",
+            )
+        ]
+    )
+
+    help_text = router.help_text("cli")
+
+    assert "\n# forged" not in help_text
+    assert "\n## forged" not in help_text
+    assert r"\|" in help_text
+    assert r"\#" in help_text
+    assert r"\\" in help_text
 
 
 class _BuiltinSink:
@@ -584,7 +602,9 @@ def test_builtin_registration_defines_portable_scope_and_concurrency() -> None:
     }
 
     for name, policy in expected.items():
-        route = router.classify(f"/{name}", channel_name="feishu" if name == "send" else "cli")
+        route = router.classify(
+            f"/{name}", channel_name="feishu" if name == "send" else "cli"
+        )
         assert route.kind == "command"
         assert route.descriptor is not None
         assert (route.descriptor.concurrency, route.descriptor.scopes) == policy
@@ -691,7 +711,9 @@ def test_builtin_sessions_and_session_prefix_lookup(tmp_path) -> None:
 
     assert history.response_text is not None
     assert "Recent Sessions" in history.response_text
-    assert history.response_text.index("def456-secon") < history.response_text.index("abc123-first")
+    assert history.response_text.index("def456-secon") < history.response_text.index(
+        "abc123-first"
+    )
     assert detail.response_text is not None
     assert "abc123-first" in detail.response_text
     assert "Score: 8.5" in detail.response_text
@@ -751,6 +773,69 @@ def test_builtin_export_rejects_arguments_and_empty_session(tmp_path) -> None:
     assert empty.level == "warning"
 
 
+def test_builtin_export_uses_unique_exclusive_files_for_same_timestamp(
+    tmp_path, monkeypatch
+) -> None:
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return RealDatetime(2026, 7, 25, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(builtin_commands, "datetime", FixedDatetime)
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(messages=[{"role": "user", "content": "complete"}]),
+        model_override=None,
+    )
+    router = _builtin_router()
+
+    def export_one() -> CommandResult:
+        return _run_builtin(
+            router,
+            "/export",
+            components={"output_dir": tmp_path},
+            state=state,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: export_one(), range(2)))
+
+    paths = [result.attachments[0] for result in results]
+    assert len(set(paths)) == 2
+    assert all(
+        path.read_text(encoding="utf-8").endswith("complete\n") for path in paths
+    )
+
+
+def test_builtin_export_does_not_follow_existing_symlink(tmp_path, monkeypatch) -> None:
+    class FixedDatetime:
+        @classmethod
+        def now(cls, tz=None):
+            return RealDatetime(2026, 7, 25, 12, 0, 0, tzinfo=tz)
+
+    monkeypatch.setattr(builtin_commands, "datetime", FixedDatetime)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("do not replace", encoding="utf-8")
+    collision = tmp_path / "session_20260725_120000.md"
+    collision.symlink_to(victim)
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(messages=[{"role": "user", "content": "exported"}]),
+        model_override=None,
+    )
+
+    result = _run_builtin(
+        _builtin_router(),
+        "/export",
+        components={"output_dir": tmp_path},
+        state=state,
+    )
+
+    attachment = result.attachments[0]
+    assert victim.read_text(encoding="utf-8") == "do not replace"
+    assert attachment != collision
+    assert not attachment.is_symlink()
+    assert attachment.read_text(encoding="utf-8").endswith("exported\n")
+
+
 def test_builtin_tools_skills_and_plugins_render_catalogs() -> None:
     registry = SimpleNamespace(list_tools=lambda: ["Read", "Write"])
     skill_catalog = SimpleNamespace(
@@ -797,7 +882,9 @@ def test_builtin_model_lists_validates_and_updates_session_override() -> None:
     }
     components = {"agent": SimpleNamespace(model="model-a")}
 
-    listed = _run_builtin(router, "/model", config=config, components=components, state=state)
+    listed = _run_builtin(
+        router, "/model", config=config, components=components, state=state
+    )
     switched = _run_builtin(
         router, "/model model-b", config=config, components=components, state=state
     )
@@ -809,7 +896,10 @@ def test_builtin_model_lists_validates_and_updates_session_override() -> None:
     assert "model-a (active)" in listed.response_text
     assert switched.response_text == "Switched to model: model-b (session only)"
     assert state.model_override == "model-b"
-    assert rejected.response_text == "Unknown model: unknown. Available models: model-a, model-b"
+    assert (
+        rejected.response_text
+        == "Unknown model: unknown. Available models: model-a, model-b"
+    )
     assert rejected.level == "error"
     assert state.model_override == "model-b"
 
@@ -845,18 +935,164 @@ def test_builtin_send_queues_only_existing_files_inside_output_dir(tmp_path) -> 
     missing = _run_builtin(
         router, "/send absent.txt", channel_name="feishu", components=components
     )
-    usage = _run_builtin(
-        router, "/send", channel_name="feishu", components=components
-    )
+    usage = _run_builtin(router, "/send", channel_name="feishu", components=components)
 
-    assert sent.attachments == (inside.resolve(),)
+    assert len(sent.attachments) == 1
+    assert sent.attachments[0].parent == output_dir / "spool"
+    assert sent.attachments[0].read_text(encoding="utf-8") == "report"
     assert sent.response_text == f"Sending file: {inside.resolve()}"
     assert traversal.response_text == "File is outside the output directory."
     assert traversal.level == "error"
     assert absolute.response_text == "File is outside the output directory."
     assert missing.response_text == "File not found: absent.txt"
     assert usage.response_text == "Usage: /send <path>"
-    assert router.classify("/send report.txt", channel_name="cli").kind == "unknown_slash"
+    assert (
+        router.classify("/send report.txt", channel_name="cli").kind == "unknown_slash"
+    )
+
+
+def test_builtin_send_attaches_immutable_inside_snapshot(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = output_dir / "report.txt"
+    source.write_text("original report", encoding="utf-8")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("outside secret", encoding="utf-8")
+
+    result = _run_builtin(
+        _builtin_router(),
+        "/send report.txt",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+    )
+    source.unlink()
+    source.symlink_to(victim)
+
+    attachment = result.attachments[0]
+    assert attachment != source
+    assert attachment.parent == output_dir / "spool"
+    assert attachment.read_text(encoding="utf-8") == "original report"
+    assert victim.read_text(encoding="utf-8") == "outside secret"
+
+
+def test_builtin_send_fails_closed_without_nofollow_support(
+    tmp_path, monkeypatch
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = output_dir / "report.txt"
+    source.write_text("original report", encoding="utf-8")
+    monkeypatch.delattr(builtin_commands.os, "O_NOFOLLOW")
+
+    result = _run_builtin(
+        _builtin_router(),
+        "/send report.txt",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+    )
+
+    assert (
+        result.response_text == "Secure file sending is not supported on this platform."
+    )
+    assert result.level == "error"
+    assert result.attachments == ()
+    assert source.read_text(encoding="utf-8") == "original report"
+    assert not (output_dir / "spool").exists()
+
+
+def test_builtin_send_uses_private_spool_permissions(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    spool_dir = output_dir / "spool"
+    spool_dir.mkdir()
+    os.chmod(spool_dir, 0o777)
+    source = output_dir / "report.txt"
+    source.write_text("report", encoding="utf-8")
+
+    result = _run_builtin(
+        _builtin_router(),
+        "/send report.txt",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+    )
+
+    assert stat.S_IMODE(spool_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(result.attachments[0].stat().st_mode) == 0o600
+
+
+def test_builtin_external_markdown_values_cannot_forge_rows_or_headings(
+    tmp_path,
+) -> None:
+    sessions_file = tmp_path / "sessions.jsonl"
+    sessions_file.write_text(
+        json.dumps(
+            {
+                "session_id": "abc\\id|admin\n# forged",
+                "timestamp": "now|later\n## forged",
+                "score": 1,
+                "task_summary": "summary|extra\n# forged",
+                "tools_used": ["Read|Write\n## forged"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    components = {
+        "sessions_file": sessions_file,
+        "registry": SimpleNamespace(list_tools=lambda: ["Read|Write\n# forged"]),
+        "skill_catalog": SimpleNamespace(
+            list_skills=lambda: [
+                SimpleNamespace(
+                    id="review|admin\n# forged",
+                    source="user\\local",
+                    description="desc|extra\n## forged",
+                )
+            ]
+        ),
+        "plugin_catalog": SimpleNamespace(
+            list_plugins=lambda: [
+                SimpleNamespace(
+                    name="stats|admin\n# forged",
+                    version="1\\2",
+                    source="built|in",
+                    description="desc\n## forged",
+                )
+            ]
+        ),
+    }
+    router = _builtin_router()
+
+    outputs = [
+        _run_builtin(router, command, components=components).response_text or ""
+        for command in ("/sessions", "/session abc", "/tools", "/skills", "/plugins")
+    ]
+
+    for output in outputs:
+        assert "\n# forged" not in output
+        assert "\n## forged" not in output
+    combined = "\n".join(outputs)
+    assert r"\|" in combined
+    assert r"\#" in combined
+    assert r"\\" in combined
+
+
+def test_builtin_session_turn_heading_escapes_user_prefix(tmp_path) -> None:
+    store = SimpleNamespace(
+        get_turns_for_session=lambda _prefix: [{"role": "user", "content": "safe"}]
+    )
+    components = {
+        "sessions_file": tmp_path / "missing.jsonl",
+        "context_manager": SimpleNamespace(store=store),
+    }
+
+    result = _run_builtin(
+        _builtin_router(),
+        "/session abc\n# forged",
+        components=components,
+    )
+
+    assert result.response_text is not None
+    assert "\n# forged" not in result.response_text
+    assert r"\# forged" in result.response_text
 
 
 def test_builtin_interrupt_handlers_are_defensive_when_called_directly() -> None:
@@ -866,6 +1102,23 @@ def test_builtin_interrupt_handlers_are_defensive_when_called_directly() -> None
         result = _run_builtin(router, command)
         assert result.level == "error"
         assert "coordinator" in result.response_text.lower()
+
+
+def test_builtin_registration_is_atomic_when_late_descriptor_conflicts() -> None:
+    router = CommandRouter(
+        plugin_commands=[
+            CommandDescriptor("send", _noop_handler, scopes=frozenset({"feishu"}))
+        ]
+    )
+
+    with pytest.raises(ValueError, match="plugin command conflicts"):
+        register_builtin_commands(router)
+
+    for command in ("/help", "/memory", "/quit", "/cancel", "/now"):
+        assert router.classify(command, channel_name="cli").kind == "unknown_slash"
+    route = router.classify("/send report.txt", channel_name="feishu")
+    assert route.kind == "command"
+    assert route.source == "plugin"
 
 
 def test_command_coordinator_is_exported_from_commands_package() -> None:
@@ -939,7 +1192,9 @@ def _turn(text: str, *, message_id: str = "m-1") -> TurnInput:
 def test_coordinator_installs_fresh_active_operation_before_dispatch_await() -> None:
     async def scenario() -> None:
         old_token = CancelToken()
-        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}), cancel_token=old_token)
+        state = RuntimeSessionState(
+            ctx=SimpleNamespace(metadata={}), cancel_token=old_token
+        )
         coordinator, core = _coordinator()
         sink = _CoordinatorSink()
 
@@ -977,7 +1232,9 @@ def test_active_model_turn_queues_interjection_then_promotes_late_mailbox() -> N
             coordinator.handle(_turn("first"), state, first_sink)  # type: ignore[arg-type]
         )
         await started.wait()
-        await coordinator.handle(_turn("follow up", message_id="m-2"), state, second_sink)  # type: ignore[arg-type]
+        await coordinator.handle(
+            _turn("follow up", message_id="m-2"), state, second_sink
+        )  # type: ignore[arg-type]
 
         assert [entry["text"] for entry in state.pending_interjections] == ["follow up"]
         assert state.restart_queue == []
@@ -1016,8 +1273,12 @@ def test_active_non_interjection_command_queues_restart_fifo() -> None:
         )
         await started.wait()
         queued_sinks = [_CoordinatorSink(), _CoordinatorSink()]
-        await coordinator.handle(_turn("second", message_id="m-2"), state, queued_sinks[0])  # type: ignore[arg-type]
-        await coordinator.handle(_turn("third", message_id="m-3"), state, queued_sinks[1])  # type: ignore[arg-type]
+        await coordinator.handle(
+            _turn("second", message_id="m-2"), state, queued_sinks[0]
+        )  # type: ignore[arg-type]
+        await coordinator.handle(
+            _turn("third", message_id="m-3"), state, queued_sinks[1]
+        )  # type: ignore[arg-type]
 
         assert state.pending_interjections == []
         assert [entry["text"] for entry in state.restart_queue] == ["second", "third"]
@@ -1042,7 +1303,9 @@ def test_now_routes_payload_for_idle_active_and_non_capable_operations() -> None
         )
         idle_coordinator, idle_core = _coordinator(router)
         idle_state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
-        await idle_coordinator.handle(_turn("/now Do This"), idle_state, _CoordinatorSink())  # type: ignore[arg-type]
+        await idle_coordinator.handle(
+            _turn("/now Do This"), idle_state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
         assert [call.text for call in idle_core.calls] == ["Do This"]
 
         blank_sink = _CoordinatorSink()
@@ -1055,7 +1318,9 @@ def test_now_routes_payload_for_idle_active_and_non_capable_operations() -> None
             accepts_interjections=True,
             cancel_token=CancelToken(),
         )
-        await idle_coordinator.handle(_turn("/now urgent"), capable_state, _CoordinatorSink())  # type: ignore[arg-type]
+        await idle_coordinator.handle(
+            _turn("/now urgent"), capable_state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
         assert capable_state.pending_interjections[0]["text"] == "urgent"
         assert capable_state.pending_interjections[0]["urgency"] == "now"
 
@@ -1065,7 +1330,9 @@ def test_now_routes_payload_for_idle_active_and_non_capable_operations() -> None
             accepts_interjections=False,
             cancel_token=CancelToken(),
         )
-        await idle_coordinator.handle(_turn("/now later"), non_capable_state, _CoordinatorSink())  # type: ignore[arg-type]
+        await idle_coordinator.handle(
+            _turn("/now later"), non_capable_state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
         assert [entry["text"] for entry in non_capable_state.restart_queue] == ["later"]
 
     asyncio.run(scenario())
@@ -1131,18 +1398,26 @@ def test_cancel_restart_replaces_queue_and_discards_unapplied_interjections() ->
         await coordinator.handle(_turn("unapplied"), state, _CoordinatorSink())  # type: ignore[arg-type]
         await coordinator.handle(_turn("/cancel old task"), state, _CoordinatorSink())  # type: ignore[arg-type]
         await coordinator.handle(_turn("after old"), state, _CoordinatorSink())  # type: ignore[arg-type]
-        await coordinator.handle(_turn("/cancel newest task"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        await coordinator.handle(
+            _turn("/cancel newest task"), state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
         tail_sink = _CoordinatorSink()
         await coordinator.handle(_turn("tail"), state, tail_sink)  # type: ignore[arg-type]
 
         assert state.operation_state == "cancelling"
-        assert [entry["text"] for entry in state.restart_queue] == ["newest task", "tail"]
+        assert [entry["text"] for entry in state.restart_queue] == [
+            "newest task",
+            "tail",
+        ]
         release.set()
         await running
 
         assert [call.text for call in core.calls] == ["first", "newest task", "tail"]
         assert state.pending_interjections == []
-        assert any("1" in text and "unapplied" in text.lower() for text, _ in original_sink.statuses)
+        assert any(
+            "1" in text and "unapplied" in text.lower()
+            for text, _ in original_sink.statuses
+        )
 
     asyncio.run(scenario())
 
@@ -1448,7 +1723,9 @@ def test_idle_cancel_is_noop_but_cancel_payload_forwards_normally() -> None:
     no_op_sink = _CoordinatorSink()
 
     asyncio.run(coordinator.handle(_turn("/cancel"), state, no_op_sink))  # type: ignore[arg-type]
-    asyncio.run(coordinator.handle(_turn("/cancel new work"), state, _CoordinatorSink()))  # type: ignore[arg-type]
+    asyncio.run(
+        coordinator.handle(_turn("/cancel new work"), state, _CoordinatorSink())
+    )  # type: ignore[arg-type]
 
     assert "no active" in no_op_sink.statuses[0][0].lower()
     assert [call.text for call in core.calls] == ["new work"]
@@ -1477,7 +1754,9 @@ def test_unknown_slash_is_deterministic_and_never_queues_or_forwards(
     assert core.calls == []
 
 
-def test_explicit_skill_forwards_only_while_idle_and_is_busy_otherwise(tmp_path) -> None:
+def test_explicit_skill_forwards_only_while_idle_and_is_busy_otherwise(
+    tmp_path,
+) -> None:
     router = CommandRouter(skill_catalog=_skill_catalog(tmp_path, ("review", True)))
     coordinator, core = _coordinator(router)
     idle = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
@@ -1604,7 +1883,9 @@ def test_busy_anytime_forward_waits_for_unwind_and_its_own_sink_drain() -> None:
 
         assert forwarded_before_sink_ready is False
         assert [call.text for call in core.calls] == ["first", "deferred prompt"]
-        forwarded_state, accepts_interjections, forwarded_token = core.state_snapshots[1]
+        forwarded_state, accepts_interjections, forwarded_token = core.state_snapshots[
+            1
+        ]
         assert forwarded_state == "active"
         assert accepts_interjections is True
         assert forwarded_token is not None
@@ -1662,9 +1943,7 @@ def test_busy_forward_survives_response_and_drain_sink_failures() -> None:
             state,
             RaisingSink(),  # type: ignore[arg-type]
         )
-        assert [entry["text"] for entry in state.restart_queue] == [
-            "deferred prompt"
-        ]
+        assert [entry["text"] for entry in state.restart_queue] == ["deferred prompt"]
 
         release_first.set()
         await original
@@ -1687,9 +1966,7 @@ def test_command_result_is_rendered_forwarded_and_returns_action() -> None:
         )
 
     router = CommandRouter(
-        core_commands=[
-            CommandDescriptor("expand", handler, accepts_interjections=True)
-        ]
+        core_commands=[CommandDescriptor("expand", handler, accepts_interjections=True)]
     )
     coordinator, core = _coordinator(router)
     sink = _CoordinatorSink()

@@ -65,6 +65,17 @@ def _in_scope(descriptor: CommandDescriptor, channel_name: str) -> bool:
     return "all" in descriptor.scopes or channel_name.casefold() in descriptor.scopes
 
 
+def _markdown_inline(value: Any, *, preserve_usage_syntax: bool = False) -> str:
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n").replace("\n", " ")
+    text = text.replace("\\", "\\\\")
+    characters = ["`", "*", "#", "|"]
+    if not preserve_usage_syntax:
+        characters.extend(("[", "]", "<", ">"))
+    for character in characters:
+        text = text.replace(character, f"\\{character}")
+    return text
+
+
 class _AmbiguousSkillReference(Exception):
     def __init__(self, skill_ref: str, candidates: tuple[str, ...]) -> None:
         self.skill_ref = skill_ref
@@ -102,30 +113,48 @@ class CommandRouter:
         return names
 
     def register_core(self, descriptor: CommandDescriptor) -> None:
-        names = self._registration_names(descriptor)
-        conflict = next((name for name in names if name in self._core_lookup), None)
-        if conflict is not None:
-            raise ValueError(f"duplicate core command name or alias: /{conflict}")
-        plugin_conflict = next(
-            (name for name in names if name in self._plugin_lookup), None
-        )
-        if plugin_conflict is not None:
-            raise ValueError(
-                "plugin command conflicts with reserved core command: "
-                f"/{plugin_conflict}"
+        self.register_core_batch((descriptor,))
+
+    def register_core_batch(self, descriptors: Iterable[CommandDescriptor]) -> None:
+        """Register core descriptors atomically after preflighting all names."""
+
+        pending = tuple(descriptors)
+        pending_names: set[str] = set()
+        registrations: list[tuple[CommandDescriptor, tuple[str, ...]]] = []
+        for descriptor in pending:
+            names = self._registration_names(descriptor)
+            conflict = next(
+                (
+                    name
+                    for name in names
+                    if name in self._core_lookup or name in pending_names
+                ),
+                None,
             )
-        self._core_commands.append(descriptor)
-        for name in names:
-            self._core_lookup[name] = descriptor
+            if conflict is not None:
+                raise ValueError(f"duplicate core command name or alias: /{conflict}")
+            plugin_conflict = next(
+                (name for name in names if name in self._plugin_lookup), None
+            )
+            if plugin_conflict is not None:
+                raise ValueError(
+                    "plugin command conflicts with reserved core command: "
+                    f"/{plugin_conflict}"
+                )
+            pending_names.update(names)
+            registrations.append((descriptor, names))
+
+        self._core_commands.extend(descriptor for descriptor, _ in registrations)
+        for descriptor, names in registrations:
+            for name in names:
+                self._core_lookup[name] = descriptor
 
     def register_plugin(self, descriptor: CommandDescriptor) -> None:
         names = self._registration_names(descriptor)
         reserved = next((name for name in names if name in self._core_lookup), None)
         if reserved is not None:
             raise ValueError(f"reserved core command name or alias: /{reserved}")
-        duplicate = next(
-            (name for name in names if name in self._plugin_lookup), None
-        )
+        duplicate = next((name for name in names if name in self._plugin_lookup), None)
         if duplicate is not None:
             raise ValueError(f"duplicate plugin command name or alias: /{duplicate}")
         self._plugin_commands.append(descriptor)
@@ -205,9 +234,7 @@ class CommandRouter:
             name.casefold(), sorted(by_casefold), n=3, cutoff=0.6
         )
         return tuple(
-            candidate
-            for match in matches
-            for candidate in by_casefold[match]
+            candidate for match in matches for candidate in by_casefold[match]
         )[:3]
 
     def classify(
@@ -316,9 +343,7 @@ class CommandRouter:
                     classification.descriptor.name,
                     classification.request.session_id,
                 )
-                failure_message = (
-                    f"Command /{classification.descriptor.name} failed."
-                )
+                failure_message = f"Command /{classification.descriptor.name} failed."
                 return CommandResult(
                     response_text=failure_message,
                     level="error",
@@ -365,9 +390,12 @@ class CommandRouter:
         )
         lines = []
         for descriptor in sorted(descriptors, key=lambda item: item.name):
-            usage = descriptor.usage or f"/{descriptor.name}"
+            usage = _markdown_inline(
+                descriptor.usage or f"/{descriptor.name}",
+                preserve_usage_syntax=True,
+            )
             line = usage
             if descriptor.description:
-                line += f" - {descriptor.description}"
+                line += f" - {_markdown_inline(descriptor.description)}"
             lines.append(line)
         return "\n".join(lines)
