@@ -156,7 +156,8 @@ class CommandRouter:
             (
                 bundle
                 for bundle in self._skill_catalog.list_skills()
-                if bundle.id.casefold() == skill_ref.casefold()
+                if bundle.user_invocable
+                and bundle.id.casefold() == skill_ref.casefold()
             ),
             key=lambda bundle: bundle.id,
         )

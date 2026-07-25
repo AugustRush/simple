@@ -358,6 +358,40 @@ def test_casefold_colliding_skill_ids_are_ambiguous() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "invocation",
+    ["/REVIEW Keep THIS Case", "/skill REVIEW Keep THIS Case"],
+)
+def test_non_invocable_casefold_collision_does_not_shadow_public_skill(
+    invocation: str,
+) -> None:
+    public = SimpleNamespace(id="review", user_invocable=True)
+    internal = SimpleNamespace(id="Review", user_invocable=False)
+
+    class CollisionCatalog:
+        def get(self, skill_ref: str):
+            return next(
+                (
+                    bundle
+                    for bundle in (internal, public)
+                    if bundle.id == skill_ref
+                ),
+                None,
+            )
+
+        def list_skills(self):
+            return [internal, public]
+
+    router = CommandRouter(skill_catalog=CollisionCatalog())
+
+    route = router.classify(invocation)
+
+    assert route.kind == "skill"
+    assert route.skill_id == "review"
+    assert route.skill_args == "Keep THIS Case"
+    assert route.suggestions == ()
+
+
 @pytest.mark.parametrize("invocation", ["/internal", "/skill internal task"])
 def test_non_user_invocable_skill_is_an_unknown_slash(
     tmp_path, invocation: str
