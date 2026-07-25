@@ -219,9 +219,25 @@ For active sessions:
 - `idle_only` commands return a clear busy error and do not enter the mailbox;
 - ordinary text enters the per-session mailbox.
 
-`/now <message>` adds an urgent mailbox entry when busy. When idle it forwards
-the payload as an ordinary new turn. `/cancel <new task>` force-cancels the
-active operation and queues the payload as the next turn.
+Cancellation semantics are fixed:
+
+- `/cancel` force-cancels the active operation, aborting the current LLM request
+  and force-terminating registered child processes;
+- `/cancel graceful` requests cooperative cancellation and graceful child
+  process termination at the next safe boundary;
+- `/cancel <new task>` force-cancels and replaces the pending restart queue with
+  the supplied task as its first entry;
+- cancellation while idle is an informational no-op;
+- a later force cancellation upgrades a pending graceful cancellation;
+- repeated cancellation is idempotent apart from restart-queue updates.
+
+Every accepted cancellation gets an immediate acknowledgement on the command's
+sink. The original operation emits at most one final cancellation result when
+its execution unwinds. A queued restart begins only after that unwind and the
+coordinator's cleanup completes.
+
+`/now <message>` adds an urgent interjection when active. When idle it forwards
+the payload as an ordinary new turn.
 
 ## Command Inventory
 
@@ -287,9 +303,13 @@ The shared components dictionary is never mutated with per-session values.
 Handlers may return:
 
 - `CommandResult`;
-- a string, treated as `forward_text` for declarative command files and as
-  response text when explicitly marked by the adapter;
+- a string, always treated as `forward_text` to preserve the existing legacy
+  behavior for Python and declarative plugin commands;
 - `None`, treated as a handled side-effect-only legacy command.
+
+Portable plugins that need to reply directly return `CommandResult` with
+response text. No implicit marker or source-dependent string interpretation is
+used.
 
 Built-in evolution handlers are migrated to portable structured results and
 must not print directly to `shared.CONSOLE`. Arbitrary console output from
@@ -302,17 +322,54 @@ but must adopt structured returns for cross-channel output.
 Feishu schedules each accepted message on the main event loop without holding
 a per-chat lock across the handler call.
 
+`RuntimeSessionState` owns two distinct FIFO collections:
+
+- `pending_interjections`: messages that may be drained into the currently
+  active model/tool loop;
+- `restart_queue`: complete new turns that begin only after cancellation and
+  cleanup of the active operation.
+
+The two collections are never aliased. `BaseAgent` drains
+`pending_interjections` in place at each existing tool-loop boundary, preserving
+arrival order. Urgency is metadata and does not reorder entries. Entries that
+arrive after the state becomes `cancelling` go to `restart_queue`, never back
+into the operation being stopped.
+
+The coordinator state transitions are:
+
+| State | Input | Action | Next state |
+|---|---|---|---|
+| `idle` | ordinary text or idle-only command | create token and dispatch | `active` |
+| `idle` | `/now <text>` | dispatch `<text>` as an ordinary turn | `active` |
+| `idle` | any `/cancel` form | report no active operation; `/cancel <text>` dispatches `<text>` | `idle` or `active` |
+| `active` | ordinary text | append to `pending_interjections` | `active` |
+| `active` | `/now <text>` | append urgent interjection | `active` |
+| `active` | `/cancel` or graceful form | signal token and acknowledge | `cancelling` |
+| `active` | `/cancel <text>` | force signal; replace restart queue with `<text>` | `cancelling` |
+| `active` | anytime command | execute on its own sink | `active` |
+| `active` | idle-only command | return busy error | `active` |
+| `cancelling` | ordinary text | append to `restart_queue` | `cancelling` |
+| `cancelling` | `/cancel <text>` | replace restart queue with `<text>` | `cancelling` |
+| `cancelling` | other cancellation | upgrade or acknowledge idempotently | `cancelling` |
+| `cancelling` | anytime command | execute on its own sink | `cancelling` |
+| `cancelling` | active operation unwinds | start FIFO restart if present, otherwise stop | `active` or `idle` |
+
+Replacing on `/cancel <text>` makes the newest explicit redirection
+authoritative. Ordinary messages received afterward append in arrival order and
+become subsequent turns. A restart that becomes active uses the normal rules,
+so remaining queued entries wait until it completes.
+
 The coordinator performs these steps without awaiting between state lookup and
 marking a new operation active:
 
 1. resolve or create the session state;
 2. route interrupt/anytime commands;
-3. if an operation is active, enqueue ordinary text or reject idle-only
-   commands;
+3. apply the state-transition table, including interjection versus restart
+   ownership;
 4. otherwise mark the operation active and create a fresh cancel token;
 5. dispatch a command or model turn;
 6. clear active state in `finally`;
-7. process a queued restart message, if present.
+7. process the next queued restart message, if present.
 
 Because all callbacks run on one asyncio event loop and the active flag is set
 before the first dispatch await, this transition is atomic with respect to
@@ -368,14 +425,58 @@ Each iteration uses a fresh `AgentContext`, as today, and receives task state
 plus recent progress. Progress output is emitted through a Ralph observer; the
 service contains no Rich or Feishu imports.
 
+The turn dependency returns a `RalphIterationResult` containing content,
+tool-call names, and an optional execution error. One iteration follows this
+order:
+
+1. check cancellation;
+2. compute `iteration_number = current_iteration + 1` without advancing the
+   durable cursor;
+3. build the prompt from the goal, completion criteria, and recent progress;
+4. execute one model/tool turn in a fresh context;
+5. if execution returns an error, record it and transition to `failed`;
+6. record a bounded content summary and tool calls;
+7. when a verifier is configured, run it after every error-free iteration;
+8. atomically persist the iteration result, set `current_iteration` to
+   `iteration_number`, and store the selected next state;
+9. emit progress only after persistence succeeds.
+
+`current_iteration` therefore means the last durably recorded attempt. If the
+process exits during a model or verifier call, resume repeats that uncommitted
+iteration rather than skipping it.
+
+Completion is deterministic:
+
+- with a verifier, exit code `0` is the only completion signal; the promise
+  token alone is insufficient;
+- without a verifier, the configured completion promise in model content marks
+  the task complete;
+- verifier nonzero exit, timeout, or ordinary test failure appends a bounded
+  diagnostic to progress and continues to the next iteration;
+- verifier setup/infrastructure errors transition the task to `failed`;
+- if no completion signal occurs by `max_iterations`, the task becomes
+  `max_iterations_reached`.
+
+The latest verifier diagnostic is included in the next iteration prompt so the
+model can react to the actual failure.
+
 The service checks cancellation before each iteration and publishes the same
 cancel token to the iteration context so an in-flight model or tool operation
 can be aborted. It persists after every iteration and before reporting any
 terminal status.
 
-Expected exceptions become `failed` with a bounded diagnostic in progress.
-Cancellation becomes `interrupted`. Neither escapes to terminate CLI or
-gateway processing.
+All `Exception` instances from turn execution, verification, or service logic,
+other than store-write failures described below, become `failed` with a bounded
+diagnostic. `asyncio.CancelledError` and
+cooperative/force token cancellation become `interrupted`. Observer/output
+exceptions are logged and ignored because delivery failure must not change task
+truth.
+
+If a nonterminal or terminal store write fails, execution stops immediately and
+returns a durability error. The service must not report the unpersisted state as
+complete, failed, interrupted, or exhausted. Therefore every reported terminal
+outcome has first been durably stored; a storage outage is reported separately
+rather than pretending the terminal transition succeeded.
 
 Post-task memory staging remains once per Ralph run, not once per iteration.
 
@@ -391,8 +492,15 @@ The verification runner:
    commands;
 5. launches with `asyncio.create_subprocess_exec()` rather than a shell;
 6. runs in the workspace root with a controlled environment;
-7. enforces a timeout and bounded captured output;
-8. terminates the process on cancellation or timeout.
+7. enforces a timeout and retains at most the last 64 KiB from each output
+   stream;
+8. starts a new process session and, on cancellation or timeout, sends SIGTERM
+   to the process group, waits a short bounded grace period, then sends SIGKILL.
+
+The controlled environment contains only `PATH`, `HOME`, `LANG`, `LC_ALL`,
+`LC_CTYPE`, `TMPDIR`, and `VIRTUAL_ENV` when present, plus
+`AGENT_WORKSPACE_ROOT` and `AGENT_OUTPUT_DIR`. It does not forward provider API
+keys or arbitrary configured secrets.
 
 This permits normal checks such as `pytest tests/` while rejecting shell
 operators, inline interpreters, destructive commands, and commands requiring
@@ -505,8 +613,9 @@ where runtime-generated help is sufficient.
 3. Unknown slash commands never reach the model.
 4. Model selection is isolated per runtime session.
 5. Same-chat cancellation and mailbox messages reach an active Feishu turn.
-6. `/ralph <goal>` does not crash, resume continues correctly, and terminal
-   state is always persisted.
+6. `/ralph <goal>` does not crash, resume continues correctly, and every
+   reported terminal state was persisted before delivery; persistence failure
+   produces a distinct durability error.
 7. Ralph verification cannot bypass shell safety or invoke a shell interpreter.
 8. Command and Ralph domain code has no Rich or Feishu dependency.
 9. Focused tests and the full existing suite pass.
