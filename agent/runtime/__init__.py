@@ -4,6 +4,7 @@ from agent.core.output import EventCollector, RuntimeEvent, _active_event_collec
 
 from .contracts import (
     AgentCore,
+    OperationState,
     RuntimeComponents,
     RuntimeSessionState,
     TurnExecution,
@@ -17,6 +18,7 @@ __all__ = [
     "AgentCore",
     "EventCollector",
     "HeartbeatWriter",
+    "OperationState",
     "RuntimeComponents",
     "RuntimeEvent",
     "RuntimeSessionState",

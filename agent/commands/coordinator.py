@@ -1,0 +1,559 @@
+from __future__ import annotations
+
+from dataclasses import replace
+import logging
+import time
+from typing import Any, Callable, Mapping
+
+from agent.core.output import (
+    OutputSink,
+    RuntimeEvent,
+    _active_event_collector,
+)
+from agent.runtime.contracts import AgentCore, RuntimeSessionState, TurnInput
+from agent.shared import CancelToken
+
+from .models import CommandAction, CommandContext, CommandResult
+from .router import CommandClassification, CommandRouter
+
+logger = logging.getLogger(__name__)
+
+_BUSY_MESSAGE = "Session is busy; wait for the current operation to finish."
+_FAILED_MESSAGE = "Command handling failed."
+
+
+class CommandCoordinator:
+    """Coordinate one session operation without owning session storage."""
+
+    def __init__(
+        self,
+        agent_core: AgentCore,
+        router: CommandRouter,
+        *,
+        components: Mapping[str, Any] | None = None,
+        config: Mapping[str, Any] | None = None,
+        cancel_token_factory: Callable[[], Any] | None = None,
+        event_hook: Callable[[RuntimeEvent], None] | None = None,
+    ) -> None:
+        self._agent_core = agent_core
+        self._router = router
+        self._components = components if components is not None else {}
+        self._config = config if config is not None else {}
+        self._cancel_token_factory = cancel_token_factory or CancelToken
+        self._event_hook = event_hook
+
+    async def handle(
+        self,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        sink: OutputSink,
+    ) -> CommandAction | None:
+        try:
+            classification = self._router.classify(
+                turn_input.text,
+                channel_name=turn_input.channel_name,
+                session_id=turn_input.session_id,
+                metadata=turn_input.metadata,
+            )
+            return await self._route(classification, turn_input, state, sink)
+        except Exception:
+            logger.exception(
+                "command coordination failed: session_id=%s channel=%s",
+                turn_input.session_id,
+                turn_input.channel_name,
+            )
+            self._emit("command_failed", turn_input, outcome="internal_error")
+            sink.on_error(_FAILED_MESSAGE)
+            return None
+        finally:
+            await self._drain_if_supported(sink)
+
+    async def _route(
+        self,
+        classification: CommandClassification,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        sink: OutputSink,
+    ) -> CommandAction | None:
+        if classification.kind == "unknown_slash":
+            self._emit_received(classification, turn_input)
+            result = await self._router.execute(
+                classification,
+                self._command_context(turn_input, state, sink),
+            )
+            await self._render_result(result, sink)
+            self._emit(
+                "command_rejected",
+                turn_input,
+                command=self._command_name(classification),
+                reason="unknown",
+            )
+            return result.action
+
+        if classification.kind == "skill":
+            self._emit_received(classification, turn_input)
+            if state.operation_state != "idle":
+                await self._reject_busy(classification, turn_input, sink)
+                return None
+            return await self._run_operation(
+                turn_input,
+                state,
+                sink,
+                classification=None,
+                forward_text=classification.text,
+                accepts_interjections=True,
+                forward_target="skill",
+                forward_command=classification.skill_id or "skill",
+            )
+
+        if classification.kind == "text":
+            if state.operation_state == "cancelling":
+                self._queue_restart(turn_input, sink, state)
+                sink.on_status("Message queued for the next turn.", level="info")
+                return None
+            if state.operation_state == "active":
+                if state.accepts_interjections:
+                    self._queue_interjection(turn_input, sink, state)
+                    sink.on_status("Interjection queued.", level="info")
+                else:
+                    self._queue_restart(turn_input, sink, state)
+                    sink.on_status("Message queued for the next turn.", level="info")
+                return None
+            return await self._run_operation(
+                turn_input,
+                state,
+                sink,
+                classification=None,
+                forward_text=classification.text,
+                accepts_interjections=True,
+            )
+
+        self._emit_received(classification, turn_input)
+        descriptor = classification.descriptor
+        if descriptor is None:
+            raise RuntimeError("classified command has no descriptor")
+        if descriptor.name == "cancel":
+            return await self._handle_cancel(
+                classification, turn_input, state, sink
+            )
+        if descriptor.name == "now":
+            return await self._handle_now(classification, turn_input, state, sink)
+
+        if state.operation_state != "idle":
+            if descriptor.concurrency in ("anytime", "interrupt"):
+                return await self._execute_command(
+                    classification, turn_input, state, sink
+                )
+            await self._reject_busy(classification, turn_input, sink)
+            return None
+
+        return await self._run_operation(
+            turn_input,
+            state,
+            sink,
+            classification=classification,
+            forward_text=None,
+            accepts_interjections=descriptor.accepts_interjections,
+        )
+
+    async def _run_operation(
+        self,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        sink: OutputSink,
+        *,
+        classification: CommandClassification | None,
+        forward_text: str | None,
+        accepts_interjections: bool,
+        forward_target: str = "model",
+        forward_command: str = "",
+    ) -> CommandAction | None:
+        current_input = turn_input
+        current_sink = sink
+        current_classification = classification
+        current_forward = forward_text
+        current_accepts = accepts_interjections
+        current_forward_target = forward_target
+        current_forward_command = forward_command
+        first_action: CommandAction | None = None
+        first = True
+
+        while True:
+            token = self._cancel_token_factory()
+            state.cancel_token = token
+            state.accepts_interjections = current_accepts
+            state.operation_state = "active"
+            try:
+                if current_classification is not None:
+                    action = await self._execute_command(
+                        current_classification,
+                        current_input,
+                        state,
+                        current_sink,
+                    )
+                else:
+                    self._emit(
+                        "command_forwarded",
+                        current_input,
+                        command=current_forward_command,
+                        target=current_forward_target,
+                    )
+                    forwarded_input = replace(
+                        current_input,
+                        text=current_forward if current_forward is not None else current_input.text,
+                    )
+                    await self._agent_core.handle_turn(
+                        forwarded_input,
+                        state,
+                        sink=current_sink,
+                    )
+                    action = None
+            except Exception:
+                logger.exception(
+                    "operation dispatch failed: session_id=%s channel=%s",
+                    current_input.session_id,
+                    current_input.channel_name,
+                )
+                self._emit(
+                    "command_failed",
+                    current_input,
+                    command=self._command_name(current_classification),
+                    outcome="internal_error",
+                )
+                current_sink.on_error(_FAILED_MESSAGE)
+                action = None
+            finally:
+                cancelled = state.operation_state == "cancelling" or bool(
+                    getattr(token, "is_cancelled", False)
+                )
+                if cancelled:
+                    unapplied = len(state.pending_interjections)
+                    state.pending_interjections.clear()
+                    if unapplied:
+                        current_sink.on_status(
+                            f"{unapplied} interjection(s) were unapplied because the operation was cancelled.",
+                            level="warning",
+                        )
+                await self._drain_if_supported(current_sink)
+
+                # Keep the operation non-idle across the drain await. Inputs
+                # arriving there are still late arrivals for this operation.
+                if not cancelled and state.pending_interjections:
+                    late = list(state.pending_interjections)
+                    state.pending_interjections.clear()
+                    state.restart_queue[0:0] = late
+
+                state.operation_state = "idle"
+                state.accepts_interjections = False
+                state.cancel_token = None
+
+            if first:
+                first_action = action
+                first = False
+            if not state.restart_queue:
+                return first_action
+
+            queued = state.restart_queue.pop(0)
+            current_input = self._queued_turn_input(queued)
+            current_sink = queued.get("sink") or sink
+            current_classification = None
+            current_forward = queued["text"]
+            current_accepts = True
+            current_forward_target = "model"
+            current_forward_command = ""
+
+    async def _execute_command(
+        self,
+        classification: CommandClassification,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        sink: OutputSink,
+    ) -> CommandAction | None:
+        started_at = time.perf_counter()
+        result = await self._router.execute(
+            classification,
+            self._command_context(turn_input, state, sink),
+        )
+        await self._render_result(result, sink)
+        command = self._command_name(classification)
+        duration_ms = round((time.perf_counter() - started_at) * 1000, 1)
+        if result.error:
+            self._emit(
+                "command_failed",
+                turn_input,
+                command=command,
+                duration_ms=duration_ms,
+                outcome="failed",
+            )
+        else:
+            self._emit(
+                "command_handled",
+                turn_input,
+                command=command,
+                duration_ms=duration_ms,
+                outcome="handled",
+            )
+
+        if result.forward_text is not None:
+            self._emit(
+                "command_forwarded",
+                turn_input,
+                command=command,
+                target="model",
+            )
+            await self._agent_core.handle_turn(
+                replace(turn_input, text=result.forward_text),
+                state,
+                sink=sink,
+            )
+        return result.action
+
+    async def _handle_now(
+        self,
+        classification: CommandClassification,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        sink: OutputSink,
+    ) -> CommandAction | None:
+        request = classification.request
+        payload = request.args if request is not None else ""
+        if not payload:
+            sink.on_status("/now requires a message.", level="error")
+            self._emit(
+                "command_rejected",
+                turn_input,
+                command="now",
+                reason="missing_payload",
+            )
+            return None
+
+        payload_input = replace(turn_input, text=payload)
+        if state.operation_state == "idle":
+            return await self._run_operation(
+                payload_input,
+                state,
+                sink,
+                classification=None,
+                forward_text=payload,
+                accepts_interjections=True,
+            )
+        if state.operation_state == "active" and state.accepts_interjections:
+            self._queue_interjection(
+                payload_input, sink, state, urgency="now"
+            )
+            sink.on_status("Urgent interjection queued.", level="info")
+        else:
+            self._queue_restart(payload_input, sink, state, urgency="now")
+            sink.on_status("Message queued for the next turn.", level="info")
+        self._emit(
+            "command_handled",
+            turn_input,
+            command="now",
+            outcome="queued",
+        )
+        return None
+
+    async def _handle_cancel(
+        self,
+        classification: CommandClassification,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        sink: OutputSink,
+    ) -> CommandAction | None:
+        request = classification.request
+        args = request.args if request is not None else ""
+        mode = args.casefold()
+        graceful = mode == "graceful"
+        explicit_force = mode == "force"
+        payload = "" if graceful or explicit_force else args
+
+        if state.operation_state == "idle":
+            if payload:
+                return await self._run_operation(
+                    replace(turn_input, text=payload),
+                    state,
+                    sink,
+                    classification=None,
+                    forward_text=payload,
+                    accepts_interjections=True,
+                )
+            sink.on_status("No active operation to cancel.", level="info")
+            self._emit(
+                "command_handled",
+                turn_input,
+                command="cancel",
+                outcome="no_op",
+            )
+            return None
+
+        state.operation_state = "cancelling"
+        token = state.cancel_token
+        if token is not None:
+            token.cancel("graceful" if graceful else "force")
+        if payload:
+            replacement = self._queue_entry(
+                replace(turn_input, text=payload), sink, urgency="now"
+            )
+            state.restart_queue[:] = [replacement]
+            sink.on_status(
+                "Cancellation requested; replacement task queued.",
+                level="warning",
+            )
+        else:
+            level = "graceful" if graceful else "force"
+            sink.on_status(
+                f"{level.capitalize()} cancellation requested.",
+                level="warning",
+            )
+        self._emit(
+            "command_handled",
+            turn_input,
+            command="cancel",
+            outcome="cancelling",
+            level="graceful" if graceful else "force",
+        )
+        return None
+
+    async def _reject_busy(
+        self,
+        classification: CommandClassification,
+        turn_input: TurnInput,
+        sink: OutputSink,
+    ) -> None:
+        sink.on_status(_BUSY_MESSAGE, level="error")
+        self._emit(
+            "command_rejected",
+            turn_input,
+            command=self._command_name(classification),
+            reason="busy",
+        )
+
+    async def _render_result(self, result: CommandResult, sink: OutputSink) -> None:
+        if result.response_text is not None:
+            sink.on_status(result.response_text, level=result.level)
+        elif result.error:
+            sink.on_error(result.error)
+        for attachment in result.attachments:
+            sink.queue_attachment(attachment)
+
+    def _command_context(
+        self,
+        turn_input: TurnInput,
+        state: RuntimeSessionState,
+        sink: OutputSink,
+    ) -> CommandContext:
+        return CommandContext(
+            components=self._components,
+            config=self._config,
+            session_state=state,
+            sink=sink,
+            channel_name=turn_input.channel_name,
+            session_id=turn_input.session_id,
+            message_id=str(turn_input.metadata.get("message_id", "")),
+            metadata=turn_input.metadata,
+        )
+
+    def _emit_received(
+        self,
+        classification: CommandClassification,
+        turn_input: TurnInput,
+    ) -> None:
+        self._emit(
+            "command_received",
+            turn_input,
+            command=self._command_name(classification),
+        )
+
+    def _emit(self, name: str, turn_input: TurnInput, **fields: object) -> None:
+        collector = _active_event_collector.get()
+        if collector is not None:
+            collector.emit(name, **fields)
+        if self._event_hook is not None:
+            try:
+                self._event_hook(
+                    RuntimeEvent(
+                        name=name,
+                        session_id=turn_input.session_id,
+                        channel_name=turn_input.channel_name,
+                        fields=fields,
+                        metadata=turn_input.metadata,
+                    )
+                )
+            except Exception:
+                logger.exception("command event hook failed: event=%s", name)
+
+    @staticmethod
+    def _command_name(
+        classification: CommandClassification | None,
+    ) -> str:
+        if classification is None:
+            return ""
+        if classification.descriptor is not None:
+            return classification.descriptor.name
+        if classification.request is not None:
+            return classification.request.name
+        return classification.skill_id or ""
+
+    @classmethod
+    def _queue_entry(
+        cls,
+        turn_input: TurnInput,
+        sink: OutputSink,
+        *,
+        urgency: str = "normal",
+    ) -> dict[str, Any]:
+        return {
+            "text": turn_input.text,
+            "from_user": str(
+                turn_input.metadata.get("user_id")
+                or turn_input.metadata.get("sender")
+                or ""
+            ),
+            "arrived_at": time.time(),
+            "urgency": urgency,
+            "turn_input": turn_input,
+            "sink": sink,
+        }
+
+    @classmethod
+    def _queue_interjection(
+        cls,
+        turn_input: TurnInput,
+        sink: OutputSink,
+        state: RuntimeSessionState,
+        *,
+        urgency: str = "normal",
+    ) -> None:
+        state.pending_interjections.append(
+            cls._queue_entry(turn_input, sink, urgency=urgency)
+        )
+
+    @classmethod
+    def _queue_restart(
+        cls,
+        turn_input: TurnInput,
+        sink: OutputSink,
+        state: RuntimeSessionState,
+        *,
+        urgency: str = "normal",
+    ) -> None:
+        state.restart_queue.append(cls._queue_entry(turn_input, sink, urgency=urgency))
+
+    @staticmethod
+    def _queued_turn_input(entry: Mapping[str, Any]) -> TurnInput:
+        turn_input = entry.get("turn_input")
+        if isinstance(turn_input, TurnInput):
+            return replace(turn_input, text=str(entry["text"]))
+        return TurnInput.from_text(str(entry["text"]))
+
+    @staticmethod
+    async def _drain_if_supported(sink: Any) -> None:
+        drain = getattr(sink, "drain", None)
+        if not callable(drain):
+            return
+        try:
+            result = drain()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception:
+            logger.exception("command output sink drain failed")

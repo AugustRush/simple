@@ -1,5 +1,7 @@
 """Transport-neutral command contracts and deterministic routing."""
 
+from .coordinator import CommandCoordinator
+
 from .models import (
     CommandAction,
     CommandConcurrency,
@@ -22,6 +24,7 @@ from .router import (
 __all__ = [
     "CommandAction",
     "CommandClassification",
+    "CommandCoordinator",
     "CommandConcurrency",
     "CommandContext",
     "CommandDescriptor",

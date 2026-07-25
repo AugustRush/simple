@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, TypeVar, overload
+from typing import Any, Callable, Literal, Mapping, TypeAlias, TypeVar, overload
 
 from agent.core.attachments import MessageAttachment
 from agent.core.output import (
@@ -19,6 +19,7 @@ from agent.skills.catalog import prepare_user_message_for_skills
 from agent.tools.runtime import _active_schedule_target
 
 T = TypeVar("T")
+OperationState: TypeAlias = Literal["idle", "active", "cancelling"]
 
 
 @dataclass(frozen=True)
@@ -124,16 +125,33 @@ class RuntimeSessionState:
     context_manager: Any = None
     memory_worker: Any = None
     cancel_token: Any = None  # CancelToken | None
-    # User messages that arrived while a turn was in progress.  The channel
-    # handler appends here when state.cancel_token is set + non-cancelled
-    # (meaning: a turn is running for this session).  send_message drains
-    # this at every tool-loop iteration and injects the messages as a
-    # <user_interjection> block in ctx — the LLM then decides what to do.
-    pending_messages: list[dict] = field(default_factory=list)
-    # True while send_message is actively running for this session.  The
-    # channel handler uses this to decide "queue → mailbox" vs "start new
-    # turn".  Set/cleared inside the turn dispatch path.
-    turn_in_progress: bool = False
+    operation_state: OperationState = "idle"
+    accepts_interjections: bool = False
+    pending_interjections: list[dict[str, Any]] = field(default_factory=list)
+    restart_queue: list[dict[str, Any]] = field(default_factory=list)
+    model_override: str | None = None
+
+    @property
+    def pending_messages(self) -> list[dict[str, Any]]:
+        """Compatibility alias for BaseAgent's existing mailbox metadata."""
+
+        return self.pending_interjections
+
+    @pending_messages.setter
+    def pending_messages(self, value: list[dict[str, Any]]) -> None:
+        self.pending_interjections = (
+            list(value) if value is self.restart_queue else value
+        )
+
+    @property
+    def turn_in_progress(self) -> bool:
+        """Compatibility view over the explicit operation state."""
+
+        return self.operation_state != "idle"
+
+    @turn_in_progress.setter
+    def turn_in_progress(self, value: bool) -> None:
+        self.operation_state = "active" if value else "idle"
 
     def ensure_task_context(self, text: str) -> None:
         if not self.task_context:

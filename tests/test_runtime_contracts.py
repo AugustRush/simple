@@ -149,6 +149,50 @@ def test_runtime_session_state_records_turns_and_tools():
     assert state.tools_used == ["bash", "search"]
 
 
+def test_runtime_session_state_has_explicit_operation_defaults():
+    state = RuntimeSessionState(ctx=object())
+
+    assert state.operation_state == "idle"
+    assert state.accepts_interjections is False
+    assert state.model_override is None
+    assert state.turn_in_progress is False
+
+
+def test_runtime_session_state_owns_distinct_interjection_and_restart_queues():
+    first = RuntimeSessionState(ctx=object())
+    second = RuntimeSessionState(ctx=object())
+
+    assert first.pending_interjections == []
+    assert first.restart_queue == []
+    assert first.pending_interjections is not first.restart_queue
+    assert first.pending_interjections is not second.pending_interjections
+    assert first.restart_queue is not second.restart_queue
+
+
+def test_runtime_session_state_compatibility_aliases_share_no_duplicate_state():
+    state = RuntimeSessionState(ctx=object())
+
+    state.turn_in_progress = True
+    state.pending_messages.append({"text": "follow up"})
+
+    assert state.operation_state == "active"
+    assert state.pending_messages is state.pending_interjections
+    assert state.pending_messages is not state.restart_queue
+
+    state.turn_in_progress = False
+    assert state.operation_state == "idle"
+
+
+def test_runtime_session_state_compatibility_alias_cannot_alias_restart_queue():
+    state = RuntimeSessionState(ctx=object())
+    state.restart_queue.append({"text": "restart"})
+
+    state.pending_messages = state.restart_queue
+
+    assert state.pending_messages == state.restart_queue
+    assert state.pending_messages is not state.restart_queue
+
+
 def test_turn_runner_complete_turn_records_state_and_maintenance():
     class _PluginCatalog:
         def __init__(self):
