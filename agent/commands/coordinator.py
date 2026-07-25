@@ -223,29 +223,31 @@ class CommandCoordinator:
                 current_sink.on_error(_FAILED_MESSAGE)
                 action = None
             finally:
-                cancelled = state.operation_state == "cancelling" or bool(
-                    getattr(token, "is_cancelled", False)
-                )
-                if cancelled:
-                    unapplied = len(state.pending_interjections)
-                    state.pending_interjections.clear()
-                    if unapplied:
-                        current_sink.on_status(
-                            f"{unapplied} interjection(s) were unapplied because the operation was cancelled.",
-                            level="warning",
-                        )
-                await self._drain_if_supported(current_sink)
-
-                # Keep the operation non-idle across the drain await. Inputs
-                # arriving there are still late arrivals for this operation.
-                if not cancelled and state.pending_interjections:
-                    late = list(state.pending_interjections)
-                    state.pending_interjections.clear()
-                    state.restart_queue[0:0] = late
-
-                state.operation_state = "idle"
-                state.accepts_interjections = False
-                state.cancel_token = None
+                try:
+                    # Keep the operation non-idle across this await, then
+                    # re-read cancellation before deciding mailbox ownership.
+                    await self._drain_if_supported(current_sink)
+                    cancelled = state.operation_state == "cancelling" or bool(
+                        getattr(token, "is_cancelled", False)
+                    )
+                    if cancelled:
+                        unapplied = len(state.pending_interjections)
+                        state.pending_interjections.clear()
+                        if unapplied:
+                            self._safe_status(
+                                current_sink,
+                                f"{unapplied} interjection(s) were unapplied because the operation was cancelled.",
+                                level="warning",
+                            )
+                            await self._drain_if_supported(current_sink)
+                    elif state.pending_interjections:
+                        late = list(state.pending_interjections)
+                        state.pending_interjections.clear()
+                        state.restart_queue[0:0] = late
+                finally:
+                    state.operation_state = "idle"
+                    state.accepts_interjections = False
+                    state.cancel_token = None
 
             if first:
                 first_action = action
@@ -545,6 +547,13 @@ class CommandCoordinator:
         if isinstance(turn_input, TurnInput):
             return replace(turn_input, text=str(entry["text"]))
         return TurnInput.from_text(str(entry["text"]))
+
+    @staticmethod
+    def _safe_status(sink: Any, text: str, *, level: str) -> None:
+        try:
+            sink.on_status(text, level=level)
+        except Exception:
+            logger.exception("command output sink status failed")
 
     @staticmethod
     async def _drain_if_supported(sink: Any) -> None:
