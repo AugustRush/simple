@@ -84,8 +84,10 @@ class CommandCoordinator:
             self._emit("command_failed", turn_input, outcome="internal_error")
             self._safe_error(sink, _FAILED_MESSAGE)
         finally:
-            await self._drain_if_supported(sink)
-            sink_ready.set()
+            try:
+                await self._drain_if_supported(sink)
+            finally:
+                sink_ready.set()
         await self._run_restarts_if_idle(state, sink)
         return action
 

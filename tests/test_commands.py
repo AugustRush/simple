@@ -1015,6 +1015,81 @@ def test_replacement_waits_for_originating_sink_drain_before_dispatch() -> None:
     asyncio.run(scenario())
 
 
+def test_cancelled_originating_drain_always_releases_queued_owner() -> None:
+    async def scenario() -> None:
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        first_returning = asyncio.Event()
+
+        class BlockingDrainSink(_CoordinatorSink):
+            def __init__(self) -> None:
+                super().__init__()
+                self.drain_started = asyncio.Event()
+                self.release_drain = asyncio.Event()
+
+            async def drain(self) -> None:
+                self.drain_count += 1
+                self.drain_started.set()
+                await self.release_drain.wait()
+
+        async def core_behavior(turn_input, state, sink):
+            if turn_input.text == "first":
+                first_started.set()
+                await release_first.wait()
+                first_returning.set()
+
+        async def noop_interrupt(request, context):
+            return CommandResult()
+
+        router = CommandRouter(
+            core_commands=[
+                CommandDescriptor("cancel", noop_interrupt, concurrency="interrupt")
+            ]
+        )
+        core = _CoordinatorCore(core_behavior)
+        coordinator, _ = _coordinator(router, core=core)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+        owner = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await first_started.wait()
+
+        queued_sink = BlockingDrainSink()
+        originating = asyncio.create_task(
+            coordinator.handle(
+                _turn("/cancel replacement", message_id="m-2"),
+                state,
+                queued_sink,  # type: ignore[arg-type]
+            )
+        )
+        await queued_sink.drain_started.wait()
+
+        release_first.set()
+        await first_returning.wait()
+        await asyncio.sleep(0)
+        assert state.operation_state == "active"
+        assert [call.text for call in core.calls] == ["first"]
+
+        originating.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await originating
+        queued_sink.release_drain.set()
+
+        done, _ = await asyncio.wait({owner}, timeout=0.05)
+        if owner not in done:
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
+
+        assert owner in done
+        assert [call.text for call in core.calls] == ["first", "replacement"]
+        assert state.operation_state == "idle"
+        assert state.accepts_interjections is False
+        assert state.cancel_token is None
+        assert state.restart_queue == []
+
+    asyncio.run(scenario())
+
+
 def test_idle_cancel_is_noop_but_cancel_payload_forwards_normally() -> None:
     async def noop_interrupt(request, context):
         return CommandResult()
