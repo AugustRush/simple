@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import logging
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, NotRequired, TypedDict
 
 from agent.core.output import (
     OutputSink,
@@ -20,6 +21,16 @@ logger = logging.getLogger(__name__)
 
 _BUSY_MESSAGE = "Session is busy; wait for the current operation to finish."
 _FAILED_MESSAGE = "Command handling failed."
+
+
+class _QueueEntry(TypedDict):
+    text: str
+    from_user: str
+    arrived_at: float
+    urgency: str
+    turn_input: TurnInput
+    sink: OutputSink
+    ready: NotRequired[asyncio.Event]
 
 
 class CommandCoordinator:
@@ -48,6 +59,8 @@ class CommandCoordinator:
         state: RuntimeSessionState,
         sink: OutputSink,
     ) -> CommandAction | None:
+        sink_ready = asyncio.Event()
+        action: CommandAction | None = None
         try:
             classification = self._router.classify(
                 turn_input.text,
@@ -55,7 +68,13 @@ class CommandCoordinator:
                 session_id=turn_input.session_id,
                 metadata=turn_input.metadata,
             )
-            return await self._route(classification, turn_input, state, sink)
+            action = await self._route(
+                classification,
+                turn_input,
+                state,
+                sink,
+                sink_ready,
+            )
         except Exception:
             logger.exception(
                 "command coordination failed: session_id=%s channel=%s",
@@ -63,10 +82,12 @@ class CommandCoordinator:
                 turn_input.channel_name,
             )
             self._emit("command_failed", turn_input, outcome="internal_error")
-            sink.on_error(_FAILED_MESSAGE)
-            return None
+            self._safe_error(sink, _FAILED_MESSAGE)
         finally:
             await self._drain_if_supported(sink)
+            sink_ready.set()
+        await self._run_restarts_if_idle(state, sink)
+        return action
 
     async def _route(
         self,
@@ -74,6 +95,7 @@ class CommandCoordinator:
         turn_input: TurnInput,
         state: RuntimeSessionState,
         sink: OutputSink,
+        sink_ready: asyncio.Event,
     ) -> CommandAction | None:
         if classification.kind == "unknown_slash":
             self._emit_received(classification, turn_input)
@@ -108,16 +130,24 @@ class CommandCoordinator:
 
         if classification.kind == "text":
             if state.operation_state == "cancelling":
-                self._queue_restart(turn_input, sink, state)
-                sink.on_status("Message queued for the next turn.", level="info")
+                self._queue_restart(turn_input, sink, state, ready=sink_ready)
+                self._safe_status(
+                    sink, "Message queued for the next turn.", level="info"
+                )
                 return None
             if state.operation_state == "active":
                 if state.accepts_interjections:
-                    self._queue_interjection(turn_input, sink, state)
-                    sink.on_status("Interjection queued.", level="info")
+                    self._queue_interjection(
+                        turn_input, sink, state, ready=sink_ready
+                    )
+                    self._safe_status(sink, "Interjection queued.", level="info")
                 else:
-                    self._queue_restart(turn_input, sink, state)
-                    sink.on_status("Message queued for the next turn.", level="info")
+                    self._queue_restart(
+                        turn_input, sink, state, ready=sink_ready
+                    )
+                    self._safe_status(
+                        sink, "Message queued for the next turn.", level="info"
+                    )
                 return None
             return await self._run_operation(
                 turn_input,
@@ -134,15 +164,22 @@ class CommandCoordinator:
             raise RuntimeError("classified command has no descriptor")
         if descriptor.name == "cancel":
             return await self._handle_cancel(
-                classification, turn_input, state, sink
+                classification, turn_input, state, sink, sink_ready
             )
         if descriptor.name == "now":
-            return await self._handle_now(classification, turn_input, state, sink)
+            return await self._handle_now(
+                classification, turn_input, state, sink, sink_ready
+            )
 
         if state.operation_state != "idle":
             if descriptor.concurrency in ("anytime", "interrupt"):
                 return await self._execute_command(
-                    classification, turn_input, state, sink
+                    classification,
+                    turn_input,
+                    state,
+                    sink,
+                    queue_forward=True,
+                    forward_ready=sink_ready,
                 )
             await self._reject_busy(classification, turn_input, sink)
             return None
@@ -167,6 +204,7 @@ class CommandCoordinator:
         accepts_interjections: bool,
         forward_target: str = "model",
         forward_command: str = "",
+        initial_ready: asyncio.Event | None = None,
     ) -> CommandAction | None:
         current_input = turn_input
         current_sink = sink
@@ -175,6 +213,7 @@ class CommandCoordinator:
         current_accepts = accepts_interjections
         current_forward_target = forward_target
         current_forward_command = forward_command
+        current_ready = initial_ready
         first_action: CommandAction | None = None
         first = True
 
@@ -184,6 +223,8 @@ class CommandCoordinator:
             state.accepts_interjections = current_accepts
             state.operation_state = "active"
             try:
+                if current_ready is not None:
+                    await current_ready.wait()
                 if current_classification is not None:
                     action = await self._execute_command(
                         current_classification,
@@ -220,7 +261,7 @@ class CommandCoordinator:
                     command=self._command_name(current_classification),
                     outcome="internal_error",
                 )
-                current_sink.on_error(_FAILED_MESSAGE)
+                self._safe_error(current_sink, _FAILED_MESSAGE)
                 action = None
             finally:
                 try:
@@ -263,6 +304,7 @@ class CommandCoordinator:
             current_accepts = True
             current_forward_target = "model"
             current_forward_command = ""
+            current_ready = queued.get("ready")
 
     async def _execute_command(
         self,
@@ -270,6 +312,9 @@ class CommandCoordinator:
         turn_input: TurnInput,
         state: RuntimeSessionState,
         sink: OutputSink,
+        *,
+        queue_forward: bool = False,
+        forward_ready: asyncio.Event | None = None,
     ) -> CommandAction | None:
         started_at = time.perf_counter()
         result = await self._router.execute(
@@ -303,12 +348,40 @@ class CommandCoordinator:
                 command=command,
                 target="model",
             )
-            await self._agent_core.handle_turn(
-                replace(turn_input, text=result.forward_text),
-                state,
-                sink=sink,
-            )
+            forwarded_input = replace(turn_input, text=result.forward_text)
+            if queue_forward:
+                self._queue_restart(
+                    forwarded_input,
+                    sink,
+                    state,
+                    ready=forward_ready,
+                )
+            else:
+                await self._agent_core.handle_turn(
+                    forwarded_input,
+                    state,
+                    sink=sink,
+                )
         return result.action
+
+    async def _run_restarts_if_idle(
+        self,
+        state: RuntimeSessionState,
+        fallback_sink: OutputSink,
+    ) -> None:
+        if state.operation_state != "idle" or not state.restart_queue:
+            return
+        queued = state.restart_queue.pop(0)
+        turn_input = self._queued_turn_input(queued)
+        await self._run_operation(
+            turn_input,
+            state,
+            queued.get("sink") or fallback_sink,
+            classification=None,
+            forward_text=queued["text"],
+            accepts_interjections=True,
+            initial_ready=queued.get("ready"),
+        )
 
     async def _handle_now(
         self,
@@ -316,11 +389,12 @@ class CommandCoordinator:
         turn_input: TurnInput,
         state: RuntimeSessionState,
         sink: OutputSink,
+        sink_ready: asyncio.Event,
     ) -> CommandAction | None:
         request = classification.request
         payload = request.args if request is not None else ""
         if not payload:
-            sink.on_status("/now requires a message.", level="error")
+            self._safe_status(sink, "/now requires a message.", level="error")
             self._emit(
                 "command_rejected",
                 turn_input,
@@ -331,22 +405,42 @@ class CommandCoordinator:
 
         payload_input = replace(turn_input, text=payload)
         if state.operation_state == "idle":
-            return await self._run_operation(
+            action = await self._run_operation(
                 payload_input,
                 state,
                 sink,
                 classification=None,
                 forward_text=payload,
                 accepts_interjections=True,
+                forward_command="now",
             )
+            self._emit(
+                "command_handled",
+                turn_input,
+                command="now",
+                outcome="forwarded",
+            )
+            return action
         if state.operation_state == "active" and state.accepts_interjections:
             self._queue_interjection(
-                payload_input, sink, state, urgency="now"
+                payload_input,
+                sink,
+                state,
+                urgency="now",
+                ready=sink_ready,
             )
-            sink.on_status("Urgent interjection queued.", level="info")
+            self._safe_status(sink, "Urgent interjection queued.", level="info")
         else:
-            self._queue_restart(payload_input, sink, state, urgency="now")
-            sink.on_status("Message queued for the next turn.", level="info")
+            self._queue_restart(
+                payload_input,
+                sink,
+                state,
+                urgency="now",
+                ready=sink_ready,
+            )
+            self._safe_status(
+                sink, "Message queued for the next turn.", level="info"
+            )
         self._emit(
             "command_handled",
             turn_input,
@@ -361,6 +455,7 @@ class CommandCoordinator:
         turn_input: TurnInput,
         state: RuntimeSessionState,
         sink: OutputSink,
+        sink_ready: asyncio.Event,
     ) -> CommandAction | None:
         request = classification.request
         args = request.args if request is not None else ""
@@ -371,15 +466,25 @@ class CommandCoordinator:
 
         if state.operation_state == "idle":
             if payload:
-                return await self._run_operation(
+                action = await self._run_operation(
                     replace(turn_input, text=payload),
                     state,
                     sink,
                     classification=None,
                     forward_text=payload,
                     accepts_interjections=True,
+                    forward_command="cancel",
                 )
-            sink.on_status("No active operation to cancel.", level="info")
+                self._emit(
+                    "command_handled",
+                    turn_input,
+                    command="cancel",
+                    outcome="forwarded",
+                )
+                return action
+            self._safe_status(
+                sink, "No active operation to cancel.", level="info"
+            )
             self._emit(
                 "command_handled",
                 turn_input,
@@ -394,16 +499,21 @@ class CommandCoordinator:
             token.cancel("graceful" if graceful else "force")
         if payload:
             replacement = self._queue_entry(
-                replace(turn_input, text=payload), sink, urgency="now"
+                replace(turn_input, text=payload),
+                sink,
+                urgency="now",
+                ready=sink_ready,
             )
             state.restart_queue[:] = [replacement]
-            sink.on_status(
+            self._safe_status(
+                sink,
                 "Cancellation requested; replacement task queued.",
                 level="warning",
             )
         else:
             level = "graceful" if graceful else "force"
-            sink.on_status(
+            self._safe_status(
+                sink,
                 f"{level.capitalize()} cancellation requested.",
                 level="warning",
             )
@@ -422,7 +532,7 @@ class CommandCoordinator:
         turn_input: TurnInput,
         sink: OutputSink,
     ) -> None:
-        sink.on_status(_BUSY_MESSAGE, level="error")
+        self._safe_status(sink, _BUSY_MESSAGE, level="error")
         self._emit(
             "command_rejected",
             turn_input,
@@ -432,11 +542,11 @@ class CommandCoordinator:
 
     async def _render_result(self, result: CommandResult, sink: OutputSink) -> None:
         if result.response_text is not None:
-            sink.on_status(result.response_text, level=result.level)
+            self._safe_status(sink, result.response_text, level=result.level)
         elif result.error:
-            sink.on_error(result.error)
+            self._safe_error(sink, result.error)
         for attachment in result.attachments:
-            sink.queue_attachment(attachment)
+            self._safe_attachment(sink, attachment)
 
     def _command_context(
         self,
@@ -503,8 +613,9 @@ class CommandCoordinator:
         sink: OutputSink,
         *,
         urgency: str = "normal",
-    ) -> dict[str, Any]:
-        return {
+        ready: asyncio.Event | None = None,
+    ) -> _QueueEntry:
+        entry: _QueueEntry = {
             "text": turn_input.text,
             "from_user": str(
                 turn_input.metadata.get("user_id")
@@ -516,6 +627,9 @@ class CommandCoordinator:
             "turn_input": turn_input,
             "sink": sink,
         }
+        if ready is not None:
+            entry["ready"] = ready
+        return entry
 
     @classmethod
     def _queue_interjection(
@@ -525,9 +639,10 @@ class CommandCoordinator:
         state: RuntimeSessionState,
         *,
         urgency: str = "normal",
+        ready: asyncio.Event | None = None,
     ) -> None:
         state.pending_interjections.append(
-            cls._queue_entry(turn_input, sink, urgency=urgency)
+            cls._queue_entry(turn_input, sink, urgency=urgency, ready=ready)
         )
 
     @classmethod
@@ -538,8 +653,11 @@ class CommandCoordinator:
         state: RuntimeSessionState,
         *,
         urgency: str = "normal",
+        ready: asyncio.Event | None = None,
     ) -> None:
-        state.restart_queue.append(cls._queue_entry(turn_input, sink, urgency=urgency))
+        state.restart_queue.append(
+            cls._queue_entry(turn_input, sink, urgency=urgency, ready=ready)
+        )
 
     @staticmethod
     def _queued_turn_input(entry: Mapping[str, Any]) -> TurnInput:
@@ -554,6 +672,20 @@ class CommandCoordinator:
             sink.on_status(text, level=level)
         except Exception:
             logger.exception("command output sink status failed")
+
+    @staticmethod
+    def _safe_error(sink: Any, error: str) -> None:
+        try:
+            sink.on_error(error)
+        except Exception:
+            logger.exception("command output sink error reporting failed")
+
+    @staticmethod
+    def _safe_attachment(sink: Any, attachment: Any) -> None:
+        try:
+            sink.queue_attachment(attachment)
+        except Exception:
+            logger.exception("command output sink attachment failed")
 
     @staticmethod
     async def _drain_if_supported(sink: Any) -> None:

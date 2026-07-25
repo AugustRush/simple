@@ -193,6 +193,62 @@ def test_runtime_session_state_compatibility_alias_cannot_alias_restart_queue():
     assert state.pending_messages is not state.restart_queue
 
 
+def test_runtime_session_state_preserves_legacy_full_positional_constructor():
+    ctx = object()
+    tools_used = ["bash"]
+    context_manager = object()
+    memory_worker = object()
+    cancel_token = object()
+    pending_messages = [{"text": "follow up"}]
+
+    state = RuntimeSessionState(
+        ctx,
+        tools_used,
+        4,
+        "task",
+        context_manager,
+        memory_worker,
+        cancel_token,
+        pending_messages,
+        True,
+    )
+
+    assert state.ctx is ctx
+    assert state.tools_used is tools_used
+    assert state.turn_count == 4
+    assert state.task_context == "task"
+    assert state.context_manager is context_manager
+    assert state.memory_worker is memory_worker
+    assert state.cancel_token is cancel_token
+    assert state.pending_messages is pending_messages
+    assert state.pending_messages is state.pending_interjections
+    assert state.pending_messages is not state.restart_queue
+    assert state.operation_state == "active"
+    assert state.turn_in_progress is True
+
+
+@pytest.mark.parametrize(
+    ("turn_in_progress", "expected_state"),
+    [(False, "idle"), (True, "active")],
+)
+def test_runtime_session_state_accepts_legacy_keywords(
+    turn_in_progress: bool,
+    expected_state: str,
+) -> None:
+    pending_messages = [{"text": "follow up"}]
+
+    state = RuntimeSessionState(
+        ctx=object(),
+        pending_messages=pending_messages,
+        turn_in_progress=turn_in_progress,
+    )
+
+    assert state.pending_messages is pending_messages
+    assert state.pending_messages is state.pending_interjections
+    assert state.operation_state == expected_state
+    assert state.turn_in_progress is turn_in_progress
+
+
 def test_turn_runner_complete_turn_records_state_and_maintenance():
     class _PluginCatalog:
         def __init__(self):

@@ -114,7 +114,7 @@ class RuntimeComponents:
         return value
 
 
-@dataclass
+@dataclass(init=False)
 class RuntimeSessionState:
     """Mutable per-session state shared by turn-oriented runners."""
 
@@ -130,6 +130,61 @@ class RuntimeSessionState:
     pending_interjections: list[dict[str, Any]] = field(default_factory=list)
     restart_queue: list[dict[str, Any]] = field(default_factory=list)
     model_override: str | None = None
+
+    def __init__(
+        self,
+        ctx: Any,
+        tools_used: list[str] | None = None,
+        turn_count: int = 0,
+        task_context: str = "",
+        context_manager: Any = None,
+        memory_worker: Any = None,
+        cancel_token: Any = None,
+        pending_messages: list[dict[str, Any]] | None = None,
+        turn_in_progress: bool = False,
+        *,
+        operation_state: OperationState | None = None,
+        accepts_interjections: bool = False,
+        pending_interjections: list[dict[str, Any]] | None = None,
+        restart_queue: list[dict[str, Any]] | None = None,
+        model_override: str | None = None,
+    ) -> None:
+        if (
+            pending_messages is not None
+            and pending_interjections is not None
+            and pending_messages is not pending_interjections
+        ):
+            raise ValueError(
+                "pending_messages and pending_interjections must reference "
+                "the same mailbox"
+            )
+        mailbox = (
+            pending_interjections
+            if pending_interjections is not None
+            else pending_messages
+        )
+        if mailbox is None:
+            mailbox = []
+        restarts = restart_queue if restart_queue is not None else []
+        if restarts is mailbox:
+            restarts = list(restarts)
+
+        self.ctx = ctx
+        self.tools_used = tools_used if tools_used is not None else []
+        self.turn_count = turn_count
+        self.task_context = task_context
+        self.context_manager = context_manager
+        self.memory_worker = memory_worker
+        self.cancel_token = cancel_token
+        self.operation_state = (
+            operation_state
+            if operation_state is not None
+            else ("active" if turn_in_progress else "idle")
+        )
+        self.accepts_interjections = accepts_interjections
+        self.pending_interjections = mailbox
+        self.restart_queue = restarts
+        self.model_override = model_override
 
     @property
     def pending_messages(self) -> list[dict[str, Any]]:

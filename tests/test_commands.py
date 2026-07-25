@@ -915,6 +915,106 @@ def test_cancellation_report_failures_cannot_bypass_cleanup_or_restart() -> None
     asyncio.run(scenario())
 
 
+def test_replacement_waits_for_originating_sink_drain_before_dispatch() -> None:
+    async def scenario() -> None:
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        first_returning = asyncio.Event()
+        allow_replacement_return = asyncio.Event()
+
+        class SnapshotClearingSink(_CoordinatorSink):
+            def __init__(self) -> None:
+                super().__init__()
+                self._pending: list[asyncio.Task] = []
+                self.snapshot_drained = asyncio.Event()
+                self.allow_snapshot_clear = asyncio.Event()
+                self.output_scheduled = asyncio.Event()
+                self.finish_output = asyncio.Event()
+                self.output_finished = asyncio.Event()
+                self._paused_once = False
+
+            def on_status(self, text: str, *, level: str = "info") -> None:
+                super().on_status(text, level=level)
+
+                async def deliver() -> None:
+                    if text == "replacement output":
+                        self.output_scheduled.set()
+                        await self.finish_output.wait()
+                        self.output_finished.set()
+
+                self._pending.append(asyncio.create_task(deliver()))
+
+            async def drain(self) -> None:
+                self.drain_count += 1
+                while self._pending:
+                    snapshot = list(self._pending)
+                    await asyncio.gather(*snapshot)
+                    if not self._paused_once:
+                        self._paused_once = True
+                        self.snapshot_drained.set()
+                        await self.allow_snapshot_clear.wait()
+                    self._pending.clear()
+
+        async def core_behavior(turn_input, state, sink):
+            if turn_input.text == "first":
+                first_started.set()
+                await release_first.wait()
+                first_returning.set()
+            elif turn_input.text == "replacement":
+                sink.on_status("replacement output")
+                await allow_replacement_return.wait()
+
+        async def noop_interrupt(request, context):
+            return CommandResult()
+
+        router = CommandRouter(
+            core_commands=[
+                CommandDescriptor("cancel", noop_interrupt, concurrency="interrupt")
+            ]
+        )
+        core = _CoordinatorCore(core_behavior)
+        coordinator, _ = _coordinator(router, core=core)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+        original_handle = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await first_started.wait()
+
+        replacement_sink = SnapshotClearingSink()
+        replacement_handle = asyncio.create_task(
+            coordinator.handle(
+                _turn("/cancel replacement", message_id="m-2"),
+                state,
+                replacement_sink,  # type: ignore[arg-type]
+            )
+        )
+        await replacement_sink.snapshot_drained.wait()
+
+        release_first.set()
+        await first_returning.wait()
+        await asyncio.sleep(0)
+        scheduled_before_originating_drain = replacement_sink.output_scheduled.is_set()
+
+        replacement_sink.allow_snapshot_clear.set()
+        await replacement_sink.output_scheduled.wait()
+        allow_replacement_return.set()
+        done, _ = await asyncio.wait(
+            {original_handle, replacement_handle},
+            timeout=0.05,
+            return_when=asyncio.ALL_COMPLETED,
+        )
+        returned_before_output_finished = len(done) == 2
+
+        replacement_sink.finish_output.set()
+        await asyncio.gather(original_handle, replacement_handle)
+
+        assert scheduled_before_originating_drain is False
+        assert returned_before_output_finished is False
+        assert replacement_sink.output_finished.is_set()
+
+    asyncio.run(scenario())
+
+
 def test_idle_cancel_is_noop_but_cancel_payload_forwards_normally() -> None:
     async def noop_interrupt(request, context):
         return CommandResult()
@@ -1011,6 +1111,152 @@ def test_anytime_command_runs_while_busy_and_idle_only_command_is_rejected() -> 
     assert calls == ["status", "status"]
 
 
+def test_busy_anytime_forward_waits_for_unwind_and_its_own_sink_drain() -> None:
+    async def scenario() -> None:
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        handler_started = asyncio.Event()
+        release_handler = asyncio.Event()
+        handler_returning = asyncio.Event()
+        forwarded_started = asyncio.Event()
+
+        class BlockingDrainSink(_CoordinatorSink):
+            def __init__(self) -> None:
+                super().__init__()
+                self.drain_started = asyncio.Event()
+                self.release_drain = asyncio.Event()
+
+            async def drain(self) -> None:
+                self.drain_count += 1
+                self.drain_started.set()
+                await self.release_drain.wait()
+
+        async def core_behavior(turn_input, state, sink):
+            if turn_input.text == "first":
+                first_started.set()
+                await release_first.wait()
+            elif turn_input.text == "deferred prompt":
+                forwarded_started.set()
+
+        async def anytime_handler(request, context):
+            handler_started.set()
+            await release_handler.wait()
+            handler_returning.set()
+            return CommandResult(forward_text="deferred prompt")
+
+        router = CommandRouter(
+            core_commands=[
+                CommandDescriptor(
+                    "inspect",
+                    anytime_handler,
+                    concurrency="anytime",
+                )
+            ]
+        )
+        core = _CoordinatorCore(core_behavior)
+        coordinator, _ = _coordinator(router, core=core)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+        original = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await first_started.wait()
+
+        command_sink = BlockingDrainSink()
+        command = asyncio.create_task(
+            coordinator.handle(
+                _turn("/inspect", message_id="m-2"),
+                state,
+                command_sink,  # type: ignore[arg-type]
+            )
+        )
+        await handler_started.wait()
+        release_first.set()
+        await original
+        assert state.operation_state == "idle"
+
+        release_handler.set()
+        await handler_returning.wait()
+        await asyncio.sleep(0)
+        forwarded_before_sink_ready = forwarded_started.is_set()
+
+        await command_sink.drain_started.wait()
+        command_sink.release_drain.set()
+        await command
+
+        assert forwarded_before_sink_ready is False
+        assert [call.text for call in core.calls] == ["first", "deferred prompt"]
+        forwarded_state, accepts_interjections, forwarded_token = core.state_snapshots[1]
+        assert forwarded_state == "active"
+        assert accepts_interjections is True
+        assert forwarded_token is not None
+        assert state.operation_state == "idle"
+        assert state.cancel_token is None
+
+    asyncio.run(scenario())
+
+
+def test_busy_forward_survives_response_and_drain_sink_failures() -> None:
+    async def scenario() -> None:
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        class RaisingSink(_CoordinatorSink):
+            def on_status(self, text: str, *, level: str = "info") -> None:
+                raise RuntimeError("status failed")
+
+            def on_error(self, error: str) -> None:
+                raise RuntimeError("error output failed")
+
+            async def drain(self) -> None:
+                raise RuntimeError("drain failed")
+
+        async def core_behavior(turn_input, state, sink):
+            if turn_input.text == "first":
+                first_started.set()
+                await release_first.wait()
+
+        async def anytime_handler(request, context):
+            return CommandResult(
+                response_text="acknowledged",
+                forward_text="deferred prompt",
+            )
+
+        router = CommandRouter(
+            core_commands=[
+                CommandDescriptor(
+                    "inspect",
+                    anytime_handler,
+                    concurrency="anytime",
+                )
+            ]
+        )
+        core = _CoordinatorCore(core_behavior)
+        coordinator, _ = _coordinator(router, core=core)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+        original = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await first_started.wait()
+
+        await coordinator.handle(
+            _turn("/inspect", message_id="m-2"),
+            state,
+            RaisingSink(),  # type: ignore[arg-type]
+        )
+        assert [entry["text"] for entry in state.restart_queue] == [
+            "deferred prompt"
+        ]
+
+        release_first.set()
+        await original
+
+        assert [call.text for call in core.calls] == ["first", "deferred prompt"]
+        assert state.operation_state == "idle"
+        assert state.restart_queue == []
+
+    asyncio.run(scenario())
+
+
 def test_command_result_is_rendered_forwarded_and_returns_action() -> None:
     async def handler(request, context):
         return CommandResult(
@@ -1074,6 +1320,47 @@ def test_coordinator_emits_command_lifecycle_events() -> None:
     assert "command_rejected" in names
     assert all(event.session_id == "s-1" for event in events)
     assert all(event.channel_name == "feishu" for event in events)
+
+
+@pytest.mark.parametrize(
+    ("invocation", "payload", "command_name"),
+    [
+        ("/now redirected work", "redirected work", "now"),
+        ("/cancel replacement work", "replacement work", "cancel"),
+    ],
+)
+def test_idle_interrupt_forward_events_preserve_originating_command(
+    invocation: str,
+    payload: str,
+    command_name: str,
+) -> None:
+    async def noop_interrupt(request, context):
+        return CommandResult()
+
+    router = CommandRouter(
+        core_commands=[
+            CommandDescriptor("now", noop_interrupt, concurrency="interrupt"),
+            CommandDescriptor("cancel", noop_interrupt, concurrency="interrupt"),
+        ]
+    )
+    events: list = []
+    coordinator, core = _coordinator(router, events=events)
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+    asyncio.run(coordinator.handle(_turn(invocation), state, _CoordinatorSink()))  # type: ignore[arg-type]
+
+    assert [call.text for call in core.calls] == [payload]
+    assert [(event.name, dict(event.fields)) for event in events] == [
+        ("command_received", {"command": command_name}),
+        (
+            "command_forwarded",
+            {"command": command_name, "target": "model"},
+        ),
+        (
+            "command_handled",
+            {"command": command_name, "outcome": "forwarded"},
+        ),
+    ]
 
 
 def test_coordinator_exception_is_stable_and_always_cleans_state() -> None:
