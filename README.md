@@ -460,24 +460,68 @@ uv run simple memory tidy                # AI-assisted memory reorganization
 
 ## Interactive Commands
 
+Commands are handled by a shared runtime coordinator and work across all
+channels unless marked otherwise.
+
+### Shared (all channels)
+
 | Command | Description |
 |---|---|
-| `/help` | Show all commands |
+| `/help` | Show commands available in this channel |
 | `/memory` | Memory export summary |
-| `/context` | LTM context manager statistics |
+| `/context` | Long-term context statistics |
 | `/sessions` | List recent session history |
-| `/session <id>` | View session details |
-| `/tools` | List all available tools |
+| `/session <id>` | View session details by ID prefix |
+| `/tools` | List available tools |
 | `/skills` | List available skills |
 | `/plugins` | List loaded plugins |
-| `/model [name]` | Show or switch active model (session only) |
-| `/ralph <goal>` | Launch autonomous multi-iteration task loop |
-| `/ralph list` | List all Ralph autonomous tasks |
+| `/model [name]` | Show or switch the session model |
+| `/export` | Export the current session to Markdown |
+| `/ralph <goal> [--max N] [--verify "cmd"]` | Start a Ralph task |
+| `/ralph list` | List all Ralph tasks |
 | `/ralph resume <id>` | Resume a paused Ralph task |
-| `/export` | Export current session as markdown |
-| `/evolve` | Trigger system-prompt self-evolution |
-| `/generate-tool <desc>` | Generate a new user tool |
-| `/quit` | Exit the agent |
+| `/cancel [graceful]` | Cancel the current operation |
+| `/cancel <new task>` | Cancel and queue a new task |
+| `/now <message>` | Send an urgent interjection |
+
+### CLI only
+
+| Command | Description |
+|---|---|
+| `/quit` (`/exit`, `/q`) | Exit the CLI |
+| `Ctrl+C` | Interrupt a blocking operation (force cancel) |
+
+### Feishu only
+
+| Command | Description |
+|---|---|
+| `/send <path>` | Send a file from the output directory |
+
+### Plugin commands
+
+Plugins contribute additional slash commands at startup. Common ones include
+`/evolve` and `/generate-tool` from the built-in evolution plugin.
+
+`/help` is generated from the live descriptor set and automatically reflects
+which commands are available in each channel.
+
+### Cancellation behaviour
+
+- **CLI:** `Ctrl+C` force-cancels the current LLM request and terminates child
+  processes immediately. `/cancel` has the same effect.
+- **Feishu:** `/cancel` arrives as an asynchronous message. A same-chat `/cancel`
+  reaches the active turn at the next coordinator boundary even when another
+  operation is blocking that chat.
+- `/cancel graceful` requests cooperative cancellation at the next safe
+  tool-loop boundary. A subsequent force `/cancel` upgrades it.
+- `/cancel <new task>` force-cancels and starts the supplied task.
+
+### Plugin command return contract
+
+Plugin command handlers may return a `CommandResult`, a string (treated as
+forward text), or `None` (side-effect only). Portable plugins use
+`CommandResult` with explicit `response_text` to avoid coupling to a specific
+output sink.
 
 ## Built-in Tools
 
