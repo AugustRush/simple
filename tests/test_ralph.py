@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import pytest
+import signal
 import time
 
 
@@ -184,6 +185,56 @@ def test_verifier_rejects_unsafe_commands_without_spawning(monkeypatch, tmp_path
 
     assert result.status is VerificationStatus.REJECTED
     assert result.error
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3.11 -c 'print(1)'",
+        "/opt/tools/python3.11 -c 'print(1)'",
+        "pypy3.10 -c 'print(1)'",
+        "env python3.11 -c 'print(1)'",
+        "env -iv python3.11 -c 'print(1)'",
+        "env -uHOME pypy3.10 -c 'print(1)'",
+        "env -iuHOME python3.11 -c 'print(1)'",
+        "env -iu HOME pypy3.10 -c 'print(1)'",
+        "env CHECK=1 python3.12 -c 'print(1)'",
+        "env -S \"python3.11 -c 'print(1)'\"",
+        "/usr/bin/env -i pypy3.10 -c 'print(1)'",
+    ],
+)
+def test_verifier_rejects_versioned_inline_python_without_spawning(
+    monkeypatch, tmp_path, command
+):
+    from agent.ralph import RalphVerifier, VerificationStatus
+
+    async def forbidden_spawn(*args, **kwargs):
+        raise AssertionError("inline Python reached process creation")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", forbidden_spawn)
+    verifier = RalphVerifier(
+        workspace_root=tmp_path,
+        output_dir=tmp_path / "output",
+    )
+
+    result = asyncio.run(verifier.verify(command))
+
+    assert result.status is VerificationStatus.REJECTED
+    assert result.error and "inline interpreter" in result.error
+
+
+def test_verifier_does_not_scan_innocent_interpreter_arguments(tmp_path):
+    from agent.ralph import RalphVerifier, VerificationStatus
+
+    verifier = RalphVerifier(
+        workspace_root=tmp_path,
+        output_dir=tmp_path / "output",
+    )
+
+    result = asyncio.run(verifier.verify("echo python3.11 -c"))
+
+    assert result.status is VerificationStatus.PASSED
+    assert result.stdout_tail == "python3.11 -c\n"
 
 
 @pytest.mark.parametrize(
@@ -392,3 +443,171 @@ def test_verifier_caller_cancellation_propagates_after_cleanup(tmp_path):
 
     assert (workspace / "term-seen").read_text() == "yes"
     assert time.monotonic() - started < 2
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX process groups")
+@pytest.mark.parametrize("trigger", ["timeout", "token", "caller"])
+def test_verifier_escalates_for_live_process_group_after_leader_exits(
+    tmp_path, trigger
+):
+    from agent.ralph import RalphVerifier, VerificationStatus
+    from agent.shared import CancelToken
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    group_parent = workspace / "group-parent"
+    group_parent.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, signal, time\n"
+        "from pathlib import Path\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    os.close(1)\n"
+        "    os.close(2)\n"
+        "    Path('child-pid').write_text(str(os.getpid()))\n"
+        "    while True:\n"
+        "        time.sleep(1)\n"
+        "Path('ready').write_text('yes')\n"
+        "while True:\n"
+        "    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    group_parent.chmod(0o755)
+    verifier = RalphVerifier(
+        workspace_root=workspace,
+        output_dir=tmp_path / "output",
+        timeout_seconds=2 if trigger == "timeout" else 5,
+        termination_grace_seconds=0.15,
+    )
+    token = CancelToken()
+    child_pid: int | None = None
+    repeated_cancellations: list[bool] = []
+
+    async def wait_for_file(path):
+        for _ in range(200):
+            if path.exists():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"process did not create {path.name}")
+
+    async def scenario():
+        pending = asyncio.create_task(
+            verifier.verify(
+                "./group-parent",
+                cancel_token=token if trigger == "token" else None,
+            )
+        )
+        await wait_for_file(workspace / "ready")
+        await wait_for_file(workspace / "child-pid")
+        if trigger == "token":
+            token.cancel("graceful")
+        elif trigger == "caller":
+            pending.cancel()
+
+            def cancel_again():
+                repeated_cancellations.append(pending.cancel())
+
+            asyncio.get_running_loop().call_later(0.03, cancel_again)
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            return None
+        return await pending
+
+    try:
+        result = asyncio.run(scenario())
+        child_pid = int((workspace / "child-pid").read_text())
+        if trigger == "timeout":
+            assert result is not None and result.status is VerificationStatus.TIMEOUT
+        elif trigger == "token":
+            assert result is not None and result.status is VerificationStatus.CANCELLED
+        else:
+            assert repeated_cancellations == [True]
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if child_pid is None and (workspace / "child-pid").exists():
+            child_pid = int((workspace / "child-pid").read_text())
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX process groups")
+@pytest.mark.parametrize(
+    "cancellation_path",
+    ["force", "upgrade-from-graceful", "upgrade-and-caller-cancel"],
+)
+def test_verifier_force_cancellation_kills_process_group_without_grace(
+    tmp_path, cancellation_path
+):
+    from agent.ralph import RalphVerifier, VerificationStatus
+    from agent.shared import CancelToken
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    group_parent = workspace / "group-parent"
+    group_parent.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, signal, time\n"
+        "from pathlib import Path\n"
+        "child = os.fork()\n"
+        "if child == 0:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    os.close(1)\n"
+        "    os.close(2)\n"
+        "    Path('child-pid').write_text(str(os.getpid()))\n"
+        "    while True:\n"
+        "        time.sleep(1)\n"
+        "Path('ready').write_text('yes')\n"
+        "while True:\n"
+        "    time.sleep(1)\n",
+        encoding="utf-8",
+    )
+    group_parent.chmod(0o755)
+    verifier = RalphVerifier(
+        workspace_root=workspace,
+        output_dir=tmp_path / "output",
+        timeout_seconds=5,
+        termination_grace_seconds=2,
+    )
+    token = CancelToken()
+    child_pid: int | None = None
+
+    async def scenario():
+        pending = asyncio.create_task(verifier.verify("./group-parent", cancel_token=token))
+        for _ in range(200):
+            if (workspace / "ready").exists() and (workspace / "child-pid").exists():
+                break
+            await asyncio.sleep(0.01)
+        assert (workspace / "ready").exists()
+        started = time.monotonic()
+        if cancellation_path != "force":
+            token.cancel("graceful")
+            await asyncio.sleep(0.05)
+        token.cancel("force")
+        if cancellation_path == "upgrade-and-caller-cancel":
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            return None, time.monotonic() - started
+        return await pending, time.monotonic() - started
+
+    try:
+        result, elapsed = asyncio.run(scenario())
+        child_pid = int((workspace / "child-pid").read_text())
+        if result is not None:
+            assert result.status is VerificationStatus.CANCELLED
+        assert elapsed < 0.5
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        if child_pid is None and (workspace / "child-pid").exists():
+            child_pid = int((workspace / "child-pid").read_text())
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass

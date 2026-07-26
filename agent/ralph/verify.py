@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import signal
 import shlex
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from agent.security.shell import shell_command_check
 
@@ -114,6 +115,10 @@ class RalphVerifier:
                 status=VerificationStatus.SETUP_ERROR,
                 error=f"Unable to start verification command: {exc}",
             )
+        try:
+            process_group_id = os.getpgid(process.pid)
+        except (ProcessLookupError, PermissionError):
+            process_group_id = process.pid
 
         stdout_tail = _TailBuffer(RALPH_VERIFICATION_OUTPUT_LIMIT)
         stderr_tail = _TailBuffer(RALPH_VERIFICATION_OUTPUT_LIMIT)
@@ -150,7 +155,13 @@ class RalphVerifier:
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if cancel_wait is not None and cancel_wait in done:
-                await self._terminate_process(process, process_wait, force=cancel_level == "force")
+                await self._terminate_process(
+                    process,
+                    process_wait,
+                    process_group_id,
+                    force=cancel_level == "force",
+                    force_requested=lambda: cancel_level == "force",
+                )
                 status = VerificationStatus.CANCELLED
                 error = "Verification was cancelled"
             elif process_wait in done:
@@ -160,20 +171,31 @@ class RalphVerifier:
                     else VerificationStatus.FAILED
                 )
             else:
-                await self._terminate_process(process, process_wait)
+                await self._terminate_process(process, process_wait, process_group_id)
                 status = VerificationStatus.TIMEOUT
                 error = f"Verification timed out after {self.timeout_seconds:g} seconds"
             await self._finish_drains(stdout_task, stderr_task)
         except asyncio.CancelledError:
             try:
-                await asyncio.shield(self._terminate_process(process, process_wait))
-                await asyncio.shield(self._finish_drains(stdout_task, stderr_task))
+                await _await_cleanup_despite_cancellation(
+                    self._cleanup_process(
+                        process,
+                        process_wait,
+                        process_group_id,
+                        stdout_task,
+                        stderr_task,
+                        force=cancel_level == "force",
+                        force_requested=lambda: cancel_level == "force",
+                    )
+                )
             except Exception:
                 pass
             raise
         except Exception as exc:
             try:
-                await asyncio.shield(self._terminate_process(process, process_wait))
+                await asyncio.shield(
+                    self._terminate_process(process, process_wait, process_group_id)
+                )
                 await asyncio.shield(self._finish_drains(stdout_task, stderr_task))
             except Exception:
                 for task in (stdout_task, stderr_task):
@@ -205,24 +227,42 @@ class RalphVerifier:
         self,
         process: asyncio.subprocess.Process,
         process_wait: asyncio.Task[int],
+        process_group_id: int,
         *,
         force: bool = False,
+        force_requested: Callable[[], bool] | None = None,
     ) -> None:
-        if process.returncode is not None:
-            await _reap(process_wait)
-            return
-
         first_signal = signal.SIGKILL if force else signal.SIGTERM
-        _signal_process_group(process, first_signal)
+        _signal_process_group(process, process_group_id, first_signal)
         if not force:
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(process_wait),
-                    timeout=self.termination_grace_seconds,
-                )
-            except asyncio.TimeoutError:
-                _signal_process_group(process, signal.SIGKILL)
+            group_exited = await _wait_for_process_group_exit(
+                process_group_id,
+                self.termination_grace_seconds,
+                force_requested=force_requested,
+            )
+            if not group_exited:
+                _signal_process_group(process, process_group_id, signal.SIGKILL)
         await _reap(process_wait)
+
+    async def _cleanup_process(
+        self,
+        process: asyncio.subprocess.Process,
+        process_wait: asyncio.Task[int],
+        process_group_id: int,
+        stdout_task: asyncio.Task[None],
+        stderr_task: asyncio.Task[None],
+        *,
+        force: bool = False,
+        force_requested: Callable[[], bool] | None = None,
+    ) -> None:
+        await self._terminate_process(
+            process,
+            process_wait,
+            process_group_id,
+            force=force,
+            force_requested=force_requested,
+        )
+        await self._finish_drains(stdout_task, stderr_task)
 
     async def _finish_drains(self, *tasks: asyncio.Task[None]) -> None:
         try:
@@ -269,10 +309,11 @@ async def _drain_stream(
 
 def _signal_process_group(
     process: asyncio.subprocess.Process,
+    process_group_id: int,
     sig: signal.Signals,
 ) -> None:
     try:
-        os.killpg(process.pid, sig)
+        os.killpg(process_group_id, sig)
         return
     except ProcessLookupError:
         return
@@ -287,6 +328,34 @@ def _signal_process_group(
         pass
 
 
+def _process_group_is_alive(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+async def _wait_for_process_group_exit(
+    process_group_id: int,
+    timeout: float,
+    *,
+    force_requested: Callable[[], bool] | None = None,
+) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while _process_group_is_alive(process_group_id):
+        if force_requested is not None and force_requested():
+            return False
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(0.01, remaining))
+    return True
+
+
 async def _reap(process_wait: asyncio.Task[int]) -> None:
     try:
         await asyncio.shield(process_wait)
@@ -294,11 +363,22 @@ async def _reap(process_wait: asyncio.Task[int]) -> None:
         pass
 
 
+async def _await_cleanup_despite_cancellation(cleanup: Any) -> None:
+    cleanup_task = asyncio.create_task(cleanup)
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+    await cleanup_task
+
+
 def _inline_interpreter_reason(argv: list[str]) -> str | None:
+    effective_argv = _effective_command_argv(argv)
+    if not effective_argv:
+        return None
+    executable = Path(effective_argv[0]).name
     inline_flags = {
-        "python": ("-c",),
-        "python2": ("-c",),
-        "python3": ("-c",),
         "perl": ("-e",),
         "ruby": ("-e",),
         "node": ("-e", "--eval"),
@@ -307,15 +387,106 @@ def _inline_interpreter_reason(argv: list[str]) -> str | None:
         "sh": ("-c",),
         "zsh": ("-c",),
     }
-    for index, token in enumerate(argv):
-        executable = Path(token).name
-        flags = inline_flags.get(executable)
-        if flags is None:
-            continue
-        for argument in argv[index + 1 :]:
-            if any(argument == flag or argument.startswith(flag) for flag in flags):
-                return f"inline interpreter execution via '{executable}' is not allowed"
+    flags = (
+        ("-c",)
+        if re.fullmatch(r"(?:python|pypy)(?:\d+(?:\.\d+)*)?", executable)
+        else inline_flags.get(executable)
+    )
+    if flags is None:
+        return None
+    for argument in effective_argv[1:]:
+        if any(argument == flag or argument.startswith(flag) for flag in flags):
+            return f"inline interpreter execution via '{executable}' is not allowed"
     return None
+
+
+def _effective_command_argv(argv: list[str]) -> list[str]:
+    effective = argv
+    while effective and Path(effective[0]).name == "env":
+        index = 1
+        split_command: list[str] | None = None
+        while index < len(effective):
+            token = effective[index]
+            if token == "--":
+                index += 1
+                break
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+                index += 1
+                continue
+            if token in (
+                "--ignore-environment",
+                "--null",
+                "--debug",
+                "--list-signal-handling",
+            ):
+                index += 1
+                continue
+            if token in (
+                "--unset",
+                "--chdir",
+                "--argv0",
+                "--block-signal",
+                "--default-signal",
+                "--ignore-signal",
+            ):
+                index += 2
+                continue
+            if token == "--split-string":
+                if index + 1 >= len(effective):
+                    return []
+                try:
+                    split_command = shlex.split(effective[index + 1], posix=True)
+                except ValueError:
+                    return []
+                index += 2
+                break
+            short_options = _parse_env_short_options(effective, index)
+            if short_options is not None:
+                index, split_source = short_options
+                if split_source is None:
+                    continue
+                try:
+                    split_command = shlex.split(split_source, posix=True)
+                except ValueError:
+                    return []
+                break
+            if token.startswith("-") and "=" in token:
+                index += 1
+                continue
+            break
+        suffix = effective[index:]
+        effective = (split_command + suffix) if split_command is not None else suffix
+    return effective
+
+
+def _parse_env_short_options(
+    argv: list[str],
+    index: int,
+) -> tuple[int, str | None] | None:
+    token = argv[index]
+    if token == "-":
+        return index + 1, None
+    if not token.startswith("-") or token.startswith("--"):
+        return None
+    cluster = token[1:]
+    position = 0
+    while position < len(cluster):
+        option = cluster[position]
+        if option in "i0v":
+            position += 1
+            continue
+        if option in "uPCa":
+            if position + 1 < len(cluster):
+                return index + 1, None
+            return min(index + 2, len(argv)), None
+        if option == "S":
+            if position + 1 < len(cluster):
+                return index + 1, cluster[position + 1 :]
+            if index + 1 < len(argv):
+                return index + 2, argv[index + 1]
+            return len(argv), None
+        return None
+    return index + 1, None
 
 
 __all__ = [
