@@ -32,6 +32,8 @@ from agent import (
     _active_sink,
     _build_gateway_channels,
 )
+from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
+from agent.runtime import RuntimeSessionState, TurnInput
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -529,6 +531,179 @@ def test_feishu_sink_on_turn_complete_empty_text_no_send():
         loop.run_until_complete(_run())
     finally:
         loop.close()
+
+
+def test_feishu_sink_flush_attachments_consumes_queue_once(tmp_path):
+    sink = _make_feishu_sink()
+    target = tmp_path / "report.txt"
+    target.write_text("report", encoding="utf-8")
+    sink.queue_attachment(target)
+
+    async def _run():
+        with patch.object(
+            sink,
+            "_send_file_async",
+            new=AsyncMock(),
+        ) as mock_send:
+            await sink.flush_attachments()
+            assert sink._attachments == []
+            assert sink._attachment_keys == set()
+            sink.on_turn_complete("done", [])
+            await sink.drain()
+            mock_send.assert_awaited_once_with(target.resolve())
+
+    asyncio.run(_run())
+
+
+def test_feishu_coordinator_flushes_temp_before_cleanup(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = output_dir / "report.txt"
+    source.write_text("report", encoding="utf-8")
+    sink = _make_feishu_sink()
+    uploaded: list[tuple[Path, bool, str]] = []
+
+    def upload(path: Path):
+        uploaded.append((path, path.exists(), path.read_text(encoding="utf-8")))
+        return "file-key"
+
+    sink._upload_file_sync = MagicMock(side_effect=upload)
+    sink._do_send = MagicMock()
+    router = CommandRouter()
+    register_builtin_commands(router)
+
+    class UnusedCore:
+        async def handle_turn(self, *args, **kwargs):
+            raise AssertionError("command must not forward to the model")
+
+    coordinator = CommandCoordinator(
+        UnusedCore(),  # type: ignore[arg-type]
+        router,
+        components={"output_dir": output_dir},
+    )
+    state = RuntimeSessionState(ctx=MagicMock(messages=[]))
+
+    asyncio.run(
+        coordinator.handle(
+            TurnInput.from_text(
+                "/send report.txt",
+                session_id="s-1",
+                channel_name="feishu",
+            ),
+            state,
+            sink,
+        )
+    )
+
+    assert len(uploaded) == 1
+    attachment, existed_during_upload, content = uploaded[0]
+    assert existed_during_upload is True
+    assert content == "report"
+    assert not attachment.exists()
+    assert not attachment.parent.exists()
+    assert sink._attachments == []
+    assert sink._attachment_keys == set()
+    sink._do_send.assert_called_once()
+
+
+def test_feishu_flush_error_clears_queue_and_coordinator_cleans_temp(tmp_path):
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "report.txt").write_text("report", encoding="utf-8")
+    sink = _make_feishu_sink()
+    attempted: list[Path] = []
+
+    async def fail_send(path: Path) -> None:
+        attempted.append(path)
+        assert path.is_file()
+        raise RuntimeError("upload failed")
+
+    sink._send_file_async = fail_send  # type: ignore[method-assign]
+    router = CommandRouter()
+    register_builtin_commands(router)
+
+    class UnusedCore:
+        async def handle_turn(self, *args, **kwargs):
+            raise AssertionError("command must not forward to the model")
+
+    coordinator = CommandCoordinator(
+        UnusedCore(),  # type: ignore[arg-type]
+        router,
+        components={"output_dir": output_dir},
+    )
+    state = RuntimeSessionState(ctx=MagicMock(messages=[]))
+
+    asyncio.run(
+        coordinator.handle(
+            TurnInput.from_text(
+                "/send report.txt",
+                session_id="s-1",
+                channel_name="feishu",
+            ),
+            state,
+            sink,
+        )
+    )
+
+    assert len(attempted) == 1
+    assert not attempted[0].exists()
+    assert not attempted[0].parent.exists()
+    assert sink._attachments == []
+    assert sink._attachment_keys == set()
+
+
+def test_feishu_flush_cancellation_clears_queue_and_temp(tmp_path):
+    async def scenario() -> None:
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "report.txt").write_text("report", encoding="utf-8")
+        sink = _make_feishu_sink()
+        started = asyncio.Event()
+        attempted: list[Path] = []
+
+        async def block_send(path: Path) -> None:
+            attempted.append(path)
+            started.set()
+            await asyncio.Event().wait()
+
+        sink._send_file_async = block_send  # type: ignore[method-assign]
+        router = CommandRouter()
+        register_builtin_commands(router)
+
+        class UnusedCore:
+            async def handle_turn(self, *args, **kwargs):
+                raise AssertionError("command must not forward to the model")
+
+        coordinator = CommandCoordinator(
+            UnusedCore(),  # type: ignore[arg-type]
+            router,
+            components={"output_dir": output_dir},
+        )
+        state = RuntimeSessionState(ctx=MagicMock(messages=[]))
+        running = asyncio.create_task(
+            coordinator.handle(
+                TurnInput.from_text(
+                    "/send report.txt",
+                    session_id="s-1",
+                    channel_name="feishu",
+                ),
+                state,
+                sink,
+            )
+        )
+
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+        assert attempted[0].is_file()
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+        assert not attempted[0].exists()
+        assert not attempted[0].parent.exists()
+        assert sink._attachments == []
+        assert sink._attachment_keys == set()
+
+    asyncio.run(scenario())
 
 
 def test_feishu_sink_on_tool_start_schedules_hint():

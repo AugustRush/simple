@@ -1455,6 +1455,84 @@ def test_coordinator_keeps_normal_export_attachment_after_drain(tmp_path) -> Non
     assert Path(sink.attachments[0]).is_file()
 
 
+def test_coordinator_flushes_all_attachments_before_drain() -> None:
+    async def handler(request, context):
+        return CommandResult(attachments=("report.md",))
+
+    class LifecycleSink(_CoordinatorSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lifecycle: list[str] = []
+
+        async def flush_attachments(self) -> None:
+            assert self.attachments == ["report.md"]
+            self.lifecycle.append("flush")
+
+        async def drain(self) -> None:
+            self.drain_count += 1
+            self.lifecycle.append("drain")
+
+    coordinator, _ = _coordinator(
+        CommandRouter(core_commands=[CommandDescriptor("report", handler)])
+    )
+    sink = LifecycleSink()
+    state = RuntimeSessionState(ctx=SimpleNamespace(messages=[]))
+
+    asyncio.run(
+        coordinator.handle(
+            _turn("/report"),
+            state,
+            sink,  # type: ignore[arg-type]
+        )
+    )
+
+    assert sink.lifecycle[:2] == ["flush", "drain"]
+
+
+def test_coordinator_drains_before_temp_cleanup_when_flush_raises(tmp_path) -> None:
+    private_dir = tmp_path / ".send-test"
+    private_dir.mkdir()
+    attachment = private_dir / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+
+    async def handler(request, context):
+        return CommandResult(
+            attachments=(attachment,),
+            temporary_attachments=(attachment,),
+        )
+
+    class FailingFlushSink(_CoordinatorSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.exists_during_drain: list[bool] = []
+
+        async def flush_attachments(self) -> None:
+            assert attachment.is_file()
+            raise RuntimeError("flush failed after scheduling")
+
+        async def drain(self) -> None:
+            self.drain_count += 1
+            self.exists_during_drain.append(attachment.exists())
+
+    coordinator, _ = _coordinator(
+        CommandRouter(core_commands=[CommandDescriptor("report", handler)])
+    )
+    sink = FailingFlushSink()
+    state = RuntimeSessionState(ctx=SimpleNamespace(messages=[]))
+
+    asyncio.run(
+        coordinator.handle(
+            _turn("/report"),
+            state,
+            sink,  # type: ignore[arg-type]
+        )
+    )
+
+    assert sink.exists_during_drain[0] is True
+    assert not attachment.exists()
+    assert not private_dir.exists()
+
+
 def test_coordinator_cleans_temporary_attachment_when_drain_raises(tmp_path) -> None:
     class RaisingDrainSink(_CoordinatorSink):
         async def drain(self) -> None:

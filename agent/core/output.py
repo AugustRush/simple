@@ -127,6 +127,9 @@ class OutputSink(ABC):
     def queue_attachment(self, path: Path) -> None:
         """Queue a file attachment for delivery with the current turn."""
 
+    async def flush_attachments(self) -> None:
+        """Consume attachments queued so far before returning."""
+
     def sync_stream_cb(self, chunk: str) -> None:
         """Synchronous callback adapter for BaseAgent.send_message."""
 

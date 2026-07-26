@@ -495,6 +495,18 @@ class FeishuOutputSink(OutputSink):
     def queue_attachment(self, path: Path) -> None:
         self._queue_attachment(path)
 
+    async def flush_attachments(self) -> None:
+        """Send and consume the attachment batch currently queued."""
+
+        await self.drain()
+        if not self._attachments:
+            return
+        try:
+            await self._send_attachments_async()
+        finally:
+            self._attachments = []
+            self._attachment_keys = set()
+
     async def drain(self) -> None:
         """Await all pending send tasks before the handler returns."""
         while self._pending:

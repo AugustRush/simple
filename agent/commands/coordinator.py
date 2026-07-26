@@ -545,8 +545,11 @@ class CommandCoordinator:
                 self._safe_error(sink, result.error)
             for attachment in result.attachments:
                 self._safe_attachment(sink, attachment)
-            if result.temporary_attachments:
-                await self._drain_if_supported(sink)
+            if result.attachments:
+                try:
+                    await self._flush_attachments_if_supported(sink)
+                finally:
+                    await self._drain_if_supported(sink)
         finally:
             self._cleanup_temporary_attachments(result.temporary_attachments)
 
@@ -713,3 +716,12 @@ class CommandCoordinator:
                 await result
         except Exception:
             logger.exception("command output sink drain failed")
+
+    @staticmethod
+    async def _flush_attachments_if_supported(sink: Any) -> None:
+        flush = getattr(sink, "flush_attachments", None)
+        if not callable(flush):
+            return
+        result = flush()
+        if hasattr(result, "__await__"):
+            await result
