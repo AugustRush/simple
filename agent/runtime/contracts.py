@@ -292,7 +292,10 @@ class TurnRunner:
                 "metadata": dict(turn_input.metadata),
             },
             memory_worker=state.memory_worker,
-            system_prompt=self._components.require("system_prompt"),
+            system_prompt=(
+                state.system_prompt_override
+                or self._components.require("system_prompt")
+            ),
             task_context=state.task_context,
             error=result.error or "",
         )

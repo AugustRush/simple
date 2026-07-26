@@ -272,12 +272,17 @@ class ChannelRunner:
                 current.append(event)
             self._log_runtime_event(event)
 
-        coordinator = CommandCoordinator(
-            agent_core,
-            router,
-            components=components,
-            config=self._cfg,
-            event_hook=_record_runtime_event,
+        coordinator_factory = components.get("command_coordinator_factory")
+        coordinator = (
+            coordinator_factory(event_hook=_record_runtime_event)
+            if callable(coordinator_factory)
+            else CommandCoordinator(
+                agent_core,
+                router,
+                components=components,
+                config=self._cfg,
+                event_hook=_record_runtime_event,
+            )
         )
 
         async def _handle(msg: IncomingMessage, sink: OutputSink) -> bool:

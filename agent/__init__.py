@@ -369,7 +369,6 @@ def __getattr__(name: str):
         "app",
         "memory_app",
         "_interactive_loop",
-        "_ralph_task_loop",
         "main_callback",
         "_missing_feishu_dependency_hint",
         "memory_tidy",

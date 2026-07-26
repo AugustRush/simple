@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -244,6 +245,10 @@ user-invocable: true
     prompt = components["system_prompt"]
 
     assert components["turn_runner"].__class__.__name__ == "TurnRunner"
+    assert components["command_router"].classify(
+        "/help", channel_name="cli"
+    ).kind == "command"
+    assert callable(components["command_coordinator_factory"])
     assert "activate_skill" in registry.list_tools()
     assert "list_skill_files" in registry.list_tools()
     assert "read_skill_file" in registry.list_tools()
@@ -6788,7 +6793,119 @@ def test_interactive_loop_delegates_turn_to_agent_core(monkeypatch, tmp_path):
     assert kwargs == {}
 
 
-def test_interactive_loop_passes_unknown_slash_input_to_agent_core(monkeypatch, tmp_path):
+def test_interactive_loop_delegates_every_input_to_command_coordinator(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    class Agent:
+        api_format = "openai"
+        model = "fake-model"
+
+    class PluginCatalog:
+        def fire_session_start(self, components):
+            return None
+
+        async def fire_session_end(self, event):
+            return None
+
+    class Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        async def handle(self, turn_input, state, sink):
+            self.calls.append((turn_input, state, sink))
+            return "exit_cli" if turn_input.text == "/quit" else None
+
+    answers = iter(["hello", "/help", "/unknown", "/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+    coordinator = Coordinator()
+    components = {
+        "agent": Agent(),
+        "memory": SimpleNamespace(read_index=lambda: ""),
+        "system_prompt": "system",
+        "skill_catalog": object(),
+        "user_tool_catalog": object(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path,
+        "plugin_catalog": PluginCatalog(),
+        "command_coordinator_factory": lambda **kwargs: coordinator,
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    assert [call[0].text for call in coordinator.calls] == [
+        "hello",
+        "/help",
+        "/unknown",
+        "/quit",
+    ]
+    assert all(call[0].channel_name == "cli" for call in coordinator.calls)
+
+
+def test_interactive_loop_wires_coordinator_cancel_token_to_sigint(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+    import agent.cli as cli_module
+
+    class Agent:
+        api_format = "openai"
+        model = "fake-model"
+
+    class PluginCatalog:
+        def fire_session_start(self, components):
+            return None
+
+        async def fire_session_end(self, event):
+            return None
+
+    observed = []
+
+    class Coordinator:
+        def __init__(self, token_factory):
+            self.token_factory = token_factory
+
+        async def handle(self, turn_input, state, sink):
+            if turn_input.text == "/quit":
+                return "exit_cli"
+            token = self.token_factory()
+            observed.append((token, cli_module._current_cancel_token))
+            return None
+
+    def factory(**kwargs):
+        return Coordinator(kwargs["cancel_token_factory"])
+
+    answers = iter(["hello", "/quit"])
+    monkeypatch.setattr(
+        agent_module.Prompt,
+        "ask",
+        lambda *_args, **_kwargs: next(answers),
+    )
+    components = {
+        "agent": Agent(),
+        "memory": SimpleNamespace(read_index=lambda: ""),
+        "system_prompt": "system",
+        "skill_catalog": object(),
+        "user_tool_catalog": object(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path,
+        "plugin_catalog": PluginCatalog(),
+        "command_coordinator_factory": factory,
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    assert len(observed) == 1
+    assert observed[0][0] is observed[0][1]
+    assert cli_module._current_cancel_token is None
+
+
+def test_interactive_loop_rejects_unknown_slash_before_agent_core(monkeypatch, tmp_path):
     import agent as agent_module
     from agent.runtime import TurnExecution, TurnResult
 
@@ -6804,6 +6921,9 @@ def test_interactive_loop_passes_unknown_slash_input_to_agent_core(monkeypatch, 
     class _FakeSkillCatalog:
         def list_skills(self):
             return []
+
+        def get(self, skill_id):
+            return None
 
     class _FakePluginCatalog:
         def fire_session_start(self, components):
@@ -6847,8 +6967,7 @@ def test_interactive_loop_passes_unknown_slash_input_to_agent_core(monkeypatch, 
 
     asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
 
-    assert len(agent_core.calls) == 1
-    assert agent_core.calls[0][0].text == "/skill quality/review tighten"
+    assert agent_core.calls == []
 
 
 def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):

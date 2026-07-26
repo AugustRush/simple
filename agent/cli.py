@@ -6,7 +6,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import re
 import signal
 import sys
 from typing import Any, Optional
@@ -19,7 +18,8 @@ from rich.table import Table
 
 import agent as agent_module
 from agent import shared
-from agent.core.output import CliOutputSink, _active_sink
+from agent.core.output import CliOutputSink
+from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.shared import CancelToken
 
@@ -35,20 +35,13 @@ DeliveryTarget = agent_module.DeliveryTarget
 MemoryPalace = agent_module.MemoryPalace
 NewScheduledTask = agent_module.NewScheduledTask
 PluginCatalog = agent_module.PluginCatalog
-RalphTask = agent_module.RalphTask
-RALPH_COMPLETION_PROMISE = agent_module.RALPH_COMPLETION_PROMISE
-RALPH_DEFAULT_MAX_ITERATIONS = agent_module.RALPH_DEFAULT_MAX_ITERATIONS
 SchedulerDelivery = agent_module.SchedulerDelivery
 SchedulerService = agent_module.SchedulerService
 SchedulerStore = agent_module.SchedulerStore
 SkillCatalog = agent_module.SkillCatalog
 StagingBuffer = agent_module.StagingBuffer
-TurnEvent = agent_module.TurnEvent
 TriggerSpec = agent_module.TriggerSpec
 _build_gateway_channels = agent_module._build_gateway_channels
-_new_id = agent_module._new_id
-_load_ralph_task = agent_module._load_ralph_task
-_save_ralph_task = agent_module._save_ralph_task
 
 app = typer.Typer(
     name="agent",
@@ -83,188 +76,6 @@ def _configure_runtime_logging() -> None:
         )
     for logger_name in _INTERACTION_LOGGER_NAMES:
         logging.getLogger(logger_name).setLevel(logging.INFO)
-
-async def _ralph_task_loop(
-    agent: "BaseAgent",
-    task: RalphTask,
-    system_prompt: str,
-    skill_catalog: "SkillCatalog",
-    ctx_mgr: Optional["ContextManager"],
-) -> RalphTask:
-    """Ralph-mode autonomous task loop.
-
-    Runs up to task.max_iterations iterations. Each iteration gets a fresh
-    AgentContext (preventing context rot) but receives the full task state and
-    recent progress summary. Completion is determined externally — either by a
-    promise token in the output or by a verify_command exit code — not by LLM
-    self-assessment.
-
-    Context handling contract:
-    - No mark_activity() / staging during iterations → background consolidation
-      does not fire mid-task, keeping iterations uninterrupted.
-    - After the task ends (any status), all iterations are staged as a single
-      summary entry and consolidation is enqueued once. This ensures LTM learns
-      from the Ralph session without fragmenting it into mid-task chunks.
-    """
-    all_summaries: list[str] = []
-
-    def _build_iter_prompt(t: RalphTask) -> str:
-        criteria_text = "\n".join(f"- {c}" for c in t.completion_criteria)
-        progress_text = ""
-        if t.progress:
-            recent = t.progress[-3:]  # only last 3 to keep token cost bounded
-            progress_text = "\n\n## Recent Progress\n" + "\n".join(
-                f"- Iteration {p['iteration']}: {p['summary']}" for p in recent
-            )
-        return (
-            f"## Current Task\n{t.goal}\n\n"
-            f"## Acceptance Criteria\n{criteria_text}\n\n"
-            f"Once all criteria are satisfied, output at the end of your reply: `{t.completion_promise}`\n"
-            f"{progress_text}\n\n"
-            f"This is iteration {t.current_iteration} of {t.max_iterations}."
-        )
-
-    for i in range(task.max_iterations):
-        task.current_iteration = i + 1
-        shared.CONSOLE.print(
-            f"\n[dim]── Ralph iteration {task.current_iteration}/{task.max_iterations} ──[/dim]"
-        )
-
-        # Fresh AgentContext per iteration — prevents context rot across iterations.
-        iter_ctx = AgentContext(system_prompt=system_prompt)
-        iter_ctx.metadata["skill_catalog"] = skill_catalog
-
-        collected: list[str] = []
-
-        def _stream_cb(chunk: str, _col: list = collected) -> None:
-            shared.CONSOLE.print(chunk, end="", markup=False)
-            _col.append(chunk)
-
-        shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
-        result = await agent.send_message(
-            iter_ctx, _build_iter_prompt(task), _stream_cb
-        )
-        shared.CONSOLE.print()
-
-        if result.error:
-            shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
-
-        iter_summary = result.content[:300] if result.content else "(no output)"
-        all_summaries.append(f"Iter {task.current_iteration}: {iter_summary}")
-
-        # ── Notify plugins so evolution / correction detection works in Ralph ─
-        if agent.plugin_catalog:
-            try:
-                await agent.plugin_catalog.fire_turn_end(
-                    TurnEvent(
-                        user_input=_build_iter_prompt(task),
-                        agent_response=result.content or "",
-                        tool_calls=result.tool_calls_made,
-                        timestamp=datetime.now(timezone.utc).isoformat(),
-                        turn_index=task.current_iteration,
-                    )
-                )
-            except Exception:
-                pass  # plugin errors must not abort the task loop
-
-        # ── External completion check 1: promise token ────────────────────────
-        if task.completion_promise in result.content:
-            task.status = "complete"
-            task.progress.append(
-                {
-                    "iteration": task.current_iteration,
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "tool_calls": result.tool_calls_made,
-                    "summary": iter_summary,
-                    "completed_by": "promise",
-                }
-            )
-            _save_ralph_task(task)
-            break
-
-        # ── External completion check 2: verify command ───────────────────────
-        if task.verify_command:
-            v_out: bytes = b""
-            v_err: bytes = b""
-            try:
-                verify_proc = await asyncio.create_subprocess_shell(
-                    task.verify_command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                v_out, v_err = await asyncio.wait_for(
-                    verify_proc.communicate(), timeout=60
-                )
-                v_exit = verify_proc.returncode
-            except asyncio.TimeoutError:
-                v_exit = -1
-                shared.CONSOLE.print("[yellow]Verify command timed out (60s)[/yellow]")
-            except Exception as ve:
-                v_exit = -1
-                shared.CONSOLE.print(f"[yellow]Verify command error: {ve}[/yellow]")
-
-            if v_exit == 0:
-                shared.CONSOLE.print("[green]Verify passed (exit 0)[/green]")
-                task.status = "complete"
-                task.progress.append(
-                    {
-                        "iteration": task.current_iteration,
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "tool_calls": result.tool_calls_made,
-                        "summary": iter_summary,
-                        "completed_by": "verify_command",
-                    }
-                )
-                _save_ralph_task(task)
-                break
-            else:
-                # Capture verification output and append to iter_summary so it
-                # flows into task.progress and becomes visible in the next
-                # iteration's prompt via _build_iter_prompt(recent[-3:]).
-                # Without this, the agent knows verification failed but not why,
-                # making subsequent iterations effectively blind retries.
-                verify_output = (v_err or v_out).decode("utf-8", errors="replace")
-                verify_snippet = verify_output[-600:].strip()
-                if verify_snippet:
-                    iter_summary += (
-                        f"\n\nverify_failed (exit {v_exit}):\n{verify_snippet}"
-                    )
-                    shared.CONSOLE.print(
-                        f"[yellow]Verify failed (exit {v_exit}), continuing[/yellow]\n"
-                        f"[dim]{verify_snippet[:200]}[/dim]"
-                    )
-                else:
-                    shared.CONSOLE.print(
-                        f"[yellow]Verify failed (exit {v_exit}), continuing[/yellow]"
-                    )
-
-        task.progress.append(
-            {
-                "iteration": task.current_iteration,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "tool_calls": result.tool_calls_made,
-                "summary": iter_summary,
-            }
-        )
-        _save_ralph_task(task)
-
-    if task.status == "running":
-        task.status = "max_iterations_reached"
-        _save_ralph_task(task)
-
-    # ── Post-task: stage the full run and enqueue one consolidation job ───────
-    # Done once after the loop ends (not per-iteration) to avoid fragmenting the
-    # task narrative in LTM and to prevent background consolidation from firing
-    # mid-task (which would use a separate API call on incomplete context).
-    if ctx_mgr and all_summaries:
-        goal_line = f"[Ralph/{task.id}] goal: {task.goal} | status: {task.status} | iters: {task.current_iteration}/{task.max_iterations}"
-        ctx_mgr.staging.append("user", goal_line)
-        ctx_mgr.staging.append("assistant", "\n".join(all_summaries[-5:]))
-        ctx_mgr.mark_activity()
-        if ctx_mgr.should_enqueue_consolidation():
-            ctx_mgr.enqueue_consolidation("ralph_task_end")
-
-    return task
 
 def _missing_feishu_dependency_hint() -> str:
     exe = Path(sys.executable).as_posix()
@@ -428,9 +239,8 @@ def _cli_sigint_handler(signum: int, frame: Any) -> None:
 
 async def _interactive_loop(components: dict, cfg: dict):
     """Main interactive chat loop."""
+    global _current_cancel_token
     agent: BaseAgent = components["agent"]
-    memory: MemoryPalace = components["memory"]
-    evolution: Optional[EvolutionEngine] = components.get("evolution")
     plugin_catalog: PluginCatalog = components.get("plugin_catalog")  # type: ignore[assignment]
     if plugin_catalog is None:
         plugin_catalog = PluginCatalog(
@@ -447,11 +257,8 @@ async def _interactive_loop(components: dict, cfg: dict):
     system_prompt = components["system_prompt"]
     ctx_mgr: Optional[ContextManager] = components.get("context_manager")
     skill_catalog: SkillCatalog = components["skill_catalog"]
-    user_tool_catalog: UserToolCatalog = components["user_tool_catalog"]
 
     ctx = AgentContext(system_prompt=system_prompt)
-    # Expose ctx in components so plugin slash-command handlers can update it.
-    components["ctx"] = ctx
     # Track the user's first non-command message so it can be re-injected into
     # the system prompt after compaction (compact_messages drops early messages
     # to keep working memory bounded; this preserves the original task intent
@@ -477,6 +284,35 @@ async def _interactive_loop(components: dict, cfg: dict):
         memory_worker=memory_worker,
         cancel_token=CancelToken(),
     )
+
+    def _new_cli_cancel_token() -> CancelToken:
+        global _current_cancel_token, _sigint_count
+        token = CancelToken()
+        _current_cancel_token = token
+        _sigint_count = 0
+        return token
+
+    coordinator_factory = components.get("command_coordinator_factory")
+    if callable(coordinator_factory):
+        coordinator = coordinator_factory(
+            cancel_token_factory=_new_cli_cancel_token,
+        )
+    else:
+        router = components.get("command_router")
+        if router is None:
+            router = CommandRouter(skill_catalog=components.get("skill_catalog"))
+            register_builtin_commands(router)
+            get_commands = getattr(plugin_catalog, "get_slash_commands", None)
+            if callable(get_commands):
+                router.register_plugin_catalog(plugin_catalog)
+            components["command_router"] = router
+        coordinator = CommandCoordinator(
+            _agent_core_for_components(components),
+            router,
+            components=components,
+            config=cfg,
+            cancel_token_factory=_new_cli_cancel_token,
+        )
 
     # Queue orphaned staging files from previous sessions for background
     # recovery. Doing this synchronously would block startup on a network model
@@ -527,460 +363,22 @@ async def _interactive_loop(components: dict, cfg: dict):
             if not user_input.strip():
                 continue
 
-            # Handle slash commands
-            if user_input.startswith("/"):
-                raw_cmd = user_input[1:].strip()
-                cmd = raw_cmd.lower()
-                if cmd in ("quit", "exit", "q"):
-                    break
-                elif cmd in ("help", "?"):
-                    _help_table = Table(title="Commands", show_header=False, box=None)
-                    _help_table.add_column("Command", style="cyan", no_wrap=True)
-                    _help_table.add_column("Description")
-                    for _hcmd, _hdesc in [
-                        ("/help", "Show this help"),
-                        ("/cancel", "Cancel the currently running task (Ctrl+C also works)"),
-                        ("/memory", "Show memory export summary"),
-                        ("/context", "Show LTM context manager stats"),
-                        ("/sessions", "List recent session history"),
-                        ("/session <id>", "View session details"),
-                        ("/export", "Export current session to markdown file"),
-                        ("/tools", "List all available tools"),
-                        ("/skills", "List available skills"),
-                        ("/plugins", "List loaded plugins"),
-                        ("/model [name]", "Show or switch active model (session only)"),
-                        ("/ralph <goal>", "Run Ralph autonomous task loop"),
-                        ("  --max N", "  Max iterations (default 10)"),
-                        ("  --verify <cmd>", "  Shell command to verify completion"),
-                        ("/ralph list", "List all Ralph autonomous tasks"),
-                        ("/ralph resume <id>", "Resume a paused Ralph task"),
-                        ("/evolve", "Trigger system-prompt self-evolution"),
-                        ("/generate-tool <desc>", "Generate a new user tool"),
-                        ("/quit", "Exit the agent"),
-                    ]:
-                        _help_table.add_row(_hcmd, _hdesc)
-                    shared.CONSOLE.print(_help_table)
-                    continue
-                elif cmd == "cancel":
-                    state.cancel_token.cancel()
-                    shared.CONSOLE.print(
-                        "[yellow]已发送取消信号。在 CLI 模式下请使用 Ctrl+C 打断正在运行的任务。[/yellow]"
-                    )
-                    continue
-                elif cmd == "memory":
-                    lines = [
-                        line
-                        for line in memory.read_index().splitlines()
-                        if line.strip()
-                    ]
-                    table = Table(title="Memory Export")
-                    table.add_column("Metric")
-                    table.add_column("Value")
-                    table.add_row("Projection", "memory/memory.jsonl")
-                    table.add_row("Entries", str(len(lines)))
-                    shared.CONSOLE.print(table)
-                    continue
-                elif cmd == "context":
-                    if ctx_mgr:
-                        stats = ctx_mgr.stats()
-                        table = Table(title="Context Manager (LTM)")
-                        table.add_column("Metric")
-                        table.add_column("Value")
-                        table.add_row(
-                            "Dynamic Categories",
-                            f"{stats['dynamic_categories']}/{stats['max_categories']}",
-                        )
-                        table.add_row(
-                            "Total Categories", str(stats["total_categories"])
-                        )
-                        table.add_row("Total Entries", str(stats["total_entries"]))
-                        table.add_row(
-                            "Category Names",
-                            ", ".join(stats["category_names"]) or "—",
-                        )
-                        table.add_row(
-                            "Staged Turns",
-                            str(stats["staged_turns"]),
-                        )
-                        table.add_row(
-                            "Needs Consolidation",
-                            "yes" if stats["needs_consolidation"] else "no",
-                        )
-                        table.add_row(
-                            "Idle",
-                            f"{stats['idle_elapsed_s']}s / {stats['idle_threshold_s']}s",
-                        )
-                        shared.CONSOLE.print(table)
-                    else:
-                        shared.CONSOLE.print("[yellow]Context manager not available.[/yellow]")
-                    continue
-                elif cmd == "sessions" or cmd == "history":
-                    sessions_data: list[dict] = []
-                    if shared.SESSIONS_FILE.exists():
-                        with open(shared.SESSIONS_FILE, encoding="utf-8") as f:
-                            for line in f:
-                                try:
-                                    sessions_data.append(json.loads(line.strip()))
-                                except Exception:
-                                    pass
-                    if not sessions_data:
-                        shared.CONSOLE.print("[yellow]No session history found.[/yellow]")
-                    else:
-                        table = Table(title="Recent Sessions")
-                        table.add_column("Session ID", style="cyan", no_wrap=True)
-                        table.add_column("Timestamp")
-                        table.add_column("Score")
-                        table.add_column("Summary")
-                        for s in reversed(sessions_data[-20:]):
-                            sid = str(s.get("session_id", "?"))[:12]
-                            ts = str(s.get("timestamp", "?"))[:19]
-                            score_val = s.get("objective_score") or s.get("score")
-                            score = f"{float(score_val):.1f}" if score_val is not None else "?"
-                            summary = str(s.get("task_summary", ""))[:60]
-                            table.add_row(sid, ts, score, summary or "\u2014")
-                        shared.CONSOLE.print(table)
-                    continue
-                elif cmd.startswith("session "):
-                    parts = raw_cmd.split(None, 1)
-                    if len(parts) < 2 or not parts[1].strip():
-                        shared.CONSOLE.print(
-                            "[yellow]Usage: /session <session_id_prefix>[/yellow]"
-                        )
-                    else:
-                        prefix = parts[1].strip()
-                        found = None
-                        if shared.SESSIONS_FILE.exists():
-                            with open(shared.SESSIONS_FILE, encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        s = json.loads(line.strip())
-                                        if str(s.get("session_id", "")).startswith(prefix):
-                                            found = s
-                                            break
-                                    except Exception:
-                                        pass
-                        if found is None and ctx_mgr and hasattr(ctx_mgr, "store"):
-                            turns_list = ctx_mgr.store.get_turns_for_session(prefix)
-                            if turns_list:
-                                shared.CONSOLE.print(
-                                    f"[cyan]Session {prefix} turns:[/cyan]"
-                                )
-                                for t in turns_list[-10:]:
-                                    shared.CONSOLE.print(
-                                        f"[dim]{t.get('role', '?')}: "
-                                        f"{str(t.get('content', ''))[:120]}[/dim]"
-                                    )
-                            else:
-                                shared.CONSOLE.print(
-                                    f"[yellow]Session not found: {prefix}[/yellow]"
-                                )
-                        elif found is not None:
-                            score_val = found.get("objective_score") or found.get("score")
-                            score = f"{float(score_val):.1f}" if score_val is not None else "?"
-                            tools = found.get("tools_used", [])
-                            details = (
-                                f"[bold]Session:[/bold] {found.get('session_id', '?')}\n"
-                                f"[bold]Timestamp:[/bold] {found.get('timestamp', '?')}\n"
-                                f"[bold]Score:[/bold] {score}\n"
-                                f"[bold]Summary:[/bold] {found.get('task_summary', '?')}\n"
-                                f"[bold]Tools Used:[/bold] {', '.join(tools) if tools else 'none'}\n"
-                                f"[bold]Corrections:[/bold] {found.get('correction_count', 0)}"
-                            )
-                            shared.CONSOLE.print(
-                                Panel(details, title="Session Details")
-                            )
-                        else:
-                            shared.CONSOLE.print(
-                                f"[yellow]Session not found: {prefix}[/yellow]"
-                            )
-                    continue
-                elif cmd == "export":
-                    messages = ctx.messages
-                    if not messages:
-                        shared.CONSOLE.print("[yellow]No messages to export.[/yellow]")
-                    else:
-                        out_dir = components.get("output_dir") or shared.DEFAULT_OUTPUT_DIR
-                        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                        path = out_dir / f"session_{ts}.md"
-                        lines_out: list[str] = [
-                            f"# Session Export — {ts}",
-                            "",
-                        ]
-                        for m in messages:
-                            role = str(m.get("role", "?")).upper()
-                            content = m.get("content", "")
-                            if isinstance(content, list):
-                                # Vision content blocks — extract text parts
-                                text_parts = [
-                                    b.get("text", "") for b in content
-                                    if isinstance(b, dict) and b.get("type") == "text"
-                                ]
-                                content = "\n".join(text_parts) or "[media content]"
-                            lines_out.append(f"## {role}")
-                            lines_out.append("")
-                            lines_out.append(str(content))
-                            lines_out.append("")
-                        path.write_text("\n".join(lines_out), encoding="utf-8")
-                        shared.CONSOLE.print(
-                            f"[green]Exported {len(messages)} messages to {path}[/green]"
-                        )
-                    continue
-                # ── Plugin-contributed slash commands (checked before built-ins) ──
-                plugin_cmds = plugin_catalog.get_slash_commands()
-                matched_plugin_key: Optional[str] = None
-                for _key in plugin_cmds:
-                    if cmd == _key or cmd.startswith(_key + " "):
-                        matched_plugin_key = _key
-                        break
-                if matched_plugin_key is not None:
-                    _cmd_result = await plugin_cmds[matched_plugin_key](raw_cmd, components)
-                    if isinstance(_cmd_result, str) and _cmd_result.strip():
-                        # Markdown command body — feed as next user input so
-                        # the agent runs a normal turn with the substituted
-                        # body. No `continue` here; we fall through to the
-                        # turn dispatch below.
-                        user_input = _cmd_result
-                    else:
-                        continue
-                elif cmd == "tools":
-                    _tool_list = components["registry"].list_tools()
-                    _tools_table = Table(title="Available Tools")
-                    _tools_table.add_column("Tool", style="cyan")
-                    for _t in _tool_list:
-                        _tools_table.add_row(_t)
-                    shared.CONSOLE.print(_tools_table)
-                    continue
-                elif cmd == "skills":
-                    skills = skill_catalog.list_skills()
-                    if not skills:
-                        shared.CONSOLE.print("[yellow]No skills found.[/yellow]")
-                    else:
-                        table = Table(title="Available Skills")
-                        table.add_column("ID")
-                        table.add_column("Source")
-                        table.add_column("Description")
-                        for bundle in skills:
-                            table.add_row(
-                                bundle.id,
-                                bundle.source,
-                                bundle.description or "—",
-                            )
-                        shared.CONSOLE.print(table)
-                    continue
-                elif cmd == "plugins":
-                    plugins = plugin_catalog.list_plugins()
-                    if not plugins:
-                        shared.CONSOLE.print("[yellow]No plugins loaded.[/yellow]")
-                    else:
-                        table = Table(title="Loaded Plugins")
-                        table.add_column("Name")
-                        table.add_column("Version")
-                        table.add_column("Source")
-                        table.add_column("Description")
-                        for pm in plugins:
-                            table.add_row(
-                                pm.name,
-                                pm.version or "—",
-                                pm.source,
-                                pm.description or "—",
-                            )
-                        shared.CONSOLE.print(table)
-                        shared.CONSOLE.print(
-                            "[dim]Tip: set plugins.<name>.enabled = false "
-                            "in config.json to disable a plugin[/dim]"
-                        )
-                    continue
-                elif cmd.startswith("mode "):
-                    # Kept as a hidden override for debugging; not advertised
-                    shared.CONSOLE.print(
-                        "[dim](manual mode override removed — routing is automatic)[/dim]"
-                    )
-                    continue
-                elif cmd == "model" or cmd.startswith("model "):
-                    parts = cmd.split(None, 1)
-                    provider_cfg = cfg.get("providers", {}).get(
-                        cfg.get("active_provider", ""), {}
-                    )
-                    available = provider_cfg.get(
-                        "models", [provider_cfg.get("default_model", agent.model)]
-                    )
-                    if len(parts) == 1:
-                        # List available models
-                        table = Table(title="Models")
-                        table.add_column("Model")
-                        table.add_column("Active")
-                        for m in available:
-                            mark = (
-                                "[bold green]✓[/bold green]" if m == agent.model else ""
-                            )
-                            table.add_row(m, mark)
-                        shared.CONSOLE.print(table)
-                    else:
-                        new_model = parts[1].strip()
-                        agent.set_model(new_model)
-                        shared.CONSOLE.print(
-                            f"[green]Switched to model: {new_model}[/green] "
-                            "[dim](session only — not persisted)[/dim]"
-                        )
-                    continue
-                elif cmd == "ralph" or cmd.startswith("ralph "):
-                    # /ralph <goal> [--max N] [--verify <shell_cmd>]
-                    # /ralph list
-                    # /ralph resume <task_id>
-                    sub_parts = raw_cmd.split(None, 1)
-                    sub = sub_parts[1].strip() if len(sub_parts) > 1 else ""
-                    sub_cmd = sub.split(None, 1)[0].lower() if sub else ""
-
-                    if sub_cmd == "list":
-                        tasks_dir = shared.AGENT_HOME / "tasks"
-                        task_files = sorted(tasks_dir.glob("*.json")) if tasks_dir.is_dir() else []
-                        if not task_files:
-                            shared.CONSOLE.print("[yellow]No Ralph tasks found.[/yellow]")
-                        else:
-                            table = Table(title="Ralph Tasks")
-                            table.add_column("ID", style="cyan")
-                            table.add_column("Status")
-                            table.add_column("Goal")
-                            table.add_column("Iterations")
-                            for tf in task_files:
-                                try:
-                                    t = json.loads(tf.read_text())
-                                    sid = tf.stem[:12]
-                                    status = str(t.get("status", "?"))
-                                    goal = str(t.get("goal", ""))[:60]
-                                    iters = f"{t.get('current_iteration',0)}/{t.get('max_iterations',0)}"
-                                    status_color = "green" if status == "complete" else "yellow"
-                                    table.add_row(
-                                        sid,
-                                        f"[{status_color}]{status}[/{status_color}]",
-                                        goal,
-                                        iters,
-                                    )
-                                except Exception:
-                                    table.add_row(tf.stem[:12], "corrupt", "\u2014", "\u2014")
-                            shared.CONSOLE.print(table)
-                        continue
-
-                    if sub_cmd == "resume":
-                        resume_parts = sub.split(None, 1)
-                        if len(resume_parts) < 2:
-                            shared.CONSOLE.print("[yellow]Usage: /ralph resume <task_id>[/yellow]")
-                        else:
-                            task_id = resume_parts[1].strip()
-                            task = _load_ralph_task(task_id)
-                            if task is None:
-                                shared.CONSOLE.print(
-                                    f"[yellow]Task not found: {task_id}[/yellow]"
-                                )
-                            elif task.status == "complete":
-                                shared.CONSOLE.print(
-                                    f"[yellow]Task already complete: {task.id[:12]}[/yellow]"
-                                )
-                            else:
-                                task.status = "running"
-                                shared.CONSOLE.print(
-                                    f"[cyan]Resuming Ralph task {task.id[:12]}: {task.goal}[/cyan]"
-                                )
-                                _ralph_sink = CliOutputSink(shared.CONSOLE)
-                                _ralph_token = _active_sink.set(_ralph_sink)
-                                try:
-                                    task = await _ralph_task_loop(
-                                        agent, task, system_prompt,
-                                        skill_catalog, ctx_mgr,
-                                    )
-                                finally:
-                                    _active_sink.reset(_ralph_token)
-                                status_color = "green" if task.status == "complete" else "yellow"
-                                shared.CONSOLE.print(
-                                    f"[{status_color}]Ralph complete | status: {task.status} | "
-                                    f"iterations: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
-                                )
-                        continue
-
-                    # /ralph <goal> [--max N] [--verify <shell_cmd>]
-                    if not sub:
-                        shared.CONSOLE.print(
-                            "[yellow]Usage: /ralph <goal> [--max N] [--verify <cmd>][/yellow]\n"
-                            "[dim]Subcommands: list | resume <id>[/dim]\n"
-                            "[dim]Example: /ralph 'make all tests pass' --max 10 --verify 'pytest tests/'[/dim]"
-                        )
-                        continue
-
-                    goal_str = parts[1].strip()
-                    max_iters = RALPH_DEFAULT_MAX_ITERATIONS
-                    verify_cmd: Optional[str] = None
-
-                    # Parse --max N
-                    max_match = re.search(r"--max\s+(\d+)", goal_str)
-                    if max_match:
-                        max_iters = int(max_match.group(1))
-                        goal_str = (
-                            goal_str[: max_match.start()].rstrip()
-                            + goal_str[max_match.end() :]
-                        )
-
-                    # Parse --verify <cmd> (everything after --verify to end of string)
-                    verify_match = re.search(r"--verify\s+(.+)$", goal_str)
-                    if verify_match:
-                        verify_cmd = verify_match.group(1).strip().strip("'\"")
-                        goal_str = goal_str[: verify_match.start()].rstrip()
-
-                    goal_str = goal_str.strip().strip("'\"")
-                    if not goal_str:
-                        shared.CONSOLE.print("[yellow]Goal cannot be empty.[/yellow]")
-                        continue
-
-                    task = RalphTask(
-                        id=_new_id(),
-                        goal=goal_str,
-                        completion_criteria=[
-                            f"Goal achieved: {goal_str}",
-                            "Output contains the completion promise token",
-                        ],
-                        verify_command=verify_cmd,
-                        completion_promise=RALPH_COMPLETION_PROMISE,
-                        max_iterations=max_iters,
-                    )
-                    _save_ralph_task(task)
-                    shared.CONSOLE.print(
-                        f"[cyan]Ralph mode started | id: {task.id} | max_iters: {max_iters}"
-                        + (f" | verify: {verify_cmd}" if verify_cmd else "")
-                        + "[/cyan]"
-                    )
-                    _ralph_sink = CliOutputSink(shared.CONSOLE)
-                    _ralph_token = _active_sink.set(_ralph_sink)
-                    try:
-                        task = await _ralph_task_loop(
-                            agent,
-                            task,
-                            system_prompt,
-                            skill_catalog,
-                            ctx_mgr,
-                        )
-                    finally:
-                        _active_sink.reset(_ralph_token)
-                    status_color = "green" if task.status == "complete" else "yellow"
-                    shared.CONSOLE.print(
-                        f"[{status_color}]Ralph complete | status: {task.status} | "
-                        f"iterations: {task.current_iteration}/{task.max_iterations}[/{status_color}]"
-                    )
-                    continue
-
             _turn_sink = CliOutputSink(shared.CONSOLE)
             try:
-                # Fresh cancel token for each turn — any stale cancellation
-                # from a previous turn must not affect this one.
-                state.cancel_token = CancelToken()
-                global _current_cancel_token, _sigint_count
-                _current_cancel_token = state.cancel_token
-                _sigint_count = 0
-                shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
                 ctx.metadata["skill_catalog"] = skill_catalog
-                await _agent_core_for_components(components).handle_turn(
-                    TurnInput.from_text(user_input, channel_name="cli"),
+                if not user_input.lstrip().startswith("/"):
+                    shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+                action = await coordinator.handle(
+                    TurnInput.from_text(
+                        user_input,
+                        session_id="cli",
+                        channel_name="cli",
+                    ),
                     state,
-                    sink=_turn_sink,
+                    _turn_sink,
                 )
+                if action == "exit_cli":
+                    break
             except Exception as e:
                 shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
             finally:
