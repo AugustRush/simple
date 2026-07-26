@@ -538,13 +538,16 @@ class CommandCoordinator:
         )
 
     async def _render_result(self, result: CommandResult, sink: OutputSink) -> None:
+        queued_attachments: list[tuple[Any, Any]] = []
         try:
             if result.response_text is not None:
                 self._safe_status(sink, result.response_text, level=result.level)
             elif result.error:
                 self._safe_error(sink, result.error)
             for attachment in result.attachments:
-                self._safe_attachment(sink, attachment)
+                queued_attachments.append(
+                    (attachment, self._safe_attachment(sink, attachment))
+                )
             if result.attachments:
                 try:
                     await self._flush_attachments_if_supported(sink)
@@ -554,17 +557,29 @@ class CommandCoordinator:
             self._cleanup_temporary_attachments(
                 result.temporary_attachments,
                 sink,
+                tuple(queued_attachments),
             )
 
     @staticmethod
     def _cleanup_temporary_attachments(
-        attachments: tuple[Any, ...], sink: OutputSink
+        attachments: tuple[Any, ...],
+        sink: OutputSink,
+        queued_attachments: tuple[tuple[Any, Any], ...],
     ) -> None:
         defer_cleanup = getattr(sink, "defer_temporary_attachment_cleanup", None)
         for attachment in attachments:
+            receipt = next(
+                (
+                    queued_receipt
+                    for queued_attachment, queued_receipt in queued_attachments
+                    if queued_attachment is attachment
+                    or queued_attachment == attachment
+                ),
+                None,
+            )
             if callable(defer_cleanup):
                 try:
-                    if defer_cleanup(Path(attachment)):
+                    if defer_cleanup(receipt):
                         continue
                 except Exception:
                     logger.exception(
@@ -715,11 +730,12 @@ class CommandCoordinator:
             logger.exception("command output sink error reporting failed")
 
     @staticmethod
-    def _safe_attachment(sink: Any, attachment: Any) -> None:
+    def _safe_attachment(sink: Any, attachment: Any) -> Any:
         try:
-            sink.queue_attachment(attachment)
+            return sink.queue_attachment(attachment)
         except Exception:
             logger.exception("command output sink attachment failed")
+            return None
 
     @staticmethod
     async def _drain_if_supported(sink: Any) -> None:

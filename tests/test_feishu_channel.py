@@ -9,6 +9,7 @@ are required.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 from pathlib import Path
@@ -33,7 +34,13 @@ from agent import (
     _active_sink,
     _build_gateway_channels,
 )
-from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
+from agent.commands import (
+    CommandCoordinator,
+    CommandDescriptor,
+    CommandResult,
+    CommandRouter,
+    register_builtin_commands,
+)
 from agent.runtime import RuntimeSessionState, TurnInput
 
 
@@ -543,17 +550,54 @@ def test_feishu_sink_flush_attachments_consumes_queue_once(tmp_path):
     async def _run():
         with patch.object(
             sink,
-            "_send_file_async",
-            new=AsyncMock(),
+            "_send_file_sync",
         ) as mock_send:
             await sink.flush_attachments()
             assert sink._attachments == []
             assert sink._attachment_keys == set()
             sink.on_turn_complete("done", [])
             await sink.drain()
-            mock_send.assert_awaited_once_with(target.resolve())
+            mock_send.assert_called_once_with(target.resolve())
 
     asyncio.run(_run())
+
+
+def test_feishu_sink_duplicate_queue_returns_same_cleanup_receipt(tmp_path):
+    target = tmp_path / "report.txt"
+    target.write_text("report", encoding="utf-8")
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    sink = _make_feishu_sink()
+
+    first = sink.queue_attachment(target)
+    duplicate = sink.queue_attachment(nested / ".." / "report.txt")
+
+    assert first is duplicate
+    assert len(sink._attachments) == 1
+
+
+def test_feishu_sink_turn_completion_clears_attachment_receipts(tmp_path):
+    target = tmp_path / "report.txt"
+    target.write_text("report", encoding="utf-8")
+    sink = _make_feishu_sink()
+    sink.queue_attachment(target)
+
+    async def _run():
+        with patch.object(
+            sink,
+            "_send_response_async",
+            new=AsyncMock(),
+        ), patch.object(
+            sink,
+            "_send_file_async",
+            new=AsyncMock(),
+        ):
+            sink.on_turn_complete("done", [])
+            await sink.drain()
+
+    asyncio.run(_run())
+
+    assert sink._attachment_receipts == {}
 
 
 def test_feishu_coordinator_flushes_temp_before_cleanup(tmp_path):
@@ -614,12 +658,12 @@ def test_feishu_flush_error_clears_queue_and_coordinator_cleans_temp(tmp_path):
     sink = _make_feishu_sink()
     attempted: list[Path] = []
 
-    async def fail_send(path: Path) -> None:
+    def fail_send(path: Path) -> None:
         attempted.append(path)
         assert path.is_file()
         raise RuntimeError("upload failed")
 
-    sink._send_file_async = fail_send  # type: ignore[method-assign]
+    sink._send_file_sync = fail_send  # type: ignore[method-assign]
     router = CommandRouter()
     register_builtin_commands(router)
 
@@ -651,65 +695,6 @@ def test_feishu_flush_error_clears_queue_and_coordinator_cleans_temp(tmp_path):
     assert not attempted[0].parent.exists()
     assert sink._attachments == []
     assert sink._attachment_keys == set()
-
-
-def test_feishu_flush_cancellation_clears_queue_and_temp(tmp_path):
-    async def scenario() -> None:
-        output_dir = tmp_path / "output"
-        output_dir.mkdir()
-        (output_dir / "report.txt").write_text("report", encoding="utf-8")
-        sink = _make_feishu_sink()
-        started = asyncio.Event()
-        release_send = asyncio.Event()
-        attempted: list[Path] = []
-
-        async def block_send(path: Path) -> None:
-            attempted.append(path)
-            started.set()
-            await release_send.wait()
-
-        sink._send_file_async = block_send  # type: ignore[method-assign]
-        router = CommandRouter()
-        register_builtin_commands(router)
-
-        class UnusedCore:
-            async def handle_turn(self, *args, **kwargs):
-                raise AssertionError("command must not forward to the model")
-
-        coordinator = CommandCoordinator(
-            UnusedCore(),  # type: ignore[arg-type]
-            router,
-            components={"output_dir": output_dir},
-        )
-        state = RuntimeSessionState(ctx=MagicMock(messages=[]))
-        running = asyncio.create_task(
-            coordinator.handle(
-                TurnInput.from_text(
-                    "/send report.txt",
-                    session_id="s-1",
-                    channel_name="feishu",
-                ),
-                state,
-                sink,
-            )
-        )
-
-        await asyncio.wait_for(started.wait(), timeout=0.2)
-        assert attempted[0].is_file()
-        running.cancel()
-        await asyncio.sleep(0)
-        assert not running.done()
-        assert attempted[0].is_file()
-        release_send.set()
-        with pytest.raises(asyncio.CancelledError):
-            await running
-
-        assert not attempted[0].exists()
-        assert not attempted[0].parent.exists()
-        assert sink._attachments == []
-        assert sink._attachment_keys == set()
-
-    asyncio.run(scenario())
 
 
 def test_feishu_flush_cancellation_returns_before_sync_uploader_and_defers_cleanup(
@@ -815,79 +800,6 @@ def test_feishu_flush_cancellation_returns_before_sync_uploader_and_defers_clean
     asyncio.run(scenario())
 
 
-def test_feishu_external_upload_task_cancellation_defers_to_sync_worker(tmp_path):
-    async def scenario() -> None:
-        private_dir = tmp_path / ".send-test"
-        private_dir.mkdir()
-        attachment = private_dir / "report.txt"
-        attachment.write_text("report", encoding="utf-8")
-        pending_dir = tmp_path / ".send-pending"
-        pending_dir.mkdir()
-        pending_attachment = pending_dir / "pending.txt"
-        pending_attachment.write_text("pending", encoding="utf-8")
-        sink = _make_feishu_sink()
-        worker_started = threading.Event()
-        release_worker = threading.Event()
-        worker_finished = threading.Event()
-        observed_content: list[str] = []
-
-        def blocking_upload(path: Path):
-            worker_started.set()
-            release_worker.wait()
-            try:
-                observed_content.append(path.read_text(encoding="utf-8"))
-            except FileNotFoundError:
-                observed_content.append("missing")
-            finally:
-                worker_finished.set()
-            return "file-key"
-
-        sink._upload_file_sync = MagicMock(side_effect=blocking_upload)
-        sink._do_send = MagicMock()
-        sink.queue_attachment(attachment)
-        sink.queue_attachment(pending_attachment)
-        flush = asyncio.create_task(sink.flush_attachments())
-
-        assert await asyncio.to_thread(worker_started.wait, 1)
-        safety_release = threading.Timer(5, release_worker.set)
-        safety_release.daemon = True
-        safety_release.start()
-        current = asyncio.current_task()
-        upload_tasks = [
-            task
-            for task in asyncio.all_tasks()
-            if task not in (current, flush) and not task.done()
-        ]
-        assert len(upload_tasks) == 1
-        upload_tasks[0].cancel()
-        await asyncio.gather(upload_tasks[0], return_exceptions=True)
-        outcome = (await asyncio.gather(flush, return_exceptions=True))[0]
-        cleanup_transferred = sink.defer_temporary_attachment_cleanup(attachment)
-        pending_cleanup_transferred = sink.defer_temporary_attachment_cleanup(
-            pending_attachment
-        )
-        pending_attachment.unlink()
-        pending_dir.rmdir()
-        existed_before_worker_release = attachment.is_file()
-        release_worker.set()
-        safety_release.cancel()
-        assert await asyncio.to_thread(worker_finished.wait, 1)
-        for _attempt in range(100):
-            if not attachment.exists() and not private_dir.exists():
-                break
-            await asyncio.sleep(0.01)
-
-        assert isinstance(outcome, asyncio.CancelledError)
-        assert cleanup_transferred is True
-        assert pending_cleanup_transferred is False
-        assert existed_before_worker_release is True
-        assert observed_content == ["report"]
-        assert not attachment.exists()
-        assert not private_dir.exists()
-
-    asyncio.run(scenario())
-
-
 def test_feishu_sync_worker_cleans_deferred_snapshot_after_event_loop_closes(
     tmp_path, monkeypatch
 ):
@@ -914,7 +826,7 @@ def test_feishu_sync_worker_cleans_deferred_snapshot_after_event_loop_closes(
 
     sink._upload_file_sync = MagicMock(side_effect=blocking_upload)
     sink._do_send = MagicMock()
-    sink.queue_attachment(attachment)
+    receipt = sink.queue_attachment(attachment)
     monkeypatch.setattr(
         "channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
         0.01,
@@ -925,7 +837,7 @@ def test_feishu_sync_worker_cleans_deferred_snapshot_after_event_loop_closes(
         assert await asyncio.to_thread(worker_started.wait, 1)
         flush.cancel()
         outcome = (await asyncio.gather(flush, return_exceptions=True))[0]
-        return outcome, sink.defer_temporary_attachment_cleanup(attachment)
+        return outcome, sink.defer_temporary_attachment_cleanup(receipt)
 
     loop = asyncio.new_event_loop()
     try:
@@ -952,6 +864,183 @@ def test_feishu_sync_worker_cleans_deferred_snapshot_after_event_loop_closes(
     assert observed_content == ["report"]
     assert not attachment.exists()
     assert not private_dir.exists()
+
+
+def test_feishu_cancellation_cleans_never_started_upload_when_executor_saturated(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        attachments: list[Path] = []
+        for index in range(2):
+            private_dir = tmp_path / f".send-{index}"
+            private_dir.mkdir()
+            attachment = private_dir / f"report-{index}.txt"
+            attachment.write_text(f"report-{index}", encoding="utf-8")
+            attachments.append(attachment)
+
+        async def handler(request, context):
+            return CommandResult(
+                attachments=tuple(attachments),
+                temporary_attachments=tuple(attachments),
+            )
+
+        sink = _make_feishu_sink()
+        upload_started = threading.Event()
+        release_upload = threading.Event()
+        uploaded: list[Path] = []
+
+        def blocking_upload(path: Path):
+            uploaded.append(path)
+            upload_started.set()
+            release_upload.wait()
+            return "file-key"
+
+        sink._upload_file_sync = MagicMock(side_effect=blocking_upload)
+        sink._do_send = MagicMock()
+        monkeypatch.setattr(
+            "channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
+            0.01,
+        )
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+
+        def occupy_default_executor() -> None:
+            blocker_started.set()
+            release_blocker.wait()
+
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(executor)
+        blocker = loop.run_in_executor(None, occupy_default_executor)
+        for _attempt in range(100):
+            if blocker_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+
+        router = CommandRouter(
+            core_commands=[CommandDescriptor("report", handler)]
+        )
+
+        class UnusedCore:
+            async def handle_turn(self, *args, **kwargs):
+                raise AssertionError("command must not forward to the model")
+
+        coordinator = CommandCoordinator(UnusedCore(), router)  # type: ignore[arg-type]
+        state = RuntimeSessionState(ctx=MagicMock(messages=[]))
+        running = asyncio.create_task(
+            coordinator.handle(
+                TurnInput.from_text(
+                    "/report",
+                    session_id="s-1",
+                    channel_name="feishu",
+                ),
+                state,
+                sink,
+            )
+        )
+
+        for _attempt in range(20):
+            if upload_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        worker_started_despite_saturated_executor = upload_started.is_set()
+        running.cancel()
+        await asyncio.sleep(0)
+        running.cancel()
+        outcome = (await asyncio.gather(running, return_exceptions=True))[0]
+        second_worker_never_started = len(uploaded) <= 1
+        release_upload.set()
+        release_blocker.set()
+        await asyncio.gather(blocker, return_exceptions=True)
+        executor.shutdown(wait=True)
+        for _attempt in range(100):
+            if all(
+                not path.exists() and not path.parent.exists()
+                for path in attachments
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+        assert isinstance(outcome, asyncio.CancelledError)
+        assert worker_started_despite_saturated_executor is True
+        assert second_worker_never_started is True
+        assert all(not path.exists() for path in attachments)
+        assert all(not path.parent.exists() for path in attachments)
+
+    asyncio.run(scenario())
+
+
+def test_feishu_coordinator_handoff_uses_queue_receipt_for_path_alias(tmp_path):
+    async def scenario() -> None:
+        private_dir = tmp_path / ".send-test"
+        private_dir.mkdir()
+        attachment = private_dir / "report.txt"
+        attachment.write_text("report", encoding="utf-8")
+        alias = private_dir / "nested" / ".." / "report.txt"
+        (private_dir / "nested").mkdir()
+
+        async def handler(request, context):
+            return CommandResult(
+                attachments=(alias,),
+                temporary_attachments=(alias,),
+            )
+
+        sink = _make_feishu_sink()
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        observed_content: list[str] = []
+
+        def blocking_upload(path: Path):
+            worker_started.set()
+            release_worker.wait()
+            try:
+                observed_content.append(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                observed_content.append("missing")
+            return "file-key"
+
+        sink._upload_file_sync = MagicMock(side_effect=blocking_upload)
+        sink._do_send = MagicMock()
+        router = CommandRouter(
+            core_commands=[CommandDescriptor("report", handler)]
+        )
+
+        class UnusedCore:
+            async def handle_turn(self, *args, **kwargs):
+                raise AssertionError("command must not forward to the model")
+
+        coordinator = CommandCoordinator(UnusedCore(), router)  # type: ignore[arg-type]
+        state = RuntimeSessionState(ctx=MagicMock(messages=[]))
+        running = asyncio.create_task(
+            coordinator.handle(
+                TurnInput.from_text(
+                    "/report",
+                    session_id="s-1",
+                    channel_name="feishu",
+                ),
+                state,
+                sink,
+            )
+        )
+
+        assert await asyncio.to_thread(worker_started.wait, 1)
+        running.cancel()
+        await asyncio.sleep(0)
+        running.cancel()
+        outcome = (await asyncio.gather(running, return_exceptions=True))[0]
+        existed_before_worker_release = attachment.is_file()
+        release_worker.set()
+        for _attempt in range(100):
+            if not attachment.exists():
+                break
+            await asyncio.sleep(0.01)
+
+        assert isinstance(outcome, asyncio.CancelledError)
+        assert existed_before_worker_release is True
+        assert observed_content == ["report"]
+        assert not attachment.exists()
+
+    asyncio.run(scenario())
 
 
 def test_feishu_sink_on_tool_start_schedules_hint():

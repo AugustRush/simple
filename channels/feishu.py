@@ -36,7 +36,6 @@ Configuration in ``~/.agent/config.json``::
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import importlib.util
 import inspect
 import json
@@ -67,87 +66,72 @@ FEISHU_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
 _ATTACHMENT_CANCEL_GRACE_SECONDS = 0.05
 
 
-class _AttachmentCleanupState:
-    """Coordinate cleanup ownership with actual synchronous upload workers."""
+def _cleanup_attachment_path(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+        path.parent.rmdir()
+    except OSError:
+        logger.exception(
+            "deferred Feishu attachment cleanup failed: attachment=%s",
+            path,
+        )
 
-    def __init__(
-        self,
-        paths: tuple[Path, ...],
-        on_safe: Callable[[Path, "_AttachmentCleanupState"], None],
-    ) -> None:
-        self._paths = {str(path): path for path in paths}
-        self._states = {key: "pending" for key in self._paths}
-        self._claimed: set[str] = set()
+
+class _AttachmentLease:
+    """Opaque cleanup receipt shared by the coordinator and batch worker."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._state = "pending"
+        self._cleanup_owned = False
         self._lock = threading.Lock()
-        self._on_safe = on_safe
 
-    def mark_submitted(self, path: Path) -> None:
-        key = str(path)
+    def run(self, operation: Callable[[Path], None]) -> bool:
         with self._lock:
-            if self._states.get(key) != "pending":
-                raise RuntimeError("attachment upload path is not pending")
-            self._states[key] = "submitted"
-
-    def run_worker(self, path: Path, operation: Callable[[Path], Any]) -> Any:
-        try:
-            return operation(path)
-        except BaseException:
-            logger.exception("Feishu attachment upload worker failed")
-            raise
-        finally:
-            self._settle(path)
-
-    def settle_without_worker(self, path: Path) -> None:
-        self._settle(path)
-
-    def abandon_unsubmitted(self) -> None:
-        with self._lock:
-            paths = [
-                self._paths[key]
-                for key, state in self._states.items()
-                if state == "pending"
-            ]
-        for path in paths:
-            self._settle(path)
-
-    def needs_deferred_cleanup(self, path: Path) -> bool:
-        with self._lock:
-            return self._states.get(str(path)) in ("pending", "submitted")
-
-    def transfer_cleanup(self, path: Path) -> bool:
-        key = str(path)
-        with self._lock:
-            if self._states.get(key) not in ("pending", "submitted"):
+            if self._state == "cancelled":
                 return False
-            self._claimed.add(key)
-            return True
+            if self._state != "pending":
+                raise RuntimeError("attachment lease is not pending")
+            self._state = "running"
+        try:
+            operation(self.path)
+        finally:
+            self._finish()
+        return True
 
-    def _settle(self, path: Path) -> None:
-        key = str(path)
+    def cancel_pending(self) -> None:
         cleanup = False
         with self._lock:
-            state = self._states.get(key)
-            if state == "finished":
-                return
-            if state is None:
-                return
-            self._states[key] = "finished"
-            cleanup = key in self._claimed
+            if self._state == "pending":
+                self._state = "cancelled"
+                cleanup = self._cleanup_owned
         if cleanup:
-            try:
-                path.unlink(missing_ok=True)
-                path.parent.rmdir()
-            except OSError:
-                logger.exception(
-                    "deferred Feishu attachment cleanup failed: attachment=%s",
-                    path,
-                )
-        self._on_safe(path, self)
+            _cleanup_attachment_path(self.path)
+
+    def transfer_cleanup(self) -> bool:
+        cleanup = False
+        with self._lock:
+            if self._cleanup_owned:
+                return True
+            self._cleanup_owned = True
+            cleanup = self._state in ("cancelled", "finished")
+        if cleanup:
+            _cleanup_attachment_path(self.path)
+        return True
+
+    def _finish(self) -> None:
+        cleanup = False
+        with self._lock:
+            self._state = "finished"
+            cleanup = self._cleanup_owned
+        if cleanup:
+            _cleanup_attachment_path(self.path)
 
 
-_ACTIVE_ATTACHMENT_CLEANUP: contextvars.ContextVar[
-    _AttachmentCleanupState | None
-] = contextvars.ContextVar("feishu_attachment_cleanup", default=None)
+@dataclass(frozen=True)
+class _QueuedAttachment:
+    path: Path
+    lease: _AttachmentLease
 
 
 def build_feishu_client(config: "FeishuConfig") -> Any:
@@ -405,12 +389,9 @@ class FeishuOutputSink(OutputSink):
         self._progress_fail_count = 0
         self._tool_progress_lines: OrderedDict[str, str] = OrderedDict()
         self._last_batch_progress_key: tuple[int, int] | None = None
-        self._attachments: list[Path] = []
+        self._attachments: list[_QueuedAttachment] = []
         self._attachment_keys: set[str] = set()
-        self._deferred_attachment_cleanups: dict[
-            str, _AttachmentCleanupState
-        ] = {}
-        self._deferred_attachment_lock = threading.Lock()
+        self._attachment_receipts: dict[str, _AttachmentLease] = {}
 
     def _trace_latency(self, stage: str, **fields: object) -> None:
         if not shared._latency_trace_enabled():
@@ -581,69 +562,65 @@ class FeishuOutputSink(OutputSink):
         if level in ("error", "warning"):
             self._schedule(self._send_plain_async(text), label="send_status")
 
-    def queue_attachment(self, path: Path) -> None:
-        self._queue_attachment(path)
+    def queue_attachment(self, path: Path) -> object | None:
+        return self._queue_attachment(path)
 
-    def defer_temporary_attachment_cleanup(self, path: Path) -> bool:
-        """Transfer cleanup for a snapshot still owned by an upload task."""
+    def defer_temporary_attachment_cleanup(self, receipt: object) -> bool:
+        """Transfer cleanup using the opaque receipt returned while queueing."""
 
-        try:
-            attachment = Path(path)
-            key = str(attachment)
-        except (TypeError, ValueError):
+        if not isinstance(receipt, _AttachmentLease):
             return False
-        with self._deferred_attachment_lock:
-            cleanup_state = self._deferred_attachment_cleanups.pop(key, None)
-        if cleanup_state is None:
-            return False
-        try:
-            return cleanup_state.transfer_cleanup(attachment)
-        except Exception:
-            logger.exception(
-                "Feishu attachment cleanup transfer failed: attachment=%s",
-                attachment,
-            )
-            return False
+        return receipt.transfer_cleanup()
 
-    def _attachment_worker_safe(
-        self, path: Path, cleanup_state: _AttachmentCleanupState
-    ) -> None:
-        key = str(path)
-        with self._deferred_attachment_lock:
-            if self._deferred_attachment_cleanups.get(key) is cleanup_state:
-                self._deferred_attachment_cleanups.pop(key, None)
-
-    def _register_deferred_attachment_cleanup(
-        self,
-        paths: tuple[Path, ...],
-        cleanup_state: _AttachmentCleanupState,
-    ) -> None:
-        with self._deferred_attachment_lock:
-            for path in paths:
-                if cleanup_state.needs_deferred_cleanup(path):
-                    self._deferred_attachment_cleanups[str(path)] = cleanup_state
-
-    def _observe_deferred_attachment_upload(
-        self, upload_task: asyncio.Task[None]
-    ) -> None:
-        if upload_task.cancelled():
+    @staticmethod
+    def _observe_attachment_batch(completion: asyncio.Future[None]) -> None:
+        if completion.cancelled():
             return
-        try:
-            upload_task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Feishu attachment flush failed during cancellation")
+        completion.exception()
 
-    async def _send_attachment_batch_async(
-        self, cleanup_state: _AttachmentCleanupState
-    ) -> None:
-        token = _ACTIVE_ATTACHMENT_CLEANUP.set(cleanup_state)
+    def _start_attachment_batch(
+        self, attachments: tuple[_QueuedAttachment, ...]
+    ) -> asyncio.Future[None]:
+        loop = asyncio.get_running_loop()
+        completion: asyncio.Future[None] = loop.create_future()
+        completion.add_done_callback(self._observe_attachment_batch)
+
+        def publish(error: BaseException | None) -> None:
+            if completion.done():
+                return
+            if error is None:
+                completion.set_result(None)
+            else:
+                completion.set_exception(error)
+
+        def run_batch() -> None:
+            error: BaseException | None = None
+            try:
+                for attachment in attachments:
+                    attachment.lease.run(self._send_file_sync)
+            except BaseException as exc:
+                error = exc
+                logger.exception("Feishu attachment batch worker failed")
+            finally:
+                for attachment in attachments:
+                    attachment.lease.cancel_pending()
+                try:
+                    loop.call_soon_threadsafe(publish, error)
+                except RuntimeError:
+                    pass
+
+        worker = threading.Thread(
+            target=run_batch,
+            name="feishu-attachment-batch",
+            daemon=True,
+        )
         try:
-            await self._send_attachments_async()
-        finally:
-            cleanup_state.abandon_unsubmitted()
-            _ACTIVE_ATTACHMENT_CLEANUP.reset(token)
+            worker.start()
+        except BaseException:
+            for attachment in attachments:
+                attachment.lease.cancel_pending()
+            raise
+        return completion
 
     async def flush_attachments(self) -> None:
         """Send and consume the attachment batch currently queued."""
@@ -652,40 +629,25 @@ class FeishuOutputSink(OutputSink):
         if not self._attachments:
             return
         queued_attachments = tuple(self._attachments)
-        cleanup_state = _AttachmentCleanupState(
-            queued_attachments,
-            self._attachment_worker_safe,
-        )
-        upload_task = asyncio.create_task(
-            self._send_attachment_batch_async(cleanup_state)
-        )
+        completion = self._start_attachment_batch(queued_attachments)
         try:
-            await asyncio.shield(upload_task)
+            await asyncio.shield(completion)
         except asyncio.CancelledError:
             try:
-                done, _pending = await asyncio.wait(
-                    {upload_task},
+                await asyncio.wait(
+                    {completion},
                     timeout=_ATTACHMENT_CANCEL_GRACE_SECONDS,
                 )
             except asyncio.CancelledError:
-                done = set()
-            if upload_task not in done and not upload_task.done():
-                upload_task.cancel()
-            cleanup_state.abandon_unsubmitted()
-            self._register_deferred_attachment_cleanup(
-                queued_attachments,
-                cleanup_state,
-            )
-            if upload_task.done():
-                self._observe_deferred_attachment_upload(upload_task)
-            else:
-                upload_task.add_done_callback(
-                    self._observe_deferred_attachment_upload
-                )
+                pass
+            if not completion.done():
+                for attachment in queued_attachments:
+                    attachment.lease.cancel_pending()
             raise
         finally:
             self._attachments = []
             self._attachment_keys = set()
+            self._attachment_receipts = {}
 
     async def drain(self) -> None:
         """Await all pending send tasks before the handler returns."""
@@ -777,6 +739,7 @@ class FeishuOutputSink(OutputSink):
             self._tool_progress_lines = OrderedDict()
             self._attachments = []
             self._attachment_keys = set()
+            self._attachment_receipts = {}
 
     def _render_primary_markdown(self) -> str:
         parts: list[str] = []
@@ -969,6 +932,10 @@ class FeishuOutputSink(OutputSink):
         await loop.run_in_executor(None, self._do_send, "text", body)
 
     async def _send_file_async(self, file_path: Path) -> None:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._send_file_sync, file_path)
+
+    def _send_file_sync(self, file_path: Path) -> None:
         started_at = time.perf_counter()
         path = Path(file_path)
         if not path.is_file():
@@ -981,32 +948,11 @@ class FeishuOutputSink(OutputSink):
             )
             return
 
-        loop = asyncio.get_running_loop()
-        cleanup_state = _ACTIVE_ATTACHMENT_CLEANUP.get()
-
-        async def run_upload(operation: Callable[[Path], Any]) -> Any:
-            if cleanup_state is None:
-                return await loop.run_in_executor(None, operation, path)
-            cleanup_state.mark_submitted(path)
-            try:
-                worker = loop.run_in_executor(
-                    None,
-                    cleanup_state.run_worker,
-                    path,
-                    operation,
-                )
-            except BaseException:
-                cleanup_state.settle_without_worker(path)
-                raise
-            return await worker
-
         ext = path.suffix.lower()
         if ext in self._IMAGE_EXTS:
-            key = await run_upload(self._upload_image_sync)
+            key = self._upload_image_sync(path)
             if key:
-                await loop.run_in_executor(
-                    None,
-                    self._do_send,
+                self._do_send(
                     "image",
                     json.dumps({"image_key": key}, ensure_ascii=False),
                 )
@@ -1019,11 +965,9 @@ class FeishuOutputSink(OutputSink):
             )
             return
 
-        key = await run_upload(self._upload_file_sync)
+        key = self._upload_file_sync(path)
         if key:
-            await loop.run_in_executor(
-                None,
-                self._do_send,
+            self._do_send(
                 "file",
                 json.dumps({"file_key": key}, ensure_ascii=False),
             )
@@ -1035,20 +979,23 @@ class FeishuOutputSink(OutputSink):
             duration_ms=f"{(time.perf_counter() - started_at) * 1000:.1f}",
         )
 
-    def _queue_attachment(self, file_path: Path) -> None:
+    def _queue_attachment(self, file_path: Path) -> _AttachmentLease | None:
         try:
             path = Path(file_path).resolve()
         except OSError:
-            return
+            return None
         key = str(path)
         if key in self._attachment_keys:
-            return
+            return self._attachment_receipts[key]
+        lease = _AttachmentLease(path)
         self._attachment_keys.add(key)
-        self._attachments.append(path)
+        self._attachment_receipts[key] = lease
+        self._attachments.append(_QueuedAttachment(path, lease))
+        return lease
 
     async def _send_attachments_async(self) -> None:
-        for path in self._attachments:
-            await self._send_file_async(path)
+        for attachment in self._attachments:
+            await self._send_file_async(attachment.path)
 
     @staticmethod
     def _format_byte_count(value: Any) -> str | None:

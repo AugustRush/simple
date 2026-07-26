@@ -124,13 +124,13 @@ class OutputSink(ABC):
         (e.g. Feishu sends a message, CLI prints a panel).
         """
 
-    def queue_attachment(self, path: Path) -> None:
-        """Queue a file attachment for delivery with the current turn."""
+    def queue_attachment(self, path: Path) -> object | None:
+        """Queue an attachment and optionally return an opaque cleanup receipt."""
 
     async def flush_attachments(self) -> None:
         """Consume attachments queued so far before returning."""
 
-    def defer_temporary_attachment_cleanup(self, path: Path) -> bool:
+    def defer_temporary_attachment_cleanup(self, receipt: object) -> bool:
         """Return true only after irrevocably assuming responsibility for cleanup.
 
         Implementations must return false, not raise, when ownership cannot be
