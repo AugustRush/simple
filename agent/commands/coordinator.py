@@ -567,15 +567,38 @@ class CommandCoordinator:
         queued_attachments: tuple[tuple[Any, Any], ...],
     ) -> None:
         defer_cleanup = getattr(sink, "defer_temporary_attachment_cleanup", None)
-        for attachment in attachments:
-            receipt = next(
-                (
-                    queued_receipt
-                    for queued_attachment, queued_receipt in queued_attachments
-                    if queued_attachment is attachment
-                    or queued_attachment == attachment
-                ),
-                None,
+        receipt_indices: list[int | None] = [None] * len(attachments)
+        consumed_indices: set[int] = set()
+        for attachment_index, attachment in enumerate(attachments):
+            for queued_index, (queued_attachment, _receipt) in enumerate(
+                queued_attachments
+            ):
+                if (
+                    queued_index not in consumed_indices
+                    and queued_attachment is attachment
+                ):
+                    receipt_indices[attachment_index] = queued_index
+                    consumed_indices.add(queued_index)
+                    break
+        for attachment_index, attachment in enumerate(attachments):
+            if receipt_indices[attachment_index] is not None:
+                continue
+            for queued_index, (queued_attachment, _receipt) in enumerate(
+                queued_attachments
+            ):
+                if (
+                    queued_index not in consumed_indices
+                    and queued_attachment == attachment
+                ):
+                    receipt_indices[attachment_index] = queued_index
+                    consumed_indices.add(queued_index)
+                    break
+
+        for attachment, receipt_index in zip(attachments, receipt_indices):
+            receipt = (
+                queued_attachments[receipt_index][1]
+                if receipt_index is not None
+                else None
             )
             if callable(defer_cleanup):
                 try:

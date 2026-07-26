@@ -1645,6 +1645,52 @@ def test_coordinator_cleans_temp_when_sink_cleanup_handoff_raises(tmp_path) -> N
     assert not private_dir.exists()
 
 
+def test_coordinator_matches_equal_temporary_attachments_to_distinct_receipts() -> None:
+    first = Path("same-report.txt")
+    second = Path("same-report.txt")
+    assert first == second
+    assert first is not second
+
+    async def handler(request, context):
+        return CommandResult(
+            attachments=(first, second),
+            temporary_attachments=(second, first),
+        )
+
+    class ReceiptSink(_CoordinatorSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipts = [object(), object()]
+            self.handoffs: list[object] = []
+
+        def queue_attachment(self, attachment: object) -> object:
+            self.attachments.append(attachment)
+            return self.receipts[len(self.attachments) - 1]
+
+        async def flush_attachments(self) -> None:
+            return None
+
+        def defer_temporary_attachment_cleanup(self, receipt: object) -> bool:
+            self.handoffs.append(receipt)
+            return True
+
+    coordinator, _ = _coordinator(
+        CommandRouter(core_commands=[CommandDescriptor("report", handler)])
+    )
+    sink = ReceiptSink()
+    state = RuntimeSessionState(ctx=SimpleNamespace(messages=[]))
+
+    asyncio.run(
+        coordinator.handle(
+            _turn("/report"),
+            state,
+            sink,  # type: ignore[arg-type]
+        )
+    )
+
+    assert sink.handoffs == [sink.receipts[1], sink.receipts[0]]
+
+
 def test_coordinator_cleans_temporary_attachment_when_drain_raises(tmp_path) -> None:
     class RaisingDrainSink(_CoordinatorSink):
         async def drain(self) -> None:

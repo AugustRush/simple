@@ -600,6 +600,409 @@ def test_feishu_sink_turn_completion_clears_attachment_receipts(tmp_path):
     assert sink._attachment_receipts == {}
 
 
+def test_feishu_flush_cancelled_during_initial_drain_settles_pending_batch(
+    tmp_path,
+):
+    async def scenario() -> None:
+        private_dir = tmp_path / ".send-test"
+        private_dir.mkdir()
+        attachment = private_dir / "report.txt"
+        attachment.write_text("report", encoding="utf-8")
+        sink = _make_feishu_sink()
+        receipt = sink.queue_attachment(attachment)
+        drain_started = asyncio.Event()
+        release_drain = asyncio.Event()
+
+        async def blocking_drain() -> None:
+            drain_started.set()
+            await release_drain.wait()
+
+        sink.drain = blocking_drain  # type: ignore[method-assign]
+        flush = asyncio.create_task(sink.flush_attachments())
+        await drain_started.wait()
+        flush.cancel()
+        outcome = (await asyncio.gather(flush, return_exceptions=True))[0]
+        cleanup_transferred = sink.defer_temporary_attachment_cleanup(receipt)
+
+        assert isinstance(outcome, asyncio.CancelledError)
+        assert cleanup_transferred is True
+        assert not attachment.exists()
+        assert not private_dir.exists()
+        assert sink._attachments == []
+        assert sink._attachment_keys == set()
+        assert sink._attachment_receipts == {}
+
+    asyncio.run(scenario())
+
+
+def test_feishu_thread_start_failure_settles_and_forgets_pending_batch(tmp_path):
+    async def scenario() -> None:
+        private_dir = tmp_path / ".send-test"
+        private_dir.mkdir()
+        attachment = private_dir / "report.txt"
+        attachment.write_text("report", encoding="utf-8")
+        sink = _make_feishu_sink()
+        receipt = sink.queue_attachment(attachment)
+
+        with patch(
+            "channels.feishu.threading.Thread.start",
+            side_effect=RuntimeError("thread start failed"),
+        ):
+            with pytest.raises(RuntimeError, match="thread start failed"):
+                await sink.flush_attachments()
+
+        cleanup_transferred = sink.defer_temporary_attachment_cleanup(receipt)
+        replacement = sink.queue_attachment(attachment)
+
+        assert cleanup_transferred is True
+        assert not attachment.exists()
+        assert not private_dir.exists()
+        assert replacement is not receipt
+        assert len(sink._attachments) == 1
+
+    asyncio.run(scenario())
+
+
+def test_feishu_worker_can_finish_before_thread_start_reports_failure(tmp_path):
+    async def scenario() -> None:
+        private_dir = tmp_path / ".send-test"
+        private_dir.mkdir()
+        attachment = private_dir / "report.txt"
+        attachment.write_text("report", encoding="utf-8")
+        sink = _make_feishu_sink()
+        receipt = sink.queue_attachment(attachment)
+        worker_finished = threading.Event()
+
+        def send_file(path: Path) -> None:
+            assert path == attachment.resolve()
+            worker_finished.set()
+
+        sink._send_file_sync = send_file  # type: ignore[method-assign]
+        original_start = threading.Thread.start
+
+        def start_then_fail(worker: threading.Thread) -> None:
+            original_start(worker)
+            assert worker_finished.wait(timeout=1)
+            raise RuntimeError("start failed after worker ran")
+
+        with patch(
+            "channels.feishu.threading.Thread.start",
+            new=start_then_fail,
+        ):
+            with pytest.raises(RuntimeError, match="start failed after worker ran"):
+                await sink.flush_attachments()
+
+        cleanup_transferred = sink.defer_temporary_attachment_cleanup(receipt)
+        replacement = sink.queue_attachment(attachment)
+
+        assert cleanup_transferred is True
+        assert not attachment.exists()
+        assert not private_dir.exists()
+        assert replacement is not receipt
+        assert len(sink._attachments) == 1
+
+    asyncio.run(scenario())
+
+
+def test_feishu_attachment_batches_are_globally_bounded_across_sinks(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        monkeypatch.setattr(
+            "channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            threading.BoundedSemaphore(2),
+            raising=False,
+        )
+        release_workers = threading.Event()
+        started_paths: list[Path] = []
+        started_lock = threading.Lock()
+        sinks: list[FeishuOutputSink] = []
+        attachments: list[Path] = []
+        receipts: list[object | None] = []
+
+        def blocking_send(path: Path) -> None:
+            with started_lock:
+                started_paths.append(path)
+            release_workers.wait()
+
+        for index in range(3):
+            private_dir = tmp_path / f".send-{index}"
+            private_dir.mkdir()
+            attachment = private_dir / f"report-{index}.txt"
+            attachment.write_text(f"report-{index}", encoding="utf-8")
+            sink = _make_feishu_sink()
+            sink._send_file_sync = blocking_send  # type: ignore[method-assign]
+            sinks.append(sink)
+            attachments.append(attachment)
+            receipts.append(sink.queue_attachment(attachment))
+
+        running = [
+            asyncio.create_task(sinks[index].flush_attachments())
+            for index in range(2)
+        ]
+        for _attempt in range(100):
+            with started_lock:
+                started_count = len(started_paths)
+            if started_count == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        excess = asyncio.create_task(sinks[2].flush_attachments())
+        for _attempt in range(100):
+            with started_lock:
+                started_count = len(started_paths)
+            if excess.done() or started_count == 3:
+                break
+            await asyncio.sleep(0.01)
+
+        excess_finished_promptly = excess.done()
+        excess_outcome = None
+        if excess_finished_promptly:
+            excess_outcome = (await asyncio.gather(excess, return_exceptions=True))[0]
+        cleanup_transferred = sinks[2].defer_temporary_attachment_cleanup(
+            receipts[2]
+        )
+        live_workers = [
+            worker
+            for worker in threading.enumerate()
+            if worker.name == "feishu-attachment-batch" and worker.is_alive()
+        ]
+        existing_attachments = [path for path in attachments if path.exists()]
+
+        for index in range(2):
+            sinks[index].defer_temporary_attachment_cleanup(receipts[index])
+        release_workers.set()
+        if not excess.done():
+            running.append(excess)
+        await asyncio.gather(*running, return_exceptions=True)
+
+        fourth_dir = tmp_path / ".send-3"
+        fourth_dir.mkdir()
+        fourth_attachment = fourth_dir / "report-3.txt"
+        fourth_attachment.write_text("report-3", encoding="utf-8")
+        fourth_sink = _make_feishu_sink()
+        fourth_sink._send_file_sync = MagicMock()  # type: ignore[method-assign]
+        fourth_receipt = fourth_sink.queue_attachment(fourth_attachment)
+        await fourth_sink.flush_attachments()
+        fourth_cleanup_transferred = (
+            fourth_sink.defer_temporary_attachment_cleanup(fourth_receipt)
+        )
+        for _attempt in range(100):
+            remaining_workers = [
+                worker
+                for worker in threading.enumerate()
+                if worker.name == "feishu-attachment-batch" and worker.is_alive()
+            ]
+            if not remaining_workers:
+                break
+            await asyncio.sleep(0.01)
+
+        assert excess_finished_promptly is True
+        assert isinstance(excess_outcome, RuntimeError)
+        assert str(excess_outcome) == "Feishu attachment upload capacity exhausted"
+        assert cleanup_transferred is True
+        assert len(live_workers) == 2
+        assert all(worker.daemon for worker in live_workers)
+        assert existing_attachments == attachments[:2]
+        assert fourth_cleanup_transferred is True
+        assert not fourth_attachment.exists()
+        assert not fourth_dir.exists()
+        assert remaining_workers == []
+
+    asyncio.run(scenario())
+
+
+def test_feishu_batch_reserves_global_capacity_for_each_attachment(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        monkeypatch.setattr(
+            "channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            threading.BoundedSemaphore(2),
+        )
+        release_worker = threading.Event()
+        worker_started = threading.Event()
+        attempted: list[Path] = []
+
+        def blocking_send(path: Path) -> None:
+            attempted.append(path)
+            worker_started.set()
+            release_worker.wait()
+
+        first_sink = _make_feishu_sink()
+        first_sink._send_file_sync = blocking_send  # type: ignore[method-assign]
+        first_attachments: list[Path] = []
+        first_receipts: list[object | None] = []
+        for index in range(2):
+            private_dir = tmp_path / f".batch-{index}"
+            private_dir.mkdir()
+            attachment = private_dir / f"report-{index}.txt"
+            attachment.write_text(f"report-{index}", encoding="utf-8")
+            first_attachments.append(attachment)
+            first_receipts.append(first_sink.queue_attachment(attachment))
+
+        first_flush = asyncio.create_task(first_sink.flush_attachments())
+        assert await asyncio.to_thread(worker_started.wait, 1)
+
+        excess_dir = tmp_path / ".excess"
+        excess_dir.mkdir()
+        excess_attachment = excess_dir / "excess.txt"
+        excess_attachment.write_text("excess", encoding="utf-8")
+        excess_sink = _make_feishu_sink()
+        excess_sink._send_file_sync = blocking_send  # type: ignore[method-assign]
+        excess_receipt = excess_sink.queue_attachment(excess_attachment)
+        excess_flush = asyncio.create_task(excess_sink.flush_attachments())
+        for _attempt in range(100):
+            if excess_flush.done() or len(attempted) > 1:
+                break
+            await asyncio.sleep(0.01)
+
+        excess_finished_promptly = excess_flush.done()
+        excess_outcome = None
+        if excess_finished_promptly:
+            excess_outcome = (
+                await asyncio.gather(excess_flush, return_exceptions=True)
+            )[0]
+        excess_cleanup_transferred = (
+            excess_sink.defer_temporary_attachment_cleanup(excess_receipt)
+        )
+        live_workers = [
+            worker
+            for worker in threading.enumerate()
+            if worker.name == "feishu-attachment-batch" and worker.is_alive()
+        ]
+        existing_attachments = [
+            path
+            for path in (*first_attachments, excess_attachment)
+            if path.exists()
+        ]
+
+        for receipt in first_receipts:
+            first_sink.defer_temporary_attachment_cleanup(receipt)
+        release_worker.set()
+        pending = [first_flush]
+        if not excess_flush.done():
+            pending.append(excess_flush)
+        await asyncio.gather(*pending, return_exceptions=True)
+        for _attempt in range(100):
+            remaining_workers = [
+                worker
+                for worker in threading.enumerate()
+                if worker.name == "feishu-attachment-batch" and worker.is_alive()
+            ]
+            if not remaining_workers:
+                break
+            await asyncio.sleep(0.01)
+
+        assert excess_finished_promptly is True
+        assert isinstance(excess_outcome, RuntimeError)
+        assert str(excess_outcome) == "Feishu attachment upload capacity exhausted"
+        assert excess_cleanup_transferred is True
+        assert len(live_workers) == 1
+        assert existing_attachments == first_attachments
+        assert not excess_attachment.exists()
+        assert not excess_dir.exists()
+        assert remaining_workers == []
+
+    asyncio.run(scenario())
+
+
+def test_feishu_excess_command_returns_and_cleans_while_capacity_is_blocked(
+    tmp_path, monkeypatch
+):
+    async def scenario() -> None:
+        monkeypatch.setattr(
+            "channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            threading.BoundedSemaphore(1),
+        )
+        release_worker = threading.Event()
+        worker_started = threading.Event()
+
+        def blocking_send(path: Path) -> None:
+            worker_started.set()
+            release_worker.wait()
+
+        blocker_dir = tmp_path / ".blocker"
+        blocker_dir.mkdir()
+        blocker_attachment = blocker_dir / "blocker.txt"
+        blocker_attachment.write_text("blocker", encoding="utf-8")
+        blocker_sink = _make_feishu_sink()
+        blocker_sink._send_file_sync = blocking_send  # type: ignore[method-assign]
+        blocker_receipt = blocker_sink.queue_attachment(blocker_attachment)
+        blocker_flush = asyncio.create_task(blocker_sink.flush_attachments())
+        assert await asyncio.to_thread(worker_started.wait, 1)
+
+        excess_dir = tmp_path / ".excess-command"
+        excess_dir.mkdir()
+        excess_attachment = excess_dir / "excess.txt"
+        excess_attachment.write_text("excess", encoding="utf-8")
+
+        async def handler(request, context):
+            return CommandResult(
+                attachments=(excess_attachment,),
+                temporary_attachments=(excess_attachment,),
+            )
+
+        excess_sink = _make_feishu_sink()
+        excess_sink._send_file_sync = blocking_send  # type: ignore[method-assign]
+        excess_sink._send_plain_async = AsyncMock()  # type: ignore[method-assign]
+        router = CommandRouter(
+            core_commands=[CommandDescriptor("report", handler)]
+        )
+
+        class UnusedCore:
+            async def handle_turn(self, *args, **kwargs):
+                raise AssertionError("command must not forward to the model")
+
+        coordinator = CommandCoordinator(UnusedCore(), router)  # type: ignore[arg-type]
+        state = RuntimeSessionState(ctx=MagicMock(messages=[]))
+        returned_promptly = True
+        try:
+            await asyncio.wait_for(
+                coordinator.handle(
+                    TurnInput.from_text(
+                        "/report",
+                        session_id="s-1",
+                        channel_name="feishu",
+                    ),
+                    state,
+                    excess_sink,
+                ),
+                timeout=0.3,
+            )
+        except TimeoutError:
+            returned_promptly = False
+
+        excess_cleaned_while_blocked = (
+            not excess_attachment.exists() and not excess_dir.exists()
+        )
+        live_workers = [
+            worker
+            for worker in threading.enumerate()
+            if worker.name == "feishu-attachment-batch" and worker.is_alive()
+        ]
+
+        blocker_sink.defer_temporary_attachment_cleanup(blocker_receipt)
+        release_worker.set()
+        await asyncio.gather(blocker_flush, return_exceptions=True)
+        for _attempt in range(100):
+            remaining_workers = [
+                worker
+                for worker in threading.enumerate()
+                if worker.name == "feishu-attachment-batch" and worker.is_alive()
+            ]
+            if not remaining_workers:
+                break
+            await asyncio.sleep(0.01)
+
+        assert returned_promptly is True
+        assert excess_cleaned_while_blocked is True
+        assert len(live_workers) == 1
+        assert remaining_workers == []
+
+    asyncio.run(scenario())
+
+
 def test_feishu_coordinator_flushes_temp_before_cleanup(tmp_path):
     output_dir = tmp_path / "output"
     output_dir.mkdir()

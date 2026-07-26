@@ -64,6 +64,12 @@ logger = logging.getLogger(__name__)
 LARK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 FEISHU_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
 _ATTACHMENT_CANCEL_GRACE_SECONDS = 0.05
+_ATTACHMENT_MAX_IN_FLIGHT = 2
+_ATTACHMENT_BATCH_CAPACITY = threading.BoundedSemaphore(
+    _ATTACHMENT_MAX_IN_FLIGHT
+)
+_ATTACHMENT_BATCH_CAPACITY_LOCK = threading.Lock()
+_ATTACHMENT_BATCH_CAPACITY_ERROR = "Feishu attachment upload capacity exhausted"
 
 
 def _cleanup_attachment_path(path: Path) -> None:
@@ -132,6 +138,43 @@ class _AttachmentLease:
 class _QueuedAttachment:
     path: Path
     lease: _AttachmentLease
+
+
+class _AttachmentBatchCapacityLease:
+    """A fixed-size, idempotently released reservation of global capacity."""
+
+    def __init__(
+        self,
+        capacity: threading.BoundedSemaphore,
+        size: int,
+    ) -> None:
+        self._capacity = capacity
+        self._size = size
+        self._released = False
+        self._lock = threading.Lock()
+
+    @classmethod
+    def try_acquire(cls, size: int) -> "_AttachmentBatchCapacityLease | None":
+        capacity = _ATTACHMENT_BATCH_CAPACITY
+        with _ATTACHMENT_BATCH_CAPACITY_LOCK:
+            acquired = 0
+            for _index in range(size):
+                if capacity.acquire(blocking=False):
+                    acquired += 1
+                    continue
+                for _rollback in range(acquired):
+                    capacity.release()
+                return None
+        return cls(capacity, acquired)
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            with _ATTACHMENT_BATCH_CAPACITY_LOCK:
+                for _index in range(self._size):
+                    self._capacity.release()
 
 
 def build_feishu_client(config: "FeishuConfig") -> Any:
@@ -582,6 +625,14 @@ class FeishuOutputSink(OutputSink):
         self, attachments: tuple[_QueuedAttachment, ...]
     ) -> asyncio.Future[None]:
         loop = asyncio.get_running_loop()
+        capacity_lease = _AttachmentBatchCapacityLease.try_acquire(
+            len(attachments)
+        )
+        if capacity_lease is None:
+            for attachment in attachments:
+                attachment.lease.cancel_pending()
+            raise RuntimeError(_ATTACHMENT_BATCH_CAPACITY_ERROR)
+
         completion: asyncio.Future[None] = loop.create_future()
         completion.add_done_callback(self._observe_attachment_batch)
 
@@ -604,45 +655,58 @@ class FeishuOutputSink(OutputSink):
             finally:
                 for attachment in attachments:
                     attachment.lease.cancel_pending()
+                capacity_lease.release()
                 try:
                     loop.call_soon_threadsafe(publish, error)
                 except RuntimeError:
                     pass
 
-        worker = threading.Thread(
-            target=run_batch,
-            name="feishu-attachment-batch",
-            daemon=True,
-        )
+        worker: threading.Thread | None = None
         try:
+            worker = threading.Thread(
+                target=run_batch,
+                name="feishu-attachment-batch",
+                daemon=True,
+            )
             worker.start()
         except BaseException:
             for attachment in attachments:
                 attachment.lease.cancel_pending()
+            if worker is None or worker.ident is None:
+                capacity_lease.release()
             raise
         return completion
 
     async def flush_attachments(self) -> None:
         """Send and consume the attachment batch currently queued."""
 
-        await self.drain()
-        if not self._attachments:
-            return
-        queued_attachments = tuple(self._attachments)
-        completion = self._start_attachment_batch(queued_attachments)
+        queued_attachments: tuple[_QueuedAttachment, ...] = ()
+        completion: asyncio.Future[None] | None = None
         try:
+            await self.drain()
+            queued_attachments = tuple(self._attachments)
+            if not queued_attachments:
+                return
+            completion = self._start_attachment_batch(queued_attachments)
             await asyncio.shield(completion)
         except asyncio.CancelledError:
-            try:
-                await asyncio.wait(
-                    {completion},
-                    timeout=_ATTACHMENT_CANCEL_GRACE_SECONDS,
-                )
-            except asyncio.CancelledError:
-                pass
-            if not completion.done():
-                for attachment in queued_attachments:
+            if completion is not None:
+                try:
+                    await asyncio.wait(
+                        {completion},
+                        timeout=_ATTACHMENT_CANCEL_GRACE_SECONDS,
+                    )
+                except asyncio.CancelledError:
+                    pass
+            if completion is None or not completion.done():
+                pending_batch = queued_attachments or tuple(self._attachments)
+                for attachment in pending_batch:
                     attachment.lease.cancel_pending()
+            raise
+        except BaseException:
+            pending_batch = queued_attachments or tuple(self._attachments)
+            for attachment in pending_batch:
+                attachment.lease.cancel_pending()
             raise
         finally:
             self._attachments = []
