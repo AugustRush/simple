@@ -70,6 +70,12 @@ USER_PLUGINS_DIR = AGENT_HOME / "plugins"
 
 DEFAULT_MODEL = "claude-opus-4-5"
 DEFAULT_MAX_TOKENS = 8192
+
+# Default model input context window in tokens.  Used by the compaction
+# trigger to decide when working memory (ctx.messages) must be trimmed
+# before the next LLM call.  Override per-provider in config.json.
+DEFAULT_CONTEXT_WINDOW = 128_000
+
 MEMORY_TIDY_INTERVAL = 3600
 MEMORY_TIDY_FILE_THRESHOLD = 5
 DEFAULT_MAX_PARALLEL_AGENTS = 3
@@ -366,7 +372,6 @@ class _AnthropicFallbackResponse:
     stop_reason: str
     content: list[object]
 
-
 __all__ = [
     "AGENT_HOME",
     "MEMORY_DIR",
@@ -406,6 +411,7 @@ __all__ = [
     "SLEEP_TOKEN_RATIO",
     "DECAY_FACTOR",
     "RETRIEVAL_TOP_K",
+    "DEFAULT_CONTEXT_WINDOW",
     "STAGING_DIR",
     "RECENT_SESSION_TURNS",
     "PALACE_DB_FILE",

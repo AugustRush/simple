@@ -1,39 +1,47 @@
 {
   "_readme": "Copy this file to ~/.agent/config.json and fill in your API keys.",
-
   "active_provider": "anthropic",
-
   "providers": {
-    "_readme": "api_format must be 'anthropic' or 'openai'. supports_vision controls whether image attachments are sent directly to the model. api_key can be a literal value or '$ENV_VAR' to read from environment.",
-
+    "_readme": "api_format must be 'anthropic' or 'openai'. supports_vision controls whether image attachments are sent directly to the model. api_key can be a literal value or '$ENV_VAR' to read from environment. context_window controls the input context limit used by message compaction. Set higher for models with larger context windows.",
     "anthropic": {
       "api_format": "anthropic",
       "supports_vision": true,
       "api_key": "$ANTHROPIC_API_KEY",
       "default_model": "claude-opus-4-5",
-      "models": ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-3-5"],
-      "max_tokens": 8192
+      "models": [
+        "claude-opus-4-5",
+        "claude-sonnet-4-5",
+        "claude-haiku-3-5"
+      ],
+      "max_tokens": 8192,
+      "context_window": 180000
     },
-
     "openai": {
       "api_format": "openai",
       "supports_vision": true,
       "api_key": "$OPENAI_API_KEY",
       "default_model": "gpt-4o",
-      "models": ["gpt-4o", "gpt-4o-mini", "o1-preview"],
-      "max_tokens": 4096
+      "models": [
+        "gpt-4o",
+        "gpt-4o-mini",
+        "o1-preview"
+      ],
+      "max_tokens": 4096,
+      "context_window": 128000
     },
-
     "deepseek": {
       "api_format": "openai",
       "supports_vision": false,
       "api_key": "$DEEPSEEK_API_KEY",
       "base_url": "https://api.deepseek.com/v1",
       "default_model": "deepseek-chat",
-      "models": ["deepseek-chat", "deepseek-reasoner"],
-      "max_tokens": 8192
+      "models": [
+        "deepseek-chat",
+        "deepseek-reasoner"
+      ],
+      "max_tokens": 8192,
+      "context_window": 128000
     },
-
     "qwen": {
       "_readme": "Any OpenAI-compatible endpoint works — Qwen, Groq, Together, local vLLM, etc.",
       "api_format": "openai",
@@ -41,10 +49,14 @@
       "api_key": "$DASHSCOPE_API_KEY",
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "default_model": "qwen-max",
-      "models": ["qwen-max", "qwen-plus", "qwen-turbo"],
-      "max_tokens": 8192
+      "models": [
+        "qwen-max",
+        "qwen-plus",
+        "qwen-turbo"
+      ],
+      "max_tokens": 8192,
+      "context_window": 128000
     },
-
     "ollama": {
       "_readme": "Local Ollama — set api_key to any non-empty string (auth not required).",
       "api_format": "openai",
@@ -52,23 +64,25 @@
       "api_key": "ollama",
       "base_url": "http://localhost:11434/v1",
       "default_model": "qwen2.5:14b",
-      "models": ["qwen2.5:14b", "qwen2.5:7b", "llama3.2", "mistral"],
-      "max_tokens": 4096
+      "models": [
+        "qwen2.5:14b",
+        "qwen2.5:7b",
+        "llama3.2",
+        "mistral"
+      ],
+      "max_tokens": 4096,
+      "context_window": 128000
     }
   },
-
   "max_tool_call_iterations": 40,
   "_max_tool_call_iterations_readme": "Maximum model/tool exchange rounds in one turn before stopping as a possible loop. Values above the runtime cap are clamped; long workflows should make progress visible instead of raising this limit.",
-
   "memory": {
     "_readme": "tidy_interval_seconds: how often (in seconds) the agent auto-reorganises memory. tidy_file_threshold: minimum number of new memory files before a tidy is triggered.",
     "tidy_interval_seconds": 3600,
     "tidy_file_threshold": 5
   },
-
   "context": {
     "_readme": "Intelligent context manager. Split into 'storage' (what to keep) and 'consolidation' (when/how to compress).",
-
     "storage": {
       "_readme": [
         "max_categories: upper limit on dynamic LTM categories.",
@@ -79,7 +93,6 @@
       "max_categories": 15,
       "decay_factor": 0.95
     },
-
     "consolidation": {
       "_readme": [
         "token_ratio: fraction of the provider's max_tokens at which a sleep cycle fires (default 0.70).",
@@ -104,7 +117,6 @@
       }
     }
   },
-
   "assistant_identity": {
     "_readme": [
       "Optional deterministic assistant identity bootstrap.",
@@ -113,22 +125,23 @@
     "name": "",
     "role": ""
   },
-
   "mcp_servers": [
     {
       "_readme": "Remove this object and add real MCP server entries. Each entry needs name, command, and args.",
       "_example": true,
       "name": "filesystem",
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/tmp"
+      ]
     }
   ],
-
   "evolution": {
     "_readme": "Self-improvement plugin. Set enabled=false to disable session scoring and behavioral rule learning entirely.",
     "enabled": true
   },
-
   "scheduler": {
     "_readme": [
       "Persistent scheduled task service.",
@@ -138,7 +151,6 @@
     "poll_seconds": 30,
     "lease_seconds": 300
   },
-
   "audio": {
     "_readme": [
       "Optional speech-to-text command used by the built-in transcribe_audio tool.",
@@ -148,26 +160,22 @@
     ],
     "transcription_command": "$SIMPLE_AUDIO_TRANSCRIBE_COMMAND"
   },
-
   "plugins": {
     "_readme": "Per-plugin enable/disable. Use the plugin name as key. Set enabled=false to disable a plugin without removing it.",
-    "_example_disabled": { "enabled": false }
+    "_example_disabled": {
+      "enabled": false
+    }
   },
-
   "user_tools": {
     "_readme": "Disabled by default because ~/.agent/tools/*.py is trusted Python code executed in-process during startup. Set enabled=true only for tools you trust.",
     "enabled": false
   },
-
   "system_prompt_file": null,
   "_system_prompt_file_readme": "null = use the built-in prompt. Set to an absolute path to load a custom system prompt from a .md or .txt file, e.g. '/Users/you/.agent/my_prompt.md'.",
-
   "tavily_api_key": "$TAVILY_API_KEY",
   "_tavily_api_key_readme": "Optional. Used by the built-in tavily_search tool. Can be a literal key or '$ENV_VAR'. Leave empty or null to disable Tavily-backed search.",
-
   "output_dir": null,
   "_output_dir_readme": "null = use default ~/.agent/output. Set to an absolute path to override. Supports ~ and $ENV expansion. All tool/MCP/skill outputs (screenshots, exports, temp files) go here. Subdirectories are created on demand.",
-
   "channels": {
     "_readme": "External channel configuration. Only one channel may be active at a time. If no channel is enabled the CLI is used by default.",
     "feishu": {

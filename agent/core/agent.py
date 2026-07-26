@@ -153,6 +153,7 @@ class BaseAgent:
         max_tokens: int = shared.DEFAULT_MAX_TOKENS,
         api_format: str = "anthropic",
         supports_vision: bool = False,
+        context_window: int | None = None,
     ):
         self.client = client
         self.registry = registry
@@ -160,6 +161,11 @@ class BaseAgent:
         self.supports_vision = supports_vision
         self.model = model
         self.max_tokens = max_tokens
+        self.context_window = (
+            context_window
+            if context_window is not None
+            else shared.DEFAULT_CONTEXT_WINDOW
+        )
         from agent.core.transport import build_transport
         self._transport = build_transport(api_format, client)
         self.context_manager: Optional[ContextManager] = None
@@ -2151,6 +2157,16 @@ class BaseAgent:
         try:
             orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
 
+            # Compact messages *before* the first LLM call so a long
+            # conversation never exceeds the model's context window.
+            # Previously this only ran inside the tool loop (_iteration>0),
+            # which meant the first call could fail with a 400 error when
+            # accumulated messages exceeded the model's input limit.
+            if self.context_manager and self.context_manager.should_compact_messages(
+                ctx.messages, self.context_window
+            ):
+                ctx.messages = self.context_manager.compact_messages(ctx.messages)
+
             # D1: bounded tool-call loop — prevents infinite model loops
             max_tool_call_iterations = max(1, int(self.max_tool_call_iterations))
             _iteration = 0
@@ -2203,7 +2219,7 @@ class BaseAgent:
                     _iteration > 0
                     and self.context_manager
                     and self.context_manager.should_compact_messages(
-                        ctx.messages, self.max_tokens
+                        ctx.messages, self.context_window
                     )
                 ):
                     ctx.messages = self.context_manager.compact_messages(
@@ -2567,9 +2583,14 @@ class BaseAgent:
                 ctx_mgr.staging.append("assistant", assistant_content)
             if ctx_mgr.should_enqueue_consolidation():
                 ctx_mgr.enqueue_consolidation("staged_turns")
-        # Keep working memory bounded without blocking on LLM consolidation.
+        # Post-turn compaction serves two purposes:
+        # 1. Trim working memory when a session-level context manager
+        #    has a lower threshold than the agent default (multi-tenant).
+        # 2. Wake the background memory worker so staged content gets
+        #    consolidated without delaying the interactive loop.
+        # The pre-loop check in send_message handles the common case.
         if ctx_mgr and ctx_mgr.should_compact_messages(
-            ctx.messages, agent.max_tokens
+            ctx.messages, getattr(agent, "context_window", agent.max_tokens)
         ):
             ctx.messages = ctx_mgr.compact_messages(ctx.messages)
             if system_prompt:

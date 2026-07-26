@@ -122,6 +122,20 @@ async def _build_components_async(cfg: dict):
     mcp_client_cls = agent_module.MCPClient
 
     client, model, max_tokens = ModelClientFactory.from_config(cfg)
+
+    # Resolve context_window from provider config, falling back to the
+    # DEFAULT_CONTEXT_WINDOW constant.  Follows the same resolution order
+    # as max_tokens: top-level cfg key overrides provider-level key.
+    providers = cfg.get("providers", {})
+    active_name = cfg.get("active_provider", "anthropic")
+    provider_cfg = providers.get(active_name, {})
+    context_window = (
+        cfg.get("context_window")
+        or provider_cfg.get("context_window")
+    )
+    if context_window is not None:
+        context_window = int(context_window)
+
     system_prompt = _load_system_prompt(cfg)
 
     # Sub-config sections
@@ -265,6 +279,7 @@ async def _build_components_async(cfg: dict):
         max_tokens=max_tokens,
         api_format=api_format,
         supports_vision=supports_vision,
+        context_window=context_window,
     )
     agent.max_parallel_agents = max(
         1,

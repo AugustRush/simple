@@ -422,6 +422,48 @@ class StagingBuffer:
                     continue
             return msgs
 
+    def read_last(self, n: int) -> list[dict]:
+        """Return the last ``n`` staged messages (newest first in result order).
+
+        Significantly cheaper than ``read_all()`` when only the tail of a
+        large staging buffer is needed (e.g. prompt injection)."""
+        if n <= 0:
+            return []
+        with self._lock:
+            if self._sqlite_backed:
+                with self._connect() as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT role, content, ts
+                        FROM staging_turns
+                        WHERE session_id = ?
+                        ORDER BY id DESC
+                        LIMIT ?
+                        """,
+                        (self.session_id, n),
+                    ).fetchall()
+                result = [
+                    {
+                        "role": row["role"],
+                        "content": row["content"],
+                        "ts": row["ts"],
+                    }
+                    for row in reversed(rows)
+                ]
+                return result
+            if not self.path.exists():
+                return []
+            msgs = []
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msgs.append(json.loads(line))
+                except Exception:
+                    continue
+            return msgs[-n:]
+
     def count(self) -> int:
         with self._lock:
             if self._sqlite_backed:
@@ -3104,7 +3146,7 @@ class ContextManager:
 
     def _recent_session_context(self, limit: int = shared.RECENT_SESSION_TURNS) -> str:
         """Return the most recent staged turns for explicit current-session recall."""
-        staged = self.staging.read_all()
+        staged = self.staging.read_last(limit * 4)
         if not staged:
             # Staging may be empty after a restart (sleep archived turns to
             # conversation_turns).  Fall back to the durable store so the
@@ -3155,7 +3197,7 @@ class ContextManager:
         current_messages: Optional[list[dict]] = None,
         limit: int = shared.RECENT_SESSION_TURNS,
     ) -> str:
-        staged = self.staging.read_all()
+        staged = self.staging.read_last(limit * 4)
         if not staged:
             return ""
         if current_messages is None:
