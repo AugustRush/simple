@@ -30,7 +30,7 @@ import time
 import traceback
 import uuid
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -121,52 +121,34 @@ from .security.shell import (
 
 # ── Ralph Loop ────────────────────────────────────────────────────────────────
 TASKS_DIR = AGENT_HOME / "tasks"
-RALPH_COMPLETION_PROMISE = "<promise>COMPLETE</promise>"
-RALPH_DEFAULT_MAX_ITERATIONS = 10
-
-
-@dataclass
-class RalphTask:
-    """State for a Ralph-mode autonomous task iteration loop.
-
-    Persisted to ~/.agent/tasks/<id>.json after every iteration so the task
-    survives process restarts and provides an audit trail.
-    """
-
-    id: str
-    goal: str
-    completion_criteria: list
-    verify_command: Optional[str]
-    completion_promise: str
-    max_iterations: int
-    current_iteration: int = 0
-    status: str = "running"  # running | complete | max_iterations_reached
-    progress: list = field(default_factory=list)  # append-only per-iteration log
-    created_at: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.created_at:
-            self.created_at = datetime.now(timezone.utc).isoformat()
+from .ralph import (
+    RALPH_COMPLETION_PROMISE,
+    RALPH_DEFAULT_MAX_ITERATIONS,
+    RALPH_MAX_ITERATIONS,
+    RalphIterationResult,
+    RalphParseError,
+    RalphStoreError,
+    RalphTask,
+    RalphTaskStore,
+    RalphTaskStatus,
+    RalphValidationError,
+    RalphVerifier,
+    VerificationResult,
+    VerificationStatus,
+    parse_ralph_command,
+)
 
 
 def _save_ralph_task(task: RalphTask) -> None:
     """Atomically persist task state to disk."""
-    TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    _atomic_write_text(
-        TASKS_DIR / f"{task.id}.json",
-        json.dumps(asdict(task), indent=2, ensure_ascii=False),
-    )
+    RalphTaskStore(TASKS_DIR).save(task)
 
 
 def _load_ralph_task(task_id: str) -> Optional[RalphTask]:
     """Load a previously persisted task, or None if not found."""
-    path = TASKS_DIR / f"{task_id}.json"
-    if not path.exists():
-        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return RalphTask(**data)
-    except Exception:
+        return RalphTaskStore(TASKS_DIR).load(task_id)
+    except (RalphStoreError, RalphValidationError):
         return None
 
 
