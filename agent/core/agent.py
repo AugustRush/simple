@@ -323,6 +323,13 @@ class BaseAgent:
     def current_context(self) -> Optional["AgentContext"]:
         return _active_agent_context.get()
 
+    def _effective_model(self, ctx: Optional["AgentContext"] = None) -> str:
+        request_ctx = ctx or self.current_context()
+        override = (
+            request_ctx.metadata.get("model_override") if request_ctx else None
+        )
+        return str(override or self.model)
+
     def _plan_orchestration(
         self,
         ctx: AgentContext,
@@ -1048,7 +1055,7 @@ class BaseAgent:
     async def _create(self, ctx: "AgentContext", tools: list[dict]) -> Any:
         """Non-streaming API call, returns a normalised response object."""
         return await self._transport.create(
-            model=self.model,
+            model=self._effective_model(ctx),
             max_tokens=self.max_tokens,
             system=ctx.system_prompt,
             messages=ctx.messages,
@@ -1083,6 +1090,11 @@ class BaseAgent:
             messages=list(ctx.messages),
             system_prompt=ctx.system_prompt,
             tools_enabled=ctx.tools_enabled,
+            metadata={
+                key: ctx.metadata[key]
+                for key in ("model_override",)
+                if key in ctx.metadata
+            },
         )
 
     async def _continue_truncated_response(
@@ -2195,7 +2207,7 @@ class BaseAgent:
                 try:
                     response_started_at = time.perf_counter()
                     heartbeat_state["op"] = "LLM"
-                    heartbeat_state["detail"] = self.model
+                    heartbeat_state["detail"] = self._effective_model(ctx)
                     heartbeat_state["started_at"] = time.monotonic()
                     heartbeat_state["current_tool"] = None
                     if heartbeat_writer is not None:
@@ -2577,7 +2589,7 @@ class BaseAgent:
         function; the transport handles both.
         """
         return await self._transport.stream(
-            model=self.model,
+            model=self._effective_model(ctx),
             max_tokens=self.max_tokens,
             system=ctx.system_prompt,
             messages=ctx.messages,
@@ -2678,7 +2690,7 @@ class BaseAgent:
         sub_agent = BaseAgent(
             self.client,
             sub_registry,
-            model=self.model,
+            model=self._effective_model(),
             max_tokens=self.max_tokens,
             api_format=self.api_format,
             supports_vision=self.supports_vision,
@@ -2705,7 +2717,7 @@ class BaseAgent:
         in the transport — provider-specific dispatch is not the agent's job.
         """
         return await self._transport.simple_chat(
-            model=self.model,
+            model=self._effective_model(),
             max_tokens=max_tokens,
             system=system,
             prompt=prompt,

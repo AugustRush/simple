@@ -441,6 +441,26 @@ def test_agent_core_uses_live_component_prompt_for_existing_session():
     assert "Current Task Context" in observed["system_prompt"]
 
 
+def test_agent_core_replaces_request_model_metadata_for_each_session_state():
+    class _Ctx:
+        metadata = {"model_override": "stale-model"}
+
+    core = AgentCore({})
+    ctx = _Ctx()
+
+    core._publish_turn_runtime_metadata(
+        TurnInput.from_text("first", session_id="session-1"),
+        RuntimeSessionState(ctx=ctx, model_override="session-model"),
+    )
+    assert ctx.metadata["model_override"] == "session-model"
+
+    core._publish_turn_runtime_metadata(
+        TurnInput.from_text("second", session_id="session-2"),
+        RuntimeSessionState(ctx=ctx),
+    )
+    assert "model_override" not in ctx.metadata
+
+
 def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
     class _Ctx:
         agent_id = "ctx-1"

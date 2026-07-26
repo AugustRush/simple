@@ -917,7 +917,8 @@ def test_builtin_model_lists_validates_and_updates_session_override() -> None:
             "test": {"default_model": "model-a", "models": ["model-a", "model-b"]}
         },
     }
-    components = {"agent": SimpleNamespace(model="model-a")}
+    agent = SimpleNamespace(model="model-a")
+    components = {"agent": agent}
 
     listed = _run_builtin(
         router, "/model", config=config, components=components, state=state
@@ -939,6 +940,56 @@ def test_builtin_model_lists_validates_and_updates_session_override() -> None:
     )
     assert rejected.level == "error"
     assert state.model_override == "model-b"
+    assert agent.model == "model-a"
+
+
+def test_builtin_model_uses_active_provider_default_when_models_are_absent() -> None:
+    router = _builtin_router()
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(messages=[]),
+        model_override=None,
+    )
+    config = {
+        "active_provider": "primary",
+        "providers": {
+            "primary": {"default_model": "primary-default"},
+            "secondary": {
+                "default_model": "secondary-default",
+                "models": ["secondary-default", "secondary-extra"],
+            },
+        },
+    }
+    agent = SimpleNamespace(model="primary-default")
+
+    listed = _run_builtin(
+        router,
+        "/model",
+        config=config,
+        components={"agent": agent},
+        state=state,
+    )
+    switched = _run_builtin(
+        router,
+        "/model primary-default",
+        config=config,
+        components={"agent": agent},
+        state=state,
+    )
+    rejected = _run_builtin(
+        router,
+        "/model secondary-extra",
+        config=config,
+        components={"agent": agent},
+        state=state,
+    )
+
+    assert listed.response_text == "## Models\n\n- primary-default (active)"
+    assert switched.response_text == (
+        "Switched to model: primary-default (session only)"
+    )
+    assert rejected.level == "error"
+    assert state.model_override == "primary-default"
+    assert agent.model == "primary-default"
 
 
 def test_builtin_quit_is_cli_only_and_returns_exit_action() -> None:

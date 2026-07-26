@@ -4905,6 +4905,60 @@ def test_send_message_writes_runtime_heartbeat_without_polluting_messages(
     assert not any("heartbeat" in json.dumps(message).lower() for message in ctx.messages)
 
 
+def test_send_message_heartbeat_reports_request_model_override(monkeypatch):
+    import agent as agent_module
+    from agent.core.output import _active_sink
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    response = agent_module.shared._OAIResponse(
+        [
+            agent_module.shared._OAIChoice(
+                "stop",
+                agent_module.shared._OAIMsg("done", None),
+            )
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        await asyncio.sleep(0.03)
+        return response
+
+    class _Sink:
+        def __init__(self):
+            self.details = []
+
+        def on_heartbeat(self, **kwargs):
+            self.details.append(kwargs["op_detail"])
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={
+            "model_override": "request-model",
+            "heartbeat_interval": 0.01,
+        },
+    )
+    sink = _Sink()
+
+    async def _run():
+        token = _active_sink.set(sink)
+        try:
+            return await agent.send_message(ctx, "hello")
+        finally:
+            _active_sink.reset(token)
+
+    result = asyncio.run(_run())
+
+    assert result.content == "done"
+    assert "request-model" in sink.details
+    assert agent.model == "configured-model"
+
+
 def test_openai_transport_recovers_malformed_tool_arguments():
     import agent as agent_module
     from agent.core.transport import OpenAITransport
@@ -5778,6 +5832,207 @@ def test_stream_response_propagates_stream_failures():
         asyncio.run(agent._stream_response(ctx, [], lambda chunk: None))
 
 
+def test_base_agent_effective_model_prefers_request_context_override():
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    default_ctx = agent_module.AgentContext(system_prompt="system")
+    override_ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": "request-model"},
+    )
+
+    assert agent._effective_model(default_ctx) == "configured-model"
+    assert agent._effective_model(override_ctx) == "request-model"
+    assert agent.model == "configured-model"
+
+
+def test_agent_core_isolates_concurrent_session_model_overrides():
+    import agent as agent_module
+    from agent.runtime import AgentCore, RuntimeSessionState, TurnInput
+
+    class _ConcurrentTransport:
+        def __init__(self):
+            self.calls = []
+            self.both_started = asyncio.Event()
+
+        async def create(self, **kwargs):
+            self.calls.append((kwargs["model"], kwargs["messages"][-1]["content"]))
+            if len(self.calls) == 2:
+                self.both_started.set()
+            await self.both_started.wait()
+            return kwargs["model"]
+
+        @staticmethod
+        def parse_response(response):
+            return "end_turn", f"reply from {response}", []
+
+        @staticmethod
+        def completion_error(response):
+            return None
+
+        @staticmethod
+        def build_final_message(response, text):
+            return {"role": "assistant", "content": text}
+
+    async def _run():
+        agent = agent_module.BaseAgent(
+            object(),
+            agent_module.ToolRegistry(),
+            model="configured-model",
+            api_format="openai",
+        )
+        transport = _ConcurrentTransport()
+        agent._transport = transport
+        core = AgentCore(
+            {
+                "agent": agent,
+                "system_prompt": "system",
+                "post_turn_maintenance": lambda **kwargs: None,
+            }
+        )
+        states = [
+            RuntimeSessionState(
+                ctx=agent_module.AgentContext(system_prompt="system"),
+                model_override=model,
+            )
+            for model in ("session-model-a", "session-model-b")
+        ]
+
+        executions = await asyncio.gather(
+            *(
+                core.handle_turn(
+                    TurnInput.from_text(
+                        f"request-{index}",
+                        session_id=f"session-{index}",
+                        metadata={"heartbeat_enabled": False},
+                    ),
+                    state,
+                )
+                for index, state in enumerate(states)
+            )
+        )
+        return agent, transport, executions
+
+    agent, transport, executions = asyncio.run(_run())
+
+    assert sorted(transport.calls) == [
+        ("session-model-a", "request-0"),
+        ("session-model-b", "request-1"),
+    ]
+    assert sorted(execution.result.text for execution in executions) == [
+        "reply from session-model-a",
+        "reply from session-model-b",
+    ]
+    assert agent.model == "configured-model"
+
+
+def test_sub_agent_construction_uses_active_request_model_override():
+    import agent as agent_module
+    from agent.core.agent import _active_agent_context
+
+    parent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    active_ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": "request-model"},
+    )
+
+    token = _active_agent_context.set(active_ctx)
+    try:
+        child = parent._create_sub_agent(agent_module.ToolRegistry())
+    finally:
+        _active_agent_context.reset(token)
+
+    assert child.model == "request-model"
+    assert parent.model == "configured-model"
+
+
+def test_lightweight_llm_call_uses_active_request_model_override():
+    import agent as agent_module
+    from agent.core.agent import _active_agent_context
+
+    class _Transport:
+        def __init__(self):
+            self.model = None
+
+        async def simple_chat(self, **kwargs):
+            self.model = kwargs["model"]
+            return "summary"
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    transport = _Transport()
+    agent._transport = transport
+    active_ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": "request-model"},
+    )
+
+    async def _run():
+        token = _active_agent_context.set(active_ctx)
+        try:
+            return await agent._call_llm("prompt", system="system")
+        finally:
+            _active_agent_context.reset(token)
+
+    assert asyncio.run(_run()) == "summary"
+    assert transport.model == "request-model"
+    assert agent.model == "configured-model"
+
+
+def test_truncation_continuation_preserves_request_model_override():
+    import agent as agent_module
+
+    class _Transport:
+        def __init__(self):
+            self.models = []
+
+        async def create(self, **kwargs):
+            self.models.append(kwargs["model"])
+            return object()
+
+        @staticmethod
+        def parse_response(response):
+            return "end_turn", " continued", []
+
+        @staticmethod
+        def completion_error(response):
+            return None
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    transport = _Transport()
+    agent._transport = transport
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": "request-model"},
+    )
+
+    text, error = asyncio.run(agent._continue_truncated_response(ctx, "partial"))
+
+    assert error is None
+    assert text == "partial continued"
+    assert transport.models == ["request-model"]
+
+
 def test_stream_response_supports_async_stream_callback():
     import agent as agent_module
 
@@ -5832,6 +6087,36 @@ def test_stream_response_supports_async_stream_callback():
     assert isinstance(response, _FakeFinalMessage)
     assert text == "hello world"
     assert seen == ["hello", " world"]
+
+
+def test_stream_response_uses_request_model_override():
+    import agent as agent_module
+
+    class _Transport:
+        def __init__(self):
+            self.model = None
+
+        async def stream(self, **kwargs):
+            self.model = kwargs["model"]
+            return object(), "done"
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    transport = _Transport()
+    agent._transport = transport
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": "request-model"},
+    )
+
+    asyncio.run(agent._stream_response(ctx, [], lambda chunk: None))
+
+    assert transport.model == "request-model"
+    assert agent.model == "configured-model"
 
 
 def test_turn_runner_appends_attachment_context_for_text_model(tmp_path):
