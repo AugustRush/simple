@@ -969,6 +969,7 @@ def test_builtin_registration_defines_portable_scope_and_concurrency() -> None:
         "send": ("anytime", frozenset({"feishu"})),
         "cancel": ("interrupt", frozenset({"all"})),
         "now": ("interrupt", frozenset({"all"})),
+        "ralph": ("idle_only", frozenset({"all"})),
     }
 
     for name, policy in expected.items():
@@ -981,7 +982,9 @@ def test_builtin_registration_defines_portable_scope_and_concurrency() -> None:
     assert router.classify("/exit", channel_name="cli").descriptor.name == "quit"
     assert router.classify("/q", channel_name="cli").descriptor.name == "quit"
     assert router.classify("/history", channel_name="cli").descriptor.name == "sessions"
-    assert router.classify("/ralph", channel_name="cli").kind == "unknown_slash"
+    ralph = router.classify("/ralph", channel_name="cli")
+    assert ralph.kind == "command"
+    assert ralph.descriptor.accepts_interjections is True
 
 
 def test_builtin_help_uses_live_descriptors_and_channel_scope() -> None:
@@ -997,6 +1000,111 @@ def test_builtin_help_uses_live_descriptors_and_channel_scope() -> None:
     assert feishu_help is not None
     assert "/send <path>" in feishu_help
     assert "/quit" not in feishu_help
+
+
+def test_builtin_ralph_maps_start_list_resume_and_parse_errors():
+    from agent.ralph import (
+        RalphRunResult,
+        RalphTask,
+        RalphTaskAmbiguousError,
+        RalphTaskStatus,
+    )
+
+    class Service:
+        def __init__(self):
+            self.calls = []
+
+        async def start(self, goal, session_state, *, max_iterations, verify_command, observer=None):
+            self.calls.append(("start", goal, max_iterations, verify_command, session_state, observer))
+            task = RalphTask(id="new-task", goal=goal, max_iterations=max_iterations)
+            task.status = RalphTaskStatus.COMPLETE
+            return RalphRunResult(task)
+
+        async def resume(self, task_ref, session_state, *, observer=None):
+            self.calls.append(("resume", task_ref, session_state, observer))
+            if task_ref == "abc":
+                raise RalphTaskAmbiguousError("abc", ("abc1", "abc2"))
+            return RalphRunResult(RalphTask(id="resumed", goal="old"))
+
+        def list_tasks(self):
+            return [RalphTask(id="listed", goal="existing")]
+
+    service = Service()
+    router = _builtin_router()
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(messages=[]),
+        model_override=None,
+        cancel_token=None,
+        pending_interjections=[],
+    )
+
+    started = _run_builtin(
+        router,
+        "/ralph Build Feature --max 4 --verify 'pytest -q'",
+        components={"ralph_service": service},
+        state=state,
+    )
+    listed = _run_builtin(
+        router,
+        "/ralph list",
+        components={"ralph_service": service},
+        state=state,
+    )
+    resumed = _run_builtin(
+        router,
+        "/ralph resume resumed",
+        components={"ralph_service": service},
+        state=state,
+    )
+    ambiguous = _run_builtin(
+        router,
+        "/ralph resume abc",
+        components={"ralph_service": service},
+        state=state,
+    )
+    invalid = _run_builtin(
+        router,
+        "/ralph goal --max nope",
+        components={"ralph_service": service},
+        state=state,
+    )
+
+    assert service.calls[0][0:4] == ("start", "Build Feature", 4, "pytest -q")
+    assert service.calls[1][0:2] == ("resume", "resumed")
+    assert "complete" in started.response_text.lower()
+    assert "listed" in listed.response_text and "existing" in listed.response_text
+    assert "resumed" in resumed.response_text.lower()
+    assert ambiguous.level == "error" and "ambiguous" in ambiguous.response_text.lower()
+    assert invalid.level == "error" and "--max" in invalid.response_text
+
+
+def test_ralph_command_coordinator_regression_does_not_crash():
+    from agent.ralph import RalphRunResult, RalphTask
+
+    class Service:
+        async def start(self, goal, session_state, **kwargs):
+            assert goal == "demo task"
+            return RalphRunResult(RalphTask(id="demo", goal=goal))
+
+    router = _builtin_router()
+    coordinator, core = _coordinator(
+        router,
+        components={"ralph_service": Service()},
+    )
+    state = RuntimeSessionState(ctx=SimpleNamespace(messages=[], metadata={}))
+    sink = _CoordinatorSink()
+
+    asyncio.run(
+        coordinator.handle(
+            TurnInput.from_text("/ralph demo task", session_id="s-1"),
+            state,
+            sink,  # type: ignore[arg-type]
+        )
+    )
+
+    assert core.calls == []
+    assert sink.errors == []
+    assert any("demo" in text for text, _ in sink.statuses)
 
 
 def test_builtin_memory_and_context_render_read_only_summaries() -> None:

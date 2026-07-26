@@ -14,6 +14,81 @@ from agent import shared
 from .models import CommandContext, CommandDescriptor, CommandRequest, CommandResult
 from .router import CommandRouter
 
+
+def _ralph_service(context: CommandContext) -> Any:
+    return _component(context, "ralph_service")
+
+
+def _ralph_observer(context: CommandContext):
+    def observe(event: Any) -> None:
+        status = getattr(event, "status", "")
+        status_text = getattr(status, "value", str(status))
+        context.sink.on_status(
+            f"Ralph {event.task_id} | {status_text} | "
+            f"iteration {event.iteration}/{event.max_iterations}"
+        )
+
+    return observe
+
+
+async def _ralph_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    from agent.ralph import (
+        RalphParseError,
+        RalphListCommand,
+        RalphResumeCommand,
+        RalphRunResult,
+        RalphStoreError,
+        RalphValidationError,
+        parse_ralph_command,
+    )
+
+    service = _ralph_service(context)
+    if service is None:
+        return _error("Ralph service is unavailable.")
+    try:
+        parsed = parse_ralph_command(request.args)
+        if isinstance(parsed, RalphListCommand):
+            tasks = service.list_tasks()
+            if not tasks:
+                return CommandResult(response_text="No Ralph tasks found.")
+            lines = ["Ralph tasks:"]
+            lines.extend(
+                f"- `{task.id}` | {task.status.value} | "
+                f"{task.current_iteration}/{task.max_iterations} | {task.goal}"
+                for task in tasks
+            )
+            return CommandResult(response_text="\n".join(lines))
+        observer = _ralph_observer(context)
+        if isinstance(parsed, RalphResumeCommand):
+            outcome = await service.resume(
+                parsed.task_id_prefix,
+                context.session_state,
+                observer=observer,
+            )
+        else:
+            outcome = await service.start(
+                parsed.goal,
+                context.session_state,
+                max_iterations=parsed.max_iterations,
+                verify_command=parsed.verify_command,
+                observer=observer,
+            )
+        if not isinstance(outcome, RalphRunResult):
+            return _error("Ralph service returned an invalid result.")
+        if outcome.durability_error:
+            return _error(outcome.durability_error)
+        task = outcome.task
+        return CommandResult(
+            response_text=(
+                f"Ralph `{task.id}` {task.status.value} after "
+                f"{task.current_iteration}/{task.max_iterations} iteration(s)."
+            )
+        )
+    except (RalphParseError, RalphStoreError, RalphValidationError) as exc:
+        return _error(str(exc))
+
 _DEFAULT_MAX_SEND_SNAPSHOT_BYTES = 32 * 1024 * 1024
 
 
@@ -811,6 +886,14 @@ def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]
             usage="/now <message>",
             description="Apply an urgent interjection or start it next",
             concurrency="interrupt",
+        ),
+        CommandDescriptor(
+            "ralph",
+            _ralph_handler,
+            usage='/ralph <goal> [--max N] [--verify "command"]',
+            description="Run or resume an autonomous Ralph task",
+            concurrency="idle_only",
+            accepts_interjections=True,
         ),
     )
 

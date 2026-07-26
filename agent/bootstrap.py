@@ -17,6 +17,7 @@ from agent.config import (
 from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime import AgentCore, TurnRunner
+from agent.ralph import RalphIterationResult, RalphService, RalphTaskStore, RalphVerifier
 from agent.skills.catalog import SkillCatalog
 from agent.tools.builtin_tools import BuiltinTools
 from agent.tools.runtime import MCPClient, ToolRegistry, UserToolCatalog
@@ -385,6 +386,38 @@ async def _build_components_async(cfg: dict):
         "mcp_status": mcp_status,
         "mcp_task": None,
     }
+
+    async def _execute_ralph_iteration(
+        iter_ctx: Any,
+        prompt: str,
+        *,
+        cancel_token: Any = None,
+        model_override: str | None = None,
+    ) -> RalphIterationResult:
+        result = await agent.send_message(iter_ctx, prompt)
+        return RalphIterationResult(
+            iteration=1,
+            summary=result.content or "",
+            tool_calls=tuple(result.tool_calls_made or ()),
+            error=result.error,
+        )
+
+    def _new_ralph_context() -> Any:
+        iter_ctx = agent_module.AgentContext(system_prompt=system_prompt)
+        iter_ctx.metadata["skill_catalog"] = skill_catalog
+        return iter_ctx
+
+    components["ralph_service"] = RalphService(
+        turn_executor=_execute_ralph_iteration,
+        store=RalphTaskStore(agent_module.TASKS_DIR),
+        verifier=RalphVerifier(
+            workspace_root=workspace_root,
+            output_dir=output_dir,
+            blocked_commands=tuple(cfg.get("shell_blocked_commands", ())),
+        ),
+        context_factory=_new_ralph_context,
+        context_manager=ctx_manager,
+    )
     components["turn_runner"] = TurnRunner(components)
     components["agent_core"] = AgentCore(components)
     # Stash references so builtin tools (install_plugin / uninstall_plugin /

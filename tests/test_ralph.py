@@ -6,6 +6,7 @@ import os
 import pytest
 import signal
 import time
+from types import SimpleNamespace
 
 
 def test_parser_builds_typed_start_command_from_quoted_tokens():
@@ -613,3 +614,438 @@ def test_verifier_force_cancellation_kills_process_group_without_grace(
                 os.kill(child_pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+
+
+class _RalphMemoryStore:
+    def __init__(self, task=None, *, fail_on_save: int | None = None):
+        self.task = task
+        self.saved = []
+        self.fail_on_save = fail_on_save
+
+    def save(self, task):
+        from agent.ralph import RalphTaskStoreIOError
+
+        if self.fail_on_save is not None and len(self.saved) + 1 == self.fail_on_save:
+            raise RalphTaskStoreIOError("save", "disk unavailable")
+        snapshot = type(task).from_dict(task.to_dict())
+        self.saved.append(snapshot)
+        self.task = snapshot
+
+    def load(self, task_ref):
+        return type(self.task).from_dict(self.task.to_dict())
+
+
+def _ralph_state(*, token=None, model="session-model", pending=None):
+    return SimpleNamespace(
+        cancel_token=token,
+        model_override=model,
+        pending_interjections=pending if pending is not None else [],
+    )
+
+
+def test_ralph_service_completes_by_promise_without_verifier():
+    from agent.ralph import (
+        RALPH_COMPLETION_PROMISE,
+        RalphIterationResult,
+        RalphService,
+        RalphTask,
+        RalphTaskStatus,
+    )
+
+    store = _RalphMemoryStore()
+
+    async def execute(context, prompt, *, cancel_token, model_override):
+        assert cancel_token is None
+        assert model_override == "session-model"
+        return RalphIterationResult(1, f"done {RALPH_COMPLETION_PROMISE}", ("write",))
+
+    task = RalphTask(id="promise", goal="finish the work", max_iterations=3)
+    store.save(task)
+    result = asyncio.run(
+        RalphService(turn_executor=execute, store=store).run(task, _ralph_state())
+    )
+
+    assert result.durability_error is None
+    assert result.task.status is RalphTaskStatus.COMPLETE
+    assert result.task.current_iteration == 1
+    assert result.task.iterations[-1].completed_by == "promise"
+
+
+def test_ralph_service_verifier_is_authoritative_and_feeds_diagnostics_forward():
+    from agent.ralph import (
+        RALPH_COMPLETION_PROMISE,
+        RalphIterationResult,
+        RalphService,
+        RalphTask,
+        RalphTaskStatus,
+        VerificationResult,
+        VerificationStatus,
+    )
+
+    prompts = []
+    verification = iter(
+        [
+            VerificationResult(
+                VerificationStatus.FAILED,
+                exit_code=7,
+                stderr_tail="first failure",
+            ),
+            VerificationResult(VerificationStatus.PASSED, exit_code=0),
+        ]
+    )
+
+    async def execute(context, prompt, **kwargs):
+        prompts.append(prompt)
+        return RalphIterationResult(
+            len(prompts), f"claimed {RALPH_COMPLETION_PROMISE}"
+        )
+
+    class Verifier:
+        async def verify(self, command, *, cancel_token=None):
+            assert command == "pytest -q"
+            return next(verification)
+
+    task = RalphTask(
+        id="verify",
+        goal="pass tests",
+        verify_command="pytest -q",
+        max_iterations=3,
+    )
+    store = _RalphMemoryStore()
+    store.save(task)
+    result = asyncio.run(
+        RalphService(turn_executor=execute, store=store, verifier=Verifier()).run(
+            task, _ralph_state()
+        )
+    )
+
+    assert result.task.status is RalphTaskStatus.COMPLETE
+    assert result.task.current_iteration == 2
+    assert result.task.iterations[0].completed_by is None
+    assert result.task.iterations[1].completed_by == "verify_command"
+    assert "first failure" in prompts[1]
+
+
+@pytest.mark.parametrize("verification_status", ["timeout", "failed"])
+def test_ralph_service_nonpassing_verifier_reaches_iteration_limit(
+    verification_status,
+):
+    from agent.ralph import (
+        RalphIterationResult,
+        RalphService,
+        RalphTask,
+        RalphTaskStatus,
+        VerificationResult,
+        VerificationStatus,
+    )
+
+    status = VerificationStatus(verification_status)
+
+    async def execute(context, prompt, **kwargs):
+        return RalphIterationResult(1, "not yet")
+
+    class Verifier:
+        async def verify(self, command, *, cancel_token=None):
+            return VerificationResult(
+                status,
+                exit_code=2 if status is VerificationStatus.FAILED else None,
+                error="timed out" if status is VerificationStatus.TIMEOUT else None,
+            )
+
+    task = RalphTask(
+        id=f"limit-{verification_status}",
+        goal="work",
+        verify_command="pytest",
+        max_iterations=1,
+    )
+    store = _RalphMemoryStore()
+    store.save(task)
+    result = asyncio.run(
+        RalphService(turn_executor=execute, store=store, verifier=Verifier()).run(
+            task, _ralph_state()
+        )
+    )
+
+    assert result.task.status is RalphTaskStatus.MAX_ITERATIONS_REACHED
+    assert result.task.iterations[0].verification.status is status
+
+
+@pytest.mark.parametrize("failure_source", ["return", "raise", "verifier"])
+def test_ralph_service_persists_infrastructure_failures(failure_source):
+    from agent.ralph import (
+        RalphIterationResult,
+        RalphService,
+        RalphTask,
+        RalphTaskStatus,
+        VerificationResult,
+        VerificationStatus,
+    )
+
+    async def execute(context, prompt, **kwargs):
+        if failure_source == "raise":
+            raise RuntimeError("transport exploded")
+        return RalphIterationResult(
+            1,
+            "partial",
+            error="provider failed" if failure_source == "return" else None,
+        )
+
+    class Verifier:
+        async def verify(self, command, *, cancel_token=None):
+            return VerificationResult(
+                VerificationStatus.SETUP_ERROR,
+                error="spawn failed",
+            )
+
+    task = RalphTask(
+        id=f"failure-{failure_source}",
+        goal="work",
+        verify_command="pytest" if failure_source == "verifier" else None,
+    )
+    store = _RalphMemoryStore()
+    store.save(task)
+    result = asyncio.run(
+        RalphService(
+            turn_executor=execute,
+            store=store,
+            verifier=Verifier() if failure_source == "verifier" else None,
+        ).run(task, _ralph_state())
+    )
+
+    assert result.task.status is RalphTaskStatus.FAILED
+    assert store.task.status is RalphTaskStatus.FAILED
+    assert result.task.last_error
+
+
+def test_ralph_service_cancellation_is_interrupted_and_durable():
+    from agent.ralph import RalphService, RalphTask, RalphTaskStatus
+    from agent.shared import CancelToken
+
+    token = CancelToken()
+    token.cancel("graceful")
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("cancelled run executed a turn")
+
+    task = RalphTask(id="cancelled", goal="work")
+    store = _RalphMemoryStore()
+    store.save(task)
+    result = asyncio.run(
+        RalphService(turn_executor=forbidden, store=store).run(
+            task, _ralph_state(token=token)
+        )
+    )
+
+    assert result.task.status is RalphTaskStatus.INTERRUPTED
+    assert store.task.status is RalphTaskStatus.INTERRUPTED
+    assert result.task.current_iteration == 0
+
+
+def test_ralph_service_caller_cancellation_persists_before_returning():
+    from agent.ralph import RalphService, RalphTask, RalphTaskStatus
+
+    entered = asyncio.Event()
+
+    async def execute(context, prompt, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    task = RalphTask(id="caller-cancel", goal="work")
+    store = _RalphMemoryStore()
+    store.save(task)
+
+    async def scenario():
+        pending = asyncio.create_task(
+            RalphService(turn_executor=execute, store=store).run(
+                task, _ralph_state()
+            )
+        )
+        await entered.wait()
+        pending.cancel()
+        asyncio.get_running_loop().call_soon(pending.cancel)
+        return await pending
+
+    result = asyncio.run(scenario())
+
+    assert result.task.status is RalphTaskStatus.INTERRUPTED
+    assert store.task.status is RalphTaskStatus.INTERRUPTED
+
+
+def test_ralph_service_internal_setup_exception_becomes_durable_failure():
+    from agent.ralph import RalphService, RalphTask, RalphTaskStatus
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("turn executor should not be reached")
+
+    def broken_context():
+        raise RuntimeError("context setup failed")
+
+    task = RalphTask(id="setup-failure", goal="work")
+    store = _RalphMemoryStore()
+    store.save(task)
+    result = asyncio.run(
+        RalphService(
+            turn_executor=forbidden,
+            store=store,
+            context_factory=broken_context,
+        ).run(task, _ralph_state())
+    )
+
+    assert result.task.status is RalphTaskStatus.FAILED
+    assert store.task.status is RalphTaskStatus.FAILED
+    assert "context setup failed" in result.task.last_error
+
+
+def test_ralph_service_persists_before_observer_and_ignores_observer_errors():
+    from agent.ralph import RalphIterationResult, RalphService, RalphTask
+
+    store = _RalphMemoryStore()
+    observed = []
+
+    async def execute(context, prompt, **kwargs):
+        return RalphIterationResult(1, "continue")
+
+    def observer(event):
+        observed.append((event.kind, store.task.current_iteration, store.task.status))
+        raise RuntimeError("delivery failed")
+
+    task = RalphTask(id="observer", goal="work", max_iterations=1)
+    store.save(task)
+    result = asyncio.run(
+        RalphService(turn_executor=execute, store=store, observer=observer).run(
+            task, _ralph_state()
+        )
+    )
+
+    assert result.durability_error is None
+    assert observed[0][1] == 1
+    assert observed[-1][2].value == "max_iterations_reached"
+
+
+def test_ralph_service_store_failure_returns_last_durable_truth():
+    from agent.ralph import RalphIterationResult, RalphService, RalphTask, RalphTaskStatus
+
+    async def execute(context, prompt, **kwargs):
+        return RalphIterationResult(1, "<promise>COMPLETE</promise>")
+
+    task = RalphTask(id="durability", goal="work")
+    store = _RalphMemoryStore(fail_on_save=2)
+    store.save(task)
+    result = asyncio.run(
+        RalphService(turn_executor=execute, store=store).run(task, _ralph_state())
+    )
+
+    assert result.durability_error and "disk unavailable" in result.durability_error
+    assert result.task.status is RalphTaskStatus.RUNNING
+    assert result.task.current_iteration == 0
+
+
+def test_ralph_service_resume_starts_after_durable_cursor_and_rejects_terminal():
+    from agent.ralph import (
+        RalphIterationResult,
+        RalphService,
+        RalphTask,
+        RalphTaskStatus,
+        RalphValidationError,
+    )
+
+    seen = []
+
+    async def execute(context, prompt, **kwargs):
+        seen.append(prompt)
+        return RalphIterationResult(3, "done <promise>COMPLETE</promise>")
+
+    task = RalphTask(
+        id="resume",
+        goal="work",
+        current_iteration=2,
+        max_iterations=4,
+    )
+    store = _RalphMemoryStore(task)
+    result = asyncio.run(
+        RalphService(turn_executor=execute, store=store).resume(
+            "resume", _ralph_state()
+        )
+    )
+    assert result.task.current_iteration == 3
+    assert "iteration 3 of 4" in seen[0].lower()
+
+    for status in (RalphTaskStatus.COMPLETE, RalphTaskStatus.MAX_ITERATIONS_REACHED):
+        store.task.status = status
+        with pytest.raises(RalphValidationError) as exc_info:
+            asyncio.run(
+                RalphService(turn_executor=execute, store=store).resume(
+                    "resume", _ralph_state()
+                )
+            )
+        assert exc_info.value.code == "task_not_resumable"
+
+
+def test_ralph_service_interjections_keep_shared_queue_identity_and_order():
+    from agent.ralph import RalphIterationResult, RalphService, RalphTask
+
+    pending = [
+        {"text": "first", "urgency": "normal"},
+        {"text": "second", "urgency": "urgent"},
+    ]
+    queue_id = id(pending)
+    prompts = []
+
+    async def execute(context, prompt, **kwargs):
+        prompts.append(prompt)
+        assert context.metadata["pending_messages"] is pending
+        assert id(context.metadata["pending_messages"]) == queue_id
+        if len(prompts) == 1:
+            pending.append({"text": "during turn", "urgency": "normal"})
+        return RalphIterationResult(len(prompts), "continue")
+
+    task = RalphTask(id="mailbox", goal="work", max_iterations=2)
+    store = _RalphMemoryStore()
+    store.save(task)
+    asyncio.run(
+        RalphService(turn_executor=execute, store=store).run(
+            task, _ralph_state(pending=pending)
+        )
+    )
+
+    assert "first" in prompts[0] and "second" in prompts[0]
+    assert prompts[0].index("first") < prompts[0].index("second")
+    assert "urgent" in prompts[0]
+    assert "during turn" in prompts[1]
+    assert pending == []
+
+
+def test_ralph_service_stages_memory_once_after_run():
+    from agent.ralph import RalphIterationResult, RalphService, RalphTask
+
+    class Staging:
+        def __init__(self):
+            self.entries = []
+
+        def append(self, role, content):
+            self.entries.append((role, content))
+
+    manager = SimpleNamespace(
+        staging=Staging(),
+        mark_activity=lambda: None,
+        should_enqueue_consolidation=lambda: True,
+        enqueue_consolidation=lambda reason: manager.jobs.append(reason),
+        jobs=[],
+    )
+
+    async def execute(context, prompt, **kwargs):
+        return RalphIterationResult(1, "done <promise>COMPLETE</promise>")
+
+    task = RalphTask(id="memory", goal="work")
+    store = _RalphMemoryStore()
+    store.save(task)
+    asyncio.run(
+        RalphService(
+            turn_executor=execute,
+            store=store,
+            context_manager=manager,
+        ).run(task, _ralph_state())
+    )
+
+    assert [role for role, _ in manager.staging.entries] == ["user", "assistant"]
+    assert manager.jobs == ["ralph_task_end"]

@@ -33,6 +33,13 @@ from .store import (
     RalphTaskStoreIOError,
     TaskNotFoundError,
 )
+from .service import (
+    RALPH_DIAGNOSTIC_LIMIT,
+    RALPH_SUMMARY_LIMIT,
+    RalphProgressEvent,
+    RalphRunResult,
+    RalphService,
+)
 from .verify import (
     RALPH_DEFAULT_VERIFY_TIMEOUT_SECONDS,
     RALPH_VERIFICATION_OUTPUT_LIMIT,
@@ -44,9 +51,11 @@ __all__ = [
     "RALPH_COMPLETION_PROMISE",
     "RALPH_DEFAULT_MAX_ITERATIONS",
     "RALPH_DEFAULT_VERIFY_TIMEOUT_SECONDS",
+    "RALPH_DIAGNOSTIC_LIMIT",
     "RALPH_MAX_ITERATIONS",
     "RALPH_MAX_PROGRESS_ENTRIES",
     "RALPH_MAX_TASK_FILE_BYTES",
+    "RALPH_SUMMARY_LIMIT",
     "RALPH_VERIFICATION_OUTPUT_LIMIT",
     "RALPH_VERIFY_ENV_ALLOWLIST",
     "AmbiguousTaskIdError",
@@ -54,9 +63,12 @@ __all__ = [
     "RalphIterationResult",
     "RalphListCommand",
     "RalphParseError",
+    "RalphProgressEvent",
     "RalphParsedCommand",
     "RalphResumeCommand",
     "RalphStartCommand",
+    "RalphRunResult",
+    "RalphService",
     "RalphStoreError",
     "RalphTask",
     "RalphTaskAmbiguousError",
