@@ -407,23 +407,29 @@ class AgentCore:
             return
         import agent as agent_module
 
-        base_prompt = (
-            state.base_system_prompt_override
-            if state.base_system_prompt_override is not None
-            else self._components.values.get("base_system_prompt", "")
-        )
-        refreshed = agent_module._compose_system_prompt(
-            base_prompt,
+        shared_refreshed = agent_module._compose_system_prompt(
+            self._components.values.get("base_system_prompt", ""),
             self._components.values.get("registry"),
             self._components.values.get("workspace_root"),
             self._components.values.get("output_dir"),
             skill_catalog=skill_catalog,
             plugin_catalog=self._plugin_catalog(),
         )
+        if isinstance(self._components.values, dict):
+            self._components.values["system_prompt"] = shared_refreshed
+
         if state.base_system_prompt_override is not None:
+            refreshed = agent_module._compose_system_prompt(
+                state.base_system_prompt_override,
+                self._components.values.get("registry"),
+                self._components.values.get("workspace_root"),
+                self._components.values.get("output_dir"),
+                skill_catalog=skill_catalog,
+                plugin_catalog=self._plugin_catalog(),
+            )
             state.system_prompt_override = refreshed
-        elif isinstance(self._components.values, dict):
-            self._components.values["system_prompt"] = refreshed
+        else:
+            refreshed = shared_refreshed
         state.ctx.system_prompt = agent_module._with_task_context(
             refreshed,
             state.task_context,

@@ -2098,6 +2098,63 @@ def test_reload_validation_failure_rolls_back_catalog_and_router(tmp_path):
     assert route.descriptor.aliases == ()
     assert router.classify("/manual").kind == "command"
 
+    command_file.write_text("RESTORED", encoding="utf-8")
+    retry = asyncio.run(catalog.reload({"command_router": router}))
+    assert retry["ok"] is True
+    assert catalog.get_slash_command_metadata()["release:deploy"] == {}
+
+
+def test_concurrent_reload_serializes_discovery_and_awaited_side_effects(tmp_path):
+    import shutil
+
+    from agent import PluginCatalog
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+    plugin_dir = tmp_path / "late"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "late", "mcp_servers": '
+        '[{"name": "late-server", "command": "late"}]}',
+        encoding="utf-8",
+    )
+
+    async def scenario():
+        entered_connect = asyncio.Event()
+        release_connect = asyncio.Event()
+        events: list[str] = []
+
+        class MCPClient:
+            async def connect_from_config(self, config):
+                entered_connect.set()
+                await release_connect.wait()
+                events.append("connect")
+
+        class Registry:
+            def unregister_by_source_prefix(self, prefix):
+                events.append(f"unregister:{prefix}")
+
+        components = {"mcp_client": MCPClient(), "registry": Registry()}
+        first = asyncio.create_task(catalog.reload(components))
+        await entered_connect.wait()
+        shutil.rmtree(plugin_dir)
+        second = asyncio.create_task(catalog.reload(components))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        second_was_waiting = not second.done()
+        release_connect.set()
+        first_result, second_result = await asyncio.gather(first, second)
+        return events, second_was_waiting, first_result, second_result
+
+    events, second_was_waiting, first_result, second_result = asyncio.run(scenario())
+
+    assert second_was_waiting is True
+    assert events == ["connect", "unregister:mcp:late-server"]
+    assert first_result["added_plugins"] == ["late"]
+    assert second_result["removed_plugins"] == ["late"]
+    assert catalog.list_plugins() == []
+    assert catalog.get_bundled_mcp() == []
+
 
 def test_user_same_name_plugin_replaces_omitted_builtin_commands(tmp_path):
     from agent import PluginCatalog
@@ -2136,6 +2193,66 @@ def test_user_same_name_plugin_replaces_omitted_builtin_commands(tmp_path):
     assert metadata["release:deploy"]["description"] == "user deploy"
     assert "release:old" not in commands
     assert "release:old" not in metadata
+
+
+def test_user_same_name_plugin_replaces_all_builtin_owned_assets(tmp_path):
+    from agent import PluginCatalog
+
+    builtin_dir = tmp_path / "builtin" / "release"
+    user_dir = tmp_path / "user" / "release"
+    for plugin_dir in (builtin_dir, user_dir):
+        (plugin_dir / ".claude-plugin").mkdir(parents=True)
+
+    (builtin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "release", "skills": ["skills"], '
+        '"mcp_servers": [{"name": "old-server", "command": "old"}]}',
+        encoding="utf-8",
+    )
+    (builtin_dir / "commands").mkdir()
+    (builtin_dir / "commands" / "old.md").write_text("OLD", encoding="utf-8")
+    (builtin_dir / "skills" / "old-skill").mkdir(parents=True)
+    (builtin_dir / "skills" / "old-skill" / "SKILL.md").write_text(
+        "Old skill", encoding="utf-8"
+    )
+    (builtin_dir / "agents").mkdir()
+    (builtin_dir / "agents" / "old-agent.md").write_text(
+        "Old agent", encoding="utf-8"
+    )
+
+    (user_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "release", "skills": ["replacement-skills"], '
+        '"mcp_servers": [{"name": "new-server", "command": "new"}]}',
+        encoding="utf-8",
+    )
+    (user_dir / "commands").mkdir()
+    (user_dir / "commands" / "new.md").write_text("NEW", encoding="utf-8")
+    (user_dir / "replacement-skills" / "new-skill").mkdir(parents=True)
+    (user_dir / "replacement-skills" / "new-skill" / "SKILL.md").write_text(
+        "New skill", encoding="utf-8"
+    )
+    (user_dir / "agents").mkdir()
+    (user_dir / "agents" / "new-agent.md").write_text(
+        "New agent", encoding="utf-8"
+    )
+
+    catalog = PluginCatalog(
+        builtin_dir=tmp_path / "builtin", user_dir=tmp_path / "user"
+    )
+    catalog.discover_and_load()
+
+    commands = catalog.get_slash_commands()
+    skills = catalog.get_bundled_skills()
+    mcp = catalog.get_bundled_mcp()
+    agents = {
+        definition["key"] for definition in catalog.list_agent_definitions()
+    }
+
+    assert set(commands) == {"release:new"}
+    assert skills == [("release", user_dir / "replacement-skills")]
+    assert [(owner, config["name"]) for owner, config in mcp] == [
+        ("release", "new-server")
+    ]
+    assert agents == {"plugin:release:new-agent"}
 
 
 def test_install_plugin_from_local_path_and_reload(tmp_path, monkeypatch):

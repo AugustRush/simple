@@ -886,6 +886,7 @@ class PluginCatalog:
         self._user_dir = user_dir
         self._plugin_config = plugin_config or {}
         self._turn_hook_timeout_seconds = max(0.0, float(turn_hook_timeout_seconds))
+        self._reload_lock = asyncio.Lock()
         self._hook_executor = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="agent-plugin-hook"
         )
@@ -978,6 +979,33 @@ class PluginCatalog:
             return market
         return [(entry_dir, entry_dir.name)]
 
+    def _remove_plugin_owned_state(
+        self,
+        plugin_name: str,
+        slash_command_owners: dict[str, str],
+    ) -> None:
+        """Remove every catalog asset owned by one replaced plugin."""
+
+        for cmd_key, owner in tuple(slash_command_owners.items()):
+            if owner != plugin_name:
+                continue
+            self._slash_commands.pop(cmd_key, None)
+            self._slash_command_metadata.pop(cmd_key, None)
+            slash_command_owners.pop(cmd_key, None)
+        self._bundled_skills = [
+            item for item in self._bundled_skills if item[0] != plugin_name
+        ]
+        self._bundled_mcp = [
+            item for item in self._bundled_mcp if item[0] != plugin_name
+        ]
+        self._agent_defs = {
+            key: value
+            for key, value in self._agent_defs.items()
+            if value.get("plugin") != plugin_name
+        }
+        self._plugin_source_dirs.pop(plugin_name, None)
+        self._plugins.pop(plugin_name, None)
+
     def _load_one_plugin(
         self,
         plugin_dir: Path,
@@ -1056,14 +1084,9 @@ class PluginCatalog:
         meta.source = source
 
         # A user plugin with the same plugin name replaces the built-in plugin
-        # as a unit. Commands omitted by the replacement must not survive.
+        # as a unit. Assets omitted by the replacement must not survive.
         if plugin_name in self._plugins:
-            for cmd_key, owner in tuple(slash_command_owners.items()):
-                if owner != plugin_name:
-                    continue
-                self._slash_commands.pop(cmd_key, None)
-                self._slash_command_metadata.pop(cmd_key, None)
-                slash_command_owners.pop(cmd_key, None)
+            self._remove_plugin_owned_state(plugin_name, slash_command_owners)
 
         # Slash commands contributed by the Python plugin (declarative
         # commands/*.md registration arrives in commit 2).
@@ -1241,6 +1264,12 @@ class PluginCatalog:
     # ── Hot reload ───────────────────────────────────────────────────────
 
     async def reload(self, components: dict) -> dict:
+        """Serialize plugin reload transactions for this catalog instance."""
+
+        async with self._reload_lock:
+            return await self._reload_locked(components)
+
+    async def _reload_locked(self, components: dict) -> dict:
         """Re-scan plugin directories and apply diffs in place.
 
         Re-imports Python plugins (sys.modules cache cleared), re-registers

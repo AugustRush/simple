@@ -26,7 +26,7 @@ from agent.commands import (
     register_builtin_commands,
 )
 from agent.plugins.catalog import PluginCatalog
-from agent.runtime import RuntimeSessionState, TurnInput, TurnResult
+from agent.runtime import AgentCore, RuntimeSessionState, TurnInput, TurnResult
 from agent.shared import CancelToken
 from agent.skills.catalog import SkillCatalog
 
@@ -589,6 +589,69 @@ def test_plugin_adapter_preserves_metadata_and_core_precedence(tmp_path) -> None
     assert route.descriptor.usage == "/deploy <target>"
     assert route.descriptor.description == "Deploy a target"
     assert router.classify("/deploy prod", channel_name="cli").kind == "unknown_slash"
+
+
+def test_skill_prompt_dirty_refreshes_shared_and_evolved_sessions(monkeypatch) -> None:
+    import agent as agent_module
+
+    class DirtyOnceSkills:
+        def __init__(self) -> None:
+            self.dirty = True
+
+        def consume_dirty(self) -> bool:
+            dirty, self.dirty = self.dirty, False
+            return dirty
+
+    class CapturingRunner:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def run(self, turn_input, ctx, stream_callback=None):
+            self.prompts.append(ctx.system_prompt)
+            return TurnResult(text="ok")
+
+        async def complete_turn(self, turn_input, state, result):
+            return []
+
+    monkeypatch.setattr(
+        agent_module,
+        "_compose_system_prompt",
+        lambda base, registry, workspace_root, output_dir, **kwargs: (
+            f"REFRESHED::{base}"
+        ),
+    )
+    runner = CapturingRunner()
+    components = {
+        "base_system_prompt": "shared base",
+        "system_prompt": "OLD::shared base",
+        "registry": object(),
+        "workspace_root": "/workspace",
+        "output_dir": "/output",
+        "skill_catalog": DirtyOnceSkills(),
+        "turn_runner": runner,
+    }
+    core = AgentCore(components)
+    evolved = RuntimeSessionState(
+        ctx=SimpleNamespace(system_prompt="OLD::evolved", metadata={}),
+        base_system_prompt_override="evolved base",
+        system_prompt_override="OLD::evolved",
+    )
+    ordinary = RuntimeSessionState(
+        ctx=SimpleNamespace(system_prompt="OLD::shared base", metadata={})
+    )
+
+    async def run_sessions() -> None:
+        await core.handle_turn(TurnInput("evolved task"), evolved)
+        await core.handle_turn(TurnInput("ordinary task"), ordinary)
+
+    asyncio.run(run_sessions())
+
+    assert components["system_prompt"] == "REFRESHED::shared base"
+    assert evolved.system_prompt_override == "REFRESHED::evolved base"
+    assert runner.prompts[0].startswith("REFRESHED::evolved base")
+    assert "evolved task" in runner.prompts[0]
+    assert runner.prompts[1].startswith("REFRESHED::shared base")
+    assert "ordinary task" in runner.prompts[1]
 
 
 @pytest.mark.parametrize(
