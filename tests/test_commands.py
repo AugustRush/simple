@@ -990,6 +990,24 @@ def test_builtin_send_queues_only_existing_files_inside_output_dir(tmp_path) -> 
     )
 
 
+def test_builtin_send_accepts_absolute_path_inside_output_dir(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = output_dir / "report.txt"
+    source.write_text("report", encoding="utf-8")
+
+    result = _run_builtin(
+        _builtin_router(),
+        f"/send {source.resolve()}",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+    )
+
+    assert len(result.attachments) == 1
+    assert result.attachments[0].read_text(encoding="utf-8") == "report"
+    assert result.response_text == f"Sending file: {source.resolve()}"
+
+
 def test_builtin_send_attaches_immutable_inside_snapshot(tmp_path) -> None:
     output_dir = tmp_path / "output"
     output_dir.mkdir()

@@ -469,12 +469,19 @@ def _copy_file_descriptor(source: int, destination: int, max_bytes: int) -> int:
     return copied
 
 
-def _relative_send_components(raw_path: str) -> tuple[str, ...]:
+def _relative_send_components(
+    raw_path: str, output_root: Path
+) -> tuple[str, ...]:
     expanded = os.path.expandvars(raw_path)
     candidate = Path(expanded).expanduser()
     if candidate.is_absolute():
-        raise _UnsafeSendPath
-    components = tuple(expanded.split(os.sep))
+        try:
+            relative = candidate.resolve(strict=False).relative_to(output_root)
+        except ValueError as exc:
+            raise _UnsafeSendPath from exc
+        components = relative.parts
+    else:
+        components = tuple(expanded.split(os.sep))
     if not components or any(part in ("", ".", "..") for part in components):
         raise _UnsafeSendPath
     return components
@@ -636,7 +643,7 @@ async def _send_handler(
         return _error("Output directory is not available.")
     try:
         output_root = Path(output_dir).expanduser().resolve(strict=False)
-        components = _relative_send_components(raw_path)
+        components = _relative_send_components(raw_path, output_root)
     except (OSError, RuntimeError, ValueError):
         return _error("Invalid file path.")
     except _UnsafeSendPath:

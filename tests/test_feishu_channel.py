@@ -712,7 +712,9 @@ def test_feishu_flush_cancellation_clears_queue_and_temp(tmp_path):
     asyncio.run(scenario())
 
 
-def test_feishu_flush_cancellation_waits_for_sync_uploader_before_cleanup(tmp_path):
+def test_feishu_flush_cancellation_returns_before_sync_uploader_and_defers_cleanup(
+    tmp_path, monkeypatch
+):
     async def scenario() -> None:
         output_dir = tmp_path / "output"
         output_dir.mkdir()
@@ -727,7 +729,7 @@ def test_feishu_flush_cancellation_waits_for_sync_uploader_before_cleanup(tmp_pa
         def blocking_upload(path: Path):
             attempted.append(path)
             worker_started.set()
-            release_worker.wait(timeout=1)
+            release_worker.wait()
             try:
                 observed_content.append(path.read_text(encoding="utf-8"))
             except FileNotFoundError:
@@ -738,6 +740,11 @@ def test_feishu_flush_cancellation_waits_for_sync_uploader_before_cleanup(tmp_pa
 
         sink._upload_file_sync = MagicMock(side_effect=blocking_upload)
         sink._do_send = MagicMock()
+        monkeypatch.setattr(
+            "channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
+            0.01,
+            raising=False,
+        )
         router = CommandRouter()
         register_builtin_commands(router)
 
@@ -765,16 +772,24 @@ def test_feishu_flush_cancellation_waits_for_sync_uploader_before_cleanup(tmp_pa
 
         assert await asyncio.to_thread(worker_started.wait, 1)
         running.cancel()
-        await asyncio.sleep(0.02)
-        cancellation_waited_for_worker = not running.done()
+        await asyncio.sleep(0)
+        running.cancel()
+        await asyncio.sleep(0.05)
+        cancellation_returned_before_worker = running.done()
         snapshot_existed_while_blocked = attempted[0].is_file()
+        worker_was_still_blocked = not worker_finished.is_set()
         release_worker.set()
-        with pytest.raises(asyncio.CancelledError):
-            await running
+        outcome = (await asyncio.gather(running, return_exceptions=True))[0]
         assert await asyncio.to_thread(worker_finished.wait, 1)
+        for _attempt in range(100):
+            if not attempted[0].exists():
+                break
+            await asyncio.sleep(0.01)
 
-        assert cancellation_waited_for_worker is True
+        assert cancellation_returned_before_worker is True
         assert snapshot_existed_while_blocked is True
+        assert worker_was_still_blocked is True
+        assert isinstance(outcome, asyncio.CancelledError)
         assert observed_content == ["report"]
         assert not attempted[0].exists()
         assert not attempted[0].parent.exists()

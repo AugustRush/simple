@@ -63,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 LARK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 FEISHU_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
+_ATTACHMENT_CANCEL_GRACE_SECONDS = 0.05
 
 
 def build_feishu_client(config: "FeishuConfig") -> Any:
@@ -322,6 +323,7 @@ class FeishuOutputSink(OutputSink):
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._attachments: list[Path] = []
         self._attachment_keys: set[str] = set()
+        self._deferred_attachment_uploads: dict[str, asyncio.Task[None]] = {}
 
     def _trace_latency(self, stage: str, **fields: object) -> None:
         if not shared._latency_trace_enabled():
@@ -495,27 +497,73 @@ class FeishuOutputSink(OutputSink):
     def queue_attachment(self, path: Path) -> None:
         self._queue_attachment(path)
 
+    def defer_temporary_attachment_cleanup(self, path: Path) -> bool:
+        """Transfer cleanup for a snapshot still owned by an upload task."""
+
+        try:
+            attachment = Path(path).resolve()
+        except OSError:
+            return False
+        upload_task = self._deferred_attachment_uploads.pop(
+            str(attachment), None
+        )
+        if upload_task is None:
+            return False
+
+        def cleanup_after_upload(_task: asyncio.Task[None]) -> None:
+            try:
+                attachment.unlink(missing_ok=True)
+                attachment.parent.rmdir()
+            except OSError:
+                logger.exception(
+                    "deferred Feishu attachment cleanup failed: attachment=%s",
+                    attachment,
+                )
+
+        upload_task.add_done_callback(cleanup_after_upload)
+        return True
+
+    def _observe_deferred_attachment_upload(
+        self, upload_task: asyncio.Task[None]
+    ) -> None:
+        for key, task in tuple(self._deferred_attachment_uploads.items()):
+            if task is upload_task:
+                self._deferred_attachment_uploads.pop(key, None)
+        if upload_task.cancelled():
+            return
+        try:
+            upload_task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Feishu attachment flush failed during cancellation")
+
     async def flush_attachments(self) -> None:
         """Send and consume the attachment batch currently queued."""
 
         await self.drain()
         if not self._attachments:
             return
+        queued_attachments = tuple(self._attachments)
         upload_task = asyncio.create_task(self._send_attachments_async())
         try:
             await asyncio.shield(upload_task)
         except asyncio.CancelledError:
-            while not upload_task.done():
-                try:
-                    await asyncio.shield(upload_task)
-                except asyncio.CancelledError:
-                    continue
             try:
-                upload_task.result()
+                done, _pending = await asyncio.wait(
+                    {upload_task},
+                    timeout=_ATTACHMENT_CANCEL_GRACE_SECONDS,
+                )
             except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Feishu attachment flush failed during cancellation")
+                done = set()
+            if upload_task in done:
+                self._observe_deferred_attachment_upload(upload_task)
+            else:
+                for attachment in queued_attachments:
+                    self._deferred_attachment_uploads[str(attachment)] = upload_task
+                upload_task.add_done_callback(
+                    self._observe_deferred_attachment_upload
+                )
             raise
         finally:
             self._attachments = []

@@ -130,6 +130,11 @@ class OutputSink(ABC):
     async def flush_attachments(self) -> None:
         """Consume attachments queued so far before returning."""
 
+    def defer_temporary_attachment_cleanup(self, path: Path) -> bool:
+        """Return true when the sink assumes responsibility for later cleanup."""
+
+        return False
+
     def sync_stream_cb(self, chunk: str) -> None:
         """Synchronous callback adapter for BaseAgent.send_message."""
 

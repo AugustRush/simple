@@ -551,11 +551,28 @@ class CommandCoordinator:
                 finally:
                     await self._drain_if_supported(sink)
         finally:
-            self._cleanup_temporary_attachments(result.temporary_attachments)
+            self._cleanup_temporary_attachments(
+                result.temporary_attachments,
+                sink,
+            )
 
     @staticmethod
-    def _cleanup_temporary_attachments(attachments: tuple[Any, ...]) -> None:
+    def _cleanup_temporary_attachments(
+        attachments: tuple[Any, ...], sink: OutputSink
+    ) -> None:
+        defer_cleanup = getattr(sink, "defer_temporary_attachment_cleanup", None)
         for attachment in attachments:
+            if callable(defer_cleanup):
+                try:
+                    if defer_cleanup(Path(attachment)):
+                        continue
+                except Exception:
+                    logger.exception(
+                        "output sink temporary attachment ownership failed: "
+                        "attachment=%s",
+                        attachment,
+                    )
+                    continue
             try:
                 path = Path(attachment)
                 path.unlink(missing_ok=True)
