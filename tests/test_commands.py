@@ -25,6 +25,7 @@ from agent.commands import (
     parse_command,
     register_builtin_commands,
 )
+from agent.plugins.catalog import PluginCatalog
 from agent.runtime import RuntimeSessionState, TurnInput, TurnResult
 from agent.shared import CancelToken
 from agent.skills.catalog import SkillCatalog
@@ -319,6 +320,167 @@ def test_plugin_command_takes_precedence_over_same_named_skill(tmp_path) -> None
     assert route.descriptor is descriptor
     assert route.request is not None
     assert route.request.args == "Production"
+
+
+@pytest.mark.parametrize("async_handler", [False, True])
+@pytest.mark.parametrize(
+    ("handler_result", "expected"),
+    [
+        (
+            CommandResult(response_text="portable reply"),
+            CommandResult(response_text="portable reply"),
+        ),
+        ("legacy model input", CommandResult(forward_text="legacy model input")),
+        (None, CommandResult()),
+    ],
+)
+def test_plugin_adapter_normalizes_legacy_handler_results(
+    tmp_path, async_handler: bool, handler_result: object, expected: CommandResult
+) -> None:
+    if async_handler:
+
+        async def handler(raw_cmd: str, components: dict) -> object:
+            return handler_result
+
+    else:
+
+        def handler(raw_cmd: str, components: dict) -> object:
+            return handler_result
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog._slash_commands["deploy"] = handler
+    router = CommandRouter()
+    router.register_plugin_catalog(catalog)
+
+    route = router.classify("/deploy Keep THIS Case")
+    result = asyncio.run(
+        router.execute(route, CommandContext({}, {}, object(), object()))
+    )
+
+    assert result == expected
+
+
+@pytest.mark.parametrize("async_handler", [False, True])
+def test_plugin_adapter_returns_stable_error_without_exception_details(
+    tmp_path, async_handler: bool
+) -> None:
+    secret = "token=plugin-secret at /private/plugin.py"
+    if async_handler:
+
+        async def handler(raw_cmd: str, components: dict) -> None:
+            raise RuntimeError(secret)
+
+    else:
+
+        def handler(raw_cmd: str, components: dict) -> None:
+            raise RuntimeError(secret)
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog._slash_commands["explode"] = handler
+    router = CommandRouter()
+    router.register_plugin_catalog(catalog)
+
+    result = asyncio.run(
+        router.execute(
+            router.classify("/explode"),
+            CommandContext({}, {}, object(), object()),
+        )
+    )
+
+    assert result.response_text == "Command /explode failed."
+    assert result.error == "Command /explode failed."
+    assert secret not in result.response_text
+    assert secret not in result.error
+
+
+def test_plugin_adapter_passes_raw_command_and_per_invocation_overlay(tmp_path) -> None:
+    shared_components = {"registry": object(), "ctx": "shared sentinel"}
+    observed: list[tuple[str, dict]] = []
+
+    async def handler(raw_cmd: str, components: dict) -> None:
+        observed.append((raw_cmd, components))
+        components["plugin_local"] = raw_cmd
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog._slash_commands["deploy"] = handler
+    router = CommandRouter()
+    router.register_plugin_catalog(catalog)
+    first_ctx = object()
+    second_ctx = object()
+
+    async def invoke(command: str, session_id: str, current_ctx: object) -> None:
+        state = SimpleNamespace(ctx=current_ctx)
+        context = CommandContext(
+            shared_components,
+            {},
+            state,
+            object(),
+            channel_name="feishu",
+            session_id=session_id,
+        )
+        await router.execute(
+            router.classify(
+                command,
+                channel_name="feishu",
+                session_id=session_id,
+            ),
+            context,
+        )
+
+    async def invoke_both() -> None:
+        await asyncio.gather(
+            invoke("/Deploy Keep THIS Case", "session-1", first_ctx),
+            invoke("/deploy Other Args", "session-2", second_ctx),
+        )
+
+    asyncio.run(invoke_both())
+
+    assert [raw for raw, _ in observed] == [
+        "Deploy Keep THIS Case",
+        "deploy Other Args",
+    ]
+    assert observed[0][1] is not observed[1][1]
+    assert observed[0][1]["ctx"] is first_ctx
+    assert observed[1][1]["ctx"] is second_ctx
+    assert observed[0][1]["command_context"].session_id == "session-1"
+    assert observed[1][1]["command_context"].session_id == "session-2"
+    assert observed[0][1]["command_sink"] is observed[0][1]["command_context"].sink
+    assert observed[0][1]["channel_name"] == "feishu"
+    assert observed[1][1]["session_id"] == "session-2"
+    assert shared_components == {"registry": shared_components["registry"], "ctx": "shared sentinel"}
+
+
+def test_plugin_adapter_preserves_metadata_and_core_precedence(tmp_path) -> None:
+    async def handler(raw_cmd: str, components: dict) -> None:
+        return None
+
+    handler.__command_aliases__ = ("ship",)  # type: ignore[attr-defined]
+    handler.__command_scopes__ = ("feishu",)  # type: ignore[attr-defined]
+    handler.__command_usage__ = "/deploy <target>"  # type: ignore[attr-defined]
+    handler.__command_description__ = "Deploy a target"  # type: ignore[attr-defined]
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog._slash_commands.update({"deploy": handler, "help": handler})
+    router = CommandRouter()
+    register_builtin_commands(router)
+
+    with pytest.raises(ValueError, match="reserved core command"):
+        router.register_plugin_catalog(catalog)
+
+    assert router.classify("/help").source == "core"
+
+    catalog._slash_commands.pop("help")
+    router.register_plugin_catalog(catalog)
+    route = router.classify("/ship prod", channel_name="feishu")
+
+    assert route.kind == "command"
+    assert route.source == "plugin"
+    assert route.descriptor is not None
+    assert route.descriptor.name == "deploy"
+    assert route.descriptor.aliases == ("ship",)
+    assert route.descriptor.scopes == frozenset({"feishu"})
+    assert route.descriptor.usage == "/deploy <target>"
+    assert route.descriptor.description == "Deploy a target"
+    assert router.classify("/deploy prod", channel_name="cli").kind == "unknown_slash"
 
 
 @pytest.mark.parametrize(

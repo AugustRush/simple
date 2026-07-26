@@ -16,9 +16,9 @@ Plugin lifecycle
    The returned string is a **suffix** — not a replacement.
 6. ``register_slash_commands()`` exposes /evolve, /generate-tool, /stats.
 
-Slash command handlers receive (raw_cmd: str, components: dict).
-``components["ctx"]`` is the live AgentContext so handlers can update the
-running system prompt without restarting the session.
+Slash command handlers receive (raw_cmd: str, components: dict). The router's
+per-invocation overlay provides ``command_context`` and the current session
+``ctx`` so handlers can update prompt state without mutating shared components.
 """
 
 from __future__ import annotations
@@ -222,72 +222,99 @@ class EvolutionPlugin:
             "stats": self._handle_stats,
         }
 
-    async def _handle_evolve(self, raw_cmd: str, components: dict) -> None:
-        if self._engine is None:
-            _console().print("[yellow]Evolution engine not available.[/yellow]")
-            return
-        _console().print("[yellow]Running evolution engine...[/yellow]")
-        new_prompt = await self._engine.rewrite_system_prompt()
-        components["base_system_prompt"] = new_prompt
+    @staticmethod
+    def _current_state(components: dict) -> Any:
+        command_context = components.get("command_context")
+        if command_context is not None:
+            return command_context.session_state
+        return None
+
+    @classmethod
+    def _current_ctx(cls, components: dict) -> Any:
+        state = cls._current_state(components)
+        if state is not None:
+            return getattr(state, "ctx", None)
+        return components.get("ctx")
+
+    @staticmethod
+    def _compose_prompt(base_prompt: str, components: dict) -> str:
         import agent as _agent_mod
 
-        components["system_prompt"] = _agent_mod._compose_system_prompt(
-            new_prompt,
+        return _agent_mod._compose_system_prompt(
+            base_prompt,
             components["registry"],
-            _agent_mod.Path.cwd().resolve(),
+            components.get("workspace_root") or _agent_mod.Path.cwd().resolve(),
             components["output_dir"],
-            skill_catalog=components["skill_catalog"],
-            plugin_catalog=components["plugin_catalog"],
+            skill_catalog=components.get("skill_catalog"),
+            plugin_catalog=components.get("plugin_catalog"),
         )
-        ctx = components.get("ctx")
-        if ctx is not None:
-            ctx.system_prompt = components["system_prompt"]
-        _console().print("[green]System prompt updated.[/green]")
 
-    async def _handle_generate_tool(self, raw_cmd: str, components: dict) -> None:
+    async def _handle_evolve(self, raw_cmd: str, components: dict) -> Any:
+        from agent.commands import CommandResult
+
         if self._engine is None:
-            _console().print("[yellow]Evolution engine not available.[/yellow]")
-            return
+            return CommandResult(
+                response_text="Evolution engine is not available.",
+                level="warning",
+            )
+        new_prompt = await self._engine.rewrite_system_prompt()
+        system_prompt = self._compose_prompt(new_prompt, components)
+        components["base_system_prompt"] = new_prompt
+        components["system_prompt"] = system_prompt
+        state = self._current_state(components)
+        if state is not None:
+            state.base_system_prompt = new_prompt
+        ctx = self._current_ctx(components)
+        if ctx is not None:
+            ctx.system_prompt = system_prompt
+        return CommandResult(response_text="System prompt updated.")
+
+    async def _handle_generate_tool(self, raw_cmd: str, components: dict) -> Any:
+        from agent.commands import CommandResult
+
+        if self._engine is None:
+            return CommandResult(
+                response_text="Evolution engine is not available.",
+                level="warning",
+            )
         parts = raw_cmd.split(None, 1)
         if len(parts) < 2 or not parts[1].strip():
-            _console().print("[yellow]Usage: /generate-tool <description>[/yellow]")
-            return
+            return CommandResult(
+                response_text="Usage: /generate-tool <description>",
+                level="warning",
+            )
         description = parts[1].strip()
-        _console().print("[dim]Generating tool...[/dim]")
         await self._engine.generate_tool(description, components["registry"])
         user_tool_catalog = components.get("user_tool_catalog")
         if user_tool_catalog is not None and components.get("user_tools_enabled", False):
             user_tool_catalog.load_into_registry(components["registry"])
-        import agent as _agent_mod
-
-        components["system_prompt"] = _agent_mod._compose_system_prompt(
-            components["base_system_prompt"],
-            components["registry"],
-            _agent_mod.Path.cwd().resolve(),
-            components["output_dir"],
-            skill_catalog=components["skill_catalog"],
-            plugin_catalog=components["plugin_catalog"],
+        state = self._current_state(components)
+        base_prompt = getattr(
+            state, "base_system_prompt", components.get("base_system_prompt", "")
         )
-        ctx = components.get("ctx")
+        system_prompt = self._compose_prompt(base_prompt, components)
+        components["system_prompt"] = system_prompt
+        ctx = self._current_ctx(components)
         if ctx is not None:
-            ctx.system_prompt = components["system_prompt"]
+            ctx.system_prompt = system_prompt
+        return CommandResult(
+            response_text="Tool generated and command catalog refreshed."
+        )
 
-    async def _handle_stats(self, raw_cmd: str, components: dict) -> None:
-        import agent as _agent_mod
+    async def _handle_stats(self, raw_cmd: str, components: dict) -> Any:
+        from agent.commands import CommandResult
 
-        table = _agent_mod.Table(title="Evolution Statistics")
-        table.add_column("Metric")
-        table.add_column("Value")
+        stats: list[tuple[str, Any]] = []
         if self._engine is not None:
-            rl_stats = self._engine.get_stats()
-            for k, v in rl_stats.items():
-                table.add_row(k, str(v))
+            stats.extend(self._engine.get_stats().items())
         if self._rule_store is not None:
             rule_stats = self._rule_store.get_stats()
-            table.add_row("rules_total", str(rule_stats["total"]))
+            stats.append(("rules_total", rule_stats["total"]))
             for status, count in rule_stats.get("by_status", {}).items():
-                table.add_row(f"rules_{status}", str(count))
-        _console().print(table)
+                stats.append((f"rules_{status}", count))
+        lines = ["## Evolution Statistics", ""]
+        lines.extend(f"- `{key}`: {value}" for key, value in stats)
+        return CommandResult(response_text="\n".join(lines))
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 

@@ -784,6 +784,49 @@ def _make_markdown_command_handler(
     return _handler
 
 
+def _command_metadata(
+    handler: Callable,
+    explicit: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return portable command metadata without retaining caller-owned values."""
+
+    source = explicit or {}
+    result: dict[str, Any] = {}
+    for field_name in ("aliases", "scopes"):
+        value = source.get(
+            field_name,
+            getattr(
+                handler,
+                f"__command_{field_name}__",
+                getattr(handler, field_name, None),
+            ),
+        )
+        if value:
+            result[field_name] = (value,) if isinstance(value, str) else tuple(value)
+    for field_name in ("usage", "description", "concurrency"):
+        value = source.get(
+            field_name,
+            getattr(
+                handler,
+                f"__command_{field_name}__",
+                getattr(handler, field_name, None),
+            ),
+        )
+        if value:
+            result[field_name] = str(value)
+    accepts_interjections = source.get(
+        "accepts_interjections",
+        getattr(
+            handler,
+            "__command_accepts_interjections__",
+            getattr(handler, "accepts_interjections", None),
+        ),
+    )
+    if accepts_interjections is not None:
+        result["accepts_interjections"] = bool(accepts_interjections)
+    return result
+
+
 async def _maybe_await_with_timeout(value: Any, timeout_seconds: float) -> Any:
     if timeout_seconds > 0:
         return await asyncio.wait_for(_maybe_await(value), timeout=timeout_seconds)
@@ -849,6 +892,7 @@ class PluginCatalog:
         # name → (plugin_object, PluginMeta)
         self._plugins: dict[str, tuple[Any, PluginMeta]] = {}
         self._slash_commands: dict[str, Callable] = {}
+        self._slash_command_metadata: dict[str, dict[str, Any]] = {}
         # Skills bundled by plugins: list of (plugin_name, skills_root_path)
         self._bundled_skills: list[tuple[str, Path]] = []
         # MCP configs bundled by plugins: list of (plugin_name, server_config_dict)
@@ -887,6 +931,7 @@ class PluginCatalog:
         """
         self._plugins.clear()
         self._slash_commands.clear()
+        self._slash_command_metadata.clear()
         self._bundled_skills.clear()
         self._bundled_mcp.clear()
         self._agent_defs.clear()
@@ -1024,6 +1069,7 @@ class PluginCatalog:
                         f"'{existing_owner}' — overriding[/yellow]"
                     )
                 self._slash_commands[cmd_key] = handler
+                self._slash_command_metadata[cmd_key] = _command_metadata(handler)
                 slash_command_owners[cmd_key] = plugin_name
 
         # Record (user overrides builtin with the same plugin name).
@@ -1123,6 +1169,9 @@ class PluginCatalog:
                     f"'{existing_owner}' — overriding[/yellow]"
                 )
             self._slash_commands[cmd_key] = handler
+            self._slash_command_metadata[cmd_key] = _command_metadata(
+                handler, explicit=metadata
+            )
             slash_command_owners[cmd_key] = plugin_name
 
     def _load_agent_files(
@@ -1326,6 +1375,14 @@ class PluginCatalog:
     def get_slash_commands(self) -> dict[str, Callable]:
         """Return mapping of command name → async handler(raw_cmd, components)."""
         return dict(self._slash_commands)
+
+    def get_slash_command_metadata(self) -> dict[str, dict[str, Any]]:
+        """Return detached metadata snapshots for registered slash commands."""
+
+        return {
+            name: dict(command_metadata)
+            for name, command_metadata in self._slash_command_metadata.items()
+        }
 
     # ── Hook helpers ────────────────────────────────────────────────────────────
 

@@ -174,6 +174,74 @@ def test_plugin_registers_slash_command(tmp_path):
     assert components["_called"] is True
 
 
+def test_python_plugin_exposes_detached_slash_command_metadata(tmp_path):
+    from agent import PluginCatalog
+
+    _write_plugin(
+        tmp_path / "metadata_plugin",
+        """
+        def register():
+            class P:
+                name = "metadata_plugin"
+                def register_slash_commands(self):
+                    async def handler(raw_cmd, components):
+                        return None
+                    handler.__command_aliases__ = ("hi",)
+                    handler.__command_scopes__ = ("cli", "feishu")
+                    handler.__command_usage__ = "/hello <name>"
+                    handler.__command_description__ = "Greet someone"
+                    return {"hello": handler}
+            return P()
+    """,
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    commands = catalog.get_slash_commands()
+    metadata = catalog.get_slash_command_metadata()
+    commands.clear()
+    metadata["hello"]["aliases"] = ("mutated",)
+
+    assert "hello" in catalog.get_slash_commands()
+    assert catalog.get_slash_command_metadata()["hello"] == {
+        "aliases": ("hi",),
+        "scopes": ("cli", "feishu"),
+        "usage": "/hello <name>",
+        "description": "Greet someone",
+    }
+
+
+def test_declarative_plugin_exposes_command_frontmatter_metadata(tmp_path):
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "release"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "release"}', encoding="utf-8"
+    )
+    commands_dir = plugin_dir / "commands"
+    commands_dir.mkdir()
+    (commands_dir / "deploy.md").write_text(
+        "---\n"
+        "description: Deploy a release\n"
+        'aliases: ["ship"]\n'
+        'scopes: ["feishu"]\n'
+        "usage: /release:deploy <environment>\n"
+        "---\n"
+        "Deploy $ARGUMENTS.",
+        encoding="utf-8",
+    )
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+
+    assert catalog.get_slash_command_metadata()["release:deploy"] == {
+        "aliases": ("ship",),
+        "scopes": ("feishu",),
+        "usage": "/release:deploy <environment>",
+        "description": "Deploy a release",
+    }
+
+
 # ─── Lifecycle hooks ──────────────────────────────────────────────────────────
 
 
@@ -727,6 +795,193 @@ def test_evolution_plugin_slash_commands_registered():
     assert "evolve" in cmds
     assert "generate-tool" in cmds
     assert "stats" in cmds
+
+
+def _run_evolution_command(plugin, command: str, components: dict, state):
+    from types import SimpleNamespace
+
+    from agent.commands import CommandContext, CommandRouter
+
+    catalog = SimpleNamespace(get_slash_commands=plugin.register_slash_commands)
+    router = CommandRouter()
+    router.register_plugin_catalog(catalog)
+    route = router.classify(command, channel_name="feishu", session_id="chat-1")
+    return asyncio.run(
+        router.execute(
+            route,
+            CommandContext(
+                components,
+                {},
+                state,
+                object(),
+                channel_name="feishu",
+                session_id="chat-1",
+            ),
+        )
+    )
+
+
+def test_evolution_evolve_returns_status_and_updates_current_prompt(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import agent as agent_module
+    import agent._builtin.plugins.evolution as evolution_module
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+
+    class Engine:
+        async def rewrite_system_prompt(self):
+            return "rewritten prompt"
+
+    class ForbiddenConsole:
+        def print(self, *args, **kwargs):
+            raise AssertionError("portable command must not print")
+
+    monkeypatch.setattr(evolution_module, "_console", lambda: ForbiddenConsole())
+    monkeypatch.setattr(
+        agent_module,
+        "_compose_system_prompt",
+        lambda base, registry, workspace_root, output_dir, **kwargs: f"COMPOSED::{base}",
+    )
+    plugin = EvolutionPlugin()
+    plugin._engine = Engine()
+    shared = {
+        "base_system_prompt": "shared base",
+        "system_prompt": "shared composed",
+        "registry": object(),
+        "workspace_root": "/workspace",
+        "output_dir": "/output",
+        "skill_catalog": object(),
+        "plugin_catalog": object(),
+    }
+    state = SimpleNamespace(ctx=SimpleNamespace(system_prompt="session old"))
+
+    result = _run_evolution_command(plugin, "/evolve", shared, state)
+
+    assert result.response_text == "System prompt updated."
+    assert result.level == "info"
+    assert state.ctx.system_prompt == "COMPOSED::rewritten prompt"
+    assert state.base_system_prompt == "rewritten prompt"
+    assert shared["base_system_prompt"] == "shared base"
+    assert shared["system_prompt"] == "shared composed"
+
+
+def test_evolution_generate_tool_validates_description_without_side_effects():
+    from types import SimpleNamespace
+
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+
+    class Engine:
+        async def generate_tool(self, description, registry):
+            raise AssertionError("invalid command must not generate a tool")
+
+    plugin = EvolutionPlugin()
+    plugin._engine = Engine()
+
+    result = _run_evolution_command(
+        plugin,
+        "/generate-tool   ",
+        {"registry": object()},
+        SimpleNamespace(ctx=SimpleNamespace(system_prompt="old")),
+    )
+
+    assert result.response_text == "Usage: /generate-tool <description>"
+    assert result.level == "warning"
+
+
+def test_evolution_generate_tool_reloads_recomposes_and_returns_status(monkeypatch):
+    from types import SimpleNamespace
+
+    import agent as agent_module
+    import agent._builtin.plugins.evolution as evolution_module
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+
+    calls: list[tuple[str, object]] = []
+
+    class Engine:
+        async def generate_tool(self, description, registry):
+            calls.append((description, registry))
+            return "generated.py"
+
+    class UserTools:
+        def load_into_registry(self, registry):
+            calls.append(("reload", registry))
+
+    class ForbiddenConsole:
+        def print(self, *args, **kwargs):
+            raise AssertionError("portable command must not print")
+
+    monkeypatch.setattr(evolution_module, "_console", lambda: ForbiddenConsole())
+    monkeypatch.setattr(
+        agent_module,
+        "_compose_system_prompt",
+        lambda base, registry, workspace_root, output_dir, **kwargs: f"COMPOSED::{base}",
+    )
+    registry = object()
+    plugin = EvolutionPlugin()
+    plugin._engine = Engine()
+    state = SimpleNamespace(ctx=SimpleNamespace(system_prompt="old"))
+
+    result = _run_evolution_command(
+        plugin,
+        "/generate-tool Build a Release Checker",
+        {
+            "registry": registry,
+            "user_tool_catalog": UserTools(),
+            "user_tools_enabled": True,
+            "base_system_prompt": "base",
+            "workspace_root": "/workspace",
+            "output_dir": "/output",
+            "skill_catalog": object(),
+            "plugin_catalog": object(),
+        },
+        state,
+    )
+
+    assert calls == [("Build a Release Checker", registry), ("reload", registry)]
+    assert state.ctx.system_prompt == "COMPOSED::base"
+    assert result.response_text == "Tool generated and command catalog refreshed."
+
+
+def test_evolution_stats_returns_markdown_text_without_console(monkeypatch):
+    from types import SimpleNamespace
+
+    import agent._builtin.plugins.evolution as evolution_module
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+
+    class Engine:
+        def get_stats(self):
+            return {"total": 3, "avg_score": 7.5}
+
+    class Rules:
+        def get_stats(self):
+            return {"total": 2, "by_status": {"active": 1, "probation": 1}}
+
+    class ForbiddenConsole:
+        def print(self, *args, **kwargs):
+            raise AssertionError("portable command must not print")
+
+    monkeypatch.setattr(evolution_module, "_console", lambda: ForbiddenConsole())
+    plugin = EvolutionPlugin()
+    plugin._engine = Engine()
+    plugin._rule_store = Rules()
+
+    result = _run_evolution_command(
+        plugin,
+        "/stats",
+        {},
+        SimpleNamespace(ctx=SimpleNamespace(system_prompt="old")),
+    )
+
+    assert result.response_text == (
+        "## Evolution Statistics\n\n"
+        "- `total`: 3\n"
+        "- `avg_score`: 7.5\n"
+        "- `rules_total`: 2\n"
+        "- `rules_active`: 1\n"
+        "- `rules_probation`: 1"
+    )
 
 
 # ─── CorrectionDetector ───────────────────────────────────────────────────────

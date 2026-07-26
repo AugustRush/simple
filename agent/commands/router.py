@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import difflib
+import inspect
 import logging
 from typing import Any, Iterable, Literal, Mapping, TypeAlias
 
@@ -150,16 +151,109 @@ class CommandRouter:
                 self._core_lookup[name] = descriptor
 
     def register_plugin(self, descriptor: CommandDescriptor) -> None:
-        names = self._registration_names(descriptor)
-        reserved = next((name for name in names if name in self._core_lookup), None)
-        if reserved is not None:
-            raise ValueError(f"reserved core command name or alias: /{reserved}")
-        duplicate = next((name for name in names if name in self._plugin_lookup), None)
-        if duplicate is not None:
-            raise ValueError(f"duplicate plugin command name or alias: /{duplicate}")
-        self._plugin_commands.append(descriptor)
-        for name in names:
-            self._plugin_lookup[name] = descriptor
+        self.register_plugin_batch((descriptor,))
+
+    def register_plugin_batch(
+        self, descriptors: Iterable[CommandDescriptor]
+    ) -> None:
+        """Register plugin descriptors atomically without acquiring core names."""
+
+        pending = tuple(descriptors)
+        pending_names: set[str] = set()
+        registrations: list[tuple[CommandDescriptor, tuple[str, ...]]] = []
+        for descriptor in pending:
+            names = self._registration_names(descriptor)
+            reserved = next((name for name in names if name in self._core_lookup), None)
+            if reserved is not None:
+                raise ValueError(f"reserved core command name or alias: /{reserved}")
+            duplicate = next(
+                (
+                    name
+                    for name in names
+                    if name in self._plugin_lookup or name in pending_names
+                ),
+                None,
+            )
+            if duplicate is not None:
+                raise ValueError(
+                    f"duplicate plugin command name or alias: /{duplicate}"
+                )
+            pending_names.update(names)
+            registrations.append((descriptor, names))
+
+        self._plugin_commands.extend(descriptor for descriptor, _ in registrations)
+        for descriptor, names in registrations:
+            for name in names:
+                self._plugin_lookup[name] = descriptor
+
+    def register_plugin_catalog(self, catalog: Any) -> None:
+        """Adapt a legacy plugin catalog into portable command descriptors."""
+
+        commands = catalog.get_slash_commands()
+        metadata_getter = getattr(catalog, "get_slash_command_metadata", None)
+        metadata = metadata_getter() if callable(metadata_getter) else {}
+        descriptors = []
+        for name, legacy_handler in commands.items():
+            command_metadata = metadata.get(name, {})
+
+            async def handler(
+                request: CommandRequest,
+                context: CommandContext,
+                *,
+                _legacy_handler: Any = legacy_handler,
+            ) -> CommandResult:
+                overlay = dict(context.components)
+                overlay.update(
+                    {
+                        "ctx": getattr(context.session_state, "ctx", None),
+                        "command_context": context,
+                        "command_sink": context.sink,
+                        "session_state": context.session_state,
+                        "channel_name": context.channel_name,
+                        "session_id": context.session_id,
+                    }
+                )
+                raw_command = request.original_text.strip()[1:]
+                result = _legacy_handler(raw_command, overlay)
+                if inspect.isawaitable(result):
+                    result = await result
+                if isinstance(result, CommandResult):
+                    return result
+                if isinstance(result, str):
+                    return CommandResult(forward_text=result)
+                if result is None:
+                    return CommandResult()
+                raise TypeError(
+                    "plugin command handler must return CommandResult, str, or None"
+                )
+
+            def field_value(field: str, default: Any) -> Any:
+                return command_metadata.get(
+                    field,
+                    getattr(
+                        legacy_handler,
+                        f"__command_{field}__",
+                        getattr(legacy_handler, field, default),
+                    ),
+                )
+
+            descriptors.append(
+                CommandDescriptor(
+                    name=name,
+                    handler=handler,
+                    aliases=tuple(field_value("aliases", ())),
+                    usage=str(field_value("usage", f"/{name}")),
+                    description=str(
+                        field_value("description", inspect.getdoc(legacy_handler) or "")
+                    ),
+                    scopes=frozenset(field_value("scopes", ("all",))),
+                    concurrency=field_value("concurrency", "idle_only"),
+                    accepts_interjections=bool(
+                        field_value("accepts_interjections", False)
+                    ),
+                )
+            )
+        self.register_plugin_batch(descriptors)
 
     def _command_match(
         self, request: CommandRequest

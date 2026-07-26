@@ -204,8 +204,23 @@ class HelloPlugin:
         return {"hello": self._handle_hello}
 
     async def _handle_hello(self, raw_cmd, components):
-        print("Hello from slash command!")
+        from agent.commands import CommandResult
+        return CommandResult(response_text="Hello from slash command!")
 ```
+
+Slash commands are routed through the same portable command layer on every
+channel. Handlers keep the legacy `(raw_cmd, components)` signature: `raw_cmd`
+contains the command name without `/` plus its arguments, while `components`
+is a shallow per-invocation overlay containing the current session `ctx`,
+`command_context`, `command_sink`, `channel_name`, and `session_id`. Mutating
+this overlay does not mutate the shared component mapping.
+
+For cross-channel output, return `CommandResult`. Existing handlers remain
+compatible: a returned string is forwarded as the next model input, and
+`None` means the command handled its side effects without a response. Both
+synchronous and asynchronous handlers are supported. Command exceptions are
+logged and converted to a stable error response rather than escaping into the
+transport.
 
 Plugin hooks:
 | Hook | When | Can do |
