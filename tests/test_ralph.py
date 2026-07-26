@@ -200,6 +200,8 @@ def test_verifier_rejects_unsafe_commands_without_spawning(monkeypatch, tmp_path
         "env -iu HOME pypy3.10 -c 'print(1)'",
         "env CHECK=1 python3.12 -c 'print(1)'",
         "env -S \"python3.11 -c 'print(1)'\"",
+        "env -S \"-i python3.11 -c 'print(1)'\"",
+        "env --split-string=\"python3.11 -c 'print(1)'\"",
         "/usr/bin/env -i pypy3.10 -c 'print(1)'",
     ],
 )

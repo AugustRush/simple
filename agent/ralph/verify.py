@@ -403,6 +403,7 @@ def _inline_interpreter_reason(argv: list[str]) -> str | None:
 def _effective_command_argv(argv: list[str]) -> list[str]:
     effective = argv
     while effective and Path(effective[0]).name == "env":
+        env_executable = effective[0]
         index = 1
         split_command: list[str] | None = None
         while index < len(effective):
@@ -440,6 +441,13 @@ def _effective_command_argv(argv: list[str]) -> list[str]:
                     return []
                 index += 2
                 break
+            if token.startswith("--split-string="):
+                try:
+                    split_command = shlex.split(token.partition("=")[2], posix=True)
+                except ValueError:
+                    return []
+                index += 1
+                break
             short_options = _parse_env_short_options(effective, index)
             if short_options is not None:
                 index, split_source = short_options
@@ -455,7 +463,11 @@ def _effective_command_argv(argv: list[str]) -> list[str]:
                 continue
             break
         suffix = effective[index:]
-        effective = (split_command + suffix) if split_command is not None else suffix
+        effective = (
+            [env_executable, *split_command, *suffix]
+            if split_command is not None
+            else suffix
+        )
     return effective
 
 
