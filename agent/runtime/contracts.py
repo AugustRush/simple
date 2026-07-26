@@ -130,6 +130,8 @@ class RuntimeSessionState:
     pending_interjections: list[dict[str, Any]] = field(default_factory=list)
     restart_queue: list[dict[str, Any]] = field(default_factory=list)
     model_override: str | None = None
+    base_system_prompt_override: str | None = None
+    system_prompt_override: str | None = None
 
     def __init__(
         self,
@@ -148,6 +150,8 @@ class RuntimeSessionState:
         pending_interjections: list[dict[str, Any]] | None = None,
         restart_queue: list[dict[str, Any]] | None = None,
         model_override: str | None = None,
+        base_system_prompt_override: str | None = None,
+        system_prompt_override: str | None = None,
     ) -> None:
         if (
             pending_messages is not None
@@ -185,6 +189,8 @@ class RuntimeSessionState:
         self.pending_interjections = mailbox
         self.restart_queue = restarts
         self.model_override = model_override
+        self.base_system_prompt_override = base_system_prompt_override
+        self.system_prompt_override = system_prompt_override
 
     @property
     def pending_messages(self) -> list[dict[str, Any]]:
@@ -401,15 +407,22 @@ class AgentCore:
             return
         import agent as agent_module
 
+        base_prompt = (
+            state.base_system_prompt_override
+            if state.base_system_prompt_override is not None
+            else self._components.values.get("base_system_prompt", "")
+        )
         refreshed = agent_module._compose_system_prompt(
-            self._components.values.get("base_system_prompt", ""),
+            base_prompt,
             self._components.values.get("registry"),
             self._components.values.get("workspace_root"),
             self._components.values.get("output_dir"),
             skill_catalog=skill_catalog,
             plugin_catalog=self._plugin_catalog(),
         )
-        if isinstance(self._components.values, dict):
+        if state.base_system_prompt_override is not None:
+            state.system_prompt_override = refreshed
+        elif isinstance(self._components.values, dict):
             self._components.values["system_prompt"] = refreshed
         state.ctx.system_prompt = agent_module._with_task_context(
             refreshed,
@@ -420,7 +433,11 @@ class AgentCore:
         self,
         state: RuntimeSessionState,
     ) -> None:
-        prompt = self._components.values.get("system_prompt")
+        prompt = (
+            state.system_prompt_override
+            if state.system_prompt_override is not None
+            else self._components.values.get("system_prompt")
+        )
         if not isinstance(prompt, str) or not prompt:
             return
         import agent as agent_module

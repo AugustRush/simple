@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import difflib
 import inspect
 import logging
+import threading
 from typing import Any, Iterable, Literal, Mapping, TypeAlias
 
 from agent.skills.catalog import parse_explicit_skill_request
@@ -11,6 +13,9 @@ from agent.skills.catalog import parse_explicit_skill_request
 from .models import CommandContext, CommandDescriptor, CommandRequest, CommandResult
 
 logger = logging.getLogger(__name__)
+
+_SYNC_PLUGIN_CAPACITY = 4
+_SYNC_PLUGIN_GATE = threading.BoundedSemaphore(_SYNC_PLUGIN_CAPACITY)
 
 ClassificationKind: TypeAlias = Literal["command", "skill", "unknown_slash", "text"]
 CommandSource: TypeAlias = Literal["core", "plugin"]
@@ -96,6 +101,8 @@ class CommandRouter:
     ) -> None:
         self._core_commands: list[CommandDescriptor] = []
         self._plugin_commands: list[CommandDescriptor] = []
+        self._manual_plugin_commands: list[CommandDescriptor] = []
+        self._catalog_plugin_commands: list[CommandDescriptor] = []
         self._core_lookup: dict[str, CommandDescriptor] = {}
         self._plugin_lookup: dict[str, CommandDescriptor] = {}
         self._skill_catalog = skill_catalog
@@ -159,6 +166,21 @@ class CommandRouter:
         """Register plugin descriptors atomically without acquiring core names."""
 
         pending = tuple(descriptors)
+        self._replace_plugin_commands(
+            (*self._manual_plugin_commands, *pending),
+            self._catalog_plugin_commands,
+        )
+
+    def _replace_plugin_commands(
+        self,
+        manual: Iterable[CommandDescriptor],
+        catalog: Iterable[CommandDescriptor],
+    ) -> None:
+        """Validate and atomically replace the two plugin command sources."""
+
+        manual_commands = tuple(manual)
+        catalog_commands = tuple(catalog)
+        pending = (*manual_commands, *catalog_commands)
         pending_names: set[str] = set()
         registrations: list[tuple[CommandDescriptor, tuple[str, ...]]] = []
         for descriptor in pending:
@@ -170,7 +192,7 @@ class CommandRouter:
                 (
                     name
                     for name in names
-                    if name in self._plugin_lookup or name in pending_names
+                    if name in pending_names
                 ),
                 None,
             )
@@ -181,10 +203,15 @@ class CommandRouter:
             pending_names.update(names)
             registrations.append((descriptor, names))
 
-        self._plugin_commands.extend(descriptor for descriptor, _ in registrations)
+        lookup: dict[str, CommandDescriptor] = {}
         for descriptor, names in registrations:
             for name in names:
-                self._plugin_lookup[name] = descriptor
+                lookup[name] = descriptor
+
+        self._manual_plugin_commands = list(manual_commands)
+        self._catalog_plugin_commands = list(catalog_commands)
+        self._plugin_commands = [descriptor for descriptor, _ in registrations]
+        self._plugin_lookup = lookup
 
     def register_plugin_catalog(self, catalog: Any) -> None:
         """Adapt a legacy plugin catalog into portable command descriptors."""
@@ -214,7 +241,37 @@ class CommandRouter:
                     }
                 )
                 raw_command = request.original_text.strip()[1:]
-                result = _legacy_handler(raw_command, overlay)
+                if inspect.iscoroutinefunction(_legacy_handler):
+                    result = _legacy_handler(raw_command, overlay)
+                else:
+                    if not _SYNC_PLUGIN_GATE.acquire(blocking=False):
+                        raise RuntimeError("synchronous plugin command capacity reached")
+                    worker_state = {"abandoned": False}
+                    worker = asyncio.create_task(
+                        asyncio.to_thread(_legacy_handler, raw_command, overlay)
+                    )
+
+                    def release_worker(task: asyncio.Task[Any]) -> None:
+                        _SYNC_PLUGIN_GATE.release()
+                        if not worker_state["abandoned"]:
+                            return
+                        try:
+                            abandoned_result = task.result()
+                        except asyncio.CancelledError:
+                            return
+                        except Exception:
+                            return
+                        if inspect.iscoroutine(abandoned_result):
+                            abandoned_result.close()
+                        elif isinstance(abandoned_result, asyncio.Future):
+                            abandoned_result.cancel()
+
+                    worker.add_done_callback(release_worker)
+                    try:
+                        result = await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        worker_state["abandoned"] = True
+                        raise
                 if inspect.isawaitable(result):
                     result = await result
                 if isinstance(result, CommandResult):
@@ -253,7 +310,7 @@ class CommandRouter:
                     ),
                 )
             )
-        self.register_plugin_batch(descriptors)
+        self._replace_plugin_commands(self._manual_plugin_commands, descriptors)
 
     def _command_match(
         self, request: CommandRequest

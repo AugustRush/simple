@@ -263,7 +263,8 @@ class EvolutionPlugin:
         components["system_prompt"] = system_prompt
         state = self._current_state(components)
         if state is not None:
-            state.base_system_prompt = new_prompt
+            state.base_system_prompt_override = new_prompt
+            state.system_prompt_override = system_prompt
         ctx = self._current_ctx(components)
         if ctx is not None:
             ctx.system_prompt = system_prompt
@@ -284,16 +285,32 @@ class EvolutionPlugin:
                 level="warning",
             )
         description = parts[1].strip()
-        await self._engine.generate_tool(description, components["registry"])
+        generation_result = await self._engine.generate_tool(
+            description, components["registry"]
+        )
+        if isinstance(generation_result, str) and generation_result.startswith(
+            "Tool generation failed:"
+        ):
+            return CommandResult(
+                response_text=generation_result,
+                level="error",
+                error=generation_result,
+            )
         user_tool_catalog = components.get("user_tool_catalog")
         if user_tool_catalog is not None and components.get("user_tools_enabled", False):
             user_tool_catalog.load_into_registry(components["registry"])
         state = self._current_state(components)
         base_prompt = getattr(
-            state, "base_system_prompt", components.get("base_system_prompt", "")
+            state,
+            "base_system_prompt_override",
+            components.get("base_system_prompt", ""),
         )
+        if base_prompt is None:
+            base_prompt = components.get("base_system_prompt", "")
         system_prompt = self._compose_prompt(base_prompt, components)
         components["system_prompt"] = system_prompt
+        if state is not None:
+            state.system_prompt_override = system_prompt
         ctx = self._current_ctx(components)
         if ctx is not None:
             ctx.system_prompt = system_prompt

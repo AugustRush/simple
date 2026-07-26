@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import pytest
 import time
 import textwrap
 from pathlib import Path
@@ -862,9 +863,67 @@ def test_evolution_evolve_returns_status_and_updates_current_prompt(
     assert result.response_text == "System prompt updated."
     assert result.level == "info"
     assert state.ctx.system_prompt == "COMPOSED::rewritten prompt"
-    assert state.base_system_prompt == "rewritten prompt"
+    assert state.base_system_prompt_override == "rewritten prompt"
+    assert state.system_prompt_override == "COMPOSED::rewritten prompt"
     assert shared["base_system_prompt"] == "shared base"
     assert shared["system_prompt"] == "shared composed"
+
+
+def test_evolution_prompt_override_survives_next_agent_core_turn(monkeypatch):
+    from types import SimpleNamespace
+
+    import agent as agent_module
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    from agent.runtime import AgentCore, RuntimeSessionState, TurnInput, TurnResult
+
+    class Engine:
+        async def rewrite_system_prompt(self):
+            return "session evolved"
+
+    class CapturingTurnRunner:
+        def __init__(self):
+            self.prompts: list[str] = []
+
+        async def run(self, turn_input, ctx, stream_callback=None):
+            self.prompts.append(ctx.system_prompt)
+            return TurnResult(text="ok")
+
+        async def complete_turn(self, turn_input, state, result):
+            return []
+
+    monkeypatch.setattr(
+        agent_module,
+        "_compose_system_prompt",
+        lambda base, registry, workspace_root, output_dir, **kwargs: f"COMPOSED::{base}",
+    )
+    runner = CapturingTurnRunner()
+    shared = {
+        "base_system_prompt": "shared base",
+        "system_prompt": "COMPOSED::shared base",
+        "registry": object(),
+        "workspace_root": "/workspace",
+        "output_dir": "/output",
+        "skill_catalog": None,
+        "plugin_catalog": None,
+        "turn_runner": runner,
+    }
+    state = RuntimeSessionState(
+        ctx=SimpleNamespace(system_prompt="COMPOSED::shared base", metadata={})
+    )
+    plugin = EvolutionPlugin()
+    plugin._engine = Engine()
+
+    _run_evolution_command(plugin, "/evolve", shared, state)
+    asyncio.run(
+        AgentCore(shared).handle_turn(
+            TurnInput("next user task", session_id="chat-1"), state
+        )
+    )
+
+    assert runner.prompts[0].startswith("COMPOSED::session evolved")
+    assert "next user task" in runner.prompts[0]
+    assert shared["base_system_prompt"] == "shared base"
+    assert shared["system_prompt"] == "COMPOSED::shared base"
 
 
 def test_evolution_generate_tool_validates_description_without_side_effects():
@@ -921,7 +980,11 @@ def test_evolution_generate_tool_reloads_recomposes_and_returns_status(monkeypat
     registry = object()
     plugin = EvolutionPlugin()
     plugin._engine = Engine()
-    state = SimpleNamespace(ctx=SimpleNamespace(system_prompt="old"))
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(system_prompt="old"),
+        base_system_prompt_override="evolved base",
+        system_prompt_override="COMPOSED::evolved base",
+    )
 
     result = _run_evolution_command(
         plugin,
@@ -940,8 +1003,58 @@ def test_evolution_generate_tool_reloads_recomposes_and_returns_status(monkeypat
     )
 
     assert calls == [("Build a Release Checker", registry), ("reload", registry)]
-    assert state.ctx.system_prompt == "COMPOSED::base"
+    assert state.ctx.system_prompt == "COMPOSED::evolved base"
+    assert state.system_prompt_override == "COMPOSED::evolved base"
     assert result.response_text == "Tool generated and command catalog refreshed."
+
+
+def test_evolution_generate_tool_propagates_engine_failure_without_reload(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    import agent as agent_module
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+
+    calls: list[str] = []
+    failure = "Tool generation failed: syntax error at line 3: invalid syntax"
+
+    class Engine:
+        async def generate_tool(self, description, registry):
+            calls.append("generate")
+            return failure
+
+    class UserTools:
+        def load_into_registry(self, registry):
+            calls.append("reload")
+
+    def compose(*args, **kwargs):
+        calls.append("compose")
+        return "unexpected"
+
+    monkeypatch.setattr(agent_module, "_compose_system_prompt", compose)
+    plugin = EvolutionPlugin()
+    plugin._engine = Engine()
+    state = SimpleNamespace(ctx=SimpleNamespace(system_prompt="old"))
+
+    result = _run_evolution_command(
+        plugin,
+        "/generate-tool invalid tool",
+        {
+            "registry": object(),
+            "user_tool_catalog": UserTools(),
+            "user_tools_enabled": True,
+            "base_system_prompt": "base",
+            "output_dir": "/output",
+        },
+        state,
+    )
+
+    assert calls == ["generate"]
+    assert result.response_text == failure
+    assert result.error == failure
+    assert result.level == "error"
+    assert state.ctx.system_prompt == "old"
 
 
 def test_evolution_stats_returns_markdown_text_without_console(monkeypatch):
@@ -1864,6 +1977,165 @@ def test_reload_drops_removed_plugin(tmp_path):
 
     assert "transient" in result["removed_plugins"]
     assert "transient" not in catalog._plugins
+
+
+def test_reload_atomically_replaces_routed_plugin_commands_and_metadata(tmp_path):
+    from agent import PluginCatalog
+    from agent.commands import (
+        CommandContext,
+        CommandDescriptor,
+        CommandRequest,
+        CommandResult,
+        CommandRouter,
+    )
+
+    plugin_dir = tmp_path / "release"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "release"}', encoding="utf-8"
+    )
+    commands_dir = plugin_dir / "commands"
+    commands_dir.mkdir()
+    change_file = commands_dir / "change.md"
+    gone_file = commands_dir / "gone.md"
+    change_file.write_text(
+        "---\ndescription: old description\n---\nOLD $ARGUMENTS",
+        encoding="utf-8",
+    )
+    gone_file.write_text("GONE", encoding="utf-8")
+
+    async def manual_handler(
+        request: CommandRequest, context: CommandContext
+    ) -> CommandResult:
+        return CommandResult(response_text="manual")
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+    router = CommandRouter(
+        plugin_commands=[CommandDescriptor("manual", manual_handler)]
+    )
+    router.register_plugin_catalog(catalog)
+
+    change_file.write_text(
+        "---\n"
+        "description: new description\n"
+        'aliases: ["fresh"]\n'
+        'scopes: ["feishu"]\n'
+        "---\n"
+        "NEW $ARGUMENTS",
+        encoding="utf-8",
+    )
+    gone_file.unlink()
+    (commands_dir / "added.md").write_text("ADDED $ARGUMENTS", encoding="utf-8")
+
+    asyncio.run(catalog.reload({"command_router": router}))
+
+    fresh = router.classify("/fresh target", channel_name="feishu")
+    fresh_result = asyncio.run(
+        router.execute(
+            fresh,
+            CommandContext(
+                {},
+                {},
+                object(),
+                object(),
+                channel_name="feishu",
+            ),
+        )
+    )
+    assert fresh_result.forward_text == "NEW target"
+    assert fresh.descriptor is not None
+    assert fresh.descriptor.description == "new description"
+    assert fresh.descriptor.scopes == frozenset({"feishu"})
+    assert router.classify("/release:change target").kind == "unknown_slash"
+    assert router.classify("/release:added target").kind == "command"
+    assert router.classify("/release:gone").kind == "unknown_slash"
+    assert router.classify("/manual").kind == "command"
+
+
+def test_reload_validation_failure_rolls_back_catalog_and_router(tmp_path):
+    from agent import PluginCatalog
+    from agent.commands import (
+        CommandDescriptor,
+        CommandRequest,
+        CommandResult,
+        CommandRouter,
+    )
+
+    plugin_dir = tmp_path / "release"
+    (plugin_dir / ".claude-plugin").mkdir(parents=True)
+    (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "release"}', encoding="utf-8"
+    )
+    commands_dir = plugin_dir / "commands"
+    commands_dir.mkdir()
+    command_file = commands_dir / "deploy.md"
+    command_file.write_text("OLD", encoding="utf-8")
+
+    async def manual_handler(request: CommandRequest, context) -> CommandResult:
+        return CommandResult(response_text="manual")
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.discover_and_load()
+    router = CommandRouter(
+        plugin_commands=[CommandDescriptor("manual", manual_handler)]
+    )
+    router.register_plugin_catalog(catalog)
+    old_handler = catalog.get_slash_commands()["release:deploy"]
+
+    command_file.write_text(
+        '---\naliases: ["manual"]\n---\nNEW', encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="duplicate plugin command"):
+        asyncio.run(catalog.reload({"command_router": router}))
+
+    assert catalog.get_slash_commands()["release:deploy"] is old_handler
+    assert catalog.get_slash_command_metadata()["release:deploy"] == {}
+    route = router.classify("/release:deploy")
+    assert route.kind == "command"
+    assert route.descriptor is not None
+    assert route.descriptor.aliases == ()
+    assert router.classify("/manual").kind == "command"
+
+
+def test_user_same_name_plugin_replaces_omitted_builtin_commands(tmp_path):
+    from agent import PluginCatalog
+
+    builtin_root = tmp_path / "builtin"
+    user_root = tmp_path / "user"
+    for root, body, include_old in (
+        (builtin_root, "BUILTIN", True),
+        (user_root, "USER", False),
+    ):
+        plugin_dir = root / "release"
+        (plugin_dir / ".claude-plugin").mkdir(parents=True)
+        (plugin_dir / ".claude-plugin" / "plugin.json").write_text(
+            '{"name": "release"}', encoding="utf-8"
+        )
+        commands_dir = plugin_dir / "commands"
+        commands_dir.mkdir()
+        (commands_dir / "deploy.md").write_text(
+            f"---\ndescription: {body.lower()} deploy\n---\n{body}",
+            encoding="utf-8",
+        )
+        if include_old:
+            (commands_dir / "old.md").write_text(
+                "---\ndescription: old builtin command\n---\nOLD",
+                encoding="utf-8",
+            )
+
+    catalog = PluginCatalog(builtin_dir=builtin_root, user_dir=user_root)
+    catalog.discover_and_load()
+
+    commands = catalog.get_slash_commands()
+    metadata = catalog.get_slash_command_metadata()
+    deploy = asyncio.run(commands["release:deploy"]("release:deploy", {}))
+
+    assert deploy == "USER"
+    assert metadata["release:deploy"]["description"] == "user deploy"
+    assert "release:old" not in commands
+    assert "release:old" not in metadata
 
 
 def test_install_plugin_from_local_path_and_reload(tmp_path, monkeypatch):

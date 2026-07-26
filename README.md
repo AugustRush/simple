@@ -218,9 +218,12 @@ this overlay does not mutate the shared component mapping.
 For cross-channel output, return `CommandResult`. Existing handlers remain
 compatible: a returned string is forwarded as the next model input, and
 `None` means the command handled its side effects without a response. Both
-synchronous and asynchronous handlers are supported. Command exceptions are
-logged and converted to a stable error response rather than escaping into the
-transport.
+synchronous and asynchronous handlers are supported; synchronous handlers use
+bounded worker capacity so they do not block the async command loop. Saturated
+or failed commands are converted to a stable error response rather than
+escaping into the transport. Plugin reload replaces routed plugin descriptors
+as one snapshot when the runtime supplies its command router, so added,
+changed, and removed commands take effect together.
 
 Plugin hooks:
 | Hook | When | Can do |

@@ -893,6 +893,7 @@ class PluginCatalog:
         self._plugins: dict[str, tuple[Any, PluginMeta]] = {}
         self._slash_commands: dict[str, Callable] = {}
         self._slash_command_metadata: dict[str, dict[str, Any]] = {}
+        self._slash_command_owners: dict[str, str] = {}
         # Skills bundled by plugins: list of (plugin_name, skills_root_path)
         self._bundled_skills: list[tuple[str, Path]] = []
         # MCP configs bundled by plugins: list of (plugin_name, server_config_dict)
@@ -932,12 +933,11 @@ class PluginCatalog:
         self._plugins.clear()
         self._slash_commands.clear()
         self._slash_command_metadata.clear()
+        self._slash_command_owners.clear()
         self._bundled_skills.clear()
         self._bundled_mcp.clear()
         self._agent_defs.clear()
         self._plugin_source_dirs.clear()
-        _slash_command_owners: dict[str, str] = {}  # cmd_key → owning plugin name
-
         # Auto-create user plugins directory
         if self._user_dir:
             self._user_dir.mkdir(parents=True, exist_ok=True)
@@ -962,7 +962,7 @@ class PluginCatalog:
                         source=source,
                         name_hint=plugin_name_hint,
                         source_dir_name=entry_dir.name,
-                        slash_command_owners=_slash_command_owners,
+                        slash_command_owners=self._slash_command_owners,
                     )
         return [name for name in self._plugins]
 
@@ -1054,6 +1054,16 @@ class PluginCatalog:
             )
             plugin_name = meta.name
         meta.source = source
+
+        # A user plugin with the same plugin name replaces the built-in plugin
+        # as a unit. Commands omitted by the replacement must not survive.
+        if plugin_name in self._plugins:
+            for cmd_key, owner in tuple(slash_command_owners.items()):
+                if owner != plugin_name:
+                    continue
+                self._slash_commands.pop(cmd_key, None)
+                self._slash_command_metadata.pop(cmd_key, None)
+                slash_command_owners.pop(cmd_key, None)
 
         # Slash commands contributed by the Python plugin (declarative
         # commands/*.md registration arrives in commit 2).
@@ -1253,6 +1263,19 @@ class PluginCatalog:
             (pname, cfg.get("name", "?"))
             for pname, cfg in self._bundled_mcp
         }
+        old_discovery_state = {
+            "plugins": dict(self._plugins),
+            "slash_commands": dict(self._slash_commands),
+            "slash_command_metadata": {
+                name: dict(value)
+                for name, value in self._slash_command_metadata.items()
+            },
+            "slash_command_owners": dict(self._slash_command_owners),
+            "bundled_skills": list(self._bundled_skills),
+            "bundled_mcp": list(self._bundled_mcp),
+            "plugin_source_dirs": dict(self._plugin_source_dirs),
+            "agent_defs": dict(self._agent_defs),
+        }
         # Drop sys.modules entries so re-imported Python plugins pick up
         # any code changes on disk.  Safe to drop for plugins that were
         # never python-only (no-op).
@@ -1264,6 +1287,27 @@ class PluginCatalog:
         new_plugin_names = set(loaded)
         added = new_plugin_names - old_plugin_names
         removed = old_plugin_names - new_plugin_names
+
+        command_router = components.get("command_router")
+        if command_router is not None:
+            try:
+                command_router.register_plugin_catalog(self)
+            except Exception:
+                self._plugins = old_discovery_state["plugins"]
+                self._slash_commands = old_discovery_state["slash_commands"]
+                self._slash_command_metadata = old_discovery_state[
+                    "slash_command_metadata"
+                ]
+                self._slash_command_owners = old_discovery_state[
+                    "slash_command_owners"
+                ]
+                self._bundled_skills = old_discovery_state["bundled_skills"]
+                self._bundled_mcp = old_discovery_state["bundled_mcp"]
+                self._plugin_source_dirs = old_discovery_state[
+                    "plugin_source_dirs"
+                ]
+                self._agent_defs = old_discovery_state["agent_defs"]
+                raise
 
         # Reload skill catalog: clear and rewalk both user/builtin trees,
         # then re-attach every plugin's bundled skills root.

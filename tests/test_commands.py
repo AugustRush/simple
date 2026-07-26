@@ -450,6 +450,114 @@ def test_plugin_adapter_passes_raw_command_and_per_invocation_overlay(tmp_path) 
     assert shared_components == {"registry": shared_components["registry"], "ctx": "shared sentinel"}
 
 
+def test_plugin_adapter_offloads_sync_handler_without_losing_async_context(
+    tmp_path,
+) -> None:
+    from contextvars import ContextVar
+
+    marker = ContextVar("plugin_marker", default="missing")
+    observed: dict[str, str] = {}
+
+    def handler(raw_cmd: str, components: dict):
+        observed["sync"] = marker.get()
+        time.sleep(0.15)
+
+        async def finish():
+            observed["awaitable"] = marker.get()
+            return "forwarded"
+
+        return finish()
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog._slash_commands["slow"] = handler
+    router = CommandRouter()
+    router.register_plugin_catalog(catalog)
+
+    async def scenario() -> tuple[CommandResult, float]:
+        token = marker.set("session-context")
+        started = time.perf_counter()
+        heartbeat_at = 0.0
+
+        async def heartbeat() -> None:
+            nonlocal heartbeat_at
+            await asyncio.sleep(0.01)
+            heartbeat_at = time.perf_counter() - started
+
+        try:
+            result, _ = await asyncio.gather(
+                router.execute(
+                    router.classify("/slow"),
+                    CommandContext({}, {}, object(), object()),
+                ),
+                heartbeat(),
+            )
+            return result, heartbeat_at
+        finally:
+            marker.reset(token)
+
+    result, heartbeat_at = asyncio.run(scenario())
+
+    assert heartbeat_at < 0.08
+    assert observed == {
+        "sync": "session-context",
+        "awaitable": "session-context",
+    }
+    assert result.forward_text == "forwarded"
+
+
+def test_plugin_adapter_bounds_sync_work_after_caller_cancellation(tmp_path) -> None:
+    release = threading.Event()
+    all_started = threading.Event()
+    started = 0
+    started_lock = threading.Lock()
+    capacity = 4
+
+    def handler(raw_cmd: str, components: dict) -> None:
+        nonlocal started
+        with started_lock:
+            started += 1
+            if started == capacity:
+                all_started.set()
+        release.wait(2)
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog._slash_commands["block"] = handler
+    router = CommandRouter()
+    router.register_plugin_catalog(catalog)
+
+    async def scenario() -> CommandResult:
+        tasks = [
+            asyncio.create_task(
+                router.execute(
+                    router.classify("/block"),
+                    CommandContext({}, {}, object(), object()),
+                )
+            )
+            for _ in range(capacity)
+        ]
+        try:
+            assert await asyncio.to_thread(all_started.wait, 1)
+            tasks[0].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[0]
+            return await asyncio.wait_for(
+                router.execute(
+                    router.classify("/block"),
+                    CommandContext({}, {}, object(), object()),
+                ),
+                0.2,
+            )
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    overflow = asyncio.run(scenario())
+
+    assert overflow.level == "error"
+    assert overflow.error == "Command /block failed."
+    assert started == capacity
+
+
 def test_plugin_adapter_preserves_metadata_and_core_precedence(tmp_path) -> None:
     async def handler(raw_cmd: str, components: dict) -> None:
         return None
