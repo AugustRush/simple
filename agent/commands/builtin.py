@@ -472,14 +472,14 @@ def _copy_file_descriptor(source: int, destination: int, max_bytes: int) -> int:
 def _relative_send_components(
     raw_path: str, output_root: Path
 ) -> tuple[str, ...]:
-    expanded = os.path.expandvars(raw_path)
-    candidate = Path(expanded).expanduser()
+    expanded = os.path.expanduser(os.path.expandvars(raw_path))
+    candidate = Path(expanded)
     if candidate.is_absolute():
-        try:
-            relative = candidate.resolve(strict=False).relative_to(output_root)
-        except ValueError as exc:
-            raise _UnsafeSendPath from exc
-        components = relative.parts
+        absolute_components = tuple(expanded.split(os.sep))
+        root_components = tuple(os.fspath(output_root).split(os.sep))
+        if absolute_components[: len(root_components)] != root_components:
+            raise _UnsafeSendPath
+        components = absolute_components[len(root_components) :]
     else:
         components = tuple(expanded.split(os.sep))
     if not components or any(part in ("", ".", "..") for part in components):

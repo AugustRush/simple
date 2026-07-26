@@ -131,7 +131,11 @@ class OutputSink(ABC):
         """Consume attachments queued so far before returning."""
 
     def defer_temporary_attachment_cleanup(self, path: Path) -> bool:
-        """Return true when the sink assumes responsibility for later cleanup."""
+        """Return true only after irrevocably assuming responsibility for cleanup.
+
+        Implementations must return false, not raise, when ownership cannot be
+        transferred.
+        """
 
         return False
 

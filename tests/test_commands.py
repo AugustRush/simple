@@ -1008,6 +1008,67 @@ def test_builtin_send_accepts_absolute_path_inside_output_dir(tmp_path) -> None:
     assert result.response_text == f"Sending file: {source.resolve()}"
 
 
+def test_builtin_send_rejects_absolute_path_with_symlink_component(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = output_dir / "report.txt"
+    source.write_text("report", encoding="utf-8")
+    alias = output_dir / "alias.txt"
+    alias.symlink_to(source)
+
+    result = _run_builtin(
+        _builtin_router(),
+        f"/send {alias}",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+    )
+
+    assert result.level == "error"
+    assert result.attachments == ()
+    assert source.read_text(encoding="utf-8") == "report"
+
+
+def test_builtin_send_rejects_absolute_path_with_parent_component(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    (output_dir / "nested").mkdir(parents=True)
+    source = output_dir / "report.txt"
+    source.write_text("report", encoding="utf-8")
+    explicit_parent = f"{output_dir}/nested/../report.txt"
+
+    result = _run_builtin(
+        _builtin_router(),
+        f"/send {explicit_parent}",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+    )
+
+    assert result.response_text == "File is outside the output directory."
+    assert result.level == "error"
+    assert result.attachments == ()
+
+
+@pytest.mark.parametrize("component", [".", ""])
+def test_builtin_send_rejects_absolute_path_with_unsafe_component(
+    tmp_path, component
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = output_dir / "report.txt"
+    source.write_text("report", encoding="utf-8")
+    unsafe_path = f"{output_dir}/{component}/report.txt"
+
+    result = _run_builtin(
+        _builtin_router(),
+        f"/send {unsafe_path}",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+    )
+
+    assert result.response_text == "File is outside the output directory."
+    assert result.level == "error"
+    assert result.attachments == ()
+
+
 def test_builtin_send_attaches_immutable_inside_snapshot(tmp_path) -> None:
     output_dir = tmp_path / "output"
     output_dir.mkdir()
@@ -1547,6 +1608,39 @@ def test_coordinator_drains_before_temp_cleanup_when_flush_raises(tmp_path) -> N
     )
 
     assert sink.exists_during_drain[0] is True
+    assert not attachment.exists()
+    assert not private_dir.exists()
+
+
+def test_coordinator_cleans_temp_when_sink_cleanup_handoff_raises(tmp_path) -> None:
+    private_dir = tmp_path / ".send-test"
+    private_dir.mkdir()
+    attachment = private_dir / "report.txt"
+    attachment.write_text("report", encoding="utf-8")
+
+    async def handler(request, context):
+        return CommandResult(
+            attachments=(attachment,),
+            temporary_attachments=(attachment,),
+        )
+
+    class RaisingHandoffSink(_CoordinatorSink):
+        def defer_temporary_attachment_cleanup(self, path: Path) -> bool:
+            raise RuntimeError("ownership was not transferred")
+
+    coordinator, _ = _coordinator(
+        CommandRouter(core_commands=[CommandDescriptor("report", handler)])
+    )
+    state = RuntimeSessionState(ctx=SimpleNamespace(messages=[]))
+
+    asyncio.run(
+        coordinator.handle(
+            _turn("/report"),
+            state,
+            RaisingHandoffSink(),  # type: ignore[arg-type]
+        )
+    )
+
     assert not attachment.exists()
     assert not private_dir.exists()
 

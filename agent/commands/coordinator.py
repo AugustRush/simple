@@ -572,7 +572,6 @@ class CommandCoordinator:
                         "attachment=%s",
                         attachment,
                     )
-                    continue
             try:
                 path = Path(attachment)
                 path.unlink(missing_ok=True)
