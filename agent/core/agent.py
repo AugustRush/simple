@@ -328,7 +328,13 @@ class BaseAgent:
         override = (
             request_ctx.metadata.get("model_override") if request_ctx else None
         )
-        return str(override or self.model)
+        if override is None:
+            return self.model
+        if not isinstance(override, str):
+            raise TypeError("model override must be a nonblank string or None")
+        if not override.strip():
+            raise ValueError("model override must not be blank")
+        return override
 
     def _plan_orchestration(
         self,

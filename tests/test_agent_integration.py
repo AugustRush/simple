@@ -5846,9 +5846,107 @@ def test_base_agent_effective_model_prefers_request_context_override():
         system_prompt="system",
         metadata={"model_override": "request-model"},
     )
+    exact_ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": " request-model "},
+    )
 
     assert agent._effective_model(default_ctx) == "configured-model"
     assert agent._effective_model(override_ctx) == "request-model"
+    assert agent._effective_model(exact_ctx) == " request-model "
+    assert agent.model == "configured-model"
+
+
+@pytest.mark.parametrize("override", ["", " \t\n"])
+def test_base_agent_effective_model_rejects_blank_string_override(override):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": override},
+    )
+
+    with pytest.raises(ValueError, match="model override must not be blank"):
+        agent._effective_model(ctx)
+
+    assert agent.model == "configured-model"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [0, False, ["request-model"], {"model": "request-model"}],
+)
+def test_base_agent_effective_model_rejects_non_string_override(override):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": override},
+    )
+
+    with pytest.raises(
+        TypeError,
+        match="model override must be a nonblank string or None",
+    ):
+        agent._effective_model(ctx)
+
+    assert agent.model == "configured-model"
+
+
+@pytest.mark.parametrize(
+    ("override", "error_type"),
+    [
+        ("", ValueError),
+        (" \t", ValueError),
+        (0, TypeError),
+        (False, TypeError),
+        (["request-model"], TypeError),
+        ({"model": "request-model"}, TypeError),
+    ],
+)
+def test_non_stream_request_rejects_invalid_override_before_transport(
+    override,
+    error_type,
+):
+    import agent as agent_module
+
+    class _Transport:
+        def __init__(self):
+            self.called = False
+
+        async def create(self, **kwargs):
+            self.called = True
+            return object()
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="configured-model",
+        api_format="openai",
+    )
+    transport = _Transport()
+    agent._transport = transport
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        metadata={"model_override": override},
+    )
+
+    with pytest.raises(error_type):
+        asyncio.run(agent._create(ctx, []))
+
+    assert transport.called is False
     assert agent.model == "configured-model"
 
 
