@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -135,10 +137,43 @@ def test_descriptor_and_result_defaults() -> None:
     assert result.handled is True
     assert result.response_text is None
     assert result.attachments == ()
+    assert result.temporary_attachments == ()
     assert result.forward_text is None
     assert result.action is None
     assert result.level == "info"
     assert result.error is None
+
+
+def test_command_result_requires_temporary_attachments_to_be_attachments() -> None:
+    result = CommandResult(
+        attachments=["temporary.txt", "export.md"],
+        temporary_attachments=["temporary.txt"],
+    )
+
+    assert result.temporary_attachments == ("temporary.txt",)
+    with pytest.raises(ValueError, match="temporary attachments"):
+        CommandResult(
+            attachments=["export.md"],
+            temporary_attachments=["temporary.txt"],
+        )
+
+
+def test_command_result_temporary_field_preserves_positional_compatibility() -> None:
+    result = CommandResult(
+        True,
+        "response",
+        ("report.md",),
+        "forward",
+        "exit_cli",
+        "warning",
+        "stable error",
+    )
+
+    assert result.forward_text == "forward"
+    assert result.action == "exit_cli"
+    assert result.level == "warning"
+    assert result.error == "stable error"
+    assert result.temporary_attachments == ()
 
 
 def test_descriptor_rejects_invalid_scope() -> None:
@@ -530,7 +565,7 @@ def test_help_escapes_external_descriptor_markdown() -> None:
             CommandDescriptor(
                 "report",
                 _noop_handler,
-                usage="/report | admin\n# forged",
+                usage="/report [name](url)<tag>\\pipe | admin\n# forged",
                 description="desc\\tail\n## forged",
             )
         ]
@@ -543,6 +578,8 @@ def test_help_escapes_external_descriptor_markdown() -> None:
     assert r"\|" in help_text
     assert r"\#" in help_text
     assert r"\\" in help_text
+    for character in "[]()<>":
+        assert f"\\{character}" in help_text
 
 
 class _BuiltinSink:
@@ -938,7 +975,9 @@ def test_builtin_send_queues_only_existing_files_inside_output_dir(tmp_path) -> 
     usage = _run_builtin(router, "/send", channel_name="feishu", components=components)
 
     assert len(sent.attachments) == 1
-    assert sent.attachments[0].parent == output_dir / "spool"
+    assert sent.temporary_attachments == sent.attachments
+    assert sent.attachments[0].parent.parent == output_dir
+    assert sent.attachments[0].parent.name.startswith(".send-")
     assert sent.attachments[0].read_text(encoding="utf-8") == "report"
     assert sent.response_text == f"Sending file: {inside.resolve()}"
     assert traversal.response_text == "File is outside the output directory."
@@ -970,7 +1009,8 @@ def test_builtin_send_attaches_immutable_inside_snapshot(tmp_path) -> None:
 
     attachment = result.attachments[0]
     assert attachment != source
-    assert attachment.parent == output_dir / "spool"
+    assert attachment.parent.parent == output_dir
+    assert attachment.parent.name.startswith(".send-")
     assert attachment.read_text(encoding="utf-8") == "original report"
     assert victim.read_text(encoding="utf-8") == "outside secret"
 
@@ -997,15 +1037,12 @@ def test_builtin_send_fails_closed_without_nofollow_support(
     assert result.level == "error"
     assert result.attachments == ()
     assert source.read_text(encoding="utf-8") == "original report"
-    assert not (output_dir / "spool").exists()
+    assert not list(output_dir.glob(".send-*"))
 
 
-def test_builtin_send_uses_private_spool_permissions(tmp_path) -> None:
+def test_builtin_send_uses_private_snapshot_permissions(tmp_path) -> None:
     output_dir = tmp_path / "output"
     output_dir.mkdir()
-    spool_dir = output_dir / "spool"
-    spool_dir.mkdir()
-    os.chmod(spool_dir, 0o777)
     source = output_dir / "report.txt"
     source.write_text("report", encoding="utf-8")
 
@@ -1016,8 +1053,175 @@ def test_builtin_send_uses_private_spool_permissions(tmp_path) -> None:
         components={"output_dir": output_dir},
     )
 
-    assert stat.S_IMODE(spool_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(result.attachments[0].parent.stat().st_mode) == 0o700
     assert stat.S_IMODE(result.attachments[0].stat().st_mode) == 0o600
+
+
+def test_builtin_send_rejects_ancestor_symlink_swap(tmp_path, monkeypatch) -> None:
+    output_dir = tmp_path / "output"
+    nested = output_dir / "nested"
+    nested.mkdir(parents=True)
+    source = nested / "report.txt"
+    source.write_text("inside report", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "report.txt"
+    victim.write_text("outside secret", encoding="utf-8")
+    moved = output_dir / "nested-original"
+    real_open = builtin_commands.os.open
+    swapped = False
+
+    def swap_before_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        path_text = os.fspath(path)
+        if not swapped and (path_text == "nested" or Path(path_text) == source):
+            swapped = True
+            nested.rename(moved)
+            nested.symlink_to(outside, target_is_directory=True)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(builtin_commands.os, "open", swap_before_open)
+
+    result = _run_builtin(
+        _builtin_router(),
+        "/send nested/report.txt",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+    )
+
+    assert swapped is True
+    assert result.level == "error"
+    assert result.attachments == ()
+    assert victim.read_text(encoding="utf-8") == "outside secret"
+
+
+def test_builtin_send_rejects_oversize_before_creating_temp_files(tmp_path) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = output_dir / "report.txt"
+    source.write_bytes(b"12345")
+
+    result = _run_builtin(
+        _builtin_router(),
+        "/send report.txt",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+        config={"send_max_snapshot_bytes": 4},
+    )
+
+    assert result.response_text == "File exceeds send snapshot limit (4 bytes)."
+    assert result.level == "error"
+    assert result.attachments == ()
+    assert list(output_dir.iterdir()) == [source]
+
+
+def test_builtin_send_rejects_source_growth_and_cleans_partial_temp(
+    tmp_path, monkeypatch
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    source = output_dir / "report.txt"
+    source.write_bytes(b"start")
+    original_copy = builtin_commands._copy_file_descriptor
+
+    def grow_during_copy(*args, **kwargs):
+        with source.open("ab") as handle:
+            handle.write(b"-growth")
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(builtin_commands, "_copy_file_descriptor", grow_during_copy)
+
+    result = _run_builtin(
+        _builtin_router(),
+        "/send report.txt",
+        channel_name="feishu",
+        components={"output_dir": output_dir},
+        config={"send_max_snapshot_bytes": 64},
+    )
+
+    assert result.response_text == "File changed while preparing attachment."
+    assert result.level == "error"
+    assert result.attachments == ()
+    assert list(output_dir.iterdir()) == [source]
+
+
+def test_builtin_send_snapshot_copy_does_not_block_event_loop(
+    tmp_path, monkeypatch
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "report.txt").write_text("report", encoding="utf-8")
+    original_snapshot = builtin_commands._snapshot_send_file
+
+    def slow_snapshot(*args, **kwargs):
+        time.sleep(0.15)
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(builtin_commands, "_snapshot_send_file", slow_snapshot)
+    router = _builtin_router()
+    route = router.classify("/send report.txt", channel_name="feishu")
+    context = CommandContext(
+        {"output_dir": output_dir},
+        {},
+        SimpleNamespace(ctx=SimpleNamespace(messages=[]), model_override=None),
+        _BuiltinSink(),
+        channel_name="feishu",
+    )
+
+    async def scenario() -> None:
+        started_at = time.perf_counter()
+        task = asyncio.create_task(router.execute(route, context))
+        await asyncio.sleep(0.01)
+        tick_elapsed = time.perf_counter() - started_at
+        result = await task
+
+        assert tick_elapsed < 0.08
+        assert result.level == "info"
+
+    asyncio.run(scenario())
+
+
+def test_builtin_send_cancellation_during_copy_cleans_completed_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "report.txt").write_text("report", encoding="utf-8")
+    copy_started = threading.Event()
+    release_copy = threading.Event()
+    original_copy = builtin_commands._copy_file_descriptor
+
+    def gated_copy(*args, **kwargs):
+        copy_started.set()
+        release_copy.wait(timeout=1)
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(builtin_commands, "_copy_file_descriptor", gated_copy)
+    router = _builtin_router()
+    route = router.classify("/send report.txt", channel_name="feishu")
+    context = CommandContext(
+        {"output_dir": output_dir},
+        {},
+        SimpleNamespace(ctx=SimpleNamespace(messages=[]), model_override=None),
+        _BuiltinSink(),
+        channel_name="feishu",
+    )
+
+    async def scenario() -> None:
+        running = asyncio.create_task(router.execute(route, context))
+        assert await asyncio.to_thread(copy_started.wait, 1)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        release_copy.set()
+        for _attempt in range(100):
+            if not list(output_dir.glob(".send-*")):
+                break
+            await asyncio.sleep(0.01)
+
+        assert not list(output_dir.glob(".send-*"))
+
+    asyncio.run(scenario())
 
 
 def test_builtin_external_markdown_values_cannot_forge_rows_or_headings(
@@ -1168,16 +1372,162 @@ def _coordinator(
     *,
     core: _CoordinatorCore | None = None,
     events: list | None = None,
+    components: dict | None = None,
+    config: dict | None = None,
 ) -> tuple[CommandCoordinator, _CoordinatorCore]:
     fake_core = core or _CoordinatorCore()
     coordinator = CommandCoordinator(
         fake_core,  # type: ignore[arg-type]
         router or CommandRouter(),
-        components={"dependency": "available"},
-        config={"mode": "test"},
+        components=components or {"dependency": "available"},
+        config=config or {"mode": "test"},
         event_hook=None if events is None else events.append,
     )
     return coordinator, fake_core
+
+
+def test_coordinator_cleans_temporary_attachment_after_drain(tmp_path) -> None:
+    class ConsumingSink(_CoordinatorSink):
+        def __init__(self) -> None:
+            super().__init__()
+            self.consumed: list[tuple[Path, str]] = []
+
+        async def drain(self) -> None:
+            self.drain_count += 1
+            pending = list(self.attachments)
+            self.attachments.clear()
+            for attachment in pending:
+                path = Path(attachment)
+                self.consumed.append((path, path.read_text(encoding="utf-8")))
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "report.txt").write_text("report", encoding="utf-8")
+    router = _builtin_router()
+    coordinator, _ = _coordinator(
+        router,
+        components={"output_dir": output_dir},
+    )
+    state = RuntimeSessionState(ctx=SimpleNamespace(messages=[]))
+    sink = ConsumingSink()
+
+    asyncio.run(
+        coordinator.handle(
+            _turn("/send report.txt"),
+            state,
+            sink,  # type: ignore[arg-type]
+        )
+    )
+
+    assert len(sink.consumed) == 1
+    attachment, content = sink.consumed[0]
+    assert content == "report"
+    assert not attachment.exists()
+    assert not attachment.parent.exists()
+
+
+def test_coordinator_keeps_normal_export_attachment_after_drain(tmp_path) -> None:
+    class ConsumingSink(_CoordinatorSink):
+        async def drain(self) -> None:
+            self.drain_count += 1
+            for attachment in self.attachments:
+                assert Path(attachment).is_file()
+
+    router = _builtin_router()
+    coordinator, _ = _coordinator(
+        router,
+        components={"output_dir": tmp_path},
+    )
+    state = RuntimeSessionState(
+        ctx=SimpleNamespace(messages=[{"role": "user", "content": "hello"}])
+    )
+    sink = ConsumingSink()
+
+    asyncio.run(
+        coordinator.handle(
+            _turn("/export"),
+            state,
+            sink,  # type: ignore[arg-type]
+        )
+    )
+
+    assert len(sink.attachments) == 1
+    assert Path(sink.attachments[0]).is_file()
+
+
+def test_coordinator_cleans_temporary_attachment_when_drain_raises(tmp_path) -> None:
+    class RaisingDrainSink(_CoordinatorSink):
+        async def drain(self) -> None:
+            self.drain_count += 1
+            raise RuntimeError("delivery failed")
+
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "report.txt").write_text("report", encoding="utf-8")
+    coordinator, _ = _coordinator(
+        _builtin_router(),
+        components={"output_dir": output_dir},
+    )
+    state = RuntimeSessionState(ctx=SimpleNamespace(messages=[]))
+    sink = RaisingDrainSink()
+
+    asyncio.run(
+        coordinator.handle(
+            _turn("/send report.txt"),
+            state,
+            sink,  # type: ignore[arg-type]
+        )
+    )
+
+    assert len(sink.attachments) == 1
+    attachment = Path(sink.attachments[0])
+    assert not attachment.exists()
+    assert not attachment.parent.exists()
+
+
+def test_coordinator_cleans_temporary_attachment_when_drain_is_cancelled(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        class BlockingDrainSink(_CoordinatorSink):
+            def __init__(self) -> None:
+                super().__init__()
+                self.started = asyncio.Event()
+
+            async def drain(self) -> None:
+                self.drain_count += 1
+                if self.drain_count == 1:
+                    self.started.set()
+                    await asyncio.Event().wait()
+
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "report.txt").write_text("report", encoding="utf-8")
+        coordinator, _ = _coordinator(
+            _builtin_router(),
+            components={"output_dir": output_dir},
+        )
+        state = RuntimeSessionState(ctx=SimpleNamespace(messages=[]))
+        sink = BlockingDrainSink()
+        running = asyncio.create_task(
+            coordinator.handle(
+                _turn("/send report.txt"),
+                state,
+                sink,  # type: ignore[arg-type]
+            )
+        )
+
+        await sink.started.wait()
+        attachment = Path(sink.attachments[0])
+        assert attachment.is_file()
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+
+        assert not attachment.exists()
+        assert not attachment.parent.exists()
+
+    asyncio.run(scenario())
 
 
 def _turn(text: str, *, message_id: str = "m-1") -> TurnInput:

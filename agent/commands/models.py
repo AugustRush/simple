@@ -87,9 +87,15 @@ class CommandResult:
     action: CommandAction | None = None
     level: CommandLevel = "info"
     error: str | None = None
+    temporary_attachments: tuple[Any, ...] = ()
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "attachments", tuple(self.attachments))
+        attachments = tuple(self.attachments)
+        temporary_attachments = tuple(self.temporary_attachments)
+        if any(item not in attachments for item in temporary_attachments):
+            raise ValueError("temporary attachments must be included in attachments")
+        object.__setattr__(self, "attachments", attachments)
+        object.__setattr__(self, "temporary_attachments", temporary_attachments)
         if self.level not in _VALID_LEVELS:
             raise ValueError(f"invalid command result level: {self.level!r}")
 

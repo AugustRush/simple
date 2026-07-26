@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import json
 import os
@@ -9,10 +10,23 @@ import stat
 from typing import Any, Mapping
 
 from agent import shared
-from agent.pathing import canonicalize_user_path, path_contains
 
 from .models import CommandContext, CommandDescriptor, CommandRequest, CommandResult
 from .router import CommandRouter
+
+_DEFAULT_MAX_SEND_SNAPSHOT_BYTES = 32 * 1024 * 1024
+
+
+class _SnapshotTooLarge(Exception):
+    pass
+
+
+class _SnapshotChanged(Exception):
+    pass
+
+
+class _UnsafeSendPath(Exception):
+    pass
 
 
 def _error(message: str) -> CommandResult:
@@ -434,72 +448,181 @@ async def _quit_handler(
     return CommandResult(action="exit_cli")
 
 
-def _copy_file_descriptor(source: int, destination: int) -> None:
+def _copy_file_descriptor(source: int, destination: int, max_bytes: int) -> int:
+    copied = 0
     while True:
-        chunk = os.read(source, 1024 * 1024)
+        remaining_limit = max_bytes + 1 - copied
+        if remaining_limit <= 0:
+            raise _SnapshotTooLarge
+        chunk = os.read(source, min(1024 * 1024, remaining_limit))
         if not chunk:
             break
+        copied += len(chunk)
+        if copied > max_bytes:
+            raise _SnapshotTooLarge
         remaining = memoryview(chunk)
         while remaining:
             written = os.write(destination, remaining)
             if written <= 0:
                 raise OSError("unable to write file snapshot")
             remaining = remaining[written:]
-    os.fsync(destination)
+    return copied
 
 
-def _snapshot_send_file(source: Path, output_root: Path) -> Path:
+def _relative_send_components(raw_path: str) -> tuple[str, ...]:
+    expanded = os.path.expandvars(raw_path)
+    candidate = Path(expanded).expanduser()
+    if candidate.is_absolute():
+        raise _UnsafeSendPath
+    components = tuple(expanded.split(os.sep))
+    if not components or any(part in ("", ".", "..") for part in components):
+        raise _UnsafeSendPath
+    return components
+
+
+def _open_relative_source(
+    output_descriptor: int, components: tuple[str, ...], common_flags: int
+) -> int:
+    parent_descriptor = os.dup(output_descriptor)
+    try:
+        for component in components[:-1]:
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | common_flags,
+                dir_fd=parent_descriptor,
+            )
+            os.close(parent_descriptor)
+            parent_descriptor = next_descriptor
+        return os.open(
+            components[-1],
+            os.O_RDONLY | common_flags,
+            dir_fd=parent_descriptor,
+        )
+    finally:
+        os.close(parent_descriptor)
+
+
+def _source_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _snapshot_send_file(
+    output_root: Path,
+    components: tuple[str, ...],
+    max_bytes: int,
+) -> Path:
     nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
         raise NotImplementedError("secure file snapshots require O_NOFOLLOW")
     common_flags = nofollow | getattr(os, "O_CLOEXEC", 0)
-    source_descriptor = os.open(source, os.O_RDONLY | common_flags)
+    output_descriptor = os.open(
+        output_root,
+        os.O_RDONLY | directory | common_flags,
+    )
+    source_descriptor = -1
+    temporary_descriptor = -1
+    destination_descriptor = -1
+    temporary_name: str | None = None
+    destination_name: str | None = None
     try:
-        if not stat.S_ISREG(os.fstat(source_descriptor).st_mode):
+        if not stat.S_ISDIR(os.fstat(output_descriptor).st_mode):
+            raise ValueError("output root is not a directory")
+        source_descriptor = _open_relative_source(
+            output_descriptor, components, common_flags
+        )
+        before = os.fstat(source_descriptor)
+        if not stat.S_ISREG(before.st_mode):
             raise ValueError("source is not a regular file")
+        if before.st_size > max_bytes:
+            raise _SnapshotTooLarge
 
-        spool_dir = output_root / "spool"
-        spool_dir.mkdir(mode=0o700, exist_ok=True)
-        spool_metadata = spool_dir.lstat()
-        if not stat.S_ISDIR(spool_metadata.st_mode):
-            raise ValueError("spool path is not a directory")
-        if not path_contains(output_root, spool_dir.resolve(strict=False)):
-            raise ValueError("spool directory is outside output directory")
-
-        directory_flags = os.O_RDONLY | common_flags | getattr(os, "O_DIRECTORY", 0)
-        spool_descriptor = os.open(spool_dir, directory_flags)
-        try:
-            if not stat.S_ISDIR(os.fstat(spool_descriptor).st_mode):
-                raise ValueError("spool path is not a directory")
-            os.fchmod(spool_descriptor, 0o700)
-            destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            destination_flags |= getattr(os, "O_CLOEXEC", 0)
-            for _attempt in range(100):
-                snapshot_name = f"send_{secrets.token_hex(16)}{source.suffix}"
-                try:
-                    destination_descriptor = os.open(
-                        snapshot_name,
-                        destination_flags,
-                        0o600,
-                        dir_fd=spool_descriptor,
-                    )
-                except FileExistsError:
-                    continue
-                try:
-                    os.fchmod(destination_descriptor, 0o600)
-                    _copy_file_descriptor(source_descriptor, destination_descriptor)
-                except Exception:
-                    os.close(destination_descriptor)
-                    os.unlink(snapshot_name, dir_fd=spool_descriptor)
-                    raise
-                else:
-                    os.close(destination_descriptor)
-                    return spool_dir / snapshot_name
-            raise OSError("unable to reserve a unique spool filename")
-        finally:
-            os.close(spool_descriptor)
+        for _attempt in range(100):
+            candidate = f".send-{secrets.token_hex(16)}"
+            try:
+                os.mkdir(candidate, 0o700, dir_fd=output_descriptor)
+            except FileExistsError:
+                continue
+            temporary_name = candidate
+            break
+        if temporary_name is None:
+            raise OSError("unable to reserve a private attachment directory")
+        temporary_descriptor = os.open(
+            temporary_name,
+            os.O_RDONLY | directory | common_flags,
+            dir_fd=output_descriptor,
+        )
+        os.fchmod(temporary_descriptor, 0o700)
+        destination_name = components[-1]
+        destination_descriptor = os.open(
+            destination_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+            dir_fd=temporary_descriptor,
+        )
+        os.fchmod(destination_descriptor, 0o600)
+        copied = _copy_file_descriptor(
+            source_descriptor, destination_descriptor, max_bytes
+        )
+        after = os.fstat(source_descriptor)
+        if copied != before.st_size or _source_identity(after) != _source_identity(
+            before
+        ):
+            raise _SnapshotChanged
+        os.fsync(destination_descriptor)
+        os.close(destination_descriptor)
+        destination_descriptor = -1
+        return output_root / temporary_name / destination_name
+    except Exception:
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+            destination_descriptor = -1
+        if temporary_descriptor >= 0 and destination_name is not None:
+            try:
+                os.unlink(destination_name, dir_fd=temporary_descriptor)
+            except FileNotFoundError:
+                pass
+        if temporary_name is not None:
+            try:
+                os.rmdir(temporary_name, dir_fd=output_descriptor)
+            except OSError:
+                pass
+        raise
     finally:
-        os.close(source_descriptor)
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        os.close(output_descriptor)
+
+
+def _send_snapshot_limit(context: CommandContext) -> int:
+    configured = context.config.get(
+        "send_max_snapshot_bytes", _DEFAULT_MAX_SEND_SNAPSHOT_BYTES
+    )
+    if (
+        isinstance(configured, bool)
+        or not isinstance(configured, int)
+        or configured <= 0
+    ):
+        return _DEFAULT_MAX_SEND_SNAPSHOT_BYTES
+    return configured
+
+
+def _delete_temporary_snapshot(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+        path.parent.rmdir()
+    except OSError:
+        pass
 
 
 async def _send_handler(
@@ -513,25 +636,52 @@ async def _send_handler(
         return _error("Output directory is not available.")
     try:
         output_root = Path(output_dir).expanduser().resolve(strict=False)
-        expanded = os.path.expandvars(raw_path)
-        path = canonicalize_user_path(expanded, base_dir=output_root)
+        components = _relative_send_components(raw_path)
     except (OSError, RuntimeError, ValueError):
         return _error("Invalid file path.")
-    if not path_contains(output_root, path):
+    except _UnsafeSendPath:
         return _error("File is outside the output directory.")
+    source_display = output_root.joinpath(*components)
+    max_bytes = _send_snapshot_limit(context)
+    snapshot_task = asyncio.create_task(
+        asyncio.to_thread(
+            _snapshot_send_file,
+            output_root,
+            components,
+            max_bytes,
+        )
+    )
     try:
-        snapshot = _snapshot_send_file(path, output_root)
+        snapshot = await asyncio.shield(snapshot_task)
+    except asyncio.CancelledError:
+
+        def cleanup_completed_snapshot(task: asyncio.Task[Path]) -> None:
+            if task.cancelled():
+                return
+            try:
+                completed_snapshot = task.result()
+            except Exception:
+                return
+            _delete_temporary_snapshot(completed_snapshot)
+
+        snapshot_task.add_done_callback(cleanup_completed_snapshot)
+        raise
     except FileNotFoundError:
         return _error(f"File not found: {_markdown_inline(raw_path)}")
     except NotImplementedError:
         return _error("Secure file sending is not supported on this platform.")
+    except _SnapshotTooLarge:
+        return _error(f"File exceeds send snapshot limit ({max_bytes} bytes).")
+    except _SnapshotChanged:
+        return _error("File changed while preparing attachment.")
     except ValueError:
         return _error(f"File is not a regular file: {_markdown_inline(raw_path)}")
     except OSError:
         return _error(f"Unable to send file: {_markdown_inline(raw_path)}")
     return CommandResult(
-        response_text=f"Sending file: {_markdown_inline(path)}",
+        response_text=f"Sending file: {_markdown_inline(source_display)}",
         attachments=(snapshot,),
+        temporary_attachments=(snapshot,),
     )
 
 

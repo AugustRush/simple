@@ -70,7 +70,7 @@ def _markdown_inline(value: Any, *, preserve_usage_syntax: bool = False) -> str:
     text = text.replace("\\", "\\\\")
     characters = ["`", "*", "#", "|"]
     if not preserve_usage_syntax:
-        characters.extend(("[", "]", "<", ">"))
+        characters.extend(("[", "]", "(", ")", "<", ">"))
     for character in characters:
         text = text.replace(character, f"\\{character}")
     return text
@@ -384,15 +384,19 @@ class CommandRouter:
         """Render command help from registrations visible to one channel."""
 
         descriptors = (
-            descriptor
-            for descriptor in (*self._core_commands, *self._plugin_commands)
+            (descriptor, source)
+            for source, registered in (
+                ("core", self._core_commands),
+                ("plugin", self._plugin_commands),
+            )
+            for descriptor in registered
             if _in_scope(descriptor, channel_name)
         )
         lines = []
-        for descriptor in sorted(descriptors, key=lambda item: item.name):
+        for descriptor, source in sorted(descriptors, key=lambda item: item[0].name):
             usage = _markdown_inline(
                 descriptor.usage or f"/{descriptor.name}",
-                preserve_usage_syntax=True,
+                preserve_usage_syntax=source == "core",
             )
             line = usage
             if descriptor.description:

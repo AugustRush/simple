@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import logging
+from pathlib import Path
 import time
 from typing import Any, Callable, Mapping, NotRequired, TypedDict
 
@@ -139,14 +140,10 @@ class CommandCoordinator:
                 return None
             if state.operation_state == "active":
                 if state.accepts_interjections:
-                    self._queue_interjection(
-                        turn_input, sink, state, ready=sink_ready
-                    )
+                    self._queue_interjection(turn_input, sink, state, ready=sink_ready)
                     self._safe_status(sink, "Interjection queued.", level="info")
                 else:
-                    self._queue_restart(
-                        turn_input, sink, state, ready=sink_ready
-                    )
+                    self._queue_restart(turn_input, sink, state, ready=sink_ready)
                     self._safe_status(
                         sink, "Message queued for the next turn.", level="info"
                     )
@@ -243,7 +240,9 @@ class CommandCoordinator:
                     )
                     forwarded_input = replace(
                         current_input,
-                        text=current_forward if current_forward is not None else current_input.text,
+                        text=current_forward
+                        if current_forward is not None
+                        else current_input.text,
                     )
                     await self._agent_core.handle_turn(
                         forwarded_input,
@@ -440,9 +439,7 @@ class CommandCoordinator:
                 urgency="now",
                 ready=sink_ready,
             )
-            self._safe_status(
-                sink, "Message queued for the next turn.", level="info"
-            )
+            self._safe_status(sink, "Message queued for the next turn.", level="info")
         self._emit(
             "command_handled",
             turn_input,
@@ -484,9 +481,7 @@ class CommandCoordinator:
                     outcome="forwarded",
                 )
                 return action
-            self._safe_status(
-                sink, "No active operation to cancel.", level="info"
-            )
+            self._safe_status(sink, "No active operation to cancel.", level="info")
             self._emit(
                 "command_handled",
                 turn_input,
@@ -543,12 +538,30 @@ class CommandCoordinator:
         )
 
     async def _render_result(self, result: CommandResult, sink: OutputSink) -> None:
-        if result.response_text is not None:
-            self._safe_status(sink, result.response_text, level=result.level)
-        elif result.error:
-            self._safe_error(sink, result.error)
-        for attachment in result.attachments:
-            self._safe_attachment(sink, attachment)
+        try:
+            if result.response_text is not None:
+                self._safe_status(sink, result.response_text, level=result.level)
+            elif result.error:
+                self._safe_error(sink, result.error)
+            for attachment in result.attachments:
+                self._safe_attachment(sink, attachment)
+            if result.temporary_attachments:
+                await self._drain_if_supported(sink)
+        finally:
+            self._cleanup_temporary_attachments(result.temporary_attachments)
+
+    @staticmethod
+    def _cleanup_temporary_attachments(attachments: tuple[Any, ...]) -> None:
+        for attachment in attachments:
+            try:
+                path = Path(attachment)
+                path.unlink(missing_ok=True)
+                path.parent.rmdir()
+            except OSError:
+                logger.exception(
+                    "temporary command attachment cleanup failed: attachment=%s",
+                    attachment,
+                )
 
     def _command_context(
         self,
