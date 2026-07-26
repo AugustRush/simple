@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+import threading
 from dataclasses import asdict
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -659,12 +660,13 @@ def test_feishu_flush_cancellation_clears_queue_and_temp(tmp_path):
         (output_dir / "report.txt").write_text("report", encoding="utf-8")
         sink = _make_feishu_sink()
         started = asyncio.Event()
+        release_send = asyncio.Event()
         attempted: list[Path] = []
 
         async def block_send(path: Path) -> None:
             attempted.append(path)
             started.set()
-            await asyncio.Event().wait()
+            await release_send.wait()
 
         sink._send_file_async = block_send  # type: ignore[method-assign]
         router = CommandRouter()
@@ -695,9 +697,85 @@ def test_feishu_flush_cancellation_clears_queue_and_temp(tmp_path):
         await asyncio.wait_for(started.wait(), timeout=0.2)
         assert attempted[0].is_file()
         running.cancel()
+        await asyncio.sleep(0)
+        assert not running.done()
+        assert attempted[0].is_file()
+        release_send.set()
         with pytest.raises(asyncio.CancelledError):
             await running
 
+        assert not attempted[0].exists()
+        assert not attempted[0].parent.exists()
+        assert sink._attachments == []
+        assert sink._attachment_keys == set()
+
+    asyncio.run(scenario())
+
+
+def test_feishu_flush_cancellation_waits_for_sync_uploader_before_cleanup(tmp_path):
+    async def scenario() -> None:
+        output_dir = tmp_path / "output"
+        output_dir.mkdir()
+        (output_dir / "report.txt").write_text("report", encoding="utf-8")
+        sink = _make_feishu_sink()
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+        worker_finished = threading.Event()
+        attempted: list[Path] = []
+        observed_content: list[str] = []
+
+        def blocking_upload(path: Path):
+            attempted.append(path)
+            worker_started.set()
+            release_worker.wait(timeout=1)
+            try:
+                observed_content.append(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                observed_content.append("missing")
+            finally:
+                worker_finished.set()
+            return "file-key"
+
+        sink._upload_file_sync = MagicMock(side_effect=blocking_upload)
+        sink._do_send = MagicMock()
+        router = CommandRouter()
+        register_builtin_commands(router)
+
+        class UnusedCore:
+            async def handle_turn(self, *args, **kwargs):
+                raise AssertionError("command must not forward to the model")
+
+        coordinator = CommandCoordinator(
+            UnusedCore(),  # type: ignore[arg-type]
+            router,
+            components={"output_dir": output_dir},
+        )
+        state = RuntimeSessionState(ctx=MagicMock(messages=[]))
+        running = asyncio.create_task(
+            coordinator.handle(
+                TurnInput.from_text(
+                    "/send report.txt",
+                    session_id="s-1",
+                    channel_name="feishu",
+                ),
+                state,
+                sink,
+            )
+        )
+
+        assert await asyncio.to_thread(worker_started.wait, 1)
+        running.cancel()
+        await asyncio.sleep(0.02)
+        cancellation_waited_for_worker = not running.done()
+        snapshot_existed_while_blocked = attempted[0].is_file()
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+        assert await asyncio.to_thread(worker_finished.wait, 1)
+
+        assert cancellation_waited_for_worker is True
+        assert snapshot_existed_while_blocked is True
+        assert observed_content == ["report"]
         assert not attempted[0].exists()
         assert not attempted[0].parent.exists()
         assert sink._attachments == []

@@ -501,8 +501,22 @@ class FeishuOutputSink(OutputSink):
         await self.drain()
         if not self._attachments:
             return
+        upload_task = asyncio.create_task(self._send_attachments_async())
         try:
-            await self._send_attachments_async()
+            await asyncio.shield(upload_task)
+        except asyncio.CancelledError:
+            while not upload_task.done():
+                try:
+                    await asyncio.shield(upload_task)
+                except asyncio.CancelledError:
+                    continue
+            try:
+                upload_task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Feishu attachment flush failed during cancellation")
+            raise
         finally:
             self._attachments = []
             self._attachment_keys = set()
