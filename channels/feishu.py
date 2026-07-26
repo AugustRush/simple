@@ -1835,9 +1835,6 @@ class FeishuChannel(Channel):
         self._output_dir: Optional[Path] = None
         self._input_dir: Path = shared.AGENT_HOME / "input" / "feishu"
         self._input_dir_explicit = False
-        # Per-chat lock: ensures messages from the same chat are processed
-        # one at a time even if they arrive in rapid succession.
-        self._chat_locks: dict[str, asyncio.Lock] = {}
         # Ordered LRU cache for message-id deduplication
         self._processed_ids: OrderedDict[str, None] = OrderedDict()
         self._stop_event: Optional[asyncio.Event] = None
@@ -2310,35 +2307,15 @@ class FeishuChannel(Channel):
                 text_preview=_preview_text(content),
             )
 
-            if content.startswith("/send "):
-                requested = content[len("/send ") :].strip()
+            if self._handler:
+                sink = self.create_sink(msg_obj)
                 _interaction_log(
-                    "send_command_received",
+                    "message_dispatched",
                     message_id=message_id,
                     chat_id=reply_to,
-                    requested_path=requested,
+                    sink=type(sink).__name__,
                 )
-                sink = self.create_sink(msg_obj)
-                path = self._resolve_send_path(requested)
-                if path is None or not path.is_file():
-                    await sink._send_plain_async(f"File not found: {requested}")
-                    await sink.drain()
-                    return
-                await sink._send_file_async(path)
-                await sink.drain()
-                return
-
-            if self._handler:
-                lock = self._chat_locks.setdefault(reply_to, asyncio.Lock())
-                async with lock:
-                    sink = self.create_sink(msg_obj)
-                    _interaction_log(
-                        "message_dispatched",
-                        message_id=message_id,
-                        chat_id=reply_to,
-                        sink=type(sink).__name__,
-                    )
-                    await self._handler(msg_obj, sink)
+                await self._handler(msg_obj, sink)
 
         except Exception as exc:
             _interaction_log("message_processing_failed", error=str(exc))

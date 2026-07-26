@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import time
 import uuid
@@ -13,6 +14,11 @@ from rich.console import Console
 
 from agent import shared
 from agent.shared import CancelToken
+from agent.commands import (
+    CommandCoordinator,
+    CommandRouter,
+    register_builtin_commands,
+)
 from agent.core.output import CliOutputSink, OutputSink
 from agent.core.attachments import MessageAttachment
 from agent.runtime import (
@@ -246,6 +252,33 @@ class ChannelRunner:
         agent_core = components.get("agent_core")
         if agent_core is None:
             agent_core = AgentCore(RuntimeComponents(components))
+        router = components.get("command_router")
+        if router is None:
+            router = CommandRouter(skill_catalog=components.get("skill_catalog"))
+            register_builtin_commands(router)
+            plugin_catalog = components.get("plugin_catalog")
+            if plugin_catalog is not None and hasattr(
+                plugin_catalog, "get_slash_commands"
+            ):
+                router.register_plugin_catalog(plugin_catalog)
+            components["command_router"] = router
+        runtime_event_buffer: contextvars.ContextVar[list[RuntimeEvent] | None] = (
+            contextvars.ContextVar("channel_runtime_event_buffer", default=None)
+        )
+
+        def _record_runtime_event(event: RuntimeEvent) -> None:
+            current = runtime_event_buffer.get()
+            if current is not None:
+                current.append(event)
+            self._log_runtime_event(event)
+
+        coordinator = CommandCoordinator(
+            agent_core,
+            router,
+            components=components,
+            config=self._cfg,
+            event_hook=_record_runtime_event,
+        )
 
         async def _handle(msg: IncomingMessage, sink: OutputSink) -> bool:
             turn_started_at = time.perf_counter()
@@ -254,180 +287,51 @@ class ChannelRunner:
             state = self._ensure_session_state(sessions, session_id)
             ctx = state.ctx
             ctx.metadata["skill_catalog"] = skill_catalog
-
-            # /cancel arrives asynchronously in channel mode — cancel the
-            # running turn.  Default is force-cancel (aborts LLM mid-flight,
-            # SIGKILL subprocesses) for instant feedback.  Add "graceful" for
-            # the old safe-point behaviour.
-            stripped = msg.text.strip()
-            cancel_lower = stripped.lower()
-            if cancel_lower == "/cancel" or cancel_lower == "cancel":
-                if state.turn_in_progress and state.cancel_token is not None:
-                    state.cancel_token.cancel("force")
-                    sink.on_status(
-                        "已强制取消当前任务（中断 LLM + 终止子进程）",
-                        level="warning",
-                    )
-                else:
-                    sink.on_status("当前没有正在运行的任务", level="info")
-                return True
-            if cancel_lower in ("/cancel graceful", "cancel graceful"):
-                if state.turn_in_progress and state.cancel_token is not None:
-                    state.cancel_token.cancel()
-                    sink.on_status(
-                        "已发送取消信号，当前任务将在下一个安全点停止",
-                        level="warning",
-                    )
-                else:
-                    sink.on_status("当前没有正在运行的任务", level="info")
-                return True
-            # /cancel <message> — cancel + restart with a new task in one message.
-            if cancel_lower.startswith("/cancel ") or cancel_lower.startswith("cancel "):
-                payload = stripped.split(None, 1)[1] if len(stripped.split(None, 1)) > 1 else ""
-                if not payload:
-                    sink.on_status(
-                        "/cancel <任务描述> 可以取消当前任务并立即开始新任务",
-                        level="warning",
-                    )
-                    return True
-                if state.turn_in_progress and state.cancel_token is not None:
-                    state.cancel_token.cancel("force")
-                    state.pending_messages.append({
-                        "text": payload,
-                        "from_user": msg.metadata.get("user_id", "") or msg.metadata.get("sender", ""),
-                        "arrived_at": time.time(),
-                        "urgency": "now",
-                    })
-                    sink.on_status(
-                        f"已取消当前任务，将在取消完成后开始：{payload[:60]}",
-                        level="warning",
-                    )
-                    return True
-                # No turn running — treat payload as a normal message.
-                msg.text = payload
-                # Fall through to normal turn dispatch.
-
-            # ── Interjection mailbox ──────────────────────────────────────
-            # If a turn is currently running for this session, NEW user
-            # messages go into a mailbox.  send_message drains the mailbox
-            # at every tool-loop boundary and injects the entries as a
-            # <user_interjection> block — the LLM decides what to do.
-            #
-            # /now <msg> is the same path but marks urgency="now" so the
-            # LLM knows the user actively interrupted vs casually adding
-            # info.  v1 does NOT abort the current step on /now — the
-            # message is read at the next natural boundary (typically
-            # 5-15s).  For instant abort, the user can /cancel then
-            # send a new message; that starts a fresh turn.
-            is_now_command = False
-            mailbox_text = msg.text
-            stripped = msg.text.strip()
-            if stripped.startswith("/now"):
-                is_now_command = True
-                mailbox_text = stripped[len("/now"):].lstrip()
-                if not mailbox_text:
-                    sink.on_status(
-                        "/now 命令需要带消息，例如：/now 改用 ssh 别用 https",
-                        level="warning",
-                    )
-                    return True
-
-            if state.turn_in_progress:
-                state.pending_messages.append({
-                    "text": mailbox_text,
-                    "from_user": msg.metadata.get("user_id", "") or msg.metadata.get("sender", ""),
-                    "arrived_at": time.time(),
-                    "urgency": "now" if is_now_command else "normal",
-                })
-                tag = "/now，下个边界优先读" if is_now_command else "下个边界处理"
-                sink.on_status(
-                    f"📬 已收到（{tag}）：{mailbox_text[:60]}",
-                    level="info",
-                )
-                return True
-
-            # No turn in progress — proceed with normal turn dispatch.
-            # Wrap turn processing in a small loop so that after a cancelled
-            # turn, pending restart messages (from /cancel <msg>) are picked
-            # up and processed as a new turn without the user needing to send
-            # another message.
-            turn_text = msg.text
-            while True:
-                # Fresh token for each turn so stale cancellations don't leak.
-                state.cancel_token = CancelToken()
-                state.turn_in_progress = True
-                try:
-                    _interaction_log(
-                        "turn_started",
-                        session_id=session_id,
-                        channel=msg.channel_name,
-                        message_id=msg.metadata.get("message_id"),
-                        chat_id=msg.metadata.get("chat_id"),
-                        text_len=len(turn_text),
-                        text_preview=_preview_text(turn_text),
-                    )
-                    _trace_latency(
-                        "message_handler_started",
-                        session_id=session_id,
-                        channel=msg.channel_name,
-                        message_id=msg.metadata.get("message_id"),
-                        chat_id=msg.metadata.get("chat_id"),
-                        sink=type(sink).__name__,
-                        text_len=len(turn_text),
-                    )
-                    agent_started_at = time.perf_counter()
-                    turn_input = TurnInput.from_text(
-                        turn_text,
+            _interaction_log(
+                "turn_started",
+                session_id=session_id,
+                channel=msg.channel_name,
+                message_id=msg.metadata.get("message_id"),
+                chat_id=msg.metadata.get("chat_id"),
+                text_len=len(msg.text),
+                text_preview=_preview_text(msg.text),
+            )
+            _trace_latency(
+                "message_handler_started",
+                session_id=session_id,
+                channel=msg.channel_name,
+                message_id=msg.metadata.get("message_id"),
+                chat_id=msg.metadata.get("chat_id"),
+                sink=type(sink).__name__,
+                text_len=len(msg.text),
+            )
+            current_events: list[RuntimeEvent] = []
+            event_token = runtime_event_buffer.set(current_events)
+            try:
+                await coordinator.handle(
+                    TurnInput.from_text(
+                        msg.text,
                         session_id=session_id,
                         channel_name=msg.channel_name,
                         metadata=msg.metadata,
                         attachments=msg.attachments,
-                    )
-                    execution = await agent_core.handle_turn(
-                        turn_input,
-                        state,
-                        sink=sink,
-                    )
-                    if execution.blocked:
-                        for event in execution.events:
-                            self._log_runtime_event(event)
-                        return False
-                    result = execution.result
-                    for event in execution.events:
-                        self._log_runtime_event(event)
-
-                except Exception as exc:
-                    _interaction_log(
-                        "turn_failed",
-                        session_id=session_id,
-                        channel=msg.channel_name,
-                        message_id=msg.metadata.get("message_id"),
-                        error=str(exc),
-                    )
-                    sink.on_error(str(exc))
-                    if hasattr(sink, "drain"):
-                        await sink.drain()
-                finally:
-                    _trace_latency(
-                        "message_handler_finished",
-                        session_id=session_id,
-                        channel=msg.channel_name,
-                        message_id=msg.metadata.get("message_id"),
-                        duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
-                        turn_count=state.turn_count,
-                    )
-                    state.turn_in_progress = False
-
-                # If a pending message was not drained as an interjection before
-                # the turn ended, process it as the next turn instead of losing
-                # it.  This also covers /cancel <message> restart requests.
-                if state.pending_messages:
-                    next_entry = state.pending_messages.pop(0)
-                    turn_text = next_entry["text"]
-                    continue
-                break
-
-            return True
+                    ),
+                    state,
+                    sink,
+                )
+            finally:
+                runtime_event_buffer.reset(event_token)
+                _trace_latency(
+                    "message_handler_finished",
+                    session_id=session_id,
+                    channel=msg.channel_name,
+                    message_id=msg.metadata.get("message_id"),
+                    duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
+                    turn_count=state.turn_count,
+                )
+            return not any(
+                event.name == "prompt_blocked" for event in current_events
+            )
 
         return _handle
 

@@ -737,6 +737,190 @@ def test_channel_runner_delegates_message_turn_to_agent_core():
     assert kwargs == {}
 
 
+def test_channel_runner_queues_message_after_noninterjection_command():
+    from agent.commands import CommandDescriptor, CommandResult, CommandRouter
+    from agent.runtime import TurnExecution, TurnResult
+
+    command_entered = asyncio.Event()
+    release_command = asyncio.Event()
+    model_calls = []
+    sessions = {}
+
+    async def slow_handler(request, context):
+        command_entered.set()
+        await release_command.wait()
+        return CommandResult(response_text="slow done")
+
+    class Core:
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            model_calls.append(turn_input.text)
+            return TurnExecution(result=TurnResult(text="ok"))
+
+    router = CommandRouter(
+        core_commands=[
+            CommandDescriptor(
+                "slow",
+                slow_handler,
+                concurrency="idle_only",
+                accepts_interjections=False,
+            )
+        ]
+    )
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": object(),
+            "agent_core": Core(),
+            "command_router": router,
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler(sessions)
+
+    async def scenario():
+        first = asyncio.create_task(
+            handler(
+                IncomingMessage(text="/slow", metadata={"chat_id": "chat-a"}),
+                OutputSink(),
+            )
+        )
+        await asyncio.wait_for(command_entered.wait(), timeout=0.2)
+        await handler(
+            IncomingMessage(text="next turn", metadata={"chat_id": "chat-a"}),
+            OutputSink(),
+        )
+        state = sessions["chat-a"]
+        assert state.pending_interjections == []
+        assert [entry["text"] for entry in state.restart_queue] == ["next turn"]
+        release_command.set()
+        await first
+
+    asyncio.run(scenario())
+
+    assert model_calls == ["next turn"]
+
+
+def test_channel_runner_same_chat_cancel_and_interjections_reach_active_turn():
+    from agent.runtime import TurnExecution, TurnResult
+
+    sessions = {}
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = []
+
+    class Sink(OutputSink):
+        def __init__(self):
+            self.statuses = []
+
+        def on_status(self, text, *, level="info"):
+            self.statuses.append((text, level))
+
+    class Core:
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            calls.append((turn_input.session_id, turn_input.text))
+            if turn_input.session_id == "chat-a" and turn_input.text == "first":
+                entered.set()
+                while not state.cancel_token.is_cancelled:
+                    await asyncio.sleep(0.005)
+                cancelled.set()
+            return TurnExecution(result=TurnResult(text="ok"))
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": object(),
+            "agent_core": Core(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler(sessions)
+
+    async def send(chat_id, text, sink=None):
+        return await handler(
+            IncomingMessage(text=text, metadata={"chat_id": chat_id}),
+            sink or Sink(),
+        )
+
+    async def scenario():
+        first = asyncio.create_task(send("chat-a", "first"))
+        await entered.wait()
+        await send("chat-a", "/now urgent change")
+        await send("chat-a", "ordinary note")
+        state = sessions["chat-a"]
+        assert [(entry["text"], entry["urgency"]) for entry in state.pending_interjections] == [
+            ("urgent change", "now"),
+            ("ordinary note", "normal"),
+        ]
+
+        await asyncio.wait_for(send("chat-b", "independent"), timeout=0.2)
+        cancel_sink = Sink()
+        await asyncio.wait_for(send("chat-a", "/cancel", cancel_sink), timeout=0.2)
+        await asyncio.wait_for(cancelled.wait(), timeout=0.2)
+        assert any("cancellation requested" in text.lower() for text, _ in cancel_sink.statuses)
+        await first
+
+    asyncio.run(scenario())
+
+    assert ("chat-b", "independent") in calls
+    assert calls.count(("chat-a", "first")) == 1
+
+
+def test_channel_runner_rapid_messages_are_not_lost_or_duplicated():
+    from agent.runtime import TurnExecution, TurnResult
+
+    sessions = {}
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    class Core:
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            calls.append(turn_input.text)
+            if turn_input.text == "one":
+                entered.set()
+                await release.wait()
+            return TurnExecution(result=TurnResult(text="ok"))
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": object(),
+            "agent_core": Core(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": None,
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler(sessions)
+
+    async def send(text):
+        await handler(
+            IncomingMessage(text=text, metadata={"chat_id": "chat-a"}),
+            OutputSink(),
+        )
+
+    async def scenario():
+        first = asyncio.create_task(send("one"))
+        await entered.wait()
+        await asyncio.gather(send("two"), send("three"), send("four"))
+        release.set()
+        await first
+
+    asyncio.run(scenario())
+
+    assert calls == ["one", "two", "three", "four"]
+
+
 def test_channel_runner_logs_blocked_turn_without_response_delivery(caplog):
     from agent.runtime import RuntimeEvent, TurnExecution, TurnResult
 

@@ -244,11 +244,12 @@ class CommandCoordinator:
                         if current_forward is not None
                         else current_input.text,
                     )
-                    await self._agent_core.handle_turn(
+                    execution = await self._agent_core.handle_turn(
                         forwarded_input,
                         state,
                         sink=current_sink,
                     )
+                    self._publish_execution_events(execution)
                     action = None
             except Exception:
                 logger.exception(
@@ -358,12 +359,19 @@ class CommandCoordinator:
                     ready=forward_ready,
                 )
             else:
-                await self._agent_core.handle_turn(
+                execution = await self._agent_core.handle_turn(
                     forwarded_input,
                     state,
                     sink=sink,
                 )
+                self._publish_execution_events(execution)
         return result.action
+
+    def _publish_execution_events(self, execution: Any) -> None:
+        if self._event_hook is None:
+            return
+        for event in getattr(execution, "events", ()) or ():
+            self._event_hook(event)
 
     async def _run_restarts_if_idle(
         self,

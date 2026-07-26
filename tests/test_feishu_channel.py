@@ -2673,17 +2673,12 @@ def test_feishu_channel_create_sink_treats_group_chat_type_as_chat_id():
     assert sink._receive_id == "oc_test_chat"
 
 
-def test_feishu_channel_send_command_uses_output_dir(tmp_path):
+def test_feishu_channel_send_command_delegates_to_shared_handler(tmp_path):
     channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
     channel._client = MagicMock()
     channel._handler = AsyncMock()
     channel._output_dir = tmp_path
-    target = tmp_path / "note.txt"
-    target.write_text("hello", encoding="utf-8")
-
     mock_sink = MagicMock()
-    mock_sink._send_file_async = AsyncMock()
-    mock_sink.drain = AsyncMock()
 
     message = MagicMock()
     message.message_id = "msg_123"
@@ -2711,13 +2706,62 @@ def test_feishu_channel_send_command_uses_output_dir(tmp_path):
                 return_value=mock_sink,
             ):
                 await channel._on_message(data)
-                mock_sink._send_file_async.assert_awaited_once_with(target)
-                mock_sink.drain.assert_awaited_once()
-                channel._handler.assert_not_called()
+                channel._handler.assert_awaited_once()
+                incoming, observed_sink = channel._handler.await_args.args
+                assert incoming.text == "/send note.txt"
+                assert observed_sink is mock_sink
 
         loop.run_until_complete(_run())
     finally:
         loop.close()
+
+
+def test_feishu_same_chat_events_reach_handler_concurrently():
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    first_entered = asyncio.Event()
+    release_first = asyncio.Event()
+    second_seen = asyncio.Event()
+
+    async def handler(msg, sink):
+        if msg.text == "first":
+            first_entered.set()
+            await release_first.wait()
+        elif msg.text == "/cancel":
+            second_seen.set()
+
+    channel._handler = handler
+
+    def event(message_id, text):
+        message = MagicMock()
+        message.message_id = message_id
+        message.chat_id = "ou_sender"
+        message.chat_type = "p2p"
+        message.message_type = "text"
+        message.content = json.dumps({"text": text})
+        message.mentions = []
+        sender = MagicMock()
+        sender.sender_type = "user"
+        sender.sender_id.open_id = "ou_sender"
+        data = MagicMock()
+        data.event.message = message
+        data.event.sender = sender
+        return data
+
+    async def scenario():
+        with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+            channel, "_download_message_attachments", new=AsyncMock(return_value=())
+        ), patch.object(channel, "create_sink", side_effect=lambda msg: MagicMock()):
+            first = asyncio.create_task(channel._on_message(event("msg-1", "first")))
+            await first_entered.wait()
+            second = asyncio.create_task(channel._on_message(event("msg-2", "/cancel")))
+            try:
+                await asyncio.wait_for(second_seen.wait(), timeout=0.1)
+            finally:
+                release_first.set()
+                await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
 
 
 def test_feishu_channel_logs_received_message(caplog):
