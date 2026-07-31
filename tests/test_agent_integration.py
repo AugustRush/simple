@@ -4202,6 +4202,7 @@ def test_send_message_reports_terminal_error_when_openai_length_stays_truncated(
     agent = agent_module.BaseAgent(
         object(), registry, model="fake-model", api_format="openai"
     )
+    agent.max_truncation_continuations = 2
 
     responses = iter(
         [
@@ -5685,6 +5686,7 @@ def test_send_message_reports_error_after_auto_continue_budget(monkeypatch):
     agent = agent_module.BaseAgent(
         object(), registry, model="fake-model", api_format="openai"
     )
+    agent.max_truncation_continuations = 2
 
     responses = iter(
         [
@@ -5725,6 +5727,117 @@ def test_send_message_reports_error_after_auto_continue_budget(monkeypatch):
 
     assert result.content == "第一段第二段第三段"
     assert result.error == "Model response remained truncated after 2 auto-continue attempts"
+
+
+def test_auto_continue_accumulates_each_truncated_segment(monkeypatch):
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.max_truncation_continuations = 3
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length", agent_module.shared._OAIMsg("one", None)
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length", agent_module.shared._OAIMsg(" two", None)
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length", agent_module.shared._OAIMsg(" three", None)
+                    )
+                ]
+            ),
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop", agent_module.shared._OAIMsg(" four", None)
+                    )
+                ]
+            ),
+        ]
+    )
+    seen_messages = []
+
+    async def fake_create(ctx, tools):
+        seen_messages.append(list(ctx.messages))
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    result = asyncio.run(
+        agent.send_message(agent_module.AgentContext(system_prompt="system"), "build it")
+    )
+
+    assert result.error is None
+    assert result.content == "one two three four"
+    assert len(seen_messages) == 4
+    assert {"role": "assistant", "content": " two"} in seen_messages[2]
+    assert {"role": "assistant", "content": " three"} in seen_messages[3]
+
+
+def test_build_components_applies_truncation_continuation_limit(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["max_truncation_continuations"] = 7
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert components["agent"].max_truncation_continuations == 7
+
+
+@pytest.mark.parametrize(
+    ("configured_value", "expected_value"),
+    [
+        ("large", 6),
+        (100_000, 20),
+        (-1, 0),
+    ],
+)
+def test_build_components_bounds_truncation_continuation_limit(
+    monkeypatch, tmp_path, configured_value, expected_value
+):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["max_truncation_continuations"] = configured_value
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert components["agent"].max_truncation_continuations == expected_value
 
 
 def test_memory_tidy_uses_force_tidy(monkeypatch):
@@ -6166,7 +6279,9 @@ def test_sub_agent_construction_uses_active_request_model_override():
         agent_module.ToolRegistry(),
         model="configured-model",
         api_format="openai",
+        context_window=64_000,
     )
+    parent.max_truncation_continuations = 9
     active_ctx = agent_module.AgentContext(
         system_prompt="system",
         metadata={"model_override": "request-model"},
@@ -6180,6 +6295,8 @@ def test_sub_agent_construction_uses_active_request_model_override():
 
     assert child.model == "request-model"
     assert parent.model == "configured-model"
+    assert child.context_window == 64_000
+    assert child.max_truncation_continuations == 9
 
 
 def test_lightweight_llm_call_uses_active_request_model_override():

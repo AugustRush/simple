@@ -136,7 +136,6 @@ _ = _TaskLocalContextStack  # publicly importable for any third-party caller
 class BaseAgent:
     """Core agent: streams Claude, handles tool_use loop."""
 
-    _MAX_TRUNCATION_CONTINUATIONS = 2
     _TOOL_LOOP_REPEAT_THRESHOLD = 3
     _TOOL_LOOP_UNPRODUCTIVE_THRESHOLD = 4
     _CONTINUE_PROMPT = (
@@ -174,6 +173,9 @@ class BaseAgent:
         self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self.sub_agent_retries = shared.DEFAULT_SUB_AGENT_RETRIES
         self.max_tool_call_iterations = shared.MAX_TOOL_CALL_ITERATIONS
+        self.max_truncation_continuations = (
+            shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS
+        )
         self.max_rendezvous_rounds = 2  # Mirrors OrchestrationDecision default.
         self.result_content_max_chars = shared.DEFAULT_RESULT_CONTENT_MAX_CHARS
         self.llm_max_retries = shared.DEFAULT_LLM_MAX_RETRIES
@@ -1150,9 +1152,10 @@ class BaseAgent:
     ) -> tuple[str, Optional[str]]:
         """Try to complete a truncated final response with bounded follow-up calls."""
         merged = partial_text
-        continuation_error = "Model response was truncated (finish_reason=length)"
-        for _ in range(self._MAX_TRUNCATION_CONTINUATIONS):
-            continuation_ctx = self._build_continuation_context(ctx)
+        continuation_ctx = self._build_continuation_context(ctx)
+        attempts = 0
+        for _ in range(max(0, int(self.max_truncation_continuations))):
+            attempts += 1
             continuation_ctx.messages.append(
                 {"role": "user", "content": self._CONTINUE_PROMPT}
             )
@@ -1164,10 +1167,13 @@ class BaseAgent:
             continuation_error = self._response_completion_error(response)
             if continuation_error is None:
                 return merged, None
+            continuation_ctx.messages.append(
+                self._transport.build_final_message(response, text)
+            )
         return (
             merged,
             f"Model response remained truncated after "
-            f"{self._MAX_TRUNCATION_CONTINUATIONS} auto-continue attempts",
+            f"{attempts} auto-continue attempts",
         )
 
     def _assistant_message(self, response: Any, text: str) -> dict:
@@ -2738,12 +2744,14 @@ class BaseAgent:
             max_tokens=self.max_tokens,
             api_format=self.api_format,
             supports_vision=self.supports_vision,
+            context_window=self.context_window,
         )
         sub_agent.context_manager = self.context_manager
         sub_agent.max_parallel_agents = self.max_parallel_agents
         sub_agent.sub_agent_timeout_seconds = self.sub_agent_timeout_seconds
         sub_agent.sub_agent_retries = self.sub_agent_retries
         sub_agent.max_tool_call_iterations = self.max_tool_call_iterations
+        sub_agent.max_truncation_continuations = self.max_truncation_continuations
         sub_agent.result_content_max_chars = self.result_content_max_chars
         return sub_agent
 

@@ -301,6 +301,15 @@ async def _build_components_async(cfg: dict):
         min_value=1,
         max_value=shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
     )
+    agent.max_truncation_continuations = _bounded_int(
+        cfg.get(
+            "max_truncation_continuations",
+            shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
+        ),
+        default=shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
+        min_value=0,
+        max_value=shared.MAX_CONFIGURABLE_TRUNCATION_CONTINUATIONS,
+    )
     agent.llm_max_retries = max(
         0,
         int(cfg.get("llm_max_retries", shared.DEFAULT_LLM_MAX_RETRIES)),

@@ -75,6 +75,8 @@ DEFAULT_CONFIG: dict = {
     # ── Runtime guardrails ────────────────────────────────────────────────
     # Maximum model/tool exchange rounds in one turn before treating it as a loop.
     "max_tool_call_iterations": shared.MAX_TOOL_CALL_ITERATIONS,
+    # Bounded follow-up calls used to finish a response stopped by the output cap.
+    "max_truncation_continuations": shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
     # ── MCP servers ───────────────────────────────────────────────────────
     "mcp_servers": [],
     # ── Evolution / self-improvement ──────────────────────────────────────
@@ -235,6 +237,7 @@ def _validate_config(cfg: dict) -> list[str]:
         "system_prompt_file", "output_dir", "tavily_api_key",
         "assistant_identity", "shell_blocked_commands",
         "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
+        "max_truncation_continuations",
     })
 
     # ── Top-level unknown keys ────────────────────────────────────────────
@@ -295,6 +298,11 @@ def _validate_config(cfg: dict) -> list[str]:
         "max_tool_call_iterations",
         1,
         shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
+    )
+    _check_int(
+        "max_truncation_continuations",
+        0,
+        shared.MAX_CONFIGURABLE_TRUNCATION_CONTINUATIONS,
     )
     _check_int("llm_max_retries", 0, 20)
     _check_float("llm_retry_base_delay", 0.1)
