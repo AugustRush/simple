@@ -531,6 +531,14 @@ def test_shell_returns_confirmation_request_for_restricted_command(tmp_path):
     assert "requires confirmation" in result["error"].lower()
 
 
+def test_shell_tool_schema_does_not_expose_confirmation_token(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    shell = next(item for item in registry.to_anthropic_format() if item["name"] == "shell")
+
+    assert "confirmation_token" not in shell["input_schema"]["properties"]
+
+
 def test_shell_returns_recovery_hint_for_external_absolute_path(tmp_path):
     tools, _, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
 
@@ -546,13 +554,25 @@ def test_shell_returns_recovery_hint_for_external_absolute_path(tmp_path):
     assert any("git clone <url> repo-name" in item for item in hint["patterns"])
 
 
-def test_shell_runs_restricted_command_after_matching_confirmation(
+def test_shell_runs_restricted_command_after_user_scoped_confirmation(
     tmp_path, monkeypatch
 ):
-    from agent.security.shell import shell_command_confirm
+    from agent.core.agent import AgentContext, _active_agent_context
+    from agent.security.shell import ShellAuthorizationScope, shell_command_confirm
 
     tools, _, _ = make_builtin_tools(tmp_path)
-    first = asyncio.run(tools._shell("mv a b", timeout=1))
+    ctx = AgentContext(
+        metadata={
+            "session_id": "session-1",
+            "channel_name": "feishu",
+            "user_id": "user-1",
+        }
+    )
+    active = _active_agent_context.set(ctx)
+    try:
+        first = asyncio.run(tools._shell("mv a b", timeout=1))
+    finally:
+        _active_agent_context.reset(active)
     captured = {}
 
     class FakeProc:
@@ -567,71 +587,29 @@ def test_shell_runs_restricted_command_after_matching_confirmation(
 
     monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
 
-    assert shell_command_confirm(first["confirmation_token"], "mv a b") is True
-    result = asyncio.run(tools._shell("mv a b", timeout=1))
+    scope = ShellAuthorizationScope("session-1", "feishu", "user-1")
+    assert shell_command_confirm(first["confirmation_token"], scope=scope) is True
+    active = _active_agent_context.set(ctx)
+    try:
+        result = asyncio.run(tools._shell("mv a b", timeout=1))
+    finally:
+        _active_agent_context.reset(active)
 
     assert result["ok"] is True
     assert captured["command"] == "mv a b"
 
 
-def test_shell_runs_restricted_command_with_confirmation_token(
-    tmp_path, monkeypatch
-):
+def test_shell_rejects_model_supplied_confirmation_token(tmp_path):
     tools, _, _ = make_builtin_tools(tmp_path)
-    first = asyncio.run(tools._shell("mv a b", timeout=1))
-    captured = {}
 
-    class FakeProc:
-        returncode = 0
-
-        async def communicate(self):
-            return (b"ok", b"")
-
-    async def fake_create_subprocess_shell(*args, **kwargs):
-        captured["command"] = args[0]
-        return FakeProc()
-
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
-
-    result = asyncio.run(
-        tools._shell(
-            "mv a b",
-            timeout=1,
-            confirmation_token=first["confirmation_token"],
+    with pytest.raises(TypeError, match="confirmation_token"):
+        asyncio.run(
+            tools._shell(
+                "mv a b",
+                timeout=1,
+                confirmation_token="model-controlled",
+            )
         )
-    )
-
-    assert result["ok"] is True
-    assert captured["command"] == "mv a b"
-
-
-def test_shell_rejects_mismatched_confirmation_token(tmp_path):
-    tools, _, _ = make_builtin_tools(tmp_path)
-    first = asyncio.run(tools._shell("mv a b", timeout=1))
-
-    result = asyncio.run(
-        tools._shell(
-            "mv c d",
-            timeout=1,
-            confirmation_token=first["confirmation_token"],
-        )
-    )
-
-    assert result["ok"] is False
-    assert result["requires_confirmation"] is True
-
-
-def test_shell_confirmation_is_exact_command_only(tmp_path):
-    from agent.security.shell import shell_command_confirm
-
-    tools, _, _ = make_builtin_tools(tmp_path)
-    first = asyncio.run(tools._shell("mv a b", timeout=1))
-
-    assert shell_command_confirm(first["confirmation_token"], "mv a b") is True
-    result = asyncio.run(tools._shell("mv c d", timeout=1))
-
-    assert result["ok"] is False
-    assert result["requires_confirmation"] is True
 
 
 def test_shell_rejects_inline_cwd_escape(tmp_path):
@@ -796,32 +774,25 @@ def test_web_fetch_uses_asyncio_to_thread(tmp_path, monkeypatch):
 
 
 def test_web_fetch_reports_download_progress(tmp_path, monkeypatch):
-    import urllib.request
-
     from agent.core.output import EventCollector, _active_event_collector
+    from agent.security.network import FetchResponse
     from agent.tools.executor import RegularToolExecutor
 
     _tools, registry, _workspace = make_builtin_tools(tmp_path)
 
-    class _FakeResponse:
-        headers = {"Content-Length": "11"}
-
-        def __init__(self):
-            self._chunks = [b"<p>hello ", b"world</p>", b""]
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self, _size):
-            return self._chunks.pop(0)
+    def fake_fetch(url, **kwargs):
+        kwargs["on_progress"](9, 18)
+        kwargs["on_progress"](18, 18)
+        return FetchResponse(
+            body=b"<p>hello world</p>",
+            final_url=url,
+            status=200,
+            headers={"Content-Length": "18"},
+        )
 
     monkeypatch.setattr(
-        urllib.request,
-        "urlopen",
-        lambda *args, **kwargs: _FakeResponse(),
+        "agent.tools.builtin_tools.fetch_public_http_url",
+        fake_fetch,
     )
 
     async def run():

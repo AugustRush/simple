@@ -106,6 +106,32 @@ def _minimal_cfg():
     }
 
 
+def test_runtime_publishes_and_clears_user_id_per_turn():
+    import agent.runtime.contracts as contracts
+    from agent.runtime import TurnInput
+
+    core = contracts.AgentCore.__new__(contracts.AgentCore)
+    core._components = SimpleNamespace(values={})
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(metadata={"user_id": "stale"}),
+        model_override=None,
+        turn_count=0,
+    )
+    core._context_metadata = lambda current: current.ctx.metadata
+
+    core._publish_turn_runtime_metadata(
+        TurnInput("hello", "session-1", "feishu", metadata={"user_id": "user-1"}),
+        state,
+    )
+    assert state.ctx.metadata["user_id"] == "user-1"
+
+    core._publish_turn_runtime_metadata(
+        TurnInput("hello again", "session-1", "feishu", metadata={}),
+        state,
+    )
+    assert "user_id" not in state.ctx.metadata
+
+
 @pytest.fixture(autouse=True)
 def _clear_fake_mcp_instances():
     """Reset class-level instance trackers between tests."""
@@ -4121,6 +4147,52 @@ def test_send_message_classifies_request_timeout(monkeypatch):
     assert result.error == "Model request timed out"
 
 
+def test_create_enforces_input_budget_before_transport(tmp_path):
+    import agent as agent_module
+
+    store = agent_module.LTMStore(context_dir=tmp_path / "context")
+    manager = agent_module.ContextManager(
+        store=store,
+        retriever=agent_module.LocalRetriever(),
+        consolidation=agent_module.ConsolidationEngine(store=store),
+        staging=agent_module.StagingBuffer(
+            context_dir=tmp_path / "context", session_id="budget"
+        ),
+    )
+    calls = []
+
+    class Transport:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return object()
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="openai",
+        context_window=100,
+        max_tokens=20,
+    )
+    agent.context_manager = manager
+    agent._transport = Transport()
+    ctx = agent_module.AgentContext(
+        system_prompt="s" * 40,
+        messages=[
+            {"role": "user", "content": "x" * 400},
+            {"role": "assistant", "content": "old"},
+            {"role": "user", "content": "latest"},
+        ],
+    )
+
+    asyncio.run(agent._create(ctx, [{"name": "tool", "description": "y" * 40}]))
+
+    assert len(calls) == 1
+    budget = agent._input_token_budget(ctx, [{"name": "tool", "description": "y" * 40}])
+    assert manager.consolidation.estimate_tokens(calls[0]["messages"]) < budget
+    assert calls[0]["messages"][-1]["content"] == "latest"
+
+
 def test_send_message_reports_terminal_error_when_openai_length_stays_truncated(
     monkeypatch,
 ):
@@ -4633,6 +4705,56 @@ def test_send_message_auto_continues_openai_length_finish(monkeypatch):
     assert len(seen_messages) == 2
     assert seen_messages[1][-2] == {"role": "assistant", "content": "第一段没有说完"}
     assert "Continue exactly from where you left off" in seen_messages[1][-1]["content"]
+
+
+def test_anthropic_max_tokens_uses_existing_truncation_continuation():
+    import agent as agent_module
+    from agent.core.transport import AnthropicTransport
+
+    class Response:
+        def __init__(self, stop_reason, text):
+            self.stop_reason = stop_reason
+            self.content = [type("TextBlock", (), {"type": "text", "text": text})()]
+
+    assert AnthropicTransport(object()).completion_error(
+        Response("max_tokens", "partial")
+    ) == "Model response was truncated (stop_reason=max_tokens)"
+
+    class Transport:
+        def __init__(self):
+            self.responses = iter(
+                [Response("max_tokens", "first"), Response("end_turn", " second")]
+            )
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            self.calls += 1
+            return next(self.responses)
+
+        @staticmethod
+        def parse_response(response):
+            return response.stop_reason, response.content[0].text, []
+
+        @staticmethod
+        def completion_error(response):
+            return AnthropicTransport.completion_error(AnthropicTransport(object()), response)
+
+        @staticmethod
+        def build_final_message(response, text):
+            return {"role": "assistant", "content": text}
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), api_format="anthropic"
+    )
+    transport = Transport()
+    agent._transport = transport
+    result = asyncio.run(
+        agent.send_message(agent_module.AgentContext(system_prompt="system"), "hello")
+    )
+
+    assert transport.calls == 2
+    assert result.error is None
+    assert result.content == "first second"
 
 
 def test_send_message_stream_preserves_reasoning_content_for_openai_tool_loop(
@@ -7372,10 +7494,10 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
         def enqueue_consolidation(self, reason):
             pass
 
-        def should_compact_messages(self, messages, max_tokens):
+        def should_compact_messages(self, messages, input_token_budget):
             return True
 
-        def compact_messages(self, messages):
+        def compact_messages(self, messages, *, input_token_budget):
             return messages
 
         def should_session_end_sleep(self):

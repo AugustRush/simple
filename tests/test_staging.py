@@ -317,7 +317,8 @@ def test_retrieve_implicit_context_includes_recent_staging_after_compaction(
     )
 
     compacted_messages = ctx_mgr.compact_messages(
-        [{"role": "user", "content": f"older turn {i}"} for i in range(10)]
+        [{"role": "user", "content": f"older turn {i}"} for i in range(10)],
+        input_token_budget=64,
     )
     result = ctx_mgr.retrieve_implicit_context(
         "What did we decide about retries?",

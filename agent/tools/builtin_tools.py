@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from agent import shared
 from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
+from agent.security.network import fetch_public_http_url
 from agent.security.shell import shell_command_uses_shell_features
 
 from .executor import report_tool_progress
@@ -55,6 +56,22 @@ def _looks_like_plugin(dir_path: Path) -> bool:
     if (dir_path / "skills").is_dir() or (dir_path / "commands").is_dir():
         return True
     return False
+
+
+def _resolve_user_plugin_target(name: str) -> Path:
+    if name != name.strip() or re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?\Z", name
+    ) is None:
+        raise ValueError("plugin name must be a canonical slug")
+
+    root = shared.USER_PLUGINS_DIR.expanduser().resolve(strict=False)
+    target = (root / name).resolve(strict=False)
+    if target.parent != root:
+        raise ValueError(
+            "plugin target must be a direct child of USER_PLUGINS_DIR"
+        )
+    return target
+
 
 from .runtime import _active_schedule_target  # noqa: E402
 class BuiltinTools:
@@ -144,10 +161,6 @@ class BuiltinTools:
                     "cwd": {
                         "type": "string",
                         "description": "Optional working directory. Defaults to an isolated sandbox directory (AGENT_SANDBOX_DIR) so downloads, clones, and generated artifacts never pollute the workspace. For current project files, set cwd to the workspace root and use relative command arguments; for external clones/downloads, keep the default cwd and use relative paths.",
-                    },
-                    "confirmation_token": {
-                        "type": "string",
-                        "description": "Confirmation token returned by a previous rejected restricted command. Must be used with the exact same command.",
                     },
                 },
                 "required": ["command", "intent"],
@@ -688,29 +701,30 @@ class BuiltinTools:
     # ── Plugin install / uninstall implementations ────────────────────────
 
     async def _install_plugin(
-        self, source: str, intent: str = "", name: str = ""
+        self, source: str, intent: str = "", name: Optional[str] = None
     ) -> dict:
-        import re as _re
         import shutil
         import urllib.parse as _urlparse
 
         if not source.strip():
             return {"ok": False, "error": "source is required"}
 
-        user_plugins_dir = shared.USER_PLUGINS_DIR
-        user_plugins_dir.mkdir(parents=True, exist_ok=True)
-
         # Derive name from URL or path when not provided.
-        if not name.strip():
+        if name is None:
             raw = source.rstrip("/")
             if raw.endswith(".git"):
                 raw = raw[:-4]
             # Take the last URL/path segment as the slug.
             slug = _urlparse.urlparse(raw).path.rsplit("/", 1)[-1] if "://" in raw else Path(raw).name
             slug = slug or "plugin"
-            name = _re.sub(r"[^a-zA-Z0-9_-]", "-", slug).strip("-") or "plugin"
+            name = re.sub(r"[^a-zA-Z0-9_-]", "-", slug).strip("-") or "plugin"
 
-        target = user_plugins_dir / name
+        try:
+            target = _resolve_user_plugin_target(name)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             return {
                 "ok": False,
@@ -807,16 +821,10 @@ class BuiltinTools:
     async def _uninstall_plugin(self, name: str, intent: str = "") -> dict:
         import shutil
 
-        if not name.strip():
-            return {"ok": False, "error": "name is required"}
-
-        target = (shared.USER_PLUGINS_DIR / name).resolve()
-        # Guard: only allow removal inside the user plugins directory.
-        if shared.USER_PLUGINS_DIR.resolve() not in target.parents:
-            return {
-                "ok": False,
-                "error": "refusing to remove paths outside USER_PLUGINS_DIR",
-            }
+        try:
+            target = _resolve_user_plugin_target(name)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         if not target.is_dir():
             return {"ok": False, "error": f"plugin '{name}' not found at {target}"}
 
@@ -915,37 +923,25 @@ class BuiltinTools:
 
     @staticmethod
     def _make_urllib_request(url: str, timeout: int = WEB_FETCH_TIMEOUT) -> bytes:
-        """Open *url* with a browser-like User-Agent; return raw bytes."""
-        req = urllib.request.Request(
+        """Fetch *url* through the validated, address-pinned network boundary."""
+        result = fetch_public_http_url(
             url,
+            timeout=timeout,
+            max_bytes=WEB_FETCH_MAX_BYTES,
             headers={
                 "User-Agent": WEB_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             },
+            on_progress=lambda bytes_done, total: report_tool_progress(
+                status="downloading",
+                current=bytes_done,
+                total=total,
+                bytes_done=bytes_done,
+                bytes_total=total,
+            ),
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            total_raw = resp.headers.get("Content-Length") if resp.headers else None
-            try:
-                total = int(total_raw) if total_raw else None
-            except (TypeError, ValueError):
-                total = None
-            chunks: list[bytes] = []
-            bytes_done = 0
-            while bytes_done < WEB_FETCH_MAX_BYTES:
-                chunk = resp.read(min(64 * 1024, WEB_FETCH_MAX_BYTES - bytes_done))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                bytes_done += len(chunk)
-                report_tool_progress(
-                    status="downloading",
-                    current=bytes_done,
-                    total=total,
-                    bytes_done=bytes_done,
-                    bytes_total=total,
-                )
-            return b"".join(chunks)
+        return result.body
 
     @staticmethod
     def _make_tavily_request(
@@ -1303,10 +1299,7 @@ class BuiltinTools:
                     "default cwd (sandbox_cwd) and use relative paths, e.g. "
                     "git clone <url> repo-name."
                 ),
-                (
-                    "Only use confirmation_token if the external absolute path "
-                    "is truly required."
-                ),
+                "If the external absolute path is truly required, ask the user to approve it.",
             ],
         }
 
@@ -1316,7 +1309,6 @@ class BuiltinTools:
         intent: str = "",
         timeout: int = 300,
         cwd: Optional[str] = None,
-        confirmation_token: str = "",
     ) -> dict[str, Any]:
         # Security: block dangerous commands before spawning any subprocess.
         extra_blocked: list[str] = (
@@ -1324,10 +1316,16 @@ class BuiltinTools:
         )
         import agent as agent_module
 
-        if confirmation_token:
-            from agent.security.shell import shell_command_confirm
+        from agent.core.agent import _active_agent_context
+        from agent.security.shell import ShellAuthorizationScope
 
-            shell_command_confirm(str(confirmation_token), command)
+        active_context = _active_agent_context.get()
+        metadata = active_context.metadata if active_context is not None else {}
+        authorization_scope = ShellAuthorizationScope(
+            str(metadata.get("session_id") or "default"),
+            str(metadata.get("channel_name") or "cli"),
+            str(metadata.get("user_id") or ""),
+        )
 
         output_dir = self._process_output_dir()
         sandbox_dir = self._sandbox_dir()
@@ -1336,6 +1334,7 @@ class BuiltinTools:
             command,
             extra_blocked,
             allowed_roots=frozenset({self.workspace_root, output_dir}),
+            scope=authorization_scope,
         )
         if not safety.allowed:
             if safety.requires_confirmation:

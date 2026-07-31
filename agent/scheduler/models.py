@@ -142,9 +142,10 @@ class WeeklyTrigger:
         return candidate_local.astimezone(UTC)
 
     def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
-        candidate = scheduled_for.astimezone(UTC) + timedelta(days=7)
+        tz = ZoneInfo(self.timezone_name)
+        candidate = (scheduled_for.astimezone(tz) + timedelta(days=7)).astimezone(UTC)
         while candidate <= now.astimezone(UTC):
-            candidate = candidate + timedelta(days=7)
+            candidate = (candidate.astimezone(tz) + timedelta(days=7)).astimezone(UTC)
         return candidate
 
 
@@ -344,3 +345,4 @@ class ExecutionResult:
 class DeliveryResult:
     status: str
     output_path: str = ""
+    error: str = ""

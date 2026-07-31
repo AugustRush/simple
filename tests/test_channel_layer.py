@@ -471,7 +471,7 @@ def test_channel_runner_scopes_context_manager_per_chat():
         def enqueue_consolidation(self, reason):
             raise AssertionError(f"unexpected enqueue: {reason}")
 
-        def should_compact_messages(self, messages, max_tokens):
+        def should_compact_messages(self, messages, input_token_budget):
             return False
 
     class _RootContextManager:
@@ -496,7 +496,7 @@ def test_channel_runner_scopes_context_manager_per_chat():
         def enqueue_consolidation(self, reason):
             raise AssertionError(f"unexpected enqueue on root manager: {reason}")
 
-        def should_compact_messages(self, messages, max_tokens):
+        def should_compact_messages(self, messages, input_token_budget):
             return False
 
     class _FakeAgent:
@@ -1091,10 +1091,10 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
         def enqueue_consolidation(self, reason):
             self.enqueued.append(reason)
 
-        def should_compact_messages(self, messages, max_tokens):
+        def should_compact_messages(self, messages, input_token_budget):
             return True
 
-        def compact_messages(self, messages):
+        def compact_messages(self, messages, *, input_token_budget):
             return [{"role": "user", "content": "compacted"}]
 
     class _RootContextManager:
@@ -1116,7 +1116,7 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
         def enqueue_consolidation(self, reason):
             raise AssertionError(f"unexpected root enqueue: {reason}")
 
-        def should_compact_messages(self, messages, max_tokens):
+        def should_compact_messages(self, messages, input_token_budget):
             return False
 
     class _FakeAgent:

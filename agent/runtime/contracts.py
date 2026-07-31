@@ -494,6 +494,11 @@ class AgentCore:
         metadata = dict(turn_input.metadata)
         ctx_metadata["session_id"] = turn_input.session_id
         ctx_metadata["channel_name"] = turn_input.channel_name
+        user_id = str(metadata.get("user_id") or "")
+        if user_id:
+            ctx_metadata["user_id"] = user_id
+        else:
+            ctx_metadata.pop("user_id", None)
         if state.model_override is None:
             ctx_metadata.pop("model_override", None)
         else:

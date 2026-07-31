@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -53,6 +54,17 @@ class SchedulerStore:
 
     def close(self) -> None:
         self._conn.close()
+
+    @contextmanager
+    def _immediate_transaction(self):
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            self._conn.rollback()
+            raise
+        else:
+            self._conn.commit()
 
     def _ensure_schema(self) -> None:
         with self._conn:
@@ -292,21 +304,24 @@ class SchedulerStore:
     def claim_due_tasks(
         self, now: datetime, limit: int = 10, lease_seconds: int = 300
     ) -> list[ClaimedTask]:
+        if lease_seconds < 3:
+            raise ValueError("lease_seconds must be at least 3")
         now = now.astimezone(UTC)
-        rows = self._conn.execute(
-            """
-            SELECT * FROM scheduled_tasks
-            WHERE enabled = 1
-              AND next_run_at IS NOT NULL
-              AND next_run_at <= ?
-              AND (lease_until IS NULL OR lease_until < ?)
-            ORDER BY next_run_at ASC, created_at ASC
-            LIMIT ?
-            """,
-            (_iso(now), _iso(now), int(limit)),
-        ).fetchall()
         claimed: list[ClaimedTask] = []
-        with self._conn:
+        with self._immediate_transaction():
+            self._recover_stale_runs_in_transaction(now)
+            rows = self._conn.execute(
+                """
+                SELECT * FROM scheduled_tasks
+                WHERE enabled = 1
+                  AND next_run_at IS NOT NULL
+                  AND next_run_at <= ?
+                  AND active_run_id IS NULL
+                ORDER BY next_run_at ASC, created_at ASC
+                LIMIT ?
+                """,
+                (_iso(now), int(limit)),
+            ).fetchall()
             for row in rows:
                 task = self._task_from_row(row)
                 if task.next_run_at is None:
@@ -331,11 +346,14 @@ class SchedulerStore:
                         _iso(started_at),
                     ),
                 )
-                self._conn.execute(
+                cursor = self._conn.execute(
                     """
                     UPDATE scheduled_tasks
                     SET next_run_at = ?, lease_until = ?, active_run_id = ?, updated_at = ?
                     WHERE id = ?
+                      AND enabled = 1
+                      AND active_run_id IS NULL
+                      AND next_run_at <= ?
                     """,
                     (
                         _iso(next_run_at),
@@ -343,9 +361,18 @@ class SchedulerStore:
                         run_id,
                         _iso(now),
                         task.id,
+                        _iso(now),
                     ),
                 )
-                refreshed = self.get_task(task.id)
+                if cursor.rowcount != 1:
+                    self._conn.execute(
+                        "DELETE FROM scheduled_task_runs WHERE id = ?", (run_id,)
+                    )
+                    continue
+                refreshed_row = self._conn.execute(
+                    "SELECT * FROM scheduled_tasks WHERE id = ?", (task.id,)
+                ).fetchone()
+                refreshed = self._task_from_row(refreshed_row) if refreshed_row else None
                 assert refreshed is not None
                 claimed.append(
                     ClaimedTask(
@@ -366,6 +393,10 @@ class SchedulerStore:
 
     def recover_stale_runs(self, now: datetime) -> int:
         now = now.astimezone(UTC)
+        with self._immediate_transaction():
+            return self._recover_stale_runs_in_transaction(now)
+
+    def _recover_stale_runs_in_transaction(self, now: datetime) -> int:
         rows = self._conn.execute(
             """
             SELECT t.id AS task_id, t.active_run_id, r.scheduled_for
@@ -378,27 +409,97 @@ class SchedulerStore:
             """,
             (_iso(now),),
         ).fetchall()
-        if not rows:
-            return 0
-        with self._conn:
-            for row in rows:
-                self._conn.execute(
+        recovered = 0
+        for row in rows:
+            cursor = self._conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET next_run_at = ?, lease_until = NULL, active_run_id = NULL, updated_at = ?
+                WHERE id = ? AND active_run_id = ? AND lease_until < ?
+                """,
+                (
+                    row["scheduled_for"],
+                    _iso(now),
+                    row["task_id"],
+                    row["active_run_id"],
+                    _iso(now),
+                ),
+            )
+            if cursor.rowcount != 1:
+                continue
+            self._conn.execute(
                     """
                     UPDATE scheduled_task_runs
                     SET status = 'interrupted', finished_at = ?, updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND task_id = ? AND status = 'running'
                     """,
-                    (_iso(now), _iso(now), row["active_run_id"]),
-                )
-                self._conn.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET next_run_at = ?, lease_until = NULL, active_run_id = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (row["scheduled_for"], _iso(now), row["task_id"]),
-                )
-        return len(rows)
+                (
+                    _iso(now),
+                    _iso(now),
+                    row["active_run_id"],
+                    row["task_id"],
+                ),
+            )
+            recovered += 1
+        return recovered
+
+    def renew_lease(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        now: datetime,
+        lease_seconds: int,
+    ) -> bool:
+        if lease_seconds < 3:
+            raise ValueError("lease_seconds must be at least 3")
+        now = now.astimezone(UTC)
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET lease_until = ?, updated_at = ?
+                WHERE id = ?
+                  AND active_run_id = ?
+                  AND lease_until IS NOT NULL
+                  AND lease_until >= ?
+                  AND EXISTS (
+                      SELECT 1 FROM scheduled_task_runs r
+                      WHERE r.id = ? AND r.task_id = scheduled_tasks.id
+                        AND r.status = 'running'
+                  )
+                """,
+                (
+                    _iso(now + timedelta(seconds=lease_seconds)),
+                    _iso(now),
+                    task_id,
+                    run_id,
+                    _iso(now),
+                    run_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def owns_unexpired_lease(
+        self, task_id: str, run_id: str, *, now: datetime
+    ) -> bool:
+        now = now.astimezone(UTC)
+        row = self._conn.execute(
+            """
+            SELECT 1
+            FROM scheduled_tasks t
+            JOIN scheduled_task_runs r
+              ON r.id = t.active_run_id AND r.task_id = t.id
+            WHERE t.id = ?
+              AND t.active_run_id = ?
+              AND t.lease_until IS NOT NULL
+              AND t.lease_until >= ?
+              AND r.status = 'running'
+            LIMIT 1
+            """,
+            (task_id, run_id, _iso(now)),
+        ).fetchone()
+        return row is not None
 
     def complete_run(
         self,
@@ -411,15 +512,42 @@ class SchedulerStore:
         error: str = "",
         output_path: str = "",
         delivery_status: str = "",
-    ) -> None:
+    ) -> bool:
         finished_at = finished_at.astimezone(UTC)
-        with self._conn:
-            self._conn.execute(
+        with self._immediate_transaction():
+            task_cursor = self._conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET active_run_id = NULL, lease_until = NULL,
+                    last_run_at = ?,
+                    last_success_at = CASE WHEN ? = 'succeeded' THEN ? ELSE last_success_at END,
+                    updated_at = ?
+                WHERE id = ?
+                  AND active_run_id = ?
+                  AND EXISTS (
+                      SELECT 1 FROM scheduled_task_runs r
+                      WHERE r.id = ? AND r.task_id = scheduled_tasks.id
+                        AND r.status = 'running'
+                  )
+                """,
+                (
+                    _iso(finished_at),
+                    status,
+                    _iso(finished_at),
+                    _iso(finished_at),
+                    task_id,
+                    run_id,
+                    run_id,
+                ),
+            )
+            if task_cursor.rowcount != 1:
+                return False
+            run_cursor = self._conn.execute(
                 """
                 UPDATE scheduled_task_runs
                 SET status = ?, summary = ?, error = ?, output_path = ?,
                     delivery_status = ?, finished_at = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND task_id = ? AND status = 'running'
                 """,
                 (
                     status,
@@ -430,33 +558,12 @@ class SchedulerStore:
                     _iso(finished_at),
                     _iso(finished_at),
                     run_id,
+                    task_id,
                 ),
             )
-            if status == "succeeded":
-                self._conn.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET active_run_id = NULL, lease_until = NULL,
-                        last_run_at = ?, last_success_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        _iso(finished_at),
-                        _iso(finished_at),
-                        _iso(finished_at),
-                        task_id,
-                    ),
-                )
-            else:
-                self._conn.execute(
-                    """
-                    UPDATE scheduled_tasks
-                    SET active_run_id = NULL, lease_until = NULL,
-                        last_run_at = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (_iso(finished_at), _iso(finished_at), task_id),
-                )
+            if run_cursor.rowcount != 1:
+                raise RuntimeError("owned scheduler run disappeared during completion")
+        return True
 
     def set_enabled(self, task_id: str, enabled: bool) -> None:
         now = datetime.now(UTC)

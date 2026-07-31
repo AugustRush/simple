@@ -775,6 +775,27 @@ async def _coordinator_owned_handler(
     )
 
 
+async def _confirm_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    parts = request.args.split()
+    if len(parts) != 1:
+        return _error("Usage: /confirm <token>")
+
+    from agent.security.shell import ShellAuthorizationScope, shell_command_confirm
+
+    scope = ShellAuthorizationScope(
+        context.session_id,
+        context.channel_name,
+        str(context.metadata.get("user_id") or ""),
+    )
+    if not shell_command_confirm(parts[0], scope=scope):
+        return _error("Confirmation token is invalid, expired, or belongs to another user.")
+    return CommandResult(
+        response_text="Confirmation accepted. Retry the requested operation."
+    )
+
+
 def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]:
     async def help_handler(
         request: CommandRequest, context: CommandContext
@@ -854,6 +875,13 @@ def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]
             _model_handler,
             usage="/model [name]",
             description="Show or switch the session model",
+            concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "confirm",
+            _confirm_handler,
+            usage="/confirm <token>",
+            description="Approve one pending restricted shell command",
             concurrency="anytime",
         ),
         CommandDescriptor(

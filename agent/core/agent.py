@@ -20,7 +20,7 @@ from agent import shared
 from agent.config import _compose_system_prompt
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_sink
-from agent.memory.system import ContextManager, LTMEntry
+from agent.memory.system import ContextLimitError, ContextManager, LTMEntry
 from agent.orchestration.runtime import (
     RendezvousDirective,
     SubtaskResult,
@@ -1066,6 +1066,7 @@ class BaseAgent:
 
     async def _create(self, ctx: "AgentContext", tools: list[dict]) -> Any:
         """Non-streaming API call, returns a normalised response object."""
+        self._prepare_provider_context(ctx, tools)
         return await self._transport.create(
             model=self._effective_model(ctx),
             max_tokens=self.max_tokens,
@@ -1073,6 +1074,39 @@ class BaseAgent:
             messages=ctx.messages,
             tools=tools,
         )
+
+    def _input_token_budget(self, ctx: "AgentContext", tools: list[dict]) -> int:
+        overhead_messages = [
+            {"role": "system", "content": ctx.system_prompt},
+            {
+                "role": "system",
+                "content": json.dumps(tools, ensure_ascii=False, sort_keys=True),
+            },
+        ]
+        overhead = self._estimate_input_tokens(overhead_messages)
+        return self.context_window - self.max_tokens - overhead
+
+    def _estimate_input_tokens(self, messages: list[dict]) -> int:
+        if self.context_manager is not None:
+            return self.context_manager.consolidation.estimate_tokens(messages)
+        serialized = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+        return max(0, int(len(serialized) / max(1.0, float(shared.CHARS_PER_TOKEN))))
+
+    def _prepare_provider_context(
+        self, ctx: "AgentContext", tools: list[dict]
+    ) -> None:
+        budget = self._input_token_budget(ctx, tools)
+        if budget <= 0:
+            raise ContextLimitError("provider input token budget is not positive")
+        if self.context_manager is not None:
+            ctx.messages = self.context_manager.compact_messages(
+                ctx.messages, input_token_budget=budget
+            )
+        estimate = self._estimate_input_tokens(ctx.messages)
+        if estimate >= budget:
+            raise ContextLimitError(
+                f"provider input estimate {estimate} is not below budget {budget}"
+            )
 
     def _parse_response(self, response: Any) -> tuple[str, str, list[dict]]:
         return self._transport.parse_response(response)
@@ -1170,6 +1204,8 @@ class BaseAgent:
         return None
 
     def _format_agent_error(self, exc: Exception) -> str:
+        if isinstance(exc, ContextLimitError):
+            return f"ContextLimitError: {exc}"
         if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
             return "Model request timed out"
         if isinstance(exc, ValueError):
@@ -2157,16 +2193,6 @@ class BaseAgent:
         try:
             orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
 
-            # Compact messages *before* the first LLM call so a long
-            # conversation never exceeds the model's context window.
-            # Previously this only ran inside the tool loop (_iteration>0),
-            # which meant the first call could fail with a 400 error when
-            # accumulated messages exceeded the model's input limit.
-            if self.context_manager and self.context_manager.should_compact_messages(
-                ctx.messages, self.context_window
-            ):
-                ctx.messages = self.context_manager.compact_messages(ctx.messages)
-
             # D1: bounded tool-call loop — prevents infinite model loops
             max_tool_call_iterations = max(1, int(self.max_tool_call_iterations))
             _iteration = 0
@@ -2209,21 +2235,6 @@ class BaseAgent:
                         content=result_text or shared._cancelled_by_user_text(user_message),
                         tool_calls_made=tool_calls_made,
                         error=trace_error,
-                    )
-
-                # Keep working memory bounded for sub-agents (the main
-                # interactive loop compacts between turns, but sub-agents
-                # only call send_message() once and may hit the token limit
-                # during long tool-call sequences).
-                if (
-                    _iteration > 0
-                    and self.context_manager
-                    and self.context_manager.should_compact_messages(
-                        ctx.messages, self.context_window
-                    )
-                ):
-                    ctx.messages = self.context_manager.compact_messages(
-                        ctx.messages
                     )
 
                 try:
@@ -2589,10 +2600,15 @@ class BaseAgent:
         # 2. Wake the background memory worker so staged content gets
         #    consolidated without delaying the interactive loop.
         # The pre-loop check in send_message handles the common case.
+        input_token_budget = (
+            getattr(agent, "context_window", agent.max_tokens) - agent.max_tokens
+        )
         if ctx_mgr and ctx_mgr.should_compact_messages(
-            ctx.messages, getattr(agent, "context_window", agent.max_tokens)
+            ctx.messages, input_token_budget=input_token_budget
         ):
-            ctx.messages = ctx_mgr.compact_messages(ctx.messages)
+            ctx.messages = ctx_mgr.compact_messages(
+                ctx.messages, input_token_budget=input_token_budget
+            )
             if system_prompt:
                 ctx.system_prompt = agent_module._with_task_context(
                     system_prompt, task_context
@@ -2615,6 +2631,7 @@ class BaseAgent:
         ``callback`` may be a plain sync function or an async coroutine
         function; the transport handles both.
         """
+        self._prepare_provider_context(ctx, tools)
         return await self._transport.stream(
             model=self._effective_model(ctx),
             max_tokens=self.max_tokens,

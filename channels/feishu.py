@@ -1545,17 +1545,23 @@ class FeishuOutputSink(OutputSink):
             )
             resp = self._client.im.v1.message.create(req)
             if not resp.success():
+                failure = RuntimeError(
+                    "Feishu send failed: "
+                    f"code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}"
+                )
+                error = str(failure)
                 logger.error(
                     "Feishu send failed: code=%s msg=%s log_id=%s",
                     resp.code,
                     resp.msg,
                     resp.get_log_id(),
                 )
-                return
+                raise failure
             success = True
         except Exception as exc:
             error = str(exc)
             logger.error("Feishu send error: %s", exc)
+            raise
         finally:
             if success:
                 self._interaction_log(

@@ -5,6 +5,7 @@ import re
 import shlex
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -89,7 +90,8 @@ HIGH_RISK_PATTERNS: tuple[str, ...] = (
     "dd if=",
 )
 
-# Medium-risk patterns: inline code execution.
+# Legacy medium-risk patterns retained for compatibility exports. Inline code
+# execution is classified from parsed argv below.
 MEDIUM_RISK_PATTERNS: tuple[str, ...] = (
     "python -c",
     "python3 -c",
@@ -99,6 +101,35 @@ MEDIUM_RISK_PATTERNS: tuple[str, ...] = (
     "sh -c",
     "zsh -c",
 )
+
+_INLINE_INTERPRETERS = (
+    (
+        re.compile(r"python(?:\d+(?:\.\d+)*)?\Z"),
+        frozenset({"-c"}),
+        frozenset({"-W", "-X", "--check-hash-based-pycs"}),
+    ),
+    (
+        re.compile(r"(?:bash|sh|zsh|fish)\Z"),
+        frozenset({"-c"}),
+        frozenset({"-O", "-o"}),
+    ),
+    (
+        re.compile(r"perl\Z"),
+        frozenset({"-e"}),
+        frozenset({"-C", "-F", "-I", "-M", "-m"}),
+    ),
+    (
+        re.compile(r"ruby\Z"),
+        frozenset({"-e"}),
+        frozenset(
+            {"-0", "-C", "-E", "-F", "-I", "-K", "-R", "-T", "-W", "-r"}
+        ),
+    ),
+)
+
+_HIGH_RISK_OPTIONS: dict[str, frozenset[str]] = {
+    "find": frozenset({"-delete"}),
+}
 
 HIGH_RISK_SHELL_OPERATORS: frozenset[str] = frozenset(
     {
@@ -125,30 +156,89 @@ SHELL_BLOCKED_PATTERNS: tuple[str, ...] = HIGH_RISK_PATTERNS + MEDIUM_RISK_PATTE
 
 # ── Session allowlist ───────────────────────────────────────────────────────
 
-_session_allowlist: set[str] = set()
-
-# Pending confirmation tokens: token → command
-_pending_tokens: dict[str, str] = {}
+CONFIRMATION_TTL = timedelta(minutes=5)
 
 
-def shell_session_allowlist_add(command_base: str) -> None:
-    """Add an exact command string to the session allowlist."""
-    _session_allowlist.add(command_base)
+@dataclass(frozen=True)
+class ShellAuthorizationScope:
+    session_id: str
+    channel_name: str
+    user_id: str = ""
+
+
+@dataclass(frozen=True)
+class PendingShellConfirmation:
+    command: str
+    scope: ShellAuthorizationScope
+    expires_at: datetime
+
+
+_DEFAULT_SCOPE = ShellAuthorizationScope("default", "cli", "")
+_session_allowlist: dict[tuple[ShellAuthorizationScope, str], datetime] = {}
+_pending_tokens: dict[str, PendingShellConfirmation] = {}
+
+
+def _authorization_scope(
+    scope: ShellAuthorizationScope | None,
+) -> ShellAuthorizationScope:
+    return scope or _DEFAULT_SCOPE
+
+
+def _authorization_time(now: datetime | None) -> datetime:
+    value = now or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _normalize_command(command: str) -> str:
+    return str(command).strip()
+
+
+def shell_session_allowlist_add(
+    command_base: str,
+    *,
+    scope: ShellAuthorizationScope | None = None,
+    now: datetime | None = None,
+    expires_at: datetime | None = None,
+) -> None:
+    """Allow one normalized command in one authorization scope until expiry."""
+    current = _authorization_time(now)
+    expiry = _authorization_time(expires_at) if expires_at else current + CONFIRMATION_TTL
+    _session_allowlist[
+        (_authorization_scope(scope), _normalize_command(command_base))
+    ] = expiry
 
 
 def shell_session_allowlist_clear() -> None:
     """Clear all entries from the session allowlist."""
     _session_allowlist.clear()
+    _pending_tokens.clear()
 
 
-def shell_session_allowlist_contains(command_base: str) -> bool:
-    """Check whether an exact command string is in the session allowlist."""
-    return command_base in _session_allowlist
+def shell_session_allowlist_contains(
+    command_base: str,
+    *,
+    scope: ShellAuthorizationScope | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Check for an unexpired exact command approval in one scope."""
+    key = (_authorization_scope(scope), _normalize_command(command_base))
+    expiry = _session_allowlist.get(key)
+    if expiry is None:
+        return False
+    if expiry <= _authorization_time(now):
+        _session_allowlist.pop(key, None)
+        return False
+    return True
 
 
 def shell_command_uses_shell_features(command: str) -> bool:
     """Return True when *command* depends on shell parsing/control features."""
-    return _find_shell_operator(command) is not None
+    try:
+        return _find_shell_operator(command) is not None
+    except _ShellParseError:
+        return True
 
 
 # ── ShellCheckResult ────────────────────────────────────────────────────────
@@ -170,26 +260,66 @@ class ShellCheckResult:
         return not self.allowed
 
 
-def shell_command_confirm(token: str, command: str) -> bool:
-    """Verify a confirmation token and add the command to the session allowlist.
-
-    Returns True if the token was valid and the command is now allowed.
-    """
-    stored = _pending_tokens.pop(token, None)
-    if stored is None or stored != command:
+def shell_command_confirm(
+    token: str,
+    *,
+    scope: ShellAuthorizationScope,
+    now: datetime | None = None,
+) -> bool:
+    """Redeem one pending token using trusted request identity."""
+    current = _authorization_time(now)
+    stored = _pending_tokens.get(str(token))
+    if stored is None or stored.scope != scope or stored.expires_at <= current:
+        if stored is not None and stored.expires_at <= current:
+            _pending_tokens.pop(str(token), None)
         return False
-    shell_session_allowlist_add(command)
+    _pending_tokens.pop(str(token), None)
+    shell_session_allowlist_add(
+        stored.command,
+        scope=stored.scope,
+        now=current,
+        expires_at=stored.expires_at,
+    )
     return True
 
 
+def _pending_confirmation(
+    command: str,
+    *,
+    scope: ShellAuthorizationScope,
+    now: datetime,
+) -> str:
+    for stale_token, record in list(_pending_tokens.items()):
+        if record.expires_at <= now:
+            _pending_tokens.pop(stale_token, None)
+    token = str(uuid.uuid4())
+    _pending_tokens[token] = PendingShellConfirmation(
+        command=_normalize_command(command),
+        scope=scope,
+        expires_at=now + CONFIRMATION_TTL,
+    )
+    return token
+
+
 # ── Internal helpers ─────────────────────────────────────────────────────────
+
+
+class _ShellParseError(ValueError):
+    pass
+
+
+def _parse_command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError as exc:
+        raise _ShellParseError(str(exc)) from exc
 
 
 def _is_env_assignment(token: str) -> bool:
     return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", token))
 
 
-def _resolve_effective_command(tokens: list[str]) -> Optional[str]:
+def _resolve_effective_command_index(tokens: list[str]) -> Optional[int]:
     idx = 0
     while idx < len(tokens):
         token = tokens[idx]
@@ -208,17 +338,50 @@ def _resolve_effective_command(tokens: list[str]) -> Optional[str]:
                 if _is_env_assignment(token):
                     idx += 1
                     continue
-                if token.startswith("-"):
+                if token == "--split-string":
+                    if idx + 1 < len(tokens):
+                        split_tokens = _parse_command_tokens(tokens[idx + 1])
+                        tokens[idx : idx + 2] = split_tokens
+                        continue
                     idx += 1
-                    if token in {
-                        "-C",
-                        "--chdir",
-                        "-S",
-                        "--split-string",
-                        "-u",
-                        "--unset",
-                    } and idx < len(tokens):
+                    continue
+                if token.startswith("--split-string="):
+                    split_tokens = _parse_command_tokens(token.partition("=")[2])
+                    tokens[idx : idx + 1] = split_tokens
+                    continue
+                if token.startswith("--"):
+                    idx += 1
+                    if token in {"--chdir", "--unset"} and idx < len(tokens):
                         idx += 1
+                    continue
+                if token.startswith("-") and token != "-":
+                    option_chars = token[1:]
+                    value_option = min(
+                        (
+                            (option_chars.index(option), option)
+                            for option in "CSu"
+                            if option in option_chars
+                        ),
+                        default=None,
+                    )
+                    if value_option is None:
+                        idx += 1
+                        continue
+
+                    value_option_index, option = value_option
+                    attached_value = option_chars[value_option_index + 1 :]
+                    if option == "S":
+                        if attached_value:
+                            split_tokens = _parse_command_tokens(attached_value)
+                            tokens[idx : idx + 1] = split_tokens
+                        elif idx + 1 < len(tokens):
+                            split_tokens = _parse_command_tokens(tokens[idx + 1])
+                            tokens[idx : idx + 2] = split_tokens
+                        else:
+                            idx += 1
+                        continue
+
+                    idx += 1 if attached_value else 2
                     continue
                 break
             continue
@@ -253,19 +416,29 @@ def _resolve_effective_command(tokens: list[str]) -> Optional[str]:
                 break
             continue
 
-        return cmd
+        return idx
     return None
 
 
-def _iter_command_words(command: str) -> list[str]:
+def _resolve_effective_command(tokens: list[str]) -> Optional[str]:
+    idx = _resolve_effective_command_index(tokens)
+    if idx is None:
+        return None
+    return os.path.basename(tokens[idx].strip().lstrip("./"))
+
+
+def _parse_shell_tokens(command: str) -> list[str]:
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
-        tokens = command.split()
+        return list(lexer)
+    except ValueError as exc:
+        raise _ShellParseError(str(exc)) from exc
+
+
+def _iter_command_words(command: str) -> list[str]:
     words: list[str] = []
-    for token in tokens:
+    for token in _parse_shell_tokens(command):
         if token in HIGH_RISK_SHELL_OPERATORS:
             continue
         if token in {"(", ")", "{", "}"}:
@@ -275,18 +448,48 @@ def _iter_command_words(command: str) -> list[str]:
 
 
 def _find_shell_operator(command: str) -> Optional[str]:
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
-        tokens = command.split()
-    for token in tokens:
+    for token in _parse_shell_tokens(command):
         if token in HIGH_RISK_SHELL_OPERATORS:
             return token
     if "$(" in command:
         return "$("
     return None
+
+
+def _is_inline_execution(tokens: list[str], command_index: int) -> bool:
+    command_name = os.path.basename(tokens[command_index].strip().lstrip("./"))
+    for pattern, execution_flags, options_with_values in _INLINE_INTERPRETERS:
+        if pattern.fullmatch(command_name):
+            idx = command_index + 1
+            while idx < len(tokens):
+                token = tokens[idx]
+                if token == "--":
+                    return False
+                if token.startswith(tuple(execution_flags)):
+                    return True
+                if token in options_with_values:
+                    idx += 2
+                    continue
+                if not token.startswith("-"):
+                    return False
+                idx += 1
+            return False
+    return False
+
+
+def _find_high_risk_option(
+    tokens: list[str], command_index: int
+) -> Optional[str]:
+    command_name = os.path.basename(tokens[command_index].strip().lstrip("./"))
+    high_risk_options = _HIGH_RISK_OPTIONS.get(command_name, frozenset())
+    return next(
+        (
+            token
+            for token in tokens[command_index + 1 :]
+            if token in high_risk_options
+        ),
+        None,
+    )
 
 
 def _has_absolute_path_token(
@@ -362,6 +565,8 @@ def shell_command_check(
     extra_blocked: Optional[list[str]] = None,
     *,
     allowed_roots: frozenset[Path] | None = None,
+    scope: ShellAuthorizationScope | None = None,
+    now: datetime | None = None,
 ) -> ShellCheckResult:
     """Classify *command* by risk level and determine whether it may run.
 
@@ -373,8 +578,22 @@ def shell_command_check(
     "absolute path" checkpoint.
     """
     extra = frozenset(extra_blocked or [])
+    authorization_scope = _authorization_scope(scope)
+    authorization_now = _authorization_time(now)
+    normalized_command = _normalize_command(command)
 
-    shell_operator_block = _command_requires_shell_operator_block(command)
+    # Parse before allowlist and risk checks so malformed input always fails closed.
+    try:
+        tokens = _parse_command_tokens(command)
+        shell_operator_block = _command_requires_shell_operator_block(command)
+        command_index = _resolve_effective_command_index(tokens)
+    except _ShellParseError:
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason="command could not be parsed safely",
+        )
+
     if shell_operator_block:
         return ShellCheckResult(
             allowed=False,
@@ -382,18 +601,16 @@ def shell_command_check(
             reason=shell_operator_block,
         )
 
-    # ── Parse command tokens ─────────────────────────────────────────────
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        tokens = command.split()
-
     argv0: Optional[str] = None
-    if tokens:
+    if command_index is not None:
         argv0 = _resolve_effective_command(tokens)
 
     # ── Check session allowlist first ────────────────────────────────────
-    if shell_session_allowlist_contains(command):
+    if shell_session_allowlist_contains(
+        normalized_command,
+        scope=authorization_scope,
+        now=authorization_now,
+    ):
         return ShellCheckResult(
             allowed=True,
             risk_level="low",
@@ -407,19 +624,6 @@ def shell_command_check(
                 allowed=False,
                 risk_level="high",
                 reason=f"command pattern '{pattern}' is blocked for safety",
-            )
-
-    # ── Medium-risk patterns ─────────────────────────────────────────────
-    for pattern in MEDIUM_RISK_PATTERNS:
-        if pattern in command:
-            token = str(uuid.uuid4())
-            _pending_tokens[token] = command
-            return ShellCheckResult(
-                allowed=False,
-                risk_level="medium",
-                reason=f"command pattern '{pattern}' is medium risk: inline code execution",
-                requires_confirmation=True,
-                confirmation_token=token,
             )
 
     if not argv0:
@@ -443,9 +647,37 @@ def shell_command_check(
                 reason=f"command '{argv0}' is high risk: disk/system destruction",
             )
 
+    high_risk_option = _find_high_risk_option(tokens, command_index)
+    if high_risk_option:
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason=(
+                f"command option '{argv0} {high_risk_option}' is high risk: "
+                "destructive operation"
+            ),
+        )
+
+    if _is_inline_execution(tokens, command_index):
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="medium",
+            reason=f"command '{argv0}' is medium risk: inline code execution",
+            requires_confirmation=True,
+            confirmation_token=token,
+        )
+
     if _has_absolute_path_token(tokens, allowed_roots=allowed_roots):
-        token = str(uuid.uuid4())
-        _pending_tokens[token] = command
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
         return ShellCheckResult(
             allowed=False,
             risk_level="medium",
@@ -456,8 +688,11 @@ def shell_command_check(
 
     # ── Medium-risk commands ─────────────────────────────────────────────
     if argv0 in MEDIUM_RISK_COMMANDS:
-        token = str(uuid.uuid4())
-        _pending_tokens[token] = command
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
         risk_descriptions = {
             "rm": "file deletion",
             "rmdir": "directory removal",

@@ -405,7 +405,10 @@ async def _interactive_loop(components: dict, cfg: dict):
                         components["model"],
                         api_format=agent.api_format,
                     )
-                ctx.messages = ctx_mgr.compact_messages(ctx.messages)
+                ctx.messages = ctx_mgr.compact_messages(
+                    ctx.messages,
+                    input_token_budget=agent.context_window - agent.max_tokens,
+                )
             except Exception as e:
                 shared.CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
 
@@ -876,7 +879,7 @@ def schedule_delete(task_id: str = typer.Argument(..., help="Task id")):
 @app.command()
 def scheduler(
     poll_seconds: Optional[float] = typer.Option(None, "--poll-seconds", min=0.1),
-    lease_seconds: Optional[int] = typer.Option(None, "--lease-seconds", min=1),
+    lease_seconds: Optional[int] = typer.Option(None, "--lease-seconds", min=3),
     name: Optional[str] = typer.Option(
         None, "--name", help="Instance name for multi-tenant isolation (default: ~/.agent)"
     ),

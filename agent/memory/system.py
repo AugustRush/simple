@@ -17,6 +17,12 @@ from typing import Any, Callable, Optional
 import agent as agent_module
 from agent import shared
 from agent.lexical import LATIN_TOKEN_RE, count_cjk_chars, lexical_terms
+
+
+class ContextLimitError(RuntimeError):
+    """Raised when complete provider context cannot fit its input budget."""
+
+
 _FACT_SOURCE_PRECEDENCE = {
     "user_statement": 0,
     "direct_user": 0,
@@ -2231,6 +2237,9 @@ class ConsolidationEngine:
                     inp = block.get("input")
                     if inp is not None:
                         total += _count(json.dumps(inp, ensure_ascii=False))
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                total += _count(json.dumps(tool_calls, ensure_ascii=False))
         return total
 
     def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
@@ -2908,29 +2917,160 @@ class ContextManager:
             has_pending or has_staged_work
         ) and self.idle_elapsed() >= self.idle_seconds
 
-    def should_compact_messages(self, messages: list[dict], max_tokens: int) -> bool:
-        """Front-end compaction keeps working memory bounded without network calls."""
-        if len(messages) < self.min_messages:
-            return False
-        return self.consolidation.should_sleep(messages, max_tokens)
-
-    def compact_messages(self, messages: list[dict]) -> list[dict]:
-        keep_last = self.consolidation.keep_last_messages
-        if len(messages) <= keep_last:
-            return messages
-        _before = len(messages)
-        ideal = len(messages) - keep_last
-        for i in range(ideal, -1, -1):
-            msg = messages[i]
-            if msg.get("role") == "user" and isinstance(msg.get("content"), str):
-                ideal = i
-                break
-        compacted = messages[ideal:]
-        _emit_consolidation(
-            "compaction",
-            messages_before=_before,
-            messages_after=len(compacted),
+    def should_compact_messages(
+        self, messages: list[dict], input_token_budget: int
+    ) -> bool:
+        """Return whether provider-bound messages violate the strict budget."""
+        return self.consolidation.estimate_tokens(messages) >= int(
+            input_token_budget
         )
+
+    @staticmethod
+    def _anthropic_tool_result_ids(message: dict) -> Optional[set[str]]:
+        if message.get("role") != "user":
+            return None
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            return None
+        if not all(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in content
+        ):
+            return None
+        return {str(block.get("tool_use_id") or "") for block in content}
+
+    @classmethod
+    def _is_real_user_request(cls, message: dict) -> bool:
+        return message.get("role") == "user" and cls._anthropic_tool_result_ids(
+            message
+        ) is None
+
+    @classmethod
+    def _complete_message_units(
+        cls, messages: list[dict], newest_request_index: int
+    ) -> list[list[int]]:
+        units: list[list[int]] = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            role = message.get("role")
+            openai_calls = message.get("tool_calls") if role == "assistant" else None
+            openai_ids = {
+                str(call.get("id") or "")
+                for call in openai_calls or []
+                if isinstance(call, dict)
+            }
+            content = message.get("content")
+            content_blocks = content if isinstance(content, list) else []
+            anthropic_ids = {
+                str(block.get("id") or "")
+                for block in content_blocks
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            }
+            expected_ids = openai_ids | anthropic_ids
+            if expected_ids:
+                if "" in expected_ids:
+                    raise ContextLimitError("tool history is structurally incomplete")
+                unit = [index]
+                answered: set[str] = set()
+                cursor = index + 1
+                while cursor < len(messages):
+                    following = messages[cursor]
+                    if following.get("role") == "tool":
+                        tool_id = str(following.get("tool_call_id") or "")
+                        if tool_id not in expected_ids:
+                            raise ContextLimitError(
+                                "tool history contains an orphan tool result"
+                            )
+                        answered.add(tool_id)
+                        unit.append(cursor)
+                        cursor += 1
+                        continue
+                    result_ids = cls._anthropic_tool_result_ids(following)
+                    if result_ids is not None:
+                        if not result_ids or not result_ids.issubset(expected_ids):
+                            raise ContextLimitError(
+                                "tool history contains an orphan tool result"
+                            )
+                        answered.update(result_ids)
+                        unit.append(cursor)
+                        cursor += 1
+                        continue
+                    break
+                if answered != expected_ids:
+                    raise ContextLimitError("tool history is structurally incomplete")
+                units.append(unit)
+                index = cursor
+                continue
+            if role == "tool" or cls._anthropic_tool_result_ids(message) is not None:
+                raise ContextLimitError("tool history contains an orphan tool result")
+            if (
+                role == "user"
+                and index != newest_request_index
+                and index + 1 < len(messages)
+                and messages[index + 1].get("role") == "assistant"
+                and not messages[index + 1].get("tool_calls")
+                and not any(
+                    isinstance(block, dict) and block.get("type") == "tool_use"
+                    for block in (
+                        messages[index + 1].get("content")
+                        if isinstance(messages[index + 1].get("content"), list)
+                        else []
+                    )
+                )
+            ):
+                units.append([index, index + 1])
+                index += 2
+                continue
+            units.append([index])
+            index += 1
+        return units
+
+    def compact_messages(
+        self, messages: list[dict], *, input_token_budget: int
+    ) -> list[dict]:
+        budget = int(input_token_budget)
+        if budget <= 0:
+            raise ContextLimitError("provider input token budget is not positive")
+        newest_request_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if self._is_real_user_request(messages[index])
+            ),
+            -1,
+        )
+        if newest_request_index >= 0 and self.consolidation.estimate_tokens(
+            [messages[newest_request_index]]
+        ) >= budget:
+            raise ContextLimitError("newest user request exceeds provider input budget")
+
+        retained = self._complete_message_units(messages, newest_request_index)
+
+        def materialize() -> list[dict]:
+            kept_indexes = {item for unit in retained for item in unit}
+            return [msg for index, msg in enumerate(messages) if index in kept_indexes]
+
+        compacted = materialize()
+        while self.consolidation.estimate_tokens(compacted) >= budget:
+            removable = next(
+                (
+                    unit
+                    for unit in retained
+                    if newest_request_index not in unit
+                ),
+                None,
+            )
+            if removable is None:
+                raise ContextLimitError("complete conversation context exceeds input budget")
+            retained.remove(removable)
+            compacted = materialize()
+        if len(compacted) != len(messages):
+            _emit_consolidation(
+                "compaction",
+                messages_before=len(messages),
+                messages_after=len(compacted),
+            )
         return compacted
 
     # ── Retrieval ─────────────────────────────────────────────────────────────

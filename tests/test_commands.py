@@ -937,8 +937,10 @@ def _run_builtin(
     components: dict | None = None,
     config: dict | None = None,
     state: object | None = None,
+    session_id: str = "s-1",
+    metadata: dict | None = None,
 ) -> CommandResult:
-    route = router.classify(command, channel_name=channel_name, session_id="s-1")
+    route = router.classify(command, channel_name=channel_name, session_id=session_id)
     assert route.kind == "command"
     context = CommandContext(
         components or {},
@@ -946,7 +948,8 @@ def _run_builtin(
         state or SimpleNamespace(ctx=SimpleNamespace(messages=[]), model_override=None),
         _BuiltinSink(),
         channel_name=channel_name,
-        session_id="s-1",
+        session_id=session_id,
+        metadata=metadata or {},
     )
     return asyncio.run(router.execute(route, context))
 
@@ -965,6 +968,7 @@ def test_builtin_registration_defines_portable_scope_and_concurrency() -> None:
         "skills": ("anytime", frozenset({"all"})),
         "plugins": ("anytime", frozenset({"all"})),
         "model": ("anytime", frozenset({"all"})),
+        "confirm": ("anytime", frozenset({"all"})),
         "quit": ("anytime", frozenset({"cli"})),
         "send": ("anytime", frozenset({"feishu"})),
         "cancel": ("interrupt", frozenset({"all"})),
@@ -1000,6 +1004,54 @@ def test_builtin_help_uses_live_descriptors_and_channel_scope() -> None:
     assert feishu_help is not None
     assert "/send <path>" in feishu_help
     assert "/quit" not in feishu_help
+
+
+def test_builtin_confirm_redeems_with_command_context_identity():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_allowlist_clear,
+    )
+
+    shell_session_allowlist_clear()
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "feishu", "user-1")
+    pending = shell_command_check("mv a b", scope=scope)
+
+    result = _run_builtin(
+        router,
+        f"/confirm {pending.confirmation_token}",
+        channel_name="feishu",
+        session_id="s-1",
+        metadata={"user_id": "user-1"},
+    )
+
+    assert result.response_text == "Confirmation accepted. Retry the requested operation."
+    assert shell_command_check("mv a b", scope=scope).allowed is True
+
+
+def test_builtin_confirm_rejects_wrong_user_and_invalid_arguments():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_allowlist_clear,
+    )
+
+    shell_session_allowlist_clear()
+    router = _builtin_router()
+    owner = ShellAuthorizationScope("s-1", "feishu", "user-1")
+    pending = shell_command_check("mv a b", scope=owner)
+
+    wrong_user = _run_builtin(
+        router,
+        f"/confirm {pending.confirmation_token}",
+        channel_name="feishu",
+        metadata={"user_id": "user-2"},
+    )
+    usage = _run_builtin(router, "/confirm token extra")
+
+    assert "invalid, expired" in (wrong_user.response_text or "").lower()
+    assert usage.response_text == "Usage: /confirm <token>"
 
 
 def test_builtin_ralph_maps_start_list_resume_and_parse_errors():
