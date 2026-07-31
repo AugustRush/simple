@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
+import threading
 
 from typer.testing import CliRunner
 
@@ -146,6 +147,142 @@ def test_scheduler_store_recovers_stale_run_and_requeues_task(tmp_path):
     assert refreshed.active_run_id is None
     assert refreshed.next_run_at == claimed[0].run.scheduled_for
     assert runs[0].status == "interrupted"
+
+
+def test_scheduler_store_concurrent_claim_creates_exactly_one_run(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    db_path = tmp_path / "scheduler.db"
+    setup = SchedulerStore(db_path=db_path)
+    task = setup.create_task(
+        NewScheduledTask(
+            name="single-owner",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "once"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+    setup.close()
+    barrier = threading.Barrier(2)
+    claims = []
+    errors = []
+
+    def claim():
+        store = SchedulerStore(db_path=db_path)
+        try:
+            barrier.wait()
+            claims.append(
+                store.claim_due_tasks(
+                    datetime(2026, 4, 19, tzinfo=timezone.utc),
+                    lease_seconds=30,
+                )
+            )
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            store.close()
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    verify = SchedulerStore(db_path=db_path)
+    assert errors == []
+    assert sorted(len(items) for items in claims) == [0, 1]
+    assert len(verify.list_runs(task.id)) == 1
+
+
+def test_claim_due_tasks_recovers_and_reclaims_stale_run_atomically(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="recover-in-claim",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "retry"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+    first = store.claim_due_tasks(
+        datetime(2026, 4, 19, tzinfo=timezone.utc), lease_seconds=30
+    )[0]
+
+    second = store.claim_due_tasks(
+        datetime(2026, 4, 19, 0, 1, tzinfo=timezone.utc), lease_seconds=30
+    )
+    runs = store.list_runs(task.id)
+
+    assert len(second) == 1
+    assert second[0].run.id != first.run.id
+    assert [run.status for run in runs] == ["interrupted", "running"]
+    assert store.get_task(task.id).active_run_id == second[0].run.id
+
+
+def test_scheduler_store_lease_and_completion_are_fenced(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="fenced",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "run"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+    started = datetime(2026, 4, 19, tzinfo=timezone.utc)
+    claim = store.claim_due_tasks(started, lease_seconds=30)[0]
+    before_expiry = datetime(2026, 4, 19, 0, 0, 20, tzinfo=timezone.utc)
+    after_expiry = datetime(2026, 4, 19, 0, 0, 31, tzinfo=timezone.utc)
+
+    assert store.renew_lease(task.id, claim.run.id, now=before_expiry, lease_seconds=30)
+    assert not store.renew_lease(task.id, "stale-run", now=before_expiry, lease_seconds=30)
+    assert store.owns_unexpired_lease(task.id, claim.run.id, now=before_expiry)
+    assert not store.complete_run(
+        task.id,
+        "stale-run",
+        finished_at=before_expiry,
+        status="failed",
+    )
+    assert store.get_task(task.id).active_run_id == claim.run.id
+    assert not store.renew_lease(
+        task.id,
+        claim.run.id,
+        now=datetime(2026, 4, 19, 0, 0, 51, tzinfo=timezone.utc),
+        lease_seconds=30,
+    )
+    assert not store.owns_unexpired_lease(task.id, claim.run.id, now=after_expiry.replace(second=51))
+    assert store.complete_run(
+        task.id,
+        claim.run.id,
+        finished_at=before_expiry,
+        status="succeeded",
+    )
+    assert store.get_task(task.id).active_run_id is None
 
 
 def test_scheduler_service_executes_due_agent_prompt_task_and_persists_run(tmp_path):
