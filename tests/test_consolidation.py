@@ -581,6 +581,70 @@ def test_should_sleep_false(tmp_path):
     assert eng.should_sleep(messages, max_tokens=8192) is False
 
 
+def test_compact_messages_uses_input_budget_even_below_min_messages(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "x" * 400},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new request"},
+    ]
+
+    assert ctx_mgr.should_compact_messages(messages, input_token_budget=40)
+    compacted = ctx_mgr.compact_messages(messages, input_token_budget=40)
+
+    assert compacted == [{"role": "user", "content": "new request"}]
+    assert ctx_mgr.consolidation.estimate_tokens(compacted) < 40
+
+
+def test_compact_messages_raises_when_newest_request_cannot_fit(tmp_path):
+    from agent import ContextLimitError
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    with pytest.raises(ContextLimitError):
+        ctx_mgr.compact_messages(
+            [{"role": "user", "content": "x" * 1000}],
+            input_token_budget=10,
+        )
+
+
+def test_compact_messages_drops_complete_openai_tool_turn(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call-1", "function": {"name": "lookup", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "x" * 400},
+        {"role": "user", "content": "new request"},
+    ]
+
+    compacted = ctx_mgr.compact_messages(messages, input_token_budget=40)
+
+    assert compacted == [{"role": "user", "content": "new request"}]
+
+
+def test_compact_messages_rejects_incomplete_anthropic_tool_turn(tmp_path):
+    from agent import ContextLimitError
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "request"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "tool-1", "name": "lookup", "input": {}}
+            ],
+        },
+    ]
+
+    with pytest.raises(ContextLimitError, match="incomplete"):
+        ctx_mgr.compact_messages(messages, input_token_budget=100)
+
+
 def test_parse_entries(tmp_path):
     eng = make_engine(tmp_path)
     raw = (

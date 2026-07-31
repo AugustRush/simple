@@ -4147,6 +4147,52 @@ def test_send_message_classifies_request_timeout(monkeypatch):
     assert result.error == "Model request timed out"
 
 
+def test_create_enforces_input_budget_before_transport(tmp_path):
+    import agent as agent_module
+
+    store = agent_module.LTMStore(context_dir=tmp_path / "context")
+    manager = agent_module.ContextManager(
+        store=store,
+        retriever=agent_module.LocalRetriever(),
+        consolidation=agent_module.ConsolidationEngine(store=store),
+        staging=agent_module.StagingBuffer(
+            context_dir=tmp_path / "context", session_id="budget"
+        ),
+    )
+    calls = []
+
+    class Transport:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return object()
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="openai",
+        context_window=100,
+        max_tokens=20,
+    )
+    agent.context_manager = manager
+    agent._transport = Transport()
+    ctx = agent_module.AgentContext(
+        system_prompt="s" * 40,
+        messages=[
+            {"role": "user", "content": "x" * 400},
+            {"role": "assistant", "content": "old"},
+            {"role": "user", "content": "latest"},
+        ],
+    )
+
+    asyncio.run(agent._create(ctx, [{"name": "tool", "description": "y" * 40}]))
+
+    assert len(calls) == 1
+    budget = agent._input_token_budget(ctx, [{"name": "tool", "description": "y" * 40}])
+    assert manager.consolidation.estimate_tokens(calls[0]["messages"]) < budget
+    assert calls[0]["messages"][-1]["content"] == "latest"
+
+
 def test_send_message_reports_terminal_error_when_openai_length_stays_truncated(
     monkeypatch,
 ):
@@ -7398,10 +7444,10 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
         def enqueue_consolidation(self, reason):
             pass
 
-        def should_compact_messages(self, messages, max_tokens):
+        def should_compact_messages(self, messages, input_token_budget):
             return True
 
-        def compact_messages(self, messages):
+        def compact_messages(self, messages, *, input_token_budget):
             return messages
 
         def should_session_end_sleep(self):

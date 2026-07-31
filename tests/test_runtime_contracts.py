@@ -366,7 +366,7 @@ def test_post_turn_maintenance_records_runtime_event_turn_id():
         def should_enqueue_consolidation(self):
             return False
 
-        def should_compact_messages(self, messages, max_tokens):
+        def should_compact_messages(self, messages, input_token_budget):
             return False
 
     class _Agent:

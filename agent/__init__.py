@@ -199,6 +199,7 @@ from .memory.system import (
     AgentRuntimeEvent,
     BackgroundMemoryWorker,
     ConsolidationEngine,
+    ContextLimitError,
     ContextManager,
     ConversationTurn,
     FactAssertion,

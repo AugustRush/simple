@@ -405,7 +405,10 @@ async def _interactive_loop(components: dict, cfg: dict):
                         components["model"],
                         api_format=agent.api_format,
                     )
-                ctx.messages = ctx_mgr.compact_messages(ctx.messages)
+                ctx.messages = ctx_mgr.compact_messages(
+                    ctx.messages,
+                    input_token_budget=agent.context_window - agent.max_tokens,
+                )
             except Exception as e:
                 shared.CONSOLE.print(f"[dim]Session-end consolidation error: {e}[/dim]")
 
