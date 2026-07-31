@@ -774,32 +774,25 @@ def test_web_fetch_uses_asyncio_to_thread(tmp_path, monkeypatch):
 
 
 def test_web_fetch_reports_download_progress(tmp_path, monkeypatch):
-    import urllib.request
-
     from agent.core.output import EventCollector, _active_event_collector
+    from agent.security.network import FetchResponse
     from agent.tools.executor import RegularToolExecutor
 
     _tools, registry, _workspace = make_builtin_tools(tmp_path)
 
-    class _FakeResponse:
-        headers = {"Content-Length": "11"}
-
-        def __init__(self):
-            self._chunks = [b"<p>hello ", b"world</p>", b""]
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self, _size):
-            return self._chunks.pop(0)
+    def fake_fetch(url, **kwargs):
+        kwargs["on_progress"](9, 18)
+        kwargs["on_progress"](18, 18)
+        return FetchResponse(
+            body=b"<p>hello world</p>",
+            final_url=url,
+            status=200,
+            headers={"Content-Length": "18"},
+        )
 
     monkeypatch.setattr(
-        urllib.request,
-        "urlopen",
-        lambda *args, **kwargs: _FakeResponse(),
+        "agent.tools.builtin_tools.fetch_public_http_url",
+        fake_fetch,
     )
 
     async def run():

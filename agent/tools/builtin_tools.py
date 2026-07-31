@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 from agent import shared
 from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
+from agent.security.network import fetch_public_http_url
 from agent.security.shell import shell_command_uses_shell_features
 
 from .executor import report_tool_progress
@@ -922,37 +923,25 @@ class BuiltinTools:
 
     @staticmethod
     def _make_urllib_request(url: str, timeout: int = WEB_FETCH_TIMEOUT) -> bytes:
-        """Open *url* with a browser-like User-Agent; return raw bytes."""
-        req = urllib.request.Request(
+        """Fetch *url* through the validated, address-pinned network boundary."""
+        result = fetch_public_http_url(
             url,
+            timeout=timeout,
+            max_bytes=WEB_FETCH_MAX_BYTES,
             headers={
                 "User-Agent": WEB_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
             },
+            on_progress=lambda bytes_done, total: report_tool_progress(
+                status="downloading",
+                current=bytes_done,
+                total=total,
+                bytes_done=bytes_done,
+                bytes_total=total,
+            ),
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            total_raw = resp.headers.get("Content-Length") if resp.headers else None
-            try:
-                total = int(total_raw) if total_raw else None
-            except (TypeError, ValueError):
-                total = None
-            chunks: list[bytes] = []
-            bytes_done = 0
-            while bytes_done < WEB_FETCH_MAX_BYTES:
-                chunk = resp.read(min(64 * 1024, WEB_FETCH_MAX_BYTES - bytes_done))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                bytes_done += len(chunk)
-                report_tool_progress(
-                    status="downloading",
-                    current=bytes_done,
-                    total=total,
-                    bytes_done=bytes_done,
-                    bytes_total=total,
-                )
-            return b"".join(chunks)
+        return result.body
 
     @staticmethod
     def _make_tavily_request(
