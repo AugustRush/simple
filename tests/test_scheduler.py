@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import threading
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from typer.testing import CliRunner
@@ -35,6 +36,33 @@ def test_weekly_trigger_rolls_forward_to_named_weekday():
     assert trigger.next_after(now) == datetime(
         2026, 4, 22, 1, 0, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.parametrize(
+    ("scheduled_for", "now", "expected"),
+    [
+        (
+            datetime(2026, 3, 1, 14, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 1, 14, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 8, 13, 0, tzinfo=timezone.utc),
+        ),
+        (
+            datetime(2026, 10, 25, 13, 0, tzinfo=timezone.utc),
+            datetime(2026, 10, 25, 13, 1, tzinfo=timezone.utc),
+            datetime(2026, 11, 1, 14, 0, tzinfo=timezone.utc),
+        ),
+    ],
+)
+def test_weekly_trigger_preserves_wall_clock_across_dst(
+    scheduled_for, now, expected
+):
+    from agent.scheduler import WeeklyTrigger
+
+    trigger = WeeklyTrigger("sun", "09:00", "America/New_York")
+    next_run = trigger.advance_from(scheduled_for, now)
+
+    assert next_run == expected
+    assert next_run.astimezone(ZoneInfo("America/New_York")).hour == 9
 
 
 def test_scheduler_store_creates_and_lists_tasks(tmp_path):
