@@ -206,7 +206,9 @@ class AnthropicTransport(ModelTransport):
         return stop_reason, text, tool_calls
 
     def completion_error(self, response):
-        return None  # Anthropic surfaces truncation via stop_reason already
+        if getattr(response, "stop_reason", None) == "max_tokens":
+            return "Model response was truncated (stop_reason=max_tokens)"
+        return None
 
     def build_assistant_message(self, response, text):
         return {"role": "assistant", "content": response.content}

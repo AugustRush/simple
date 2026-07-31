@@ -4707,6 +4707,56 @@ def test_send_message_auto_continues_openai_length_finish(monkeypatch):
     assert "Continue exactly from where you left off" in seen_messages[1][-1]["content"]
 
 
+def test_anthropic_max_tokens_uses_existing_truncation_continuation():
+    import agent as agent_module
+    from agent.core.transport import AnthropicTransport
+
+    class Response:
+        def __init__(self, stop_reason, text):
+            self.stop_reason = stop_reason
+            self.content = [type("TextBlock", (), {"type": "text", "text": text})()]
+
+    assert AnthropicTransport(object()).completion_error(
+        Response("max_tokens", "partial")
+    ) == "Model response was truncated (stop_reason=max_tokens)"
+
+    class Transport:
+        def __init__(self):
+            self.responses = iter(
+                [Response("max_tokens", "first"), Response("end_turn", " second")]
+            )
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            self.calls += 1
+            return next(self.responses)
+
+        @staticmethod
+        def parse_response(response):
+            return response.stop_reason, response.content[0].text, []
+
+        @staticmethod
+        def completion_error(response):
+            return AnthropicTransport.completion_error(AnthropicTransport(object()), response)
+
+        @staticmethod
+        def build_final_message(response, text):
+            return {"role": "assistant", "content": text}
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), api_format="anthropic"
+    )
+    transport = Transport()
+    agent._transport = transport
+    result = asyncio.run(
+        agent.send_message(agent_module.AgentContext(system_prompt="system"), "hello")
+    )
+
+    assert transport.calls == 2
+    assert result.error is None
+    assert result.content == "first second"
+
+
 def test_send_message_stream_preserves_reasoning_content_for_openai_tool_loop(
     monkeypatch,
 ):
