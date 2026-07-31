@@ -145,10 +145,6 @@ class BuiltinTools:
                         "type": "string",
                         "description": "Optional working directory. Defaults to an isolated sandbox directory (AGENT_SANDBOX_DIR) so downloads, clones, and generated artifacts never pollute the workspace. For current project files, set cwd to the workspace root and use relative command arguments; for external clones/downloads, keep the default cwd and use relative paths.",
                     },
-                    "confirmation_token": {
-                        "type": "string",
-                        "description": "Confirmation token returned by a previous rejected restricted command. Must be used with the exact same command.",
-                    },
                 },
                 "required": ["command", "intent"],
             },
@@ -1303,10 +1299,7 @@ class BuiltinTools:
                     "default cwd (sandbox_cwd) and use relative paths, e.g. "
                     "git clone <url> repo-name."
                 ),
-                (
-                    "Only use confirmation_token if the external absolute path "
-                    "is truly required."
-                ),
+                "If the external absolute path is truly required, ask the user to approve it.",
             ],
         }
 
@@ -1316,7 +1309,6 @@ class BuiltinTools:
         intent: str = "",
         timeout: int = 300,
         cwd: Optional[str] = None,
-        confirmation_token: str = "",
     ) -> dict[str, Any]:
         # Security: block dangerous commands before spawning any subprocess.
         extra_blocked: list[str] = (
@@ -1324,10 +1316,16 @@ class BuiltinTools:
         )
         import agent as agent_module
 
-        if confirmation_token:
-            from agent.security.shell import shell_command_confirm
+        from agent.core.agent import _active_agent_context
+        from agent.security.shell import ShellAuthorizationScope
 
-            shell_command_confirm(str(confirmation_token), command)
+        active_context = _active_agent_context.get()
+        metadata = active_context.metadata if active_context is not None else {}
+        authorization_scope = ShellAuthorizationScope(
+            str(metadata.get("session_id") or "default"),
+            str(metadata.get("channel_name") or "cli"),
+            str(metadata.get("user_id") or ""),
+        )
 
         output_dir = self._process_output_dir()
         sandbox_dir = self._sandbox_dir()
@@ -1336,6 +1334,7 @@ class BuiltinTools:
             command,
             extra_blocked,
             allowed_roots=frozenset({self.workspace_root, output_dir}),
+            scope=authorization_scope,
         )
         if not safety.allowed:
             if safety.requires_confirmation:

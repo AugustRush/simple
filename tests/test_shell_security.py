@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 
@@ -29,6 +31,68 @@ def test_shell_security_requires_confirmation_for_restricted_commands():
         assert result.risk_level == "medium"
         assert result.requires_confirmation is True
         assert result.confirmation_token
+
+
+def test_shell_confirmation_is_scoped_one_time_and_expires():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_confirm,
+    )
+
+    now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    scope = ShellAuthorizationScope("session-1", "feishu", "user-1")
+    first = shell_command_check("  mv a b  ", scope=scope, now=now)
+
+    assert shell_command_confirm(first.confirmation_token, scope=scope, now=now)
+    assert not shell_command_confirm(first.confirmation_token, scope=scope, now=now)
+    assert shell_command_check("mv a b", scope=scope, now=now).allowed is True
+    assert shell_command_check("mv  a b", scope=scope, now=now).allowed is False
+    assert shell_command_check(
+        "mv a b", scope=scope, now=now + timedelta(minutes=5)
+    ).allowed is False
+
+
+@pytest.mark.parametrize(
+    "other_scope",
+    [
+        pytest.param(("session-2", "feishu", "user-1"), id="session"),
+        pytest.param(("session-1", "cli", "user-1"), id="channel"),
+        pytest.param(("session-1", "feishu", "user-2"), id="user"),
+    ],
+)
+def test_shell_confirmation_rejects_other_authorization_scopes(other_scope):
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_confirm,
+    )
+
+    now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    owner = ShellAuthorizationScope("session-1", "feishu", "user-1")
+    other = ShellAuthorizationScope(*other_scope)
+    first = shell_command_check("mv a b", scope=owner, now=now)
+
+    assert not shell_command_confirm(first.confirmation_token, scope=other, now=now)
+    assert shell_command_check("mv a b", scope=other, now=now).allowed is False
+
+
+def test_shell_confirmation_rejects_expired_pending_token():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_command_confirm,
+    )
+
+    now = datetime(2026, 7, 31, 12, 0, tzinfo=timezone.utc)
+    scope = ShellAuthorizationScope("session-1", "feishu", "user-1")
+    first = shell_command_check("mv a b", scope=scope, now=now)
+
+    assert not shell_command_confirm(
+        first.confirmation_token,
+        scope=scope,
+        now=now + timedelta(minutes=5),
+    )
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ import re
 import shlex
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -155,25 +156,81 @@ SHELL_BLOCKED_PATTERNS: tuple[str, ...] = HIGH_RISK_PATTERNS + MEDIUM_RISK_PATTE
 
 # ── Session allowlist ───────────────────────────────────────────────────────
 
-_session_allowlist: set[str] = set()
-
-# Pending confirmation tokens: token → command
-_pending_tokens: dict[str, str] = {}
+CONFIRMATION_TTL = timedelta(minutes=5)
 
 
-def shell_session_allowlist_add(command_base: str) -> None:
-    """Add an exact command string to the session allowlist."""
-    _session_allowlist.add(command_base)
+@dataclass(frozen=True)
+class ShellAuthorizationScope:
+    session_id: str
+    channel_name: str
+    user_id: str = ""
+
+
+@dataclass(frozen=True)
+class PendingShellConfirmation:
+    command: str
+    scope: ShellAuthorizationScope
+    expires_at: datetime
+
+
+_DEFAULT_SCOPE = ShellAuthorizationScope("default", "cli", "")
+_session_allowlist: dict[tuple[ShellAuthorizationScope, str], datetime] = {}
+_pending_tokens: dict[str, PendingShellConfirmation] = {}
+
+
+def _authorization_scope(
+    scope: ShellAuthorizationScope | None,
+) -> ShellAuthorizationScope:
+    return scope or _DEFAULT_SCOPE
+
+
+def _authorization_time(now: datetime | None) -> datetime:
+    value = now or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _normalize_command(command: str) -> str:
+    return str(command).strip()
+
+
+def shell_session_allowlist_add(
+    command_base: str,
+    *,
+    scope: ShellAuthorizationScope | None = None,
+    now: datetime | None = None,
+    expires_at: datetime | None = None,
+) -> None:
+    """Allow one normalized command in one authorization scope until expiry."""
+    current = _authorization_time(now)
+    expiry = _authorization_time(expires_at) if expires_at else current + CONFIRMATION_TTL
+    _session_allowlist[
+        (_authorization_scope(scope), _normalize_command(command_base))
+    ] = expiry
 
 
 def shell_session_allowlist_clear() -> None:
     """Clear all entries from the session allowlist."""
     _session_allowlist.clear()
+    _pending_tokens.clear()
 
 
-def shell_session_allowlist_contains(command_base: str) -> bool:
-    """Check whether an exact command string is in the session allowlist."""
-    return command_base in _session_allowlist
+def shell_session_allowlist_contains(
+    command_base: str,
+    *,
+    scope: ShellAuthorizationScope | None = None,
+    now: datetime | None = None,
+) -> bool:
+    """Check for an unexpired exact command approval in one scope."""
+    key = (_authorization_scope(scope), _normalize_command(command_base))
+    expiry = _session_allowlist.get(key)
+    if expiry is None:
+        return False
+    if expiry <= _authorization_time(now):
+        _session_allowlist.pop(key, None)
+        return False
+    return True
 
 
 def shell_command_uses_shell_features(command: str) -> bool:
@@ -203,16 +260,45 @@ class ShellCheckResult:
         return not self.allowed
 
 
-def shell_command_confirm(token: str, command: str) -> bool:
-    """Verify a confirmation token and add the command to the session allowlist.
-
-    Returns True if the token was valid and the command is now allowed.
-    """
-    stored = _pending_tokens.pop(token, None)
-    if stored is None or stored != command:
+def shell_command_confirm(
+    token: str,
+    *,
+    scope: ShellAuthorizationScope,
+    now: datetime | None = None,
+) -> bool:
+    """Redeem one pending token using trusted request identity."""
+    current = _authorization_time(now)
+    stored = _pending_tokens.get(str(token))
+    if stored is None or stored.scope != scope or stored.expires_at <= current:
+        if stored is not None and stored.expires_at <= current:
+            _pending_tokens.pop(str(token), None)
         return False
-    shell_session_allowlist_add(command)
+    _pending_tokens.pop(str(token), None)
+    shell_session_allowlist_add(
+        stored.command,
+        scope=stored.scope,
+        now=current,
+        expires_at=stored.expires_at,
+    )
     return True
+
+
+def _pending_confirmation(
+    command: str,
+    *,
+    scope: ShellAuthorizationScope,
+    now: datetime,
+) -> str:
+    for stale_token, record in list(_pending_tokens.items()):
+        if record.expires_at <= now:
+            _pending_tokens.pop(stale_token, None)
+    token = str(uuid.uuid4())
+    _pending_tokens[token] = PendingShellConfirmation(
+        command=_normalize_command(command),
+        scope=scope,
+        expires_at=now + CONFIRMATION_TTL,
+    )
+    return token
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
@@ -479,6 +565,8 @@ def shell_command_check(
     extra_blocked: Optional[list[str]] = None,
     *,
     allowed_roots: frozenset[Path] | None = None,
+    scope: ShellAuthorizationScope | None = None,
+    now: datetime | None = None,
 ) -> ShellCheckResult:
     """Classify *command* by risk level and determine whether it may run.
 
@@ -490,6 +578,9 @@ def shell_command_check(
     "absolute path" checkpoint.
     """
     extra = frozenset(extra_blocked or [])
+    authorization_scope = _authorization_scope(scope)
+    authorization_now = _authorization_time(now)
+    normalized_command = _normalize_command(command)
 
     # Parse before allowlist and risk checks so malformed input always fails closed.
     try:
@@ -515,7 +606,11 @@ def shell_command_check(
         argv0 = _resolve_effective_command(tokens)
 
     # ── Check session allowlist first ────────────────────────────────────
-    if shell_session_allowlist_contains(command):
+    if shell_session_allowlist_contains(
+        normalized_command,
+        scope=authorization_scope,
+        now=authorization_now,
+    ):
         return ShellCheckResult(
             allowed=True,
             risk_level="low",
@@ -564,8 +659,11 @@ def shell_command_check(
         )
 
     if _is_inline_execution(tokens, command_index):
-        token = str(uuid.uuid4())
-        _pending_tokens[token] = command
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
         return ShellCheckResult(
             allowed=False,
             risk_level="medium",
@@ -575,8 +673,11 @@ def shell_command_check(
         )
 
     if _has_absolute_path_token(tokens, allowed_roots=allowed_roots):
-        token = str(uuid.uuid4())
-        _pending_tokens[token] = command
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
         return ShellCheckResult(
             allowed=False,
             risk_level="medium",
@@ -587,8 +688,11 @@ def shell_command_check(
 
     # ── Medium-risk commands ─────────────────────────────────────────────
     if argv0 in MEDIUM_RISK_COMMANDS:
-        token = str(uuid.uuid4())
-        _pending_tokens[token] = command
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
         risk_descriptions = {
             "rm": "file deletion",
             "rmdir": "directory removal",

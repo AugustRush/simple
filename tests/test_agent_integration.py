@@ -106,6 +106,32 @@ def _minimal_cfg():
     }
 
 
+def test_runtime_publishes_and_clears_user_id_per_turn():
+    import agent.runtime.contracts as contracts
+    from agent.runtime import TurnInput
+
+    core = contracts.AgentCore.__new__(contracts.AgentCore)
+    core._components = SimpleNamespace(values={})
+    state = SimpleNamespace(
+        ctx=SimpleNamespace(metadata={"user_id": "stale"}),
+        model_override=None,
+        turn_count=0,
+    )
+    core._context_metadata = lambda current: current.ctx.metadata
+
+    core._publish_turn_runtime_metadata(
+        TurnInput("hello", "session-1", "feishu", metadata={"user_id": "user-1"}),
+        state,
+    )
+    assert state.ctx.metadata["user_id"] == "user-1"
+
+    core._publish_turn_runtime_metadata(
+        TurnInput("hello again", "session-1", "feishu", metadata={}),
+        state,
+    )
+    assert "user_id" not in state.ctx.metadata
+
+
 @pytest.fixture(autouse=True)
 def _clear_fake_mcp_instances():
     """Reset class-level instance trackers between tests."""
