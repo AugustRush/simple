@@ -2298,6 +2298,124 @@ def test_install_plugin_from_local_path_and_reload(tmp_path, monkeypatch):
     assert "sample-plugin" in catalog._plugins
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../escape",
+        "nested/plugin",
+        r"nested\plugin",
+        "/absolute-plugin",
+        ".",
+        "..",
+        " plugin ",
+        "",
+    ],
+)
+def test_install_plugin_rejects_noncanonical_explicit_name_before_io(
+    tmp_path, monkeypatch, name
+):
+    import shutil
+
+    from agent import shared as shared_module
+    from agent.tools.builtin_tools import BuiltinTools
+    from agent.tools.runtime import ToolRegistry
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plugin.json").write_text("{}", encoding="utf-8")
+    plugins = tmp_path / "plugins"
+    monkeypatch.setattr(shared_module, "USER_PLUGINS_DIR", plugins)
+    tools = BuiltinTools(memory=None, registry=ToolRegistry())
+
+    def unexpected_io(*args, **kwargs):
+        raise AssertionError("invalid plugin name reached filesystem I/O")
+
+    with monkeypatch.context() as io_guard:
+        io_guard.setattr(Path, "mkdir", unexpected_io)
+        io_guard.setattr(Path, "exists", unexpected_io)
+        io_guard.setattr(shutil, "copytree", unexpected_io)
+        io_guard.setattr(asyncio, "create_subprocess_exec", unexpected_io)
+        result = asyncio.run(
+            tools._install_plugin(
+                source=str(source),
+                intent="boundary regression",
+                name=name,
+            )
+        )
+
+    assert result["ok"] is False
+    assert "canonical slug" in result["error"]
+    assert not plugins.exists()
+    assert not (tmp_path / "escape").exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "../escape",
+        "nested/plugin",
+        r"nested\plugin",
+        "/absolute-plugin",
+        ".",
+        "..",
+        " plugin ",
+        "",
+    ],
+)
+def test_uninstall_plugin_rejects_noncanonical_name_before_io(
+    tmp_path, monkeypatch, name
+):
+    import shutil
+
+    from agent import shared as shared_module
+    from agent.tools.builtin_tools import BuiltinTools
+    from agent.tools.runtime import ToolRegistry
+
+    plugins = tmp_path / "plugins"
+    plugins.mkdir()
+    sentinel = tmp_path / "escape"
+    sentinel.mkdir()
+    (sentinel / "keep.txt").write_text("keep", encoding="utf-8")
+    monkeypatch.setattr(shared_module, "USER_PLUGINS_DIR", plugins)
+    tools = BuiltinTools(memory=None, registry=ToolRegistry())
+
+    def unexpected_io(*args, **kwargs):
+        raise AssertionError("invalid plugin name reached filesystem I/O")
+
+    with monkeypatch.context() as io_guard:
+        io_guard.setattr(Path, "exists", unexpected_io)
+        io_guard.setattr(Path, "is_dir", unexpected_io)
+        io_guard.setattr(shutil, "rmtree", unexpected_io)
+        result = asyncio.run(
+            tools._uninstall_plugin(name=name, intent="boundary regression")
+        )
+
+    assert result["ok"] is False
+    assert "canonical slug" in result["error"]
+    assert (sentinel / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+@pytest.mark.parametrize("name", ["alpha", "alpha-2", "alpha_beta"])
+def test_install_plugin_accepts_canonical_explicit_name(tmp_path, monkeypatch, name):
+    from agent import shared as shared_module
+    from agent.tools.builtin_tools import BuiltinTools
+    from agent.tools.runtime import ToolRegistry
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plugin.json").write_text("{}", encoding="utf-8")
+    plugins = tmp_path / "plugins"
+    monkeypatch.setattr(shared_module, "USER_PLUGINS_DIR", plugins)
+    tools = BuiltinTools(memory=None, registry=ToolRegistry())
+
+    result = asyncio.run(
+        tools._install_plugin(source=str(source), intent="install", name=name)
+    )
+
+    assert result["ok"] is True
+    assert Path(result["installed_at"]).resolve().parent == plugins.resolve()
+
+
 
 def test_reload_marks_skill_catalog_dirty(tmp_path):
     """After reload, next turn must rebuild prompt — verify _dirty is set."""

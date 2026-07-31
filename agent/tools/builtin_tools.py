@@ -56,6 +56,22 @@ def _looks_like_plugin(dir_path: Path) -> bool:
         return True
     return False
 
+
+def _resolve_user_plugin_target(name: str) -> Path:
+    if name != name.strip() or re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?\Z", name
+    ) is None:
+        raise ValueError("plugin name must be a canonical slug")
+
+    root = shared.USER_PLUGINS_DIR.expanduser().resolve(strict=False)
+    target = (root / name).resolve(strict=False)
+    if target.parent != root:
+        raise ValueError(
+            "plugin target must be a direct child of USER_PLUGINS_DIR"
+        )
+    return target
+
+
 from .runtime import _active_schedule_target  # noqa: E402
 class BuiltinTools:
     """Built-in tools with bounded file access and structured responses."""
@@ -684,29 +700,30 @@ class BuiltinTools:
     # ── Plugin install / uninstall implementations ────────────────────────
 
     async def _install_plugin(
-        self, source: str, intent: str = "", name: str = ""
+        self, source: str, intent: str = "", name: Optional[str] = None
     ) -> dict:
-        import re as _re
         import shutil
         import urllib.parse as _urlparse
 
         if not source.strip():
             return {"ok": False, "error": "source is required"}
 
-        user_plugins_dir = shared.USER_PLUGINS_DIR
-        user_plugins_dir.mkdir(parents=True, exist_ok=True)
-
         # Derive name from URL or path when not provided.
-        if not name.strip():
+        if name is None:
             raw = source.rstrip("/")
             if raw.endswith(".git"):
                 raw = raw[:-4]
             # Take the last URL/path segment as the slug.
             slug = _urlparse.urlparse(raw).path.rsplit("/", 1)[-1] if "://" in raw else Path(raw).name
             slug = slug or "plugin"
-            name = _re.sub(r"[^a-zA-Z0-9_-]", "-", slug).strip("-") or "plugin"
+            name = re.sub(r"[^a-zA-Z0-9_-]", "-", slug).strip("-") or "plugin"
 
-        target = user_plugins_dir / name
+        try:
+            target = _resolve_user_plugin_target(name)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             return {
                 "ok": False,
@@ -803,16 +820,10 @@ class BuiltinTools:
     async def _uninstall_plugin(self, name: str, intent: str = "") -> dict:
         import shutil
 
-        if not name.strip():
-            return {"ok": False, "error": "name is required"}
-
-        target = (shared.USER_PLUGINS_DIR / name).resolve()
-        # Guard: only allow removal inside the user plugins directory.
-        if shared.USER_PLUGINS_DIR.resolve() not in target.parents:
-            return {
-                "ok": False,
-                "error": "refusing to remove paths outside USER_PLUGINS_DIR",
-            }
+        try:
+            target = _resolve_user_plugin_target(name)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
         if not target.is_dir():
             return {"ok": False, "error": f"plugin '{name}' not found at {target}"}
 
