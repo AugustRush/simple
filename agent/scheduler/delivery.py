@@ -84,5 +84,5 @@ class SchedulerDelivery:
                     await asyncio.sleep(5.0 * (attempt + 1))
         return DeliveryResult(
             status="failed",
-            output_path=str(last_error) if last_error else "unknown error",
+            error=str(last_error) if last_error else "unknown error",
         )

@@ -344,3 +344,4 @@ class ExecutionResult:
 class DeliveryResult:
     status: str
     output_path: str = ""
+    error: str = ""

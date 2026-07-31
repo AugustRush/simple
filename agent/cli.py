@@ -876,7 +876,7 @@ def schedule_delete(task_id: str = typer.Argument(..., help="Task id")):
 @app.command()
 def scheduler(
     poll_seconds: Optional[float] = typer.Option(None, "--poll-seconds", min=0.1),
-    lease_seconds: Optional[int] = typer.Option(None, "--lease-seconds", min=1),
+    lease_seconds: Optional[int] = typer.Option(None, "--lease-seconds", min=3),
     name: Optional[str] = typer.Option(
         None, "--name", help="Instance name for multi-tenant isolation (default: ~/.agent)"
     ),

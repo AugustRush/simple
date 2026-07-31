@@ -2521,6 +2521,20 @@ def test_feishu_sink_falls_back_to_create_on_reply_failure():
     assert sink._client.im.v1.message.create.called
 
 
+def test_feishu_sink_raises_when_create_returns_non_success():
+    sink = _make_feishu_sink()
+    sink._first_reply = False
+    response = MagicMock()
+    response.success.return_value = False
+    response.code = 230001
+    response.msg = "permission denied"
+    response.get_log_id.return_value = "log-123"
+    sink._client.im.v1.message.create.return_value = response
+
+    with pytest.raises(RuntimeError, match="230001.*permission denied.*log-123"):
+        sink._do_send("text", '{"text":"hello"}')
+
+
 def test_feishu_sink_second_send_uses_create_directly():
     """After the first message (reply consumed), _do_send goes straight to Create."""
     sink = _make_feishu_sink()

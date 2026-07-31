@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 import sqlite3
 import threading
+from types import SimpleNamespace
 
+import pytest
 from typer.testing import CliRunner
 
 
@@ -643,6 +645,238 @@ def test_scheduler_service_executes_claimed_tasks_concurrently(tmp_path):
     assert len(starts) == 2
     assert runs_first[0].status == "succeeded"
     assert runs_second[0].status == "succeeded"
+
+
+def test_scheduler_service_rejects_too_short_lease():
+    from agent.scheduler import SchedulerService
+
+    async def unused(*args):
+        raise AssertionError("unused")
+
+    with pytest.raises(ValueError, match="at least 3"):
+        SchedulerService(
+            store=object(),
+            agent_executor=unused,
+            system_executor=unused,
+            delivery=unused,
+            lease_seconds=2,
+        )
+
+
+def test_scheduler_service_cancels_execution_when_renewal_loses_ownership(monkeypatch):
+    from agent.scheduler import SchedulerService
+
+    completions = []
+    delivered = []
+    cancelled = asyncio.Event()
+
+    class Store:
+        def renew_lease(self, *args, **kwargs):
+            return False
+
+        def complete_run(self, *args, **kwargs):
+            completions.append((args, kwargs))
+            return True
+
+    async def executor(task, run):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    async def delivery(*args):
+        delivered.append(True)
+
+    real_sleep = asyncio.sleep
+
+    async def immediate_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr("agent.scheduler.runtime.asyncio.sleep", immediate_sleep)
+    service = SchedulerService(
+        store=Store(),
+        agent_executor=executor,
+        system_executor=executor,
+        delivery=delivery,
+        lease_seconds=3,
+    )
+    task = SimpleNamespace(id="task", kind="agent_prompt")
+    run = SimpleNamespace(
+        id="run", started_at=datetime(2026, 4, 19, tzinfo=timezone.utc)
+    )
+
+    asyncio.run(service._execute_claimed(task, run))
+
+    assert cancelled.is_set()
+    assert delivered == []
+    assert completions[0][1]["status"] == "interrupted"
+
+
+def test_scheduler_service_checks_ownership_immediately_before_delivery():
+    from agent.scheduler import ExecutionResult, SchedulerService
+
+    delivered = []
+    completions = []
+
+    class Store:
+        def owns_unexpired_lease(self, *args, **kwargs):
+            return False
+
+        def complete_run(self, *args, **kwargs):
+            completions.append((args, kwargs))
+            return True
+
+        def renew_lease(self, *args, **kwargs):
+            return True
+
+    async def executor(task, run):
+        return ExecutionResult(summary="done", text_output="payload")
+
+    async def delivery(*args):
+        delivered.append(True)
+
+    service = SchedulerService(
+        store=Store(),
+        agent_executor=executor,
+        system_executor=executor,
+        delivery=delivery,
+        lease_seconds=300,
+    )
+    task = SimpleNamespace(id="task", kind="agent_prompt")
+    run = SimpleNamespace(
+        id="run", started_at=datetime(2026, 4, 19, tzinfo=timezone.utc)
+    )
+
+    asyncio.run(service._execute_claimed(task, run))
+
+    assert delivered == []
+    assert completions[0][1]["status"] == "interrupted"
+
+
+def test_scheduler_service_rechecks_ownership_after_delivery():
+    from agent.scheduler import ExecutionResult, SchedulerService
+
+    ownership = iter([True, False])
+    completions = []
+
+    class Store:
+        def owns_unexpired_lease(self, *args, **kwargs):
+            return next(ownership)
+
+        def complete_run(self, *args, **kwargs):
+            completions.append((args, kwargs))
+            return True
+
+        def renew_lease(self, *args, **kwargs):
+            return True
+
+    async def executor(task, run):
+        return ExecutionResult(summary="done", text_output="payload")
+
+    async def delivery(*args):
+        return "delivered"
+
+    service = SchedulerService(
+        store=Store(),
+        agent_executor=executor,
+        system_executor=executor,
+        delivery=delivery,
+        lease_seconds=300,
+    )
+    task = SimpleNamespace(id="task", kind="agent_prompt")
+    run = SimpleNamespace(
+        id="run", started_at=datetime(2026, 4, 19, tzinfo=timezone.utc)
+    )
+
+    asyncio.run(service._execute_claimed(task, run))
+
+    assert len(completions) == 1
+    assert completions[0][1]["status"] == "interrupted"
+
+
+def test_scheduler_delivery_failure_is_persisted_without_losing_executor_output(tmp_path):
+    from agent.scheduler import (
+        DeliveryResult,
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="delivery-fails",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "run"},
+            delivery_mode="channel",
+            delivery_target=DeliveryTarget.channel(
+                target_type="feishu_chat", chat_id="oc_test", chat_type="group"
+            ),
+        )
+    )
+    output_path = str(tmp_path / "executor-output.md")
+
+    async def executor(task, run):
+        return ExecutionResult(
+            summary="executed", text_output="send me", output_path=output_path
+        )
+
+    async def delivery(*args):
+        return DeliveryResult(status="failed", error="Feishu unavailable")
+
+    service = SchedulerService(
+        store=store,
+        agent_executor=executor,
+        system_executor=executor,
+        delivery=delivery,
+    )
+    asyncio.run(
+        service.run_once(datetime(2026, 4, 19, tzinfo=timezone.utc))
+    )
+
+    run = store.list_runs(task.id)[0]
+    refreshed = store.get_task(task.id)
+    assert run.status == "failed"
+    assert run.error == "Feishu unavailable"
+    assert run.output_path == output_path
+    assert run.delivery_status == "failed"
+    assert refreshed.last_success_at is None
+
+
+def test_scheduler_delivery_failure_uses_error_field(monkeypatch):
+    from agent.scheduler.delivery import SchedulerDelivery
+
+    delivery = SchedulerDelivery(cfg={})
+    attempts = []
+
+    async def fail(*args, **kwargs):
+        attempts.append(True)
+        raise RuntimeError("send failed")
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(delivery, "deliver_channel", fail)
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+    result = asyncio.run(
+        delivery.deliver(
+            task_id="task",
+            run_id="run",
+            delivery_mode="channel",
+            target=SimpleNamespace(),
+            text="payload",
+            max_retries=2,
+        )
+    )
+
+    assert len(attempts) == 3
+    assert result.status == "failed"
+    assert result.error == "send failed"
+    assert result.output_path == ""
 
 
 def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_path):
