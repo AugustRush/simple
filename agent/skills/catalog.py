@@ -318,15 +318,39 @@ class SkillCatalog:
                 }
             return self._activation_payload(bundle, registry=registry)
 
-        def list_skill_files(skill_name: str) -> dict[str, Any]:
+        def list_skill_files(skill_name: str, path: str = "") -> dict[str, Any]:
             bundle = self.get(skill_name)
             if bundle is None:
                 return {"ok": False, "error": f"Skill '{skill_name}' not found"}
+            filter_dir: str | None = None
+            if path:
+                rel_path = Path(path)
+                if rel_path.is_absolute():
+                    return {
+                        "ok": False,
+                        "error": "Skill file paths must be relative to the skill bundle",
+                    }
+                if rel_path.as_posix() not in (".", ""):
+                    target = (bundle.path / rel_path).resolve(strict=False)
+                    if target != bundle.path and bundle.path not in target.parents:
+                        return {
+                            "ok": False,
+                            "error": "Requested path escapes the skill bundle",
+                        }
+                    filter_dir = rel_path.as_posix().rstrip("/")
+            files = [
+                supporting
+                for supporting in bundle.supporting_files
+                if filter_dir is None
+                or supporting == filter_dir
+                or supporting.startswith(filter_dir + "/")
+            ]
             return {
                 "ok": True,
                 "skill": bundle.id,
                 "bundle_root": self._bundle_root_label(bundle),
-                "files": bundle.supporting_files,
+                "path": filter_dir or ".",
+                "files": files,
             }
 
         def read_skill_file(skill_name: str, path: str) -> dict[str, Any]:
@@ -378,9 +402,15 @@ class SkillCatalog:
                     "skill_name": {
                         "type": "string",
                         "description": "Skill id, unique leaf name, or display name",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional bundle-relative subpath to list; omit for the whole bundle",
+                        "default": "",
                     }
                 },
                 "required": ["skill_name"],
+                "additionalProperties": False,
             },
             list_skill_files,
             replace=True,
