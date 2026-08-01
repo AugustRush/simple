@@ -150,6 +150,126 @@ class TestSummarizeToolResult:
         assert parsed["error"] == "permission denied"
         assert parsed["summarized"] is True
 
+    def test_read_file_structured_summary_drops_content_keeps_metadata(self):
+        payload = json.dumps(
+            {
+                "ok": True,
+                "root": "workspace",
+                "path": "agent/config.py",
+                "content": "line1\n" * 400,
+                "revision": "sha256:abc123",
+                "start_line": 1,
+                "end_line": 200,
+                "total_lines": 480,
+                "next_start_line": 201,
+                "size_bytes": 18240,
+                "returned_bytes": 7210,
+                "encoding": "utf-8",
+                "bom": False,
+                "newline": "lf",
+            }
+        )
+
+        result = summarize_tool_result("read_file", payload)
+        parsed = json.loads(result)
+
+        assert parsed["ok"] is True
+        assert parsed["summarized"] is True
+        assert "content" not in parsed
+        assert parsed["path"] == "agent/config.py"
+        assert parsed["revision"] == "sha256:abc123"
+        assert parsed["next_start_line"] == 201
+        assert parsed["total_lines"] == 480
+        assert parsed["newline"] == "lf"
+        assert "line1" not in result
+
+    def test_write_and_edit_structured_summaries_preserve_revisions(self):
+        write_payload = json.dumps(
+            {
+                "ok": True,
+                "root": "workspace",
+                "path": "agent/config.py",
+                "mode": "overwrite",
+                "old_revision": "sha256:old",
+                "new_revision": "sha256:new",
+                "old_size_bytes": 100,
+                "new_size_bytes": 120,
+                "byte_delta": 20,
+            }
+        )
+        edit_payload = json.dumps(
+            {
+                "ok": True,
+                "root": "workspace",
+                "path": "agent/config.py",
+                "mode": "edit",
+                "old_revision": "sha256:new",
+                "new_revision": "sha256:newer",
+                "old_size_bytes": 120,
+                "new_size_bytes": 90,
+                "byte_delta": -30,
+                "replacement_count": 2,
+                "replaced_occurrences": 3,
+            }
+        )
+
+        write_summary = json.loads(summarize_tool_result("write_file", write_payload))
+        assert write_summary["new_revision"] == "sha256:new"
+        assert write_summary["old_revision"] == "sha256:old"
+        assert write_summary["byte_delta"] == 20
+
+        edit_summary = json.loads(summarize_tool_result("edit_file", edit_payload))
+        assert edit_summary["old_revision"] == "sha256:new"
+        assert edit_summary["new_revision"] == "sha256:newer"
+        assert edit_summary["replacement_count"] == 2
+        assert edit_summary["replaced_occurrences"] == 3
+
+    def test_list_files_structured_summary_keeps_cursor_drops_items(self):
+        payload = json.dumps(
+            {
+                "ok": True,
+                "root": "workspace",
+                "path": "agent",
+                "items": [{"path": "a.py", "kind": "file", "size_bytes": 1}],
+                "count": 1,
+                "truncated": True,
+                "next_cursor": "opaque-token",
+            }
+        )
+
+        result = json.loads(summarize_tool_result("list_files", payload))
+
+        assert result["ok"] is True
+        assert result["summarized"] is True
+        assert "items" not in result
+        assert result["count"] == 1
+        assert result["truncated"] is True
+        assert result["next_cursor"] == "opaque-token"
+
+    def test_structured_error_preserves_stable_envelope(self):
+        error = json.dumps(
+            {
+                "ok": False,
+                "error": {
+                    "code": "revision_conflict",
+                    "message": "File changed since it was read.",
+                    "details": {
+                        "expected_revision": "sha256:a",
+                        "actual_revision": "sha256:b",
+                    },
+                    "retryable": True,
+                },
+            }
+        )
+
+        result = json.loads(summarize_tool_result("edit_file", error))
+
+        assert result["ok"] is False
+        assert result["summarized"] is True
+        assert result["error"]["code"] == "revision_conflict"
+        assert result["error"]["retryable"] is True
+        assert result["error"]["details"]["actual_revision"] == "sha256:b"
+
     def test_redacted_summary_omits_raw_preview(self):
         result = summarize_tool_result(
             "shell",
