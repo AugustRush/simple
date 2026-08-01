@@ -530,8 +530,9 @@ async def _run_command_menu(monkeypatch, answers):
 
     iterator = iter(answers)
 
-    async def fake_prompt(items):
-        return next(iterator)
+    async def fake_prompt(state, title):
+        answer = next(iterator)
+        return state.pick(answer) if answer is not None else None
 
     monkeypatch.setattr(cli, "_menu_prompt_async", fake_prompt)
     return await cli._command_menu(_builtin_cli_router())
@@ -574,14 +575,36 @@ def test_command_menu_plain_command_returns_immediately(monkeypatch):
 def test_command_menu_cancel_returns_none(monkeypatch):
     import asyncio
 
-    assert asyncio.run(_run_command_menu(monkeypatch, [""])) is None
+    assert asyncio.run(_run_command_menu(monkeypatch, [None])) is None
     assert (
-        asyncio.run(_run_command_menu(monkeypatch, ["permissions", ""]))
+        asyncio.run(_run_command_menu(monkeypatch, ["permissions", None]))
         is None
     )
 
 
-def test_selection_menu_accepts_numbers_exact_names_and_filters(monkeypatch):
+def test_menu_state_filters_live():
+    from agent.cli import _MenuState
+
+    state = _MenuState(
+        [
+            ("alpha", "Alpha", "first option"),
+            ("beta", "Beta", "second option"),
+            ("gamma", "Gamma", "third option"),
+        ]
+    )
+
+    assert [item[0] for item in state.filtered("")] == ["alpha", "beta", "gamma"]
+    assert [item[0] for item in state.filtered("g")] == ["gamma"]
+    assert [item[0] for item in state.filtered("/b")] == ["beta"]
+    assert [item[0] for item in state.filtered("2")] == ["beta"]
+    assert state.filtered("zzz") == []
+    assert state.pick("") == "alpha"
+    assert state.pick("2") == "beta"
+    assert state.pick("third") == "gamma"
+    assert state.pick("zzz") is None
+
+
+def test_selection_menu_accepts_numbers_names_and_filters(monkeypatch):
     import asyncio
 
     import agent.cli as cli
@@ -595,8 +618,9 @@ def test_selection_menu_accepts_numbers_exact_names_and_filters(monkeypatch):
     async def run(answers):
         iterator = iter(answers)
 
-        async def fake_prompt(current):
-            return next(iterator)
+        async def fake_prompt(state, title):
+            answer = next(iterator)
+            return state.pick(answer) if answer is not None else None
 
         monkeypatch.setattr(cli, "_menu_prompt_async", fake_prompt)
         return await cli._select_from_menu("测试菜单", items)
@@ -605,7 +629,7 @@ def test_selection_menu_accepts_numbers_exact_names_and_filters(monkeypatch):
     assert asyncio.run(run(["gamma"])) == "gamma"
     assert asyncio.run(run(["/alpha"])) == "alpha"
     assert asyncio.run(run(["third"])) == "gamma"
-    assert asyncio.run(run(["zzz", "3"])) == "gamma"
+    assert asyncio.run(run([None])) is None
 
 
 def test_cli_command_completer_lists_only_cli_visible_commands(monkeypatch):

@@ -190,29 +190,114 @@ _COMMAND_OPTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
 }
 
 
-async def _menu_prompt_async(items: Sequence[tuple[str, str, str]]) -> str:
-    """One menu input line; Enter accepts the highlighted completion."""
-    words = [str(index) for index in range(1, len(items) + 1)]
-    words.extend(value for value, _label, _hint in items)
-    words.extend(label for _value, label, _hint in items)
-    return await PromptSession(key_bindings=_CLI_KEY_BINDINGS).prompt_async(
+class _MenuState:
+    """Filterable selection state shared by the menu toolbar and key bindings."""
+
+    def __init__(self, items: Sequence[tuple[str, str, str]]) -> None:
+        self.items = list(items)
+        self.selected = 0
+
+    def filtered(self, query: str) -> list[tuple[str, str, str]]:
+        """Live-filter items by the text currently being typed."""
+        lowered = query.strip().lstrip("/").casefold()
+        if not lowered:
+            return list(self.items)
+        if lowered.isdigit():
+            index = int(lowered)
+            if 1 <= index <= len(self.items):
+                return [self.items[index - 1]]
+            return []
+        return [
+            item
+            for item in self.items
+            if lowered in item[0].casefold()
+            or lowered in item[1].casefold()
+            or lowered in item[2].casefold()
+        ]
+
+    def pick(self, query: str) -> Optional[str]:
+        """Return the highlighted item's value for the current query."""
+        filtered = self.filtered(query)
+        if not filtered:
+            return None
+        return filtered[min(self.selected, len(filtered) - 1)][0]
+
+
+def _menu_key_bindings(state: "_MenuState") -> KeyBindings:
+    """Arrow-key navigation plus Enter/Esc confirmation for the menu."""
+    kb = KeyBindings()
+
+    @kb.add("up")
+    def _up(event: Any) -> None:
+        filtered = state.filtered(event.app.current_buffer.text)
+        if filtered:
+            state.selected = max(
+                0, min(state.selected, len(filtered) - 1) - 1
+            )
+
+    @kb.add("down")
+    def _down(event: Any) -> None:
+        filtered = state.filtered(event.app.current_buffer.text)
+        if filtered:
+            state.selected = min(
+                len(filtered) - 1, max(0, state.selected) + 1
+            )
+
+    @kb.add("enter")
+    def _enter(event: Any) -> None:
+        picked = state.pick(event.app.current_buffer.text)
+        if picked is not None:
+            event.app.exit(result=picked)
+
+    @kb.add("escape")
+    def _cancel(event: Any) -> None:
+        event.app.exit(result=None)
+
+    return kb
+
+
+def _menu_toolbar(state: "_MenuState", title: str):
+    """Bottom-toolbar renderer that narrows the list on every keystroke."""
+    from prompt_toolkit.application.current import get_app
+
+    def render() -> list[tuple[str, str]]:
+        query = get_app().current_buffer.text
+        filtered = state.filtered(query)
+        fragments: list[tuple[str, str]] = [
+            ("bold", title),
+            (
+                "dim",
+                "  输入即筛选 · ↑/↓ 选择 · Enter 确认 · Esc 取消",
+            ),
+            ("", "\n"),
+        ]
+        if not filtered:
+            fragments.append(("red", "没有匹配项"))
+            return fragments
+        selected = min(state.selected, len(filtered) - 1)
+        for index, (_value, label, hint) in enumerate(filtered[:8]):
+            marker = "›" if index == selected else " "
+            style = "bold cyan" if index == selected else ""
+            fragments.append((style, f"{marker} {index + 1}. {label}"))
+            if hint:
+                fragments.append(("dim", f"  {hint}"))
+            fragments.append(("", "\n"))
+        if len(filtered) > 8:
+            fragments.append(
+                ("dim", f"… 共 {len(filtered)} 项，输入更多字符缩小范围")
+            )
+        return fragments
+
+    return render
+
+
+async def _menu_prompt_async(
+    state: "_MenuState", title: str
+) -> Optional[str]:
+    """Run the live-filtering menu and return the picked value (or None)."""
+    return await PromptSession(key_bindings=_menu_key_bindings(state)).prompt_async(
         "请选择 › ",
-        completer=WordCompleter(words, ignore_case=True),
-    )
-
-
-def _render_selection_menu(
-    title: str, items: Sequence[tuple[str, str, str]]
-) -> None:
-    table = Table(title=title, border_style="bright_black", pad_edge=False)
-    table.add_column("#", justify="right", style="bold cyan", no_wrap=True)
-    table.add_column("选项", style="bold")
-    table.add_column("说明", style="dim")
-    for index, (_value, label, hint) in enumerate(items, 1):
-        table.add_row(str(index), markup_escape(label), markup_escape(hint))
-    shared.CONSOLE.print(table)
-    shared.CONSOLE.print(
-        "[dim]输入编号或名称快速选择 · 输入关键词过滤 · 空回车取消 · Tab 补全[/dim]"
+        bottom_toolbar=_menu_toolbar(state, title),
     )
 
 
@@ -220,58 +305,12 @@ async def _select_from_menu(
     title: str,
     items: Sequence[tuple[str, str, str]],
 ) -> Optional[str]:
-    """Interactive numbered selection menu returning the chosen value.
-
-    Accepts a number, an exact option name, or a keyword filter that narrows
-    the list; an empty answer cancels the menu.
-    """
-    current = list(items)
-    while True:
-        _render_selection_menu(title, current)
-        try:
-            answer = (await _menu_prompt_async(current)).strip()
-        except (KeyboardInterrupt, EOFError):
-            return None
-        if not answer:
-            return None
-        if answer.isdigit():
-            index = int(answer)
-            if 1 <= index <= len(current):
-                return current[index - 1][0]
-            shared.CONSOLE.print(
-                f"[red]编号超出范围（1-{len(current)}）[/red]"
-            )
-            continue
-        lowered = answer.casefold().lstrip("/")
-        exact = [
-            item
-            for item in current
-            if item[0].casefold().lstrip("/") == lowered
-            or item[1].casefold().lstrip("/") == lowered
-        ]
-        if len(exact) == 1:
-            return exact[0][0]
-        if len(exact) > 1:
-            shared.CONSOLE.print(
-                "[yellow]匹配到多个选项，请输入编号或更精确的名称[/yellow]"
-            )
-            continue
-        matches = [
-            item
-            for item in current
-            if lowered in item[0].casefold()
-            or lowered in item[1].casefold()
-            or lowered in item[2].casefold()
-        ]
-        if not matches:
-            shared.CONSOLE.print(
-                f"[red]没有匹配「{markup_escape(answer)}」的选项[/red]"
-            )
-            continue
-        if len(matches) == 1:
-            return matches[0][0]
-        current = matches
-        title = f"{title}（匹配 {len(current)} 项）"
+    """Live-filtering selection menu returning the chosen value."""
+    state = _MenuState(items)
+    try:
+        return await _menu_prompt_async(state, title)
+    except (KeyboardInterrupt, EOFError):
+        return None
 
 
 async def _command_menu(router: CommandRouter) -> Optional[str]:

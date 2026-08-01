@@ -606,10 +606,12 @@ Commands are handled by a shared runtime coordinator and work across all
 channels unless marked otherwise.
 
 In the interactive CLI, type `/` and press Enter to open a selection menu of
-the commands available in this channel — pick one by number or filter by
-name. Commands with fixed options (e.g. `/permissions`, `/auto-approve`)
-show a second menu for the argument. While typing a `/`-command, `Tab`
-completes the name from the live command list.
+the commands available in this channel. The menu filters live as you type
+(numbers jump straight to that entry, names narrow the list); use `↑`/`↓` to
+move and Enter to confirm, or Esc to cancel. Commands with fixed options
+(e.g. `/permissions`, `/auto-approve`) show a second menu for the argument.
+While typing a `/`-command, `Tab` completes the name from the live command
+list.
 
 ### Shared (all channels)
 
