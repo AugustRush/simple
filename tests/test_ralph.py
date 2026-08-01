@@ -9,6 +9,25 @@ import time
 from types import SimpleNamespace
 
 
+def _wait_for_process_exit(pid: int, timeout: float = 2.0) -> None:
+    """Wait until ``pid`` has fully disappeared from the process table.
+
+    A signal-killed orphan (reparented to the OS init/launchd) passes
+    through a brief zombie window in which ``os.kill(pid, 0)`` still
+    succeeds even though the process is dead; the reaper clears it within
+    milliseconds.  Polling keeps the "group was really killed" assertion
+    deterministic instead of racing that reaper.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"process {pid} is still alive after {timeout:g}s")
+
+
 def test_parser_builds_typed_start_command_from_quoted_tokens():
     from agent.ralph import RalphStartCommand, parse_ralph_command
 
@@ -526,8 +545,7 @@ def test_verifier_escalates_for_live_process_group_after_leader_exits(
             assert result is not None and result.status is VerificationStatus.CANCELLED
         else:
             assert repeated_cancellations == [True]
-        with pytest.raises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        _wait_for_process_exit(child_pid)
     finally:
         if child_pid is None and (workspace / "child-pid").exists():
             child_pid = int((workspace / "child-pid").read_text())
@@ -604,8 +622,7 @@ def test_verifier_force_cancellation_kills_process_group_without_grace(
         if result is not None:
             assert result.status is VerificationStatus.CANCELLED
         assert elapsed < 0.5
-        with pytest.raises(ProcessLookupError):
-            os.kill(child_pid, 0)
+        _wait_for_process_exit(child_pid)
     finally:
         if child_pid is None and (workspace / "child-pid").exists():
             child_pid = int((workspace / "child-pid").read_text())

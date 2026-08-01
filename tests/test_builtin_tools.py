@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -93,6 +94,32 @@ def test_registry_rejects_cross_source_replace():
         )
 
 
+def test_file_tool_schemas_are_rooted_and_closed(tmp_path):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+
+    for name in ("read_file", "write_file", "edit_file", "list_files"):
+        schema = registry._tools[name].parameters
+        assert schema["additionalProperties"] is False, name
+        assert schema["properties"]["root"]["enum"] == ["workspace", "output_dir"]
+
+    read_schema = registry._tools["read_file"].parameters
+    assert "max_bytes" not in read_schema["properties"]
+    assert "path" in read_schema["required"]
+    assert "edit_file" in registry.list_tools()
+
+    write_schema = registry._tools["write_file"].parameters
+    assert set(write_schema["required"]) == {"root", "path", "mode", "content"}
+    assert write_schema["properties"]["mode"]["enum"] == ["create", "overwrite"]
+
+    edit_schema = registry._tools["edit_file"].parameters
+    assert set(edit_schema["required"]) == {
+        "root",
+        "path",
+        "expected_revision",
+        "replacements",
+    }
+
+
 def test_registry_call_sanitizes_exceptions():
     from agent import ToolRegistry
 
@@ -164,27 +191,33 @@ def test_list_installed_plugins_counts_only_listed_user_plugins(tmp_path, monkey
     ]
 
 
-def test_read_file_truncates_large_content(tmp_path):
+def test_read_file_returns_bounded_window_and_revision(tmp_path):
     tools, _, workspace = make_builtin_tools(tmp_path)
     path = workspace / "large.txt"
-    path.write_text("abcdefghij", encoding="utf-8")
+    path.write_text("\n".join(f"line{i}" for i in range(10)) + "\n", encoding="utf-8")
 
-    result = tools._read_file(str(path), max_bytes=4)
+    result = tools._read_file(
+        root="workspace", path="large.txt", start_line=3, line_count=2
+    )
 
     assert result["ok"] is True
-    assert result["content"] == "abcd"
-    assert result["truncated"] is True
+    assert result["path"] == "large.txt"
+    assert result["content"] == "line2\nline3\n"
+    assert result["start_line"] == 3
+    assert result["end_line"] == 4
+    assert result["next_start_line"] == 5
+    assert result["total_lines"] == 10
+    assert result["revision"].startswith("sha256:")
 
 
-def test_read_file_rejects_binary_content(tmp_path):
+def test_read_file_rejects_invalid_utf8_content(tmp_path):
     tools, _, workspace = make_builtin_tools(tmp_path)
-    path = workspace / "binary.bin"
-    path.write_bytes(b"\x00\x01\x02abc")
+    (workspace / "binary.bin").write_bytes(b"\x00\x01\x02abc")
 
-    result = tools._read_file(str(path))
+    result = tools._read_file(root="workspace", path="binary.bin")
 
     assert result["ok"] is False
-    assert "binary" in result["error"].lower()
+    assert result["error"]["code"] == "unsupported_encoding"
 
 
 def test_list_files_respects_recursive_and_max_results(tmp_path):
@@ -198,17 +231,37 @@ def test_list_files_respects_recursive_and_max_results(tmp_path):
     (nested / "c.txt").write_text("c", encoding="utf-8")
 
     flat = tools._list_files(
-        str(root), pattern="*.txt", recursive=False, max_results=10
+        root="workspace",
+        path="files",
+        pattern="*.txt",
+        recursive=False,
+        max_results=10,
     )
     recursive = tools._list_files(
-        str(root), pattern="*.txt", recursive=True, max_results=2
+        root="workspace",
+        path="files",
+        pattern="*.txt",
+        recursive=True,
+        max_results=2,
     )
 
     assert flat["ok"] is True
-    assert all("nested/c.txt" not in item for item in flat["items"])
+    assert all(item["path"] != "files/nested/c.txt" for item in flat["items"])
     assert recursive["ok"] is True
     assert len(recursive["items"]) == 2
     assert recursive["truncated"] is True
+    assert recursive["next_cursor"] is not None
+
+    resumed = tools._list_files(
+        root="workspace",
+        path="files",
+        pattern="*.txt",
+        recursive=True,
+        max_results=2,
+        cursor=recursive["next_cursor"],
+    )
+    assert resumed["ok"] is True
+    assert [item["path"] for item in resumed["items"]] == ["files/nested/c.txt"]
 
 
 def test_read_file_rejects_paths_outside_workspace(tmp_path):
@@ -216,10 +269,10 @@ def test_read_file_rejects_paths_outside_workspace(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("secret", encoding="utf-8")
 
-    result = tools._read_file(str(outside))
+    result = tools._read_file(root="workspace", path=str(outside))
 
     assert result["ok"] is False
-    assert "outside the workspace" in result["error"].lower()
+    assert result["error"]["code"] == "invalid_path"
 
 
 def test_read_file_allows_text_files_in_output_dir(tmp_path):
@@ -227,25 +280,11 @@ def test_read_file_allows_text_files_in_output_dir(tmp_path):
     artifact = output / "result.txt"
     artifact.write_text("generated", encoding="utf-8")
 
-    result = tools._read_file(str(artifact))
+    result = tools._read_file(root="output_dir", path="result.txt")
 
     assert result["ok"] is True
-    assert result["path"] == str(artifact.resolve())
+    assert result["path"] == "result.txt"
     assert result["content"] == "generated"
-
-
-def test_read_file_returns_binary_metadata_for_output_dir_artifacts(tmp_path):
-    tools, _, _workspace, output = make_builtin_tools_with_output_dir(tmp_path)
-    artifact = output / "phoenix_fire.jpeg"
-    artifact.write_bytes(b"\xff\xd8\xff\x00fakejpeg")
-
-    result = tools._read_file(str(artifact))
-
-    assert result["ok"] is True
-    assert result["path"] == str(artifact.resolve())
-    assert result["binary"] is True
-    assert result["content"] == ""
-    assert "generated artifact" in result["message"]
 
 
 def test_list_files_allows_output_dir(tmp_path):
@@ -253,42 +292,346 @@ def test_list_files_allows_output_dir(tmp_path):
     artifact = output / "phoenix_fire.jpeg"
     artifact.write_bytes(b"fake")
 
-    result = tools._list_files(str(output))
+    result = tools._list_files(root="output_dir", path=".")
 
     assert result["ok"] is True
-    assert str(artifact.resolve()) in result["items"]
+    assert [item["path"] for item in result["items"]] == ["phoenix_fire.jpeg"]
 
 
 def test_write_file_rejects_paths_outside_workspace(tmp_path):
     tools, _, _workspace = make_builtin_tools(tmp_path)
     outside = tmp_path / "outside.txt"
 
-    result = tools._write_file(str(outside), "secret")
+    result = tools._write_file(
+        root="workspace", path=str(outside), mode="create", content="secret"
+    )
 
     assert result["ok"] is False
-    assert "outside the workspace" in result["error"].lower()
+    assert result["error"]["code"] == "invalid_path"
 
 
-def test_write_file_redirects_workspace_paths_to_output_dir(tmp_path):
+def test_write_file_explicit_output_dir(tmp_path):
     tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
 
-    result = tools._write_file(str(workspace / "report.md"), "generated")
+    result = tools._write_file(
+        root="output_dir",
+        path="report.md",
+        mode="create",
+        content="generated",
+    )
 
     assert result["ok"] is True
-    assert Path(result["path"]) == (output_dir / "report.md").resolve()
+    assert result["path"] == "report.md"
     assert not (workspace / "report.md").exists()
     assert (output_dir / "report.md").read_text(encoding="utf-8") == "generated"
 
 
 def test_write_file_allows_scoped_workspace_write(tmp_path):
-    tools, reg, workspace, _output_dir = make_builtin_tools_with_output_dir(tmp_path)
-    reg.set_context("write_scope", ["src/app.py"])
+    from agent import BuiltinTools, MemoryPalace, ToolRegistry
+    from agent.tools.files import FileAccessPolicy, FileService
 
-    result = tools._write_file("src/app.py", "print('ok')\n")
+    registry = ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "agent-output"
+    output.mkdir()
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    policy = FileAccessPolicy.from_config(
+        {"workspace": {"read": True, "write": True}},
+        workspace_root=workspace,
+        output_root=output,
+    )
+    service = FileService(policy, write_scope=["src/app.py"])
+    tools = BuiltinTools(
+        memory=memory,
+        registry=registry,
+        workspace_root=workspace,
+        output_dir=output,
+        file_service=service,
+    )
+
+    result = tools._write_file(
+        root="workspace",
+        path="src/app.py",
+        mode="create",
+        content="print('ok')\n",
+    )
 
     assert result["ok"] is True
-    assert Path(result["path"]) == (workspace / "src" / "app.py").resolve()
+    assert result["path"] == "src/app.py"
     assert (workspace / "src" / "app.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+    forbidden = tools._write_file(
+        root="workspace",
+        path="other.txt",
+        mode="create",
+        content="x",
+    )
+    assert forbidden["error"]["code"] == "access_denied"
+
+
+def test_registry_round_trip_create_edit_read(tmp_path):
+    tools, registry, _workspace, output = make_builtin_tools_with_output_dir(tmp_path)
+
+    created = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {
+                    "root": "output_dir",
+                    "path": "note.txt",
+                    "mode": "create",
+                    "content": "alpha\nbeta\n",
+                },
+            )
+        )
+    )
+    assert created["ok"] is True
+
+    read = json.loads(
+        asyncio.run(
+            registry.call(
+                "read_file",
+                {"root": "output_dir", "path": "note.txt"},
+            )
+        )
+    )
+    assert read["content"] == "alpha\nbeta\n"
+
+    edited = json.loads(
+        asyncio.run(
+            registry.call(
+                "edit_file",
+                {
+                    "root": "output_dir",
+                    "path": "note.txt",
+                    "expected_revision": read["revision"],
+                    "replacements": [
+                        {"old_text": "beta", "new_text": "gamma", "expected_count": 1}
+                    ],
+                },
+            )
+        )
+    )
+    assert edited["ok"] is True
+    assert (output / "note.txt").read_text(encoding="utf-8") == "alpha\ngamma\n"
+
+
+def test_tool_schema_validation_rejects_invalid_inputs(tmp_path):
+    tools, registry, workspace = make_builtin_tools(tmp_path)
+    (workspace / "a.txt").write_text("x", encoding="utf-8")
+
+    missing = json.loads(
+        asyncio.run(registry.call("read_file", {"root": "workspace"}))
+    )
+    assert missing["error"]["code"] == "invalid_request"
+    assert "missing required field: path" in missing["error"]["message"]
+
+    unknown = json.loads(
+        asyncio.run(
+            registry.call(
+                "read_file",
+                {"root": "workspace", "path": "a.txt", "bogus": 1},
+            )
+        )
+    )
+    assert unknown["error"]["code"] == "invalid_request"
+    assert "unknown field" in unknown["error"]["message"]
+
+    wrong_type = json.loads(
+        asyncio.run(
+            registry.call(
+                "read_file",
+                {"root": "workspace", "path": "a.txt", "start_line": "1"},
+            )
+        )
+    )
+    assert wrong_type["error"]["code"] == "invalid_request"
+
+    bad_enum = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {"root": "bogus", "path": "a.txt", "mode": "create", "content": "x"},
+            )
+        )
+    )
+    assert bad_enum["error"]["code"] == "invalid_request"
+
+
+def test_tool_schema_validation_no_coercion_and_integer_bounds():
+    from agent import ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(
+        "bounded",
+        "bounded tool",
+        {
+            "type": "object",
+            "properties": {"n": {"type": "integer", "minimum": 1}},
+            "required": ["n"],
+        },
+        lambda n: {"ok": True, "n": n},
+    )
+
+    coerced = json.loads(asyncio.run(registry.call("bounded", {"n": "5"})))
+    assert coerced["error"]["code"] == "invalid_request"
+
+    below = json.loads(asyncio.run(registry.call("bounded", {"n": 0})))
+    assert below["error"]["code"] == "invalid_request"
+
+    ok = json.loads(asyncio.run(registry.call("bounded", {"n": 5})))
+    assert ok == {"ok": True, "n": 5}
+
+
+def test_schema_validation_runs_before_authorizer_and_handler():
+    from agent import ToolRegistry
+
+    calls = []
+
+    def authorizer(tool_input, registry):
+        calls.append(("authorizer", tool_input))
+        return None
+
+    registry = ToolRegistry()
+    registry.register(
+        "guarded",
+        "guarded tool",
+        {
+            "type": "object",
+            "properties": {"n": {"type": "integer"}},
+            "required": ["n"],
+            "additionalProperties": False,
+        },
+        lambda n: calls.append(("handler", n)) or {"ok": True},
+        authorizer=authorizer,
+    )
+
+    invalid = json.loads(asyncio.run(registry.call("guarded", {"n": "bad"})))
+    assert invalid["error"]["code"] == "invalid_request"
+    assert calls == []
+
+    valid = json.loads(asyncio.run(registry.call("guarded", {"n": 3})))
+    assert valid == {"ok": True}
+    assert calls == [("authorizer", {"n": 3}), ("handler", 3)]
+
+
+def test_authorizer_denial_is_returned_unchanged():
+    from agent import ToolRegistry
+
+    denial = {
+        "ok": False,
+        "error": {
+            "code": "access_denied",
+            "message": "blocked by authorizer",
+            "details": {"reason": "test"},
+            "retryable": False,
+        },
+    }
+
+    def authorizer(tool_input, registry):
+        return denial
+
+    registry = ToolRegistry()
+    registry.register(
+        "guarded",
+        "guarded tool",
+        {"type": "object", "properties": {}},
+        lambda: {"ok": True},
+        authorizer=authorizer,
+    )
+
+    result = json.loads(asyncio.run(registry.call("guarded", {})))
+    assert result == denial
+
+
+def test_file_mutation_authorizer_allows_output_dir_for_read_only(tmp_path):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("capability_profile", "read_only")
+
+    output_write = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {"root": "output_dir", "path": "a.txt", "mode": "create", "content": "x"},
+            )
+        )
+    )
+    assert output_write["ok"] is True
+
+    workspace_write = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {"root": "workspace", "path": "a.txt", "mode": "create", "content": "x"},
+            )
+        )
+    )
+    assert workspace_write["error"]["code"] == "access_denied"
+
+
+def test_file_mutation_authorizer_enforces_implementation_scope(tmp_path):
+    from agent import BuiltinTools, MemoryPalace, ToolRegistry
+    from agent.tools.files import FileAccessPolicy, FileService
+
+    registry = ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    policy = FileAccessPolicy.from_config(
+        {"workspace": {"read": True, "write": True}},
+        workspace_root=workspace,
+        output_root=output,
+    )
+    service = FileService(
+        policy,
+        write_scope=lambda: registry.get_context("write_scope") or (),
+    )
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    BuiltinTools(
+        memory,
+        registry,
+        workspace_root=workspace,
+        output_dir=output,
+        file_service=service,
+    )
+    registry.set_context("file_access_policy", policy)
+    registry.set_context("capability_profile", "implementation")
+    registry.set_context("write_scope", ["src/app.py"])
+
+    inside = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {
+                    "root": "workspace",
+                    "path": "src/app.py",
+                    "mode": "create",
+                    "content": "print('x')\n",
+                },
+            )
+        )
+    )
+    assert inside["ok"] is True
+    assert (workspace / "src" / "app.py").read_text() == "print('x')\n"
+
+    outside = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {"root": "workspace", "path": "other.txt", "mode": "create", "content": "x"},
+            )
+        )
+    )
+    assert outside["error"]["code"] == "access_denied"
+    assert "write scope" in outside["error"]["message"]
 
 
 def test_registry_call_returns_structured_builtin_payloads(tmp_path):
@@ -296,11 +639,13 @@ def test_registry_call_returns_structured_builtin_payloads(tmp_path):
     path = workspace / "note.txt"
     path.write_text("hello", encoding="utf-8")
 
-    result = asyncio.run(registry.call("read_file", {"path": str(path)}))
+    result = asyncio.run(
+        registry.call("read_file", {"root": "workspace", "path": "note.txt"})
+    )
     payload = json.loads(result)
 
     assert payload["ok"] is True
-    assert payload["path"] == str(path.resolve())
+    assert payload["path"] == "note.txt"
     assert payload["content"] == "hello"
 
 
@@ -432,7 +777,7 @@ def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
         async def communicate(self):
             return (b"", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
     async def fake_terminate(self, proc):
@@ -443,7 +788,7 @@ def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
         raise asyncio.TimeoutError()
 
     monkeypatch.setattr(
-        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
     monkeypatch.setattr(
@@ -468,13 +813,13 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
         async def communicate(self):
             return (b"ok", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
         captured["env"] = kwargs.get("env")
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
     monkeypatch.setattr(
-        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
     result = asyncio.run(tools._shell("echo ok", timeout=1))
@@ -498,13 +843,13 @@ def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch)
         async def communicate(self):
             return (b"ok", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
         captured["cwd"] = kwargs.get("cwd")
         captured["env"] = kwargs.get("env")
         return FakeProc()
 
     monkeypatch.setattr(
-        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
     result = asyncio.run(tools._shell("echo ok", timeout=1))
@@ -525,11 +870,13 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
         async def communicate(self):
             return (b"ok", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
 
     result = asyncio.run(
         tools._shell("echo ok", timeout=1, cwd=str(output_dir))
@@ -539,33 +886,42 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
     assert captured["cwd"] == str(output_dir.resolve())
 
 
-def test_shell_moves_new_workspace_files_to_output_dir(tmp_path):
+def test_shell_blocks_workspace_write_by_default(tmp_path):
+    from agent.security.filesystem_sandbox import detect_sandbox_support
+
     tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
-    script = workspace / "make_report.py"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "from pathlib import Path\n"
-        "Path('report.html').write_text('generated', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    script.chmod(0o755)
+    (workspace / "a.txt").write_text("keep", encoding="utf-8")
 
     result = asyncio.run(
-        tools._shell("./make_report.py", timeout=1, cwd=str(workspace))
+        tools._shell(f"touch {workspace}/new.txt", timeout=10)
     )
 
-    moved = result["moved_artifacts"]
+    assert not (workspace / "new.txt").exists()
+    if detect_sandbox_support() is not None:
+        # On an enforcing platform the sandbox denies the write inside the
+        # child process; on unsupported platforms shell fails closed earlier.
+        assert result["exit_code"] != 0
+        assert not result["ok"] or "Operation not permitted" in result["output"]
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork"),
+    reason="requires POSIX process groups",
+)
+def test_shell_allows_output_dir_writes(tmp_path):
+    from agent.security.filesystem_sandbox import detect_sandbox_support
+
+    if detect_sandbox_support() is None:
+        pytest.skip("requires an enforcing filesystem sandbox")
+    tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
+
+    result = asyncio.run(
+        tools._shell(f"touch {output_dir}/made.txt", timeout=10)
+    )
+
     assert result["ok"] is True
-    assert len(moved) == 1
-    assert moved[0]["from"] == str((workspace / "report.html").resolve())
-    assert Path(moved[0]["to"]) == (
-        output_dir / "workspace-artifacts" / "report.html"
-    ).resolve()
-    assert not (workspace / "report.html").exists()
-    assert (workspace / "make_report.py").exists()
-    assert (
-        output_dir / "workspace-artifacts" / "report.html"
-    ).read_text(encoding="utf-8") == "generated"
+    assert result["exit_code"] == 0
+    assert (output_dir / "made.txt").exists()
 
 
 def test_shell_returns_confirmation_request_for_restricted_command(tmp_path):
@@ -630,11 +986,13 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
         async def communicate(self):
             return (b"ok", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
-        captured["command"] = args[0]
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["argv"] = args
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
 
     scope = ShellAuthorizationScope("session-1", "feishu", "user-1")
     assert shell_command_confirm(first["confirmation_token"], scope=scope) is True
@@ -645,7 +1003,8 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
         _active_agent_context.reset(active)
 
     assert result["ok"] is True
-    assert captured["command"] == "mv a b"
+    assert captured["argv"][-3:] == ("/bin/sh", "-c", "mv a b")
+    assert captured["argv"][0].endswith("sandbox-exec")
 
 
 def test_shell_rejects_model_supplied_confirmation_token(tmp_path):

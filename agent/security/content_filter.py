@@ -210,6 +210,55 @@ class ContentFilter:
 
 # ── Tool result summarization ────────────────────────────────────────────────
 
+# Metadata allowlists for built-in file service results.  Bodies (read content,
+# listed items, replacement text) are dropped; the fields the agent needs to
+# continue safely (revisions, ranges, cursors, statistics) are preserved.
+_STRUCTURED_FILE_SUMMARY_FIELDS: dict[str, tuple[str, ...]] = {
+    "read_file": (
+        "root",
+        "path",
+        "revision",
+        "start_line",
+        "end_line",
+        "total_lines",
+        "next_start_line",
+        "size_bytes",
+        "returned_bytes",
+        "encoding",
+        "bom",
+        "newline",
+    ),
+    "write_file": (
+        "root",
+        "path",
+        "mode",
+        "old_revision",
+        "new_revision",
+        "old_size_bytes",
+        "new_size_bytes",
+        "byte_delta",
+    ),
+    "edit_file": (
+        "root",
+        "path",
+        "mode",
+        "old_revision",
+        "new_revision",
+        "old_size_bytes",
+        "new_size_bytes",
+        "byte_delta",
+        "replacement_count",
+        "replaced_occurrences",
+    ),
+    "list_files": (
+        "root",
+        "path",
+        "count",
+        "truncated",
+        "next_cursor",
+    ),
+}
+
 
 def _truncate_text(text: str, limit: int = 200) -> str:
     """Truncate text at a word/sentence boundary near limit."""
@@ -242,12 +291,27 @@ def summarize_tool_result(
     raw = str(raw_result or "")
     try:
         data = json.loads(raw)
-        ok = data.get("ok", True)
-        if not ok:
-            err = data.get("error", "unknown error")
-            return json.dumps({"ok": False, "error": err, "summarized": True})
     except Exception:
-        pass
+        data = None
+
+    if isinstance(data, dict):
+        # Structured file-service envelopes get metadata-preserving summaries
+        # before any generic truncation applies.
+        if data.get("ok") is False:
+            err = data.get("error", "unknown error")
+            summary: dict[str, Any] = {"ok": False, "summarized": True}
+            if isinstance(err, dict):
+                # Preserve the stable error code/details/retryability envelope.
+                summary["error"] = dict(err)
+            else:
+                summary["error"] = err
+            return json.dumps(summary, ensure_ascii=False)
+        if data.get("ok") is True and tool_name in _STRUCTURED_FILE_SUMMARY_FIELDS:
+            summary = {"ok": True, "summarized": True}
+            for field in _STRUCTURED_FILE_SUMMARY_FIELDS[tool_name]:
+                if field in data:
+                    summary[field] = data[field]
+            return json.dumps(summary, ensure_ascii=False)
 
     # Per-tool summarization strategies
     def preview_payload(raw_text: str, limit: int) -> dict[str, Any]:

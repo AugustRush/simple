@@ -21,7 +21,19 @@ from agent import shared
 from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
 from agent.security.network import fetch_public_http_url
+from agent.security.filesystem_sandbox import (
+    SandboxUnavailableError,
+    ShellSandboxRequest,
+    build_sandbox_command,
+    new_scratch_dir,
+)
 from agent.security.shell import shell_command_uses_shell_features
+from agent.tools.files import (
+    FileAccessPolicy,
+    FileService,
+    _normalize_write_scope,
+    write_scope_allows,
+)
 
 from .executor import report_tool_progress
 from .runtime import ToolRegistry
@@ -29,9 +41,6 @@ from .runtime import ToolRegistry
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
-TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
-TOOL_DEFAULT_MAX_LIST_RESULTS = 100
 _atomic_write_text = shared._atomic_write_text
 
 WEB_FETCH_MAX_BYTES = 512 * 1024
@@ -85,6 +94,7 @@ class BuiltinTools:
         workspace_root: Optional[Path] = None,
         chapter_normalizer: Optional[Callable[[str], str]] = None,
         output_dir: Optional[Path] = None,
+        file_service: Optional[FileService] = None,
     ):
         self.memory = memory
         self.registry = registry
@@ -92,6 +102,21 @@ class BuiltinTools:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.chapter_normalizer = chapter_normalizer or (lambda chapter: str(chapter))
         self._output_dir = output_dir
+        if file_service is not None:
+            self._file_service = file_service
+        else:
+            # Default policy mirrors the startup defaults: a readable,
+            # non-writable workspace plus an always-usable output_dir.
+            # The write_scope is resolved per call from the active registry
+            # context so sub-agent scopes apply even though the policy is
+            # immutable.
+            self._file_service = FileService(
+                FileAccessPolicy(
+                    workspace_root=self.workspace_root,
+                    output_root=self._process_output_dir(),
+                ),
+                write_scope=lambda: self.registry.get_context("write_scope") or (),
+            )
         self._cached_schedule_store: Any = None
         self._register()
 
@@ -171,21 +196,33 @@ class BuiltinTools:
 
         r.register(
             "read_file",
-            "Read the contents of a file.",
+            "Read a bounded line window of a UTF-8 text file. Returns an exact sha256 revision of the file; pass that revision back as expected_revision to write_file or edit_file before mutating. Use root=workspace for repository files and root=output_dir for generated artifacts.",
             {
                 "type": "object",
                 "properties": {
+                    "root": {
+                        "type": "string",
+                        "enum": ["workspace", "output_dir"],
+                        "description": "Security domain (default workspace)",
+                        "default": "workspace",
+                    },
                     "path": {
                         "type": "string",
-                        "description": "Absolute or relative file path",
+                        "description": "Root-relative file path",
                     },
-                    "max_bytes": {
+                    "start_line": {
                         "type": "integer",
-                        "description": "Maximum bytes to read before truncating",
-                        "default": TOOL_DEFAULT_MAX_READ_BYTES,
+                        "description": "One-based first line to return (default 1)",
+                        "default": 1,
+                    },
+                    "line_count": {
+                        "type": "integer",
+                        "description": "Maximum number of complete lines to return (default 200)",
+                        "default": 200,
                     },
                 },
                 "required": ["path"],
+                "additionalProperties": False,
             },
             self._read_file,
             source="builtin",
@@ -193,21 +230,32 @@ class BuiltinTools:
 
         r.register(
             "write_file",
-            "Write content to a file (creates or overwrites).",
+            "Atomically create or overwrite a whole UTF-8 text file under an explicit root. mode=create requires the target to be absent; mode=overwrite requires the exact expected_revision from read_file and preserves the file mode and UTF-8 BOM.",
             {
                 "type": "object",
                 "properties": {
+                    "root": {
+                        "type": "string",
+                        "enum": ["workspace", "output_dir"],
+                        "description": "Security domain: workspace requires startup write enablement plus write_scope; output_dir is always writable",
+                    },
                     "path": {"type": "string", "description": "File path"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["create", "overwrite"],
+                        "description": "create fails if the target exists; overwrite requires expected_revision",
+                    },
                     "content": {"type": "string", "description": "Content to write"},
-                    "max_bytes": {
-                        "type": "integer",
-                        "description": "Maximum payload size accepted by the tool",
-                        "default": TOOL_DEFAULT_MAX_WRITE_BYTES,
+                    "expected_revision": {
+                        "type": "string",
+                        "description": "Required for overwrite: the revision returned by a previous read_file",
                     },
                 },
-                "required": ["path", "content"],
+                "required": ["root", "path", "mode", "content"],
+                "additionalProperties": False,
             },
             self._write_file,
+            authorizer=self._file_mutation_authorizer,
             source="builtin",
         )
 
@@ -256,32 +304,84 @@ class BuiltinTools:
 
         r.register(
             "list_files",
-            "List files in a directory.",
+            "List entries under an explicit root with bounded, deterministic results and an opaque cursor for continuation. Never follows symlinks.",
             {
                 "type": "object",
                 "properties": {
+                    "root": {
+                        "type": "string",
+                        "enum": ["workspace", "output_dir"],
+                        "description": "Security domain (default workspace)",
+                        "default": "workspace",
+                    },
                     "path": {
                         "type": "string",
-                        "description": "Directory path (default: current dir)",
+                        "description": "Root-relative directory path (default: .)",
+                        "default": ".",
                     },
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern (default: *)",
+                        "description": "Basename glob pattern with no path separator (default: *)",
+                        "default": "*",
                     },
                     "recursive": {
                         "type": "boolean",
                         "description": "Whether to recurse into subdirectories",
                         "default": False,
                     },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Opaque continuation token from a previous truncated listing; must be used with identical request parameters",
+                    },
                     "max_results": {
                         "type": "integer",
                         "description": "Maximum number of paths to return",
-                        "default": TOOL_DEFAULT_MAX_LIST_RESULTS,
+                        "default": 1000,
                     },
                 },
                 "required": [],
+                "additionalProperties": False,
             },
             self._list_files,
+            source="builtin",
+        )
+
+        r.register(
+            "edit_file",
+            "Apply an ordered batch of exact, non-overlapping text replacements to one snapshot revision. Every replacement must declare the exact expected occurrence count; any mismatch leaves the file byte-for-byte unchanged. Preserves the original BOM, mode, and all bytes outside replaced spans.",
+            {
+                "type": "object",
+                "properties": {
+                    "root": {
+                        "type": "string",
+                        "enum": ["workspace", "output_dir"],
+                        "description": "Security domain: workspace requires startup write enablement plus write_scope; output_dir is always writable",
+                    },
+                    "path": {"type": "string", "description": "Root-relative file path"},
+                    "expected_revision": {
+                        "type": "string",
+                        "description": "Exact revision returned by a previous read_file",
+                    },
+                    "replacements": {
+                        "type": "array",
+                        "description": "Ordered exact replacements; each later replacement may match text inserted by an earlier one",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"},
+                                "expected_count": {"type": "integer"},
+                            },
+                            "required": ["old_text", "new_text", "expected_count"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["root", "path", "expected_revision", "replacements"],
+                "additionalProperties": False,
+            },
+            self._edit_file,
+            authorizer=self._file_mutation_authorizer,
             source="builtin",
         )
 
@@ -408,6 +508,7 @@ class BuiltinTools:
                     "prompt": {
                         "type": "string",
                         "description": "Backward-compatible content field. Defaults to a literal message unless action_type=agent_task.",
+                        "default": "",
                     },
                     "action_type": {
                         "type": "string",
@@ -455,7 +556,7 @@ class BuiltinTools:
                         "description": "optional override: standalone or channel",
                     },
                 },
-                "required": ["name", "trigger_type", "prompt"],
+                "required": ["name", "trigger_type"],
             },
             self._schedule_create,
             source="builtin",
@@ -1119,6 +1220,53 @@ class BuiltinTools:
     def _error(self, message: str, **payload: Any) -> dict[str, Any]:
         return {"ok": False, "error": message, **payload}
 
+    def _file_mutation_authorizer(
+        self,
+        tool_input: dict[str, Any],
+        registry: ToolRegistry,
+    ) -> dict[str, Any] | None:
+        """Call-aware authorization for root-dependent file mutations.
+
+        ``write_file``/``edit_file`` carry the base ``output_write``
+        capability and are available in every Agent profile for
+        ``output_dir``.  A workspace target additionally requires the
+        ``workspace_write`` capability (implementation profile with an
+        explicit write_scope), the startup workspace write switch, and
+        containment in the effective write scope.
+        """
+        if tool_input.get("root") != "workspace":
+            return None
+        profile = registry.get_context("capability_profile")
+        if profile is not None and profile != "full":
+            if profile != "implementation":
+                return self._structured_access_denied(
+                    "workspace writes require the workspace_write capability"
+                )
+            scope = registry.get_context("write_scope") or ()
+            path = tool_input.get("path", "")
+            if not write_scope_allows(scope, path):
+                return self._structured_access_denied(
+                    f"path is outside the effective write scope: {path}"
+                )
+        policy = registry.get_context("file_access_policy")
+        if policy is not None and not policy.workspace_write:
+            return self._structured_access_denied(
+                "workspace writes are disabled by the file access policy"
+            )
+        return None
+
+    @staticmethod
+    def _structured_access_denied(message: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error": {
+                "code": "access_denied",
+                "message": message,
+                "details": {},
+                "retryable": False,
+            },
+        }
+
     def _resolve_tool_path(self, path: str) -> tuple[Path, str]:
         return resolve_workspace_path(
             path,
@@ -1154,69 +1302,6 @@ class BuiltinTools:
             self._process_output_dir(),
             path.expanduser().resolve(strict=False),
         )
-
-    def _has_write_scope(self) -> bool:
-        return bool(self.registry.get_context("write_scope") or [])
-
-    def _ensure_within_write_scope(self, path: Path) -> None:
-        scope_entries = self.registry.get_context("write_scope") or []
-        if not scope_entries:
-            return
-        allowed: list[str] = []
-        for entry in scope_entries:
-            scope_path = (
-                self.workspace_root / Path(str(entry)).expanduser()
-            ).resolve(strict=False)
-            if not self._path_is_inside_workspace(scope_path):
-                scope_path, _root_kind = self._resolve_output_path(str(entry))
-            allowed.append(str(scope_path))
-            if path_contains(scope_path, path):
-                return
-        raise ValueError(
-            f"Path '{path}' is outside the sub-agent write scope. "
-            f"Allowed paths: {', '.join(allowed)}"
-        )
-
-    def _scoped_workspace_write_path(self, path: str) -> Path | None:
-        """Return a workspace path when an explicit write_scope allows it."""
-        if not self._has_write_scope():
-            return None
-        try:
-            candidate = (self.workspace_root / Path(path).expanduser()).resolve(
-                strict=False
-            )
-        except ValueError:
-            return None
-        if not self._path_is_inside_workspace(candidate):
-            return None
-        try:
-            self._ensure_within_write_scope(candidate)
-        except ValueError:
-            return None
-        return candidate
-
-    def _resolve_write_file_path(self, path: str) -> tuple[Path, str]:
-        """Resolve write_file targets without polluting the workspace.
-
-        For normal assistant-generated files, even workspace-looking absolute
-        paths are redirected to the output directory. Scoped implementation
-        sub-agents keep explicit workspace writes so code-editing workflows can
-        still target project files deliberately.
-        """
-        candidate = Path(path).expanduser()
-        scoped_workspace_path = self._scoped_workspace_write_path(path)
-        if scoped_workspace_path is not None:
-            return scoped_workspace_path, "workspace"
-        if candidate.is_absolute() and self._path_is_inside_output_dir(candidate):
-            return self._resolve_output_path(path)
-
-        output_dir = self._process_output_dir()
-        if candidate.is_absolute() and self._path_is_inside_workspace(candidate):
-            relative = candidate.resolve(strict=False).relative_to(
-                self.workspace_root.expanduser().resolve(strict=False)
-            )
-            return self._resolve_output_path(str(relative))
-        return self._resolve_output_path(path)
 
     def _workspace_file_snapshot(self) -> set[Path]:
         """Return files currently in the workspace, ignoring agent outputs."""
@@ -1371,19 +1456,59 @@ class BuiltinTools:
                 risk_level=safety.risk_level,
             )
 
+        # The same immutable file policy governs shell descendants.  The
+        # sandbox is an OS-level boundary; the pre/post snapshot moving below
+        # is not an authorization mechanism.
+        file_policy = self.registry.get_context("file_access_policy")
+        workspace_read = file_policy.workspace_read if file_policy is not None else True
+        workspace_write = (
+            file_policy.workspace_write if file_policy is not None else False
+        )
+        write_scope = _normalize_write_scope(
+            self.registry.get_context("write_scope") or ()
+        )
+        resolved_cwd = sandbox_dir
+        if cwd:
+            resolved_cwd, _root_kind = self._resolve_output_path(cwd)
+        if not workspace_read and self._path_is_inside_workspace(resolved_cwd):
+            return self._error(
+                "Workspace cwd is not allowed when workspace reads are disabled",
+                command=command,
+                sandbox_unavailable=True,
+            )
+        try:
+            scratch_dir = new_scratch_dir(output_dir)
+            sandbox = build_sandbox_command(
+                ShellSandboxRequest(
+                    workspace_root=self.workspace_root,
+                    output_root=output_dir,
+                    workspace_read=workspace_read,
+                    workspace_write=workspace_write,
+                    write_scope=write_scope,
+                    scratch_dir=scratch_dir,
+                )
+            )
+        except SandboxUnavailableError as exc:
+            return self._error(
+                str(exc),
+                command=command,
+                sandbox_unavailable=True,
+            )
+
         proc = None
         try:
             env = os.environ.copy()
             env["AGENT_OUTPUT_DIR"] = str(output_dir)
             env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
             env["AGENT_SANDBOX_DIR"] = str(sandbox_dir)
-            resolved_cwd = sandbox_dir
-            if cwd:
-                resolved_cwd, _root_kind = self._resolve_output_path(cwd)
+            env.update(sandbox.env_updates)
             workspace_before: set[Path] | None = None
             if self._path_is_inside_workspace(resolved_cwd):
                 workspace_before = self._workspace_file_snapshot()
-            proc = await asyncio.create_subprocess_shell(
+            proc = await asyncio.create_subprocess_exec(
+                *sandbox.argv_prefix,
+                "/bin/sh",
+                "-c",
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -1644,125 +1769,67 @@ class BuiltinTools:
         except Exception:
             return
 
-    @staticmethod
-    def _is_binary_bytes(chunk: bytes) -> bool:
-        """Heuristic: null bytes suggest binary, but UTF-16/32 are text.
-
-        UTF-16 encodes ASCII as alternating null bytes (e.g. 'A' → 0x41 0x00).
-        We check whether every other byte is null — the hallmark of UTF-16/32.
-        """
-        if b"\x00" not in chunk:
-            return False
-        sample = chunk[:200]  # first 200 bytes is enough to detect the pattern
-        # Check UTF-16 LE (null at odd positions: byte 1, 3, 5, ...)
-        le_nulls = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)
-        # Check UTF-16 BE (null at even positions: byte 0, 2, 4, ...)
-        be_nulls = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)
-        half = max(len(sample) // 2, 1)
-        # If >80% of alternate positions are null, it's UTF-16 text, not binary
-        if le_nulls / half > 0.8 or be_nulls / half > 0.8:
-            return False
-        return True
-
     def _read_file(
-        self, path: str, max_bytes: int = TOOL_DEFAULT_MAX_READ_BYTES
+        self,
+        root: str = "workspace",
+        path: str = "",
+        start_line: int = 1,
+        line_count: Optional[int] = None,
     ) -> dict[str, Any]:
-        try:
-            p, root_kind = self._resolve_tool_path(path)
-            if not p.exists():
-                return self._error(f"'{path}' does not exist", path=str(p))
-            if not p.is_file():
-                return self._error(f"'{path}' is not a regular file", path=str(p))
-            max_bytes = max(1, min(int(max_bytes), TOOL_DEFAULT_MAX_READ_BYTES))
-            with open(p, "rb") as f:
-                chunk = f.read(max_bytes + 1)
-            if self._is_binary_bytes(chunk):
-                if root_kind == "output_dir":
-                    return self._ok(
-                        path=str(p),
-                        content="",
-                        binary=True,
-                        truncated=len(chunk) > max_bytes,
-                        bytes_read=min(len(chunk), max_bytes),
-                        message=(
-                            "Binary generated artifact in output directory; "
-                            "use the path directly or let the channel send the file."
-                        ),
-                    )
-                return self._error(f"'{path}' appears to be binary", path=str(p))
-            text = chunk[:max_bytes].decode("utf-8", errors="replace")
-            return self._ok(
-                path=str(p),
-                content=text,
-                binary=False,
-                truncated=len(chunk) > max_bytes,
-                bytes_read=min(len(chunk), max_bytes),
-            )
-        except ValueError as e:
-            return self._error(str(e))
-        except Exception as e:
-            return self._error(f"Error reading file: {e}")
+        return self._file_service.read_file(
+            root,
+            path,
+            start_line=start_line,
+            line_count=line_count,
+        )
 
     def _write_file(
         self,
+        root: str,
         path: str,
+        mode: str,
         content: str,
-        max_bytes: int = TOOL_DEFAULT_MAX_WRITE_BYTES,
+        expected_revision: Optional[str] = None,
     ) -> dict[str, Any]:
-        try:
-            p, _root_kind = self._resolve_write_file_path(path)
-            self._ensure_within_write_scope(p)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            payload = content.encode("utf-8")
-            max_bytes = max(1, min(int(max_bytes), TOOL_DEFAULT_MAX_WRITE_BYTES))
-            if len(payload) > max_bytes:
-                return self._error(
-                    f"Content size {len(payload)} exceeds limit {max_bytes} bytes",
-                    path=str(p),
-                )
-            tmp = p.with_name(f".{p.name}.{uuid.uuid4().hex}.tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(p)
-            return self._ok(path=str(p), bytes_written=len(payload))
-        except ValueError as e:
-            return self._error(str(e))
-        except Exception as e:
-            return self._error(f"Error writing file: {e}")
+        return self._file_service.write_file(
+            root,
+            path,
+            mode=mode,
+            content=content,
+            expected_revision=expected_revision,
+        )
+
+    def _edit_file(
+        self,
+        root: str,
+        path: str,
+        expected_revision: str,
+        replacements: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return self._file_service.edit_file(
+            root,
+            path,
+            expected_revision=expected_revision,
+            replacements=replacements,
+        )
 
     def _list_files(
         self,
+        root: str = "workspace",
         path: str = ".",
         pattern: str = "*",
         recursive: bool = False,
-        max_results: int = TOOL_DEFAULT_MAX_LIST_RESULTS,
+        cursor: Optional[str] = None,
+        max_results: Optional[int] = None,
     ) -> dict[str, Any]:
-        try:
-            p, _root_kind = self._resolve_tool_path(path)
-            if not p.exists():
-                return self._error(f"'{path}' does not exist", path=str(p))
-            if not p.is_dir():
-                return self._error(f"'{path}' is not a directory", path=str(p))
-            max_results = max(1, min(int(max_results), TOOL_DEFAULT_MAX_LIST_RESULTS))
-            iterator = p.rglob(pattern) if recursive else p.glob(pattern)
-            results = []
-            truncated = False
-            for candidate in iterator:
-                if len(results) >= max_results:
-                    truncated = True
-                    break
-                results.append(str(candidate.resolve()))
-            return self._ok(
-                path=str(p),
-                pattern=pattern,
-                recursive=recursive,
-                items=sorted(results),
-                truncated=truncated,
-                count=len(results),
-            )
-        except ValueError as e:
-            return self._error(str(e))
-        except Exception as e:
-            return self._error(f"Error listing files: {e}")
+        return self._file_service.list_files(
+            root,
+            path,
+            recursive=recursive,
+            pattern=pattern,
+            cursor=cursor,
+            max_results=max_results,
+        )
 
     def _memory_write(
         self, chapter: str, name: str, content: str, append: bool = False

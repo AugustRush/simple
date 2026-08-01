@@ -115,6 +115,19 @@ DEFAULT_CONFIG: dict = {
     "system_prompt_file": None,  # null = use built-in prompt
     # ── Output directory ──────────────────────────────────────────────────
     "output_dir": None,  # null = ~/.agent/output
+    # ── File access policy (startup-only, immutable) ─────────────────────
+    "file_access": {
+        "workspace": {
+            "read": True,
+            "write": False,
+        },
+        "max_read_lines": 400,
+        "max_read_bytes": 65536,
+        "max_snapshot_bytes": 16777216,
+        "max_write_bytes": 4194304,
+        "max_replacements": 100,
+        "max_list_results": 1000,
+    },
 }
 
 
@@ -240,7 +253,7 @@ def _validate_config(cfg: dict) -> list[str]:
         "system_prompt_file", "output_dir", "tavily_api_key",
         "assistant_identity", "shell_blocked_commands",
         "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
-        "max_truncation_continuations",
+        "max_truncation_continuations", "file_access",
     })
 
     # ── Top-level unknown keys ────────────────────────────────────────────
@@ -360,6 +373,7 @@ def load_config() -> tuple[dict, bool]:
             "audio",
             "mcp_servers",
             "context",
+            "file_access",
         ):
             if section not in raw and section in DEFAULT_CONFIG:
                 raw[section] = DEFAULT_CONFIG[section]
@@ -613,11 +627,21 @@ def _compose_system_prompt(
             lines.extend(skill_catalog.summary_lines())
         if workspace_root:
             builtin_names = {n for n, _ in groups["builtin"]}
-            if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
+            if any(
+                n in builtin_names
+                for n in ("read_file", "write_file", "list_files", "edit_file")
+            ):
                 lines.append(
-                    f"Workspace root for read_file/list_files only: {workspace_root}. "
-                    "write_file writes generated files to output_dir by default; "
-                    "workspace writes require an explicit write_scope."
+                    "File tools take an explicit `root` (`workspace` or `output_dir`) "
+                    "and a root-relative `path`; absolute paths and path traversal "
+                    "are rejected. `read_file` returns a bounded line window plus an "
+                    "exact `revision`; pass that revision back as `expected_revision` "
+                    "to `write_file` or `edit_file` before mutating, and reread after "
+                    "any conflict. The workspace is read-only by default and workspace "
+                    "writes additionally require the startup `file_access` policy plus "
+                    "an explicit `write_scope`; `output_dir` is always readable and "
+                    "writable for generated artifacts. The `file_access` configuration "
+                    "is loaded only at startup — changing it requires a restart."
                 )
             if "schedule_create" in builtin_names:
                 lines.append(
@@ -641,11 +665,13 @@ def _compose_system_prompt(
                     else f"{shared.DEFAULT_OUTPUT_DIR}/sandbox"
                 )
                 lines.append(
-                    "Shell commands run in an isolated sandbox directory by default "
+                    "Shell commands run inside an OS filesystem sandbox. The default "
+                    f"cwd is an isolated sandbox directory under output_dir "
                     f"({sandbox_hint}), NOT the workspace root ({workspace_root}). "
-                    "Downloads, clones, and generated artifacts go there automatically. "
-                    "Only set cwd explicitly when you need to operate on workspace files; "
-                    "new files accidentally created in the workspace are moved to output_dir."
+                    "Writes are blocked outside output_dir and the approved workspace "
+                    "write_scope, so downloads, clones, and generated artifacts must "
+                    "use relative paths under the sandbox/output directory. Only set "
+                    "cwd explicitly when you need to operate on workspace files."
                 )
                 lines.append(
                     "Avoid absolute path arguments in shell commands. For current project files, "

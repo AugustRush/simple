@@ -2559,6 +2559,151 @@ def test_orchestration_promotes_only_bounded_session_summary(tmp_path):
     assert entries[0].scope == "session:session-1"
 
 
+def test_compaction_keeps_tool_history_complete_and_stale_edit_requires_reread(
+    tmp_path,
+):
+    import agent as agent_module
+    from agent.security.content_filter import summarize_tool_result
+    from agent.tools.files import (
+        DEFAULT_FILE_ACCESS,
+        FileAccessPolicy,
+        FileService,
+    )
+
+    context_dir = tmp_path / "context"
+    store = agent_module.LTMStore(context_dir=context_dir)
+    manager = agent_module.ContextManager(
+        store=store,
+        retriever=agent_module.LocalRetriever(),
+        consolidation=agent_module.ConsolidationEngine(store=store),
+    )
+
+    read_payload = json.dumps(
+        {
+            "ok": True,
+            "root": "output_dir",
+            "path": "note.txt",
+            "content": "alpha\n" * 300,
+            "revision": "sha256:readrev",
+            "start_line": 1,
+            "end_line": 200,
+            "total_lines": 300,
+            "next_start_line": 201,
+            "size_bytes": 1800,
+            "returned_bytes": 1200,
+            "encoding": "utf-8",
+            "bom": False,
+            "newline": "lf",
+        }
+    )
+    edit_payload = json.dumps(
+        {
+            "ok": True,
+            "root": "output_dir",
+            "path": "note.txt",
+            "mode": "edit",
+            "old_revision": "sha256:readrev",
+            "new_revision": "sha256:editrev",
+            "old_size_bytes": 1800,
+            "new_size_bytes": 1800,
+            "byte_delta": 0,
+            "replacement_count": 1,
+            "replaced_occurrences": 1,
+        }
+    )
+    messages = [
+        {"role": "user", "content": "read and edit note.txt"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-read",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"root": "output_dir", "path": "note.txt"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-read", "content": read_payload},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-edit",
+                    "type": "function",
+                    "function": {
+                        "name": "edit_file",
+                        "arguments": '{"root": "output_dir", "path": "note.txt"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-edit", "content": edit_payload},
+    ]
+
+    compacted = manager.compact_messages(messages, input_token_budget=4000)
+
+    # Tool-call/tool-result pairs stay structurally complete: no kept call is
+    # left without its result, and no result is kept without its call.
+    kept_result_ids = {
+        str(message["tool_call_id"])
+        for message in compacted
+        if message.get("role") == "tool"
+    }
+    kept_call_ids = {
+        str(call["id"])
+        for message in compacted
+        if message.get("role") == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    assert kept_call_ids == kept_result_ids
+
+    # Summarized history still carries the exact revision, and a stale edit
+    # against it must fail, proving reread is required after compaction.
+    read_summary = json.loads(
+        summarize_tool_result("read_file", read_payload)
+    )
+    assert read_summary["revision"] == "sha256:readrev"
+    assert read_summary["next_start_line"] == 201
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    policy = FileAccessPolicy.from_config(
+        DEFAULT_FILE_ACCESS,
+        workspace_root=workspace,
+        output_root=output,
+    )
+    service = FileService(policy)
+    service.write_file("output_dir", "note.txt", mode="create", content="alpha\n")
+    fresh_revision = service.read_file("output_dir", "note.txt")["revision"]
+    service.write_file(
+        "output_dir",
+        "note.txt",
+        mode="overwrite",
+        content="changed\n",
+        expected_revision=fresh_revision,
+    )
+
+    stale = service.edit_file(
+        "output_dir",
+        "note.txt",
+        expected_revision="sha256:readrev",
+        replacements=[
+            {"old_text": "alpha", "new_text": "beta", "expected_count": 1}
+        ],
+    )
+
+    assert stale["ok"] is False
+    assert stale["error"]["code"] == "revision_conflict"
+    assert stale["error"]["retryable"] is True
+
+
 def test_pipeline_respects_max_concurrency():
     from agent.orchestration import SubtaskResult, SubtaskSpec
     from agent.orchestration.runtime import run_pipeline_subtasks
@@ -3311,6 +3456,107 @@ def test_spawn_agent_restricts_subagent_tools_for_read_only_profile(monkeypatch)
     assert observed["tools"] == ["read_file"]
 
 
+def test_read_only_subagent_keeps_output_mutation_tools(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    class _FakeMemory:
+        def write(self, *args, **kwargs):
+            return None
+
+        def read(self, *args, **kwargs):
+            return ""
+
+        def search(self, *args, **kwargs):
+            return []
+
+        def read_index(self):
+            return ""
+
+    registry = agent_module.ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    agent_module.BuiltinTools(
+        _FakeMemory(),
+        registry,
+        workspace_root=workspace,
+        output_dir=output,
+    )
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+
+    observed = {}
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        observed["tools"] = sorted(self.registry.list_tools())
+        write_result = json.loads(
+            await self.registry.call(
+                "write_file",
+                {
+                    "root": "output_dir",
+                    "path": "artifact.txt",
+                    "mode": "create",
+                    "content": "made",
+                },
+            )
+        )
+        observed["revision"] = write_result["new_revision"]
+        observed["write_ok"] = write_result["ok"]
+        observed["edit_ok"] = json.loads(
+            await self.registry.call(
+                "edit_file",
+                {
+                    "root": "output_dir",
+                    "path": "artifact.txt",
+                    "expected_revision": write_result["new_revision"],
+                    "replacements": [
+                        {"old_text": "made", "new_text": "edited", "expected_count": 1}
+                    ],
+                },
+            )
+        )["ok"]
+        workspace_result = json.loads(
+            await self.registry.call(
+                "write_file",
+                {
+                    "root": "workspace",
+                    "path": "forbidden.txt",
+                    "mode": "create",
+                    "content": "blocked",
+                },
+            )
+        )
+        observed["workspace_code"] = workspace_result["error"]["code"]
+        return agent_module.AgentResult(agent_id="sub", content="ok")
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "critic",
+                    "task": "inspect",
+                    "capability_profile": "read_only",
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is True
+    assert "write_file" in observed["tools"]
+    assert "edit_file" in observed["tools"]
+    assert observed["write_ok"] is True
+    assert observed["edit_ok"] is True
+    assert observed["workspace_code"] == "access_denied"
+    assert (output / "artifact.txt").read_text(encoding="utf-8") == "edited"
+    assert not (workspace / "forbidden.txt").exists()
+
+
 def test_spawn_agent_validates_expected_output_contract(monkeypatch):
     import agent as agent_module
 
@@ -3874,6 +4120,7 @@ def test_execute_subtask_spec_passes_expected_output_and_constraints_to_spawn_ag
 
 def test_spawn_agent_enforces_write_scope_for_write_file(monkeypatch, tmp_path):
     import agent as agent_module
+    from agent.tools.files import FileAccessPolicy, FileService
 
     class _FakeMemory:
         def write(self, *args, **kwargs):
@@ -3889,16 +4136,39 @@ def test_spawn_agent_enforces_write_scope_for_write_file(monkeypatch, tmp_path):
             return ""
 
     registry = agent_module.ToolRegistry()
-    agent_module.BuiltinTools(_FakeMemory(), registry, workspace_root=tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    policy = FileAccessPolicy.from_config(
+        {"workspace": {"read": True, "write": True}},
+        workspace_root=workspace,
+        output_root=output,
+    )
+    service = FileService(
+        policy,
+        write_scope=lambda: registry.get_context("write_scope") or (),
+    )
+    agent_module.BuiltinTools(
+        _FakeMemory(),
+        registry,
+        workspace_root=workspace,
+        file_service=service,
+    )
     parent = agent_module.BaseAgent(
         object(), registry, model="fake-model", api_format="openai"
     )
-    parent.register_spawn_capability("base system prompt", workspace_root=tmp_path)
+    parent.register_spawn_capability("base system prompt", workspace_root=workspace)
 
     async def fake_send_message(self, ctx, user_message, stream_callback=None):
         content = await self.registry.call(
             "write_file",
-            {"path": "forbidden.txt", "content": "blocked"},
+            {
+                "root": "workspace",
+                "path": "forbidden.txt",
+                "mode": "create",
+                "content": "blocked",
+            },
         )
         return agent_module.AgentResult(agent_id="sub", content=content)
 
@@ -3921,7 +4191,8 @@ def test_spawn_agent_enforces_write_scope_for_write_file(monkeypatch, tmp_path):
 
     assert payload["ok"] is True
     assert write_payload["ok"] is False
-    assert "write scope" in write_payload["error"].lower()
+    assert write_payload["error"]["code"] == "access_denied"
+    assert "write scope" in write_payload["error"]["message"].lower()
 
 
 def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch):

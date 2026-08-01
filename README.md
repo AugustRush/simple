@@ -355,8 +355,48 @@ Key config sections:
 | `scheduler` | Poll/lease/concurrency settings |
 | `tavily_api_key` | Optional Tavily search API key |
 | `output_dir` | Override default `~/.agent/output` |
+| `file_access` | Startup-only workspace read/write policy plus resource limits for file tools (see [File access](#file-access)) |
 | `assistant_identity` | Deterministic assistant name/role for fact recall |
 | `system_prompt_file` | Load custom system prompt from `.md` or `.txt` |
+
+### File access
+
+Built-in file tools are rooted and snapshot-based. Every operation takes an
+explicit `root` (`workspace` or `output_dir`) and a root-relative `path`;
+absolute paths, traversal, and symlink escapes are rejected. `read_file`
+returns a bounded line window with an exact SHA-256 `revision`; `write_file`
+and `edit_file` require that revision as `expected_revision`, so a stale write
+can never silently overwrite newer content. Failed edits leave the target
+byte-for-byte unchanged.
+
+The workspace is read-only by default. To enable workspace writes, set
+`file_access.workspace.write` to `true` in `config.json` and grant the target
+paths through a sub-agent `write_scope`; `output_dir` is always readable and
+writable for generated artifacts. The policy is loaded only at startup —
+changing it requires a restart.
+
+```json
+{
+  "file_access": {
+    "workspace": { "read": true, "write": false },
+    "max_read_lines": 400,
+    "max_read_bytes": 65536,
+    "max_snapshot_bytes": 16777216,
+    "max_write_bytes": 4194304,
+    "max_replacements": 100,
+    "max_list_results": 1000
+  }
+}
+```
+
+Example round trip:
+
+```text
+read_file(root="workspace", path="agent/config.py")     # -> revision "sha256:..."
+edit_file(root="workspace", path="agent/config.py",
+          expected_revision="sha256:...",
+          replacements=[{old_text, new_text, expected_count}])
+```
 
 ## Usage
 
@@ -529,7 +569,7 @@ output sink.
 |---|---|
 | Time | `current_time` |
 | Shell | `shell` |
-| Files | `read_file`, `write_file`, `list_files`, `send_file` |
+| Files | `read_file`, `write_file`, `edit_file`, `list_files`, `send_file` |
 | Media | `transcribe_audio` |
 | Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index` |
 | Context | `context_retrieve` |
