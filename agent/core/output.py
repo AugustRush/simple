@@ -332,6 +332,16 @@ class OutputSink(ABC):
         """
         return False
 
+    @property
+    def interactive_confirmation(self) -> bool:
+        """True when this sink can show an interactive approval menu.
+
+        Non-interactive sinks (gateway/Feishu, pipes) leave a structured
+        confirmation-required result plus a pending record so the human can
+        approve with a chat reply instead.
+        """
+        return False
+
     def on_info(self, content: Any) -> None:
         """Display an informational renderable."""
 
@@ -439,6 +449,10 @@ class CliOutputSink(OutputSink):
             getattr(self._console, "is_terminal", False)
             and callable(getattr(self._console, "print", None))
         )
+
+    @property
+    def interactive_confirmation(self) -> bool:
+        return bool(self._supports_live_status() and sys.stdin.isatty())
 
     def _set_activity(self, text: str) -> None:
         if not self._supports_live_status():

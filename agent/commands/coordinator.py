@@ -707,12 +707,46 @@ class CommandCoordinator:
             shell_approve_single_pending,
             shell_pending_for_scope,
         )
+        from agent.security.plugin_approval import (
+            plugin_install_approve_single,
+            plugin_install_pending_for_scope,
+        )
 
         scope = ShellAuthorizationScope(
             turn_input.session_id,
             turn_input.channel_name,
             str(turn_input.metadata.get("user_id") or ""),
         )
+        # Plugin installs with executable content use the same chat-approval
+        # pattern: one unexpired pending record for the scope, redeemable by
+        # a short approval reply.
+        plugin_pending = plugin_install_pending_for_scope(scope)
+        if plugin_pending:
+            if len(plugin_pending) > 1:
+                self._safe_status(
+                    sink,
+                    f"当前有 {len(plugin_pending)} 个插件安装待确认，无法用“批准”批量放行；"
+                    "请逐次确认。",
+                    level="warning",
+                )
+                return turn_input
+            source = plugin_install_approve_single(scope)
+            if source is None:
+                return turn_input
+            self._safe_status(
+                sink,
+                f"已批准待确认插件安装：{source}。可以用相同的 source 重试。",
+                level="info",
+            )
+            return replace(
+                turn_input,
+                text=(
+                    f"用户已批准安装插件：{source}。"
+                    "请用完全相同的 source 参数重新调用 install_plugin"
+                    "（如需覆盖已安装版本请带 replace=true）。"
+                ),
+            )
+
         pending = shell_pending_for_scope(scope)
         if not pending:
             return turn_input

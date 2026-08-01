@@ -2376,6 +2376,322 @@ def test_canonicalize_plugin_source_keeps_working_transports():
     assert _canonicalize_plugin_source("/local/path") == "/local/path"
 
 
+def _install_plugin_harness(tmp_path, monkeypatch):
+    """Return (tools, registry, catalog, user_plugins) wired for installs."""
+    from agent import PluginCatalog
+    from agent import shared as _shared
+    from agent.tools.builtin_tools import BuiltinTools
+    from agent.tools.runtime import ToolRegistry
+
+    user_plugins = tmp_path / "installed"
+    monkeypatch.setattr(_shared, "USER_PLUGINS_DIR", user_plugins)
+    registry = ToolRegistry()
+    tools = BuiltinTools(memory=None, registry=registry)
+    catalog = PluginCatalog(builtin_dir=tmp_path / "empty", user_dir=user_plugins)
+    catalog.discover_and_load()
+    components = {"plugin_catalog": catalog}
+    registry.set_context("plugin_catalog", catalog)
+    registry.set_context("components", components)
+    return tools, registry, catalog, user_plugins
+
+
+class _FakeConfirmationSink:
+    def __init__(self, answer: bool, interactive: bool = True):
+        self.answer = answer
+        self.interactive = interactive
+        self.asked: list[dict] = []
+
+    @property
+    def interactive_confirmation(self) -> bool:
+        return self.interactive
+
+    async def on_tool_confirmation(
+        self,
+        name: str,
+        *,
+        command: str,
+        risk_level: str,
+        reason: str,
+        confirmation_token: str,
+        scope,
+    ) -> bool:
+        self.asked.append(
+            {"name": name, "command": command, "reason": reason}
+        )
+        return self.answer
+
+
+def _run_install_with_sink(tools, source: str, sink, *, name=None, replace=False):
+    from agent.core.agent import AgentContext, _active_agent_context
+    from agent.core.output import _active_sink
+
+    ctx = AgentContext(
+        metadata={"session_id": "cli", "channel_name": "cli", "user_id": ""}
+    )
+    ctx_token = _active_agent_context.set(ctx)
+    sink_token = _active_sink.set(sink)
+    try:
+        return asyncio.run(
+            tools._install_plugin(
+                source=source,
+                intent="install test plugin",
+                name=name,
+                replace=replace,
+            )
+        )
+    finally:
+        _active_agent_context.reset(ctx_token)
+        _active_sink.reset(sink_token)
+
+
+def test_install_plugin_cleans_partial_target_on_clone_failure(
+    tmp_path, monkeypatch
+):
+    tools, _, _, user_plugins = _install_plugin_harness(tmp_path, monkeypatch)
+
+    class FakeProc:
+        returncode = 1
+
+        async def communicate(self):
+            return (b"", b"protocol error")
+
+    async def fake_clone(*args, **kwargs):
+        target = Path(args[-1])
+        target.mkdir(parents=True)
+        (target / ".git").mkdir()
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_clone)
+
+    result = asyncio.run(
+        tools._install_plugin(
+            source="git://github.com/example/plugin.git",
+            intent="test clone failure cleanup",
+        )
+    )
+
+    assert result["ok"] is False
+    assert "git clone failed" in result["error"]
+    assert not (user_plugins / "plugin").exists()
+
+
+def test_install_plugin_concurrent_installs_serialize(tmp_path, monkeypatch):
+    tools, _, _, user_plugins = _install_plugin_harness(tmp_path, monkeypatch)
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            await asyncio.sleep(0.05)
+            return (b"", b"")
+
+    async def fake_clone(*args, **kwargs):
+        await asyncio.sleep(0.01)
+        target = Path(args[-1])
+        (target / ".claude-plugin").mkdir(parents=True)
+        (target / ".claude-plugin" / "plugin.json").write_text(
+            '{"name": "plugin", "description": "demo"}', encoding="utf-8"
+        )
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_clone)
+
+    async def scenario():
+        return await asyncio.gather(
+            tools._install_plugin(
+                source="https://github.com/example/plugin.git",
+                intent="test",
+            ),
+            tools._install_plugin(
+                source="https://github.com/example/plugin.git",
+                intent="test",
+            ),
+        )
+
+    results = asyncio.run(scenario())
+
+    assert sorted(result["ok"] for result in results) == [False, True]
+    assert any(
+        "already exists" in result["error"]
+        for result in results
+        if not result["ok"]
+    )
+    assert (
+        user_plugins / "plugin" / ".claude-plugin" / "plugin.json"
+    ).is_file()
+
+
+def test_install_plugin_replace_upgrades_existing(tmp_path, monkeypatch):
+    tools, _, _, user_plugins = _install_plugin_harness(tmp_path, monkeypatch)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plugin.json").write_text(
+        '{"name": "demo", "description": "v1"}', encoding="utf-8"
+    )
+
+    first = asyncio.run(
+        tools._install_plugin(source=str(source), intent="install")
+    )
+    assert first["ok"] is True
+    installed = user_plugins / "source"
+    (installed / "v1.txt").write_text("1", encoding="utf-8")
+
+    duplicate = asyncio.run(
+        tools._install_plugin(source=str(source), intent="install")
+    )
+    assert duplicate["ok"] is False
+    assert "already exists" in duplicate["error"]
+
+    replaced = asyncio.run(
+        tools._install_plugin(source=str(source), intent="install", replace=True)
+    )
+    assert replaced["ok"] is True
+    assert replaced.get("replaced") is True
+    assert (installed / "plugin.json").is_file()
+    assert not (installed / "v1.txt").exists()
+    assert not list(user_plugins.glob(".source.old-*"))
+
+
+def test_install_plugin_rolls_back_when_reload_fails(tmp_path, monkeypatch):
+    tools, _, _, user_plugins = _install_plugin_harness(tmp_path, monkeypatch)
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "plugin.json").write_text(
+        '{"name": "demo", "description": "v1"}', encoding="utf-8"
+    )
+
+    async def failing_reload():
+        return {"ok": False, "error": "mcp connect boom"}
+
+    monkeypatch.setattr(tools, "_reload_plugins", failing_reload)
+    result = asyncio.run(
+        tools._install_plugin(source=str(source), intent="install")
+    )
+    assert result["ok"] is False
+    assert "rolled back" in result["error"]
+    assert not (user_plugins / "source").exists()
+
+    # A failed upgrade restores the previous version instead of losing it.
+    async def good_reload():
+        return {
+            "ok": True,
+            "added_plugins": [],
+            "removed_plugins": [],
+            "newly_connected_mcp": [],
+            "total_loaded": 0,
+        }
+
+    monkeypatch.setattr(tools, "_reload_plugins", good_reload)
+    first = asyncio.run(
+        tools._install_plugin(source=str(source), intent="install")
+    )
+    assert first["ok"] is True
+    installed = user_plugins / "source"
+    (installed / "v1.txt").write_text("1", encoding="utf-8")
+
+    monkeypatch.setattr(tools, "_reload_plugins", failing_reload)
+    failed = asyncio.run(
+        tools._install_plugin(source=str(source), intent="install", replace=True)
+    )
+    assert failed["ok"] is False
+    assert (installed / "v1.txt").read_text(encoding="utf-8") == "1"
+    assert not list(user_plugins.glob(".source.old-*"))
+
+
+@pytest.mark.parametrize(
+    "executable_marker",
+    ["__init__.py", ".mcp.json", ".claude-plugin/hooks/hook.json"],
+)
+def test_install_plugin_requires_confirmation_for_executable_content(
+    tmp_path, monkeypatch, executable_marker
+):
+    from agent.security.plugin_approval import plugin_install_clear_all
+
+    plugin_install_clear_all()
+    try:
+        tools, _, _, user_plugins = _install_plugin_harness(tmp_path, monkeypatch)
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "plugin.json").write_text("{}", encoding="utf-8")
+        if executable_marker == "__init__.py":
+            (source / "__init__.py").write_text("", encoding="utf-8")
+        elif executable_marker == ".mcp.json":
+            (source / ".mcp.json").write_text('{"mcpServers": {}}', encoding="utf-8")
+        else:
+            hooks = source / ".claude-plugin" / "hooks"
+            hooks.mkdir(parents=True)
+            (hooks / "hook.json").write_text("{}", encoding="utf-8")
+
+        sink = _FakeConfirmationSink(answer=False, interactive=True)
+        declined = _run_install_with_sink(tools, str(source), sink)
+        assert declined["ok"] is False
+        assert declined.get("cancelled") is True
+        assert not (user_plugins / "source").exists()
+        assert len(sink.asked) == 1
+        assert sink.asked[0]["command"] == str(source)
+
+        sink = _FakeConfirmationSink(answer=True, interactive=True)
+        approved = _run_install_with_sink(tools, str(source), sink)
+        assert approved["ok"] is True
+        assert len(sink.asked) == 1
+    finally:
+        plugin_install_clear_all()
+
+
+def test_install_plugin_declarative_skips_confirmation(tmp_path, monkeypatch):
+    from agent.security.plugin_approval import plugin_install_clear_all
+
+    plugin_install_clear_all()
+    try:
+        tools, _, _, _ = _install_plugin_harness(tmp_path, monkeypatch)
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "skills").mkdir()
+        (source / "skills" / "demo.md").write_text("body", encoding="utf-8")
+
+        sink = _FakeConfirmationSink(answer=True, interactive=True)
+        result = _run_install_with_sink(tools, str(source), sink)
+        assert result["ok"] is True
+        assert sink.asked == []
+    finally:
+        plugin_install_clear_all()
+
+
+def test_install_plugin_pending_confirmation_for_gateway(tmp_path, monkeypatch):
+    from agent.security.plugin_approval import (
+        plugin_install_approve_single,
+        plugin_install_clear_all,
+        plugin_install_pending_for_scope,
+        plugin_install_was_approved,
+    )
+    from agent.security.shell import ShellAuthorizationScope
+
+    plugin_install_clear_all()
+    try:
+        tools, _, _, _ = _install_plugin_harness(tmp_path, monkeypatch)
+        source = tmp_path / "source"
+        source.mkdir()
+        (source / "plugin.json").write_text("{}", encoding="utf-8")
+        (source / "__init__.py").write_text("", encoding="utf-8")
+
+        scope = ShellAuthorizationScope("cli", "cli", "")
+        sink = _FakeConfirmationSink(answer=False, interactive=False)
+
+        first = _run_install_with_sink(tools, str(source), sink)
+        assert first["ok"] is False
+        assert first.get("requires_confirmation") is True
+        assert plugin_install_pending_for_scope(scope) == [str(source)]
+
+        assert plugin_install_approve_single(scope) == str(source)
+        assert plugin_install_was_approved(scope, str(source)) is True
+
+        second = _run_install_with_sink(tools, str(source), sink)
+        assert second["ok"] is True
+        assert len(sink.asked) == 1  # the approved retry does not re-ask
+    finally:
+        plugin_install_clear_all()
+
+
 @pytest.mark.parametrize(
     "name",
     [
@@ -2476,6 +2792,7 @@ def test_uninstall_plugin_rejects_noncanonical_name_before_io(
 @pytest.mark.parametrize("name", ["alpha", "alpha-2", "alpha_beta"])
 def test_install_plugin_accepts_canonical_explicit_name(tmp_path, monkeypatch, name):
     from agent import shared as shared_module
+    from agent import PluginCatalog
     from agent.tools.builtin_tools import BuiltinTools
     from agent.tools.runtime import ToolRegistry
 
@@ -2484,7 +2801,12 @@ def test_install_plugin_accepts_canonical_explicit_name(tmp_path, monkeypatch, n
     (source / "plugin.json").write_text("{}", encoding="utf-8")
     plugins = tmp_path / "plugins"
     monkeypatch.setattr(shared_module, "USER_PLUGINS_DIR", plugins)
-    tools = BuiltinTools(memory=None, registry=ToolRegistry())
+    registry = ToolRegistry()
+    tools = BuiltinTools(memory=None, registry=registry)
+    catalog = PluginCatalog(builtin_dir=tmp_path / "empty", user_dir=plugins)
+    catalog.discover_and_load()
+    registry.set_context("plugin_catalog", catalog)
+    registry.set_context("components", {"plugin_catalog": catalog})
 
     result = asyncio.run(
         tools._install_plugin(source=str(source), intent="install", name=name)

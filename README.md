@@ -882,6 +882,17 @@ Place plugins under `~/.agent/plugins/`. User plugins with the same name overrid
 {"plugins": {"evolution": {"enabled": false}}}
 ```
 
+`install_plugin` clones a git URL or copies a local path into
+`~/.agent/plugins/<name>/`, then hot-reloads the catalog. Reinstalling an
+existing name requires `replace: true` (upgrade); a failed clone, validation
+or reload rolls back automatically and restores the previous version. Plugins
+with executable content (Python `__init__.py`, MCP servers, hooks) are treated
+as arbitrary code: the CLI shows an approval menu before activation, and in
+gateway channels the agent asks the user to reply "同意" (a pending record is
+created and redeemed by the coordinator), after which the identical source
+must be retried. Declarative-only plugins (skills/commands without Python,
+MCP or hooks) install without confirmation.
+
 ## Runtime Architecture
 
 ```

@@ -3554,6 +3554,42 @@ def test_coordinator_chat_approval_redeems_single_pending_command() -> None:
     assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is True
 
 
+def test_coordinator_chat_approval_redeems_plugin_pending_install() -> None:
+    from agent.security.plugin_approval import (
+        plugin_install_approve_single,
+        plugin_install_clear_all,
+        plugin_install_pending_for_scope,
+        plugin_install_record_pending,
+        plugin_install_was_approved,
+    )
+    from agent.security.shell import ShellAuthorizationScope
+
+    plugin_install_clear_all()
+    try:
+        scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+        source = "https://github.com/example/plugin.git"
+        plugin_install_record_pending(scope, source)
+        coordinator, core = _coordinator()
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+        sink = _CoordinatorSink()
+
+        asyncio.run(
+            coordinator.handle(_turn("同意"), state, sink)  # type: ignore[arg-type]
+        )
+
+        assert core.calls
+        forwarded = core.calls[0].text
+        assert source in forwarded
+        assert "install_plugin" in forwarded
+        assert any(
+            "已批准待确认插件安装" in text for text, _level in sink.statuses
+        )
+        assert plugin_install_pending_for_scope(scope) == []
+        assert plugin_install_was_approved(scope, source) is True
+    finally:
+        plugin_install_clear_all()
+
+
 @pytest.mark.parametrize(
     "reply",
     ["同意", "允许执行", "yes", "approve", " 批准 ", "ok"],

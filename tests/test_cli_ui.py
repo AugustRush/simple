@@ -944,3 +944,13 @@ def test_sink_disables_live_status_but_keeps_stream_markdown():
 
     assert sink._supports_live_status() is False
     assert sink._supports_stream_markdown() is True
+
+
+def test_sink_interactive_confirmation_requires_live_terminal():
+    from agent.core.output import CliOutputSink, OutputSink
+
+    assert OutputSink().interactive_confirmation is False
+
+    console = Console(file=StringIO(), force_terminal=True)
+    assert CliOutputSink(console, live_status=False).interactive_confirmation is False
+    assert CliOutputSink(console, live_status=True).interactive_confirmation is False

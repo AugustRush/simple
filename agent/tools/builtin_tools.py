@@ -94,6 +94,56 @@ def _canonicalize_plugin_source(source: str) -> str:
     return source
 
 
+def _plugin_executable_content(target: Path) -> str:
+    """Describe executable content a plugin ships ("" = declarative only).
+
+    Installations that run code (Python entry point, MCP server, hooks) are
+    equivalent to executing arbitrary code and must pass human confirmation
+    before activation.
+    """
+    if (target / "__init__.py").exists():
+        return "Python 入口 (__init__.py)"
+    if (target / ".mcp.json").exists():
+        return "MCP server (.mcp.json)"
+    for manifest in (
+        target / "plugin.json",
+        target / ".claude-plugin" / "plugin.json",
+    ):
+        if not manifest.exists():
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        if data.get("mcp_servers") or data.get("mcpServers"):
+            return "MCP server (plugin.json)"
+        if data.get("hooks"):
+            return "hooks (plugin.json)"
+    hooks_dir = target / ".claude-plugin" / "hooks"
+    if hooks_dir.is_dir() and any(hooks_dir.iterdir()):
+        return "hooks (.claude-plugin/hooks)"
+    return ""
+
+
+_PLUGIN_INSTALL_LOCK: Optional[asyncio.Lock] = None
+
+
+def _plugin_install_lock() -> asyncio.Lock:
+    """One lock serializes install/replace transactions process-wide."""
+    global _PLUGIN_INSTALL_LOCK
+    if _PLUGIN_INSTALL_LOCK is None:
+        _PLUGIN_INSTALL_LOCK = asyncio.Lock()
+    return _PLUGIN_INSTALL_LOCK
+
+
+class _PluginInstallError(Exception):
+    """Internal control flow carrying the structured install failure."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.payload = payload
+        super().__init__(str(payload.get("error") or "plugin install failed"))
+
+
 def _resolve_user_plugin_target(name: str) -> Path:
     if name != name.strip() or re.fullmatch(
         r"[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?\Z", name
@@ -769,18 +819,32 @@ class BuiltinTools:
                 "Supports Claude Code / Codex layouts (with .claude-plugin/plugin.json) and "
                 "marketplaces (a repo with .claude-plugin/marketplace.json listing multiple "
                 "plugins).  Hot-reloads after install so the plugin's skills, commands, agents, "
-                "MCP servers and hooks become available immediately without restart."
+                "MCP servers and hooks become available immediately without restart. "
+                "Plugins with executable content (Python entry, MCP server, hooks) require "
+                "human confirmation before activation; in non-terminal channels ask the "
+                "user to reply 同意, then retry the identical source."
             ),
             {
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Git URL (https://, git@) or absolute local path.",
+                        "description": (
+                            "Git URL (https://, git@) or absolute local path. "
+                            "git:// is normalized to https automatically."
+                        ),
                     },
                     "name": {
                         "type": "string",
                         "description": "Optional target directory name. Default: derived from source.",
+                    },
+                    "replace": {
+                        "type": "boolean",
+                        "description": (
+                            "Replace an already-installed plugin with the same name "
+                            "(upgrade). Default: false."
+                        ),
+                        "default": False,
                     },
                     "intent": {
                         "type": "string",
@@ -834,10 +898,32 @@ class BuiltinTools:
     # ── Plugin install / uninstall implementations ────────────────────────
 
     async def _install_plugin(
-        self, source: str, intent: str = "", name: Optional[str] = None
+        self,
+        source: str,
+        intent: str = "",
+        name: Optional[str] = None,
+        replace: bool = False,
+    ) -> dict:
+        """Install a plugin; serialized so concurrent installs cannot race."""
+        async with _plugin_install_lock():
+            return await self._install_plugin_locked(
+                source,
+                intent=intent,
+                name=name,
+                replace=replace,
+            )
+
+    async def _install_plugin_locked(
+        self,
+        source: str,
+        intent: str = "",
+        name: Optional[str] = None,
+        replace: bool = False,
     ) -> dict:
         import shutil
         import urllib.parse as _urlparse
+
+        from agent.security.plugin_approval import plugin_install_record_pending
 
         if not source.strip():
             return {"ok": False, "error": "source is required"}
@@ -860,12 +946,135 @@ class BuiltinTools:
             return {"ok": False, "error": str(exc)}
 
         target.parent.mkdir(parents=True, exist_ok=True)
+
+        # Replace/upgrade: move the current version aside so a failed install
+        # can restore it instead of losing the working copy.
+        backup: Optional[Path] = None
         if target.exists():
+            if not replace:
+                return {
+                    "ok": False,
+                    "error": f"plugin '{name}' already exists at {target}",
+                    "recovery_hint": (
+                        "use replace=true to upgrade it, or uninstall_plugin first"
+                    ),
+                }
+            backup = target.parent / f".{target.name}.old-{uuid.uuid4().hex[:8]}"
+            try:
+                shutil.move(str(target), str(backup))
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "error": f"failed to back up existing plugin: {exc}",
+                }
+
+        def _rollback() -> None:
+            shutil.rmtree(target, ignore_errors=True)
+            if backup is not None and backup.exists() and not target.exists():
+                shutil.move(str(backup), str(target))
+
+        try:
+            fetch_result = await self._fetch_plugin_source(source, target)
+            if not fetch_result.get("ok"):
+                raise _PluginInstallError(fetch_result)
+
+            # Validate that the installed directory looks like a plugin.
+            if not _looks_like_plugin(target):
+                raise _PluginInstallError(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"Installed directory does not appear to be a valid plugin. "
+                            f"Expected one of: plugin.json, .claude-plugin/plugin.json, "
+                            f"__init__.py, skills/, or commands/."
+                        ),
+                    }
+                )
+
+            # Executable plugins are arbitrary code: ask the human first.
+            executable_reason = _plugin_executable_content(target)
+            if executable_reason:
+                scope = self._plugin_authorization_scope()
+                approved, needs_pending = await self._confirm_plugin_install(
+                    source=source,
+                    reason=executable_reason,
+                    scope=scope,
+                )
+                if not approved:
+                    payload = {
+                        "ok": False,
+                        "error": (
+                            "plugin install cancelled: "
+                            f"{executable_reason} requires human confirmation"
+                        ),
+                        "cancelled": True,
+                    }
+                    if needs_pending:
+                        plugin_install_record_pending(scope, source)
+                        payload.update(
+                            {
+                                "requires_confirmation": True,
+                                "confirmation_guidance": (
+                                    "该插件包含可执行内容（Python 入口/MCP server/hooks），"
+                                    "安装后激活等于执行任意代码。请向用户展示要安装的来源，"
+                                    "并请用户回复『同意』；批准后请用完全相同的 source "
+                                    "重试 install_plugin（如需覆盖已安装版本请带 replace=true）。"
+                                ),
+                            }
+                        )
+                    raise _PluginInstallError(payload)
+
+            # Hot-reload the catalog so the new plugin's assets are live.
+            reload_result = await self._reload_plugins()
+            if not reload_result.get("ok", False):
+                raise _PluginInstallError(
+                    {
+                        "ok": False,
+                        "error": (
+                            "plugin files installed but activation failed; "
+                            "install rolled back"
+                        ),
+                        "reload": reload_result,
+                        "recovery_hint": (
+                            "fix the reload error and retry install_plugin"
+                        ),
+                    }
+                )
+        except _PluginInstallError as exc:
+            _rollback()
+            return exc.payload
+        except Exception as exc:
+            _rollback()
             return {
                 "ok": False,
-                "error": f"plugin '{name}' already exists at {target}",
-                "recovery_hint": "use uninstall_plugin first if you want to replace it",
+                "error": f"install failed: {exc}",
+                "recovery_hint": (
+                    "fix the error and retry; the previous version was restored"
+                    if backup is not None
+                    else "fix the error and retry"
+                ),
             }
+        finally:
+            if backup is not None and backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+
+        return {
+            "ok": True,
+            "installed_at": str(target),
+            "name": name,
+            "replaced": backup is not None,
+            "reload": reload_result,
+            "summary_text": (
+                f"{'Replaced' if backup is not None else 'Installed'} plugin "
+                f"'{name}' from {source}. "
+                f"Added: {', '.join(reload_result.get('added_plugins', [])) or 'none'}; "
+                f"connected MCP: {', '.join(reload_result.get('newly_connected_mcp', [])) or 'none'}."
+            ),
+        }
+
+    async def _fetch_plugin_source(self, source: str, target: Path) -> dict:
+        """Clone/copy *source* into *target*; clean partial results on failure."""
+        import shutil
 
         is_url = source.startswith(("http://", "https://", "git@", "git://"))
         if is_url:
@@ -914,44 +1123,74 @@ class BuiltinTools:
                     pass
 
             if proc.returncode != 0:
+                shutil.rmtree(target, ignore_errors=True)
                 return {
                     "ok": False,
                     "error": f"git clone failed: {stderr.decode(errors='replace').strip()}",
                 }
-        else:
-            src_path = Path(source).expanduser().resolve()
-            if not src_path.is_dir():
-                return {"ok": False, "error": f"source path not found: {source}"}
-            try:
-                shutil.copytree(src_path, target)
-            except Exception as exc:
-                return {"ok": False, "error": f"copy failed: {exc}"}
+            return {"ok": True}
 
-        # Validate that the installed directory looks like a plugin.
-        if not _looks_like_plugin(target):
+        src_path = Path(source).expanduser().resolve()
+        if not src_path.is_dir():
+            return {"ok": False, "error": f"source path not found: {source}"}
+        try:
+            shutil.copytree(src_path, target)
+        except Exception as exc:
             shutil.rmtree(target, ignore_errors=True)
-            return {
-                "ok": False,
-                "error": (
-                    f"Installed directory does not appear to be a valid plugin. "
-                    f"Expected one of: plugin.json, .claude-plugin/plugin.json, "
-                    f"__init__.py, skills/, or commands/."
-                ),
-            }
+            return {"ok": False, "error": f"copy failed: {exc}"}
+        return {"ok": True}
 
-        # Hot-reload the catalog so the new plugin's assets are live.
-        reload_result = await self._reload_plugins()
-        return {
-            "ok": True,
-            "installed_at": str(target),
-            "name": name,
-            "reload": reload_result,
-            "summary_text": (
-                f"Installed plugin '{name}' from {source}. "
-                f"Added: {', '.join(reload_result.get('added_plugins', [])) or 'none'}; "
-                f"connected MCP: {', '.join(reload_result.get('newly_connected_mcp', [])) or 'none'}."
-            ),
-        }
+    @staticmethod
+    def _plugin_authorization_scope() -> Any:
+        from agent.core.agent import _active_agent_context
+        from agent.security.shell import ShellAuthorizationScope
+
+        active_context = _active_agent_context.get()
+        metadata = active_context.metadata if active_context is not None else {}
+        return ShellAuthorizationScope(
+            str(metadata.get("session_id") or "default"),
+            str(metadata.get("channel_name") or "cli"),
+            str(metadata.get("user_id") or ""),
+        )
+
+    async def _confirm_plugin_install(
+        self,
+        *,
+        source: str,
+        reason: str,
+        scope: Any,
+    ) -> tuple[bool, bool]:
+        """Ask the human before activating executable plugin content.
+
+        Returns ``(approved, needs_pending)``.  Interactive sinks decide
+        immediately; a decline is final.  Non-interactive sinks leave a
+        pending record so the coordinator can redeem a later "同意" reply.
+        """
+        from agent.core.output import _APPROVAL_LOCK, _active_sink
+        from agent.security.plugin_approval import (
+            plugin_install_mark_approved,
+            plugin_install_was_approved,
+        )
+
+        async with _APPROVAL_LOCK:
+            if plugin_install_was_approved(scope, source):
+                return True, False
+            sink = _active_sink.get()
+            if sink is None:
+                return False, False
+            interactive = bool(getattr(sink, "interactive_confirmation", False))
+            approved = await sink.on_tool_confirmation(
+                "install_plugin",
+                command=source,
+                risk_level="high",
+                reason=reason,
+                confirmation_token="",
+                scope=scope,
+            )
+            if approved:
+                plugin_install_mark_approved(scope, source)
+                return True, False
+            return False, not interactive
 
     async def _uninstall_plugin(self, name: str, intent: str = "") -> dict:
         import shutil
