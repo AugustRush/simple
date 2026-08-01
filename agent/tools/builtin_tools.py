@@ -21,8 +21,19 @@ from agent import shared
 from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
 from agent.security.network import fetch_public_http_url
+from agent.security.filesystem_sandbox import (
+    SandboxUnavailableError,
+    ShellSandboxRequest,
+    build_sandbox_command,
+    new_scratch_dir,
+)
 from agent.security.shell import shell_command_uses_shell_features
-from agent.tools.files import FileAccessPolicy, FileService, write_scope_allows
+from agent.tools.files import (
+    FileAccessPolicy,
+    FileService,
+    _normalize_write_scope,
+    write_scope_allows,
+)
 
 from .executor import report_tool_progress
 from .runtime import ToolRegistry
@@ -1445,19 +1456,59 @@ class BuiltinTools:
                 risk_level=safety.risk_level,
             )
 
+        # The same immutable file policy governs shell descendants.  The
+        # sandbox is an OS-level boundary; the pre/post snapshot moving below
+        # is not an authorization mechanism.
+        file_policy = self.registry.get_context("file_access_policy")
+        workspace_read = file_policy.workspace_read if file_policy is not None else True
+        workspace_write = (
+            file_policy.workspace_write if file_policy is not None else False
+        )
+        write_scope = _normalize_write_scope(
+            self.registry.get_context("write_scope") or ()
+        )
+        resolved_cwd = sandbox_dir
+        if cwd:
+            resolved_cwd, _root_kind = self._resolve_output_path(cwd)
+        if not workspace_read and self._path_is_inside_workspace(resolved_cwd):
+            return self._error(
+                "Workspace cwd is not allowed when workspace reads are disabled",
+                command=command,
+                sandbox_unavailable=True,
+            )
+        try:
+            scratch_dir = new_scratch_dir(output_dir)
+            sandbox = build_sandbox_command(
+                ShellSandboxRequest(
+                    workspace_root=self.workspace_root,
+                    output_root=output_dir,
+                    workspace_read=workspace_read,
+                    workspace_write=workspace_write,
+                    write_scope=write_scope,
+                    scratch_dir=scratch_dir,
+                )
+            )
+        except SandboxUnavailableError as exc:
+            return self._error(
+                str(exc),
+                command=command,
+                sandbox_unavailable=True,
+            )
+
         proc = None
         try:
             env = os.environ.copy()
             env["AGENT_OUTPUT_DIR"] = str(output_dir)
             env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
             env["AGENT_SANDBOX_DIR"] = str(sandbox_dir)
-            resolved_cwd = sandbox_dir
-            if cwd:
-                resolved_cwd, _root_kind = self._resolve_output_path(cwd)
+            env.update(sandbox.env_updates)
             workspace_before: set[Path] | None = None
             if self._path_is_inside_workspace(resolved_cwd):
                 workspace_before = self._workspace_file_snapshot()
-            proc = await asyncio.create_subprocess_shell(
+            proc = await asyncio.create_subprocess_exec(
+                *sandbox.argv_prefix,
+                "/bin/sh",
+                "-c",
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

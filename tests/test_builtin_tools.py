@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 
@@ -750,7 +751,7 @@ def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
         async def communicate(self):
             return (b"", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
         return FakeProc()
 
     async def fake_terminate(self, proc):
@@ -761,7 +762,7 @@ def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
         raise asyncio.TimeoutError()
 
     monkeypatch.setattr(
-        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
     monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
     monkeypatch.setattr(
@@ -786,13 +787,13 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
         async def communicate(self):
             return (b"ok", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
         captured["env"] = kwargs.get("env")
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
     monkeypatch.setattr(
-        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
     result = asyncio.run(tools._shell("echo ok", timeout=1))
@@ -816,13 +817,13 @@ def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch)
         async def communicate(self):
             return (b"ok", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
         captured["cwd"] = kwargs.get("cwd")
         captured["env"] = kwargs.get("env")
         return FakeProc()
 
     monkeypatch.setattr(
-        asyncio, "create_subprocess_shell", fake_create_subprocess_shell
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
     result = asyncio.run(tools._shell("echo ok", timeout=1))
@@ -843,11 +844,13 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
         async def communicate(self):
             return (b"ok", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
+    async def fake_create_subprocess_exec(*args, **kwargs):
         captured["cwd"] = kwargs.get("cwd")
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
 
     result = asyncio.run(
         tools._shell("echo ok", timeout=1, cwd=str(output_dir))
@@ -857,33 +860,42 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
     assert captured["cwd"] == str(output_dir.resolve())
 
 
-def test_shell_moves_new_workspace_files_to_output_dir(tmp_path):
+def test_shell_blocks_workspace_write_by_default(tmp_path):
+    from agent.security.filesystem_sandbox import detect_sandbox_support
+
     tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
-    script = workspace / "make_report.py"
-    script.write_text(
-        "#!/usr/bin/env python3\n"
-        "from pathlib import Path\n"
-        "Path('report.html').write_text('generated', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    script.chmod(0o755)
+    (workspace / "a.txt").write_text("keep", encoding="utf-8")
 
     result = asyncio.run(
-        tools._shell("./make_report.py", timeout=1, cwd=str(workspace))
+        tools._shell(f"touch {workspace}/new.txt", timeout=10)
     )
 
-    moved = result["moved_artifacts"]
+    assert not (workspace / "new.txt").exists()
+    if detect_sandbox_support() is not None:
+        # On an enforcing platform the sandbox denies the write inside the
+        # child process; on unsupported platforms shell fails closed earlier.
+        assert result["exit_code"] != 0
+        assert not result["ok"] or "Operation not permitted" in result["output"]
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "fork"),
+    reason="requires POSIX process groups",
+)
+def test_shell_allows_output_dir_writes(tmp_path):
+    from agent.security.filesystem_sandbox import detect_sandbox_support
+
+    if detect_sandbox_support() is None:
+        pytest.skip("requires an enforcing filesystem sandbox")
+    tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
+
+    result = asyncio.run(
+        tools._shell(f"touch {output_dir}/made.txt", timeout=10)
+    )
+
     assert result["ok"] is True
-    assert len(moved) == 1
-    assert moved[0]["from"] == str((workspace / "report.html").resolve())
-    assert Path(moved[0]["to"]) == (
-        output_dir / "workspace-artifacts" / "report.html"
-    ).resolve()
-    assert not (workspace / "report.html").exists()
-    assert (workspace / "make_report.py").exists()
-    assert (
-        output_dir / "workspace-artifacts" / "report.html"
-    ).read_text(encoding="utf-8") == "generated"
+    assert result["exit_code"] == 0
+    assert (output_dir / "made.txt").exists()
 
 
 def test_shell_returns_confirmation_request_for_restricted_command(tmp_path):
@@ -948,11 +960,13 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
         async def communicate(self):
             return (b"ok", b"")
 
-    async def fake_create_subprocess_shell(*args, **kwargs):
-        captured["command"] = args[0]
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["argv"] = args
         return FakeProc()
 
-    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
 
     scope = ShellAuthorizationScope("session-1", "feishu", "user-1")
     assert shell_command_confirm(first["confirmation_token"], scope=scope) is True
@@ -963,7 +977,8 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
         _active_agent_context.reset(active)
 
     assert result["ok"] is True
-    assert captured["command"] == "mv a b"
+    assert captured["argv"][-3:] == ("/bin/sh", "-c", "mv a b")
+    assert captured["argv"][0].endswith("sandbox-exec")
 
 
 def test_shell_rejects_model_supplied_confirmation_token(tmp_path):
