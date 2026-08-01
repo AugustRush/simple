@@ -2,6 +2,7 @@
 
 from dataclasses import FrozenInstanceError
 import hashlib
+import os
 from pathlib import Path
 
 import pytest
@@ -508,3 +509,224 @@ def test_read_file_detects_mutation_during_read(tmp_path):
     assert result["ok"] is False
     assert result["error"]["code"] == "revision_conflict"
     assert result["error"]["retryable"] is True
+
+
+# ── FileService: bounded deterministic directory enumeration ───────────────
+
+
+def _make_tree(workspace: Path) -> None:
+    (workspace / "a.txt").write_text("aaaaaaaaaa", encoding="utf-8")
+    (workspace / "b").mkdir()
+    (workspace / "b" / "c.txt").write_text("cc", encoding="utf-8")
+    (workspace / "b" / "d").mkdir()
+    (workspace / "b" / "d" / "e.txt").write_text("e", encoding="utf-8")
+    (workspace / "z.txt").write_text("z", encoding="utf-8")
+
+
+def test_list_files_non_recursive_basic(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    _make_tree(workspace)
+
+    result = service.list_files("workspace", ".")
+
+    assert result["ok"] is True
+    assert result["count"] == 3
+    assert [item["path"] for item in result["items"]] == ["a.txt", "b", "z.txt"]
+    assert result["items"][0] == {
+        "path": "a.txt",
+        "kind": "file",
+        "size_bytes": 10,
+    }
+    assert result["items"][1] == {
+        "path": "b",
+        "kind": "directory",
+        "size_bytes": None,
+    }
+    assert result["truncated"] is False
+    assert result["next_cursor"] is None
+
+
+def test_list_files_recursive_deterministic_order(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    _make_tree(workspace)
+
+    result = service.list_files("workspace", ".", recursive=True)
+
+    assert [item["path"] for item in result["items"]] == [
+        "a.txt",
+        "b",
+        "b/c.txt",
+        "b/d",
+        "b/d/e.txt",
+        "z.txt",
+    ]
+
+
+def test_list_files_request_path_prefix_is_included(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    _make_tree(workspace)
+
+    result = service.list_files("workspace", "b", recursive=True)
+
+    assert [item["path"] for item in result["items"]] == [
+        "b/c.txt",
+        "b/d",
+        "b/d/e.txt",
+    ]
+    assert result["path"] == "b"
+
+
+def test_list_files_pattern_matches_basename_only(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    _make_tree(workspace)
+
+    result = service.list_files("workspace", ".", recursive=True, pattern="*.txt")
+
+    assert [item["path"] for item in result["items"]] == [
+        "a.txt",
+        "b/c.txt",
+        "b/d/e.txt",
+        "z.txt",
+    ]
+
+
+def test_list_files_missing_and_non_directory(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    _make_tree(workspace)
+
+    missing = service.list_files("workspace", "nope")
+    assert missing["error"]["code"] == "not_found"
+
+    not_dir = service.list_files("workspace", "a.txt")
+    assert not_dir["error"]["code"] == "not_directory"
+
+
+def test_list_files_invalid_paths_and_patterns(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    _make_tree(workspace)
+
+    for bad_path in ("/abs", "a/..", "a/./b", "a//b", ""):
+        result = service.list_files("workspace", bad_path)
+        assert result["error"]["code"] == "invalid_path", bad_path
+
+    for bad_pattern in ("", "a/b"):
+        result = service.list_files("workspace", ".", pattern=bad_pattern)
+        assert result["error"]["code"] == "invalid_request", bad_pattern
+
+    for bad_max in (0, -1, "2", True, 1001):
+        result = service.list_files("workspace", ".", max_results=bad_max)
+        assert result["error"]["code"] == "invalid_request", bad_max
+
+
+def test_list_files_pagination_with_cursor(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    _make_tree(workspace)
+
+    first = service.list_files(
+        "workspace", ".", recursive=True, max_results=3
+    )
+    assert first["truncated"] is True
+    assert first["next_cursor"] is not None
+    assert [item["path"] for item in first["items"]] == ["a.txt", "b", "b/c.txt"]
+
+    second = service.list_files(
+        "workspace", ".", recursive=True, max_results=3, cursor=first["next_cursor"]
+    )
+    assert second["truncated"] is False
+    assert second["next_cursor"] is None
+    assert [item["path"] for item in second["items"]] == [
+        "b/d",
+        "b/d/e.txt",
+        "z.txt",
+    ]
+
+    full = [item["path"] for item in first["items"] + second["items"]]
+    assert full == ["a.txt", "b", "b/c.txt", "b/d", "b/d/e.txt", "z.txt"]
+
+
+def test_list_files_cursor_is_bound_to_request_parameters(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    _make_tree(workspace)
+
+    first = service.list_files(
+        "workspace", ".", recursive=True, pattern="*.txt", max_results=2
+    )
+    cursor = first["next_cursor"]
+    assert cursor is not None
+
+    for kwargs in (
+        {"recursive": False},
+        {"pattern": "*"},
+        {"path": "b"},
+    ):
+        result = service.list_files(
+            "workspace",
+            kwargs.get("path", "."),
+            recursive=kwargs.get("recursive", True),
+            pattern=kwargs.get("pattern", "*.txt"),
+            cursor=cursor,
+        )
+        assert result["error"]["code"] == "invalid_request", kwargs
+
+    garbage = service.list_files("workspace", ".", cursor="not-a-cursor")
+    assert garbage["error"]["code"] == "invalid_request"
+
+
+def test_list_files_workspace_read_denial_and_output_listing(tmp_path):
+    service, workspace, output = _service(
+        tmp_path, workspace={"read": False, "write": False}
+    )
+    (output / "out.txt").write_text("x", encoding="utf-8")
+
+    denied = service.list_files("workspace", ".")
+    assert denied["error"]["code"] == "access_denied"
+
+    allowed = service.list_files("output_dir", ".")
+    assert allowed["ok"] is True
+    assert [item["path"] for item in allowed["items"]] == ["out.txt"]
+
+
+def test_list_files_symlink_kind_and_non_traversal(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    (workspace / "b").mkdir()
+    (workspace / "b" / "inner.txt").write_text("x", encoding="utf-8")
+    (workspace / "link").symlink_to("b", target_is_directory=True)
+
+    flat = service.list_files("workspace", ".")
+    assert {item["path"]: item["kind"] for item in flat["items"]} == {
+        "b": "directory",
+        "link": "symlink",
+    }
+
+    recursive = service.list_files("workspace", ".", recursive=True)
+    assert [item["path"] for item in recursive["items"]] == [
+        "b",
+        "b/inner.txt",
+        "link",
+    ]
+
+
+def test_list_files_other_entry_kinds(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    (workspace / "fifo").mkdir()
+    os.mkfifo(workspace / "fifo" / "pipe")
+
+    result = service.list_files("workspace", ".", recursive=True)
+
+    assert result["items"] == [
+        {"path": "fifo", "kind": "directory", "size_bytes": None},
+        {"path": "fifo/pipe", "kind": "other", "size_bytes": None},
+    ]
+
+
+def test_list_files_respects_configured_max_results_limit(tmp_path):
+    service, workspace, _ = _service(tmp_path, max_list_results=5)
+    _make_tree(workspace)
+
+    result = service.list_files("workspace", ".", recursive=True, max_results=6)
+    assert result["error"]["code"] == "invalid_request"
+
+    ok = service.list_files("workspace", ".", recursive=True, max_results=5)
+    assert ok["ok"] is True
+    assert ok["count"] == 5
+    assert ok["truncated"] is True

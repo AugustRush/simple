@@ -16,8 +16,11 @@ from __future__ import annotations
 
 import codecs
 from dataclasses import dataclass
+import base64
 import errno
+import fnmatch
 import hashlib
+import json
 import os
 from pathlib import Path
 import stat
@@ -754,6 +757,310 @@ class FileService:
 
     def _read_chunk(self, fd: int, size: int) -> bytes:
         return os.read(fd, size)
+
+    def list_files(
+        self,
+        root: str,
+        path: str = ".",
+        *,
+        recursive: bool = False,
+        pattern: str = "*",
+        cursor: str | None = None,
+        max_results: int | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self._list_files(
+                root,
+                path,
+                recursive=recursive,
+                pattern=pattern,
+                cursor=cursor,
+                max_results=max_results,
+            )
+        except FileServiceError as exc:
+            return exc.to_dict()
+
+    def _list_files(
+        self,
+        root: str,
+        path: str,
+        *,
+        recursive: bool,
+        pattern: str,
+        cursor: str | None,
+        max_results: int | None,
+    ) -> dict[str, Any]:
+        root = _validate_root(root)
+        if root == ROOT_WORKSPACE:
+            self._require_workspace_read()
+        if path is None:
+            path = "."
+        _validate_relative_path(path, allow_dot=True)
+        if not isinstance(pattern, str) or not pattern:
+            raise FileServiceError(
+                "invalid_request", "pattern must be a non-empty basename glob"
+            )
+        if "/" in pattern:
+            raise FileServiceError(
+                "invalid_request", "pattern must not contain a path separator"
+            )
+        if not isinstance(recursive, bool):
+            raise FileServiceError(
+                "invalid_request", "recursive must be a boolean"
+            )
+        if max_results is None:
+            max_results = self.policy.limits.max_list_results
+        if (
+            not isinstance(max_results, int)
+            or isinstance(max_results, bool)
+            or max_results < 1
+        ):
+            raise FileServiceError(
+                "invalid_request", "max_results must be a positive integer"
+            )
+        if max_results > self.policy.limits.max_list_results:
+            raise FileServiceError(
+                "invalid_request",
+                f"max_results exceeds the configured limit of "
+                f"{self.policy.limits.max_list_results}",
+            )
+        if not isinstance(cursor, (str, type(None))):
+            raise FileServiceError(
+                "invalid_request", "cursor must be a string or null"
+            )
+
+        resume_after: str | None = None
+        if cursor is not None:
+            resume_after = _decode_list_cursor(
+                cursor,
+                root=root,
+                path=path,
+                recursive=recursive,
+                pattern=pattern,
+            )
+
+        authorized = AuthorizedPath(self.policy, root, path, allow_dot=True)
+        root_fd, root_stat = authorized.open_directory()
+        items: list[dict[str, Any]] = []
+        last_emitted: str | None = None
+        truncated = False
+        root_prefix = "" if path == "." else path
+        root_identity = (root_stat.st_dev, root_stat.st_ino)
+        stack: list[_PendingDirectory] = [
+            _PendingDirectory(
+                prefix=root_prefix,
+                fd=root_fd,
+                ancestry=frozenset({root_identity}),
+            )
+        ]
+        try:
+            while stack and len(items) < max_results:
+                pending = stack[-1]
+                if pending.entries is None:
+                    try:
+                        pending.entries = _scan_directory_entries(
+                            pending.fd, pending.prefix
+                        )
+                    except FileServiceError:
+                        stack.pop()
+                        _close_fd(pending.fd)
+                        continue
+                if not pending.entries:
+                    stack.pop()
+                    _close_fd(pending.fd)
+                    continue
+                entry = pending.entries.pop(0)
+                if (
+                    recursive
+                    and entry["kind"] == "directory"
+                    and entry["identity"] not in pending.ancestry
+                ):
+                    child = _open_child_directory(
+                        self.policy, root, entry["path"]
+                    )
+                    if child is not None:
+                        stack.append(
+                            _PendingDirectory(
+                                prefix=entry["path"],
+                                fd=child,
+                                ancestry=pending.ancestry | {entry["identity"]},
+                            )
+                        )
+                if resume_after is not None:
+                    if entry["path"] <= resume_after:
+                        continue
+                    resume_after = None
+                if not fnmatch.fnmatchcase(entry["name"], pattern):
+                    continue
+                items.append(
+                    {
+                        "path": entry["path"],
+                        "kind": entry["kind"],
+                        "size_bytes": entry["size_bytes"],
+                    }
+                )
+                last_emitted = entry["path"]
+                if len(items) >= max_results:
+                    truncated = any(
+                        pending.entries is None or bool(pending.entries)
+                        for pending in stack
+                    )
+                    break
+        finally:
+            while stack:
+                _close_fd(stack.pop().fd)
+        if truncated and last_emitted is not None:
+            next_cursor = _encode_list_cursor(
+                root=root,
+                path=path,
+                recursive=recursive,
+                pattern=pattern,
+                last=last_emitted,
+            )
+        else:
+            next_cursor = None
+        return {
+            "ok": True,
+            "root": root,
+            "path": path,
+            "items": items,
+            "count": len(items),
+            "truncated": truncated,
+            "next_cursor": next_cursor,
+        }
+
+
+@dataclass
+class _PendingDirectory:
+    prefix: str
+    fd: int
+    ancestry: frozenset[tuple[int, int]]
+    entries: list[dict[str, Any]] | None = None
+
+
+def _entry_kind(st: os.stat_result) -> str:
+    if stat.S_ISREG(st.st_mode):
+        return "file"
+    if stat.S_ISDIR(st.st_mode):
+        return "directory"
+    if stat.S_ISLNK(st.st_mode):
+        return "symlink"
+    return "other"
+
+
+def _scan_directory_entries(
+    fd: int,
+    prefix: str,
+) -> list[dict[str, Any]]:
+    try:
+        with os.scandir(fd) as iterator:
+            raw = list(iterator)
+    except OSError as exc:
+        raise FileServiceError("io_error", "unable to enumerate directory") from exc
+    scanned: list[dict[str, Any]] = []
+    for entry in raw:
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue  # entry disappeared mid-listing: best-effort semantics
+        kind = _entry_kind(st)
+        rel_path = entry.name if not prefix else f"{prefix}/{entry.name}"
+        scanned.append(
+            {
+                "name": entry.name,
+                "path": rel_path,
+                "kind": kind,
+                "size_bytes": st.st_size if kind == "file" else None,
+                "identity": (st.st_dev, st.st_ino),
+            }
+        )
+    scanned.sort(key=lambda item: item["path"])
+    return scanned
+
+
+def _close_fd(fd: int) -> None:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _open_child_directory(
+    policy: FileAccessPolicy,
+    root: str,
+    rel_path: str,
+) -> int | None:
+    """Open a descendant directory for traversal, or None if it cannot be
+    opened (concurrent removal, permission, or symlink substitution).
+    """
+    try:
+        authorized = AuthorizedPath(policy, root, rel_path)
+        fd, _ = authorized.open_directory()
+        return fd
+    except FileServiceError:
+        return None
+
+
+def _list_fingerprint(
+    *,
+    root: str,
+    path: str,
+    recursive: bool,
+    pattern: str,
+) -> str:
+    return json.dumps(
+        [root, path, recursive, pattern], sort_keys=True, separators=(",", ":")
+    )
+
+
+def _encode_list_cursor(
+    *,
+    root: str,
+    path: str,
+    recursive: bool,
+    pattern: str,
+    last: str,
+) -> str:
+    payload = {
+        "version": 1,
+        "request": _list_fingerprint(
+            root=root, path=path, recursive=recursive, pattern=pattern
+        ),
+        "last": last,
+    }
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8"))
+    return encoded.decode("ascii")
+
+
+def _decode_list_cursor(
+    cursor: str,
+    *,
+    root: str,
+    path: str,
+    recursive: bool,
+    pattern: str,
+) -> str:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise FileServiceError(
+            "invalid_request", "cursor is malformed"
+        ) from exc
+    if payload.get("version") != 1:
+        raise FileServiceError("invalid_request", "cursor version is unsupported")
+    expected = _list_fingerprint(
+        root=root, path=path, recursive=recursive, pattern=pattern
+    )
+    if payload.get("request") != expected:
+        raise FileServiceError(
+            "invalid_request",
+            "cursor was created for a different request",
+        )
+    last = payload.get("last")
+    if not isinstance(last, str) or not last:
+        raise FileServiceError("invalid_request", "cursor is missing a resume point")
+    return last
 
 
 __all__ = [
