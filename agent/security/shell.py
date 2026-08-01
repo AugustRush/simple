@@ -125,6 +125,21 @@ _INLINE_INTERPRETERS = (
             {"-0", "-C", "-E", "-F", "-I", "-K", "-R", "-T", "-W", "-r"}
         ),
     ),
+    (
+        re.compile(r"(?:node|deno|bun|osascript)\Z"),
+        frozenset({"-e"}),
+        frozenset(),
+    ),
+    (
+        re.compile(r"php\Z"),
+        frozenset({"-r"}),
+        frozenset(),
+    ),
+    (
+        re.compile(r"lua\Z"),
+        frozenset({"-e"}),
+        frozenset({"-l"}),
+    ),
 )
 
 _HIGH_RISK_OPTIONS: dict[str, frozenset[str]] = {
@@ -477,6 +492,35 @@ def _is_inline_execution(tokens: list[str], command_index: int) -> bool:
     return False
 
 
+def _is_script_execution(tokens: list[str], command_index: int) -> bool:
+    """Return True when an interpreter command runs a script/module file.
+
+    Inline code (``-c``/``-e``/``-r``) is already medium risk.  A script
+    file argument is equally arbitrary code execution — e.g.
+    ``ruby wb.rb navigate ...`` or ``python3 env_check.py`` — so it must
+    require the same confirmation instead of being classified "low risk"
+    and silently bypassing the curl/wget network confirmation.
+    """
+    command_name = os.path.basename(tokens[command_index].strip().lstrip("./"))
+    for pattern, _execution_flags, options_with_values in _INLINE_INTERPRETERS:
+        if pattern.fullmatch(command_name):
+            idx = command_index + 1
+            while idx < len(tokens):
+                token = tokens[idx]
+                if token == "--":
+                    return idx + 1 < len(tokens)
+                if token == "-" or not token.startswith("-"):
+                    # "-" reads a script from stdin; any other positional is
+                    # a script/module file.
+                    return True
+                if token in options_with_values:
+                    idx += 2
+                    continue
+                idx += 1
+            return False
+    return False
+
+
 def _find_high_risk_option(
     tokens: list[str], command_index: int
 ) -> Optional[str]:
@@ -668,6 +712,20 @@ def shell_command_check(
             allowed=False,
             risk_level="medium",
             reason=f"command '{argv0}' is medium risk: inline code execution",
+            requires_confirmation=True,
+            confirmation_token=token,
+        )
+
+    if _is_script_execution(tokens, command_index):
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="medium",
+            reason=f"command '{argv0}' is medium risk: script execution",
             requires_confirmation=True,
             confirmation_token=token,
         )

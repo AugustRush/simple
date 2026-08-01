@@ -183,9 +183,59 @@ def test_shell_security_classifies_attached_env_options(command, risk_level):
         "ruby script.rb -e value",
     ],
 )
-def test_shell_security_does_not_treat_script_arguments_as_interpreter_options(
+def test_shell_security_requires_confirmation_for_script_execution(
     command,
 ):
+    from agent.security.shell import shell_command_check
+
+    result = shell_command_check(command)
+
+    assert result.allowed is False
+    assert result.risk_level == "medium"
+    assert "script execution" in result.reason
+    assert result.requires_confirmation is True
+    assert result.confirmation_token
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # The demonstrated bypass: a network/browser action routed through a
+        # script file must not silently skip the confirmation curl would get.
+        "ruby --disable-gems wb.rb navigate '{\"url\":\"https://x.com/explore\"}'",
+        "python3 env_check.py",
+        "node app.js",
+        "perl script.pl",
+        "php script.php",
+        "osascript control.scpt",
+        "python3 -m pip install requests",
+        "python3 -",
+    ],
+)
+def test_shell_security_script_execution_cannot_bypass_network_confirmation(
+    command,
+):
+    from agent.security.shell import shell_command_check
+
+    result = shell_command_check(command)
+
+    assert result.allowed is False
+    assert result.risk_level == "medium"
+    assert "script execution" in result.reason
+    assert result.requires_confirmation is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 --version",
+        "python3 -V",
+        "ruby --version",
+        "node --help",
+        "php -v",
+    ],
+)
+def test_shell_security_interpreter_flags_without_scripts_stay_low(command):
     from agent.security.shell import shell_command_check
 
     result = shell_command_check(command)
