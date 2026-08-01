@@ -14,7 +14,13 @@ def make_engine(tmp_path):
 
 
 def make_ctx_manager(tmp_path, idle_seconds=300, min_messages=4):
-    from agent import LTMStore, ConsolidationEngine, LocalRetriever, ContextManager
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
+    )
 
     store = LTMStore(context_dir=tmp_path / "context")
     engine = ConsolidationEngine(store=store)
@@ -24,6 +30,10 @@ def make_ctx_manager(tmp_path, idle_seconds=300, min_messages=4):
         consolidation=engine,
         idle_seconds=idle_seconds,
         min_messages=min_messages,
+        staging=StagingBuffer(
+            context_dir=tmp_path / "context",
+            session_id="test-session",
+        ),
     )
 
 
