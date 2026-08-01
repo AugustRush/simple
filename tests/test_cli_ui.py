@@ -804,6 +804,32 @@ def test_tui_output_pane_captures_ansi_and_tracks_last_line():
     assert pane.cursor_position().x == 0
 
 
+def test_tui_output_pane_parses_split_escape_sequences():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=4)
+    pane.write("\x1b[3")
+    pane.write("1mred text\x1b[0m\n")
+
+    fragments = pane.fragments()
+    joined = "".join(text for _style, text in fragments)
+    assert "red text" in joined
+    assert "\x1b" not in joined
+    assert pane.cursor_position().y == 1
+
+
+def test_tui_output_pane_tracks_lines_incrementally():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=4)
+    pane.write("a\n")
+    pane.write("b\n")
+    pane.write("c")
+    assert pane.cursor_position().y == 2
+    pane.write("d\n")
+    assert pane.cursor_position().y == 3
+
+
 def test_tui_output_pane_scrolls_through_history():
     from agent.tui import _OutputPane
 
@@ -893,6 +919,37 @@ def test_tui_session_submits_input_through_queue(tmp_path):
         assert await tui.ask_async() is None
 
     asyncio.run(scenario())
+
+
+def test_tui_submit_echoes_queued_input_when_busy(tmp_path):
+    from agent.tui import TuiSession
+
+    busy_tui = TuiSession(
+        history_path=tmp_path / "h1",
+        completer_factory=lambda: None,
+        cancel_callback=lambda: None,
+        busy=lambda: True,
+        console_width=80,
+    )
+    busy_tui._submit("hello")
+    busy_text = "".join(
+        text for _style, text in busy_tui._pane.fragments()
+    )
+    assert "已排队" in busy_text
+    assert "hello" in busy_text
+
+    idle_tui = TuiSession(
+        history_path=tmp_path / "h2",
+        completer_factory=lambda: None,
+        cancel_callback=lambda: None,
+        busy=lambda: False,
+        console_width=80,
+    )
+    idle_tui._submit("hello")
+    idle_text = "".join(
+        text for _style, text in idle_tui._pane.fragments()
+    )
+    assert "已排队" not in idle_text
 
 
 def test_tui_request_exit_queues_none_and_is_idempotent(tmp_path):

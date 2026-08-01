@@ -630,9 +630,12 @@ the classic prompt, so the conversation reads exactly as before. The
 slash-command palette and permission menus all work from that bottom line;
 the output pane scrolls through the whole conversation with `↑`/`↓` (when
 the input is empty), `PgUp`/`PgDn` or the mouse wheel, and `Home`/`End` jump
-to the top or newest message. `Ctrl+C` still cancels a running turn and
-`Ctrl+D` exits. When stdin/stdout are not a terminal (pipes, scripts,
-tests), the CLI falls back to the classic line-by-line prompt automatically.
+to the top or newest message. While a turn is running, typing still works:
+Enter queues the message (shown as `⏎ 已排队…` in the pane) and it is sent
+when the turn finishes, and `Ctrl+C` cancels the running turn. Rendering is
+incremental, so long conversations do not slow the input down. `Ctrl+D`
+exits. When stdin/stdout are not a terminal (pipes, scripts, tests), the CLI
+falls back to the classic line-by-line prompt automatically.
 
 ### Shared (all channels)
 

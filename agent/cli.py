@@ -658,6 +658,7 @@ async def _run_tui_session(components: dict, cfg: dict) -> None:
         history_path=_cli_history_path(),
         completer_factory=_cli_command_completer,
         cancel_callback=_tui_cancel_callback,
+        busy=lambda: _current_cancel_token is not None,
     )
     _ACTIVE_TUI = tui
     try:

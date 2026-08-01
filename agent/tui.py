@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from pathlib import Path
+import re
 import shutil
+import time
 from typing import Any, Awaitable, Callable, Optional
 
 from prompt_toolkit.application import Application
@@ -25,6 +27,9 @@ from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 
 
+_TRAILING_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-9;?]*)?$")
+
+
 class _OutputPane:
     """File-like target for rich Console that feeds the TUI output window.
 
@@ -41,25 +46,41 @@ class _OutputPane:
         view_height: Optional[int] = None,
     ) -> None:
         self._on_write = on_write
-        self._raw = ""
         self._fragments: StyleAndTextTuples = []
-        self._dirty = False
+        self._pending_escape = ""
+        # Number of newlines written; the last line index equals this count.
+        self._line_count = 0
         self._fixed_view_height = view_height
         # Top line of the visible window; 0 = beginning, max = newest output.
         self._scroll_top = 0
         self._follow_bottom = True
         self._window: Optional[Any] = None
+        self._rows_cache_value = 40
+        self._rows_cache_time = 0.0
 
     def attach_window(self, window: Any) -> None:
         self._window = window
 
     def write(self, text: str) -> int:
-        if text:
-            self._raw += text
-            self._dirty = True
-            if self._follow_bottom:
-                self._scroll_top = self._max_scroll()
-            self._notify()
+        if not text:
+            return 0
+        # Parse incrementally: re-parsing the whole conversation on every
+        # write is O(total output) per render and makes the UI unusable once
+        # the session grows.  A trailing partial escape sequence is held and
+        # completed by the next chunk (rich writes complete lines, so this is
+        # only needed for streamed plain-text tails).
+        chunk = self._pending_escape + text
+        self._pending_escape = ""
+        tail = _TRAILING_ESCAPE_RE.search(chunk)
+        if tail is not None:
+            self._pending_escape = tail.group(0)
+            chunk = chunk[: tail.start()]
+        if chunk:
+            self._fragments.extend(list(to_formatted_text(ANSI(chunk))))
+        self._line_count += text.count("\n")
+        if self._follow_bottom:
+            self._scroll_top = self._max_scroll()
+        self._notify()
         return len(text)
 
     def flush(self) -> None:
@@ -69,9 +90,6 @@ class _OutputPane:
         return False
 
     def fragments(self) -> StyleAndTextTuples:
-        if self._dirty:
-            self._fragments = list(to_formatted_text(ANSI(self._raw)))
-            self._dirty = False
         return self._fragments
 
     def cursor_position(self) -> Point:
@@ -110,18 +128,24 @@ class _OutputPane:
         return min(self._scroll_top, max(0, self._last_line() - height + 1))
 
     def _last_line(self) -> int:
-        return max(0, len(self._raw.split("\n")) - 1)
+        return self._line_count
 
     def _view_height(self) -> int:
         if self._fixed_view_height is not None:
             return max(1, self._fixed_view_height)
-        from prompt_toolkit.application.current import get_app
-
-        try:
-            rows = get_app().output.get_size().rows
-        except Exception:
-            rows = 40
-        return max(1, rows - 2)
+        now = time.monotonic()
+        if now - self._rows_cache_time >= 1.0:
+            app = get_app_or_none()
+            if app is None:
+                rows = 40
+            else:
+                try:
+                    rows = app.output.get_size().rows
+                except Exception:
+                    rows = 40
+            self._rows_cache_value = rows
+            self._rows_cache_time = now
+        return max(1, self._rows_cache_value - 2)
 
     def _max_scroll(self) -> int:
         return max(0, self._last_line() - self._view_height() + 1)
@@ -166,9 +190,11 @@ class TuiSession:
         completer_factory: Callable[[], Optional[Completer]],
         cancel_callback: Callable[[], None],
         console_width: Optional[int] = None,
+        busy: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._history_path = history_path
         self._cancel_callback = cancel_callback
+        self._busy = busy
         self._input_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self._app_exit_requested = False
 
@@ -191,6 +217,7 @@ class TuiSession:
             key_bindings=self._build_key_bindings(),
             full_screen=True,
             mouse_support=True,
+            min_redraw_interval=0.03,
         )
 
     # ── Layout ────────────────────────────────────────────────────────────
@@ -346,6 +373,18 @@ class TuiSession:
         return await self._input_queue.get()
 
     def _submit(self, text: Optional[str]) -> None:
+        if (
+            text
+            and self._busy is not None
+            and self._busy()
+        ):
+            # The loop only reads input between turns; make queued input
+            # visible so Enter during a running turn does not look dead.
+            self.console.print(
+                f"⏎ 已排队（当前任务结束后发送）：{text}",
+                markup=False,
+                style="dim",
+            )
         self._input_queue.put_nowait(text)
 
     def request_exit(self) -> None:
