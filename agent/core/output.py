@@ -14,11 +14,139 @@ from typing import Any, Mapping, Optional
 from rich.markdown import Markdown
 from rich.markup import escape as _markup_escape
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.text import Text
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 
 _APPROVAL_PROMPT = PromptSession(history=InMemoryHistory())
+
+# Inline markdown tokens styled per-line while streaming (code, bold,
+# italic, links).  Order matters: ** before * so bold consumes both stars.
+_INLINE_TOKEN_RE = re.compile(
+    r"(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]*\]\([^)]*\))"
+)
+
+
+def _append_inline_styles(text: Text, value: str) -> None:
+    """Append ``value`` to ``text`` with per-token inline styling."""
+    position = 0
+    for match in _INLINE_TOKEN_RE.finditer(value):
+        if match.start() > position:
+            text.append(value[position : match.start()])
+        token = match.group(1)
+        if token.startswith("`") and len(token) >= 2:
+            text.append(token[1:-1], style="cyan")
+        elif token.startswith("**") and len(token) >= 4:
+            text.append(token[2:-2], style="bold")
+        elif token.startswith("["):
+            link = re.match(r"\[([^\]]*)\]\(([^)]*)\)", token)
+            label = link.group(1) if link else token
+            text.append(label, style="underline cyan")
+        else:
+            text.append(token[1:-1], style="italic")
+        position = match.end()
+    if position < len(value):
+        text.append(value[position:])
+
+
+def _render_markdown_line(line: str) -> Text:
+    """Render one complete markdown line as a styled rich Text."""
+    stripped = line.strip()
+    if not stripped:
+        return Text()
+    heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+    if heading:
+        level = len(heading.group(1))
+        text = Text()
+        text.append("#" * level + " ", style="bold dim")
+        _append_inline_styles(text, heading.group(2))
+        text.stylize("bold" if level <= 2 else "bold dim")
+        return text
+    if re.fullmatch(r"([-*_])\1{2,}", stripped):
+        return Text("─" * min(60, max(10, len(stripped))), style="dim")
+    if stripped.startswith(">"):
+        text = Text()
+        text.append(line, style="dim italic")
+        return text
+    bullet = re.match(r"^(\s*)([-*+]|\d+\.)\s+(.*)$", line)
+    if bullet:
+        text = Text()
+        text.append(bullet.group(1) + bullet.group(2) + " ", style="dim")
+        _append_inline_styles(text, bullet.group(3))
+        return text
+    text = Text()
+    _append_inline_styles(text, line)
+    return text
+
+
+class _StreamMarkdown:
+    """Line-buffered streaming markdown renderer.
+
+    Completed lines are printed once, styled, so terminal scrollback is
+    preserved and nothing is re-rendered.  Fenced code blocks are buffered
+    until the closing fence so they can be syntax-highlighted as a unit; a
+    truncated fence is flushed as plain lines at turn end.
+    """
+
+    def __init__(self, console: Any) -> None:
+        self._console = console
+        self._partial = ""
+        self._in_fence = False
+        self._fence_lang = ""
+        self._fence_lines: list[str] = []
+
+    def feed(self, text: str) -> None:
+        self._partial += text
+        while "\n" in self._partial:
+            line, self._partial = self._partial.split("\n", 1)
+            self._line(line)
+
+    def _line(self, line: str) -> None:
+        stripped = line.strip()
+        if self._in_fence:
+            if stripped == "```":
+                self._emit_fence()
+                self._in_fence = False
+            else:
+                self._fence_lines.append(line)
+            return
+        if stripped.startswith("```"):
+            self._in_fence = True
+            self._fence_lang = stripped[3:].strip()
+            self._fence_lines = []
+            return
+        self._console.print(_render_markdown_line(line))
+
+    def _emit_fence(self) -> None:
+        code = "\n".join(self._fence_lines)
+        lang = self._fence_lang or "text"
+        try:
+            from rich.syntax import Syntax
+
+            self._console.print(
+                Syntax(
+                    code,
+                    lexer=lang,
+                    background_color="default",
+                    word_wrap=True,
+                )
+            )
+        except Exception:
+            for fence_line in self._fence_lines:
+                self._console.print(fence_line)
+        self._fence_lines = []
+
+    def flush(self) -> None:
+        """Flush a truncated fence and any unterminated partial line."""
+        if self._in_fence:
+            for fence_line in self._fence_lines:
+                self._console.print(fence_line)
+            self._fence_lines = []
+            self._in_fence = False
+        if self._partial:
+            self._console.print(_render_markdown_line(self._partial))
+            self._partial = ""
 
 _TOOL_KEY_PRIORITY: dict[str, list[str]] = {
     "bash": ["command"],
@@ -225,6 +353,9 @@ class CliOutputSink(OutputSink):
         self._tool_start_times: dict[str, float] = {}
         self._progress: Progress | None = None
         self._progress_task: Any = None
+        self._tool_progress: Progress | None = None
+        self._tool_progress_task: Any = None
+        self._stream_md: _StreamMarkdown | None = None
         self._last_heartbeat_at = 0.0
         self._last_heartbeat_op = ""
         self._last_tool_progress = ""
@@ -267,8 +398,13 @@ class CliOutputSink(OutputSink):
 
     def on_stream_chunk(self, chunk: str) -> None:
         self._stop_activity()
-        self._console.print(chunk, end="", markup=False)
         self._streamed.append(chunk)
+        if self._supports_live_status():
+            if self._stream_md is None:
+                self._stream_md = _StreamMarkdown(self._console)
+            self._stream_md.feed(chunk)
+            return
+        self._console.print(chunk, end="", markup=False)
         self._line_open = bool(chunk) and not chunk.endswith("\n")
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
@@ -277,7 +413,14 @@ class CliOutputSink(OutputSink):
             self._progress.stop()
             self._progress = None
             self._progress_task = None
+        if self._tool_progress is not None:
+            self._tool_progress.stop()
+            self._tool_progress = None
+            self._tool_progress_task = None
         self._finish_open_line()
+        if self._stream_md is not None:
+            self._stream_md.flush()
+            self._stream_md = None
         if not self._streamed and full_text:
             self._console.print(Markdown(full_text))
         elapsed = max(0.0, time.monotonic() - self._turn_started_at)
@@ -304,6 +447,10 @@ class CliOutputSink(OutputSink):
 
     def on_tool_end(self, name: str, result: str) -> None:
         self._stop_activity()
+        if self._tool_progress is not None:
+            self._tool_progress.stop()
+            self._tool_progress = None
+            self._tool_progress_task = None
         elapsed = ""
         start = self._tool_start_times.pop(name, None)
         if start is not None:
@@ -365,6 +512,27 @@ class CliOutputSink(OutputSink):
         message = str(progress.get("message") or "").strip()
         current = progress.get("current")
         total = progress.get("total")
+        if self._supports_live_status() and isinstance(total, (int, float)):
+            if self._tool_progress is None:
+                self._tool_progress = Progress(
+                    BarColumn(bar_width=None),
+                    TextColumn("{task.description}"),
+                    TimeElapsedColumn(),
+                    console=self._console,
+                    transient=True,
+                )
+                self._tool_progress_task = self._tool_progress.add_task(
+                    name,
+                    total=float(total),
+                )
+                self._tool_progress.start()
+            completed = float(current) if isinstance(current, (int, float)) else 0.0
+            self._tool_progress.update(
+                self._tool_progress_task,
+                completed=completed,
+                description=f"{name}: {message}" if message else name,
+            )
+            return
         suffix = ""
         if current is not None and total:
             try:

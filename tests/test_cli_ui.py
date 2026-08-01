@@ -231,3 +231,85 @@ def test_cli_prompt_session_persists_history(monkeypatch, tmp_path):
         assert "第二条输入" in persisted
     finally:
         cli._cli_prompt_session = None
+
+
+def _tty_sink():
+    from agent.core.output import CliOutputSink
+
+    console = Console(file=StringIO(), force_terminal=True)
+    return CliOutputSink(console), console
+
+
+def test_render_markdown_line_styles_inline_tokens():
+    from agent.core.output import _render_markdown_line
+
+    line = _render_markdown_line("## 标题 with **bold** and `code`")
+
+    assert line.plain == "## 标题 with bold and code"
+    styles = " ".join(str(span.style) for span in line.spans)
+    assert "bold" in styles
+    assert "cyan" in styles
+
+    bullet = _render_markdown_line("- 项目符号")
+    assert bullet.plain == "- 项目符号"
+
+    quote = _render_markdown_line("> 引用")
+    assert "italic" in " ".join(str(span.style) for span in quote.spans)
+
+
+def test_stream_markdown_buffers_code_fence():
+    sink, console = _tty_sink()
+
+    sink.on_stream_chunk("```python\nprint(1)\n```\n")
+
+    out = console.file.getvalue()
+    assert "print(1)" in out
+    assert "```" not in out
+
+
+def test_stream_markdown_flushes_truncated_fence_on_turn_end():
+    sink, console = _tty_sink()
+
+    sink.on_stream_chunk("```python\nprint(1)\n")
+    sink.on_turn_complete("", [])
+
+    assert "print(1)" in console.file.getvalue()
+    assert sink._stream_md is None
+
+
+def test_stream_chunk_renders_completed_lines_in_terminal():
+    sink, console = _tty_sink()
+
+    sink.on_stream_chunk("第一行\n第二行")
+
+    out = console.file.getvalue()
+    assert "第一行" in out
+    assert "第二行" not in out  # partial line stays buffered until newline
+    sink.on_turn_complete("", [])
+    assert "第二行" in console.file.getvalue()
+
+
+def test_stream_chunk_stays_raw_without_terminal():
+    from agent.core.output import CliOutputSink
+
+    console = Console(file=StringIO())
+    sink = CliOutputSink(console)
+
+    sink.on_stream_chunk("hello **world**")
+
+    assert console.file.getvalue() == "hello **world**"
+    assert sink._stream_md is None
+
+
+def test_tool_progress_renders_bar_in_terminal():
+    sink, console = _tty_sink()
+
+    sink.on_tool_start("shell", {"command": "long run"})
+    sink.on_tool_progress(
+        "shell", {"status": "running", "current": 3, "total": 10}
+    )
+    assert sink._tool_progress is not None
+    assert sink._tool_progress_task is not None
+
+    sink.on_tool_end("shell", '{"ok": true, "exit_code": 0, "output": "ok"}')
+    assert sink._tool_progress is None

@@ -47,6 +47,21 @@ history and paste-safe async input — without changing agent-core semantics.
 - `tests/test_cli_ui.py`: consent-gate regression tests (approve, decline,
   cancelled-turn, non-terminal sink) and history persistence tests.
 
+## P1: Streaming Markdown and Tool Progress
+
+- `agent/core/output.py`: a line-buffered streaming markdown renderer
+  (`_StreamMarkdown`) styles completed lines (headings, inline code/bold/
+  italic/links, lists, quotes, rules) and buffers fenced code until the
+  closing fence for syntax highlighting; a truncated fence flushes as plain
+  lines at turn end.  Terminal scrollback is preserved because lines are
+  printed once and never re-rendered.  Non-TTY sinks keep the raw chunk
+  path unchanged.
+- `agent/core/output.py`: tool progress events with `current`/`total` render
+  a transient rich progress bar under the tool line in terminals; without
+  totals the existing spinner/text behavior is retained.
+- `tests/test_cli_ui.py`: renderer, fence buffering, partial-line, progress
+  bar, and non-TTY fallback regressions.
+
 ## Verification
 
 Full suite passes (`uv run pytest -q`); interactive loop tests continue to
