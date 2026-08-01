@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -1501,6 +1502,86 @@ class LTMStore:
             ).fetchone()
         return self._row_to_conversation_turn(row) if row else None
 
+    def append_conversation_exchange(
+        self,
+        *,
+        session_id: str,
+        user_content: str,
+        assistant_content: str = "",
+        channel: str = "",
+        message_id: str = "",
+        reply_to_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+        created_at: Optional[str] = None,
+    ) -> bool:
+        """Atomically append one user/assistant exchange.
+
+        A non-empty message ID is an idempotency key for the user event.  The
+        check and both inserts share one immediate transaction so concurrent
+        deliveries cannot create duplicate or half-written exchanges.
+        """
+        clean_user_content = str(user_content or "").strip()
+        if not clean_user_content:
+            return False
+        clean_assistant_content = str(assistant_content or "").strip()
+        clean_session_id = str(session_id or "").strip() or "default"
+        clean_message_id = str(message_id or "").strip()
+        payload = metadata or {}
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        metadata_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        timestamp = created_at or _now()
+
+        conn = self._connect()
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if clean_message_id:
+                existing = conn.execute(
+                    """
+                    SELECT 1 FROM conversation_turns
+                    WHERE session_id = ? AND role = 'user' AND message_id = ?
+                    LIMIT 1
+                    """,
+                    (clean_session_id, clean_message_id),
+                ).fetchone()
+                if existing is not None:
+                    return False
+            conn.execute(
+                """
+                INSERT INTO conversation_turns (
+                    session_id, role, content, channel, message_id, reply_to_id,
+                    metadata_json, created_at
+                ) VALUES (?, 'user', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    clean_session_id,
+                    clean_user_content,
+                    str(channel or ""),
+                    clean_message_id,
+                    str(reply_to_id or ""),
+                    metadata_json,
+                    timestamp,
+                ),
+            )
+            if clean_assistant_content:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_turns (
+                        session_id, role, content, channel, message_id, reply_to_id,
+                        metadata_json, created_at
+                    ) VALUES (?, 'assistant', ?, ?, '', ?, ?, ?)
+                    """,
+                    (
+                        clean_session_id,
+                        clean_assistant_content,
+                        str(channel or ""),
+                        clean_message_id,
+                        metadata_json,
+                        timestamp,
+                    ),
+                )
+        return True
+
     def recent_conversation_turns(
         self,
         *,
@@ -1518,6 +1599,69 @@ class LTMStore:
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_conversation_turn(row) for row in reversed(rows)]
+
+    def search_conversation_turns(
+        self,
+        query: str,
+        *,
+        session_id: str,
+        limit: int = shared.RECENT_SESSION_TURNS,
+    ) -> list[ConversationTurn]:
+        terms = [term for term in _lexical_terms(query) if len(term) >= 2][:12]
+        if not terms:
+            return []
+        clauses = " OR ".join("content LIKE ?" for _ in terms)
+        params: list[Any] = [session_id, *(f"%{term}%" for term in terms), limit]
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM conversation_turns
+                WHERE session_id = ? AND ({clauses})
+                ORDER BY id DESC LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            rows_by_id = {int(row["id"]): row for row in rows}
+            for row in list(rows):
+                neighbor_id = int(row["id"]) + (1 if row["role"] == "user" else -1)
+                neighbor = conn.execute(
+                    """
+                    SELECT * FROM conversation_turns
+                    WHERE id = ? AND session_id = ?
+                    LIMIT 1
+                    """,
+                    (neighbor_id, session_id),
+                ).fetchone()
+                if neighbor is None:
+                    continue
+                if row["role"] == "user" and neighbor["role"] != "assistant":
+                    continue
+                if row["role"] == "assistant" and neighbor["role"] != "user":
+                    continue
+                rows_by_id[int(neighbor["id"])] = neighbor
+        ordered = sorted(rows_by_id.values(), key=lambda row: int(row["id"]))
+        return [self._row_to_conversation_turn(row) for row in ordered[-limit * 2 :]]
+
+    def has_conversation_message(
+        self,
+        *,
+        session_id: str,
+        message_id: str,
+        role: str = "user",
+    ) -> bool:
+        clean_message_id = str(message_id or "").strip()
+        if not clean_message_id:
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM conversation_turns
+                WHERE session_id = ? AND role = ? AND message_id = ?
+                LIMIT 1
+                """,
+                (str(session_id or "").strip() or "default", role, clean_message_id),
+            ).fetchone()
+        return row is not None
 
     def load_session_working_state(
         self,
@@ -2223,23 +2367,38 @@ class ConsolidationEngine:
 
         total = 0
         for msg in messages:
+            # Provider chat protocols charge a small envelope cost per message
+            # even when content is empty.
+            total += 4
             content = msg.get("content", "")
             if isinstance(content, str):
                 total += _count(content)
             elif isinstance(content, list):
                 for block in content:
                     if not isinstance(block, dict):
+                        total += _count(str(block))
                         continue
-                    # text / tool_result content
-                    text_val = block.get("text", "") or block.get("content", "")
-                    total += _count(str(text_val))
-                    # tool_use input JSON (was previously ignored)
-                    inp = block.get("input")
-                    if inp is not None:
-                        total += _count(json.dumps(inp, ensure_ascii=False))
+                    text_value = block.get("text", "") or block.get("content", "")
+                    if text_value:
+                        total += _count(str(text_value))
+                    tool_input = block.get("input")
+                    if tool_input is not None:
+                        total += _count(
+                            json.dumps(tool_input, ensure_ascii=False, default=str)
+                        )
+                    # Image/source blocks are provider-visible context too. Count
+                    # their serialized payload rather than silently treating them
+                    # as free; this is conservative for APIs that tokenize images
+                    # by dimensions instead of base64 length.
+                    if not text_value and tool_input is None:
+                        total += _count(
+                            json.dumps(block, ensure_ascii=False, default=str)
+                        )
             tool_calls = msg.get("tool_calls")
             if tool_calls:
-                total += _count(json.dumps(tool_calls, ensure_ascii=False))
+                total += _count(
+                    json.dumps(tool_calls, ensure_ascii=False, default=str)
+                )
         return total
 
     def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
@@ -2723,26 +2882,20 @@ class ContextManager:
         message_id: str = "",
         reply_to_id: str = "",
         metadata: Optional[dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         """Persist the completed exchange as durable event history."""
         session_id = self.staging.session_id
-        self.store.append_conversation_turn(
+        recorded = self.store.append_conversation_exchange(
             session_id=session_id,
-            role="user",
-            content=user_content,
+            user_content=user_content,
+            assistant_content=assistant_content,
             channel=channel,
             message_id=message_id,
             reply_to_id=reply_to_id,
             metadata=metadata,
         )
-        self.store.append_conversation_turn(
-            session_id=session_id,
-            role="assistant",
-            content=assistant_content,
-            channel=channel,
-            reply_to_id=message_id,
-            metadata=metadata,
-        )
+        if not recorded:
+            return False
         for assertion in self._extract_turn_fact_assertions(
             role="user",
             content=user_content,
@@ -2759,6 +2912,7 @@ class ContextManager:
             source_id=reply_to_id or message_id,
         ):
             self.store.add_fact_assertion(assertion)
+        return True
 
     def idle_elapsed(self) -> float:
         """Seconds since last activity (0 if never active)."""
@@ -3026,12 +3180,72 @@ class ContextManager:
             index += 1
         return units
 
+    @classmethod
+    def _repair_tool_history(cls, messages: list[dict]) -> list[dict]:
+        """Drop incomplete provider protocol units left by interrupted turns."""
+        repaired: list[dict] = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            role = message.get("role")
+            openai_calls = message.get("tool_calls") if role == "assistant" else None
+            openai_ids = {
+                str(call.get("id") or "")
+                for call in openai_calls or []
+                if isinstance(call, dict)
+            }
+            content = message.get("content")
+            blocks = content if isinstance(content, list) else []
+            anthropic_ids = {
+                str(block.get("id") or "")
+                for block in blocks
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            }
+            expected_ids = openai_ids | anthropic_ids
+            if expected_ids:
+                cursor = index + 1
+                answered: set[str] = set()
+                result_messages: list[dict] = []
+                while cursor < len(messages):
+                    following = messages[cursor]
+                    if following.get("role") == "tool":
+                        tool_id = str(following.get("tool_call_id") or "")
+                        answered.add(tool_id)
+                        result_messages.append(following)
+                        cursor += 1
+                        continue
+                    result_ids = cls._anthropic_tool_result_ids(following)
+                    if result_ids is not None:
+                        answered.update(result_ids)
+                        result_messages.append(following)
+                        cursor += 1
+                        continue
+                    break
+                if "" not in expected_ids and answered == expected_ids:
+                    repaired.append(message)
+                    repaired.extend(result_messages)
+                index = cursor
+                continue
+            if role == "tool" or cls._anthropic_tool_result_ids(message) is not None:
+                index += 1
+                continue
+            repaired.append(message)
+            index += 1
+        if len(repaired) != len(messages):
+            _emit_consolidation(
+                "tool_history_repaired",
+                messages_before=len(messages),
+                messages_after=len(repaired),
+            )
+        return repaired
+
     def compact_messages(
         self, messages: list[dict], *, input_token_budget: int
     ) -> list[dict]:
         budget = int(input_token_budget)
         if budget <= 0:
             raise ContextLimitError("provider input token budget is not positive")
+        messages = self._repair_tool_history(messages)
         newest_request_index = next(
             (
                 index
@@ -3319,10 +3533,16 @@ class ContextManager:
         """Return durable event-history evidence when the query asks for it."""
         if not self._is_episode_recall_query(query):
             return ""
-        turns = self.store.recent_conversation_turns(
+        turns = self.store.search_conversation_turns(
+            query,
             session_id=self.staging.session_id,
             limit=limit,
         )
+        if not turns:
+            turns = self.store.recent_conversation_turns(
+                session_id=self.staging.session_id,
+                limit=limit,
+            )
         if not turns:
             return ""
         lines = ["## Conversation History"]
@@ -3360,15 +3580,16 @@ class ContextManager:
                 ).strip()
                 if text:
                     visible_contents.add(text)
-        staged_contents = [
-            str(msg.get("content", "")).strip()
-            for msg in staged[-limit:]
+        missing = [
+            msg
+            for msg in staged
             if str(msg.get("content", "")).strip()
+            and str(msg.get("content", "")).strip() not in visible_contents
         ]
-        if not staged_contents or all(text in visible_contents for text in staged_contents):
+        if not missing:
             return ""
         lines = ["## Current Session (not yet consolidated)"]
-        for msg in staged[-limit:]:
+        for msg in missing[-limit:]:
             role = str(msg.get("role", "unknown")).upper()
             content = str(msg.get("content", "")).strip()
             if content:
@@ -3546,12 +3767,18 @@ class ContextManager:
         include_completed: bool = False,
     ) -> dict[str, Any]:
         threshold = 2.0
+        continuation_request = bool(
+            re.search(
+                r"(?:^|\s)(?:continue|resume)(?:\s|$)|继续|接着(?:做|来|完成)?|恢复(?:任务|工作)?",
+                str(query or "").strip().lower(),
+            )
+        )
         candidates: list[dict[str, Any]] = []
         scored: list[tuple[float, dict[str, Any]]] = []
         for candidate in self._working_state_candidates(state):
             complete = self._working_state_is_complete(candidate)
             score = self._working_state_relevance_score(candidate, query)
-            eligible = include_completed or not complete
+            eligible = include_completed or continuation_request or not complete
             candidate_trace = {
                 "task_id": str(candidate.get("task_id", "") or ""),
                 "status": str(candidate.get("status", "") or ""),
@@ -3562,7 +3789,7 @@ class ContextManager:
                 ),
             }
             candidates.append(candidate_trace)
-            if eligible and score >= threshold:
+            if eligible and (score >= threshold or continuation_request):
                 scored.append((score, candidate))
         selected: dict[str, Any] | None = None
         if not scored:
@@ -4043,6 +4270,9 @@ class BackgroundMemoryWorker:
         # the main asyncio event loop.
         self._wake_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._active_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._active_task: Optional[asyncio.Task[Any]] = None
+        self._state_lock = threading.Lock()
 
     def start(self) -> None:
         """Start the worker thread once."""
@@ -4060,6 +4290,12 @@ class BackgroundMemoryWorker:
         """Signal the worker thread to stop."""
         self._stop_event.set()
         self._wake_event.set()  # unblock any ongoing wait() immediately
+        with self._state_lock:
+            loop = self._active_loop
+            task = self._active_task
+        if loop is not None and task is not None and not task.done():
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(task.cancel)
 
     def wake(self) -> None:
         """Interrupt the poll sleep so the worker runs its next job immediately.
@@ -4075,6 +4311,25 @@ class BackgroundMemoryWorker:
         """Wait for the worker thread to exit in async call sites."""
         if self._thread:
             await asyncio.to_thread(self._thread.join)
+
+    async def _process_job(self, client: Any) -> bool:
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(
+            self.ctx_mgr.process_one_job(
+                client,
+                self.model,
+                api_format=self.api_format,
+            )
+        )
+        with self._state_lock:
+            self._active_loop = loop
+            self._active_task = task
+        try:
+            return await task
+        finally:
+            with self._state_lock:
+                self._active_loop = None
+                self._active_task = None
 
     def _run(self) -> None:
         client = self.client_factory() if self.client_factory else self.client
@@ -4095,17 +4350,16 @@ class BackgroundMemoryWorker:
                         )
                         if not should_run:
                             break
-                        processed = asyncio.run(
-                            self.ctx_mgr.process_one_job(
-                                client,
-                                self.model,
-                                api_format=self.api_format,
-                            )
-                        )
+                        processed = asyncio.run(self._process_job(client))
                         if not processed:
                             break
                         if not on_demand:
                             continue
+                except asyncio.CancelledError:
+                    if not self._stop_event.is_set():
+                        shared.CONSOLE.print(
+                            "[dim]Background consolidation cancelled unexpectedly[/dim]"
+                        )
                 except Exception as e:
                     shared.CONSOLE.print(f"[dim]Background consolidation error: {e}[/dim]")
                 # Sleep for poll_seconds OR until wake()/stop() interrupts,

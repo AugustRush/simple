@@ -398,13 +398,25 @@ async def _interactive_loop(components: dict, cfg: dict):
         if ctx_mgr and ctx_mgr.should_session_end_sleep():
             shared.CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
             try:
-                ctx_mgr.enqueue_consolidation("session_end")
-                while ctx_mgr.pending_jobs():
-                    await ctx_mgr.process_one_job(
-                        components["client"],
-                        components["model"],
-                        api_format=agent.api_format,
-                    )
+                flush_timeout = max(
+                    1.0,
+                    float(
+                        cfg.get("memory", {}).get(
+                            "session_end_flush_timeout_seconds",
+                            shared.DEFAULT_SESSION_END_FLUSH_TIMEOUT_SECONDS,
+                        )
+                    ),
+                )
+                async with asyncio.timeout(flush_timeout):
+                    ctx_mgr.enqueue_consolidation("session_end")
+                    while ctx_mgr.pending_jobs():
+                        processed = await ctx_mgr.process_one_job(
+                            components["client"],
+                            components["model"],
+                            api_format=agent.api_format,
+                        )
+                        if not processed:
+                            break
                 ctx.messages = ctx_mgr.compact_messages(
                     ctx.messages,
                     input_token_budget=agent.context_window - agent.max_tokens,

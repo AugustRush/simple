@@ -65,6 +65,9 @@ DEFAULT_CONFIG: dict = {
     "memory": {
         "tidy_interval_seconds": shared.MEMORY_TIDY_INTERVAL,
         "tidy_file_threshold": shared.MEMORY_TIDY_FILE_THRESHOLD,
+        "session_end_flush_timeout_seconds": (
+            shared.DEFAULT_SESSION_END_FLUSH_TIMEOUT_SECONDS
+        ),
     },
     # ── Multi-agent orchestration ─────────────────────────────────────────
     "orchestration": {

@@ -427,8 +427,6 @@ class BaseAgent:
                 structured_lines.append(
                     f"- {dep}: {self._stable_json(result.structured_content)}"
                 )
-            if result.full_content:
-                handoff.setdefault(f"{dep}_full_content", result.full_content)
         task = self._append_named_block(
             task,
             "Upstream structured results:",
@@ -2314,7 +2312,7 @@ class BaseAgent:
                     if stop_reason == "tool_use" and tool_uses:
                         if text:
                             result_text = text
-                        ctx.messages.append(self._assistant_message(response, text))
+                        assistant_tool_message = self._assistant_message(response, text)
 
                         # Set intent context so tool executors can enforce
                         # the intent-before-action protocol.
@@ -2397,6 +2395,11 @@ class BaseAgent:
                             _iteration += 1
                             continue
 
+                        # Commit the provider protocol unit only after every tool
+                        # and post-processing step succeeded. A cancellation or
+                        # exception must not leave an assistant tool-call without
+                        # its matching result in persistent conversation state.
+                        ctx.messages.append(assistant_tool_message)
                         ctx.messages.extend(
                             self._tool_result_messages(tool_uses, filtered_results)
                         )
@@ -2563,14 +2566,15 @@ class BaseAgent:
         if ctx_mgr:
             if record_kwargs is None:
                 record_kwargs = {}
-            ctx_mgr.record_turn(
+            recorded = ctx_mgr.record_turn(
                 user_content=user_content,
                 assistant_content=assistant_content or "",
                 channel=channel,
                 **record_kwargs,
             )
+            new_turn = recorded is not False
             record_runtime_event = getattr(ctx_mgr, "record_runtime_event", None)
-            if callable(record_runtime_event):
+            if new_turn and callable(record_runtime_event):
                 metadata = (
                     record_kwargs.get("metadata", {})
                     if isinstance(record_kwargs, dict)
@@ -2595,11 +2599,12 @@ class BaseAgent:
                     },
                     turn_id=turn_id,
                 )
-            ctx_mgr.staging.append("user", user_content)
-            if assistant_content:
-                ctx_mgr.staging.append("assistant", assistant_content)
-            if ctx_mgr.should_enqueue_consolidation():
-                ctx_mgr.enqueue_consolidation("staged_turns")
+            if new_turn:
+                ctx_mgr.staging.append("user", user_content)
+                if assistant_content:
+                    ctx_mgr.staging.append("assistant", assistant_content)
+                if ctx_mgr.should_enqueue_consolidation():
+                    ctx_mgr.enqueue_consolidation("staged_turns")
         # Post-turn compaction serves two purposes:
         # 1. Trim working memory when a session-level context manager
         #    has a lower threshold than the agent default (multi-tenant).
@@ -2735,6 +2740,8 @@ class BaseAgent:
                 sub_ctx.metadata["required_skills"] = list(
                     active_ctx.metadata["required_skills"]
                 )
+            if "cancel_token" in active_ctx.metadata:
+                sub_ctx.metadata["cancel_token"] = active_ctx.metadata["cancel_token"]
 
     def _create_sub_agent(self, sub_registry: "ToolRegistry") -> "BaseAgent":
         sub_agent = BaseAgent(
@@ -3030,7 +3037,6 @@ class BaseAgent:
                 full_content, role, shaped_task
             )
             payload["content"] = summary
-            payload["full_content"] = full_content
         # Persist sub-agent findings directly to LTM rather than the
         # staging buffer.  Staging is reserved for real user/assistant
         # conversation turns; sub-agent traces must not be mixed in or
@@ -3042,12 +3048,12 @@ class BaseAgent:
                 now = datetime.now(timezone.utc).strftime(
                     "%Y-%m-%d %H:%M UTC"
                 )
-                self.context_manager.store.write_entry(
+                self.context_manager.store.add_entry(
                     LTMEntry(
                         id=entry_id,
                         content=(
                             f"sub-agent [{role}] task: {shaped_task[:500]}\n\n"
-                            f"result: {content_to_store[:2000]}"
+                            f"result: {content_to_store}"
                         ),
                         importance=0.5,
                         category="episodes",

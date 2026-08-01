@@ -1,5 +1,6 @@
 """Tests for ConsolidationEngine and ContextManager — sleep/decay/parse/dirty-flag/idle."""
 
+import threading
 import time
 
 import pytest
@@ -73,6 +74,43 @@ def test_conversation_history_survives_staging_clear(tmp_path):
     assert staging.read_all() == []
     turns = store.recent_conversation_turns(session_id="session-1", limit=10)
     assert [turn.content for turn in turns] == ["这个会进入 durable history"]
+
+
+def test_record_turn_deduplicates_concurrent_message_delivery(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    barrier = threading.Barrier(8)
+    outcomes = []
+
+    def _record():
+        try:
+            barrier.wait()
+            outcomes.append(
+                ctx_mgr.record_turn(
+                    user_content="concurrent request",
+                    assistant_content="single reply",
+                    message_id="msg-concurrent",
+                )
+            )
+        except BaseException as exc:
+            outcomes.append(exc)
+
+    threads = [threading.Thread(target=_record) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes.count(True) == 1
+    assert outcomes.count(False) == 7
+    turns = ctx_mgr.store.recent_conversation_turns(
+        session_id=ctx_mgr.staging.session_id,
+        limit=10,
+    )
+    assert [(turn.role, turn.content) for turn in turns] == [
+        ("user", "concurrent request"),
+        ("assistant", "single reply"),
+    ]
 
 
 def test_agent_runtime_event_persists_and_projects_working_state(tmp_path):
@@ -173,6 +211,25 @@ def test_retrieve_implicit_context_includes_working_state_after_restart(tmp_path
     assert "Restored Working Context" in result
     assert "创建生态环境相关文件" in result
     assert "Use it when relevant" in result
+
+
+def test_continue_recovers_most_recent_completed_working_state(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.store.save_session_working_state(
+        ctx_mgr.staging.session_id,
+        {
+            "task_id": "garden",
+            "active_goal": "实现 3D 花园",
+            "status": "completed",
+            "progress": "已生成场景骨架",
+            "updated_at": "2026-08-01 10:00 UTC",
+        },
+    )
+
+    result = ctx_mgr.working_state_context("继续")
+
+    assert "实现 3D 花园" in result
+    assert ctx_mgr.last_working_state_recovery_trace["selected"] is True
 
 
 def test_successful_working_state_not_injected_for_unrelated_query(tmp_path):
@@ -516,8 +573,8 @@ def test_estimate_tokens(tmp_path):
         {"role": "assistant", "content": "Hi there"},  # 8 chars
     ]
     tokens = eng.estimate_tokens(messages)
-    # Default chars_per_token=4: (11+8) // 4 = 4
-    assert tokens == (11 + 8) // 4
+    # Content estimate plus four protocol tokens per chat message.
+    assert tokens == (11 // 4) + (8 // 4) + 8
 
 
 def test_estimate_tokens_respects_chars_per_token(tmp_path):
@@ -526,8 +583,8 @@ def test_estimate_tokens_respects_chars_per_token(tmp_path):
     store = LTMStore(context_dir=tmp_path / "context")
     eng = ConsolidationEngine(store=store, chars_per_token=2.0)
     messages = [{"role": "user", "content": "abcdefgh"}]  # 8 non-CJK chars
-    # 8 chars / 2.0 = 4 tokens
-    assert eng.estimate_tokens(messages) == 4
+    # 8 chars / 2.0 + four message-envelope tokens.
+    assert eng.estimate_tokens(messages) == 8
 
 
 def test_estimate_tokens_respects_cjk_chars_per_token(tmp_path):
@@ -538,9 +595,9 @@ def test_estimate_tokens_respects_cjk_chars_per_token(tmp_path):
     eng_relaxed = ConsolidationEngine(store=store, cjk_chars_per_token=2.0)
     messages = [{"role": "user", "content": "你好世界"}]  # 4 CJK chars
     # default (1.0): 4 / 1.0 = 4 tokens
-    assert eng_default.estimate_tokens(messages) == 4
+    assert eng_default.estimate_tokens(messages) == 8
     # relaxed (2.0): 4 / 2.0 = 2 tokens
-    assert eng_relaxed.estimate_tokens(messages) == 2
+    assert eng_relaxed.estimate_tokens(messages) == 6
 
 
 def test_estimate_tokens_mixed_cjk_and_latin(tmp_path):
@@ -551,7 +608,7 @@ def test_estimate_tokens_mixed_cjk_and_latin(tmp_path):
     # 4 CJK + 8 Latin chars
     messages = [{"role": "user", "content": "你好world!!!"}]
     # CJK: 2 chars / 1.0 = 2 tokens; Latin: 8 chars / 4.0 = 2 tokens → 4 total
-    assert eng.estimate_tokens(messages) == 4
+    assert eng.estimate_tokens(messages) == 8
 
 
 def test_estimate_tokens_list_content(tmp_path):
@@ -566,6 +623,26 @@ def test_estimate_tokens_list_content(tmp_path):
     ]
     tokens = eng.estimate_tokens(messages)
     assert tokens > 0
+
+
+def test_estimate_tokens_counts_empty_message_envelopes_and_images(tmp_path):
+    eng = make_engine(tmp_path)
+
+    assert eng.estimate_tokens([{"role": "user", "content": ""}] * 10) == 40
+    image_tokens = eng.estimate_tokens(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + "A" * 400},
+                    }
+                ],
+            }
+        ]
+    )
+    assert image_tokens > 50
 
 
 def test_should_sleep_true(tmp_path):
@@ -627,9 +704,7 @@ def test_compact_messages_drops_complete_openai_tool_turn(tmp_path):
     assert compacted == [{"role": "user", "content": "new request"}]
 
 
-def test_compact_messages_rejects_incomplete_anthropic_tool_turn(tmp_path):
-    from agent import ContextLimitError
-
+def test_compact_messages_repairs_incomplete_anthropic_tool_turn(tmp_path):
     ctx_mgr = make_ctx_manager(tmp_path)
     messages = [
         {"role": "user", "content": "request"},
@@ -641,8 +716,31 @@ def test_compact_messages_rejects_incomplete_anthropic_tool_turn(tmp_path):
         },
     ]
 
-    with pytest.raises(ContextLimitError, match="incomplete"):
-        ctx_mgr.compact_messages(messages, input_token_budget=100)
+    compacted = ctx_mgr.compact_messages(messages, input_token_budget=100)
+
+    assert compacted == [{"role": "user", "content": "request"}]
+
+
+def test_compact_messages_repairs_incomplete_openai_tool_turn(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call-1", "function": {"name": "lookup", "arguments": "{}"}}
+            ],
+        },
+        {"role": "user", "content": "new request"},
+    ]
+
+    compacted = ctx_mgr.compact_messages(messages, input_token_budget=100)
+
+    assert compacted == [
+        {"role": "user", "content": "old request"},
+        {"role": "user", "content": "new request"},
+    ]
 
 
 def test_parse_entries(tmp_path):
@@ -1327,6 +1425,21 @@ def test_record_turn_persists_assistant_identity_fact_before_consolidation(tmp_p
     )
 
     assert "assistant.name = 阿福" in result
+
+
+def test_record_turn_extracts_identity_from_assistant_message_alone(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+
+    ctx_mgr.record_turn(
+        user_content="请介绍一下你自己。",
+        assistant_content="你好，我叫阿福。",
+    )
+
+    facts = ctx_mgr.store.read_resolved_facts(
+        subject="assistant",
+        predicate="name",
+    )
+    assert [fact.value for fact in facts] == ["阿福"]
 
 
 def test_retrieve_implicit_context_excludes_conflicted_assistant_identity(tmp_path):

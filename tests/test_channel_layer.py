@@ -9,6 +9,7 @@ import json
 import logging
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -1158,6 +1159,128 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
     assert worker_instances[0].started is True
     assert worker_instances[0].wake_calls == 1
     assert root_ctx_mgr.spawned["chat-a"].enqueued == ["compact_triggered"]
+
+
+def test_channel_runner_flushes_session_staging_on_exit():
+    class _FakeChannel(Channel):
+        async def start(self, handler):
+            await handler(IncomingMessage(text="hello"), OutputSink())
+
+        async def stop(self):
+            return None
+
+        def create_sink(self, msg):
+            return OutputSink()
+
+    class _Manager:
+        staging = SimpleNamespace(session_id="chat-1", entries=["user", "assistant"])
+
+        def __init__(self):
+            self.enqueued = []
+            self.pending = False
+
+        def should_session_end_sleep(self):
+            return bool(self.staging.entries)
+
+        def enqueue_consolidation(self, reason):
+            self.enqueued.append(reason)
+            self.pending = True
+
+        def pending_jobs(self):
+            return int(self.pending)
+
+        async def process_one_job(self, *_args, **_kwargs):
+            self.pending = False
+            self.staging.entries.clear()
+            return True
+
+    manager = _Manager()
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": SimpleNamespace(api_format="openai"),
+            "client": object(),
+            "model": "fake-model",
+            "plugin_catalog": None,
+        },
+        cfg={},
+    )
+
+    def _make_handler(sessions):
+        async def _handler(_msg, _sink):
+            sessions["chat-1"] = SimpleNamespace(
+                memory_worker=None,
+                context_manager=manager,
+            )
+
+        return _handler
+
+    runner._make_message_handler = _make_handler
+
+    asyncio.run(runner._run_channel(_FakeChannel()))
+
+    assert manager.enqueued == ["session_end"]
+    assert manager.staging.entries == []
+
+
+def test_channel_runner_exit_timeout_retains_session_staging(caplog):
+    class _FakeChannel(Channel):
+        async def start(self, handler):
+            await handler(IncomingMessage(text="hello"), OutputSink())
+
+        async def stop(self):
+            return None
+
+        def create_sink(self, msg):
+            return OutputSink()
+
+    class _Manager:
+        staging = SimpleNamespace(session_id="chat-1", entries=["user", "assistant"])
+
+        def __init__(self):
+            self.enqueued = []
+
+        def should_session_end_sleep(self):
+            return True
+
+        def enqueue_consolidation(self, reason):
+            self.enqueued.append(reason)
+
+        def pending_jobs(self):
+            return 1
+
+        async def process_one_job(self, *_args, **_kwargs):
+            raise TimeoutError
+
+    manager = _Manager()
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": SimpleNamespace(api_format="openai"),
+            "client": object(),
+            "model": "fake-model",
+            "plugin_catalog": None,
+        },
+        cfg={},
+    )
+
+    def _make_handler(sessions):
+        async def _handler(_msg, _sink):
+            sessions["chat-1"] = SimpleNamespace(
+                memory_worker=None,
+                context_manager=manager,
+            )
+
+        return _handler
+
+    runner._make_message_handler = _make_handler
+    caplog.set_level(logging.WARNING, logger="agent.channels.base")
+
+    asyncio.run(runner._run_channel(_FakeChannel()))
+
+    assert manager.enqueued == ["session_end"]
+    assert manager.staging.entries == ["user", "assistant"]
+    assert "staging retained" in caplog.text
 
 
 def test_channel_runner_fires_session_end_per_chat_session():

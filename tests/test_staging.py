@@ -329,6 +329,30 @@ def test_retrieve_implicit_context_includes_recent_staging_after_compaction(
     assert "keep retries enabled after failures" in result
 
 
+def test_retrieve_implicit_context_recovers_missing_turn_before_visible_tail(tmp_path):
+    from agent import ConsolidationEngine, ContextManager, LocalRetriever, LTMStore, StagingBuffer
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    staging = StagingBuffer(path=tmp_path / "staging.jsonl")
+    staging.append("user", "important decision before the visible tail")
+    for index in range(6):
+        staging.append("assistant", f"visible tail {index}")
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=staging,
+    )
+    current = [
+        {"role": "assistant", "content": f"visible tail {index}"}
+        for index in range(6)
+    ]
+
+    result = manager.retrieve_implicit_context("continue", current_messages=current)
+
+    assert "important decision before the visible tail" in result
+
+
 def test_sleep_clears_staging(tmp_path):
     """After sleep(), the staging file is cleared."""
     import asyncio

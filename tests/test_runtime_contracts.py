@@ -389,6 +389,57 @@ def test_post_turn_maintenance_records_runtime_event_turn_id():
     assert events[0]["turn_id"] == "msg-123"
 
 
+def test_post_turn_maintenance_is_idempotent_for_replayed_message_id(tmp_path):
+    from agent import (
+        AgentContext,
+        BaseAgent,
+        ConsolidationEngine,
+        ContextManager,
+        LocalRetriever,
+        LTMStore,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir, memory_dir=tmp_path / "memory")
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
+    )
+
+    class _Agent:
+        context_window = 8192
+        max_tokens = 1024
+
+    ctx = AgentContext(system_prompt="system")
+    kwargs = {
+        "ctx_mgr": manager,
+        "agent": _Agent(),
+        "ctx": ctx,
+        "user_content": "hello",
+        "assistant_content": "reply",
+        "channel": "feishu",
+        "record_kwargs": {
+            "message_id": "msg-123",
+            "metadata": {"message_id": "msg-123"},
+        },
+    }
+
+    BaseAgent._post_turn_maintenance(**kwargs)
+    BaseAgent._post_turn_maintenance(**kwargs)
+
+    turns = store.recent_conversation_turns(session_id="session-1", limit=10)
+    events = store.recent_agent_events(session_id="session-1", limit=10)
+    assert [(turn.role, turn.content) for turn in turns] == [
+        ("user", "hello"),
+        ("assistant", "reply"),
+    ]
+    assert [event.event_type for event in events] == ["turn_finished"]
+    assert manager.staging.count() == 2
+
+
 def test_turn_runner_complete_turn_uses_live_component_updates():
     maintenance_calls = []
     values = {

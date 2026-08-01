@@ -674,6 +674,16 @@ class AgentCore:
                         content_preview=(final_result.text or "")[:80],
                         duration_ms=agent_duration_ms,
                     )
+                    completion_attempted = True
+                    completion_runner = self._turn_runner()
+                    complete_turn = getattr(completion_runner, "complete_turn", None)
+                    if not callable(complete_turn):
+                        complete_turn = TurnRunner(self._components).complete_turn
+                    hook_results = await complete_turn(
+                        current_input,
+                        state,
+                        final_result,
+                    )
                     if sink is not None:
                         sink.on_turn_complete(
                             final_result.text or "",
@@ -685,12 +695,6 @@ class AgentCore:
                     collector.emit("turn_response_delivered")
                     if final_result.error:
                         collector.emit("turn_error_reported", error=final_result.error)
-                    completion_attempted = True
-                    hook_results = await self._turn_runner().complete_turn(
-                        current_input,
-                        state,
-                        final_result,
-                    )
                     continued = False
                     for hook_result in hook_results or []:
                         if (

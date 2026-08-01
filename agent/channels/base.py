@@ -197,6 +197,8 @@ class ChannelRunner:
                     await ch.stop()
                 except Exception:
                     pass
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _run_channel(self, channel: Channel) -> None:
         import agent as agent_module
@@ -225,6 +227,46 @@ class ChannelRunner:
                     continue
                 worker.stop()
                 await worker.wait()
+            for session in sessions.values():
+                manager = session.context_manager
+                should_flush = getattr(manager, "should_session_end_sleep", None)
+                if manager is None or not callable(should_flush) or not should_flush():
+                    continue
+                enqueue = getattr(manager, "enqueue_consolidation", None)
+                process = getattr(manager, "process_one_job", None)
+                pending = getattr(manager, "pending_jobs", None)
+                if not all(callable(fn) for fn in (enqueue, process, pending)):
+                    continue
+                flush_timeout = max(
+                    1.0,
+                    float(
+                        self._cfg.get("memory", {}).get(
+                            "session_end_flush_timeout_seconds",
+                            shared.DEFAULT_SESSION_END_FLUSH_TIMEOUT_SECONDS,
+                        )
+                    ),
+                )
+                try:
+                    async with asyncio.timeout(flush_timeout):
+                        enqueue("session_end")
+                        while pending():
+                            processed = await process(
+                                components["client"],
+                                components["model"],
+                                api_format=components["agent"].api_format,
+                            )
+                            if not processed:
+                                break
+                except TimeoutError:
+                    logging.getLogger(__name__).warning(
+                        "Session-end consolidation timed out; staging retained",
+                        extra={"session_id": manager.staging.session_id},
+                    )
+                except Exception:
+                    logging.getLogger(__name__).exception(
+                        "Session-end consolidation failed; staging retained",
+                        extra={"session_id": manager.staging.session_id},
+                    )
             if plugin_catalog:
                 try:
                     for session_id, session in sessions.items():

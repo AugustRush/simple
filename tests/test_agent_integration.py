@@ -4245,6 +4245,45 @@ def test_send_message_reports_terminal_error_when_openai_length_stays_truncated(
     assert result.error == "Model response remained truncated after 2 auto-continue attempts"
 
 
+def test_tool_execution_failure_does_not_leave_incomplete_tool_history(monkeypatch):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    response = agent_module._OAIResponse(
+        [
+            agent_module._OAIChoice(
+                "tool_calls",
+                agent_module._OAIMsg(
+                    "",
+                    [
+                        agent_module._OAITC(
+                            "call-1",
+                            agent_module._OAIFunc("lookup", "{}"),
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return response
+
+    async def fail_tools(tool_uses, orchestration_decision=None):
+        raise RuntimeError("tool failed unexpectedly")
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fail_tools)
+    ctx = agent_module.AgentContext(system_prompt="system")
+
+    result = asyncio.run(agent.send_message(ctx, "do it"))
+
+    assert result.error == "tool failed unexpectedly"
+    assert ctx.messages == [{"role": "user", "content": "do it"}]
+
+
 def test_base_agent_runs_internal_parallel_orchestration_without_public_tool_exposure(
     monkeypatch,
 ):

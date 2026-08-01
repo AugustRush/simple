@@ -75,6 +75,44 @@ def test_background_worker_processes_queued_consolidation(tmp_path):
     assert ctx_mgr.staging.count() == 0
 
 
+def test_background_worker_stop_cancels_active_job_cleanly(capsys):
+    from agent import BackgroundMemoryWorker
+
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    class _BlockingContextManager:
+        def should_process_jobs(self):
+            return True
+
+        async def process_one_job(self, *_args, **_kwargs):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    worker = BackgroundMemoryWorker(
+        _BlockingContextManager(),
+        client=None,
+        model="x",
+        api_format="openai",
+        poll_seconds=10,
+    )
+    worker.start()
+    assert started.wait(timeout=1)
+
+    started_at = time.monotonic()
+    worker.stop()
+    asyncio.run(worker.wait())
+
+    assert time.monotonic() - started_at < 1
+    assert cancelled.is_set()
+    captured = capsys.readouterr()
+    assert "Exception in thread" not in captured.err
+    assert "Background consolidation error" not in captured.out
+
+
 def test_process_one_job_materializes_resolved_fact_from_identity_entry(tmp_path):
     from agent import LTMEntry
 
