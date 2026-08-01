@@ -688,6 +688,7 @@ async def _interactive_loop_coro(
             cfg,
             console,
             live_status=tui is None,
+            echo_input=tui is not None,
         )
     finally:
         shared.CONSOLE = original_console
@@ -699,6 +700,7 @@ async def _interactive_loop_body(
     console,
     *,
     live_status: bool = True,
+    echo_input: bool = False,
 ):
     """Main interactive chat loop."""
     global _current_cancel_token
@@ -816,13 +818,16 @@ async def _interactive_loop_body(
                     menu_input = await _command_menu(router)
                     if menu_input is None:
                         continue
-                    shared.CONSOLE.print(f"[dim]› {menu_input}[/dim]")
                     user_input = menu_input
+                    if not echo_input:
+                        shared.CONSOLE.print(f"[dim]› {menu_input}[/dim]")
             except (EOFError, KeyboardInterrupt):
                 break
 
             if not user_input.strip():
                 continue
+            if echo_input:
+                console.print(f"[green]›[/green] {markup_escape(user_input)}")
 
             _turn_sink = CliOutputSink(console, live_status=live_status)
             try:

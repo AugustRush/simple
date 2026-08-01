@@ -129,8 +129,7 @@ class TuiSession:
         )
         hint_window = Window(
             FormattedTextControl(
-                "Enter 发送 · 输入 / 实时筛选命令 · ↑/↓ 历史 · "
-                "Ctrl+C 取消 · Ctrl+D 退出"
+                "Enter 发送 · 输入 / 实时筛选命令 · Ctrl+C 取消 · Ctrl+D 退出"
             ),
             height=1,
             style="class:bottom-hint",
@@ -176,16 +175,12 @@ class TuiSession:
             buffer = event.app.current_buffer
             if buffer.complete_state is not None:
                 buffer.complete_previous()
-            elif not buffer.text:
-                buffer.history_backward(count=event.arg)
 
         @kb.add("down")
         def _down(event: Any) -> None:
             buffer = event.app.current_buffer
             if buffer.complete_state is not None:
                 buffer.complete_next()
-            elif not buffer.text:
-                buffer.history_forward(count=event.arg)
 
         @kb.add("c-c")
         @kb.add(Keys.SIGINT)
