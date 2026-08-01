@@ -3,6 +3,7 @@ openai
 typer
 rich
 mcp
+prompt_toolkit
 
 [feishu]
 lark-oapi

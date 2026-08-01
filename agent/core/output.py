@@ -4,6 +4,7 @@ import contextvars
 from dataclasses import dataclass, field
 import json
 import re
+import sys
 import time
 from abc import ABC
 from pathlib import Path
@@ -13,6 +14,11 @@ from typing import Any, Mapping, Optional
 from rich.markdown import Markdown
 from rich.markup import escape as _markup_escape
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.history import InMemoryHistory
+
+_APPROVAL_PROMPT = PromptSession(history=InMemoryHistory())
 
 _TOOL_KEY_PRIORITY: dict[str, list[str]] = {
     "bash": ["command"],
@@ -123,6 +129,25 @@ class OutputSink(ABC):
 
     def on_tool_blocked(self, name: str, reason: str) -> None:
         """Called when a plugin vetoes a tool call before execution."""
+
+    async def on_tool_confirmation(
+        self,
+        name: str,
+        *,
+        command: str,
+        risk_level: str,
+        reason: str,
+        confirmation_token: str,
+        scope: Any,
+    ) -> bool:
+        """Ask the human whether a medium-risk tool action may proceed.
+
+        Returns True only after the human approved in their own medium.
+        The default returns False because there is no interactive human at
+        this sink; callers must then fall back to the structured
+        confirmation-required result instead of assuming consent.
+        """
+        return False
 
     def on_info(self, content: Any) -> None:
         """Display an informational renderable."""
@@ -300,6 +325,40 @@ class CliOutputSink(OutputSink):
             f"[yellow]{_markup_escape(_clip_single_line(reason))}[/yellow]"
         )
         self._set_activity("Processing results…")
+
+    async def on_tool_confirmation(
+        self,
+        name: str,
+        *,
+        command: str,
+        risk_level: str,
+        reason: str,
+        confirmation_token: str,
+        scope: Any,
+    ) -> bool:
+        """Ask the human at the terminal whether a medium-risk action may run.
+
+        Only an interactive terminal qualifies; every other sink declines,
+        leaving the structured confirmation-required result for the caller.
+        The human's answer here is the only path into the allowlist — the
+        model can never fabricate it (the token is validated separately by
+        shell.py).
+        """
+        if not self._supports_live_status() or not sys.stdin.isatty():
+            return False
+        self._stop_activity()
+        self._finish_open_line()
+        self._console.print(
+            f"[yellow]需要批准的工具操作：[/yellow]"
+            f"[bold]{_markup_escape(_clip_single_line(command, 200))}[/bold]\n"
+            f"[dim]风险等级: {_markup_escape(str(risk_level))} · "
+            f"{_markup_escape(_clip_single_line(str(reason), 160))}[/dim]"
+        )
+        try:
+            answer = await _APPROVAL_PROMPT.prompt_async("允许执行？[y/N] ")
+        except (KeyboardInterrupt, EOFError):
+            return False
+        return str(answer or "").strip().lower() in {"y", "yes"}
 
     def on_tool_progress(self, name: str, progress: Mapping[str, Any]) -> None:
         status = str(progress.get("status") or "running")

@@ -15,8 +15,11 @@ import typer
 from rich.markdown import Markdown
 from rich.markup import escape as markup_escape
 from rich.panel import Panel
-from rich.prompt import Prompt
 from rich.table import Table
+
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
 
 import agent as agent_module
 from agent import shared
@@ -56,8 +59,34 @@ schedule_app = typer.Typer(help="Scheduled task commands")
 app.add_typer(schedule_app, name="schedule")
 
 
-class _CliPrompt(Prompt):
-    prompt_suffix = " "
+_cli_prompt_session: Optional[PromptSession] = None
+
+
+def _cli_history_path() -> Path:
+    """Persistent input history shared across interactive sessions."""
+    history = shared.AGENT_HOME / "cli_history"
+    history.parent.mkdir(parents=True, exist_ok=True)
+    return history
+
+
+def _cli_prompt() -> PromptSession:
+    """Build the interactive input session with persistent arrow-key history."""
+    global _cli_prompt_session
+    if _cli_prompt_session is None:
+        _cli_prompt_session = PromptSession(
+            history=FileHistory(_cli_history_path()),
+        )
+    return _cli_prompt_session
+
+
+async def _ask_user_input() -> str:
+    """Read one user turn with history, paste safety, and cancel/EOF handling."""
+    return await _cli_prompt().prompt_async(
+        HTML("\n<ansigreen>› </ansigreen>"),
+        bottom_toolbar=HTML(
+            "<i>Enter 发送 · ↑/↓ 历史 · Ctrl+C 取消 · Ctrl+D 退出</i>"
+        ),
+    )
 
 _INTERACTION_LOGGER_NAMES = (
     "agent.channels.base",
@@ -385,13 +414,10 @@ async def _interactive_loop(components: dict, cfg: dict):
     try:
         while True:
             try:
-                # Use asyncio.to_thread so the event loop stays alive (non-blocking
-                # input). This is required for future multi-channel concurrency where
-                # a second channel (Telegram, Feishu, …) runs in the same loop.
-                user_input = await asyncio.to_thread(
-                    _CliPrompt.ask,
-                    "\n[bold green]›[/bold green]",
-                )
+                # prompt_toolkit's async prompt keeps the event loop alive, so
+                # future multi-channel concurrency (Telegram, Feishu, …) can
+                # run in the same loop while the human types.
+                user_input = await _ask_user_input()
             except (EOFError, KeyboardInterrupt):
                 break
 

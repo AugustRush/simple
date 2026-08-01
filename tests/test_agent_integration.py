@@ -7684,11 +7684,12 @@ def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
 
     answers = iter(["Please explain how to generate a tool safely", "/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
 
     evolution = _FakeEvolution()
     components = {
@@ -7795,11 +7796,12 @@ def test_interactive_loop_routes_turn_through_runtime_runner(monkeypatch, tmp_pa
     prompts_dir.mkdir()
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
     answers = iter(["hello", "/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
 
     turn_runner = _FakeTurnRunner()
     components = {
@@ -7887,11 +7889,12 @@ def test_interactive_loop_delegates_turn_to_agent_core(monkeypatch, tmp_path):
     prompts_dir.mkdir()
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
     answers = iter(["hello", "/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
 
     plugin_catalog = _FakePluginCatalog()
     agent_core = _FakeAgentCore()
@@ -7946,11 +7949,12 @@ def test_interactive_loop_delegates_every_input_to_command_coordinator(
             return "exit_cli" if turn_input.text == "/quit" else None
 
     answers = iter(["hello", "/help", "/unknown", "/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
     coordinator = Coordinator()
     components = {
         "agent": Agent(),
@@ -8009,11 +8013,12 @@ def test_interactive_loop_wires_coordinator_cancel_token_to_sigint(
         return Coordinator(kwargs["cancel_token_factory"])
 
     answers = iter(["hello", "/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
     components = {
         "agent": Agent(),
         "memory": SimpleNamespace(read_index=lambda: ""),
@@ -8073,11 +8078,12 @@ def test_interactive_loop_rejects_unknown_slash_before_agent_core(monkeypatch, t
             return TurnExecution(result=TurnResult(text="ok"))
 
     answers = iter(["/skill quality/review tighten", "/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
     agent_core = _FakeAgentCore()
     components = {
         "agent": _FakeAgent(),
@@ -8414,11 +8420,12 @@ def test_interactive_loop_context_command_uses_dynamic_category_stats(
     monkeypatch.setattr(agent_module, "STAGING_DIR", tmp_path / "staging")
 
     answers = iter(["/context", "/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
 
     components = {
         "agent": _FakeAgent(),
@@ -8544,11 +8551,12 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
 
     answers = iter(["first task", "/evolve", "second task", "/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
 
     fake_agent = _FakeAgent()
     components = {
@@ -8653,11 +8661,12 @@ def test_interactive_loop_queues_orphan_recovery_in_background(monkeypatch, tmp_
     monkeypatch.setattr(agent_module, "STAGING_DIR", orphan_dir)
 
     answers = iter(["/quit"])
-    monkeypatch.setattr(
-        agent_module.Prompt,
-        "ask",
-        lambda *_args, **_kwargs: next(answers),
-    )
+    import agent.cli as cli_module
+
+    async def _fake_input():
+        return next(answers)
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
 
     fake_ctx_mgr = _FakeContextManager()
     components = {

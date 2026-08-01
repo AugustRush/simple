@@ -1267,6 +1267,52 @@ class BuiltinTools:
             },
         }
 
+    async def _try_interactive_confirmation(
+        self,
+        *,
+        safety: Any,
+        command: str,
+        extra_blocked: list[str],
+        authorization_scope: Any,
+    ) -> bool:
+        """Ask the human at the active sink for consent to a medium-risk command.
+
+        Returns True only when the human approved AND the scoped
+        confirmation token was consumed by shell.py, so the command now
+        passes the session allowlist.  Every other outcome — no interactive
+        sink, decline, cancelled turn, invalid or expired token — returns
+        False and the caller keeps the structured confirmation-required
+        result.  The model can never fabricate approval: the prompt is a
+        terminal prompt, and the token is generated and validated by
+        shell.py.
+        """
+        if not safety.confirmation_token:
+            return False
+        sink = _active_sink.get()
+        if sink is None:
+            return False
+        approved = await sink.on_tool_confirmation(
+            "shell",
+            command=command,
+            risk_level=safety.risk_level,
+            reason=safety.reason,
+            confirmation_token=safety.confirmation_token,
+            scope=authorization_scope,
+        )
+        if not approved:
+            return False
+        active_token = shared._active_cancel_token.get()
+        if active_token is not None and active_token.is_cancelled:
+            return False
+        from agent.security.shell import shell_command_confirm
+
+        return bool(
+            shell_command_confirm(
+                safety.confirmation_token,
+                scope=authorization_scope,
+            )
+        )
+
     def _resolve_tool_path(self, path: str) -> tuple[Path, str]:
         return resolve_workspace_path(
             path,
@@ -1421,6 +1467,21 @@ class BuiltinTools:
             allowed_roots=frozenset({self.workspace_root, output_dir}),
             scope=authorization_scope,
         )
+        if safety.requires_confirmation and await self._try_interactive_confirmation(
+            safety=safety,
+            command=command,
+            extra_blocked=extra_blocked,
+            authorization_scope=authorization_scope,
+        ):
+            # The human approved at the terminal; the command is now on the
+            # session allowlist.  Re-check so the rest of this function runs
+            # the normal allowed path.
+            safety = _shell_command_check(
+                command,
+                extra_blocked,
+                allowed_roots=frozenset({self.workspace_root, output_dir}),
+                scope=authorization_scope,
+            )
         if not safety.allowed:
             if safety.requires_confirmation:
                 recovery_hint = self._shell_recovery_hint(
