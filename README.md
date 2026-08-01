@@ -614,6 +614,14 @@ pressing Enter (instead of a longer command) opens the full browse menu;
 commands with fixed options (e.g. `/permissions`, `/auto-approve`) show a
 second menu for the argument there.
 
+In a real terminal the interactive CLI runs in a full-screen layout: the
+conversation, tool traces and markdown stream in the upper pane, while the
+input line stays docked at the bottom of the terminal and never scrolls
+away. The slash-command palette, history and permission menus all work from
+that bottom line; `Ctrl+C` still cancels a running turn and `Ctrl+D` exits.
+When stdin/stdout are not a terminal (pipes, scripts, tests), the CLI falls
+back to the classic line-by-line prompt automatically.
+
 ### Shared (all channels)
 
 | Command | Description |

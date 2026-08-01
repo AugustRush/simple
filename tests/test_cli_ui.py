@@ -663,12 +663,20 @@ def test_cli_command_completer_filters_live_and_respects_scope(monkeypatch):
 class _FakeMenuBuffer:
     def __init__(self, text):
         self.text = text
-        self.complete_state = SimpleNamespace(current_completion=object())
+        self.complete_state = SimpleNamespace(
+            current_completion=None,
+            complete_index=None,
+            completions=[object()],
+        )
         self.applied = False
         self.handled = False
 
     def apply_completion(self, completion):
         self.applied = True
+
+    def go_to_completion(self, index):
+        self.complete_state.complete_index = index
+        self.complete_state.current_completion = self.complete_state.completions[index]
 
     def validate_and_handle(self):
         self.handled = True
@@ -696,6 +704,17 @@ def test_enter_on_partial_command_applies_highlighted_completion():
     _accept_completion_or_submit(event)
 
     assert event.current_buffer.applied is True
+    assert event.current_buffer.handled is True
+
+
+def test_enter_with_empty_completions_submits_raw_text():
+    from agent.cli import _accept_completion_or_submit
+
+    event = _FakeMenuEvent("/zzz")
+    event.current_buffer.complete_state.completions = []
+    _accept_completion_or_submit(event)
+
+    assert event.current_buffer.applied is False
     assert event.current_buffer.handled is True
 
 
@@ -770,3 +789,88 @@ def test_interactive_loop_bare_slash_opens_command_menu(monkeypatch, tmp_path):
     asyncio.run(agent_module._interactive_loop(components, cfg))
 
     assert coordinator.calls == ["/permissions ask", "/quit"]
+
+
+def test_tui_output_pane_captures_ansi_and_tracks_last_line():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane()
+    payload = "\x1b[1mbold\x1b[0m\nsecond line\n"
+    assert pane.write(payload) == len(payload)
+
+    fragments = pane.fragments()
+    assert any(str(style) == "bold" for style, _text in fragments)
+    assert pane.cursor_position().y == 2
+    assert pane.cursor_position().x == 0
+
+
+def test_tui_session_submits_input_through_queue(tmp_path):
+    import asyncio
+
+    from agent.tui import TuiSession
+
+    tui = TuiSession(
+        history_path=tmp_path / "cli_history",
+        completer_factory=lambda: None,
+        cancel_callback=lambda: None,
+        console_width=80,
+    )
+    tui._submit("hello")
+    tui._submit(None)
+
+    async def scenario():
+        assert await tui.ask_async() == "hello"
+        assert await tui.ask_async() is None
+
+    asyncio.run(scenario())
+
+
+def test_tui_request_exit_queues_none_and_is_idempotent(tmp_path):
+    import asyncio
+
+    from agent.tui import TuiSession
+
+    tui = TuiSession(
+        history_path=tmp_path / "cli_history",
+        completer_factory=lambda: None,
+        cancel_callback=lambda: None,
+        console_width=80,
+    )
+
+    tui.request_exit()
+    tui.request_exit()
+
+    async def scenario():
+        assert await tui.ask_async() is None
+
+    asyncio.run(scenario())
+
+
+def test_ask_user_input_uses_active_tui(monkeypatch):
+    import asyncio
+
+    import agent.cli as cli
+
+    class FakeTui:
+        def __init__(self, text):
+            self.text = text
+
+        async def ask_async(self):
+            return self.text
+
+    monkeypatch.setattr(cli, "_ACTIVE_TUI", FakeTui("hello"))
+    assert asyncio.run(cli._ask_user_input()) == "hello"
+
+    monkeypatch.setattr(cli, "_ACTIVE_TUI", FakeTui(None))
+    with pytest.raises(EOFError):
+        asyncio.run(cli._ask_user_input())
+
+
+def test_sink_disables_live_status_but_keeps_stream_markdown():
+    from agent.core.output import CliOutputSink
+
+    console = Console(file=StringIO(), force_terminal=True)
+    sink = CliOutputSink(console, live_status=False)
+
+    assert sink._supports_live_status() is False
+    assert sink._supports_stream_markdown() is True

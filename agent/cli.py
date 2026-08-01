@@ -18,6 +18,8 @@ from rich.panel import Panel
 from rich.table import Table
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app_or_none
+from prompt_toolkit.application.run_in_terminal import in_terminal
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters.app import has_completions
 from prompt_toolkit.formatted_text import HTML
@@ -30,6 +32,7 @@ from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.shared import CancelToken
+from agent.tui import TuiSession
 
 AgentContext = agent_module.AgentContext
 BaseAgent = agent_module.BaseAgent
@@ -63,13 +66,23 @@ app.add_typer(schedule_app, name="schedule")
 
 
 _cli_prompt_session: Optional[PromptSession] = None
+_ACTIVE_TUI: Optional[TuiSession] = None
 
 
 def _accept_completion_or_submit(event: Any) -> None:
     """Enter accepts the highlighted completion when a menu is open."""
     buffer = event.current_buffer
     if buffer.complete_state is not None and buffer.text.strip() != "/":
-        buffer.apply_completion(buffer.complete_state.current_completion)
+        if (
+            buffer.complete_state.complete_index is None
+            and buffer.complete_state.completions
+        ):
+            buffer.go_to_completion(0)
+        if (
+            buffer.complete_state is not None
+            and buffer.complete_state.current_completion is not None
+        ):
+            buffer.apply_completion(buffer.complete_state.current_completion)
     buffer.complete_state = None
     buffer.validate_and_handle()
 
@@ -100,6 +113,12 @@ def _cli_prompt() -> PromptSession:
 
 async def _ask_user_input() -> str:
     """Read one user turn with history, paste safety, and cancel/EOF handling."""
+    tui = _ACTIVE_TUI
+    if tui is not None:
+        text = await tui.ask_async()
+        if text is None:
+            raise EOFError
+        return text
     return await _cli_prompt().prompt_async(
         HTML("\n<ansigreen>› </ansigreen>"),
         bottom_toolbar=HTML(
@@ -332,10 +351,18 @@ async def _menu_prompt_async(
     state: "_MenuState", title: str
 ) -> Optional[str]:
     """Run the live-filtering menu and return the picked value (or None)."""
-    return await PromptSession(key_bindings=_menu_key_bindings(state)).prompt_async(
-        "请选择 › ",
-        bottom_toolbar=_menu_toolbar(state, title),
-    )
+    session = PromptSession(key_bindings=_menu_key_bindings(state))
+
+    async def _prompt() -> str:
+        return await session.prompt_async(
+            "请选择 › ",
+            bottom_toolbar=_menu_toolbar(state, title),
+        )
+
+    if get_app_or_none() is not None:
+        async with in_terminal():
+            return await _prompt()
+    return await _prompt()
 
 
 async def _select_from_menu(
@@ -593,7 +620,86 @@ def _cli_session_header(components: dict, cfg: dict) -> Panel:
     )
 
 
+def _tui_enabled() -> bool:
+    """Full-screen TUI mode only makes sense on a real interactive terminal."""
+    return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+
+def _tui_cancel_callback() -> None:
+    """TUI Ctrl+C: cancel the running turn, or exit when idle."""
+    global _sigint_count
+    tui = _ACTIVE_TUI
+    if tui is None:
+        return
+    token = _current_cancel_token
+    if token is None:
+        tui.request_exit()
+        return
+    _sigint_count += 1
+    if _sigint_count == 1:
+        token.cancel()
+        shared.CONSOLE.print(
+            "\n[yellow](Ctrl+C) 正在取消当前任务… (再按一次 Ctrl+C 强制取消)[/yellow]"
+        )
+    elif _sigint_count == 2:
+        token.cancel("force")
+        shared.CONSOLE.print(
+            "\n[red](Ctrl+C) 已强制取消 (SIGKILL + 中断 LLM 请求)[/red]"
+        )
+    else:
+        tui.request_exit()
+
+
+async def _run_tui_session(components: dict, cfg: dict) -> None:
+    """Run the interactive loop inside a full-screen TUI session."""
+    global _ACTIVE_TUI
+
+    tui = TuiSession(
+        history_path=_cli_history_path(),
+        completer_factory=_cli_command_completer,
+        cancel_callback=_tui_cancel_callback,
+    )
+    _ACTIVE_TUI = tui
+    try:
+        await tui.run(_interactive_loop_coro(components, cfg, tui))
+    finally:
+        _ACTIVE_TUI = None
+
+
 async def _interactive_loop(components: dict, cfg: dict):
+    """Main interactive chat loop (line mode or full-screen TUI)."""
+    if _tui_enabled():
+        await _run_tui_session(components, cfg)
+    else:
+        await _interactive_loop_coro(components, cfg, None)
+
+
+async def _interactive_loop_coro(
+    components: dict, cfg: dict, tui: Optional[TuiSession]
+):
+    """Main interactive chat loop body shared by line and TUI modes."""
+    console = tui.console if tui is not None else shared.CONSOLE
+    original_console = shared.CONSOLE
+    if tui is not None:
+        shared.CONSOLE = console
+    try:
+        await _interactive_loop_body(
+            components,
+            cfg,
+            console,
+            live_status=tui is None,
+        )
+    finally:
+        shared.CONSOLE = original_console
+
+
+async def _interactive_loop_body(
+    components: dict,
+    cfg: dict,
+    console,
+    *,
+    live_status: bool = True,
+):
     """Main interactive chat loop."""
     global _current_cancel_token
     agent: BaseAgent = components["agent"]
@@ -718,7 +824,7 @@ async def _interactive_loop(components: dict, cfg: dict):
             if not user_input.strip():
                 continue
 
-            _turn_sink = CliOutputSink(shared.CONSOLE)
+            _turn_sink = CliOutputSink(console, live_status=live_status)
             try:
                 ctx.metadata["skill_catalog"] = skill_catalog
                 if not user_input.lstrip().startswith("/"):

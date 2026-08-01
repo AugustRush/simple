@@ -20,6 +20,8 @@ from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.text import Text
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app_or_none
+from prompt_toolkit.application.run_in_terminal import in_terminal
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.validation import Validator
 
@@ -398,8 +400,9 @@ class OutputSink(ABC):
 class CliOutputSink(OutputSink):
     """Rich-console implementation of OutputSink for the CLI channel."""
 
-    def __init__(self, console: Any) -> None:
+    def __init__(self, console: Any, *, live_status: bool = True) -> None:
         self._console = console
+        self._live_status = live_status
         self._streamed: list[str] = []
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._tool_count = 0
@@ -426,8 +429,15 @@ class CliOutputSink(OutputSink):
 
     def _supports_live_status(self) -> bool:
         return bool(
-            getattr(self._console, "is_terminal", False)
+            self._live_status
+            and getattr(self._console, "is_terminal", False)
             and callable(getattr(self._console, "status", None))
+        )
+
+    def _supports_stream_markdown(self) -> bool:
+        return bool(
+            getattr(self._console, "is_terminal", False)
+            and callable(getattr(self._console, "print", None))
         )
 
     def _set_activity(self, text: str) -> None:
@@ -455,7 +465,7 @@ class CliOutputSink(OutputSink):
     def on_stream_chunk(self, chunk: str) -> None:
         self._stop_activity()
         self._streamed.append(chunk)
-        if self._supports_live_status():
+        if self._supports_stream_markdown():
             if self._stream_md is None:
                 self._stream_md = _StreamMarkdown(self._console)
             self._stream_md.feed(chunk)
@@ -567,11 +577,19 @@ class CliOutputSink(OutputSink):
                 "  [bold cyan]2)[/bold cyan] 拒绝\n"
                 "[dim]输入 1/2 后按 Enter（也可输入 y/n 或 同意/拒绝）；Ctrl+C 取消[/dim]"
             )
-            try:
-                answer = await _APPROVAL_PROMPT.prompt_async(
+
+            async def _prompt() -> str:
+                return await _APPROVAL_PROMPT.prompt_async(
                     "请选择 1/2 › ",
                     validator=_APPROVAL_VALIDATOR,
                 )
+
+            try:
+                if get_app_or_none() is not None:
+                    async with in_terminal():
+                        answer = await _prompt()
+                else:
+                    answer = await _prompt()
             except (KeyboardInterrupt, EOFError):
                 return False
             return _approval_choice_accepted(answer)
