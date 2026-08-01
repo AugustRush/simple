@@ -18,7 +18,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.filters.app import has_completions
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
@@ -103,10 +103,11 @@ async def _ask_user_input() -> str:
     return await _cli_prompt().prompt_async(
         HTML("\n<ansigreen>› </ansigreen>"),
         bottom_toolbar=HTML(
-            "<i>Enter 发送 · ↑/↓ 历史 · / 命令菜单 · Tab 补全 · "
+            "<i>Enter 发送 · ↑/↓ 历史 · 输入 / 实时筛选命令 · "
             "Ctrl+C 取消 · Ctrl+D 退出</i>"
         ),
         completer=_cli_command_completer(),
+        complete_while_typing=True,
     )
 
 
@@ -125,23 +126,57 @@ def _set_cli_router(router: Optional[CommandRouter]) -> None:
     _cli_router = router
 
 
-def _cli_command_completer() -> Optional[WordCompleter]:
-    """Tab-completion hints for slash commands in the main input line."""
+def _cli_command_completer() -> Optional[Completer]:
+    """Live command palette for slash commands in the main input line."""
     router = _cli_router
     if router is None:
         return None
     descriptors = router.visible_descriptors("cli")
     if not descriptors:
         return None
-    words = [f"/{descriptor.name}" for descriptor in descriptors]
-    meta = {
-        f"/{descriptor.name}": (
-            (descriptor.usage or f"/{descriptor.name}")
-            + (f" · {descriptor.description}" if descriptor.description else "")
-        )
-        for descriptor in descriptors
-    }
-    return WordCompleter(words, ignore_case=True, meta_dict=meta)
+    return _SlashCommandCompleter(descriptors)
+
+
+class _SlashCommandCompleter(Completer):
+    """Live command palette: typing "/p" narrows to matching commands.
+
+    Prefix matches win (so "/p" suggests /permissions and /plugins); when no
+    command starts with the query, matches inside the name as a fallback.
+    The palette only completes a single "/word" token, so paths like
+    "/Users/..." never trigger it.
+    """
+
+    def __init__(self, descriptors: Sequence[Any]) -> None:
+        self._descriptors = list(descriptors)
+
+    def get_completions(self, document: Any, complete_event: Any):
+        word = document.get_word_before_cursor(WORD=True)
+        if not word.startswith("/") or word == "/" or "/" in word[1:]:
+            return
+        query = word[1:].casefold()
+        if not query:
+            return
+        prefix_matches = [
+            descriptor
+            for descriptor in self._descriptors
+            if descriptor.name.startswith(query)
+        ]
+        candidates = prefix_matches or [
+            descriptor
+            for descriptor in self._descriptors
+            if query in descriptor.name
+        ]
+        for descriptor in candidates:
+            usage = descriptor.usage or f"/{descriptor.name}"
+            meta = usage + (
+                f" · {descriptor.description}" if descriptor.description else ""
+            )
+            yield Completion(
+                text=f"/{descriptor.name}",
+                start_position=-len(word),
+                display=f"/{descriptor.name}",
+                display_meta=meta,
+            )
 
 
 _COMMAND_OPTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {

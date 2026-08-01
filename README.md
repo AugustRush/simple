@@ -605,13 +605,13 @@ uv run simple memory tidy                # AI-assisted memory reorganization
 Commands are handled by a shared runtime coordinator and work across all
 channels unless marked otherwise.
 
-In the interactive CLI, type `/` and press Enter to open a selection menu of
-the commands available in this channel. The menu filters live as you type
-(numbers jump straight to that entry, names narrow the list); use `↑`/`↓` to
-move and Enter to confirm, or Esc to cancel. Commands with fixed options
-(e.g. `/permissions`, `/auto-approve`) show a second menu for the argument.
-While typing a `/`-command, `Tab` completes the name from the live command
-list.
+In the interactive CLI, typing a `/`-command opens a live command palette
+right in the input line: type `/p` and the list narrows to commands starting
+with `p` (e.g. `/permissions`, `/plugins`), updating on every keystroke. Use
+`↑`/`↓` to move, Enter to run the highlighted command, `Tab` to complete,
+and Esc to dismiss. Typing `/` alone and pressing Enter opens the full browse
+menu; commands with fixed options (e.g. `/permissions`, `/auto-approve`)
+show a second menu for the argument there.
 
 ### Shared (all channels)
 

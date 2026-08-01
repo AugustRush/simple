@@ -632,18 +632,30 @@ def test_selection_menu_accepts_numbers_names_and_filters(monkeypatch):
     assert asyncio.run(run([None])) is None
 
 
-def test_cli_command_completer_lists_only_cli_visible_commands(monkeypatch):
+def test_cli_command_completer_filters_live_and_respects_scope(monkeypatch):
+    from prompt_toolkit.document import Document
+
     import agent.cli as cli
 
     monkeypatch.setattr(cli, "_cli_router", _builtin_cli_router())
     completer = cli._cli_command_completer()
 
     assert completer is not None
-    words = list(completer.words)
-    assert "/permissions" in words
-    assert "/auto-approve" in words
-    assert "/allow" in words
-    assert "/send" not in words
+
+    def suggested(text):
+        return [
+            completion.text
+            for completion in completer.get_completions(Document(text), None)
+        ]
+
+    assert "/permissions" in suggested("/p")
+    assert "/plugins" in suggested("/p")
+    assert "/permissions" in suggested("/perm")
+    assert "/export" in suggested("/x")
+    assert suggested("/") == []
+    assert suggested("/zzz") == []
+    assert "/send" not in suggested("/s")
+    assert suggested("/Users/shike") == []
 
 
 def test_interactive_loop_bare_slash_opens_command_menu(monkeypatch, tmp_path):
