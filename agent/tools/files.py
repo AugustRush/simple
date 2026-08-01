@@ -24,7 +24,14 @@ import json
 import os
 from pathlib import Path
 import stat
-from typing import Any, Mapping
+import threading
+import uuid
+from typing import Any, Mapping, Sequence
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
 
 
 class FilePolicyConfigError(ValueError):
@@ -211,6 +218,11 @@ ROOT_KINDS = (ROOT_WORKSPACE, ROOT_OUTPUT)
 _READ_CHUNK_SIZE = 64 * 1024
 _DEFAULT_READ_LINE_COUNT = 200
 _UTF8_BOM = b"\xef\xbb\xbf"
+_INTERNAL_DIR = ".simple-internal"
+
+# Per-path in-process locks keyed by (root kind, root path, relative path).
+_IN_PROCESS_LOCKS: dict[tuple[str, str, str], threading.Lock] = {}
+_IN_PROCESS_LOCKS_GUARD = threading.Lock()
 
 _STABLE_ERROR_CODES = frozenset(
     {
@@ -291,6 +303,8 @@ def _validate_relative_path(
     parts = rel_path.split("/")
     if allow_dot and parts == ["."]:
         return rel_path
+    if parts[0] == _INTERNAL_DIR:
+        raise _invalid(f"'{_INTERNAL_DIR}' is reserved for internal bookkeeping")
     for part in parts:
         if part in (".", ".."):
             raise _invalid("path cannot contain '.' or '..' components")
@@ -548,14 +562,31 @@ class _LineScanner:
 class FileService:
     """Rooted, snapshot-based file operations shared by built-in tools."""
 
-    def __init__(self, policy: FileAccessPolicy) -> None:
+    def __init__(
+        self,
+        policy: FileAccessPolicy,
+        write_scope: Sequence[str | Path] = (),
+    ) -> None:
         self.policy = policy
+        self.write_scope = _normalize_write_scope(write_scope)
 
     def _require_workspace_read(self) -> None:
         if not self.policy.workspace_read:
             raise FileServiceError(
                 "access_denied",
                 "workspace reads are disabled by the file access policy",
+            )
+
+    def _require_workspace_write(self, rel_path: str) -> None:
+        if not self.policy.workspace_write:
+            raise FileServiceError(
+                "access_denied",
+                "workspace writes are disabled by the file access policy",
+            )
+        if not any(_scope_contains(scope, rel_path) for scope in self.write_scope):
+            raise FileServiceError(
+                "access_denied",
+                f"path is outside the effective write_scope: {rel_path}",
             )
 
     def read_file(
@@ -757,6 +788,329 @@ class FileService:
 
     def _read_chunk(self, fd: int, size: int) -> bytes:
         return os.read(fd, size)
+
+    # ── Mutations ──────────────────────────────────────────────────────────
+
+    def write_file(
+        self,
+        root: str,
+        path: str,
+        *,
+        mode: str,
+        content: str,
+        expected_revision: str | None = None,
+    ) -> dict[str, Any]:
+        try:
+            return self._write_file(
+                root,
+                path,
+                mode=mode,
+                content=content,
+                expected_revision=expected_revision,
+            )
+        except FileServiceError as exc:
+            return exc.to_dict()
+
+    def edit_file(
+        self,
+        root: str,
+        path: str,
+        *,
+        expected_revision: str,
+        replacements: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        try:
+            return self._edit_file(
+                root,
+                path,
+                expected_revision=expected_revision,
+                replacements=replacements,
+            )
+        except FileServiceError as exc:
+            return exc.to_dict()
+
+    def _write_file(
+        self,
+        root: str,
+        path: str,
+        *,
+        mode: str,
+        content: str,
+        expected_revision: str | None,
+    ) -> dict[str, Any]:
+        root = _validate_root(root)
+        _validate_relative_path(path)
+        if mode not in ("create", "overwrite"):
+            raise FileServiceError(
+                "invalid_request",
+                "mode must be 'create' or 'overwrite'",
+            )
+        if root == ROOT_WORKSPACE:
+            self._require_workspace_write(path)
+        payload = _encode_request_text(content, limits=self.policy.limits)
+        if mode == "create":
+            return self._write_create(root, path, payload)
+        return self._write_overwrite(
+            root,
+            path,
+            payload,
+            expected_revision=expected_revision,
+        )
+
+    def _write_create(
+        self,
+        root: str,
+        path: str,
+        payload: bytes,
+    ) -> dict[str, Any]:
+        authorized = AuthorizedPath(self.policy, root, path)
+        lock = _acquire_mutation_locks(self.policy, root, path)
+        try:
+            parent_fd, _ = _ensure_parent_directories(
+                self.policy, root, authorized.rel_path
+            )
+            try:
+                temp_fd, temp_name = _create_temp_file(
+                    parent_fd, authorized.rel_path.rsplit("/", 1)[-1], payload
+                )
+                try:
+                    os.link(
+                        temp_name,
+                        authorized.rel_path.rsplit("/", 1)[-1],
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError as exc:
+                    raise FileServiceError(
+                        "already_exists", f"create target already exists: {path}"
+                    ) from exc
+                except (NotImplementedError, OSError) as exc:
+                    raise FileServiceError(
+                        "atomic_replace_failed",
+                        "unable to publish the created file atomically",
+                        retryable=True,
+                    ) from exc
+                finally:
+                    _close_fd(temp_fd)
+                    try:
+                        os.unlink(temp_name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+                _sync_directory(parent_fd)
+            finally:
+                _close_fd(parent_fd)
+            return {
+                "ok": True,
+                "root": root,
+                "path": path,
+                "mode": "create",
+                "old_revision": None,
+                "new_revision": "sha256:" + hashlib.sha256(payload).hexdigest(),
+                "old_size_bytes": 0,
+                "new_size_bytes": len(payload),
+                "byte_delta": len(payload),
+            }
+        finally:
+            _release_mutation_locks(lock)
+
+    def _write_overwrite(
+        self,
+        root: str,
+        path: str,
+        payload: bytes,
+        *,
+        expected_revision: str | None,
+    ) -> dict[str, Any]:
+        if not isinstance(expected_revision, str) or not expected_revision:
+            raise FileServiceError(
+                "revision_required",
+                "overwrite requires a valid expected_revision",
+            )
+        authorized = AuthorizedPath(self.policy, root, path)
+        lock = _acquire_mutation_locks(self.policy, root, path)
+        try:
+            parent_fd, _ = _ensure_parent_directories(
+                self.policy, root, authorized.rel_path
+            )
+            try:
+                target_fd, before = authorized.open_file()
+                try:
+                    old_bytes, revision = _read_target_bytes(
+                        target_fd, self.policy.limits, path
+                    )
+                    _expect_revision(revision, expected_revision, path)
+                    bom = old_bytes.startswith(_UTF8_BOM)
+                    new_bytes = _UTF8_BOM + payload if bom else payload
+                    temp_fd, temp_name = _create_temp_file(
+                        parent_fd,
+                        authorized.rel_path.rsplit("/", 1)[-1],
+                        new_bytes,
+                        mode=before.st_mode & 0o7777,
+                    )
+                    _close_fd(temp_fd)
+                    try:
+                        _recheck_target_before_replace(
+                            self.policy,
+                            root,
+                            authorized.rel_path,
+                            expected_revision,
+                            before,
+                            path,
+                        )
+                        try:
+                            os.replace(
+                                temp_name,
+                                authorized.rel_path.rsplit("/", 1)[-1],
+                                src_dir_fd=parent_fd,
+                                dst_dir_fd=parent_fd,
+                            )
+                        except (NotImplementedError, OSError) as exc:
+                            raise FileServiceError(
+                                "atomic_replace_failed",
+                                "unable to commit the overwrite atomically",
+                                retryable=True,
+                            ) from exc
+                    finally:
+                        try:
+                            os.unlink(temp_name, dir_fd=parent_fd)
+                        except OSError:
+                            pass
+                    _sync_directory(parent_fd)
+                    old_size = len(old_bytes)
+                    return {
+                        "ok": True,
+                        "root": root,
+                        "path": path,
+                        "mode": "overwrite",
+                        "old_revision": revision,
+                        "new_revision": "sha256:"
+                        + hashlib.sha256(new_bytes).hexdigest(),
+                        "old_size_bytes": old_size,
+                        "new_size_bytes": len(new_bytes),
+                        "byte_delta": len(new_bytes) - old_size,
+                    }
+                finally:
+                    _close_fd(target_fd)
+            finally:
+                _close_fd(parent_fd)
+        finally:
+            _release_mutation_locks(lock)
+
+    def _edit_file(
+        self,
+        root: str,
+        path: str,
+        *,
+        expected_revision: str,
+        replacements: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        root = _validate_root(root)
+        _validate_relative_path(path)
+        if root == ROOT_WORKSPACE:
+            self._require_workspace_write(path)
+        if not isinstance(expected_revision, str) or not expected_revision:
+            raise FileServiceError(
+                "revision_required",
+                "edit_file requires a valid expected_revision",
+            )
+        normalized = _validate_replacements(replacements, self.policy.limits)
+        authorized = AuthorizedPath(self.policy, root, path)
+        lock = _acquire_mutation_locks(self.policy, root, path)
+        try:
+            parent_fd, _ = _ensure_parent_directories(
+                self.policy, root, authorized.rel_path
+            )
+            try:
+                target_fd, before = authorized.open_file()
+                try:
+                    old_bytes, revision = _read_target_bytes(
+                        target_fd, self.policy.limits, path
+                    )
+                    _expect_revision(revision, expected_revision, path)
+                    bom = old_bytes.startswith(_UTF8_BOM)
+                    try:
+                        text = (
+                            old_bytes[len(_UTF8_BOM) :]
+                            .decode("utf-8", errors="strict")
+                            if bom
+                            else old_bytes.decode("utf-8", errors="strict")
+                        )
+                    except UnicodeDecodeError as exc:
+                        raise FileServiceError(
+                            "unsupported_encoding", "file is not valid UTF-8"
+                        ) from exc
+                    if "\x00" in text:
+                        raise FileServiceError(
+                            "unsupported_encoding",
+                            "file contains embedded NUL bytes",
+                        )
+                    new_text, total_replaced = _apply_replacements(
+                        text, normalized, self.policy.limits
+                    )
+                    payload = new_text.encode("utf-8", errors="strict")
+                    if payload[:3] == _UTF8_BOM or new_text.startswith("\ufeff"):
+                        raise FileServiceError(
+                            "invalid_request",
+                            "edited content must not begin with U+FEFF",
+                        )
+                    new_bytes = _UTF8_BOM + payload if bom else payload
+                    temp_fd, temp_name = _create_temp_file(
+                        parent_fd,
+                        authorized.rel_path.rsplit("/", 1)[-1],
+                        new_bytes,
+                        mode=before.st_mode & 0o7777,
+                    )
+                    _close_fd(temp_fd)
+                    try:
+                        _recheck_target_before_replace(
+                            self.policy,
+                            root,
+                            authorized.rel_path,
+                            expected_revision,
+                            before,
+                            path,
+                        )
+                        try:
+                            os.replace(
+                                temp_name,
+                                authorized.rel_path.rsplit("/", 1)[-1],
+                                src_dir_fd=parent_fd,
+                                dst_dir_fd=parent_fd,
+                            )
+                        except (NotImplementedError, OSError) as exc:
+                            raise FileServiceError(
+                                "atomic_replace_failed",
+                                "unable to commit the edit atomically",
+                                retryable=True,
+                            ) from exc
+                    finally:
+                        try:
+                            os.unlink(temp_name, dir_fd=parent_fd)
+                        except OSError:
+                            pass
+                    _sync_directory(parent_fd)
+                    old_size = len(old_bytes)
+                    return {
+                        "ok": True,
+                        "root": root,
+                        "path": path,
+                        "mode": "edit",
+                        "old_revision": revision,
+                        "new_revision": "sha256:"
+                        + hashlib.sha256(new_bytes).hexdigest(),
+                        "old_size_bytes": old_size,
+                        "new_size_bytes": len(new_bytes),
+                        "byte_delta": len(new_bytes) - old_size,
+                        "replacement_count": len(normalized),
+                        "replaced_occurrences": total_replaced,
+                    }
+                finally:
+                    _close_fd(target_fd)
+            finally:
+                _close_fd(parent_fd)
+        finally:
+            _release_mutation_locks(lock)
 
     def list_files(
         self,
@@ -1061,6 +1415,401 @@ def _decode_list_cursor(
     if not isinstance(last, str) or not last:
         raise FileServiceError("invalid_request", "cursor is missing a resume point")
     return last
+
+
+# ── Mutation helpers ────────────────────────────────────────────────────────
+
+
+def _normalize_write_scope(scope: Sequence[str | Path]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for raw in scope:
+        if isinstance(raw, Path):
+            text = raw.as_posix()
+        elif isinstance(raw, str):
+            text = raw
+        else:
+            raise ValueError(f"invalid write_scope entry: {raw!r}")
+        text = text.strip()
+        if text in ("", "."):
+            normalized.append("*")
+            continue
+        if text.startswith("./"):
+            text = text[2:]
+        text = text.rstrip("/")
+        if (
+            not text
+            or os.path.isabs(text)
+            or ".." in text.split("/")
+            or text == _INTERNAL_DIR
+            or text.startswith(_INTERNAL_DIR + "/")
+        ):
+            raise ValueError(f"invalid write_scope entry: {raw!r}")
+        normalized.append(text)
+    return tuple(normalized)
+
+
+def _scope_contains(scope: str, rel_path: str) -> bool:
+    if scope == "*":
+        return True
+    return rel_path == scope or rel_path.startswith(scope + "/")
+
+
+def _encode_request_text(content: Any, *, limits: FileAccessLimits) -> bytes:
+    if not isinstance(content, str):
+        raise FileServiceError("invalid_request", "content must be a string")
+    if "\x00" in content:
+        raise FileServiceError("invalid_request", "content cannot contain NUL bytes")
+    if content.startswith("\ufeff"):
+        raise FileServiceError(
+            "invalid_request", "content must not begin with U+FEFF"
+        )
+    try:
+        payload = content.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise FileServiceError(
+            "invalid_request", "content must be valid UTF-8"
+        ) from exc
+    if len(payload) > limits.max_write_bytes:
+        raise FileServiceError(
+            "file_too_large",
+            f"content exceeds max_write_bytes ({limits.max_write_bytes})",
+        )
+    return payload
+
+
+def _validate_replacements(
+    replacements: Sequence[Mapping[str, Any]],
+    limits: FileAccessLimits,
+) -> list[tuple[str, str, int]]:
+    if not isinstance(replacements, (list, tuple)) or not replacements:
+        raise FileServiceError(
+            "invalid_request", "replacements must be a non-empty list"
+        )
+    if len(replacements) > limits.max_replacements:
+        raise FileServiceError(
+            "invalid_request",
+            f"replacements exceed max_replacements ({limits.max_replacements})",
+        )
+    normalized: list[tuple[str, str, int]] = []
+    aggregate = 0
+    for item in replacements:
+        if not isinstance(item, Mapping):
+            raise FileServiceError(
+                "invalid_request", "each replacement must be an object"
+            )
+        unknown = sorted(set(item) - {"old_text", "new_text", "expected_count"})
+        if unknown:
+            raise FileServiceError(
+                "invalid_request",
+                "unknown replacement key(s): " + ", ".join(unknown),
+            )
+        old_text = item.get("old_text")
+        new_text = item.get("new_text")
+        expected_count = item.get("expected_count")
+        if not isinstance(old_text, str) or not old_text:
+            raise FileServiceError(
+                "invalid_request", "old_text must be a non-empty string"
+            )
+        if not isinstance(new_text, str):
+            raise FileServiceError(
+                "invalid_request", "new_text must be a string"
+            )
+        if (
+            isinstance(expected_count, bool)
+            or not isinstance(expected_count, int)
+            or expected_count < 1
+        ):
+            raise FileServiceError(
+                "invalid_request", "expected_count must be a positive integer"
+            )
+        if "\x00" in old_text or "\x00" in new_text:
+            raise FileServiceError(
+                "invalid_request", "replacement text cannot contain NUL bytes"
+            )
+        try:
+            old_bytes = old_text.encode("utf-8", errors="strict")
+            new_bytes = new_text.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as exc:
+            raise FileServiceError(
+                "invalid_request", "replacement text must be valid UTF-8"
+            ) from exc
+        aggregate += len(old_bytes) + len(new_bytes)
+        if aggregate > limits.max_write_bytes:
+            raise FileServiceError(
+                "file_too_large",
+                "aggregate replacement payload exceeds max_write_bytes "
+                f"({limits.max_write_bytes})",
+            )
+        normalized.append((old_text, new_text, expected_count))
+    return normalized
+
+
+def _apply_replacements(
+    text: str,
+    replacements: Sequence[tuple[str, str, int]],
+    limits: FileAccessLimits,
+) -> tuple[str, int]:
+    total_replaced = 0
+    for old_text, new_text, expected_count in replacements:
+        count = text.count(old_text)
+        if count != expected_count:
+            raise FileServiceError(
+                "match_count_mismatch",
+                f"expected {expected_count} occurrence(s) of {old_text!r}, "
+                f"observed {count}",
+                details={
+                    "old_text": old_text,
+                    "expected_count": expected_count,
+                    "actual_count": count,
+                },
+            )
+        text = text.replace(old_text, new_text)
+        total_replaced += count
+        if len(text.encode("utf-8", errors="strict")) > limits.max_write_bytes:
+            raise FileServiceError(
+                "file_too_large",
+                f"edited content exceeds max_write_bytes "
+                f"({limits.max_write_bytes})",
+            )
+    return text, total_replaced
+
+
+def _read_target_bytes(
+    fd: int,
+    limits: FileAccessLimits,
+    path: str,
+) -> tuple[bytes, str]:
+    before = os.fstat(fd)
+    if before.st_size > limits.max_snapshot_bytes:
+        raise FileServiceError(
+            "file_too_large",
+            f"file exceeds max_snapshot_bytes ({limits.max_snapshot_bytes})",
+        )
+    chunks = bytearray()
+    while True:
+        chunk = os.read(fd, _READ_CHUNK_SIZE)
+        if not chunk:
+            break
+        chunks.extend(chunk)
+        if len(chunks) > limits.max_snapshot_bytes:
+            raise FileServiceError(
+                "file_too_large",
+                f"file exceeds max_snapshot_bytes "
+                f"({limits.max_snapshot_bytes})",
+            )
+    after = os.fstat(fd)
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+    ):
+        raise FileServiceError(
+            "revision_conflict",
+            f"file changed while it was being read: {path}",
+            retryable=True,
+        )
+    data = bytes(chunks)
+    return data, "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _expect_revision(
+    revision: str,
+    expected_revision: str,
+    path: str,
+) -> None:
+    if revision != expected_revision:
+        raise FileServiceError(
+            "revision_conflict",
+            f"file changed since it was read: {path}",
+            details={
+                "expected_revision": expected_revision,
+                "actual_revision": revision,
+            },
+            retryable=True,
+        )
+
+
+def _ensure_parent_directories(
+    policy: FileAccessPolicy,
+    root: str,
+    rel_path: str,
+) -> tuple[int, str]:
+    root_path = policy.workspace_root if root == ROOT_WORKSPACE else policy.output_root
+    parts = rel_path.split("/")
+    target_name = parts[-1]
+    dir_fd = _open_root_directory(root_path)
+    try:
+        for part in parts[:-1]:
+            try:
+                fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY,
+                    dir_fd=dir_fd,
+                )
+            except NotADirectoryError as exc:
+                raise FileServiceError(
+                    "not_directory",
+                    f"path component is not a directory: {rel_path}",
+                ) from exc
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o777, dir_fd=dir_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    if exc.errno == errno.ENOTDIR:
+                        raise FileServiceError(
+                            "not_directory",
+                            f"path component is not a directory: {rel_path}",
+                        ) from exc
+                    raise FileServiceError(
+                        "io_error", "unable to create parent directory"
+                    ) from exc
+                try:
+                    fd = os.open(
+                        part,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY,
+                        dir_fd=dir_fd,
+                    )
+                except NotADirectoryError as exc:
+                    raise FileServiceError(
+                        "not_directory",
+                        f"path component is not a directory: {rel_path}",
+                    ) from exc
+                except OSError as exc:
+                    raise FileServiceError(
+                        "io_error", "unable to open created parent directory"
+                    ) from exc
+            except PermissionError as exc:
+                raise FileServiceError(
+                    "access_denied", "permission denied while creating parents"
+                ) from exc
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    raise _invalid(
+                        "symlink traversal is not allowed: " + rel_path
+                    ) from exc
+                raise FileServiceError(
+                    "io_error", "unable to traverse parent directory"
+                ) from exc
+            _close_fd(dir_fd)
+            dir_fd = fd
+        return dir_fd, target_name
+    except BaseException:
+        _close_fd(dir_fd)
+        raise
+
+
+def _create_temp_file(
+    dir_fd: int,
+    name: str,
+    payload: bytes,
+    *,
+    mode: int | None = None,
+) -> tuple[int, str]:
+    temp_name = f".{name}.simple-tmp-{uuid.uuid4().hex}"
+    fd = os.open(
+        temp_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o666,
+        dir_fd=dir_fd,
+    )
+    try:
+        if mode is not None:
+            os.fchmod(fd, mode)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+    except BaseException:
+        _close_fd(fd)
+        try:
+            os.unlink(temp_name, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    return fd, temp_name
+
+
+def _recheck_target_before_replace(
+    policy: FileAccessPolicy,
+    root: str,
+    rel_path: str,
+    expected_revision: str,
+    before: os.stat_result,
+    path: str,
+) -> None:
+    fd, current = AuthorizedPath(policy, root, rel_path).open_file()
+    try:
+        if (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            raise FileServiceError(
+                "revision_conflict",
+                f"file was replaced since it was read: {path}",
+                retryable=True,
+            )
+        data, revision = _read_target_bytes(fd, policy.limits, path)
+        _expect_revision(revision, expected_revision, path)
+    finally:
+        _close_fd(fd)
+
+
+def _sync_directory(fd: int) -> None:
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+
+
+def _acquire_mutation_locks(
+    policy: FileAccessPolicy,
+    root: str,
+    rel_path: str,
+) -> tuple[threading.Lock, int | None]:
+    root_path = policy.workspace_root if root == ROOT_WORKSPACE else policy.output_root
+    key = (root, str(root_path), rel_path)
+    with _IN_PROCESS_LOCKS_GUARD:
+        in_process = _IN_PROCESS_LOCKS.setdefault(key, threading.Lock())
+    in_process.acquire()
+    if fcntl is None:
+        in_process.release()
+        raise FileServiceError(
+            "locking_unavailable",
+            "advisory file locking is unavailable on this platform",
+            retryable=True,
+        )
+    lock_dir = policy.output_root / _INTERNAL_DIR / "locks"
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_key = hashlib.sha256(
+            f"{key[0]}:{key[1]}:{key[2]}".encode("utf-8")
+        ).hexdigest()
+        advisory_fd = os.open(
+            lock_dir / f"{lock_key}.lock",
+            os.O_RDWR | os.O_CREAT,
+            0o600,
+        )
+        fcntl.flock(advisory_fd, fcntl.LOCK_EX)
+    except OSError as exc:
+        in_process.release()
+        raise FileServiceError(
+            "locking_unavailable",
+            "unable to acquire advisory file lock",
+            retryable=True,
+        ) from exc
+    return in_process, advisory_fd
+
+
+def _release_mutation_locks(
+    lock: tuple[threading.Lock, int | None],
+) -> None:
+    in_process, advisory_fd = lock
+    if advisory_fd is not None:
+        try:
+            fcntl.flock(advisory_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        _close_fd(advisory_fd)
+    in_process.release()
 
 
 __all__ = [
