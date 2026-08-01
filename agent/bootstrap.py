@@ -25,6 +25,7 @@ from agent.runtime import AgentCore, TurnRunner
 from agent.ralph import RalphIterationResult, RalphService, RalphTaskStore, RalphVerifier
 from agent.skills.catalog import SkillCatalog
 from agent.tools.builtin_tools import BuiltinTools
+from agent.tools.files import resolve_file_access_config
 from agent.tools.runtime import MCPClient, ToolRegistry, UserToolCatalog
 
 BaseAgent = agent_module.BaseAgent
@@ -150,6 +151,14 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
 
     workspace_root = Path.cwd().resolve()
     output_dir = _resolve_output_dir(cfg)
+    # Construct the immutable file access policy before any file or shell
+    # tool is registered.  Invalid configuration or overlapping roots abort
+    # bootstrap rather than degrading into an unsafe runtime.
+    file_policy = resolve_file_access_config(
+        cfg,
+        workspace_root=workspace_root,
+        output_dir=output_dir,
+    )
 
     # Resolve active provider format for format-aware classes
     active_provider = cfg.get("active_provider", "anthropic")
@@ -239,6 +248,7 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
 
     # Share output_dir with skills via registry context
     registry.set_context("output_dir", str(output_dir))
+    registry.set_context("file_access_policy", file_policy)
     registry.set_context("supports_vision", supports_vision)
     registry.set_context(
         "shell_blocked_commands",
@@ -385,6 +395,7 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         "user_tools_enabled": user_tools_enabled,
         "output_dir": output_dir,
         "workspace_root": workspace_root,
+        "file_access_policy": file_policy,
         "cfg": cfg,
     }
     loaded_plugins = plugin_catalog.discover_and_load()

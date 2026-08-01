@@ -115,6 +115,19 @@ DEFAULT_CONFIG: dict = {
     "system_prompt_file": None,  # null = use built-in prompt
     # ── Output directory ──────────────────────────────────────────────────
     "output_dir": None,  # null = ~/.agent/output
+    # ── File access policy (startup-only, immutable) ─────────────────────
+    "file_access": {
+        "workspace": {
+            "read": True,
+            "write": False,
+        },
+        "max_read_lines": 400,
+        "max_read_bytes": 65536,
+        "max_snapshot_bytes": 16777216,
+        "max_write_bytes": 4194304,
+        "max_replacements": 100,
+        "max_list_results": 1000,
+    },
 }
 
 
@@ -240,7 +253,7 @@ def _validate_config(cfg: dict) -> list[str]:
         "system_prompt_file", "output_dir", "tavily_api_key",
         "assistant_identity", "shell_blocked_commands",
         "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
-        "max_truncation_continuations",
+        "max_truncation_continuations", "file_access",
     })
 
     # ── Top-level unknown keys ────────────────────────────────────────────
@@ -360,6 +373,7 @@ def load_config() -> tuple[dict, bool]:
             "audio",
             "mcp_servers",
             "context",
+            "file_access",
         ):
             if section not in raw and section in DEFAULT_CONFIG:
                 raw[section] = DEFAULT_CONFIG[section]
