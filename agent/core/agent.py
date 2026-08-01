@@ -341,6 +341,17 @@ class BaseAgent:
     def current_context(self) -> Optional["AgentContext"]:
         return _active_agent_context.get()
 
+    def _context_manager_for(
+        self,
+        ctx: Optional["AgentContext"] = None,
+    ) -> Optional[ContextManager]:
+        request_ctx = ctx or self.current_context()
+        if request_ctx is not None:
+            scoped = request_ctx.metadata.get("context_manager")
+            if scoped is not None:
+                return scoped
+        return self.context_manager
+
     def _effective_model(self, ctx: Optional["AgentContext"] = None) -> str:
         request_ctx = ctx or self.current_context()
         override = (
@@ -1174,18 +1185,37 @@ class BaseAgent:
         """Convert tools to the right format; return NOT_GIVEN/None if empty."""
         return self._transport.convert_tools(tools)
 
-    async def _create(self, ctx: "AgentContext", tools: list[dict]) -> Any:
+    async def _create(
+        self,
+        ctx: "AgentContext",
+        tools: list[dict],
+        *,
+        output_max_tokens: int | None = None,
+    ) -> Any:
         """Non-streaming API call, returns a normalised response object."""
-        self._prepare_provider_context(ctx, tools)
+        output_budget = self.max_tokens if output_max_tokens is None else int(
+            output_max_tokens
+        )
+        self._prepare_provider_context(
+            ctx,
+            tools,
+            output_max_tokens=output_budget,
+        )
         return await self._transport.create(
             model=self._effective_model(ctx),
-            max_tokens=self.max_tokens,
+            max_tokens=output_budget,
             system=ctx.system_prompt,
             messages=ctx.messages,
             tools=tools,
         )
 
-    def _input_token_budget(self, ctx: "AgentContext", tools: list[dict]) -> int:
+    def _input_token_budget(
+        self,
+        ctx: "AgentContext",
+        tools: list[dict],
+        *,
+        output_max_tokens: int | None = None,
+    ) -> int:
         overhead_messages = [
             {"role": "system", "content": ctx.system_prompt},
             {
@@ -1193,30 +1223,104 @@ class BaseAgent:
                 "content": json.dumps(tools, ensure_ascii=False, sort_keys=True),
             },
         ]
-        overhead = self._estimate_input_tokens(overhead_messages)
-        return self.context_window - self.max_tokens - overhead
+        overhead = self._estimate_input_tokens(overhead_messages, ctx=ctx)
+        output_budget = self.max_tokens if output_max_tokens is None else output_max_tokens
+        return self.context_window - output_budget - overhead
 
-    def _estimate_input_tokens(self, messages: list[dict]) -> int:
-        if self.context_manager is not None:
-            return self.context_manager.consolidation.estimate_tokens(messages)
+    def _estimate_input_tokens(
+        self,
+        messages: list[dict],
+        *,
+        ctx: Optional["AgentContext"] = None,
+    ) -> int:
+        context_manager = self._context_manager_for(ctx)
+        if context_manager is not None:
+            return context_manager.consolidation.estimate_tokens(messages)
         serialized = json.dumps(messages, ensure_ascii=False, sort_keys=True)
         return max(0, int(len(serialized) / max(1.0, float(shared.CHARS_PER_TOKEN))))
 
     def _prepare_provider_context(
-        self, ctx: "AgentContext", tools: list[dict]
+        self,
+        ctx: "AgentContext",
+        tools: list[dict],
+        *,
+        output_max_tokens: int | None = None,
     ) -> None:
-        budget = self._input_token_budget(ctx, tools)
+        budget = self._input_token_budget(
+            ctx,
+            tools,
+            output_max_tokens=output_max_tokens,
+        )
         if budget <= 0:
             raise ContextLimitError("provider input token budget is not positive")
-        if self.context_manager is not None:
-            ctx.messages = self.context_manager.compact_messages(
+        context_manager = self._context_manager_for(ctx)
+        if context_manager is not None:
+            ctx.messages = context_manager.compact_messages(
                 ctx.messages, input_token_budget=budget
             )
-        estimate = self._estimate_input_tokens(ctx.messages)
+        estimate = self._estimate_input_tokens(ctx.messages, ctx=ctx)
         if estimate >= budget:
             raise ContextLimitError(
                 f"provider input estimate {estimate} is not below budget {budget}"
             )
+
+    def _next_structured_output_budget(
+        self,
+        ctx: "AgentContext",
+        tools: list[dict],
+        current_budget: int,
+    ) -> int:
+        input_budget = self._input_token_budget(
+            ctx,
+            tools,
+            output_max_tokens=current_budget,
+        )
+        input_estimate = self._estimate_input_tokens(ctx.messages, ctx=ctx)
+        spare_tokens = max(0, input_budget - input_estimate - 256)
+        desired = max(current_budget * 2, current_budget + 4096)
+        return min(desired, current_budget + spare_tokens)
+
+    async def _recover_incomplete_tool_response(
+        self,
+        ctx: "AgentContext",
+        tools: list[dict],
+        response: Any,
+    ) -> tuple[Any, Optional[str]]:
+        """Retry truncated structured output without committing partial protocol."""
+        has_incomplete_tool_calls = getattr(
+            self._transport,
+            "has_incomplete_tool_calls",
+            None,
+        )
+        if not callable(has_incomplete_tool_calls) or not has_incomplete_tool_calls(
+            response
+        ):
+            return response, None
+        current_budget = int(self.max_tokens)
+        attempts = min(2, max(0, int(self.max_truncation_continuations)))
+        for _ in range(attempts):
+            next_budget = self._next_structured_output_budget(
+                ctx,
+                tools,
+                current_budget,
+            )
+            if next_budget <= current_budget:
+                break
+            current_budget = next_budget
+            response = await self._with_llm_retry(
+                self._create,
+                ctx,
+                tools,
+                output_max_tokens=current_budget,
+            )
+            if not has_incomplete_tool_calls(response):
+                return response, None
+        return (
+            response,
+            "Structured tool output remained truncated; no complete tool call was "
+            f"committed after retrying with max_tokens={current_budget}. Reduce the "
+            "single tool payload or increase the provider context/output budget.",
+        )
 
     def _parse_response(self, response: Any) -> tuple[str, str, list[dict]]:
         return self._transport.parse_response(response)
@@ -1248,7 +1352,7 @@ class BaseAgent:
             tools_enabled=ctx.tools_enabled,
             metadata={
                 key: ctx.metadata[key]
-                for key in ("model_override",)
+                for key in ("model_override", "context_manager", "session_id")
                 if key in ctx.metadata
             },
         )
@@ -2109,10 +2213,12 @@ class BaseAgent:
         # retrieve_implicit_context() covers both recent staging-buffer turns
         # (not yet consolidated) and historical LTM hits.  Skipping the
         # staging side would let recently-compacted turns drop from view.
-        if self.context_manager:
-            retrieved = self.context_manager.retrieve_implicit_context(
+        context_manager = self._context_manager_for(ctx)
+        if context_manager:
+            retrieved = context_manager.retrieve_implicit_context(
                 user_message,
                 current_messages=ctx.messages,
+                current_turn_id=str(ctx.metadata.get("turn_id") or ""),
             )
             if retrieved:
                 ctx.system_prompt = (
@@ -2400,7 +2506,7 @@ class BaseAgent:
                             )
 
                         def _abort_llm(level: str) -> None:
-                            if level == "force":
+                            if not llm_task.done():
                                 llm_task.cancel()
 
                         active_token = shared._active_cancel_token.get()
@@ -2410,7 +2516,22 @@ class BaseAgent:
                             else (lambda: None)
                         )
                         try:
-                            llm_result = await llm_task
+                            try:
+                                llm_result = await llm_task
+                            except asyncio.CancelledError:
+                                if active_token is None or not active_token.is_cancelled:
+                                    raise
+                                trace_status = "cancelled"
+                                trace_error = "Turn cancelled by user"
+                                return AgentResult(
+                                    agent_id=ctx.agent_id,
+                                    content=(
+                                        result_text
+                                        or shared._cancelled_by_user_text(user_message)
+                                    ),
+                                    tool_calls_made=tool_calls_made,
+                                    error=trace_error,
+                                )
                         finally:
                             _llm_deregister()
                         if stream_callback:
@@ -2418,6 +2539,22 @@ class BaseAgent:
                         else:
                             response = llm_result
                             streamed_text = ""
+                    response, structured_output_error = (
+                        await self._recover_incomplete_tool_response(
+                            ctx,
+                            tools,
+                            response,
+                        )
+                    )
+                    if structured_output_error is not None:
+                        trace_status = "continuation_error"
+                        trace_error = structured_output_error
+                        return AgentResult(
+                            agent_id=ctx.agent_id,
+                            content=streamed_text or result_text,
+                            tool_calls_made=tool_calls_made,
+                            error=structured_output_error,
+                        )
                     content_filter_submitted_tool_uses = None
                     content_filter_submitted_results = None
                     stop_reason, text, tool_uses = self._parse_response(response)
@@ -2703,13 +2840,34 @@ class BaseAgent:
         if ctx_mgr:
             if record_kwargs is None:
                 record_kwargs = {}
-            recorded = ctx_mgr.record_turn(
-                user_content=user_content,
-                assistant_content=assistant_content or "",
-                channel=channel,
-                **record_kwargs,
-            )
-            new_turn = recorded is not False
+            record_turn_result = getattr(ctx_mgr, "record_turn_result", None)
+            if callable(record_turn_result):
+                write_result = record_turn_result(
+                    user_content=user_content,
+                    assistant_content=assistant_content or "",
+                    channel=channel,
+                    **record_kwargs,
+                )
+                new_turn = bool(getattr(write_result, "changed", False))
+                stage_user = bool(
+                    getattr(write_result, "user_created", False)
+                    or getattr(write_result, "first_assistant_for_user", False)
+                )
+                stage_assistant = bool(
+                    getattr(write_result, "assistant_created", False)
+                )
+            else:
+                fallback_kwargs = dict(record_kwargs)
+                fallback_kwargs.pop("assistant_message_id", None)
+                recorded = ctx_mgr.record_turn(
+                    user_content=user_content,
+                    assistant_content=assistant_content or "",
+                    channel=channel,
+                    **fallback_kwargs,
+                )
+                new_turn = recorded is not False
+                stage_user = new_turn
+                stage_assistant = new_turn and bool(assistant_content)
             record_runtime_event = getattr(ctx_mgr, "record_runtime_event", None)
             if new_turn and callable(record_runtime_event):
                 metadata = (
@@ -2737,8 +2895,9 @@ class BaseAgent:
                     turn_id=turn_id,
                 )
             if new_turn:
-                ctx_mgr.staging.append("user", user_content)
-                if assistant_content:
+                if stage_user:
+                    ctx_mgr.staging.append("user", user_content)
+                if stage_assistant:
                     ctx_mgr.staging.append("assistant", assistant_content)
                 if ctx_mgr.should_enqueue_consolidation():
                     ctx_mgr.enqueue_consolidation("staged_turns")
@@ -2884,6 +3043,10 @@ class BaseAgent:
                 )
             if "cancel_token" in active_ctx.metadata:
                 sub_ctx.metadata["cancel_token"] = active_ctx.metadata["cancel_token"]
+            if "context_manager" in active_ctx.metadata:
+                sub_ctx.metadata["context_manager"] = active_ctx.metadata[
+                    "context_manager"
+                ]
 
     def _create_sub_agent(self, sub_registry: "ToolRegistry") -> "BaseAgent":
         sub_agent = BaseAgent(
@@ -2895,7 +3058,7 @@ class BaseAgent:
             supports_vision=self.supports_vision,
             context_window=self.context_window,
         )
-        sub_agent.context_manager = self.context_manager
+        sub_agent.context_manager = self._context_manager_for()
         sub_agent.max_parallel_agents = self.max_parallel_agents
         sub_agent.sub_agent_timeout_seconds = self.sub_agent_timeout_seconds
         sub_agent.sub_agent_retries = self.sub_agent_retries
@@ -3183,14 +3346,15 @@ class BaseAgent:
         # staging buffer.  Staging is reserved for real user/assistant
         # conversation turns; sub-agent traces must not be mixed in or
         # consolidation will extract them as user-visible episodes.
-        if self.context_manager and payload["ok"]:
+        context_manager = self._context_manager_for()
+        if context_manager and payload["ok"]:
             with shared._suppress_with_log("LTM write for sub-agent result failed; turn continues"):
                 content_to_store = full_content
                 entry_id = shared._new_id()
                 now = datetime.now(timezone.utc).strftime(
                     "%Y-%m-%d %H:%M UTC"
                 )
-                self.context_manager.store.add_entry(
+                context_manager.store.add_entry(
                     LTMEntry(
                         id=entry_id,
                         content=(
@@ -3204,7 +3368,7 @@ class BaseAgent:
                         scope=(f"run:{run_id}" if run_id else "run:untracked"),
                         status="active",
                         source_session=(
-                            self.context_manager.staging.session_id or ""
+                            context_manager.staging.session_id or ""
                         ),
                         confidence=0.7,
                         created_at=now,
@@ -3217,9 +3381,10 @@ class BaseAgent:
     def _promote_orchestration_runs(self) -> None:
         """Promote only bounded, successful run summaries into session memory."""
         active_runs = _active_orchestration_runs.get() or []
-        if not self.context_manager:
+        context_manager = self._context_manager_for()
+        if not context_manager:
             return
-        session_id = self.context_manager.staging.session_id
+        session_id = context_manager.staging.session_id
         for run in active_runs:
             run_id = str(run.get("run_id") or "")
             for result in run.get("results", []):
@@ -3230,7 +3395,7 @@ class BaseAgent:
                     continue
                 summary = summary[:1600]
                 now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                self.context_manager.store.add_entry(
+                context_manager.store.add_entry(
                     LTMEntry(
                         id=shared._new_id(),
                         content=(

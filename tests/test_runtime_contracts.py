@@ -317,6 +317,39 @@ def test_turn_runner_complete_turn_records_state_and_maintenance():
     ]
 
 
+def test_turn_runner_uses_turn_id_as_the_journal_identity():
+    maintenance_calls = []
+    runner = TurnRunner(
+        {
+            "agent": object(),
+            "system_prompt": "system",
+            "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
+        }
+    )
+    state = RuntimeSessionState(ctx=object())
+
+    asyncio.run(
+        runner.complete_turn(
+            TurnInput.from_text(
+                "hello",
+                metadata={
+                    "message_id": "transport-message",
+                    "turn_id": "logical-turn",
+                    "completion_id": "logical-turn:completion:1",
+                },
+            ),
+            state,
+            TurnResult(text="reply"),
+        )
+    )
+
+    assert maintenance_calls[0]["record_kwargs"]["message_id"] == "logical-turn"
+    assert (
+        maintenance_calls[0]["record_kwargs"]["assistant_message_id"]
+        == "logical-turn:completion:1"
+    )
+
+
 def test_turn_runner_complete_turn_passes_error_to_maintenance():
     maintenance_calls = []
     runner = TurnRunner(
@@ -440,6 +473,68 @@ def test_post_turn_maintenance_is_idempotent_for_replayed_message_id(tmp_path):
     assert manager.staging.count() == 2
 
 
+def test_agent_core_journals_user_input_before_model_completion(tmp_path):
+    from agent import (
+        AgentContext,
+        ConsolidationEngine,
+        ContextManager,
+        LocalRetriever,
+        LTMStore,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir, memory_dir=tmp_path / "memory")
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="cli"),
+    )
+    model_started = asyncio.Event()
+
+    class _Agent:
+        async def send_message(self, ctx, text, **kwargs):
+            model_started.set()
+            await asyncio.Event().wait()
+
+    async def scenario():
+        core = AgentCore(
+            {
+                "agent": _Agent(),
+                "system_prompt": "system",
+                "post_turn_maintenance": lambda **kwargs: None,
+            }
+        )
+        state = RuntimeSessionState(
+            ctx=AgentContext(system_prompt="system"),
+            context_manager=manager,
+        )
+        pending = asyncio.create_task(
+            core.handle_turn(
+                TurnInput.from_text(
+                    "用 three.js 画一个房子",
+                    session_id="cli",
+                    channel_name="cli",
+                ),
+                state,
+            )
+        )
+        await model_started.wait()
+        turns = store.recent_conversation_turns(session_id="cli", limit=10)
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        return turns
+
+    turns = asyncio.run(scenario())
+
+    assert [(turn.role, turn.content) for turn in turns] == [
+        ("user", "用 three.js 画一个房子")
+    ]
+    assert turns[0].message_id
+
+
 def test_turn_runner_complete_turn_uses_live_component_updates():
     maintenance_calls = []
     values = {
@@ -542,6 +637,7 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
         def __init__(self):
             self.run_calls = []
             self.complete_calls = 0
+            self.completion_ids = []
 
         async def run(self, turn_input, ctx, stream_callback=None):
             self.run_calls.append((turn_input, ctx, stream_callback))
@@ -552,6 +648,7 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
 
         async def complete_turn(self, turn_input, state, result):
             self.complete_calls += 1
+            self.completion_ids.append(turn_input.metadata.get("completion_id"))
             state.record_turn(list(result.tool_calls))
             if self.complete_calls == 1:
                 return [type("Hook", (), {"action": "continue", "message": "follow up"})()]
@@ -621,6 +718,10 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
     assert state.turn_count == 2
     assert execution.result.text == "reply:follow up"
     assert execution.iterations == 2
+    assert turn_runner.completion_ids == [
+        "msg-1:completion:1",
+        "msg-1:completion:2",
+    ]
     assert not execution.blocked
     assert [event.name for event in execution.events] == [
         "turn_started",

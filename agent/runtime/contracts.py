@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -280,6 +281,18 @@ class TurnRunner:
         if maintenance is None:
             maintenance = agent_module.BaseAgent._post_turn_maintenance
 
+        record_kwargs = {
+            "message_id": str(
+                turn_input.metadata.get("turn_id")
+                or turn_input.metadata.get("message_id")
+                or ""
+            ),
+            "metadata": dict(turn_input.metadata),
+        }
+        completion_id = str(turn_input.metadata.get("completion_id") or "")
+        if completion_id:
+            record_kwargs["assistant_message_id"] = completion_id
+
         maintenance(
             ctx_mgr=state.context_manager,
             agent=self._components.require("agent"),
@@ -287,10 +300,7 @@ class TurnRunner:
             user_content=turn_input.text,
             assistant_content=result.text or "",
             channel=turn_input.channel_name,
-            record_kwargs={
-                "message_id": str(turn_input.metadata.get("message_id", "")),
-                "metadata": dict(turn_input.metadata),
-            },
+            record_kwargs=record_kwargs,
             memory_worker=state.memory_worker,
             system_prompt=(
                 state.system_prompt_override
@@ -494,6 +504,11 @@ class AgentCore:
         metadata = dict(turn_input.metadata)
         ctx_metadata["session_id"] = turn_input.session_id
         ctx_metadata["channel_name"] = turn_input.channel_name
+        context_manager = getattr(state, "context_manager", None)
+        if context_manager is None:
+            ctx_metadata.pop("context_manager", None)
+        else:
+            ctx_metadata["context_manager"] = context_manager
         user_id = str(metadata.get("user_id") or "")
         if user_id:
             ctx_metadata["user_id"] = user_id
@@ -581,6 +596,11 @@ class AgentCore:
         if skill_catalog is not None and ctx_metadata is not None:
             ctx_metadata["skill_catalog"] = skill_catalog
         prompt = self._prepare_skill_request(turn_input.text, state)
+        turn_metadata = dict(turn_input.metadata)
+        turn_metadata.setdefault(
+            "turn_id",
+            str(turn_metadata.get("message_id") or uuid.uuid4().hex),
+        )
         prompted_input = TurnInput(
             text=prompt,
             session_id=turn_input.session_id,
@@ -588,6 +608,15 @@ class AgentCore:
             metadata=turn_input.metadata,
             attachments=turn_input.attachments,
         )
+        if state.context_manager is not None:
+            begin_turn = getattr(state.context_manager, "begin_turn", None)
+            if callable(begin_turn):
+                begin_turn(
+                    user_content=turn_input.text,
+                    channel=turn_input.channel_name,
+                    message_id=str(turn_metadata["turn_id"]),
+                    metadata=turn_metadata,
+                )
         blocked, prompt = await self._apply_prompt_submit_hooks(
             prompt,
             prompted_input,
@@ -603,6 +632,14 @@ class AgentCore:
                 events=self._drain_collector(prompted_input),
             )
 
+        runtime_input = TurnInput(
+            text=prompt,
+            session_id=turn_input.session_id,
+            channel_name=turn_input.channel_name,
+            metadata=turn_metadata,
+            attachments=turn_input.attachments,
+        )
+
         state.ensure_task_context(prompt)
         if state.context_manager:
             state.context_manager.mark_activity()
@@ -611,7 +648,7 @@ class AgentCore:
             text_len=len(prompt),
             text_preview=prompt[:80].replace("\n", " "),
         )
-        self._publish_turn_runtime_metadata(prompted_input, state)
+        self._publish_turn_runtime_metadata(runtime_input, state)
 
         active_sink_token = _active_sink.set(sink) if sink is not None else None
         schedule_target = self._schedule_target_for_turn(prompted_input)
@@ -643,11 +680,15 @@ class AgentCore:
                     state.ensure_task_context(iteration_prompt)
                     self._refresh_component_prompt_if_needed(state)
                     self._refresh_skill_prompt_if_needed(state)
+                    iteration_metadata = dict(turn_metadata)
+                    iteration_metadata["completion_id"] = (
+                        f"{turn_metadata['turn_id']}:completion:{iteration_index + 1}"
+                    )
                     current_input = TurnInput(
                         text=iteration_prompt,
                         session_id=turn_input.session_id,
                         channel_name=turn_input.channel_name,
-                        metadata=turn_input.metadata,
+                        metadata=iteration_metadata,
                         attachments=(
                             turn_input.attachments if iteration_index == 0 else ()
                         ),
@@ -679,8 +720,15 @@ class AgentCore:
                     complete_turn = getattr(completion_runner, "complete_turn", None)
                     if not callable(complete_turn):
                         complete_turn = TurnRunner(self._components).complete_turn
+                    completion_input = TurnInput(
+                        text=(turn_input.text if iteration_index == 0 else iteration_prompt),
+                        session_id=turn_input.session_id,
+                        channel_name=turn_input.channel_name,
+                        metadata=iteration_metadata,
+                        attachments=(turn_input.attachments if iteration_index == 0 else ()),
+                    )
                     hook_results = await complete_turn(
-                        current_input,
+                        completion_input,
                         state,
                         final_result,
                     )
@@ -734,7 +782,7 @@ class AgentCore:
                         text=iteration_prompt,
                         session_id=turn_input.session_id,
                         channel_name=turn_input.channel_name,
-                        metadata=turn_input.metadata,
+                        metadata=locals().get("iteration_metadata", turn_metadata),
                     ),
                     state,
                     final_result,

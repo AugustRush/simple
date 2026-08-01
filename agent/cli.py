@@ -237,6 +237,18 @@ def _cli_sigint_handler(signum: int, frame: Any) -> None:
         os.kill(os.getpid(), signal.SIGINT)
 
 
+def _build_cli_context_manager(components: dict) -> Optional[ContextManager]:
+    """Return the stable memory session shared by successive CLI processes."""
+    base_ctx_mgr: Optional[ContextManager] = components.get("context_manager")
+    if base_ctx_mgr is None:
+        return base_ctx_mgr
+    staging = getattr(base_ctx_mgr, "staging", None)
+    if getattr(staging, "session_id", None) == "cli":
+        return base_ctx_mgr
+    spawn_session = getattr(base_ctx_mgr, "spawn_session", None)
+    return spawn_session("cli") if callable(spawn_session) else base_ctx_mgr
+
+
 async def _interactive_loop(components: dict, cfg: dict):
     """Main interactive chat loop."""
     global _current_cancel_token
@@ -255,7 +267,7 @@ async def _interactive_loop(components: dict, cfg: dict):
         plugin_catalog.discover_and_load()
         components["plugin_catalog"] = plugin_catalog
     system_prompt = components["system_prompt"]
-    ctx_mgr: Optional[ContextManager] = components.get("context_manager")
+    ctx_mgr = _build_cli_context_manager(components)
     skill_catalog: SkillCatalog = components["skill_catalog"]
 
     ctx = AgentContext(system_prompt=system_prompt)

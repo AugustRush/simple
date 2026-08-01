@@ -55,6 +55,151 @@ def test_conversation_turns_persist_in_order(tmp_path):
     assert turns[1].channel == "feishu"
 
 
+def test_turn_journal_persists_user_before_assistant_completion(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+
+    assert ctx_mgr.begin_turn(
+        user_content="build a three.js house",
+        channel="cli",
+        message_id="turn-1",
+    ) is True
+    assert [
+        (turn.role, turn.content)
+        for turn in ctx_mgr.store.recent_conversation_turns(
+            session_id=ctx_mgr.staging.session_id,
+            limit=10,
+        )
+    ] == [("user", "build a three.js house")]
+
+    assert ctx_mgr.record_turn(
+        user_content="build a three.js house",
+        assistant_content="created house.html",
+        channel="cli",
+        message_id="turn-1",
+    ) is True
+    assert ctx_mgr.record_turn(
+        user_content="build a three.js house",
+        assistant_content="duplicate completion",
+        channel="cli",
+        message_id="turn-1",
+    ) is False
+    assert [
+        (turn.role, turn.content)
+        for turn in ctx_mgr.store.recent_conversation_turns(
+            session_id=ctx_mgr.staging.session_id,
+            limit=10,
+        )
+    ] == [
+        ("user", "build a three.js house"),
+        ("assistant", "created house.html"),
+    ]
+
+
+def test_cli_history_recovers_legacy_random_session_rows(tmp_path):
+    base = make_ctx_manager(tmp_path)
+    base.store.append_conversation_exchange(
+        session_id="legacy-random-session",
+        user_content="用 three.js 画一个房子",
+        assistant_content="任务处理中断了",
+        channel="cli",
+        message_id="legacy-turn",
+    )
+    cli_manager = base.spawn_session("cli")
+    cli_manager.begin_turn(
+        user_content="我们刚才聊了什么",
+        channel="cli",
+        message_id="current-turn",
+    )
+
+    result = cli_manager.retrieve_history_context("我们刚才聊了什么")
+    implicit = cli_manager.retrieve_implicit_context("我们刚才聊了什么")
+
+    assert "用 three.js 画一个房子" in result
+    assert "任务处理中断了" in result
+    assert "用 three.js 画一个房子" in implicit
+
+
+def test_turn_journal_keeps_distinct_continuation_completions(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.begin_turn(
+        user_content="create an app",
+        channel="cli",
+        message_id="turn-1",
+    )
+
+    first = ctx_mgr.record_turn_result(
+        user_content="create an app",
+        assistant_content="first visible response",
+        channel="cli",
+        message_id="turn-1",
+        assistant_message_id="turn-1:completion:1",
+    )
+    second = ctx_mgr.record_turn_result(
+        user_content="plugin follow-up",
+        assistant_content="second visible response",
+        channel="cli",
+        message_id="turn-1",
+        assistant_message_id="turn-1:completion:2",
+    )
+    replay = ctx_mgr.record_turn_result(
+        user_content="plugin follow-up",
+        assistant_content="duplicate second response",
+        channel="cli",
+        message_id="turn-1",
+        assistant_message_id="turn-1:completion:2",
+    )
+
+    assert first.first_assistant_for_user is True
+    assert second.assistant_created is True
+    assert second.first_assistant_for_user is False
+    assert replay.changed is False
+    assert [
+        (turn.role, turn.content, turn.message_id, turn.reply_to_id)
+        for turn in ctx_mgr.store.recent_conversation_turns(
+            session_id=ctx_mgr.staging.session_id,
+            limit=10,
+        )
+    ] == [
+        ("user", "create an app", "turn-1", ""),
+        (
+            "assistant",
+            "first visible response",
+            "turn-1:completion:1",
+            "turn-1",
+        ),
+        (
+            "assistant",
+            "second visible response",
+            "turn-1:completion:2",
+            "turn-1",
+        ),
+    ]
+
+
+def test_history_recall_excludes_the_current_journaled_query(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path).spawn_session("cli")
+    ctx_mgr.record_turn(
+        user_content="previous topic",
+        assistant_content="previous answer",
+        channel="cli",
+        message_id="previous-turn",
+    )
+    ctx_mgr.begin_turn(
+        user_content="我们刚才聊了什么",
+        channel="cli",
+        message_id="current-turn",
+    )
+
+    result = ctx_mgr.retrieve_history_context(
+        "我们刚才聊了什么",
+        exclude_message_id="current-turn",
+    )
+
+    assert "previous topic" in result
+    assert "previous answer" in result
+    assert "我们刚才聊了什么" not in result
+
+
 def test_conversation_history_survives_staging_clear(tmp_path):
     from agent import LTMStore, StagingBuffer
 

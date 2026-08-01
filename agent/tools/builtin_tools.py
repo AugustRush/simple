@@ -1792,9 +1792,28 @@ class BuiltinTools:
         return self._ok(content=self.memory.read_index())
 
     def _context_retrieve(self, query: str, top_k: int = 5) -> dict[str, Any]:
-        if self.context_manager is None:
+        context_manager = self.context_manager
+        current_turn_id = ""
+        # Tool definitions are shared across multiplexed sessions. Resolve the
+        # manager from the active turn instead of capturing the bootstrap
+        # manager, whose staging session is not user-facing.
+        with contextlib.suppress(Exception):
+            from agent.core.agent import _active_agent_context
+
+            active_ctx = _active_agent_context.get()
+            if active_ctx is not None:
+                context_manager = active_ctx.metadata.get(
+                    "context_manager",
+                    context_manager,
+                )
+                current_turn_id = str(active_ctx.metadata.get("turn_id") or "")
+        if context_manager is None:
             return self._error("Context manager not available.")
-        result = self.context_manager.retrieve_context(query, top_k=top_k)
+        result = context_manager.retrieve_context(
+            query,
+            top_k=top_k,
+            exclude_message_id=current_turn_id,
+        )
         sections = [s for s in result.split("\n\n") if s.strip()] if result else []
         return self._ok(
             query=query, count=len(sections), content=result, sections=sections

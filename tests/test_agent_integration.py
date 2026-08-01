@@ -5211,6 +5211,110 @@ def test_anthropic_max_tokens_uses_existing_truncation_continuation():
     assert result.content == "first second"
 
 
+def test_truncated_tool_protocol_retries_with_larger_safe_output_budget():
+    import agent as agent_module
+
+    class Transport:
+        def __init__(self):
+            self.budgets = []
+
+        @staticmethod
+        def has_incomplete_tool_calls(response):
+            return response == "partial-tool-call"
+
+        async def create(self, **kwargs):
+            self.budgets.append(kwargs["max_tokens"])
+            return "complete-tool-call"
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        max_tokens=1000,
+        context_window=20_000,
+        api_format="openai",
+    )
+    transport = Transport()
+    agent._transport = transport
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        messages=[{"role": "user", "content": "create a large artifact"}],
+    )
+    original_messages = list(ctx.messages)
+
+    response, error = asyncio.run(
+        agent._recover_incomplete_tool_response(
+            ctx,
+            [],
+            "partial-tool-call",
+        )
+    )
+
+    assert response == "complete-tool-call"
+    assert error is None
+    assert transport.budgets and transport.budgets[0] > 1000
+    assert ctx.messages == original_messages
+
+
+def test_openai_transport_detects_truncated_tool_protocol():
+    import agent as agent_module
+    from agent.core.transport import OpenAITransport
+
+    partial = agent_module.shared._OAIResponse(
+        [
+            agent_module.shared._OAIChoice(
+                "length",
+                agent_module.shared._OAIMsg(
+                    "creating file",
+                    [
+                        agent_module.shared._OAITC(
+                            "call-1",
+                            agent_module.shared._OAIFunc(
+                                "write_file",
+                                '{"path":"house.html","content":"<html>',
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+
+    assert OpenAITransport(object()).has_incomplete_tool_calls(partial) is True
+
+
+def test_truncated_tool_protocol_fails_without_committing_partial_history():
+    import agent as agent_module
+
+    class Transport:
+        @staticmethod
+        def has_incomplete_tool_calls(response):
+            return True
+
+        async def create(self, **kwargs):
+            raise AssertionError("no retry fits in the remaining context budget")
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        max_tokens=1000,
+        context_window=1100,
+        api_format="openai",
+    )
+    agent._transport = Transport()
+    ctx = agent_module.AgentContext(
+        system_prompt="system",
+        messages=[{"role": "user", "content": "x" * 300}],
+    )
+    original_messages = list(ctx.messages)
+
+    _response, error = asyncio.run(
+        agent._recover_incomplete_tool_response(ctx, [], "partial")
+    )
+
+    assert "Structured tool output remained truncated" in error
+    assert ctx.messages == original_messages
+
+
 def test_send_message_stream_preserves_reasoning_content_for_openai_tool_loop(
     monkeypatch,
 ):
@@ -5484,6 +5588,67 @@ def test_send_message_writes_runtime_heartbeat_without_polluting_messages(
     assert payload["active"] is False
     assert all(message.get("role") in {"user", "assistant", "tool"} for message in ctx.messages)
     assert not any("heartbeat" in json.dumps(message).lower() for message in ctx.messages)
+
+
+def test_cli_sink_renders_throttled_liveness_without_reasoning_content():
+    from agent.core.output import CliOutputSink
+
+    class Console:
+        def __init__(self):
+            self.lines = []
+
+        def print(self, value="", **kwargs):
+            self.lines.append(str(value))
+
+    console = Console()
+    sink = CliOutputSink(console)
+
+    sink.on_heartbeat(
+        elapsed_seconds=5,
+        current_op="LLM",
+        op_detail="deepseek-v4-flash",
+    )
+    sink.on_heartbeat(
+        elapsed_seconds=10,
+        current_op="LLM",
+        op_detail="deepseek-v4-flash",
+    )
+
+    assert len(console.lines) == 1
+    assert "模型正在生成" in console.lines[0]
+    assert "deepseek-v4-flash" in console.lines[0]
+    assert "思考" not in console.lines[0]
+
+
+def test_graceful_cancel_aborts_inflight_llm_and_returns_cancelled_turn(monkeypatch):
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    started = asyncio.Event()
+
+    async def blocked_create(ctx, tools):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(agent, "_create", blocked_create)
+
+    async def scenario():
+        cancel_token = agent_module.shared.CancelToken()
+        ctx = agent_module.AgentContext(
+            system_prompt="system",
+            metadata={"cancel_token": cancel_token},
+        )
+        pending = asyncio.create_task(agent.send_message(ctx, "long task"))
+        await started.wait()
+        cancel_token.cancel("graceful")
+        return await asyncio.wait_for(pending, timeout=1)
+
+    result = asyncio.run(scenario())
+
+    assert result.error == "Turn cancelled by user"
+    assert "cancelled" in result.content.lower()
 
 
 def test_send_message_heartbeat_reports_request_model_override(monkeypatch):

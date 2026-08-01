@@ -116,6 +116,10 @@ class ModelTransport(abc.ABC):
     def completion_error(self, response: Any) -> Optional[str]:
         """Describe a non-clean completion (truncation, refusal) or None."""
 
+    def has_incomplete_tool_calls(self, response: Any) -> bool:
+        """Return true when a truncated response contains partial tool protocol."""
+        return False
+
     # ── Message-history shaping ────────────────────────────────────────
 
     @abc.abstractmethod
@@ -397,6 +401,13 @@ class OpenAITransport(ModelTransport):
         if finish == "length":
             return "Model response was truncated (finish_reason=length)"
         return None
+
+    def has_incomplete_tool_calls(self, response: Any) -> bool:
+        try:
+            choice = response.choices[0]
+            return choice.finish_reason == "length" and bool(choice.message.tool_calls)
+        except Exception:
+            return False
 
     def build_assistant_message(self, response, text):
         msg = response.choices[0].message

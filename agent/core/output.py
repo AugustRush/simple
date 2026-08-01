@@ -156,6 +156,8 @@ class CliOutputSink(OutputSink):
         self._tool_start_times: dict[str, float] = {}
         self._progress: Progress | None = None
         self._progress_task: Any = None
+        self._last_heartbeat_at = 0.0
+        self._last_heartbeat_op = ""
 
     def on_stream_chunk(self, chunk: str) -> None:
         self._console.print(chunk, end="", markup=False)
@@ -232,6 +234,34 @@ class CliOutputSink(OutputSink):
     def on_status(self, text: str, *, level: str = "info") -> None:
         colors = {"info": "dim", "warning": "yellow", "success": "green", "error": "red"}
         self._console.print(f"[{colors.get(level, 'dim')}]{text}[/{colors.get(level, 'dim')}]")
+
+    def on_heartbeat(
+        self,
+        *,
+        elapsed_seconds: float,
+        current_op: str,
+        op_detail: str = "",
+        pending_messages: int = 0,
+    ) -> None:
+        if self._progress is not None:
+            return
+        now = time.monotonic()
+        op = str(current_op or "working")
+        if op == self._last_heartbeat_op and now - self._last_heartbeat_at < 10.0:
+            return
+        self._last_heartbeat_at = now
+        self._last_heartbeat_op = op
+        labels = {
+            "LLM": "模型正在生成",
+            "tools": "工具正在执行",
+            "starting": "正在准备",
+        }
+        label = labels.get(op, op)
+        detail = f" · {op_detail}" if op_detail else ""
+        pending = f" · {pending_messages} 条新消息待处理" if pending_messages else ""
+        self._console.print(
+            f"\n[dim]… {label} ({elapsed_seconds:.0f}s){detail}{pending}[/dim]"
+        )
 
     def on_error(self, error: str) -> None:
         self._console.print(f"[red]{error}[/red]")

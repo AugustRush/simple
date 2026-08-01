@@ -607,6 +607,19 @@ class ConversationTurn:
 
 
 @dataclass(frozen=True)
+class ConversationWriteResult:
+    """Rows created while journaling one user/assistant exchange."""
+
+    user_created: bool = False
+    assistant_created: bool = False
+    first_assistant_for_user: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return self.user_created or self.assistant_created
+
+
+@dataclass(frozen=True)
 class SessionWorkingState:
     """Durable, model-readable working context for one channel session."""
 
@@ -1513,6 +1526,132 @@ class LTMStore:
             ).fetchone()
         return self._row_to_conversation_turn(row) if row else None
 
+    def write_conversation_exchange(
+        self,
+        *,
+        session_id: str,
+        user_content: str,
+        assistant_content: str = "",
+        channel: str = "",
+        message_id: str = "",
+        assistant_message_id: str = "",
+        reply_to_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+        created_at: Optional[str] = None,
+    ) -> ConversationWriteResult:
+        """Idempotently journal a user event and optional assistant completion.
+
+        A non-empty message ID is an idempotency key for the user event.  The
+        user row is committed before an LLM request can begin; a later call can
+        attach the assistant row without duplicating the user event.
+        """
+        clean_user_content = str(user_content or "").strip()
+        if not clean_user_content:
+            return ConversationWriteResult()
+        clean_assistant_content = str(assistant_content or "").strip()
+        clean_session_id = str(session_id or "").strip() or "default"
+        clean_message_id = str(message_id or "").strip()
+        clean_assistant_message_id = str(assistant_message_id or "").strip()
+        payload = metadata or {}
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
+        metadata_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        timestamp = created_at or _now()
+
+        conn = self._connect()
+        user_created = False
+        assistant_created = False
+        first_assistant_for_user = False
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            existing_user = None
+            if clean_message_id:
+                existing_user = conn.execute(
+                    """
+                    SELECT id FROM conversation_turns
+                    WHERE session_id = ? AND role = 'user' AND message_id = ?
+                    LIMIT 1
+                    """,
+                    (clean_session_id, clean_message_id),
+                ).fetchone()
+            if existing_user is None:
+                conn.execute(
+                    """
+                    INSERT INTO conversation_turns (
+                        session_id, role, content, channel, message_id, reply_to_id,
+                        metadata_json, created_at
+                    ) VALUES (?, 'user', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_session_id,
+                        clean_user_content,
+                        str(channel or ""),
+                        clean_message_id,
+                        str(reply_to_id or ""),
+                        metadata_json,
+                        timestamp,
+                    ),
+                )
+                user_created = True
+            if clean_assistant_content:
+                existing_assistant = None
+                if clean_assistant_message_id:
+                    existing_assistant = conn.execute(
+                        """
+                        SELECT id FROM conversation_turns
+                        WHERE session_id = ? AND role = 'assistant'
+                          AND message_id = ?
+                        LIMIT 1
+                        """,
+                        (clean_session_id, clean_assistant_message_id),
+                    ).fetchone()
+                elif clean_message_id:
+                    existing_assistant = conn.execute(
+                        """
+                        SELECT id FROM conversation_turns
+                        WHERE session_id = ? AND role = 'assistant'
+                          AND reply_to_id = ?
+                        LIMIT 1
+                        """,
+                        (clean_session_id, clean_message_id),
+                    ).fetchone()
+                if existing_assistant is None:
+                    prior_assistant = None
+                    if clean_message_id:
+                        prior_assistant = conn.execute(
+                            """
+                            SELECT id FROM conversation_turns
+                            WHERE session_id = ? AND role = 'assistant'
+                              AND reply_to_id = ?
+                            LIMIT 1
+                            """,
+                            (clean_session_id, clean_message_id),
+                        ).fetchone()
+                    conn.execute(
+                        """
+                        INSERT INTO conversation_turns (
+                            session_id, role, content, channel, message_id, reply_to_id,
+                            metadata_json, created_at
+                        ) VALUES (?, 'assistant', ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            clean_session_id,
+                            clean_assistant_content,
+                            str(channel or ""),
+                            clean_assistant_message_id,
+                            clean_message_id,
+                            metadata_json,
+                            timestamp,
+                        ),
+                    )
+                    assistant_created = True
+                    first_assistant_for_user = prior_assistant is None
+        return ConversationWriteResult(
+            user_created=user_created,
+            assistant_created=assistant_created,
+            first_assistant_for_user=first_assistant_for_user,
+        )
+
     def append_conversation_exchange(
         self,
         *,
@@ -1521,91 +1660,52 @@ class LTMStore:
         assistant_content: str = "",
         channel: str = "",
         message_id: str = "",
+        assistant_message_id: str = "",
         reply_to_id: str = "",
         metadata: Optional[dict[str, Any]] = None,
         created_at: Optional[str] = None,
     ) -> bool:
-        """Atomically append one user/assistant exchange.
-
-        A non-empty message ID is an idempotency key for the user event.  The
-        check and both inserts share one immediate transaction so concurrent
-        deliveries cannot create duplicate or half-written exchanges.
-        """
-        clean_user_content = str(user_content or "").strip()
-        if not clean_user_content:
-            return False
-        clean_assistant_content = str(assistant_content or "").strip()
-        clean_session_id = str(session_id or "").strip() or "default"
-        clean_message_id = str(message_id or "").strip()
-        payload = metadata or {}
-        if not isinstance(payload, dict):
-            payload = {"value": payload}
-        metadata_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        timestamp = created_at or _now()
-
-        conn = self._connect()
-        with conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if clean_message_id:
-                existing = conn.execute(
-                    """
-                    SELECT 1 FROM conversation_turns
-                    WHERE session_id = ? AND role = 'user' AND message_id = ?
-                    LIMIT 1
-                    """,
-                    (clean_session_id, clean_message_id),
-                ).fetchone()
-                if existing is not None:
-                    return False
-            conn.execute(
-                """
-                INSERT INTO conversation_turns (
-                    session_id, role, content, channel, message_id, reply_to_id,
-                    metadata_json, created_at
-                ) VALUES (?, 'user', ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    clean_session_id,
-                    clean_user_content,
-                    str(channel or ""),
-                    clean_message_id,
-                    str(reply_to_id or ""),
-                    metadata_json,
-                    timestamp,
-                ),
-            )
-            if clean_assistant_content:
-                conn.execute(
-                    """
-                    INSERT INTO conversation_turns (
-                        session_id, role, content, channel, message_id, reply_to_id,
-                        metadata_json, created_at
-                    ) VALUES (?, 'assistant', ?, ?, '', ?, ?, ?)
-                    """,
-                    (
-                        clean_session_id,
-                        clean_assistant_content,
-                        str(channel or ""),
-                        clean_message_id,
-                        metadata_json,
-                        timestamp,
-                    ),
-                )
-        return True
+        """Compatibility API: true only when this call created the user row."""
+        return self.write_conversation_exchange(
+            session_id=session_id,
+            user_content=user_content,
+            assistant_content=assistant_content,
+            channel=channel,
+            message_id=message_id,
+            assistant_message_id=assistant_message_id,
+            reply_to_id=reply_to_id,
+            metadata=metadata,
+            created_at=created_at,
+        ).user_created
 
     def recent_conversation_turns(
         self,
         *,
         session_id: Optional[str] = None,
+        channel: Optional[str] = None,
+        exclude_message_id: str = "",
         limit: int = shared.RECENT_SESSION_TURNS,
     ) -> list[ConversationTurn]:
         limit = max(1, min(int(limit), 100))
         with self._connect() as conn:
             sql = "SELECT * FROM conversation_turns"
             params: list[Any] = []
+            clauses: list[str] = []
             if session_id:
-                sql += " WHERE session_id = ?"
+                clauses.append("session_id = ?")
                 params.append(session_id)
+            if channel:
+                clauses.append("channel = ?")
+                params.append(channel)
+            clean_exclude_id = str(exclude_message_id or "").strip()
+            if clean_exclude_id:
+                clauses.append(
+                    "NOT ((role = 'user' AND message_id = ?) "
+                    "OR (role = 'assistant' AND reply_to_id = ?))"
+                )
+                params.extend((clean_exclude_id, clean_exclude_id))
+            if clauses:
+                sql += " WHERE " + " AND ".join(clauses)
             sql += " ORDER BY id DESC LIMIT ?"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
@@ -1616,18 +1716,33 @@ class LTMStore:
         query: str,
         *,
         session_id: str,
+        exclude_message_id: str = "",
         limit: int = shared.RECENT_SESSION_TURNS,
     ) -> list[ConversationTurn]:
         terms = [term for term in _lexical_terms(query) if len(term) >= 2][:12]
         if not terms:
             return []
         clauses = " OR ".join("content LIKE ?" for _ in terms)
-        params: list[Any] = [session_id, *(f"%{term}%" for term in terms), limit]
+        clean_exclude_id = str(exclude_message_id or "").strip()
+        exclusion_sql = ""
+        exclusion_params: list[Any] = []
+        if clean_exclude_id:
+            exclusion_sql = (
+                " AND NOT ((role = 'user' AND message_id = ?) "
+                "OR (role = 'assistant' AND reply_to_id = ?))"
+            )
+            exclusion_params = [clean_exclude_id, clean_exclude_id]
+        params: list[Any] = [
+            session_id,
+            *(f"%{term}%" for term in terms),
+            *exclusion_params,
+            limit,
+        ]
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT * FROM conversation_turns
-                WHERE session_id = ? AND ({clauses})
+                WHERE session_id = ? AND ({clauses}){exclusion_sql}
                 ORDER BY id DESC LIMIT ?
                 """,
                 params,
@@ -1639,9 +1754,19 @@ class LTMStore:
                     """
                     SELECT * FROM conversation_turns
                     WHERE id = ? AND session_id = ?
+                      AND (? = '' OR NOT (
+                          (role = 'user' AND message_id = ?)
+                          OR (role = 'assistant' AND reply_to_id = ?)
+                      ))
                     LIMIT 1
                     """,
-                    (neighbor_id, session_id),
+                    (
+                        neighbor_id,
+                        session_id,
+                        clean_exclude_id,
+                        clean_exclude_id,
+                        clean_exclude_id,
+                    ),
                 ).fetchone()
                 if neighbor is None:
                     continue
@@ -2934,21 +3059,86 @@ class ContextManager:
         assistant_content: str = "",
         channel: str = "",
         message_id: str = "",
+        assistant_message_id: str = "",
         reply_to_id: str = "",
         metadata: Optional[dict[str, Any]] = None,
     ) -> bool:
-        """Persist the completed exchange as durable event history."""
+        """Persist an exchange; return whether either event was newly created."""
+        return self.record_turn_result(
+            user_content=user_content,
+            assistant_content=assistant_content,
+            channel=channel,
+            message_id=message_id,
+            assistant_message_id=assistant_message_id,
+            reply_to_id=reply_to_id,
+            metadata=metadata,
+        ).changed
+
+    def record_turn_result(
+        self,
+        *,
+        user_content: str,
+        assistant_content: str = "",
+        channel: str = "",
+        message_id: str = "",
+        assistant_message_id: str = "",
+        reply_to_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> ConversationWriteResult:
+        """Persist an exchange and expose which event rows were created."""
         session_id = self.staging.session_id
-        recorded = self.store.append_conversation_exchange(
+        write_result = self.store.write_conversation_exchange(
             session_id=session_id,
             user_content=user_content,
             assistant_content=assistant_content,
             channel=channel,
             message_id=message_id,
+            assistant_message_id=assistant_message_id,
             reply_to_id=reply_to_id,
             metadata=metadata,
         )
-        if not recorded:
+        if not write_result.changed:
+            return write_result
+        if write_result.user_created:
+            for assertion in self._extract_turn_fact_assertions(
+                role="user",
+                content=user_content,
+                session_id=session_id,
+                channel=channel,
+                source_id=message_id,
+            ):
+                self.store.add_fact_assertion(assertion)
+        if write_result.assistant_created:
+            for assertion in self._extract_turn_fact_assertions(
+                role="assistant",
+                content=assistant_content,
+                session_id=session_id,
+                channel=channel,
+                source_id=reply_to_id or message_id,
+            ):
+                self.store.add_fact_assertion(assertion)
+        return write_result
+
+    def begin_turn(
+        self,
+        *,
+        user_content: str,
+        channel: str = "",
+        message_id: str = "",
+        reply_to_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Durably journal user intent before any fallible model work starts."""
+        session_id = self.staging.session_id
+        write_result = self.store.write_conversation_exchange(
+            session_id=session_id,
+            user_content=user_content,
+            channel=channel,
+            message_id=message_id,
+            reply_to_id=reply_to_id,
+            metadata=metadata,
+        )
+        if not write_result.user_created:
             return False
         for assertion in self._extract_turn_fact_assertions(
             role="user",
@@ -2956,14 +3146,6 @@ class ContextManager:
             session_id=session_id,
             channel=channel,
             source_id=message_id,
-        ):
-            self.store.add_fact_assertion(assertion)
-        for assertion in self._extract_turn_fact_assertions(
-            role="assistant",
-            content=assistant_content,
-            session_id=session_id,
-            channel=channel,
-            source_id=reply_to_id or message_id,
         ):
             self.store.add_fact_assertion(assertion)
         return True
@@ -3558,17 +3740,30 @@ class ContextManager:
             lines.append(f"- [{anchor}] {e.content}")
         return "\n".join(lines)
 
-    def _recent_session_context(self, limit: int = shared.RECENT_SESSION_TURNS) -> str:
+    def _recent_session_context(
+        self,
+        limit: int = shared.RECENT_SESSION_TURNS,
+        *,
+        exclude_message_id: str = "",
+    ) -> str:
         """Return the most recent staged turns for explicit current-session recall."""
         staged = self.staging.read_last(limit * 4)
         if not staged:
             # Staging may be empty after a restart (sleep archived turns to
             # conversation_turns).  Fall back to the durable store so the
             # agent still sees recent conversation history.
-            turns = self.store.recent_conversation_turns(
-                session_id=self.staging.session_id,
-                limit=limit,
-            )
+            if self.staging.session_id == "cli":
+                turns = self.store.recent_conversation_turns(
+                    channel="cli",
+                    exclude_message_id=exclude_message_id,
+                    limit=limit,
+                )
+            else:
+                turns = self.store.recent_conversation_turns(
+                    session_id=self.staging.session_id,
+                    exclude_message_id=exclude_message_id,
+                    limit=limit,
+                )
             if not turns:
                 return ""
             lines = ["## Previous Session (restored from history)"]
@@ -3589,20 +3784,31 @@ class ContextManager:
         self,
         query: str,
         limit: int = shared.RECENT_SESSION_TURNS,
+        *,
+        exclude_message_id: str = "",
     ) -> str:
         """Return durable event-history evidence when the query asks for it."""
         if not self._is_episode_recall_query(query):
             return ""
-        turns = self.store.search_conversation_turns(
-            query,
-            session_id=self.staging.session_id,
-            limit=limit,
-        )
-        if not turns:
+        if self.staging.session_id == "cli":
             turns = self.store.recent_conversation_turns(
-                session_id=self.staging.session_id,
+                channel="cli",
+                exclude_message_id=exclude_message_id,
                 limit=limit,
             )
+        else:
+            turns = self.store.search_conversation_turns(
+                query,
+                session_id=self.staging.session_id,
+                exclude_message_id=exclude_message_id,
+                limit=limit,
+            )
+            if not turns:
+                turns = self.store.recent_conversation_turns(
+                    session_id=self.staging.session_id,
+                    exclude_message_id=exclude_message_id,
+                    limit=limit,
+                )
         if not turns:
             return ""
         lines = ["## Conversation History"]
@@ -4110,14 +4316,27 @@ class ContextManager:
         )
         return event
 
-    def retrieve_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
+    def retrieve_context(
+        self,
+        query: str,
+        top_k: int = shared.RETRIEVAL_TOP_K,
+        *,
+        exclude_message_id: str = "",
+    ) -> str:
         """Return explicit context lookup results across active session and LTM."""
         plan = self._plan_query(query)
         sections = []
-        history = self.retrieve_history_context(query)
+        history = self.retrieve_history_context(
+            query,
+            exclude_message_id=exclude_message_id,
+        )
         if history:
             sections.append(history)
-        recent = "" if history else self._recent_session_context()
+        recent = (
+            ""
+            if history
+            else self._recent_session_context(exclude_message_id=exclude_message_id)
+        )
         if recent:
             sections.append(recent)
         facts = self.retrieve_resolved_fact_context(query, top_k=top_k, plan=plan)
@@ -4138,6 +4357,7 @@ class ContextManager:
         query: str,
         top_k: int = shared.RETRIEVAL_TOP_K,
         current_messages: Optional[list[dict]] = None,
+        current_turn_id: str = "",
     ) -> str:
         """Return context for automatic prompt injection.
 
@@ -4154,7 +4374,9 @@ class ContextManager:
         if working_state:
             sections.append(working_state)
         if "episodes" in self._route_categories(query):
-            recent = self._recent_session_context()
+            recent = self._recent_session_context(
+                exclude_message_id=current_turn_id,
+            )
             if recent:
                 sections.append(recent)
         else:

@@ -355,6 +355,55 @@ def test_context_retrieve_returns_conversation_history_sections(tmp_path):
     assert "durable event history" in result["content"]
 
 
+def test_context_retrieve_uses_active_session_manager(tmp_path):
+    from agent import AgentContext, BuiltinTools, ConsolidationEngine, ContextManager
+    from agent import LocalRetriever, LTMStore, MemoryPalace, ToolRegistry
+    from agent.core.agent import _active_agent_context
+
+    registry = ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    base = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+    )
+    cli_manager = base.spawn_session("cli")
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+        store=store,
+    )
+    tools = BuiltinTools(
+        memory=memory,
+        registry=registry,
+        context_manager=base,
+        workspace_root=workspace,
+    )
+    base.record_turn(
+        user_content="base session topic",
+        assistant_content="base reply",
+        channel="internal",
+        message_id="base-turn",
+    )
+    cli_manager.record_turn(
+        user_content="cli session topic",
+        assistant_content="cli reply",
+        channel="cli",
+        message_id="cli-turn",
+    )
+    ctx = AgentContext(metadata={"context_manager": cli_manager})
+    token = _active_agent_context.set(ctx)
+    try:
+        result = tools._context_retrieve("刚才我们聊了什么", top_k=5)
+    finally:
+        _active_agent_context.reset(token)
+
+    assert "cli session topic" in result["content"]
+    assert "base session topic" not in result["content"]
+
+
 def test_memory_search_returns_structured_results(tmp_path):
     tools, registry, workspace = make_builtin_tools(tmp_path)
     tools.memory.write("identity", "user", "Prefers concise responses")
