@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import inspect
+import math
 from pathlib import Path
 import time
 from typing import Any, Awaitable, Callable
@@ -19,7 +20,8 @@ class SubtaskSpec:
     expected_output: str = ""
     output_contract: dict[str, Any] = field(default_factory=dict)
     write_scope: list[str] = field(default_factory=list)
-    capability_profile: str = "full"
+    capability_profile: str = "read_only"
+    run_id: str = ""
     handoff: dict[str, Any] = field(default_factory=dict)
     early_exit: bool = False
     timeout_seconds: float = 0
@@ -36,6 +38,7 @@ class SubtaskResult:
     structured_content: Any = None
     error: str | None = None
     full_content: str = ""
+    artifact_ref: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,7 @@ class RendezvousDirective:
 
 
 RuntimeProgressCallback = Callable[[str, dict[str, Any]], None]
+CAPABILITY_PROFILES = frozenset({"read_only", "research", "implementation", "full"})
 
 
 def _emit_progress(
@@ -88,6 +92,101 @@ def _validate_write_scopes(
     return count, time.perf_counter() - started
 
 
+def _validate_concurrent_capabilities(
+    specs: list[SubtaskSpec],
+    *,
+    max_concurrency: int,
+) -> None:
+    """Reject concurrent workers whose write surface cannot be isolated."""
+    if len(specs) < 2 or max(1, int(max_concurrency)) == 1:
+        return
+    unrestricted = [
+        spec.id
+        for spec in specs
+        if spec.capability_profile == "full" and not spec.write_scope
+    ]
+    if unrestricted:
+        raise ValueError(
+            "concurrent full-capability subtasks require an explicit write_scope: "
+            + ", ".join(unrestricted)
+        )
+
+
+def validate_subtask_specs(
+    specs: list[SubtaskSpec],
+    *,
+    mode: str = "",
+) -> None:
+    """Validate the execution graph before starting any child work."""
+    seen: set[str] = set()
+    by_id: dict[str, SubtaskSpec] = {}
+    for spec in specs:
+        spec_id = str(spec.id or "").strip()
+        if not spec_id:
+            raise ValueError("subtask id must be non-empty")
+        if spec_id in seen:
+            raise ValueError(f"duplicate subtask id: {spec_id}")
+        seen.add(spec_id)
+        by_id[spec_id] = spec
+        if not str(spec.role or "").strip():
+            raise ValueError(f"subtask {spec_id} has an empty role")
+        if not str(spec.task or "").strip():
+            raise ValueError(f"subtask {spec_id} has an empty task")
+        profile = str(spec.capability_profile or "").strip().lower()
+        if profile not in CAPABILITY_PROFILES:
+            raise ValueError(
+                f"subtask {spec_id} has unsupported capability_profile: {spec.capability_profile!r}"
+            )
+        if spec.timeout_seconds and (
+            not math.isfinite(float(spec.timeout_seconds))
+            or float(spec.timeout_seconds) <= 0
+        ):
+            raise ValueError(f"subtask {spec_id} timeout_seconds must be positive")
+    for spec in specs:
+        spec_id = str(spec.id).strip()
+        dependencies = [str(dep or "").strip() for dep in spec.depends_on]
+        if len(dependencies) != len(set(dependencies)):
+            raise ValueError(f"subtask {spec_id} contains duplicate dependencies")
+        if spec_id in dependencies:
+            raise ValueError(f"subtask {spec_id} cannot depend on itself")
+        missing = [dep for dep in dependencies if dep not in by_id]
+        if missing:
+            raise ValueError(
+                f"subtask {spec_id} depends on unknown subtask(s): {', '.join(missing)}"
+            )
+    if mode in {"parallel", "rendezvous"} and any(
+        spec.depends_on for spec in specs
+    ):
+        raise ValueError(f"{mode} subtasks cannot declare dependencies")
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(spec_id: str) -> None:
+        if spec_id in visiting:
+            raise ValueError("pipeline contains cyclic dependencies")
+        if spec_id in visited:
+            return
+        visiting.add(spec_id)
+        for dependency in by_id[spec_id].depends_on:
+            visit(str(dependency).strip())
+        visiting.remove(spec_id)
+        visited.add(spec_id)
+
+    for spec_id in by_id:
+        visit(spec_id)
+
+
+def _failed_result(spec: SubtaskSpec, error: str) -> SubtaskResult:
+    return SubtaskResult(
+        id=spec.id,
+        ok=False,
+        content="",
+        tool_calls_made=[],
+        error=error,
+    )
+
+
 async def run_parallel_subtasks(
     specs: list[SubtaskSpec],
     *,
@@ -98,6 +197,8 @@ async def run_parallel_subtasks(
     progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
+    validate_subtask_specs(specs, mode="parallel")
+    _validate_concurrent_capabilities(specs, max_concurrency=max_concurrency)
     write_scope_count, write_scope_check_seconds = _validate_write_scopes(
         specs, canonicalize_write_scope
     )
@@ -156,29 +257,36 @@ async def run_parallel_subtasks(
         asyncio.create_task(_run(index, spec))
         for index, spec in enumerate(specs)
     ]
-    for task in asyncio.as_completed(task_objects):
-        index, result = await task
-        results[index] = result
-        completed_count = len([r for r in results if r is not None])
-        if result.ok and specs[index].early_exit and not early_exit_triggered:
-            early_exit_triggered = True
-            early_exit_event.set()
-            for t in task_objects:
-                if not t.done():
-                    t.cancel()
-        cancelled_count = sum(
-            1 for r in results if r is not None and "cancelled" in (r.error or "")
-        )
-        _emit_progress(
-            progress_callback,
-            "batch_progress",
-            execution_mode="parallel",
-            completed=completed_count,
-            total=len(specs),
-            spec_count=len(specs),
-            max_concurrency=max(1, int(max_concurrency)),
-            cancelled=cancelled_count,
-        )
+    try:
+        for task in asyncio.as_completed(task_objects):
+            index, result = await task
+            results[index] = result
+            completed_count = len([r for r in results if r is not None])
+            if result.ok and specs[index].early_exit and not early_exit_triggered:
+                early_exit_triggered = True
+                early_exit_event.set()
+                for t in task_objects:
+                    if not t.done():
+                        t.cancel()
+            cancelled_count = sum(
+                1 for r in results if r is not None and "cancelled" in (r.error or "")
+            )
+            _emit_progress(
+                progress_callback,
+                "batch_progress",
+                execution_mode="parallel",
+                completed=completed_count,
+                total=len(specs),
+                spec_count=len(specs),
+                max_concurrency=max(1, int(max_concurrency)),
+                cancelled=cancelled_count,
+            )
+    except BaseException:
+        for task in task_objects:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*task_objects, return_exceptions=True)
+        raise
     if telemetry is not None:
         telemetry.update(
             {
@@ -199,18 +307,35 @@ async def run_pipeline_subtasks(
     specs: list[SubtaskSpec],
     *,
     executor: Callable[[SubtaskSpec, dict[str, str]], Awaitable[SubtaskResult]],
+    max_concurrency: int | None = None,
+    canonicalize_write_scope: Callable[[str], Path] | None = None,
     telemetry: dict[str, Any] | None = None,
     progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
-    _validate_write_scopes(specs)  # no-op for zero scopes; catches overlaps early
+    validate_subtask_specs(specs, mode="pipeline")
+    concurrency = max(1, int(max_concurrency or len(specs) or 1))
+    semaphore = asyncio.Semaphore(concurrency)
     pending = {spec.id: spec for spec in specs}
     summaries: dict[str, str] = {}
     successful_results: dict[str, SubtaskResult] = {}
+    failed_ids: set[str] = set()
     results: list[SubtaskResult] = []
     stage_count = 0
+    write_scope_count = 0
+    write_scope_check_seconds = 0.0
 
     while pending:
+        blocked_ids = [
+            spec_id
+            for spec_id, spec in pending.items()
+            if any(dep in failed_ids for dep in spec.depends_on)
+        ]
+        if blocked_ids:
+            for spec_id in blocked_ids:
+                pending.pop(spec_id)
+                failed_ids.add(spec_id)
+            continue
         ready = [
             (spec_id, spec)
             for spec_id, spec in pending.items()
@@ -218,6 +343,17 @@ async def run_pipeline_subtasks(
         ]
         if not ready:
             raise ValueError("pipeline contains unresolved or cyclic dependencies")
+        ready_specs = [spec for _, spec in ready]
+        _validate_concurrent_capabilities(
+            ready_specs,
+            max_concurrency=concurrency,
+        )
+        stage_scope_count, stage_scope_seconds = _validate_write_scopes(
+            ready_specs,
+            canonicalize_write_scope,
+        )
+        write_scope_count += stage_scope_count
+        write_scope_check_seconds += stage_scope_seconds
         stage_count += 1
         _emit_progress(
             progress_callback,
@@ -230,19 +366,44 @@ async def run_pipeline_subtasks(
             ready_roles=[spec.role for _, spec in ready],
             spec_count=len(specs),
         )
-        stage_results = await asyncio.gather(
-            *[
-                _invoke_pipeline_executor(
-                    executor,
-                    spec,
-                    {dep: summaries[dep] for dep in spec.depends_on},
-                    {dep: successful_results[dep] for dep in spec.depends_on},
-                )
-                for _, spec in ready
-            ]
-        )
+        async def run_ready(spec: SubtaskSpec) -> SubtaskResult:
+            async with semaphore:
+                try:
+                    operation = _invoke_pipeline_executor(
+                        executor,
+                        spec,
+                        {dep: summaries[dep] for dep in spec.depends_on},
+                        {dep: successful_results[dep] for dep in spec.depends_on},
+                    )
+                    if spec.timeout_seconds:
+                        return await asyncio.wait_for(operation, spec.timeout_seconds)
+                    return await operation
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    return _failed_result(
+                        spec,
+                        f"subtask timed out after {spec.timeout_seconds}s",
+                    )
+                except Exception as exc:
+                    return _failed_result(spec, str(exc) or exc.__class__.__name__)
+
+        stage_tasks = [asyncio.create_task(run_ready(spec)) for _, spec in ready]
+        try:
+            stage_results = await asyncio.gather(*stage_tasks)
+        except BaseException:
+            for task in stage_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*stage_tasks, return_exceptions=True)
+            raise
         succeeded_count = sum(1 for result in stage_results if result.ok)
         failed_count = len(stage_results) - succeeded_count
+        hard_failed_count = sum(
+            1
+            for (_, spec), result in zip(ready, stage_results)
+            if not result.ok and not spec.continue_on_failure
+        )
         _emit_progress(
             progress_callback,
             "phase_finished",
@@ -254,10 +415,9 @@ async def run_pipeline_subtasks(
             ready_roles=[spec.role for _, spec in ready],
             succeeded_count=succeeded_count,
             failed_count=failed_count,
-            halted=failed_count > 0,
+            halted=hard_failed_count > 0,
             spec_count=len(specs),
         )
-        stage_failed = False
         for (spec_id, spec), result in zip(ready, stage_results):
             results.append(result)
             pending.pop(spec_id)
@@ -266,23 +426,10 @@ async def run_pipeline_subtasks(
                     summaries[spec.id] = f"[failed] {result.error or 'unknown error'}"
                     successful_results[spec.id] = result
                     continue
-                stage_failed = True
+                failed_ids.add(spec.id)
                 continue
             summaries[spec.id] = result.summary
             successful_results[spec.id] = result
-        if stage_failed:
-            if telemetry is not None:
-                telemetry.update(
-                    {
-                        "execution_mode": "pipeline",
-                        "spec_count": len(specs),
-                        "stage_count": stage_count,
-                        "completed_count": len(results),
-                        "duration_seconds": time.perf_counter() - started_at,
-                    }
-                )
-            return results
-
     if telemetry is not None:
         telemetry.update(
             {
@@ -290,6 +437,10 @@ async def run_pipeline_subtasks(
                 "spec_count": len(specs),
                 "stage_count": stage_count,
                 "completed_count": len(results),
+                "skipped_count": len(specs) - len(results),
+                "max_concurrency": concurrency,
+                "write_scope_count": write_scope_count,
+                "write_scope_check_seconds": write_scope_check_seconds,
                 "duration_seconds": time.perf_counter() - started_at,
             }
         )
@@ -305,11 +456,15 @@ async def run_rendezvous_round(
         str | RendezvousDirective | Awaitable[str | RendezvousDirective],
     ],
     max_rounds: int,
+    max_concurrency: int | None = None,
     canonicalize_write_scope: Callable[[str], Path] | None = None,
     telemetry: dict[str, Any] | None = None,
     progress_callback: RuntimeProgressCallback | None = None,
 ) -> list[SubtaskResult]:
     started_at = time.perf_counter()
+    validate_subtask_specs(specs, mode="rendezvous")
+    concurrency = max(1, int(max_concurrency or len(specs) or 1))
+    _validate_concurrent_capabilities(specs, max_concurrency=concurrency)
     write_scope_count, write_scope_check_seconds = _validate_write_scopes(
         specs, canonicalize_write_scope
     )
@@ -319,6 +474,7 @@ async def run_rendezvous_round(
     lead_structured_context: dict[str, Any] | None = None
     active_specs = list(specs)
     rounds_completed = 0
+    semaphore = asyncio.Semaphore(concurrency)
 
     for round_index in range(1, rounds + 1):
         rounds_completed = round_index
@@ -334,18 +490,40 @@ async def run_rendezvous_round(
             participant_roles=[spec.role for spec in active_specs],
             spec_count=len(specs),
         )
-        round_results = await asyncio.gather(
-            *[
-                _invoke_rendezvous_executor(
-                    executor,
-                    spec,
-                    round_index=round_index,
-                    lead_summary=lead_summary,
-                    lead_structured_context=lead_structured_context,
-                )
-                for spec in active_specs
-            ]
-        )
+        async def run_participant(spec: SubtaskSpec) -> SubtaskResult:
+            async with semaphore:
+                try:
+                    operation = _invoke_rendezvous_executor(
+                        executor,
+                        spec,
+                        round_index=round_index,
+                        lead_summary=lead_summary,
+                        lead_structured_context=lead_structured_context,
+                    )
+                    if spec.timeout_seconds:
+                        return await asyncio.wait_for(operation, spec.timeout_seconds)
+                    return await operation
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    return _failed_result(
+                        spec,
+                        f"subtask timed out after {spec.timeout_seconds}s",
+                    )
+                except Exception as exc:
+                    return _failed_result(spec, str(exc) or exc.__class__.__name__)
+
+        round_tasks = [
+            asyncio.create_task(run_participant(spec)) for spec in active_specs
+        ]
+        try:
+            round_results = await asyncio.gather(*round_tasks)
+        except BaseException:
+            for task in round_tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*round_tasks, return_exceptions=True)
+            raise
         all_results.extend(round_results)
         succeeded_count = sum(1 for result in round_results if result.ok)
         failed_count = len(round_results) - succeeded_count

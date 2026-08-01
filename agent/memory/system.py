@@ -4,7 +4,7 @@ import asyncio
 from collections import deque
 import contextlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -34,6 +34,8 @@ _FACT_SOURCE_PRECEDENCE = {
     "consolidation_extract": 5,
     "summary_extract": 6,
 }
+_RUN_SCRATCH_RETENTION_DAYS = 7
+_RUN_SCRATCH_MAX_ACTIVE = 500
 _FACT_QUERY_SUBJECT_ALIASES: dict[str, tuple[str, ...]] = {
     "assistant": (
         "assistant",
@@ -1321,17 +1323,26 @@ class LTMStore:
 
     # ── Entry CRUD ────────────────────────────────────────────────────────────
 
-    def read_entries(self, category: str) -> list[LTMEntry]:
+    def read_entries(
+        self,
+        category: str,
+        *,
+        scopes: Optional[list[str]] = None,
+    ) -> list[LTMEntry]:
+        if scopes is not None and not scopes:
+            return []
         category = self.normalize_category_name(category)
         with self._connect() as conn:
-            rows = conn.execute(
-                """
+            sql = """
                 SELECT * FROM memory_items
                 WHERE category = ? AND status NOT IN ('archived', 'superseded')
-                ORDER BY importance DESC, updated_at DESC, id ASC
-                """,
-                (category,),
-            ).fetchall()
+            """
+            params: list[Any] = [category]
+            if scopes:
+                sql += f" AND scope IN ({','.join('?' for _ in scopes)})"
+                params.extend(str(scope) for scope in scopes)
+            sql += " ORDER BY importance DESC, updated_at DESC, id ASC"
+            rows = conn.execute(sql, params).fetchall()
         return [self._row_to_entry(row) for row in rows]
 
     def read_entries_for_entity(self, category: str, entity: str) -> list[LTMEntry]:
@@ -2057,7 +2068,10 @@ class LTMStore:
         query: str,
         categories: Optional[list[str]] = None,
         limit: int = shared.RETRIEVAL_TOP_K,
+        scopes: Optional[list[str]] = None,
     ) -> list[LTMEntry]:
+        if scopes is not None and not scopes:
+            return []
         query_terms = _lexical_terms(query)
         if not query_terms:
             with self._connect() as conn:
@@ -2070,6 +2084,9 @@ class LTMStore:
                     cats = [self.normalize_category_name(c) for c in categories]
                     sql += f" AND category IN ({','.join('?' for _ in cats)})"
                     params.extend(cats)
+                if scopes:
+                    sql += f" AND scope IN ({','.join('?' for _ in scopes)})"
+                    params.extend(str(scope) for scope in scopes)
                 sql += " ORDER BY importance DESC, updated_at DESC, id ASC LIMIT ?"
                 params.append(limit)
                 rows = conn.execute(sql, params).fetchall()
@@ -2104,6 +2121,9 @@ class LTMStore:
                 if normalized_categories:
                     sql += f" AND m.category IN ({','.join('?' for _ in normalized_categories)})"
                     params.extend(normalized_categories)
+                if scopes:
+                    sql += f" AND m.scope IN ({','.join('?' for _ in scopes)})"
+                    params.extend(str(scope) for scope in scopes)
                 sql += """
                     ORDER BY bm25(memory_items_fts), m.importance DESC,
                              m.updated_at DESC, m.id ASC
@@ -2131,6 +2151,9 @@ class LTMStore:
                 if normalized_categories:
                     sql += f" AND category IN ({','.join('?' for _ in normalized_categories)})"
                     params.extend(normalized_categories)
+                if scopes:
+                    sql += f" AND scope IN ({','.join('?' for _ in scopes)})"
+                    params.extend(str(scope) for scope in scopes)
                 sql += """
                     ORDER BY importance DESC, updated_at DESC, id ASC
                     LIMIT ?
@@ -2169,6 +2192,9 @@ class LTMStore:
         only the rows that need to change.
         """
         now = _now()
+        run_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=_RUN_SCRATCH_RETENTION_DAYS)
+        ).strftime("%Y-%m-%d %H:%M UTC")
         with self._connect() as conn:
             # Step 1: decay importance for all active episodes in a single UPDATE.
             conn.execute(
@@ -2182,7 +2208,7 @@ class LTMStore:
                 (shared.DECAY_FACTOR, now),
             )
             # Step 2: archive episodes that fell below the importance floor.
-            archived_ids = [
+            archived_ids = {
                 row["id"]
                 for row in conn.execute(
                     """
@@ -2193,18 +2219,46 @@ class LTMStore:
                     """,
                     (shared.MIN_IMPORTANCE,),
                 ).fetchall()
-            ]
+            }
+            archived_ids.update(
+                row["id"]
+                for row in conn.execute(
+                    """
+                    SELECT id FROM memory_items
+                    WHERE category = 'episodes'
+                      AND scope LIKE 'run:%'
+                      AND created_at < ?
+                      AND status NOT IN ('archived', 'superseded')
+                    """,
+                    (run_cutoff,),
+                ).fetchall()
+            )
+            archived_ids.update(
+                row["id"]
+                for row in conn.execute(
+                    """
+                    SELECT id FROM memory_items
+                    WHERE category = 'episodes'
+                      AND scope LIKE 'run:%'
+                      AND status NOT IN ('archived', 'superseded')
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT -1 OFFSET ?
+                    """,
+                    (_RUN_SCRATCH_MAX_ACTIVE,),
+                ).fetchall()
+            )
             if archived_ids:
+                archived_id_list = sorted(archived_ids)
                 conn.execute(
                     f"""
                     UPDATE memory_items
                     SET status     = 'archived',
                         updated_at = ?
-                    WHERE id IN ({",".join("?" for _ in archived_ids)})
+                    WHERE id IN ({",".join("?" for _ in archived_id_list)})
                     """,
-                    (now, *archived_ids),
+                    (now, *archived_id_list),
                 )
-                self._delete_fts_rows(conn, archived_ids)
+                self._delete_fts_rows(conn, archived_id_list)
         self._sync_after_mutation({"episodes"})
 
     def maintenance_snapshot(self, limit: int = 20) -> str:
@@ -3473,9 +3527,15 @@ class ContextManager:
         live outside the routed categories.
         """
         categories = self._route_categories(query)
-        candidates = self.store.search_entries(query, categories=None, limit=top_k * 6)
+        scopes = ["global", f"session:{self.staging.session_id}"]
+        candidates = self.store.search_entries(
+            query,
+            categories=None,
+            limit=top_k * 6,
+            scopes=scopes,
+        )
         if not candidates and self._is_episode_recall_query(query):
-            candidates = self.store.read_entries("episodes")[: top_k * 3]
+            candidates = self.store.read_entries("episodes", scopes=scopes)[: top_k * 3]
         if not candidates:
             return ""
         scored = self.retriever.score(query, candidates)

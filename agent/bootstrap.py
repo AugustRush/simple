@@ -318,9 +318,17 @@ async def _build_components_async(cfg: dict):
         0.1,
         float(cfg.get("llm_retry_base_delay", shared.DEFAULT_LLM_RETRY_BASE_DELAY)),
     )
-    agent.result_content_max_chars = max(
-        0,
-        int(orch_cfg.get("result_content_max_chars", shared.DEFAULT_RESULT_CONTENT_MAX_CHARS)),
+    agent.result_content_max_chars = min(
+        shared.MAX_RESULT_CONTENT_CHARS,
+        max(
+            shared.MIN_RESULT_CONTENT_CHARS,
+            int(
+                orch_cfg.get(
+                    "result_content_max_chars",
+                    shared.DEFAULT_RESULT_CONTENT_MAX_CHARS,
+                )
+            ),
+        ),
     )
     user_tools_cfg = cfg.get("user_tools", {})
     user_tools_enabled = (

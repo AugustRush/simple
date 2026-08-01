@@ -563,6 +563,98 @@ def test_retrieve_context_keeps_generic_history_semantic(tmp_path):
     assert "## Conversation History" not in result
 
 
+def test_ltm_retrieval_is_limited_to_global_and_current_session_scopes(tmp_path):
+    from agent import LTMEntry
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    for scope, content in (
+        ("global", "global evidence"),
+        ("session:default", "other session evidence"),
+        ("session:" + ctx_mgr.staging.session_id, "current session evidence"),
+        ("run:private", "private run evidence"),
+    ):
+        ctx_mgr.store.add_entry(
+            LTMEntry(
+                id=scope.replace(":", "-"),
+                content=content,
+                importance=0.8,
+                category="concepts",
+                entity="scope-test",
+                scope=scope,
+                created_at="2026-08-01",
+                updated_at="2026-08-01",
+            )
+        )
+
+    result = ctx_mgr.retrieve_ltm_context("evidence", top_k=10)
+
+    assert "global evidence" in result
+    assert "current session evidence" in result
+    assert "other session evidence" not in result
+    assert "private run evidence" not in result
+
+
+def test_empty_scope_filter_returns_no_memory_entries(tmp_path):
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    store.add_entry(
+        LTMEntry(
+            id="global",
+            content="must not leak through an empty scope filter",
+            importance=0.8,
+            category="concepts",
+            entity="scope-test",
+            scope="global",
+            created_at="2026-08-01",
+            updated_at="2026-08-01",
+        )
+    )
+
+    assert store.read_entries("concepts", scopes=[]) == []
+    assert store.search_entries("leak", scopes=[]) == []
+
+
+def test_retention_bounds_active_run_scratch_entries(tmp_path, monkeypatch):
+    import agent.memory.system as memory_system
+    from agent import LTMEntry, LTMStore
+
+    monkeypatch.setattr(memory_system, "_RUN_SCRATCH_MAX_ACTIVE", 3)
+    monkeypatch.setattr(memory_system, "_RUN_SCRATCH_RETENTION_DAYS", 3650)
+    store = LTMStore(context_dir=tmp_path / "context")
+    for index in range(5):
+        store.add_entry(
+            LTMEntry(
+                id=f"run-{index}",
+                content=f"scratch {index}",
+                importance=0.8,
+                category="episodes",
+                entity="worker",
+                scope=f"run:{index}",
+                created_at=f"2026-08-01 00:0{index} UTC",
+                updated_at=f"2026-08-01 00:0{index} UTC",
+            )
+        )
+    store.add_entry(
+        LTMEntry(
+            id="global-entry",
+            content="durable global",
+            importance=0.8,
+            category="episodes",
+            entity="user",
+            scope="global",
+            created_at="2026-08-01 00:00 UTC",
+            updated_at="2026-08-01 00:00 UTC",
+        )
+    )
+
+    store.apply_retention()
+
+    active = store.all_entries()
+    assert len([entry for entry in active if entry.scope.startswith("run:")]) == 3
+    assert any(entry.id == "global-entry" for entry in active)
+
+
 # ── ConsolidationEngine tests ─────────────────────────────────────────────────
 
 

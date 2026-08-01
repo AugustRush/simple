@@ -7,6 +7,7 @@ import contextvars
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
+import html
 import inspect
 import json
 import logging
@@ -28,6 +29,7 @@ from agent.orchestration.runtime import (
     run_parallel_subtasks as _run_parallel_subtasks,
     run_pipeline_subtasks as _run_pipeline_subtasks,
     run_rendezvous_round as _run_rendezvous_round,
+    CAPABILITY_PROFILES,
 )
 from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlanner
 from agent.pathing import canonicalize_user_path, resolve_workspace_path
@@ -46,9 +48,17 @@ from agent.security.content_filter import (
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
 
+_UPSTREAM_SUMMARY_BUDGET = 2400
+_UPSTREAM_DETAIL_BUDGET = 2400
+_UPSTREAM_STRUCTURED_BUDGET = 1200
+_RENDEZVOUS_INPUT_BUDGET = 6000
+
 # Context variable so built-in tools can access the active AgentContext
 _active_agent_context: contextvars.ContextVar[Optional["AgentContext"]] = (
     contextvars.ContextVar("active_agent_context", default=None)
+)
+_active_orchestration_runs: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
+    contextvars.ContextVar("active_orchestration_runs", default=None)
 )
 
 
@@ -368,6 +378,7 @@ class BaseAgent:
             write_scope=list(spec.write_scope) if spec.write_scope else None,
             capability_profile=spec.capability_profile,
             handoff=dict(spec.handoff) if spec.handoff else None,
+            run_id=spec.run_id,
         )
         content = str(
             payload.get("content")
@@ -385,6 +396,7 @@ class BaseAgent:
             full_content=full_content,
             tool_calls_made=list(payload.get("tool_calls_made", [])),
             error=payload.get("error"),
+            artifact_ref=str(payload.get("artifact_ref") or ""),
         )
 
     @staticmethod
@@ -408,8 +420,47 @@ class BaseAgent:
         return f"{base_text}\n\n{extra}"
 
     @staticmethod
-    def _stable_json(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    def _bounded_json(value: Any, limit: int = 2400) -> str:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if len(serialized) <= limit:
+            return serialized
+        return serialized[: max(0, limit - 32)].rstrip() + "... [truncated]"
+
+    @staticmethod
+    def _bounded_text(value: Any, limit: int) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 24)].rstrip() + "... [truncated]"
+
+    def _result_content_limit(self) -> int:
+        return min(
+            shared.MAX_RESULT_CONTENT_CHARS,
+            max(
+                shared.MIN_RESULT_CONTENT_CHARS,
+                int(self.result_content_max_chars or 0),
+            ),
+        )
+
+    @classmethod
+    def _bounded_structured(cls, value: Any, limit: int = 2400) -> Any:
+        serialized = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        if len(serialized) <= limit:
+            return value
+        return {
+            "_truncated": True,
+            "preview": serialized[: max(0, limit - 64)].rstrip(),
+        }
 
     def _with_upstream_summaries(
         self,
@@ -417,20 +468,44 @@ class BaseAgent:
         upstream_summaries: dict[str, str],
         upstream_results: dict[str, SubtaskResult] | None = None,
     ) -> SubtaskSpec:
-        lines = [f"- {dep}: {summary}" for dep, summary in upstream_summaries.items()]
-        task = self._append_named_block(spec.task, "Upstream summaries:", lines)
+        summary_text = self._bounded_text(
+            "\n".join(
+                f"- {dep}: {summary}" for dep, summary in upstream_summaries.items()
+            ),
+            _UPSTREAM_SUMMARY_BUDGET,
+        )
+        task = self._append_named_block(
+            spec.task,
+            "Upstream summaries:",
+            [summary_text] if summary_text else [],
+        )
         handoff: dict[str, Any] = dict(spec.handoff)
-        structured_lines = []
+        structured_lines: list[str] = []
+        detail_lines: list[str] = []
         for dep, result in (upstream_results or {}).items():
             if result.structured_content is not None:
-                handoff[dep] = result.structured_content
-                structured_lines.append(
-                    f"- {dep}: {self._stable_json(result.structured_content)}"
-                )
+                bounded = self._bounded_structured(result.structured_content)
+                handoff[dep] = bounded
+                structured_lines.append(f"- {dep}: {self._bounded_json(bounded)}")
+            if result.content and len(result.content) > len(result.summary):
+                detail_lines.append(f"- {dep}: {result.content}")
+        detail_text = self._bounded_text(
+            "\n".join(detail_lines),
+            _UPSTREAM_DETAIL_BUDGET,
+        )
+        task = self._append_named_block(
+            task,
+            "Upstream detail:",
+            [detail_text] if detail_text else [],
+        )
+        structured_text = self._bounded_text(
+            "\n".join(structured_lines),
+            _UPSTREAM_STRUCTURED_BUDGET,
+        )
         task = self._append_named_block(
             task,
             "Upstream structured results:",
-            structured_lines,
+            [structured_text] if structured_text else [],
         )
         return replace(spec, task=task, handoff=handoff)
 
@@ -445,19 +520,29 @@ class BaseAgent:
         task = self._append_named_block(
             spec.task,
             "Lead summary:",
-            [lead_summary] if lead_summary else [],
+            [self._bounded_text(lead_summary, _UPSTREAM_SUMMARY_BUDGET)]
+            if lead_summary
+            else [],
         )
         structured_lines = []
         for dep, value in (lead_structured_context or {}).items():
-            structured_lines.append(f"- {dep}: {self._stable_json(value)}")
+            bounded = self._bounded_structured(value)
+            structured_lines.append(f"- {dep}: {self._bounded_json(bounded)}")
         task = self._append_named_block(
             task,
             "Lead structured results:",
-            structured_lines,
+            [
+                self._bounded_text(
+                    "\n".join(structured_lines),
+                    _UPSTREAM_STRUCTURED_BUDGET,
+                )
+            ]
+            if structured_lines
+            else [],
         )
         handoff: dict[str, Any] = dict(spec.handoff)
         for dep, value in (lead_structured_context or {}).items():
-            handoff[dep] = value
+            handoff[dep] = self._bounded_structured(value)
         return replace(spec, task=task, handoff=handoff)
 
     async def _summarize_rendezvous_round(
@@ -472,12 +557,16 @@ class BaseAgent:
         lines: list[str] = []
         for result in results:
             status = "ok" if result.ok else "error"
-            detail = result.summary or result.content[:600] or result.error or ""
+            detail = self._bounded_text(
+                result.summary or result.content or result.error or "",
+                800,
+            )
             lines.append(
                 f"Agent [{result.id}] (status={status}): {detail}"
             )
-        results_text = "\n".join(
-            f"- {line.rstrip()}" for line in lines
+        results_text = self._bounded_text(
+            "\n".join(f"- {line.rstrip()}" for line in lines),
+            _RENDEZVOUS_INPUT_BUDGET,
         )
         prompt = (
             f"You are coordinating a multi-agent debate. Below are the results "
@@ -795,7 +884,7 @@ class BaseAgent:
         orchestration_mode: str,
     ) -> str:
         if explicit:
-            return explicit
+            return explicit.strip().lower()
         if orchestration_mode == "direct":
             return "full"
         if self._looks_like_implementation_work(role, task):
@@ -843,20 +932,30 @@ class BaseAgent:
                 orchestration_mode=orchestration_decision.mode,
             ),
             early_exit=bool(tool_input.get("early_exit", False)),
+            timeout_seconds=float(tool_input.get("timeout_seconds", 0) or 0),
+            continue_on_failure=bool(tool_input.get("continue_on_failure", False)),
         )
 
     def _spawn_result_payload(self, spec: SubtaskSpec, result: SubtaskResult) -> str:
+        content_limit = self._result_content_limit()
         payload: dict[str, Any] = {
             "ok": result.ok,
-            "role": spec.role,
-            "task": spec.task,
-            "content": result.content or "(no output)",
-            "tool_calls_made": result.tool_calls_made,
+            "role": self._bounded_text(spec.role, 200),
+            "task": self._bounded_text(spec.task, 1000),
+            "content": self._bounded_text(
+                result.content or "(no output)",
+                content_limit,
+            ),
+            "tool_calls_made": result.tool_calls_made[:100],
         }
         if result.structured_content is not None:
-            payload["structured_content"] = result.structured_content
+            payload["structured_content"] = self._bounded_structured(
+                result.structured_content
+            )
         if result.error:
-            payload["error"] = result.error
+            payload["error"] = self._bounded_text(result.error, 1000)
+        if result.artifact_ref:
+            payload["artifact_ref"] = result.artifact_ref
         return json.dumps(payload, ensure_ascii=False)
 
     async def _run_orchestrated_spawn_calls(
@@ -876,17 +975,10 @@ class BaseAgent:
             specs.append(spec)
             previous_spec = spec
 
+        run_id = shared._new_id()
+        specs = [replace(spec, run_id=run_id) for spec in specs]
+
         execution_mode = self._derive_execution_mode_from_spawn_calls(spawn_calls)
-        # Honour the planner's explicit mode decision when the runtime
-        # would otherwise derive something different.  This ensures the
-        # planner is authoritative: keyword-based routing and skill
-        # configuration take precedence over the LLM's raw spawn calls.
-        planner_mode = str(orchestration_decision.mode or "").strip().lower()
-        if planner_mode and planner_mode != "explicit" and planner_mode != execution_mode:
-            if planner_mode == "pipeline" and execution_mode == "parallel":
-                execution_mode = "pipeline"
-            elif planner_mode == "rendezvous" and execution_mode in ("parallel", "pipeline"):
-                execution_mode = "rendezvous"
         telemetry: dict[str, Any] = {
             "execution_mode": execution_mode,
             "spec_count": len(specs),
@@ -921,6 +1013,9 @@ class BaseAgent:
             executed = []
 
         results_by_id = {result.id: result for result in executed}
+        active_runs = _active_orchestration_runs.get()
+        if active_runs is not None:
+            active_runs.append({"run_id": run_id, "results": list(executed)})
         payloads: list[str] = []
         for spec in specs:
             result = results_by_id.get(spec.id)
@@ -949,8 +1044,20 @@ class BaseAgent:
             for _, tu in spawn_calls
         }
         explicit_modes.discard("")
-        if "rendezvous" in explicit_modes:
-            return "rendezvous"
+        supported_modes = {"parallel", "pipeline", "rendezvous"}
+        unsupported_modes = explicit_modes - supported_modes
+        if unsupported_modes:
+            raise ValueError(
+                "unsupported coordination_mode: "
+                + ", ".join(sorted(unsupported_modes))
+            )
+        if len(explicit_modes) > 1:
+            raise ValueError(
+                "conflicting coordination_mode values: "
+                + ", ".join(sorted(explicit_modes))
+            )
+        if explicit_modes:
+            return next(iter(explicit_modes))
         if any(self._string_list(tu.get("input", {}).get("depends_on")) for _, tu in spawn_calls):
             return "pipeline"
         if len(spawn_calls) > 1:
@@ -1019,6 +1126,8 @@ class BaseAgent:
         return await _run_pipeline_subtasks(
             specs,
             executor=_executor,
+            max_concurrency=self.max_parallel_agents,
+            canonicalize_write_scope=self._canonicalize_write_scope,
             telemetry=telemetry,
             progress_callback=self._emit_runtime_progress_event,
         )
@@ -1053,6 +1162,7 @@ class BaseAgent:
             executor=_executor,
             summarize=self._summarize_rendezvous_round,
             max_rounds=max_rounds,
+            max_concurrency=self.max_parallel_agents,
             canonicalize_write_scope=self._canonicalize_write_scope,
             telemetry=telemetry,
             progress_callback=self._emit_runtime_progress_event,
@@ -2005,7 +2115,12 @@ class BaseAgent:
                 current_messages=ctx.messages,
             )
             if retrieved:
-                ctx.system_prompt = ctx.system_prompt + "\n\n" + retrieved
+                ctx.system_prompt = (
+                    ctx.system_prompt
+                    + "\n\n<retrieved_context trust=\"untrusted_evidence\">\n"
+                    + html.escape(retrieved, quote=False)
+                    + "\n</retrieved_context>"
+                )
         skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
         required_skills: list[str] = list(ctx.metadata.get("required_skills", []))
         if skill_catalog and required_skills:
@@ -2021,6 +2136,18 @@ class BaseAgent:
                     + "\n\n".join(active_blocks)
                 )
         decision = self._plan_orchestration(ctx, user_message)
+        if decision.mode == "explicit":
+            policy = (
+                "When using orchestration tools, encode ordering and coordination "
+                "explicitly with depends_on and coordination_mode. Treat wording cues "
+                "as advisory only; the explicit subtask graph is authoritative."
+            )
+            if decision.guidance:
+                policy += " Advisory cues for this request: " + self._bounded_text(
+                    decision.guidance,
+                    800,
+                )
+            ctx.system_prompt += "\n\n## Orchestration policy\n" + policy
         ctx.messages.append(
             {
                 "role": "user",
@@ -2098,6 +2225,9 @@ class BaseAgent:
             "active": True,
             "current_tool": None,
         }
+        orchestration_token = None
+        if not ctx.metadata.get("_orchestration_child"):
+            orchestration_token = _active_orchestration_runs.set([])
         content_filter_recovered_response: Any | None = None
         content_filter_submitted_tool_uses: list[dict] | None = None
         content_filter_submitted_results: list[str] | None = None
@@ -2497,6 +2627,13 @@ class BaseAgent:
                         error=trace_error,
                     )
         finally:
+            if orchestration_token is not None:
+                if trace_status in {"ok", "content_filter_recovered"}:
+                    with shared._suppress_with_log(
+                        "orchestration summary promotion failed"
+                    ):
+                        self._promote_orchestration_runs()
+                _active_orchestration_runs.reset(orchestration_token)
             _active_agent_context.reset(_active_ctx_token)
             shared._active_cancel_token.reset(_cancel_token_token)
             heartbeat_state["op"] = "finished"
@@ -2664,10 +2801,15 @@ class BaseAgent:
         # concurrently (e.g. via /generate-tool while a spawn batch runs).
         tools_snapshot = dict(self.registry._tools)
         sub_registry = ToolRegistry(console=shared.CONSOLE)
+        normalized_profile = str(capability_profile or "").strip().lower()
+        if normalized_profile not in CAPABILITY_PROFILES:
+            raise ValueError(
+                f"unsupported capability_profile: {capability_profile!r}"
+            )
         allowed_capabilities: set[str] | None = None
-        if capability_profile in {"read_only", "research"}:
+        if normalized_profile in {"read_only", "research"}:
             allowed_capabilities = {"read"}
-        elif capability_profile == "implementation":
+        elif normalized_profile == "implementation":
             allowed_capabilities = {"read"}
             if write_scope:
                 allowed_capabilities.add("workspace_write")
@@ -2693,7 +2835,7 @@ class BaseAgent:
             sub_registry._context["shell_blocked_commands"] = list(blocked)
         if write_scope:
             sub_registry._context["write_scope"] = list(write_scope)
-        sub_registry._context["capability_profile"] = capability_profile
+        sub_registry._context["capability_profile"] = normalized_profile
         return sub_registry
 
     def _compose_sub_system_prompt(
@@ -2805,7 +2947,7 @@ class BaseAgent:
         if summary:
             return summary
         # Fallback: keep first result_content_max_chars with a boundary break
-        limit = max(500, self.result_content_max_chars)
+        limit = self._result_content_limit()
         if len(text) <= limit:
             return text
         boundary = text.rfind("\n", 0, limit)
@@ -2824,6 +2966,7 @@ class BaseAgent:
         write_scope: list[str] | None = None,
         capability_profile: str = "full",
         handoff: dict[str, Any] | None = None,
+        run_id: str = "",
     ) -> dict[str, Any]:
         """Execute a sub-agent and return a structured result dict.
 
@@ -2866,11 +3009,12 @@ class BaseAgent:
 
         def _fresh_sub_ctx() -> AgentContext:
             ctx = AgentContext(role=role, system_prompt=sys_prompt)
+            ctx.metadata["_orchestration_child"] = True
             self._propagate_sub_metadata(ctx, active_ctx)
             if handoff:
                 ctx.system_prompt += (
                     "\n\n## Handoff data from upstream\n"
-                    + json.dumps(handoff, ensure_ascii=False, indent=2)
+                    + self._bounded_json(handoff, limit=6000)
                 )
             return ctx
 
@@ -3029,10 +3173,8 @@ class BaseAgent:
         # bounded.  Full content is preserved in the staging buffer for
         # later retrieval via LTM, so the parent can always look up details.
         full_content = payload["content"]
-        if (
-            self.result_content_max_chars > 0
-            and len(full_content) > self.result_content_max_chars
-        ):
+        result_content_limit = self._result_content_limit()
+        if len(full_content) > result_content_limit:
             summary = await self._summarize_text(
                 full_content, role, shaped_task
             )
@@ -3059,7 +3201,7 @@ class BaseAgent:
                         category="episodes",
                         entity=role,
                         memory_type="sub_agent_observation",
-                        scope="global",
+                        scope=(f"run:{run_id}" if run_id else "run:untracked"),
                         status="active",
                         source_session=(
                             self.context_manager.staging.session_id or ""
@@ -3069,7 +3211,43 @@ class BaseAgent:
                         updated_at=now,
                     )
                 )
+                payload["artifact_ref"] = entry_id
         return payload
+
+    def _promote_orchestration_runs(self) -> None:
+        """Promote only bounded, successful run summaries into session memory."""
+        active_runs = _active_orchestration_runs.get() or []
+        if not self.context_manager:
+            return
+        session_id = self.context_manager.staging.session_id
+        for run in active_runs:
+            run_id = str(run.get("run_id") or "")
+            for result in run.get("results", []):
+                if not isinstance(result, SubtaskResult) or not result.ok:
+                    continue
+                summary = str(result.summary or result.content or "").strip()
+                if not summary:
+                    continue
+                summary = summary[:1600]
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                self.context_manager.store.add_entry(
+                    LTMEntry(
+                        id=shared._new_id(),
+                        content=(
+                            f"orchestration run {run_id} [{result.id}] summary:\n"
+                            f"{summary}"
+                        ),
+                        importance=0.45,
+                        category="episodes",
+                        entity="orchestration",
+                        memory_type="orchestration_summary",
+                        scope=f"session:{session_id}",
+                        source_session=session_id,
+                        confidence=0.6,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
 
     def register_spawn_capability(
         self, base_system_prompt: str, workspace_root: Optional[Path] = None
@@ -3120,6 +3298,13 @@ class BaseAgent:
             {
                 "type": "object",
                 "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": (
+                            "Optional unique logical subtask id. Required when another "
+                            "subtask refers to this one through depends_on."
+                        ),
+                    },
                     "role": {
                         "type": "string",
                         "description": (
@@ -3172,6 +3357,7 @@ class BaseAgent:
                     },
                     "capability_profile": {
                         "type": "string",
+                        "enum": sorted(CAPABILITY_PROFILES),
                         "description": (
                             "Optional capability profile. Use 'read_only' for analysis workers "
                             "and 'implementation' for code-changing workers."
@@ -3184,9 +3370,12 @@ class BaseAgent:
                     },
                     "coordination_mode": {
                         "type": "string",
+                        "enum": ["parallel", "pipeline", "rendezvous"],
                         "description": (
                             "Optional explicit coordination mode for grouped spawn calls. "
-                            "Use 'rendezvous' to request bounded multi-round coordination."
+                            "Use pipeline with depends_on for a DAG, or rendezvous for "
+                            "bounded multi-round coordination. All calls in a batch that "
+                            "set this field must use the same value."
                         ),
                     },
                     "early_exit": {
@@ -3196,6 +3385,15 @@ class BaseAgent:
                             "still-running agents in the same batch. Use for tasks "
                             "where any single finding completes the goal."
                         ),
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Optional per-subtask timeout. Zero uses the agent default.",
+                    },
+                    "continue_on_failure": {
+                        "type": "boolean",
+                        "description": "For pipeline nodes, allow dependent nodes to receive a failure summary.",
                     },
                 },
                 "required": ["role", "task"],
