@@ -1,6 +1,7 @@
 """Focused tests for the shared file access policy and file service."""
 
 from dataclasses import FrozenInstanceError
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -243,3 +244,267 @@ def test_default_config_section_matches_policy_defaults(tmp_path):
         output_root=tmp_path / "output",
     )
     assert policy.limits == FileAccessLimits()
+
+
+# ── FileService: rooted reads and stable snapshots ─────────────────────────
+
+
+def _service(tmp_path, **file_access):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    cfg = dict(DEFAULT_FILE_ACCESS)
+    cfg.update(file_access)
+    policy = FileAccessPolicy.from_config(
+        cfg,
+        workspace_root=workspace,
+        output_root=output,
+    )
+    from agent.tools.files import FileService
+
+    return FileService(policy), workspace, output
+
+
+def test_read_file_returns_content_revision_and_paging(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    target = workspace / "agent" / "config.py"
+    target.parent.mkdir()
+    target.write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+    result = service.read_file("workspace", "agent/config.py", start_line=2, line_count=1)
+
+    assert result["ok"] is True
+    assert result["root"] == "workspace"
+    assert result["path"] == "agent/config.py"
+    assert result["content"] == "line2\n"
+    assert result["start_line"] == 2
+    assert result["end_line"] == 2
+    assert result["total_lines"] == 3
+    assert result["next_start_line"] == 3
+    assert result["size_bytes"] == target.stat().st_size
+    assert result["returned_bytes"] == len("line2\n".encode())
+    assert result["encoding"] == "utf-8"
+    assert result["bom"] is False
+    assert result["newline"] == "lf"
+    assert result["revision"] == "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+def test_read_file_pages_to_end_of_file(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    target = workspace / "note.txt"
+    target.write_text("a\nb\n", encoding="utf-8")
+
+    first = service.read_file("workspace", "note.txt", start_line=1, line_count=1)
+    second = service.read_file("workspace", "note.txt", start_line=first["next_start_line"], line_count=1)
+
+    assert first["content"] == "a\n"
+    assert first["next_start_line"] == 2
+    assert second["content"] == "b\n"
+    assert second["next_start_line"] is None
+
+
+def test_read_file_default_line_count_is_bounded_and_conservative(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    target = workspace / "big.txt"
+    target.write_text("\n".join(f"line{i}" for i in range(500)) + "\n", encoding="utf-8")
+
+    result = service.read_file("workspace", "big.txt")
+
+    assert result["total_lines"] == 500
+    assert result["end_line"] == 200
+    assert result["next_start_line"] == 201
+
+
+def test_read_file_strips_bom_but_hashes_exact_bytes(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    target = workspace / "note.txt"
+    target.write_bytes(b"\xef\xbb\xbfalpha\r\nbeta")
+
+    result = service.read_file("workspace", "note.txt", start_line=1, line_count=1)
+
+    assert result["content"] == "alpha\r\n"
+    assert result["bom"] is True
+    assert result["newline"] == "crlf"
+    assert result["revision"] == "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+def test_read_file_newline_metadata(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    cases = {
+        "cr.txt": ("a\rb\r", "cr"),
+        "mixed.txt": ("a\nb\r\n", "mixed"),
+        "none.txt": ("plain text", "none"),
+        "no-final-newline.txt": ("a\nb", "lf"),
+    }
+    for name, (data, expected) in cases.items():
+        (workspace / name).write_text(data, encoding="utf-8")
+
+    for name, (data, expected) in cases.items():
+        result = service.read_file("workspace", name)
+        assert result["newline"] == expected, name
+        assert result["total_lines"] == len(data.splitlines()) or (
+            result["total_lines"] == 1 and "\n" not in data and "\r" not in data
+        )
+
+
+def test_read_file_empty_file_is_sole_empty_range_success(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    (workspace / "empty.txt").write_text("", encoding="utf-8")
+
+    result = service.read_file("workspace", "empty.txt", start_line=1)
+    assert result["ok"] is True
+    assert result["content"] == ""
+    assert result["total_lines"] == 0
+    assert result["end_line"] is None
+    assert result["next_start_line"] is None
+    assert result["returned_bytes"] == 0
+    assert result["newline"] == "none"
+
+    error = service.read_file("workspace", "empty.txt", start_line=2)
+    assert error["ok"] is False
+    assert error["error"]["code"] == "invalid_request"
+
+
+def test_read_file_rejects_invalid_utf8_and_nul_bytes(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    (workspace / "bad.txt").write_bytes(b"\xff\xfe")
+    (workspace / "nul.txt").write_bytes(b"a\x00b")
+    (workspace / "utf16.txt").write_bytes(b"\xff\xfea\x00")
+
+    for name in ("bad.txt", "nul.txt", "utf16.txt"):
+        result = service.read_file("workspace", name)
+        assert result["ok"] is False
+        assert result["error"]["code"] == "unsupported_encoding", name
+
+
+def test_read_file_rejects_absolute_and_traversal_paths(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    (workspace / "a.txt").write_text("a", encoding="utf-8")
+
+    for bad_path in ("/etc/passwd", "../outside", "a/../b", "a/./b", "a//b", "a\x00b", ""):
+        result = service.read_file("workspace", bad_path)
+        assert result["ok"] is False
+        assert result["error"]["code"] == "invalid_path", bad_path
+
+
+def test_read_file_rejects_unknown_root(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    result = service.read_file("bogus", "a.txt")
+    assert result["error"]["code"] == "invalid_path"
+
+
+def test_read_file_not_found_and_not_regular_file(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    (workspace / "sub").mkdir()
+
+    assert service.read_file("workspace", "missing.txt")["error"]["code"] == "not_found"
+    assert service.read_file("workspace", "sub")["error"]["code"] == "not_regular_file"
+
+
+def test_read_file_rejects_symlinks(tmp_path):
+    service, workspace, output = _service(tmp_path)
+    (workspace / "real.txt").write_text("secret", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside", encoding="utf-8")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+    (workspace / "inside-link").symlink_to(workspace / "real.txt")
+
+    assert (
+        service.read_file("workspace", "escape/secret.txt")["error"]["code"]
+        == "invalid_path"
+    )
+    assert (
+        service.read_file("workspace", "inside-link")["error"]["code"]
+        == "invalid_path"
+    )
+
+
+def test_read_file_workspace_read_denial_and_output_always_readable(tmp_path):
+    service, workspace, output = _service(tmp_path, workspace={"read": False, "write": False})
+    (workspace / "a.txt").write_text("ws", encoding="utf-8")
+    (output / "b.txt").write_text("out", encoding="utf-8")
+
+    denied = service.read_file("workspace", "a.txt")
+    assert denied["ok"] is False
+    assert denied["error"]["code"] == "access_denied"
+    assert denied["error"]["retryable"] is False
+
+    allowed = service.read_file("output_dir", "b.txt")
+    assert allowed["ok"] is True
+
+
+def test_read_file_rejects_invalid_ranges_and_line_counts(tmp_path):
+    service, workspace, _ = _service(tmp_path)
+    (workspace / "a.txt").write_text("a\nb\nc\n", encoding="utf-8")
+
+    for bad in (
+        {"start_line": 0},
+        {"start_line": True},
+        {"start_line": 4},
+        {"line_count": 0},
+        {"line_count": -1},
+        {"line_count": "10"},
+        {"line_count": 401},
+    ):
+        result = service.read_file("workspace", "a.txt", **bad)
+        assert result["ok"] is False
+        assert result["error"]["code"] == "invalid_request", bad
+
+
+def test_read_file_byte_bound_stops_at_complete_line_boundary(tmp_path):
+    service, workspace, _ = _service(
+        tmp_path, max_read_bytes=3, max_read_lines=10
+    )
+    (workspace / "a.txt").write_text("a\nb\nc\n", encoding="utf-8")
+
+    first = service.read_file("workspace", "a.txt", start_line=1, line_count=10)
+    assert first["content"] == "a\n"
+    assert first["end_line"] == 1
+    assert first["next_start_line"] == 2
+
+
+def test_read_file_line_too_large(tmp_path):
+    service, workspace, _ = _service(tmp_path, max_read_bytes=4, max_read_lines=10)
+    (workspace / "a.txt").write_text("a" * 20 + "\n", encoding="utf-8")
+
+    result = service.read_file("workspace", "a.txt")
+    assert result["ok"] is False
+    assert result["error"]["code"] == "line_too_large"
+
+
+def test_read_file_file_too_large(tmp_path):
+    service, workspace, _ = _service(tmp_path, max_snapshot_bytes=16)
+    (workspace / "a.txt").write_text("x" * 32, encoding="utf-8")
+
+    result = service.read_file("workspace", "a.txt")
+    assert result["ok"] is False
+    assert result["error"]["code"] == "file_too_large"
+
+
+def test_read_file_detects_mutation_during_read(tmp_path):
+    from agent.tools.files import FileService
+
+    service, workspace, _ = _service(tmp_path)
+    target = workspace / "a.txt"
+    target.write_text("original\n", encoding="utf-8")
+
+    class _MutatingService(FileService):
+        def __init__(self, policy, mutate_target):
+            super().__init__(policy)
+            self.mutate_target = mutate_target
+            self.mutated = False
+
+        def _read_chunk(self, fd, size):
+            data = super()._read_chunk(fd, size)
+            if data and not self.mutated:
+                self.mutated = True
+                with open(self.mutate_target, "a", encoding="utf-8") as fh:
+                    fh.write("appended")
+            return data
+
+    result = _MutatingService(service.policy, target).read_file("workspace", "a.txt")
+    assert result["ok"] is False
+    assert result["error"]["code"] == "revision_conflict"
+    assert result["error"]["retryable"] is True
