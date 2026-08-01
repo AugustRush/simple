@@ -3874,6 +3874,7 @@ def test_execute_subtask_spec_passes_expected_output_and_constraints_to_spawn_ag
 
 def test_spawn_agent_enforces_write_scope_for_write_file(monkeypatch, tmp_path):
     import agent as agent_module
+    from agent.tools.files import FileAccessPolicy, FileService
 
     class _FakeMemory:
         def write(self, *args, **kwargs):
@@ -3889,16 +3890,39 @@ def test_spawn_agent_enforces_write_scope_for_write_file(monkeypatch, tmp_path):
             return ""
 
     registry = agent_module.ToolRegistry()
-    agent_module.BuiltinTools(_FakeMemory(), registry, workspace_root=tmp_path)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    policy = FileAccessPolicy.from_config(
+        {"workspace": {"read": True, "write": True}},
+        workspace_root=workspace,
+        output_root=output,
+    )
+    service = FileService(
+        policy,
+        write_scope=lambda: registry.get_context("write_scope") or (),
+    )
+    agent_module.BuiltinTools(
+        _FakeMemory(),
+        registry,
+        workspace_root=workspace,
+        file_service=service,
+    )
     parent = agent_module.BaseAgent(
         object(), registry, model="fake-model", api_format="openai"
     )
-    parent.register_spawn_capability("base system prompt", workspace_root=tmp_path)
+    parent.register_spawn_capability("base system prompt", workspace_root=workspace)
 
     async def fake_send_message(self, ctx, user_message, stream_callback=None):
         content = await self.registry.call(
             "write_file",
-            {"path": "forbidden.txt", "content": "blocked"},
+            {
+                "root": "workspace",
+                "path": "forbidden.txt",
+                "mode": "create",
+                "content": "blocked",
+            },
         )
         return agent_module.AgentResult(agent_id="sub", content=content)
 
@@ -3921,7 +3945,8 @@ def test_spawn_agent_enforces_write_scope_for_write_file(monkeypatch, tmp_path):
 
     assert payload["ok"] is True
     assert write_payload["ok"] is False
-    assert "write scope" in write_payload["error"].lower()
+    assert write_payload["error"]["code"] == "access_denied"
+    assert "write scope" in write_payload["error"]["message"].lower()
 
 
 def test_send_message_batches_spawn_calls_when_parallel_limit_is_one(monkeypatch):

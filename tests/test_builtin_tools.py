@@ -164,27 +164,33 @@ def test_list_installed_plugins_counts_only_listed_user_plugins(tmp_path, monkey
     ]
 
 
-def test_read_file_truncates_large_content(tmp_path):
+def test_read_file_returns_bounded_window_and_revision(tmp_path):
     tools, _, workspace = make_builtin_tools(tmp_path)
     path = workspace / "large.txt"
-    path.write_text("abcdefghij", encoding="utf-8")
+    path.write_text("\n".join(f"line{i}" for i in range(10)) + "\n", encoding="utf-8")
 
-    result = tools._read_file(str(path), max_bytes=4)
+    result = tools._read_file(
+        root="workspace", path="large.txt", start_line=3, line_count=2
+    )
 
     assert result["ok"] is True
-    assert result["content"] == "abcd"
-    assert result["truncated"] is True
+    assert result["path"] == "large.txt"
+    assert result["content"] == "line2\nline3\n"
+    assert result["start_line"] == 3
+    assert result["end_line"] == 4
+    assert result["next_start_line"] == 5
+    assert result["total_lines"] == 10
+    assert result["revision"].startswith("sha256:")
 
 
-def test_read_file_rejects_binary_content(tmp_path):
+def test_read_file_rejects_invalid_utf8_content(tmp_path):
     tools, _, workspace = make_builtin_tools(tmp_path)
-    path = workspace / "binary.bin"
-    path.write_bytes(b"\x00\x01\x02abc")
+    (workspace / "binary.bin").write_bytes(b"\x00\x01\x02abc")
 
-    result = tools._read_file(str(path))
+    result = tools._read_file(root="workspace", path="binary.bin")
 
     assert result["ok"] is False
-    assert "binary" in result["error"].lower()
+    assert result["error"]["code"] == "unsupported_encoding"
 
 
 def test_list_files_respects_recursive_and_max_results(tmp_path):
@@ -198,17 +204,37 @@ def test_list_files_respects_recursive_and_max_results(tmp_path):
     (nested / "c.txt").write_text("c", encoding="utf-8")
 
     flat = tools._list_files(
-        str(root), pattern="*.txt", recursive=False, max_results=10
+        root="workspace",
+        path="files",
+        pattern="*.txt",
+        recursive=False,
+        max_results=10,
     )
     recursive = tools._list_files(
-        str(root), pattern="*.txt", recursive=True, max_results=2
+        root="workspace",
+        path="files",
+        pattern="*.txt",
+        recursive=True,
+        max_results=2,
     )
 
     assert flat["ok"] is True
-    assert all("nested/c.txt" not in item for item in flat["items"])
+    assert all(item["path"] != "files/nested/c.txt" for item in flat["items"])
     assert recursive["ok"] is True
     assert len(recursive["items"]) == 2
     assert recursive["truncated"] is True
+    assert recursive["next_cursor"] is not None
+
+    resumed = tools._list_files(
+        root="workspace",
+        path="files",
+        pattern="*.txt",
+        recursive=True,
+        max_results=2,
+        cursor=recursive["next_cursor"],
+    )
+    assert resumed["ok"] is True
+    assert [item["path"] for item in resumed["items"]] == ["files/nested/c.txt"]
 
 
 def test_read_file_rejects_paths_outside_workspace(tmp_path):
@@ -216,10 +242,10 @@ def test_read_file_rejects_paths_outside_workspace(tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("secret", encoding="utf-8")
 
-    result = tools._read_file(str(outside))
+    result = tools._read_file(root="workspace", path=str(outside))
 
     assert result["ok"] is False
-    assert "outside the workspace" in result["error"].lower()
+    assert result["error"]["code"] == "invalid_path"
 
 
 def test_read_file_allows_text_files_in_output_dir(tmp_path):
@@ -227,25 +253,11 @@ def test_read_file_allows_text_files_in_output_dir(tmp_path):
     artifact = output / "result.txt"
     artifact.write_text("generated", encoding="utf-8")
 
-    result = tools._read_file(str(artifact))
+    result = tools._read_file(root="output_dir", path="result.txt")
 
     assert result["ok"] is True
-    assert result["path"] == str(artifact.resolve())
+    assert result["path"] == "result.txt"
     assert result["content"] == "generated"
-
-
-def test_read_file_returns_binary_metadata_for_output_dir_artifacts(tmp_path):
-    tools, _, _workspace, output = make_builtin_tools_with_output_dir(tmp_path)
-    artifact = output / "phoenix_fire.jpeg"
-    artifact.write_bytes(b"\xff\xd8\xff\x00fakejpeg")
-
-    result = tools._read_file(str(artifact))
-
-    assert result["ok"] is True
-    assert result["path"] == str(artifact.resolve())
-    assert result["binary"] is True
-    assert result["content"] == ""
-    assert "generated artifact" in result["message"]
 
 
 def test_list_files_allows_output_dir(tmp_path):
@@ -253,42 +265,132 @@ def test_list_files_allows_output_dir(tmp_path):
     artifact = output / "phoenix_fire.jpeg"
     artifact.write_bytes(b"fake")
 
-    result = tools._list_files(str(output))
+    result = tools._list_files(root="output_dir", path=".")
 
     assert result["ok"] is True
-    assert str(artifact.resolve()) in result["items"]
+    assert [item["path"] for item in result["items"]] == ["phoenix_fire.jpeg"]
 
 
 def test_write_file_rejects_paths_outside_workspace(tmp_path):
     tools, _, _workspace = make_builtin_tools(tmp_path)
     outside = tmp_path / "outside.txt"
 
-    result = tools._write_file(str(outside), "secret")
+    result = tools._write_file(
+        root="workspace", path=str(outside), mode="create", content="secret"
+    )
 
     assert result["ok"] is False
-    assert "outside the workspace" in result["error"].lower()
+    assert result["error"]["code"] == "invalid_path"
 
 
-def test_write_file_redirects_workspace_paths_to_output_dir(tmp_path):
+def test_write_file_explicit_output_dir(tmp_path):
     tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
 
-    result = tools._write_file(str(workspace / "report.md"), "generated")
+    result = tools._write_file(
+        root="output_dir",
+        path="report.md",
+        mode="create",
+        content="generated",
+    )
 
     assert result["ok"] is True
-    assert Path(result["path"]) == (output_dir / "report.md").resolve()
+    assert result["path"] == "report.md"
     assert not (workspace / "report.md").exists()
     assert (output_dir / "report.md").read_text(encoding="utf-8") == "generated"
 
 
 def test_write_file_allows_scoped_workspace_write(tmp_path):
-    tools, reg, workspace, _output_dir = make_builtin_tools_with_output_dir(tmp_path)
-    reg.set_context("write_scope", ["src/app.py"])
+    from agent import BuiltinTools, MemoryPalace, ToolRegistry
+    from agent.tools.files import FileAccessPolicy, FileService
 
-    result = tools._write_file("src/app.py", "print('ok')\n")
+    registry = ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "agent-output"
+    output.mkdir()
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    policy = FileAccessPolicy.from_config(
+        {"workspace": {"read": True, "write": True}},
+        workspace_root=workspace,
+        output_root=output,
+    )
+    service = FileService(policy, write_scope=["src/app.py"])
+    tools = BuiltinTools(
+        memory=memory,
+        registry=registry,
+        workspace_root=workspace,
+        output_dir=output,
+        file_service=service,
+    )
+
+    result = tools._write_file(
+        root="workspace",
+        path="src/app.py",
+        mode="create",
+        content="print('ok')\n",
+    )
 
     assert result["ok"] is True
-    assert Path(result["path"]) == (workspace / "src" / "app.py").resolve()
+    assert result["path"] == "src/app.py"
     assert (workspace / "src" / "app.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+    forbidden = tools._write_file(
+        root="workspace",
+        path="other.txt",
+        mode="create",
+        content="x",
+    )
+    assert forbidden["error"]["code"] == "access_denied"
+
+
+def test_registry_round_trip_create_edit_read(tmp_path):
+    tools, registry, _workspace, output = make_builtin_tools_with_output_dir(tmp_path)
+
+    created = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {
+                    "root": "output_dir",
+                    "path": "note.txt",
+                    "mode": "create",
+                    "content": "alpha\nbeta\n",
+                },
+            )
+        )
+    )
+    assert created["ok"] is True
+
+    read = json.loads(
+        asyncio.run(
+            registry.call(
+                "read_file",
+                {"root": "output_dir", "path": "note.txt"},
+            )
+        )
+    )
+    assert read["content"] == "alpha\nbeta\n"
+
+    edited = json.loads(
+        asyncio.run(
+            registry.call(
+                "edit_file",
+                {
+                    "root": "output_dir",
+                    "path": "note.txt",
+                    "expected_revision": read["revision"],
+                    "replacements": [
+                        {"old_text": "beta", "new_text": "gamma", "expected_count": 1}
+                    ],
+                },
+            )
+        )
+    )
+    assert edited["ok"] is True
+    assert (output / "note.txt").read_text(encoding="utf-8") == "alpha\ngamma\n"
 
 
 def test_registry_call_returns_structured_builtin_payloads(tmp_path):
@@ -296,11 +398,13 @@ def test_registry_call_returns_structured_builtin_payloads(tmp_path):
     path = workspace / "note.txt"
     path.write_text("hello", encoding="utf-8")
 
-    result = asyncio.run(registry.call("read_file", {"path": str(path)}))
+    result = asyncio.run(
+        registry.call("read_file", {"root": "workspace", "path": "note.txt"})
+    )
     payload = json.loads(result)
 
     assert payload["ok"] is True
-    assert payload["path"] == str(path.resolve())
+    assert payload["path"] == "note.txt"
     assert payload["content"] == "hello"
 
 

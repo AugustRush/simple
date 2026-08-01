@@ -26,7 +26,7 @@ from pathlib import Path
 import stat
 import threading
 import uuid
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 try:
     import fcntl
@@ -565,10 +565,20 @@ class FileService:
     def __init__(
         self,
         policy: FileAccessPolicy,
-        write_scope: Sequence[str | Path] = (),
+        write_scope: Sequence[str | Path] | Callable[[], Sequence[str | Path]] = (),
     ) -> None:
         self.policy = policy
-        self.write_scope = _normalize_write_scope(write_scope)
+        if callable(write_scope):
+            self._write_scope_provider = write_scope
+            self.write_scope: tuple[str, ...] = ()
+        else:
+            self._write_scope_provider = None
+            self.write_scope = _normalize_write_scope(write_scope)
+
+    def _effective_write_scope(self) -> tuple[str, ...]:
+        if self._write_scope_provider is not None:
+            return _normalize_write_scope(self._write_scope_provider())
+        return self.write_scope
 
     def _require_workspace_read(self) -> None:
         if not self.policy.workspace_read:
@@ -583,10 +593,11 @@ class FileService:
                 "access_denied",
                 "workspace writes are disabled by the file access policy",
             )
-        if not any(_scope_contains(scope, rel_path) for scope in self.write_scope):
+        effective = self._effective_write_scope()
+        if not any(_scope_contains(scope, rel_path) for scope in effective):
             raise FileServiceError(
                 "access_denied",
-                f"path is outside the effective write_scope: {rel_path}",
+                f"path is outside the effective write scope: {rel_path}",
             )
 
     def read_file(
