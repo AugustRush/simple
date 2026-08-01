@@ -425,23 +425,27 @@ Shell sandbox modes:
 
 | Mode | Reads | Writes | Notes |
 |---|---|---|---|
-| `restricted` | System dirs + workspace/output only | output/scratch + user cache/state dirs + approved scope | Most locked down |
-| `read_all` (default) | **Whole machine** | output/scratch + user cache/state dirs + approved scope | Local tooling (miniconda, npm, pip) works; documents stay read-only |
+| `restricted` | System dirs + workspace/output only | Open by default; user data + workspace denied | Reads are the locked-down axis |
+| `read_all` (default) | **Whole machine** | Open by default; user data + workspace denied | Local tooling just works; documents/credentials stay write-protected |
 | `none` | Everything | Everything | Danger-full-access: no OS sandbox, GPU/Metal reachable. **Only valid with `shell_level: full`** |
 
-Writes are allowed by category, not per tool: the sandbox lets the agent
-persist tool state under the user cache/state directories (`~/.cache`,
-`~/.npm`, `~/.local`, `~/.config`, `~/Library/Caches`) so npm installs,
-HuggingFace downloads, pip/uv caches and MCP servers work without carving
-out a special case for each tool. `~/Library/Application Support` is
-writable as the macOS counterpart of `~/.config` (Chrome/Electron crashpad
-state and app data live there). GUI/rendering workloads (headless Chrome,
-Electron screenshots, Skia/Canvas rendering) additionally get the
-process-local mach bootstrap namespace, app-sandbox file extensions and
-preference reads as a category — the same facilities App Store GUI apps
-receive from `application.sb`. Home documents and sensitive dotfiles
-(`~/.ssh`, `~/.aws`, `~/.gitconfig`, …) remain read-only, as does the
-workspace unless a `write_scope` explicitly allows it.
+Writes are **open by default** — the sandbox protects user data, not tool
+behavior.  There is no per-tool allowlist (npm caches, HuggingFace downloads,
+Chrome/Electron state, MCP servers and temp dirs all just work).  The only
+write denials are protected user-data surfaces: documents/media
+(`~/Documents`, `~/Desktop`, `~/Downloads`, `~/Movies`, `~/Music`,
+`~/Pictures`), keychains and personal library data, credentials
+(`~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.git-credentials`,
+`~/.netrc`, `~/.gitconfig`), the workspace unless a `write_scope` explicitly
+reopens it, and the agent's internal bookkeeping.  GUI/rendering workloads
+(headless Chrome, Electron screenshots) receive the generic system
+facilities App Store GUI apps get from `application.sb` (process-local mach
+bootstrap, app-sandbox file extensions, preference reads).
+
+One limitation is architectural: seatbelt cannot nest — a tool that installs
+its own OS sandbox (headless Chrome, Electron) must disable it
+(`--no-sandbox` / `ELECTRON_DISABLE_SANDBOX=1`) or run unsandboxed
+(`shell_sandbox: none` with `shell_level: full`).
 
 Device/service access (Metal/IOKit — GPU, local ML) is open by default inside
 the sandbox, the same posture the profile already takes for network.  The

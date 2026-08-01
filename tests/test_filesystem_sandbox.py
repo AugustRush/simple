@@ -50,28 +50,34 @@ def test_profile_hides_workspace_when_read_disabled(tmp_path):
 
     assert f'file-read* (subpath "{request.workspace_root}")' not in profile
     assert f'file-read* (subpath "{request.output_root}")' in profile
-    assert f'file-write* (subpath "{request.output_root}")' in profile
+    assert '(allow file-write* (subpath "/"))' in profile
 
 
-def test_profile_makes_workspace_read_only_by_default(tmp_path):
+def test_profile_denies_workspace_writes_by_default(tmp_path):
     request = _request(tmp_path)
     profile = _macos_seatbelt_profile(request)
 
     assert f'file-read* (subpath "{request.workspace_root}")' in profile
-    assert f'file-write* (subpath "{request.workspace_root}")' not in profile
+    assert (
+        f'(deny file-write* (subpath "{request.workspace_root}"))'
+        in profile
+    )
 
 
-def test_profile_allows_only_scoped_workspace_writes(tmp_path):
+def test_profile_reopens_scoped_workspace_writes_after_deny(tmp_path):
     request = _request(
-        tmp_path, workspace_write=True, write_scope=["src/app.py"]
+        tmp_path, workspace_write=False, write_scope=["src/app.py"]
     )
     profile = _macos_seatbelt_profile(request)
 
     assert (
-        f'file-write* (subpath "{request.workspace_root}/src/app.py")'
+        f'(deny file-write* (subpath "{request.workspace_root}"))'
         in profile
     )
-    assert f'file-write* (subpath "{request.workspace_root}")' not in profile
+    assert (
+        f'(allow file-write* (subpath "{request.workspace_root}/src/app.py"))'
+        in profile
+    )
 
 
 def test_profile_denies_internal_bookkeeping(tmp_path):
@@ -83,13 +89,16 @@ def test_profile_denies_internal_bookkeeping(tmp_path):
     assert f'(deny file-read* (subpath "{internal}"))' in profile
 
 
-def test_read_all_mode_opens_reads_but_keeps_writes_scoped(tmp_path):
+def test_read_all_mode_opens_reads_and_defaults_writes_open(tmp_path):
     request = _request(tmp_path, mode="read_all")
     profile = _macos_seatbelt_profile(request)
 
     assert '(allow file-read* (subpath "/"))' in profile
-    assert f'file-write* (subpath "{request.output_root}")' in profile
-    assert f'file-write* (subpath "{request.workspace_root}")' not in profile
+    assert '(allow file-write* (subpath "/"))' in profile
+    assert (
+        f'(deny file-write* (subpath "{request.workspace_root}"))'
+        in profile
+    )
 
 
 def test_restricted_mode_has_no_read_all_rule(tmp_path):
@@ -127,12 +136,13 @@ def test_none_mode_builds_unsandboxed_command(tmp_path):
     assert sandbox.env_updates == {}
 
 
-def test_profile_keeps_scratch_writable(tmp_path):
+def test_profile_keeps_scratch_readable_and_writes_open(tmp_path):
     request = _request(tmp_path)
     profile = _macos_seatbelt_profile(request)
 
-    assert f'file-write* (subpath "{request.scratch_dir}")' in profile
     assert f'file-read* (subpath "{request.scratch_dir}")' in profile
+    assert '(allow file-write* (subpath "/"))' in profile
+    assert f'(deny file-write* (subpath "{request.scratch_dir}"))' not in profile
 
 
 def test_profile_escapes_seatbelt_literals(tmp_path):
@@ -160,30 +170,22 @@ def test_build_sandbox_command_fails_closed_without_adapter(monkeypatch, tmp_pat
         build_sandbox_command(_request(tmp_path))
 
 
-def test_profile_allows_home_cache_and_config_writes_by_default(tmp_path):
-    """Cache/state dirs are writable as a category, not per-tool."""
+def test_profile_opens_tool_state_and_protects_user_data(tmp_path):
+    """Writes are open by default; only user data is denied."""
     request = _request(tmp_path)
     profile = _macos_seatbelt_profile(request)
     home = request.home_dir
 
-    for sub in (
-        ".cache",
-        ".npm",
-        ".local",
-        ".config",
-        "Library/Caches",
-        "Library/Application Support",
-    ):
+    # Tool state (caches, app data) is not enumerated: it is open by default.
+    assert '(allow file-write* (subpath "/"))' in profile
+    for sub in (".cache", ".npm", "Library/Caches", "Library/Application Support"):
         literal = str(home / sub)
-        assert f'file-write* (subpath "{literal}")' in profile
-        assert f'file-read* (subpath "{literal}")' in profile
+        assert f'(deny file-write* (subpath "{literal}"))' not in profile
 
-    # Home itself, user documents and sensitive dotfiles stay read-only.
-    assert f'file-write* (subpath "{home}")' not in profile
-    ssh_dir = home / ".ssh"
-    documents = home / "Documents"
-    assert f'file-write* (subpath "{ssh_dir}")' not in profile
-    assert f'file-write* (subpath "{documents}")' not in profile
+    # User data surfaces are the deny list.
+    for sub in ("Documents", ".ssh", ".aws", ".git-credentials"):
+        literal = str(home / sub)
+        assert f'(deny file-write* (subpath "{literal}"))' in profile
 
 
 def test_profile_allows_gui_app_system_services(tmp_path):
@@ -195,18 +197,17 @@ def test_profile_allows_gui_app_system_services(tmp_path):
     assert "(allow mach-lookup)" in profile
     assert "(allow file-issue-extension)" in profile
     assert "(allow user-preference-read)" in profile
-    assert '(allow file-write* (subpath "/dev"))' in profile
 
 
-def test_profile_cache_rules_use_request_home_dir(tmp_path):
+def test_profile_protected_paths_use_request_home_dir(tmp_path):
     home = tmp_path / "other-home"
     request = _request(tmp_path, home_dir=home)
     profile = _macos_seatbelt_profile(request)
 
-    npm_dir = home / ".npm"
-    real_npm_dir = Path.home() / ".npm"
-    assert f'file-write* (subpath "{npm_dir}")' in profile
-    assert f'file-write* (subpath "{real_npm_dir}")' not in profile
+    ssh_dir = home / ".ssh"
+    real_ssh_dir = Path.home() / ".ssh"
+    assert f'(deny file-write* (subpath "{ssh_dir}"))' in profile
+    assert f'(deny file-write* (subpath "{real_ssh_dir}"))' not in profile
 
 
 # ── Real sandbox enforcement (macOS sandbox-exec) ──────────────────────────
@@ -299,6 +300,49 @@ def test_sandbox_keeps_home_documents_read_only(tmp_path):
 
 
 @_NEEDS_SANDBOX
+def test_sandbox_denies_credentials_and_reopens_scoped_workspace(tmp_path):
+    """write_scope reopens paths even inside a protected user-data root."""
+    home = tmp_path / "home"
+    workspace = home / "Desktop" / "ws"
+    workspace.mkdir(parents=True)
+    (workspace / "src").mkdir()
+    output = tmp_path / "output"
+    request = ShellSandboxRequest(
+        workspace_root=workspace,
+        output_root=output,
+        workspace_read=True,
+        workspace_write=False,
+        write_scope=("src",),
+        scratch_dir=output / "sandbox" / "tmp",
+        home_dir=home,
+    )
+    output.mkdir(parents=True, exist_ok=True)
+
+    credentials = home / ".ssh"
+    credentials.mkdir(parents=True)
+    credential_target = credentials / "id_rsa"
+    scoped_target = workspace / "src" / "ok.txt"
+    desktop_target = home / "Desktop" / "other" / "no.txt"
+
+    result = _run_in_sandbox(
+        request,
+        (
+            f"touch {credential_target}; echo CRED=$?; "
+            f"touch {scoped_target}; echo SCOPED=$?; "
+            f"mkdir -p {desktop_target.parent}; touch {desktop_target}; "
+            "echo DESKTOP=$?"
+        ),
+    )
+
+    assert "CRED=1" in result.stdout
+    assert "SCOPED=0" in result.stdout
+    assert "DESKTOP=1" in result.stdout
+    assert credential_target.exists() is False
+    assert scoped_target.exists() is True
+    assert desktop_target.exists() is False
+
+
+@_NEEDS_SANDBOX
 def test_sandbox_allows_workspace_reads(tmp_path):
     request = _request(tmp_path)
     request.workspace_root.mkdir()
@@ -354,7 +398,7 @@ def test_sandbox_denies_workspace_reads_when_read_disabled(tmp_path):
 @_NEEDS_SANDBOX
 def test_sandbox_allows_only_scoped_workspace_writes(tmp_path):
     request = _request(
-        tmp_path, workspace_write=True, write_scope=["src/app.py"]
+        tmp_path, workspace_write=False, write_scope=["src/app.py"]
     )
     (request.workspace_root / "src").mkdir(parents=True)
     allowed = request.workspace_root / "src" / "app.py"
@@ -370,15 +414,16 @@ def test_sandbox_allows_only_scoped_workspace_writes(tmp_path):
 
 
 @_NEEDS_SANDBOX
-def test_sandbox_denies_host_temp_and_internal_output(tmp_path):
+def test_sandbox_opens_host_temp_and_denies_internal_output(tmp_path):
     request = _request(tmp_path)
     request.output_root.mkdir()
     internal = request.output_root / ".simple-internal" / "locks"
     internal.mkdir(parents=True)
 
     host_tmp = _run_in_sandbox(request, "touch /tmp/simple-sandbox-test")
-    assert host_tmp.returncode != 0
-    assert not Path("/tmp/simple-sandbox-test").exists()
+    assert host_tmp.returncode == 0, host_tmp.stderr
+    assert Path("/tmp/simple-sandbox-test").exists()
+    Path("/tmp/simple-sandbox-test").unlink(missing_ok=True)
 
     internal_tmp = request.output_root / ".simple-internal" / "probe"
     internal_write = _run_in_sandbox(request, f"touch {internal_tmp}")

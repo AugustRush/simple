@@ -10,7 +10,7 @@ host.
 Three sandbox modes link to the permission levels:
 
 - ``restricted``: reads limited to platform runtimes plus the workspace and
-  output dirs; writes limited to output/scratch/approved write scope.
+  output dirs plus the user's cache/state directories.
 - ``read_all`` (default): the same write boundary, but reads are allowed
   everywhere on the host (``~/.config``, home caches, miniconda, …) so
   local tooling works without granting write access.
@@ -25,25 +25,25 @@ Seatbelt can expose the GPU services (the same mechanism App Store sandboxes
 use), so local MLX/GPU workloads work without opening writes or disabling
 confirmation; set it to ``False`` for the strictest posture.
 
-Write policy is category-based, not tool-based: local tools (npm, pip, uv,
-git, HuggingFace, MCP servers, …) all need to persist their own cache and
-state somewhere, and treating every such location as an attacker-exposed
-special case is unmaintainable.  The profile therefore treats the user's
-per-user cache/state directories (``~/.cache``, ``~/.npm``, ``~/.local``,
-``~/.config``, ``~/Library/Caches`` and ``~/Library/Application Support``)
-as writable by default — they hold recreatable tool state and app data, not
-user documents.  Everything else under the home directory (documents,
-``~/.ssh``, ``~/.aws``, ``~/.gitconfig``, the workspace) stays read-only
-unless explicitly listed in the approved write scope.
+Write policy is inverted, not allowlisted: the sandbox protects **user
+data**, not tool behavior.  Writes are open by default, so every local tool
+(npm, pip, uv, git, HuggingFace, Chrome/Electron, MCP servers, …) can
+persist caches, app state and temp files without a per-tool carve-out —
+enumerating what each tool needs is unmaintainable and always one tool
+behind.  The only explicit write denials are protected user-data surfaces:
+documents/media, keychains and credentials (``~/.ssh``, ``~/.aws``,
+``~/.git-credentials``, …), the workspace unless an approved ``write_scope``
+reopens it, and the agent's internal bookkeeping.  GUI/rendering workloads
+also receive the generic system facilities (process-local mach bootstrap,
+app-sandbox file extensions, preference reads) that App Store GUI apps get
+from ``application.sb``.
 
-GUI/rendering workloads (headless Chrome, Electron, Skia/Canvas screenshots,
-…) additionally need a small set of system facilities that the ``deny
-default`` profile would otherwise block: the process-local mach bootstrap
-namespace (crashpad/XPC handshakes use unique per-run names, so they cannot
-be enumerated), the ability to issue app-sandbox file extensions, and
-read access to the user's preferences.  These are allowed as a category —
-not per tool — and are the same facilities every App Store-style GUI app
-gets from ``application.sb``.
+One limitation is architectural, not configurable: seatbelt has no
+operation for starting a *second* sandbox, so a tool that installs its own
+OS sandbox (headless Chrome, Electron) cannot nest inside this one.  Such
+tools must disable their own sandbox (``--no-sandbox`` for Chrome,
+``ELECTRON_DISABLE_SANDBOX=1`` for Electron) or run unsandboxed via
+``shell_sandbox: none`` with permission level ``full``.
 
 On a platform where an enforcing adapter cannot be constructed, sandboxed
 modes fail closed instead of running unsandboxed.
@@ -78,6 +78,32 @@ _DEVICE_SANDBOX_RULES: tuple[str, ...] = (
     '(allow mach-lookup (global-name "com.apple.Metal"))',
     '(allow mach-lookup (global-name "com.apple.MTLCompilerService"))',
     "(allow iokit-open)",
+)
+
+# User-data surfaces that stay write-protected even though tool state is
+# open by default: documents/media, keychains/personal library data, and
+# credential files.  This is the deny side of the inverted policy — the
+# list is small and stable because it names what the user owns, not what
+# individual tools need.
+_PROTECTED_HOME_SUBDIRS: tuple[str, ...] = (
+    "Documents",
+    "Desktop",
+    "Downloads",
+    "Movies",
+    "Music",
+    "Pictures",
+    "Library/Keychains",
+    "Library/Mail",
+    "Library/Safari",
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".gitconfig",
+    ".git-credentials",
+    ".netrc",
 )
 
 
@@ -209,25 +235,14 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
         lines.append(
             f'(allow file-read* (subpath "{_seatbelt_literal(workspace)}"))'
         )
-    # output_dir is always readable and writable for generated artifacts.
+    # output_dir and scratch are always readable for generated artifacts.
     lines.append(f'(allow file-read* (subpath "{_seatbelt_literal(output)}"))')
-    lines.append(f'(allow file-write* (subpath "{_seatbelt_literal(output)}"))')
-    # Internal bookkeeping (locks, profiles, scratch internals) stays hidden.
-    lines.append(
-        f'(deny file-read* (subpath "{_seatbelt_literal(internal)}"))'
-    )
-    lines.append(
-        f'(deny file-write* (subpath "{_seatbelt_literal(internal)}"))'
-    )
-    # Private scratch used for TMPDIR/TMP/TEMP.
     lines.append(f'(allow file-read* (subpath "{_seatbelt_literal(scratch)}"))')
-    lines.append(f'(allow file-write* (subpath "{_seatbelt_literal(scratch)}"))')
-    # User cache/state directories are writable as a category: local tools
-    # (npm, pip, uv, git, HuggingFace, MCP servers, …) persist their state
-    # there, and treating each tool as a special case does not scale.  Home
-    # documents and dotfiles outside these directories stay read-only.
+    # Restricted mode still needs to read the user's cache/state dirs so
+    # tools can consume their own caches; in read_all mode reads are open
+    # anyway and these rules are redundant but harmless.
     home = str(request.home_dir.resolve(strict=False))
-    for cache_dir in (
+    for state_dir in (
         home + "/.cache",
         home + "/.npm",
         home + "/.local",
@@ -235,14 +250,13 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
         home + "/Library/Caches",
         home + "/Library/Application Support",
     ):
-        literal = _seatbelt_literal(cache_dir)
+        literal = _seatbelt_literal(state_dir)
         lines.append(f'(allow file-read* (subpath "{literal}"))')
-        lines.append(f'(allow file-write* (subpath "{literal}"))')
-    # GUI/rendering applications need the process-local mach bootstrap
-    # namespace (unique per-run crashpad/XPC names cannot be enumerated),
-    # app-sandbox file extensions, preference reads, and device-node writes
-    # (/dev/null).  Allowed as a category — same facilities App Store GUI
-    # apps get from application.sb.
+
+    # Generic system facilities every GUI/rendering app needs (crashpad/XPC
+    # handshakes use unique per-run mach names, so they cannot be
+    # enumerated; app-sandbox extensions and preference reads are generic
+    # app capabilities — the same set application.sb grants App Store apps).
     lines.extend(
         (
             "(allow mach-bootstrap)",
@@ -250,11 +264,35 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
             "(allow mach-lookup)",
             "(allow file-issue-extension)",
             "(allow user-preference-read)",
-            '(allow file-write* (subpath "/dev"))',
         )
     )
-    # Approved write_scope entries become writable; the rest of the workspace
-    # stays read-only (or hidden when workspace reads are disabled).
+
+    # Inverted write policy: open by default (tools persist caches/app state
+    # anywhere), then deny only the protected user-data surfaces.  Seatbelt
+    # resolves overlapping rules last-match-wins, so the denies below must
+    # follow this default-open allow, and write_scope re-opens must follow
+    # their denies.
+    lines.append('(allow file-write* (subpath "/"))')
+    # Internal bookkeeping (locks, profiles, scratch internals) stays hidden.
+    lines.append(
+        f'(deny file-read* (subpath "{_seatbelt_literal(internal)}"))'
+    )
+    lines.append(
+        f'(deny file-write* (subpath "{_seatbelt_literal(internal)}"))'
+    )
+    # The workspace is not writable unless write_scope enables it.
+    workspace_denied = (
+        not request.workspace_write and "*" not in request.write_scope
+    )
+    if workspace_denied:
+        lines.append(
+            f'(deny file-write* (subpath "{_seatbelt_literal(workspace)}"))'
+        )
+    # Protected user data (documents, media, keychains, credentials).
+    for sub in _PROTECTED_HOME_SUBDIRS:
+        literal = _seatbelt_literal(f"{home}/{sub}")
+        lines.append(f'(deny file-write* (subpath "{literal}"))')
+    # Approved write_scope entries reopen paths after their denies.
     for scope in request.write_scope:
         if scope == "*":
             lines.append(
@@ -263,12 +301,6 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
             continue
         candidate = request.workspace_root / scope
         if _path_is_within(candidate, request.workspace_root):
-            lines.append(
-                f'(allow file-write* (subpath "{_seatbelt_literal(str(candidate.resolve(strict=False)))}"))'
-            )
-            continue
-        candidate = request.output_root / scope
-        if _path_is_within(candidate, request.output_root):
             lines.append(
                 f'(allow file-write* (subpath "{_seatbelt_literal(str(candidate.resolve(strict=False)))}"))'
             )
