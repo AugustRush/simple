@@ -627,11 +627,21 @@ def _compose_system_prompt(
             lines.extend(skill_catalog.summary_lines())
         if workspace_root:
             builtin_names = {n for n, _ in groups["builtin"]}
-            if any(n in builtin_names for n in ("read_file", "write_file", "list_files")):
+            if any(
+                n in builtin_names
+                for n in ("read_file", "write_file", "list_files", "edit_file")
+            ):
                 lines.append(
-                    f"Workspace root for read_file/list_files only: {workspace_root}. "
-                    "write_file writes generated files to output_dir by default; "
-                    "workspace writes require an explicit write_scope."
+                    "File tools take an explicit `root` (`workspace` or `output_dir`) "
+                    "and a root-relative `path`; absolute paths and path traversal "
+                    "are rejected. `read_file` returns a bounded line window plus an "
+                    "exact `revision`; pass that revision back as `expected_revision` "
+                    "to `write_file` or `edit_file` before mutating, and reread after "
+                    "any conflict. The workspace is read-only by default and workspace "
+                    "writes additionally require the startup `file_access` policy plus "
+                    "an explicit `write_scope`; `output_dir` is always readable and "
+                    "writable for generated artifacts. The `file_access` configuration "
+                    "is loaded only at startup — changing it requires a restart."
                 )
             if "schedule_create" in builtin_names:
                 lines.append(
@@ -655,11 +665,13 @@ def _compose_system_prompt(
                     else f"{shared.DEFAULT_OUTPUT_DIR}/sandbox"
                 )
                 lines.append(
-                    "Shell commands run in an isolated sandbox directory by default "
+                    "Shell commands run inside an OS filesystem sandbox. The default "
+                    f"cwd is an isolated sandbox directory under output_dir "
                     f"({sandbox_hint}), NOT the workspace root ({workspace_root}). "
-                    "Downloads, clones, and generated artifacts go there automatically. "
-                    "Only set cwd explicitly when you need to operate on workspace files; "
-                    "new files accidentally created in the workspace are moved to output_dir."
+                    "Writes are blocked outside output_dir and the approved workspace "
+                    "write_scope, so downloads, clones, and generated artifacts must "
+                    "use relative paths under the sandbox/output directory. Only set "
+                    "cwd explicitly when you need to operate on workspace files."
                 )
                 lines.append(
                     "Avoid absolute path arguments in shell commands. For current project files, "

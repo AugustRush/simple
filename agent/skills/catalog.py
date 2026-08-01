@@ -757,7 +757,8 @@ class SkillCatalog:
             "hints": {
                 "file_access": (
                     "Use `read_skill_file` (not `read_file`) to read files inside "
-                    "the skill bundle. `read_file` is restricted to the workspace root."
+                    "the skill bundle. `read_file` only accesses the `workspace` and "
+                    "`output_dir` roots, never the skills directory."
                 ),
             },
         }
@@ -785,7 +786,8 @@ class SkillCatalog:
         lines.append(f"Bundle root: {self._bundle_root_label(bundle)}")
         if bundle.supporting_files:
             lines.append(
-                "Supporting files (use `read_skill_file` to read, NOT `read_file`):"
+                "Supporting files (use `read_skill_file` to read, NOT `read_file`, "
+                "which cannot access the skills directory):"
             )
             lines.extend(f"- {path}" for path in bundle.supporting_files)
         else:

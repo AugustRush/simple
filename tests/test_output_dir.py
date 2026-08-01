@@ -237,6 +237,36 @@ def test_build_components_wires_immutable_file_policy(monkeypatch, tmp_path):
     assert components["registry"].get_context("file_access_policy") is policy
 
 
+def test_build_components_prompt_describes_rooted_revision_contract(
+    monkeypatch, tmp_path
+):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+    prompt = components["system_prompt"]
+
+    assert "explicit `root`" in prompt
+    assert "expected_revision" in prompt
+    assert "`output_dir` is always readable and writable" in prompt
+    assert "restart" in prompt
+    assert "edit_file" in prompt
+    # Legacy implicit-redirection claims must be gone.
+    assert "moved to output_dir" not in prompt
+    assert "writes generated files to output_dir by default" not in prompt
+
+
 def test_build_components_rejects_output_inside_workspace(monkeypatch, tmp_path):
     import agent as agent_module
 

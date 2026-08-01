@@ -94,6 +94,32 @@ def test_registry_rejects_cross_source_replace():
         )
 
 
+def test_file_tool_schemas_are_rooted_and_closed(tmp_path):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+
+    for name in ("read_file", "write_file", "edit_file", "list_files"):
+        schema = registry._tools[name].parameters
+        assert schema["additionalProperties"] is False, name
+        assert schema["properties"]["root"]["enum"] == ["workspace", "output_dir"]
+
+    read_schema = registry._tools["read_file"].parameters
+    assert "max_bytes" not in read_schema["properties"]
+    assert "path" in read_schema["required"]
+    assert "edit_file" in registry.list_tools()
+
+    write_schema = registry._tools["write_file"].parameters
+    assert set(write_schema["required"]) == {"root", "path", "mode", "content"}
+    assert write_schema["properties"]["mode"]["enum"] == ["create", "overwrite"]
+
+    edit_schema = registry._tools["edit_file"].parameters
+    assert set(edit_schema["required"]) == {
+        "root",
+        "path",
+        "expected_revision",
+        "replacements",
+    }
+
+
 def test_registry_call_sanitizes_exceptions():
     from agent import ToolRegistry
 
