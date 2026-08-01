@@ -57,6 +57,50 @@ def _fmt_tool_inputs(name: str, inputs: dict) -> str:
     return _markup_escape(raw)
 
 
+def _clip_single_line(value: Any, limit: int = 120) -> str:
+    text = _redact_sensitive_text(str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _summarize_tool_result(result: str) -> tuple[bool | None, str]:
+    """Return a safe, compact CLI summary instead of dumping tool JSON."""
+    try:
+        payload = json.loads(result)
+    except Exception:
+        return None, _clip_single_line(result)
+    if not isinstance(payload, dict):
+        return None, _clip_single_line(result)
+
+    ok = bool(payload.get("ok", True))
+    if not ok:
+        return False, _clip_single_line(payload.get("error") or "Tool failed")
+
+    summary = payload.get("summary_text")
+    if summary:
+        return True, _clip_single_line(summary)
+
+    parts: list[str] = []
+    for key, label in (
+        ("path", "path"),
+        ("count", "items"),
+        ("bytes_written", "bytes"),
+        ("exit_code", "exit"),
+    ):
+        value = payload.get(key)
+        if value is not None and value != "":
+            parts.append(f"{label}={_clip_single_line(value, 72)}")
+    if parts:
+        return True, " · ".join(parts)
+
+    output = payload.get("output")
+    if output:
+        return True, _clip_single_line(output)
+    return True, "Completed"
+
+
 class OutputSink(ABC):
     """Abstract output contract for one channel session."""
 
@@ -158,49 +202,104 @@ class CliOutputSink(OutputSink):
         self._progress_task: Any = None
         self._last_heartbeat_at = 0.0
         self._last_heartbeat_op = ""
+        self._last_tool_progress = ""
+        self._activity: Any = None
+        self._line_open = False
+        self._turn_started_at = time.monotonic()
+
+    def begin_turn(self) -> None:
+        """Open a visually distinct response region for an interactive turn."""
+        self._turn_started_at = time.monotonic()
+        self._console.print("[bold cyan]Agent[/bold cyan]")
+        self._set_activity("Preparing response…")
+
+    def _supports_live_status(self) -> bool:
+        return bool(
+            getattr(self._console, "is_terminal", False)
+            and callable(getattr(self._console, "status", None))
+        )
+
+    def _set_activity(self, text: str) -> None:
+        if not self._supports_live_status():
+            return
+        label = f"[dim]{_markup_escape(_clip_single_line(text, 160))}[/dim]"
+        if self._activity is None:
+            self._activity = self._console.status(label, spinner="dots")
+            self._activity.start()
+            return
+        self._activity.update(label)
+
+    def _stop_activity(self) -> None:
+        if self._activity is None:
+            return
+        self._activity.stop()
+        self._activity = None
+
+    def _finish_open_line(self) -> None:
+        if self._line_open:
+            self._console.print()
+            self._line_open = False
 
     def on_stream_chunk(self, chunk: str) -> None:
+        self._stop_activity()
         self._console.print(chunk, end="", markup=False)
         self._streamed.append(chunk)
+        self._line_open = bool(chunk) and not chunk.endswith("\n")
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
+        self._stop_activity()
         if self._progress is not None:
             self._progress.stop()
             self._progress = None
             self._progress_task = None
+        self._finish_open_line()
         if not self._streamed and full_text:
             self._console.print(Markdown(full_text))
-        if self._tool_count > 0:
-            self._console.print(f"[dim]({self._tool_count} tool call(s) this turn)[/dim]")
+        elapsed = max(0.0, time.monotonic() - self._turn_started_at)
+        if self._tool_count or elapsed >= 2.0:
+            details = []
+            if self._tool_count:
+                suffix = "" if self._tool_count == 1 else "s"
+                details.append(f"{self._tool_count} tool{suffix}")
+            if elapsed >= 2.0:
+                details.append(f"{elapsed:.1f}s")
+            self._console.print(f"[dim]Done · {' · '.join(details)}[/dim]")
         self._console.print()
         self._streamed.clear()
         self._tool_count = 0
 
     def on_tool_start(self, name: str, inputs: dict) -> None:
+        self._stop_activity()
+        self._finish_open_line()
         hint = _fmt_tool_inputs(name, inputs)
-        self._console.print(f"\n[cyan]→ {name}[/cyan]{hint}")
+        self._console.print(f"[cyan]›[/cyan] [bold]{_markup_escape(name)}[/bold]{hint}")
         self._tool_start_times[name] = time.monotonic()
         self._tool_count += 1
+        self._set_activity(f"Running {name}…")
 
     def on_tool_end(self, name: str, result: str) -> None:
+        self._stop_activity()
         elapsed = ""
         start = self._tool_start_times.pop(name, None)
         if start is not None:
             elapsed = f" [dim]({time.monotonic() - start:.1f}s)[/dim]"
-        try:
-            data = json.loads(result)
-            ok = data.get("ok", True)
-            indicator = "[green]✓[/green]" if ok else "[yellow]✗[/yellow]"
-        except Exception:
-            indicator = "[dim]·[/dim]"
-        self._console.print(
-            f"{indicator} [dim]{result[:150]}{'...' if len(result) > 150 else ''}[/dim]{elapsed}"
+        ok, summary = _summarize_tool_result(result)
+        indicator = (
+            "[green]✓[/green]"
+            if ok is True
+            else "[red]✗[/red]" if ok is False else "[dim]·[/dim]"
         )
+        self._console.print(f"{indicator} [dim]{_markup_escape(summary)}[/dim]{elapsed}")
+        self._set_activity("Processing results…")
 
     def on_tool_blocked(self, name: str, reason: str) -> None:
+        self._stop_activity()
+        self._finish_open_line()
         self._console.print(
-            f"\n[cyan]→ {name}[/cyan] [yellow](blocked by plugin: {reason})[/yellow]"
+            f"[yellow]![/yellow] [bold]{_markup_escape(name)}[/bold] "
+            f"[yellow]{_markup_escape(_clip_single_line(reason))}[/yellow]"
         )
+        self._set_activity("Processing results…")
 
     def on_tool_progress(self, name: str, progress: Mapping[str, Any]) -> None:
         status = str(progress.get("status") or "running")
@@ -214,11 +313,20 @@ class CliOutputSink(OutputSink):
             except Exception:
                 suffix = f" {current}/{total}"
         detail = f" - {message}" if message else ""
-        self._console.print(f"[dim]↻ {name}: {status}{suffix}{detail}[/dim]")
+        text = f"{name}: {status}{suffix}{detail}"
+        if text == self._last_tool_progress:
+            return
+        self._last_tool_progress = text
+        if self._supports_live_status():
+            self._set_activity(text)
+            return
+        self._console.print(f"[dim]↻ {_markup_escape(_clip_single_line(text, 200))}[/dim]")
 
     def on_notification(self, title: str, body: str, *, level: str = "info") -> None:
         from rich.panel import Panel
 
+        self._stop_activity()
+        self._finish_open_line()
         colors = {"info": "cyan", "warning": "yellow", "error": "red"}
         self._console.print(
             Panel(
@@ -229,11 +337,19 @@ class CliOutputSink(OutputSink):
         )
 
     def on_info(self, content: Any) -> None:
+        self._stop_activity()
+        self._finish_open_line()
         self._console.print(content)
 
     def on_status(self, text: str, *, level: str = "info") -> None:
+        self._stop_activity()
+        self._finish_open_line()
         colors = {"info": "dim", "warning": "yellow", "success": "green", "error": "red"}
-        self._console.print(f"[{colors.get(level, 'dim')}]{text}[/{colors.get(level, 'dim')}]")
+        color = colors.get(level, "dim")
+        clean = _markup_escape(_redact_sensitive_text(str(text or "")))
+        self._console.print(
+            f"[{color}]{clean}[/{color}]"
+        )
 
     def on_heartbeat(
         self,
@@ -259,15 +375,23 @@ class CliOutputSink(OutputSink):
         label = labels.get(op, op)
         detail = f" · {op_detail}" if op_detail else ""
         pending = f" · {pending_messages} 条新消息待处理" if pending_messages else ""
+        activity_text = f"{label} ({elapsed_seconds:.0f}s){detail}{pending}"
+        if self._supports_live_status():
+            self._set_activity(activity_text)
+            return
         self._console.print(
-            f"\n[dim]… {label} ({elapsed_seconds:.0f}s){detail}{pending}[/dim]"
+            f"[dim]… {_markup_escape(activity_text)}[/dim]"
         )
 
     def on_error(self, error: str) -> None:
-        self._console.print(f"[red]{error}[/red]")
+        self._stop_activity()
+        self._finish_open_line()
+        clean = _markup_escape(_redact_sensitive_text(str(error or "Unknown error")))
+        self._console.print(f"[red]Error[/red] [dim]{clean}[/dim]")
 
     def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
         if event.kind == "batch_started":
+            self._stop_activity()
             self._last_batch_progress_key = None
             if event.total > 1:
                 self._progress = Progress(
@@ -308,7 +432,7 @@ class CliOutputSink(OutputSink):
             color = "red"
         elif event.kind in ("batch_progress", "batch_finished"):
             color = "dim"
-        self._console.print(f"[{color}]{msg}[/{color}]")
+        self._console.print(f"[{color}]{_markup_escape(str(msg))}[/{color}]")
 
     @staticmethod
     def _format_subagent_event(event: "SubAgentProgressEvent") -> str:

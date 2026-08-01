@@ -19,6 +19,7 @@ import agent as agent_module
 from agent.channels import Channel, ChannelRunner, CliChannel, IncomingMessage
 from agent.core import CliOutputSink, OutputSink, SubAgentProgressEvent
 from agent.core.attachments import MessageAttachment
+from agent.core.output import _summarize_tool_result
 from agent import (
     _active_sink,
     _fmt_tool_inputs,
@@ -176,6 +177,98 @@ def test_cli_output_sink_on_tool_end():
     sink, console = _make_sink()
     sink.on_tool_end("bash", "file1.py\nfile2.py")
     assert len(console.lines) == 1
+
+
+def test_cli_output_sink_compacts_structured_tool_results():
+    sink, console = _make_sink()
+    sink.on_tool_start("write_file", {"path": "/tmp/app.html"})
+    console.lines.clear()
+
+    sink.on_tool_end(
+        "write_file",
+        json.dumps(
+            {
+                "ok": True,
+                "path": "/tmp/app.html",
+                "bytes_written": 1200,
+                "content": "large content must not be rendered",
+            }
+        ),
+    )
+
+    output = "\n".join(console.lines)
+    assert "path=/tmp/app.html" in output
+    assert "bytes=1200" in output
+    assert "large content" not in output
+
+
+def test_summarize_tool_result_redacts_error_secrets():
+    ok, summary = _summarize_tool_result(
+        json.dumps({"ok": False, "error": "token=private-value request failed"})
+    )
+
+    assert ok is False
+    assert "private-value" not in summary
+    assert "token=[REDACTED]" in summary
+
+
+def test_cli_output_sink_begin_and_complete_create_clear_turn_boundary():
+    sink, console = _make_sink()
+    sink.begin_turn()
+    sink.on_tool_start("write_file", {"path": "/tmp/app.html"})
+    sink.on_tool_end("write_file", '{"ok": true, "path": "/tmp/app.html"}')
+    sink.on_stream_chunk("answer")
+    sink.on_turn_complete("answer", ["write_file"])
+
+    output = "\n".join(console.lines)
+    assert "Agent" in output
+    assert "Done · 1 tool" in output
+
+
+def test_cli_output_sink_live_heartbeat_updates_in_place():
+    class _Status:
+        def __init__(self, label):
+            self.updates = [label]
+            self.started = False
+            self.stopped = False
+
+        def start(self):
+            self.started = True
+
+        def update(self, label):
+            self.updates.append(label)
+
+        def stop(self):
+            self.stopped = True
+
+    class _LiveConsole(_FakeConsole):
+        is_terminal = True
+
+        def __init__(self):
+            super().__init__()
+            self.statuses = []
+
+        def status(self, label, spinner="dots"):
+            status = _Status(label)
+            self.statuses.append(status)
+            return status
+
+    console = _LiveConsole()
+    sink = CliOutputSink(console)
+    sink.begin_turn()
+    sink.on_heartbeat(
+        elapsed_seconds=5,
+        current_op="LLM",
+        op_detail="model",
+    )
+
+    assert len(console.statuses) == 1
+    assert console.statuses[0].started is True
+    assert any("模型正在生成" in update for update in console.statuses[0].updates)
+    assert not any("模型正在生成" in line for line in console.lines)
+
+    sink.on_stream_chunk("answer")
+    assert console.statuses[0].stopped is True
 
 
 def test_cli_output_sink_on_tool_blocked():

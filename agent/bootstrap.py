@@ -103,7 +103,7 @@ async def _connect_mcp_in_background(
             )
 
 
-async def _build_components_async(cfg: dict):
+async def _build_components_async(cfg: dict, *, announce: bool = True):
     """Build all components from config using ModelClientFactory."""
     console = shared.CONSOLE
     context_dir = shared.CONTEXT_DIR
@@ -121,7 +121,13 @@ async def _build_components_async(cfg: dict):
     user_tool_catalog_cls = agent_module.UserToolCatalog
     mcp_client_cls = agent_module.MCPClient
 
-    client, model, max_tokens = ModelClientFactory.from_config(cfg)
+    if announce:
+        client, model, max_tokens = ModelClientFactory.from_config(cfg)
+    else:
+        client, model, max_tokens = ModelClientFactory.from_config(
+            cfg,
+            announce=False,
+        )
 
     # Resolve context_window from provider config, falling back to the
     # DEFAULT_CONTEXT_WINDOW constant.  Follows the same resolution order
@@ -339,11 +345,11 @@ async def _build_components_async(cfg: dict):
     loaded_user_tools: list[str] = []
     if user_tools_enabled:
         loaded_user_tools = user_tool_catalog.load_into_registry(registry)
-        if loaded_user_tools:
+        if loaded_user_tools and announce:
             console.print(
                 "[green]User tools loaded:[/green] " + ", ".join(loaded_user_tools)
             )
-    else:
+    elif announce:
         console.print(
             "[dim]User Python tools disabled; set user_tools.enabled=true to load trusted ~/.agent/tools/*.py[/dim]"
         )
@@ -382,7 +388,7 @@ async def _build_components_async(cfg: dict):
         "cfg": cfg,
     }
     loaded_plugins = plugin_catalog.discover_and_load()
-    if loaded_plugins:
+    if loaded_plugins and announce:
         console.print("[green]Plugins loaded:[/green] " + ", ".join(loaded_plugins))
 
     # Load skills bundled by plugins into the skill catalog

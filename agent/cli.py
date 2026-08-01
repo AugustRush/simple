@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import inspect
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ from typing import Any, Optional
 
 import typer
 from rich.markdown import Markdown
+from rich.markup import escape as markup_escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
@@ -53,6 +55,10 @@ app.add_typer(memory_app, name="memory")
 schedule_app = typer.Typer(help="Scheduled task commands")
 app.add_typer(schedule_app, name="schedule")
 
+
+class _CliPrompt(Prompt):
+    prompt_suffix = " "
+
 _INTERACTION_LOGGER_NAMES = (
     "agent.channels.base",
     "agent.core.agent",
@@ -65,6 +71,14 @@ def _agent_core_for_components(components: dict):
     if agent_core is None or isinstance(agent_core, AgentCore):
         return AgentCore(RuntimeComponents(components))
     return agent_core
+
+
+async def _build_quiet_cli_components(cfg: dict) -> dict:
+    """Build interactive components without duplicating the session header."""
+    builder = agent_module._build_components_async
+    if "announce" in inspect.signature(builder).parameters:
+        return await builder(cfg, announce=False)
+    return await builder(cfg)
 
 
 def _configure_runtime_logging() -> None:
@@ -249,6 +263,20 @@ def _build_cli_context_manager(components: dict) -> Optional[ContextManager]:
     return spawn_session("cli") if callable(spawn_session) else base_ctx_mgr
 
 
+def _cli_session_header(components: dict, cfg: dict) -> Panel:
+    """Build a compact startup identity without consuming terminal width."""
+    agent = components["agent"]
+    model = markup_escape(str(getattr(agent, "model", "") or "default"))
+    provider = markup_escape(str(cfg.get("active_provider") or "default"))
+    api_format = markup_escape(str(getattr(agent, "api_format", "") or "unknown"))
+    return Panel.fit(
+        f"[bold cyan]simple[/bold cyan] [dim]interactive[/dim]\n"
+        f"[white]{model}[/white] [dim]· {provider}/{api_format} · cli[/dim]",
+        border_style="bright_black",
+        padding=(0, 1),
+    )
+
+
 async def _interactive_loop(components: dict, cfg: dict):
     """Main interactive chat loop."""
     global _current_cancel_token
@@ -339,7 +367,7 @@ async def _interactive_loop(components: dict, cfg: dict):
         ]
         if orphans:
             shared.CONSOLE.print(
-                f"[dim]💤 Queueing recovery for {len(orphans)} orphaned session(s)...[/dim]"
+                f"[dim]Recovering {len(orphans)} interrupted session(s)…[/dim]"
             )
             for orphan_path in orphans:
                 ctx_mgr.enqueue_staging_job(
@@ -349,13 +377,7 @@ async def _interactive_loop(components: dict, cfg: dict):
             if memory_worker:
                 memory_worker.wake()
 
-    shared.CONSOLE.print(
-        Panel(
-            "[bold cyan]Personal Agent[/bold cyan]\n[dim]Type /help for commands[/dim]",
-            title="Agent Ready",
-            border_style="cyan",
-        )
-    )
+    shared.CONSOLE.print(_cli_session_header(components, cfg))
     # Notify all plugins that the session has started.
     plugin_catalog.fire_session_start(components)
 
@@ -367,7 +389,8 @@ async def _interactive_loop(components: dict, cfg: dict):
                 # input). This is required for future multi-channel concurrency where
                 # a second channel (Telegram, Feishu, …) runs in the same loop.
                 user_input = await asyncio.to_thread(
-                    Prompt.ask, "\n[bold green]You[/bold green]"
+                    _CliPrompt.ask,
+                    "\n[bold green]›[/bold green]",
                 )
             except (EOFError, KeyboardInterrupt):
                 break
@@ -379,7 +402,7 @@ async def _interactive_loop(components: dict, cfg: dict):
             try:
                 ctx.metadata["skill_catalog"] = skill_catalog
                 if not user_input.lstrip().startswith("/"):
-                    shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
+                    _turn_sink.begin_turn()
                 action = await coordinator.handle(
                     TurnInput.from_text(
                         user_input,
@@ -392,7 +415,7 @@ async def _interactive_loop(components: dict, cfg: dict):
                 if action == "exit_cli":
                     break
             except Exception as e:
-                shared.CONSOLE.print(f"\n[red]Error: {e}[/red]")
+                _turn_sink.on_error(str(e))
             finally:
                 _current_cancel_token = None
 
@@ -408,7 +431,7 @@ async def _interactive_loop(components: dict, cfg: dict):
         # finally block then runs this code before the process exits.
         # (A ^C^C that arrives *here* can still abort — that is user intent.)
         if ctx_mgr and ctx_mgr.should_session_end_sleep():
-            shared.CONSOLE.print("[dim]💤 Session-end consolidation...[/dim]")
+            shared.CONSOLE.print("[dim]Saving session context…[/dim]")
             try:
                 flush_timeout = max(
                     1.0,
@@ -451,7 +474,7 @@ async def _interactive_loop(components: dict, cfg: dict):
             except Exception as exc:
                 shared.CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
 
-    shared.CONSOLE.print("\n[dim]Goodbye.[/dim]")
+    shared.CONSOLE.print("\n[dim]Session closed.[/dim]")
 
 
 @app.callback(invoke_without_command=True)
@@ -467,7 +490,7 @@ def main_callback(ctx: typer.Context):
 
         async def _run():
             try:
-                components = await agent_module._build_components_async(cfg)
+                components = await _build_quiet_cli_components(cfg)
             except RuntimeError as exc:
                 shared.CONSOLE.print(f"[red]Error: {exc}[/red]")
                 raise typer.Exit(1)
@@ -563,21 +586,17 @@ def chat(question: str = typer.Argument(..., help="Question or task for the agen
         cfg, _ = agent_module.load_config()
 
     async def _run():
-        components = await agent_module._build_components_async(cfg)
+        components = await _build_quiet_cli_components(cfg)
         ctx = AgentContext(system_prompt=components["system_prompt"])
         state = RuntimeSessionState(ctx=ctx)
-        shared.CONSOLE.print("[bold blue]Agent[/bold blue]: ", end="")
         sink = CliOutputSink(shared.CONSOLE)
+        sink.begin_turn()
         try:
-            execution = await _agent_core_for_components(components).handle_turn(
+            await _agent_core_for_components(components).handle_turn(
                 TurnInput.from_text(question, channel_name="cli"),
                 state,
                 sink=sink,
             )
-            result = execution.result
-            shared.CONSOLE.print()
-            if result.error:
-                shared.CONSOLE.print(f"[red]Error: {result.error}[/red]")
         finally:
             await agent_module._close_components(components)
 
