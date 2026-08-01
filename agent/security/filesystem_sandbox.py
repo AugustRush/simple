@@ -25,13 +25,24 @@ Seatbelt can expose the GPU services (the same mechanism App Store sandboxes
 use), so local MLX/GPU workloads work without opening writes or disabling
 confirmation; set it to ``False`` for the strictest posture.
 
+Write policy is category-based, not tool-based: local tools (npm, pip, uv,
+git, HuggingFace, MCP servers, …) all need to persist their own cache and
+state somewhere, and treating every such location as an attacker-exposed
+special case is unmaintainable.  The profile therefore treats the user's
+per-user cache/state directories (``~/.cache``, ``~/.npm``, ``~/.local``,
+``~/.config`` and ``~/Library/Caches``) as writable by default — they hold
+recreatable tool state, not user documents.  Everything else under the home
+directory (documents, ``~/.ssh``, ``~/.aws``, ``~/.gitconfig``, the
+workspace) stays read-only unless explicitly listed in the approved write
+scope.
+
 On a platform where an enforcing adapter cannot be constructed, sandboxed
 modes fail closed instead of running unsandboxed.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import os
 from pathlib import Path
@@ -73,6 +84,7 @@ class ShellSandboxRequest:
     scratch_dir: Path
     mode: str = SANDBOX_MODE_READ_ALL
     devices: bool = True
+    home_dir: Path = field(default_factory=lambda: Path.home())
 
 
 @dataclass(frozen=True)
@@ -197,6 +209,21 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
     # Private scratch used for TMPDIR/TMP/TEMP.
     lines.append(f'(allow file-read* (subpath "{_seatbelt_literal(scratch)}"))')
     lines.append(f'(allow file-write* (subpath "{_seatbelt_literal(scratch)}"))')
+    # User cache/state directories are writable as a category: local tools
+    # (npm, pip, uv, git, HuggingFace, MCP servers, …) persist their state
+    # there, and treating each tool as a special case does not scale.  Home
+    # documents and dotfiles outside these directories stay read-only.
+    home = str(request.home_dir)
+    for cache_dir in (
+        home + "/.cache",
+        home + "/.npm",
+        home + "/.local",
+        home + "/.config",
+        home + "/Library/Caches",
+    ):
+        literal = _seatbelt_literal(cache_dir)
+        lines.append(f'(allow file-read* (subpath "{literal}"))')
+        lines.append(f'(allow file-write* (subpath "{literal}"))')
     # Approved write_scope entries become writable; the rest of the workspace
     # stays read-only (or hidden when workspace reads are disabled).
     for scope in request.write_scope:

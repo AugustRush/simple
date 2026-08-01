@@ -80,6 +80,20 @@ def _looks_like_plugin(dir_path: Path) -> bool:
     return False
 
 
+def _canonicalize_plugin_source(source: str) -> str:
+    """Normalize a plugin repo reference to the standard https transport.
+
+    ``git://`` (port 9418) is a legacy transport that is frequently blocked
+    by home/corporate networks and carries no credentials, so it is
+    rewritten to the equivalent https URL before cloning.  https, ssh
+    (``git@host:path``) and local paths are left untouched — they are
+    legitimate authenticated/local transports.
+    """
+    if source.startswith("git://"):
+        return "https://" + source[len("git://") :]
+    return source
+
+
 def _resolve_user_plugin_target(name: str) -> Path:
     if name != name.strip() or re.fullmatch(
         r"[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?\Z", name
@@ -827,6 +841,8 @@ class BuiltinTools:
 
         if not source.strip():
             return {"ok": False, "error": "source is required"}
+
+        source = _canonicalize_plugin_source(source)
 
         # Derive name from URL or path when not provided.
         if name is None:

@@ -2298,6 +2298,84 @@ def test_install_plugin_from_local_path_and_reload(tmp_path, monkeypatch):
     assert "sample-plugin" in catalog._plugins
 
 
+def test_install_plugin_canonicalizes_git_protocol_to_https(tmp_path, monkeypatch):
+    """git:// URLs are cloned over https so blocked port 9418 cannot break installs."""
+    import asyncio
+    import json as _json
+
+    from agent import PluginCatalog
+    from agent import shared as _shared
+    from agent.tools.builtin_tools import BuiltinTools
+    from agent.tools.runtime import ToolRegistry
+
+    user_plugins = tmp_path / "installed"
+    monkeypatch.setattr(_shared, "USER_PLUGINS_DIR", user_plugins)
+
+    registry = ToolRegistry()
+    BuiltinTools(memory=None, registry=registry)
+    catalog = PluginCatalog(builtin_dir=tmp_path / "empty", user_dir=user_plugins)
+    catalog.discover_and_load()
+    components = {"plugin_catalog": catalog}
+    registry.set_context("plugin_catalog", catalog)
+    registry.set_context("components", components)
+
+    spawned = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"", b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        spawned["argv"] = args
+        # Simulate a successful clone producing a valid plugin layout.
+        target = Path(args[-1])
+        (target / ".claude-plugin").mkdir(parents=True)
+        (target / ".claude-plugin" / "plugin.json").write_text(
+            '{"name": "sample-plugin", "description": "demo"}', encoding="utf-8"
+        )
+        return FakeProc()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    result = _json.loads(
+        asyncio.run(
+            registry.call(
+                "install_plugin",
+                {
+                    "source": "git://github.com/example/context7.git",
+                    "intent": "install test plugin",
+                },
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert spawned["argv"][1:4] == ("clone", "--depth", "1")
+    assert spawned["argv"][4].startswith("https://github.com/example/context7.git")
+
+
+def test_canonicalize_plugin_source_keeps_working_transports():
+    from agent.tools.builtin_tools import _canonicalize_plugin_source
+
+    assert (
+        _canonicalize_plugin_source("git://github.com/example/plugin.git")
+        == "https://github.com/example/plugin.git"
+    )
+    assert (
+        _canonicalize_plugin_source("https://github.com/example/plugin.git")
+        == "https://github.com/example/plugin.git"
+    )
+    assert (
+        _canonicalize_plugin_source("git@github.com:example/plugin.git")
+        == "git@github.com:example/plugin.git"
+    )
+    assert _canonicalize_plugin_source("/local/path") == "/local/path"
+
+
 @pytest.mark.parametrize(
     "name",
     [

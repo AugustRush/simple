@@ -425,9 +425,17 @@ Shell sandbox modes:
 
 | Mode | Reads | Writes | Notes |
 |---|---|---|---|
-| `restricted` | System dirs + workspace/output only | output/scratch/approved scope | Most locked down |
-| `read_all` (default) | **Whole machine** | output/scratch/approved scope | Local tooling (miniconda, caches) works; writes stay safe |
+| `restricted` | System dirs + workspace/output only | output/scratch + user cache/state dirs + approved scope | Most locked down |
+| `read_all` (default) | **Whole machine** | output/scratch + user cache/state dirs + approved scope | Local tooling (miniconda, npm, pip) works; documents stay read-only |
 | `none` | Everything | Everything | Danger-full-access: no OS sandbox, GPU/Metal reachable. **Only valid with `shell_level: full`** |
+
+Writes are allowed by category, not per tool: the sandbox lets the agent
+persist tool state under the user cache/state directories (`~/.cache`,
+`~/.npm`, `~/.local`, `~/.config`, `~/Library/Caches`) so npm installs,
+HuggingFace downloads, pip/uv caches and MCP servers work without carving
+out a special case for each tool. Home documents and sensitive dotfiles
+(`~/.ssh`, `~/.aws`, `~/.gitconfig`, …) remain read-only, as does the
+workspace unless a `write_scope` explicitly allows it.
 
 Device/service access (Metal/IOKit — GPU, local ML) is open by default inside
 the sandbox, the same posture the profile already takes for network.  The

@@ -24,6 +24,7 @@ def _request(
     write_scope=(),
     mode="read_all",
     devices=True,
+    home_dir=None,
 ):
     workspace = tmp_path / "workspace"
     output = tmp_path / "output"
@@ -36,6 +37,7 @@ def _request(
         scratch_dir=output / "sandbox" / "tmp",
         mode=mode,
         devices=devices,
+        home_dir=home_dir or (tmp_path / "home"),
     )
 
 
@@ -158,6 +160,36 @@ def test_build_sandbox_command_fails_closed_without_adapter(monkeypatch, tmp_pat
         build_sandbox_command(_request(tmp_path))
 
 
+def test_profile_allows_home_cache_and_config_writes_by_default(tmp_path):
+    """Cache/state dirs are writable as a category, not per-tool."""
+    request = _request(tmp_path)
+    profile = _macos_seatbelt_profile(request)
+    home = request.home_dir
+
+    for sub in (".cache", ".npm", ".local", ".config", "Library/Caches"):
+        literal = str(home / sub)
+        assert f'file-write* (subpath "{literal}")' in profile
+        assert f'file-read* (subpath "{literal}")' in profile
+
+    # Home itself, user documents and sensitive dotfiles stay read-only.
+    assert f'file-write* (subpath "{home}")' not in profile
+    ssh_dir = home / ".ssh"
+    documents = home / "Documents"
+    assert f'file-write* (subpath "{ssh_dir}")' not in profile
+    assert f'file-write* (subpath "{documents}")' not in profile
+
+
+def test_profile_cache_rules_use_request_home_dir(tmp_path):
+    home = tmp_path / "other-home"
+    request = _request(tmp_path, home_dir=home)
+    profile = _macos_seatbelt_profile(request)
+
+    npm_dir = home / ".npm"
+    real_npm_dir = Path.home() / ".npm"
+    assert f'file-write* (subpath "{npm_dir}")' in profile
+    assert f'file-write* (subpath "{real_npm_dir}")' not in profile
+
+
 # ── Real sandbox enforcement (macOS sandbox-exec) ──────────────────────────
 
 
@@ -204,6 +236,32 @@ def test_sandbox_allows_output_writes(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert target.exists()
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_allows_writes_to_user_cache_dirs(tmp_path):
+    request = _request(tmp_path, home_dir=tmp_path / "home")
+    cache = request.home_dir / ".npm"
+    cache.mkdir(parents=True)
+    target = cache / "cache-write-test"
+
+    result = _run_in_sandbox(request, f"touch {target}")
+
+    assert result.returncode == 0, result.stderr
+    assert target.exists()
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_keeps_home_documents_read_only(tmp_path):
+    request = _request(tmp_path, home_dir=tmp_path / "home")
+    documents = request.home_dir / "Documents"
+    documents.mkdir(parents=True)
+    target = documents / "secret.txt"
+
+    result = _run_in_sandbox(request, f"touch {target}")
+
+    assert result.returncode != 0
+    assert not target.exists()
 
 
 @_NEEDS_SANDBOX
