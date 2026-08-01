@@ -131,6 +131,7 @@ DEFAULT_CONFIG: dict = {
     # ── Shell permission level (default for every session) ───────────────
     "permissions": {
         "shell_level": "ask",
+        "shell_sandbox": "read_all",
     },
 }
 
@@ -283,6 +284,19 @@ def _validate_config(cfg: dict) -> list[str]:
                 warnings.append(
                     f"'permissions.shell_level' must be one of "
                     f"{', '.join(PERMISSION_LEVELS)}, got '{shell_level}'"
+                )
+            from agent.security.filesystem_sandbox import SANDBOX_MODES
+
+            sandbox_mode = permissions_cfg.get("shell_sandbox", "read_all")
+            if sandbox_mode not in SANDBOX_MODES:
+                warnings.append(
+                    f"'permissions.shell_sandbox' must be one of "
+                    f"{', '.join(SANDBOX_MODES)}, got '{sandbox_mode}'"
+                )
+            elif sandbox_mode == "none" and shell_level != "full":
+                warnings.append(
+                    "'permissions.shell_sandbox' 'none' requires "
+                    "'permissions.shell_level' 'full'; falling back to 'read_all'"
                 )
 
     # ── Top-level unknown keys ────────────────────────────────────────────

@@ -191,3 +191,23 @@ Unchanged: `shell_blocked_commands` blocks at every level; cwd escapes and
 command substitution stay non-confirmable; parse failures fail closed.  The
 absolute-path recovery hint was removed with its branch (absolute paths are
 now medium-risk and auto-allowed).
+
+## P8: Linked Permission Levels and Sandbox Modes (follow-up)
+
+`full` previously only skipped confirmation; the OS seatbelt sandbox still
+blocked home-directory reads and GPU/Metal, which confused "I granted full
+access".  Permission level and sandbox are now linked:
+
+- `permissions.shell_sandbox` (default `read_all`): `restricted` = reads
+  limited to system dirs + workspace/output; `read_all` = reads open on the
+  whole machine (writes still scoped to output/scratch/approved scope);
+  `none` = no `sandbox-exec` at all (danger-full-access, GPU/Metal
+  reachable).
+- `none` is only honored when the effective permission level is `full`;
+  config validation warns otherwise and `_shell` falls back to `read_all`
+  at runtime.  Session overrides: `/permissions sandbox <mode>` and
+  `/permissions default sandbox <mode>`; `/permissions` status shows both
+  the level and the sandbox mode.
+- Unsandboxed runs skip file-policy gating and workspace artifact
+  relocation; they keep `shell_blocked_commands`, cwd-escape, command
+  substitution, and parse-fail-closed guards.

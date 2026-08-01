@@ -22,6 +22,7 @@ def _request(
     workspace_read=True,
     workspace_write=False,
     write_scope=(),
+    mode="read_all",
 ):
     workspace = tmp_path / "workspace"
     output = tmp_path / "output"
@@ -32,6 +33,7 @@ def _request(
         workspace_write=workspace_write,
         write_scope=tuple(write_scope),
         scratch_dir=output / "sandbox" / "tmp",
+        mode=mode,
     )
 
 
@@ -75,6 +77,30 @@ def test_profile_denies_internal_bookkeeping(tmp_path):
 
     assert f'(deny file-write* (subpath "{internal}"))' in profile
     assert f'(deny file-read* (subpath "{internal}"))' in profile
+
+
+def test_read_all_mode_opens_reads_but_keeps_writes_scoped(tmp_path):
+    request = _request(tmp_path, mode="read_all")
+    profile = _macos_seatbelt_profile(request)
+
+    assert '(allow file-read* (subpath "/"))' in profile
+    assert f'file-write* (subpath "{request.output_root}")' in profile
+    assert f'file-write* (subpath "{request.workspace_root}")' not in profile
+
+
+def test_restricted_mode_has_no_read_all_rule(tmp_path):
+    request = _request(tmp_path, mode="restricted")
+    profile = _macos_seatbelt_profile(request)
+
+    assert '(allow file-read* (subpath "/"))' not in profile
+
+
+def test_none_mode_builds_unsandboxed_command(tmp_path):
+    request = _request(tmp_path, mode="none")
+    sandbox = build_sandbox_command(request)
+
+    assert sandbox.argv_prefix == ()
+    assert sandbox.env_updates == {}
 
 
 def test_profile_keeps_scratch_writable(tmp_path):
@@ -172,8 +198,36 @@ def test_sandbox_allows_workspace_reads(tmp_path):
 
 
 @_NEEDS_SANDBOX
+def test_sandbox_read_all_mode_reads_outside_workspace(tmp_path):
+    request = _request(tmp_path, mode="read_all")
+    request.output_root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("home-secret", encoding="utf-8")
+
+    result = _run_in_sandbox(request, f"cat {outside}")
+
+    assert result.returncode == 0, result.stderr
+    assert "home-secret" in result.stdout
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_restricted_mode_blocks_outside_reads(tmp_path):
+    request = _request(tmp_path, mode="restricted")
+    request.output_root.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("home-secret", encoding="utf-8")
+
+    result = _run_in_sandbox(request, f"cat {outside}")
+
+    assert result.returncode != 0
+    assert "home-secret" not in result.stdout
+
+
+@_NEEDS_SANDBOX
 def test_sandbox_denies_workspace_reads_when_read_disabled(tmp_path):
-    request = _request(tmp_path, workspace_read=False)
+    # "workspace reads disabled" is a restricted-mode policy; read_all mode
+    # intentionally opens reads everywhere, so this must use restricted.
+    request = _request(tmp_path, workspace_read=False, mode="restricted")
     request.workspace_root.mkdir()
     source = request.workspace_root / "a.txt"
     source.write_text("secret", encoding="utf-8")

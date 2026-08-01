@@ -7,8 +7,19 @@ the workspace according to its read/write rules, keeps ``output_dir`` (minus
 internal bookkeeping) writable, and denies writes everywhere else on the
 host.
 
-On a platform where an enforcing adapter cannot be constructed, restricted
-shell capability fails closed instead of running unsandboxed.
+Three sandbox modes link to the permission levels:
+
+- ``restricted``: reads limited to platform runtimes plus the workspace and
+  output dirs; writes limited to output/scratch/approved write scope.
+- ``read_all`` (default): the same write boundary, but reads are allowed
+  everywhere on the host (``~/.config``, home caches, miniconda, …) so
+  local tooling works without granting write access.
+- ``none`` (danger-full-access): no OS sandbox at all; the child sees the
+  whole machine including GPU/IOKit.  Only meaningful with permission level
+  ``full``; the caller enforces that linkage.
+
+On a platform where an enforcing adapter cannot be constructed, sandboxed
+modes fail closed instead of running unsandboxed.
 """
 
 from __future__ import annotations
@@ -26,6 +37,16 @@ class SandboxUnavailableError(RuntimeError):
     """Raised when no enforcing filesystem sandbox can be constructed."""
 
 
+SANDBOX_MODE_RESTRICTED = "restricted"
+SANDBOX_MODE_READ_ALL = "read_all"
+SANDBOX_MODE_NONE = "none"
+SANDBOX_MODES: tuple[str, ...] = (
+    SANDBOX_MODE_RESTRICTED,
+    SANDBOX_MODE_READ_ALL,
+    SANDBOX_MODE_NONE,
+)
+
+
 @dataclass(frozen=True)
 class ShellSandboxRequest:
     """Immutable sandbox request derived from the active file policy."""
@@ -36,6 +57,7 @@ class ShellSandboxRequest:
     workspace_write: bool
     write_scope: tuple[str, ...]
     scratch_dir: Path
+    mode: str = SANDBOX_MODE_READ_ALL
 
 
 @dataclass(frozen=True)
@@ -61,6 +83,12 @@ def build_sandbox_command(
     request: ShellSandboxRequest,
 ) -> SandboxCommand:
     """Build the command wrapper for ``request`` or fail closed."""
+    if request.mode == SANDBOX_MODE_NONE:
+        return SandboxCommand(
+            argv_prefix=(),
+            env_updates={},
+            platform="none",
+        )
     support = detect_sandbox_support()
     if support == "darwin-sandbox-exec":
         return _build_macos_sandbox_command(request)
@@ -134,6 +162,9 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
         "(allow file-read* (subpath \"/private/var/select\"))",
         "(allow file-read* (subpath \"/dev\"))",
     ]
+    if request.mode == SANDBOX_MODE_READ_ALL:
+        # Convenience default: reads are open everywhere, writes stay scoped.
+        lines.append('(allow file-read* (subpath "/"))')
     if request.workspace_read:
         lines.append(
             f'(allow file-read* (subpath "{_seatbelt_literal(workspace)}"))'

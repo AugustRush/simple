@@ -914,6 +914,14 @@ def _config_shell_permission_level() -> str:
     return str(permissions.get("shell_level", "ask") or "ask")
 
 
+def _config_shell_sandbox_mode() -> str:
+    import agent as agent_module
+
+    cfg, _first_run = agent_module.load_config()
+    permissions = cfg.get("permissions") or {}
+    return str(permissions.get("shell_sandbox", "read_all") or "read_all")
+
+
 def _save_config_shell_permission_level(level: str) -> None:
     import agent as agent_module
 
@@ -926,54 +934,160 @@ def _save_config_shell_permission_level(level: str) -> None:
     agent_module.save_config(cfg)
 
 
+def _save_config_shell_sandbox_mode(mode: str) -> None:
+    import agent as agent_module
+
+    cfg, _first_run = agent_module.load_config()
+    permissions = cfg.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        cfg["permissions"] = permissions
+    permissions["shell_sandbox"] = mode
+    agent_module.save_config(cfg)
+
+
+def _sandbox_mode_label(mode: str) -> str:
+    labels = {
+        "restricted": "仅系统目录 + workspace/output 可读，写限 output",
+        "read_all": "全盘可读，写仍限 output/workspace 授权范围",
+        "none": "无沙箱（危险：整机包括 GPU 均可访问）",
+    }
+    return labels.get(mode, mode)
+
+
 async def _permissions_handler(
     request: CommandRequest, context: CommandContext
 ) -> CommandResult:
     from agent.security.shell import (
         PERMISSION_LEVELS,
         ShellAuthorizationScope,
+        shell_effective_permission_level,
         shell_session_permission_get,
         shell_session_permission_set,
+        shell_session_sandbox_get,
+        shell_session_sandbox_set,
     )
+    from agent.security.filesystem_sandbox import SANDBOX_MODES
+
+    registry = context.components.get("registry")
 
     scope = ShellAuthorizationScope(
         context.session_id,
         context.channel_name,
         str(context.metadata.get("user_id") or ""),
     )
+    config_level = _config_shell_permission_level()
+    config_sandbox = _config_shell_sandbox_mode()
+    session_level = shell_session_permission_get(scope)
+    effective_level = session_level or config_level
+    session_sandbox = shell_session_sandbox_get(scope)
+    effective_sandbox = session_sandbox or config_sandbox
     args = request.args.strip()
     if not args:
-        config_level = _config_shell_permission_level()
-        session_level = shell_session_permission_get(scope)
-        effective = session_level or config_level
         lines = ["## Shell 权限等级", ""]
         for level in PERMISSION_LEVELS:
-            marker = "●" if level == effective else "○"
+            marker = "●" if level == effective_level else "○"
             lines.append(f"- {marker} `{level}`：{_permission_level_label(level)}")
+        lines.append("")
+        lines.append("## Shell 沙箱模式")
+        for mode in SANDBOX_MODES:
+            marker = "●" if mode == effective_sandbox else "○"
+            lines.append(f"- {marker} `{mode}`：{_sandbox_mode_label(mode)}")
         if session_level:
             lines.append("")
             lines.append(
-                f"当前会话覆盖：`{session_level}`（配置默认：`{config_level}`）"
+                f"会话覆盖：等级 `{session_level}`"
+                f"（配置默认 `{config_level}`）"
             )
-        else:
+        if session_sandbox:
             lines.append("")
             lines.append(
-                f"当前生效：`{effective}`（配置默认）。"
-                "用 `/permissions <level>` 切换本会话，"
-                "`/permissions default <level>` 持久化默认值。"
+                f"会话覆盖：沙箱 `{session_sandbox}`"
+                f"（配置默认：`{config_sandbox}`）"
             )
+        lines.append("")
+        lines.append(
+            f"当前生效：`{effective_level}` / `{effective_sandbox}`。"
+            "用 `/permissions <level>`、`/permissions sandbox <mode>` "
+            "切换本会话；`/permissions default <level|sandbox <mode>>` "
+            "持久化默认值。"
+        )
         return CommandResult(response_text="\n".join(lines))
 
     parts = args.split(maxsplit=1)
-    if parts[0].casefold() == "default":
-        if len(parts) != 2 or parts[1].strip().casefold() not in PERMISSION_LEVELS:
+    first = parts[0].casefold()
+    if first == "sandbox":
+        mode = parts[1].strip().casefold() if len(parts) == 2 else ""
+        if not mode:
+            return CommandResult(
+                response_text=(
+                    f"当前沙箱模式：`{effective_sandbox}`"
+                    f"（配置默认 `{config_sandbox}`"
+                    + (f"，会话覆盖 `{session_sandbox}`" if session_sandbox else "")
+                    + "）。"
+                )
+            )
+        if mode not in SANDBOX_MODES:
+            return _error(
+                f"Usage: /permissions sandbox {'|'.join(SANDBOX_MODES)}"
+            )
+        if mode == "none" and shell_effective_permission_level(
+            scope, config_level
+        ) != "full":
+            return _error(
+                "沙箱模式 `none` 需要权限等级 `full`；请先设置 "
+                "/permissions full（或 /permissions default full）。"
+            )
+        shell_session_sandbox_set(scope, mode)
+        return CommandResult(
+            response_text=(
+                f"会话沙箱模式已设为 `{mode}`（本会话生效，"
+                f"{_sandbox_mode_label(mode)}）。"
+            )
+        )
+
+    if first == "default":
+        if len(parts) != 2:
             return _error(
                 "Usage: /permissions default "
-                f"{'|'.join(PERMISSION_LEVELS)}"
+                f"{'|'.join(PERMISSION_LEVELS)} | sandbox "
+                f"{'|'.join(SANDBOX_MODES)}"
             )
-        level = parts[1].strip().casefold()
+        default_args = parts[1].split(maxsplit=1)
+        if default_args[0].casefold() == "sandbox":
+            if len(default_args) != 2 or default_args[1].strip().casefold() not in (
+                SANDBOX_MODES
+            ):
+                return _error(
+                    "Usage: /permissions default sandbox "
+                    f"{'|'.join(SANDBOX_MODES)}"
+                )
+            mode = default_args[1].strip().casefold()
+            if mode == "none" and config_level != "full":
+                return _error(
+                    "沙箱模式 `none` 需要权限等级 `full`；请先设置 "
+                    "/permissions default full。"
+                )
+            _save_config_shell_sandbox_mode(mode)
+            if registry is not None:
+                try:
+                    registry.set_context("shell_sandbox_mode", mode)
+                except Exception:
+                    pass
+            return CommandResult(
+                response_text=(
+                    f"已把默认沙箱模式持久化为 `{mode}`（重启后保留，"
+                    "子代理继承该默认值）。"
+                )
+            )
+        level = default_args[0].strip().casefold()
+        if level not in PERMISSION_LEVELS:
+            return _error(
+                "Usage: /permissions default "
+                f"{'|'.join(PERMISSION_LEVELS)} | sandbox "
+                f"{'|'.join(SANDBOX_MODES)}"
+            )
         _save_config_shell_permission_level(level)
-        registry = context.components.get("registry")
         if registry is not None:
             try:
                 registry.set_context("shell_permission_level", level)
@@ -1112,8 +1226,8 @@ def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]
         CommandDescriptor(
             "permissions",
             _permissions_handler,
-            usage="/permissions [level|default <level>]",
-            description="Show or set the shell permission level (ask/medium/high/full)",
+            usage="/permissions [level|sandbox <mode>|default <level|sandbox <mode>>]",
+            description="Show or set shell permission level and sandbox mode",
             concurrency="anytime",
         ),
         CommandDescriptor(

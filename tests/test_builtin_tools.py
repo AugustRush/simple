@@ -1065,6 +1065,86 @@ def test_shell_permission_level_context_skips_confirmation(tmp_path, monkeypatch
     assert spawned
 
 
+def _fake_proc_spawn(monkeypatch):
+    spawned: list = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        spawned.append(args)
+        return FakeProc()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    return spawned
+
+
+def test_unsandboxed_full_access_skips_sandbox_exec(tmp_path, monkeypatch):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("shell_permission_level", "full")
+    registry.set_context("shell_sandbox_mode", "none")
+    spawned = _fake_proc_spawn(monkeypatch)
+
+    result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+
+    assert result["ok"] is True
+    assert spawned
+    assert spawned[0][0] == "/bin/sh"
+    assert "sandbox-exec" not in spawned[0][0]
+
+
+def test_unsandboxed_without_full_level_falls_back_to_sandbox(
+    tmp_path, monkeypatch
+):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("shell_permission_level", "ask")
+    registry.set_context("shell_sandbox_mode", "none")
+    spawned = _fake_proc_spawn(monkeypatch)
+
+    result = asyncio.run(tools._shell("mv a b", timeout=1))
+
+    assert result["ok"] is True
+    assert spawned
+    assert spawned[0][0].endswith("sandbox-exec")
+
+
+def test_session_sandbox_override_unsandboxes(tmp_path, monkeypatch):
+    from agent.core.agent import AgentContext, _active_agent_context
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_allowlist_clear,
+        shell_session_sandbox_set,
+    )
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("shell_permission_level", "full")
+    scope = ShellAuthorizationScope("sandbox-override-test", "cli", "")
+    shell_session_sandbox_set(scope, "none")
+    spawned = _fake_proc_spawn(monkeypatch)
+    ctx = AgentContext(
+        metadata={
+            "session_id": "sandbox-override-test",
+            "channel_name": "cli",
+            "user_id": "",
+        }
+    )
+    active = _active_agent_context.set(ctx)
+    try:
+        result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+    finally:
+        _active_agent_context.reset(active)
+        shell_session_allowlist_clear()
+
+    assert result["ok"] is True
+    assert spawned
+    assert spawned[0][0] == "/bin/sh"
+
+
 def test_transcribe_audio_rejects_shell_control_in_template(tmp_path):
     tools, reg, workspace = make_builtin_tools(tmp_path)
     audio = workspace / "sample.wav"

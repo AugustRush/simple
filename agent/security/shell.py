@@ -205,6 +205,7 @@ _session_allowlist: dict[tuple[ShellAuthorizationScope, str], datetime] = {}
 _pending_tokens: dict[str, PendingShellConfirmation] = {}
 _session_auto_approve: set[ShellAuthorizationScope] = set()
 _session_permission_levels: dict[ShellAuthorizationScope, str] = {}
+_session_sandbox_modes: dict[ShellAuthorizationScope, str] = {}
 
 
 def _authorization_scope(
@@ -245,6 +246,7 @@ def shell_session_allowlist_clear() -> None:
     _pending_tokens.clear()
     _session_auto_approve.clear()
     _session_permission_levels.clear()
+    _session_sandbox_modes.clear()
 
 
 def shell_session_auto_approve_enable(scope: ShellAuthorizationScope) -> None:
@@ -286,6 +288,32 @@ def _effective_permission_level(
         return session_override
     value = str(permission_level or "ask").strip().casefold()
     return value if value in PERMISSION_LEVELS else "ask"
+
+
+def shell_effective_permission_level(
+    scope: ShellAuthorizationScope,
+    permission_level: Optional[str] = None,
+) -> str:
+    """Return the effective level for *scope* (session override wins)."""
+    return _effective_permission_level(scope, permission_level)
+
+
+def shell_session_sandbox_set(
+    scope: ShellAuthorizationScope, mode: str
+) -> None:
+    """Override the shell sandbox mode for one session/channel/user scope."""
+    from agent.security.filesystem_sandbox import SANDBOX_MODES
+
+    normalized = str(mode or "").strip().casefold()
+    if normalized in SANDBOX_MODES:
+        _session_sandbox_modes[scope] = normalized
+    else:
+        _session_sandbox_modes.pop(scope, None)
+
+
+def shell_session_sandbox_get(scope: ShellAuthorizationScope) -> str:
+    """Return the session sandbox override ("" = config default applies)."""
+    return _session_sandbox_modes.get(scope, "")
 
 
 def shell_session_allowlist_contains(

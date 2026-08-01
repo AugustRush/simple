@@ -22,6 +22,7 @@ from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
 from agent.security.network import fetch_public_http_url
 from agent.security.filesystem_sandbox import (
+    SANDBOX_MODE_NONE,
     SandboxUnavailableError,
     ShellSandboxRequest,
     build_sandbox_command,
@@ -1451,7 +1452,11 @@ class BuiltinTools:
         import agent as agent_module
 
         from agent.core.agent import _active_agent_context
-        from agent.security.shell import ShellAuthorizationScope
+        from agent.security.shell import (
+            ShellAuthorizationScope,
+            shell_effective_permission_level,
+            shell_session_sandbox_get,
+        )
 
         active_context = _active_agent_context.get()
         metadata = active_context.metadata if active_context is not None else {}
@@ -1460,6 +1465,21 @@ class BuiltinTools:
             str(metadata.get("channel_name") or "cli"),
             str(metadata.get("user_id") or ""),
         )
+        # Sandbox mode is linked to the permission level: an unsandboxed
+        # (danger-full-access) run is only honored when the effective level
+        # is "full"; otherwise it fails safe back to the read-all profile.
+        sandbox_mode = str(
+            self.registry.get_context("shell_sandbox_mode") or "read_all"
+        )
+        session_sandbox = shell_session_sandbox_get(authorization_scope)
+        if session_sandbox:
+            sandbox_mode = session_sandbox
+        effective_level = shell_effective_permission_level(
+            authorization_scope, permission_level
+        )
+        if sandbox_mode == SANDBOX_MODE_NONE and effective_level != "full":
+            sandbox_mode = "read_all"
+        unsandboxed = sandbox_mode == SANDBOX_MODE_NONE
 
         output_dir = self._process_output_dir()
         sandbox_dir = self._sandbox_dir()
@@ -1522,30 +1542,39 @@ class BuiltinTools:
         resolved_cwd = sandbox_dir
         if cwd:
             resolved_cwd, _root_kind = self._resolve_output_path(cwd)
-        if not workspace_read and self._path_is_inside_workspace(resolved_cwd):
-            return self._error(
-                "Workspace cwd is not allowed when workspace reads are disabled",
-                command=command,
-                sandbox_unavailable=True,
-            )
-        try:
-            scratch_dir = new_scratch_dir(output_dir)
-            sandbox = build_sandbox_command(
-                ShellSandboxRequest(
-                    workspace_root=self.workspace_root,
-                    output_root=output_dir,
-                    workspace_read=workspace_read,
-                    workspace_write=workspace_write,
-                    write_scope=write_scope,
-                    scratch_dir=scratch_dir,
+        sandbox = None
+        if unsandboxed:
+            # Danger-full-access: no OS sandbox, no file-policy gating, and no
+            # artifact relocation — the child owns the whole machine.
+            workspace_before = None
+        else:
+            if not workspace_read and self._path_is_inside_workspace(
+                resolved_cwd
+            ):
+                return self._error(
+                    "Workspace cwd is not allowed when workspace reads are disabled",
+                    command=command,
+                    sandbox_unavailable=True,
                 )
-            )
-        except SandboxUnavailableError as exc:
-            return self._error(
-                str(exc),
-                command=command,
-                sandbox_unavailable=True,
-            )
+            try:
+                scratch_dir = new_scratch_dir(output_dir)
+                sandbox = build_sandbox_command(
+                    ShellSandboxRequest(
+                        workspace_root=self.workspace_root,
+                        output_root=output_dir,
+                        workspace_read=workspace_read,
+                        workspace_write=workspace_write,
+                        write_scope=write_scope,
+                        scratch_dir=scratch_dir,
+                        mode=sandbox_mode,
+                    )
+                )
+            except SandboxUnavailableError as exc:
+                return self._error(
+                    str(exc),
+                    command=command,
+                    sandbox_unavailable=True,
+                )
 
         proc = None
         try:
@@ -1553,12 +1582,15 @@ class BuiltinTools:
             env["AGENT_OUTPUT_DIR"] = str(output_dir)
             env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
             env["AGENT_SANDBOX_DIR"] = str(sandbox_dir)
-            env.update(sandbox.env_updates)
+            if sandbox is not None:
+                env.update(sandbox.env_updates)
             workspace_before: set[Path] | None = None
-            if self._path_is_inside_workspace(resolved_cwd):
+            if sandbox is not None and self._path_is_inside_workspace(
+                resolved_cwd
+            ):
                 workspace_before = self._workspace_file_snapshot()
             proc = await asyncio.create_subprocess_exec(
-                *sandbox.argv_prefix,
+                *(sandbox.argv_prefix if sandbox is not None else ()),
                 "/bin/sh",
                 "-c",
                 command,

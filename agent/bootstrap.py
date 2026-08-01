@@ -266,6 +266,13 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
             (cfg.get("permissions") or {}).get("shell_level", "ask") or "ask"
         ),
     )
+    registry.set_context(
+        "shell_sandbox_mode",
+        str(
+            (cfg.get("permissions") or {}).get("shell_sandbox", "read_all")
+            or "read_all"
+        ),
+    )
     audio_cfg = cfg.get("audio", {})
     audio_transcription_command = ""
     if isinstance(audio_cfg, dict):

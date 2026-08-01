@@ -647,3 +647,36 @@ def test_extra_blocked_blacklist_survives_all_permission_levels():
         )
         assert result.allowed is False
         assert "blocked by configuration" in result.reason
+
+
+def test_effective_permission_level_helper_prefers_session_override():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_effective_permission_level,
+        shell_session_permission_set,
+    )
+
+    scope = ShellAuthorizationScope("session-1", "feishu", "user-1")
+    assert shell_effective_permission_level(scope, "ask") == "ask"
+
+    shell_session_permission_set(scope, "full")
+    assert shell_effective_permission_level(scope, "ask") == "full"
+
+
+def test_session_sandbox_override_is_scoped_and_validated():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_sandbox_get,
+        shell_session_sandbox_set,
+    )
+
+    scope = ShellAuthorizationScope("session-1", "feishu", "user-1")
+    other = ShellAuthorizationScope("session-2", "feishu", "user-1")
+
+    assert shell_session_sandbox_get(scope) == ""
+    shell_session_sandbox_set(scope, "none")
+    assert shell_session_sandbox_get(scope) == "none"
+    assert shell_session_sandbox_get(other) == ""
+
+    shell_session_sandbox_set(scope, "bogus")
+    assert shell_session_sandbox_get(scope) == ""

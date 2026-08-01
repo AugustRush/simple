@@ -1225,6 +1225,101 @@ def test_config_validation_accepts_only_known_permission_levels():
     assert _validate_config({"permissions": {"shell_level": "full"}}) == []
 
 
+def test_permissions_status_shows_sandbox_mode(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    router = _builtin_router()
+
+    result = _run_builtin(router, "/permissions")
+
+    assert "沙箱" in result.response_text
+    assert "read_all" in result.response_text
+
+
+def test_permissions_sandbox_command_sets_session_override():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_sandbox_get,
+    )
+
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+    _run_builtin(
+        router,
+        "/permissions full",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+
+    result = _run_builtin(
+        router,
+        "/permissions sandbox none",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+
+    assert "none" in result.response_text
+    assert shell_session_sandbox_get(scope) == "none"
+
+
+def test_permissions_sandbox_none_requires_full():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_sandbox_get,
+    )
+
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+
+    result = _run_builtin(
+        router,
+        "/permissions sandbox none",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+
+    assert "full" in (result.response_text or "")
+    assert shell_session_sandbox_get(scope) == ""
+
+
+def test_permissions_persists_default_sandbox(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    router = _builtin_router()
+
+    rejected = _run_builtin(router, "/permissions default sandbox none")
+    assert "full" in (rejected.response_text or "")
+
+    _run_builtin(router, "/permissions default full")
+    result = _run_builtin(router, "/permissions default sandbox none")
+
+    assert "none" in result.response_text
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_level"] == "full"
+    assert cfg["permissions"]["shell_sandbox"] == "none"
+
+
+def test_config_validation_links_sandbox_none_to_full_level():
+    from agent.config import _validate_config
+
+    warnings = _validate_config(
+        {"permissions": {"shell_level": "ask", "shell_sandbox": "none"}}
+    )
+    assert any("shell_sandbox" in warning and "requires" in warning for warning in warnings)
+
+    warnings = _validate_config(
+        {"permissions": {"shell_level": "full", "shell_sandbox": "bogus"}}
+    )
+    assert any("shell_sandbox" in warning for warning in warnings)
+
+    assert _validate_config(
+        {"permissions": {"shell_level": "full", "shell_sandbox": "none"}}
+    ) == []
+
+
 def test_builtin_ralph_maps_start_list_resume_and_parse_errors():
     from agent.ralph import (
         RalphRunResult,

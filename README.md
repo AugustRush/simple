@@ -357,6 +357,7 @@ Key config sections:
 | `output_dir` | Override default `~/.agent/output` |
 | `file_access` | Startup-only workspace read/write policy plus resource limits for file tools (see [File access](#file-access)) |
 | `permissions.shell_level` | Default shell permission level: `ask`, `medium`, `high`, or `full` (see [Shell permissions](#shell-permissions)) |
+| `permissions.shell_sandbox` | OS sandbox mode: `restricted`, `read_all` (default), or `none` (danger-full-access, `full` level only) |
 | `shell_allowed_commands` | Persistent shell allowlist that skips confirmation (see [Shell permissions](#shell-permissions)) |
 | `assistant_identity` | Deterministic assistant name/role for fact recall |
 | `system_prompt_file` | Load custom system prompt from `.md` or `.txt` |
@@ -408,6 +409,9 @@ destructive commands/options (`mkfs`, `dd`, `shutdown`, `find -delete`),
 shell operators (`;`, `|`, `&&`, redirection), and pipe-to-shell patterns —
 ask the human, and they become runnable after approval.
 
+The permission level and the OS sandbox are linked: the level decides what
+asks for confirmation, and the sandbox decides what the command may touch.
+
 Permission levels (most → least restrictive):
 
 | Level | Low/medium risk | High-risk commands/options | Operators/patterns |
@@ -416,6 +420,14 @@ Permission levels (most → least restrictive):
 | `medium` | auto | auto | confirm |
 | `high` / `full` | auto | auto | auto |
 
+Shell sandbox modes:
+
+| Mode | Reads | Writes | Notes |
+|---|---|---|---|
+| `restricted` | System dirs + workspace/output only | output/scratch/approved scope | Most locked down |
+| `read_all` (default) | **Whole machine** | output/scratch/approved scope | Local tooling (miniconda, caches) works; writes stay safe |
+| `none` | Everything | Everything | Danger-full-access: no OS sandbox, GPU/Metal reachable. **Only valid with `shell_level: full`** |
+
 Runtime commands:
 
 | Command | Effect |
@@ -423,6 +435,8 @@ Runtime commands:
 | `/permissions` | Show the effective level and its description |
 | `/permissions <level>` | Override the level for this session only |
 | `/permissions default <level>` | Persist the config default (applies immediately and after restart) |
+| `/permissions sandbox <mode>` | Override the sandbox mode for this session (`none` requires `full`) |
+| `/permissions default sandbox <mode>` | Persist the default sandbox mode |
 | `/auto-approve on\|off\|status` | Session shortcut for `medium` / `ask` |
 | `/allow <command>` | Persistently allow one command (exact string) or command name (all invocations) |
 | `/deny <command>` | Remove an entry from the persistent allowlist |
@@ -437,7 +451,7 @@ Config example:
 
 ```json
 {
-  "permissions": { "shell_level": "ask" },
+  "permissions": { "shell_level": "ask", "shell_sandbox": "read_all" },
   "shell_allowed_commands": ["mkfs /dev/disk0", "osascript"]
 }
 ```
@@ -448,6 +462,22 @@ config default apply to sub-agents spawned later; a session-level
 `/permissions` override applies only to that session. Changes made through
 slash commands take effect immediately; editing `config.json` by hand takes
 effect at the next startup.
+
+For true machine-wide execution (local GPU/MLX workloads, arbitrary home
+directory access), set `"shell_level": "full"` **and**
+`"shell_sandbox": "none"`:
+
+```json
+{
+  "permissions": { "shell_level": "full", "shell_sandbox": "none" }
+}
+```
+
+This disables `sandbox-exec` entirely for shell commands — the agent can then
+read and write anything on the machine, exactly like your own terminal.
+`none` is refused unless the level is `full`, and the `shell_blocked_commands`
+blacklist plus structural guards (cwd escapes, command substitution, parse
+failures) still apply.
 
 Unconditional guards that no level can bypass: the `shell_blocked_commands`
 blacklist, cwd escapes (`cd`/`pushd` inside a command), command substitution
