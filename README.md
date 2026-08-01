@@ -605,6 +605,12 @@ uv run simple memory tidy                # AI-assisted memory reorganization
 Commands are handled by a shared runtime coordinator and work across all
 channels unless marked otherwise.
 
+In the interactive CLI, type `/` and press Enter to open a selection menu of
+the commands available in this channel — pick one by number or filter by
+name. Commands with fixed options (e.g. `/permissions`, `/auto-approve`)
+show a second menu for the argument. While typing a `/`-command, `Tab`
+completes the name from the live command list.
+
 ### Shared (all channels)
 
 | Command | Description |
@@ -635,6 +641,8 @@ channels unless marked otherwise.
 
 | Command | Description |
 |---|---|
+| `/` | Open the interactive command selection menu |
+| `Tab` | Complete the `/`-command currently being typed |
 | `/quit` (`/exit`, `/q`) | Exit the CLI |
 | `Ctrl+C` | Interrupt a blocking operation (force cancel) |
 

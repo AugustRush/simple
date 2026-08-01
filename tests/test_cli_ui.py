@@ -515,3 +515,181 @@ def test_consent_pending_tracks_approval_lock():
         assert _consent_pending() is False
 
     asyncio.run(scenario())
+
+
+def _builtin_cli_router():
+    from agent.commands import CommandRouter, register_builtin_commands
+
+    router = CommandRouter()
+    register_builtin_commands(router)
+    return router
+
+
+async def _run_command_menu(monkeypatch, answers):
+    import agent.cli as cli
+
+    iterator = iter(answers)
+
+    async def fake_prompt(items):
+        return next(iterator)
+
+    monkeypatch.setattr(cli, "_menu_prompt_async", fake_prompt)
+    return await cli._command_menu(_builtin_cli_router())
+
+
+def test_command_menu_selects_argument_by_name(monkeypatch):
+    import asyncio
+
+    result = asyncio.run(
+        _run_command_menu(monkeypatch, ["permissions", "high"])
+    )
+    assert result == "/permissions high"
+
+
+def test_command_menu_auto_approve_argument_menu(monkeypatch):
+    import asyncio
+
+    result = asyncio.run(
+        _run_command_menu(monkeypatch, ["auto-approve", "on"])
+    )
+    assert result == "/auto-approve on"
+
+
+def test_command_menu_filter_auto_selects_single_match(monkeypatch):
+    import asyncio
+
+    result = asyncio.run(
+        _run_command_menu(monkeypatch, ["perm", "sandbox read_all"])
+    )
+    assert result == "/permissions sandbox read_all"
+
+
+def test_command_menu_plain_command_returns_immediately(monkeypatch):
+    import asyncio
+
+    result = asyncio.run(_run_command_menu(monkeypatch, ["tools"]))
+    assert result == "/tools"
+
+
+def test_command_menu_cancel_returns_none(monkeypatch):
+    import asyncio
+
+    assert asyncio.run(_run_command_menu(monkeypatch, [""])) is None
+    assert (
+        asyncio.run(_run_command_menu(monkeypatch, ["permissions", ""]))
+        is None
+    )
+
+
+def test_selection_menu_accepts_numbers_exact_names_and_filters(monkeypatch):
+    import asyncio
+
+    import agent.cli as cli
+
+    items = [
+        ("alpha", "Alpha", "first option"),
+        ("beta", "Beta", "second option"),
+        ("gamma", "Gamma", "third option"),
+    ]
+
+    async def run(answers):
+        iterator = iter(answers)
+
+        async def fake_prompt(current):
+            return next(iterator)
+
+        monkeypatch.setattr(cli, "_menu_prompt_async", fake_prompt)
+        return await cli._select_from_menu("测试菜单", items)
+
+    assert asyncio.run(run(["2"])) == "beta"
+    assert asyncio.run(run(["gamma"])) == "gamma"
+    assert asyncio.run(run(["/alpha"])) == "alpha"
+    assert asyncio.run(run(["third"])) == "gamma"
+    assert asyncio.run(run(["zzz", "3"])) == "gamma"
+
+
+def test_cli_command_completer_lists_only_cli_visible_commands(monkeypatch):
+    import agent.cli as cli
+
+    monkeypatch.setattr(cli, "_cli_router", _builtin_cli_router())
+    completer = cli._cli_command_completer()
+
+    assert completer is not None
+    words = list(completer.words)
+    assert "/permissions" in words
+    assert "/auto-approve" in words
+    assert "/allow" in words
+    assert "/send" not in words
+
+
+def test_interactive_loop_bare_slash_opens_command_menu(monkeypatch, tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+
+    import agent as agent_module
+    import agent.cli as cli_module
+
+    class Agent:
+        api_format = "openai"
+        model = "fake-model"
+        max_tokens = 1024
+        context_window = 4096
+
+    class PluginCatalog:
+        def fire_session_start(self, components):
+            return None
+
+        async def fire_session_end(self, event):
+            return None
+
+    class Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        async def handle(self, turn_input, state, sink):
+            self.calls.append(turn_input.text)
+            return "exit_cli" if turn_input.text == "/quit" else None
+
+    answers = iter(["/", "/quit"])
+
+    async def _fake_input():
+        return next(answers)
+
+    async def _fake_command_menu(router):
+        return "/permissions ask"
+
+    monkeypatch.setattr(cli_module, "_ask_user_input", _fake_input)
+    monkeypatch.setattr(cli_module, "_command_menu", _fake_command_menu)
+    monkeypatch.setattr(cli_module, "_cli_router", None)
+
+    coordinator = Coordinator()
+    components = {
+        "agent": Agent(),
+        "memory": SimpleNamespace(read_index=lambda: ""),
+        "system_prompt": "system",
+        "skill_catalog": object(),
+        "user_tool_catalog": object(),
+        "registry": agent_module.ToolRegistry(),
+        "output_dir": tmp_path / "output",
+        "plugin_catalog": PluginCatalog(),
+        "command_router": _builtin_cli_router(),
+        "command_coordinator_factory": lambda **kwargs: coordinator,
+    }
+    cfg = {
+        "active_provider": "fake",
+        "providers": {
+            "fake": {
+                "api_format": "openai",
+                "default_model": "fake-model",
+                "max_tokens": 1024,
+            }
+        },
+        "memory": {},
+        "orchestration": {},
+        "context": {},
+        "mcp_servers": [],
+    }
+
+    asyncio.run(agent_module._interactive_loop(components, cfg))
+
+    assert coordinator.calls == ["/permissions ask", "/quit"]

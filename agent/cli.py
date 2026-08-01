@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import signal
 import sys
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import typer
 from rich.markdown import Markdown
@@ -18,8 +18,11 @@ from rich.panel import Panel
 from rich.table import Table
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
+from prompt_toolkit.filters.app import has_completions
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
 
 import agent as agent_module
 from agent import shared
@@ -62,6 +65,21 @@ app.add_typer(schedule_app, name="schedule")
 _cli_prompt_session: Optional[PromptSession] = None
 
 
+def _accept_completion_or_submit(event: Any) -> None:
+    """Enter accepts the highlighted completion when a menu is open."""
+    buffer = event.current_buffer
+    if buffer.complete_state is not None:
+        buffer.apply_completion(buffer.complete_state.current_completion)
+        buffer.complete_state = None
+    buffer.validate_and_handle()
+
+
+_CLI_KEY_BINDINGS = KeyBindings()
+_CLI_KEY_BINDINGS.add("enter", filter=has_completions)(
+    _accept_completion_or_submit
+)
+
+
 def _cli_history_path() -> Path:
     """Persistent input history shared across interactive sessions."""
     history = shared.AGENT_HOME / "cli_history"
@@ -75,6 +93,7 @@ def _cli_prompt() -> PromptSession:
     if _cli_prompt_session is None:
         _cli_prompt_session = PromptSession(
             history=FileHistory(_cli_history_path()),
+            key_bindings=_CLI_KEY_BINDINGS,
         )
     return _cli_prompt_session
 
@@ -84,9 +103,201 @@ async def _ask_user_input() -> str:
     return await _cli_prompt().prompt_async(
         HTML("\n<ansigreen>› </ansigreen>"),
         bottom_toolbar=HTML(
-            "<i>Enter 发送 · ↑/↓ 历史 · Ctrl+C 取消 · Ctrl+D 退出</i>"
+            "<i>Enter 发送 · ↑/↓ 历史 · / 命令菜单 · Tab 补全 · "
+            "Ctrl+C 取消 · Ctrl+D 退出</i>"
         ),
+        completer=_cli_command_completer(),
     )
+
+
+# ── Interactive command selection menu ────────────────────────────────
+# Typing "/" at the prompt opens a numbered menu of the slash commands
+# available in the CLI channel.  Commands with fixed argument choices
+# (/permissions, /auto-approve) show a second menu for the argument, so
+# the user never has to remember command syntax.
+
+_cli_router: Optional[CommandRouter] = None
+
+
+def _set_cli_router(router: Optional[CommandRouter]) -> None:
+    """Point CLI input helpers at the live command router."""
+    global _cli_router
+    _cli_router = router
+
+
+def _cli_command_completer() -> Optional[WordCompleter]:
+    """Tab-completion hints for slash commands in the main input line."""
+    router = _cli_router
+    if router is None:
+        return None
+    descriptors = router.visible_descriptors("cli")
+    if not descriptors:
+        return None
+    words = [f"/{descriptor.name}" for descriptor in descriptors]
+    meta = {
+        f"/{descriptor.name}": (
+            (descriptor.usage or f"/{descriptor.name}")
+            + (f" · {descriptor.description}" if descriptor.description else "")
+        )
+        for descriptor in descriptors
+    }
+    return WordCompleter(words, ignore_case=True, meta_dict=meta)
+
+
+_COMMAND_OPTIONS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    "auto-approve": (
+        ("on", "/auto-approve on", "本会话高危命令自动放行（操作符仍需确认）"),
+        ("off", "/auto-approve off", "恢复高风险确认"),
+        ("status", "/auto-approve status", "查看当前会话状态"),
+    ),
+    "permissions": (
+        ("", "/permissions", "查看当前权限等级与沙箱模式"),
+        ("ask", "/permissions ask", "低/中风险自动执行；高风险需确认"),
+        ("medium", "/permissions medium", "高危命令/破坏性选项自动放行；操作符仍确认"),
+        ("high", "/permissions high", "全部自动放行（保留黑名单与结构拦截）"),
+        ("full", "/permissions full", "全部自动放行；配合沙箱 none 可无沙箱"),
+        (
+            "sandbox restricted",
+            "/permissions sandbox restricted",
+            "受限读取 + 输出目录写入",
+        ),
+        (
+            "sandbox read_all",
+            "/permissions sandbox read_all",
+            "全盘读取 + 输出目录写入",
+        ),
+        ("sandbox none", "/permissions sandbox none", "无 OS 沙箱（需 full 等级）"),
+        ("default ask", "/permissions default ask", "持久化默认等级 ask"),
+        ("default medium", "/permissions default medium", "持久化默认等级 medium"),
+        ("default high", "/permissions default high", "持久化默认等级 high"),
+        ("default full", "/permissions default full", "持久化默认等级 full"),
+        (
+            "default sandbox restricted",
+            "/permissions default sandbox restricted",
+            "持久化默认沙箱 restricted",
+        ),
+        (
+            "default sandbox read_all",
+            "/permissions default sandbox read_all",
+            "持久化默认沙箱 read_all",
+        ),
+        (
+            "default sandbox none",
+            "/permissions default sandbox none",
+            "持久化默认沙箱 none",
+        ),
+    ),
+}
+
+
+async def _menu_prompt_async(items: Sequence[tuple[str, str, str]]) -> str:
+    """One menu input line; Enter accepts the highlighted completion."""
+    words = [str(index) for index in range(1, len(items) + 1)]
+    words.extend(value for value, _label, _hint in items)
+    words.extend(label for _value, label, _hint in items)
+    return await PromptSession(key_bindings=_CLI_KEY_BINDINGS).prompt_async(
+        "请选择 › ",
+        completer=WordCompleter(words, ignore_case=True),
+    )
+
+
+def _render_selection_menu(
+    title: str, items: Sequence[tuple[str, str, str]]
+) -> None:
+    table = Table(title=title, border_style="bright_black", pad_edge=False)
+    table.add_column("#", justify="right", style="bold cyan", no_wrap=True)
+    table.add_column("选项", style="bold")
+    table.add_column("说明", style="dim")
+    for index, (_value, label, hint) in enumerate(items, 1):
+        table.add_row(str(index), markup_escape(label), markup_escape(hint))
+    shared.CONSOLE.print(table)
+    shared.CONSOLE.print(
+        "[dim]输入编号或名称快速选择 · 输入关键词过滤 · 空回车取消 · Tab 补全[/dim]"
+    )
+
+
+async def _select_from_menu(
+    title: str,
+    items: Sequence[tuple[str, str, str]],
+) -> Optional[str]:
+    """Interactive numbered selection menu returning the chosen value.
+
+    Accepts a number, an exact option name, or a keyword filter that narrows
+    the list; an empty answer cancels the menu.
+    """
+    current = list(items)
+    while True:
+        _render_selection_menu(title, current)
+        try:
+            answer = (await _menu_prompt_async(current)).strip()
+        except (KeyboardInterrupt, EOFError):
+            return None
+        if not answer:
+            return None
+        if answer.isdigit():
+            index = int(answer)
+            if 1 <= index <= len(current):
+                return current[index - 1][0]
+            shared.CONSOLE.print(
+                f"[red]编号超出范围（1-{len(current)}）[/red]"
+            )
+            continue
+        lowered = answer.casefold().lstrip("/")
+        exact = [
+            item
+            for item in current
+            if item[0].casefold().lstrip("/") == lowered
+            or item[1].casefold().lstrip("/") == lowered
+        ]
+        if len(exact) == 1:
+            return exact[0][0]
+        if len(exact) > 1:
+            shared.CONSOLE.print(
+                "[yellow]匹配到多个选项，请输入编号或更精确的名称[/yellow]"
+            )
+            continue
+        matches = [
+            item
+            for item in current
+            if lowered in item[0].casefold()
+            or lowered in item[1].casefold()
+            or lowered in item[2].casefold()
+        ]
+        if not matches:
+            shared.CONSOLE.print(
+                f"[red]没有匹配「{markup_escape(answer)}」的选项[/red]"
+            )
+            continue
+        if len(matches) == 1:
+            return matches[0][0]
+        current = matches
+        title = f"{title}（匹配 {len(current)} 项）"
+
+
+async def _command_menu(router: CommandRouter) -> Optional[str]:
+    """Select a slash command (and its argument) from an interactive menu."""
+    descriptors = router.visible_descriptors("cli")
+    if not descriptors:
+        return None
+    items = [
+        (
+            descriptor.name,
+            f"/{descriptor.name}",
+            (descriptor.usage or f"/{descriptor.name}")
+            + (f" · {descriptor.description}" if descriptor.description else ""),
+        )
+        for descriptor in descriptors
+    ]
+    command = await _select_from_menu("可用命令", items)
+    if command is None:
+        return None
+    options = _COMMAND_OPTIONS.get(command)
+    if not options:
+        return f"/{command}"
+    option = await _select_from_menu(f"选择 /{command} 参数", list(options))
+    if option is None:
+        return None
+    return f"/{command} {option}".strip()
 
 _INTERACTION_LOGGER_NAMES = (
     "agent.channels.base",
@@ -361,13 +572,13 @@ async def _interactive_loop(components: dict, cfg: dict):
         _sigint_count = 0
         return token
 
+    router = components.get("command_router")
     coordinator_factory = components.get("command_coordinator_factory")
     if callable(coordinator_factory):
         coordinator = coordinator_factory(
             cancel_token_factory=_new_cli_cancel_token,
         )
     else:
-        router = components.get("command_router")
         if router is None:
             router = CommandRouter(skill_catalog=components.get("skill_catalog"))
             register_builtin_commands(router)
@@ -382,6 +593,7 @@ async def _interactive_loop(components: dict, cfg: dict):
             config=cfg,
             cancel_token_factory=_new_cli_cancel_token,
         )
+    _set_cli_router(router)
 
     # Queue orphaned staging files from previous sessions for background
     # recovery. Doing this synchronously would block startup on a network model
@@ -418,6 +630,12 @@ async def _interactive_loop(components: dict, cfg: dict):
                 # future multi-channel concurrency (Telegram, Feishu, …) can
                 # run in the same loop while the human types.
                 user_input = await _ask_user_input()
+                if user_input.strip() == "/" and router is not None:
+                    menu_input = await _command_menu(router)
+                    if menu_input is None:
+                        continue
+                    shared.CONSOLE.print(f"[dim]› {menu_input}[/dim]")
+                    user_input = menu_input
             except (EOFError, KeyboardInterrupt):
                 break
 

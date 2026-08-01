@@ -901,6 +901,47 @@ def test_help_is_generated_from_descriptors_and_filtered_by_scope() -> None:
     assert "/quit" not in feishu_help
 
 
+def test_visible_descriptors_are_scope_filtered_and_sorted() -> None:
+    router = CommandRouter(
+        core_commands=[
+            CommandDescriptor(
+                "help",
+                _noop_handler,
+                usage="/help",
+                description="Show commands",
+            ),
+            CommandDescriptor(
+                "quit",
+                _noop_handler,
+                usage="/quit",
+                description="Exit the CLI",
+                scopes=frozenset({"cli"}),
+            ),
+            CommandDescriptor(
+                "send",
+                _noop_handler,
+                usage="/send <path>",
+                description="Send a file",
+                scopes=frozenset({"feishu"}),
+            ),
+            CommandDescriptor(
+                "allow",
+                _noop_handler,
+                usage="/allow <command>",
+                description="Allow a command",
+            ),
+        ]
+    )
+
+    cli_names = [descriptor.name for descriptor in router.visible_descriptors("cli")]
+    feishu_names = [
+        descriptor.name for descriptor in router.visible_descriptors("feishu")
+    ]
+
+    assert cli_names == ["allow", "help", "quit"]
+    assert feishu_names == ["allow", "help", "send"]
+
+
 def test_help_escapes_external_descriptor_markdown() -> None:
     router = CommandRouter(
         plugin_commands=[

@@ -554,3 +554,24 @@ class CommandRouter:
                 line += f" - {_markdown_inline(descriptor.description)}"
             lines.append(line)
         return "\n".join(lines)
+
+    def visible_descriptors(
+        self, channel_name: str
+    ) -> tuple[CommandDescriptor, ...]:
+        """Return descriptors registered for one channel, sorted by name.
+
+        Interactive surfaces (the CLI command menu, completions) use this so
+        they only ever offer commands that the channel can actually run.
+        """
+
+        return tuple(
+            sorted(
+                (
+                    descriptor
+                    for registered in (self._core_commands, self._plugin_commands)
+                    for descriptor in registered
+                    if _in_scope(descriptor, channel_name)
+                ),
+                key=lambda descriptor: descriptor.name,
+            )
+        )
