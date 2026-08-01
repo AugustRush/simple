@@ -52,6 +52,18 @@ WEB_USER_AGENT = (
     "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
 )
 
+# Model-facing guidance attached to every confirmation-required shell error.
+_SHELL_CONFIRMATION_GUIDANCE = (
+    "Only high-risk commands (disk/system destruction, destructive options, "
+    "shell operators, pipe-to-shell patterns) require human approval; "
+    "medium-risk commands run without asking. An interactive terminal shows "
+    "an approval menu automatically; in non-terminal channels "
+    "(Feishu/gateway), show the exact command to the user and ask them to "
+    "reply “同意” (or run /confirm <token>). After approval, retry the "
+    "byte-identical command within 5 minutes — do not modify it and do not "
+    "route around the shell tool."
+)
+
 
 def _looks_like_plugin(dir_path: Path) -> bool:
     """Return True if *dir_path* contains at least one recognisable plugin marker."""
@@ -166,7 +178,12 @@ class BuiltinTools:
 
         r.register(
             "shell",
-            "Execute a shell command and return stdout/stderr. Use for system operations, running scripts, etc.",
+            "Execute a shell command and return stdout/stderr. Use for system operations, running scripts, etc. "
+            "Medium-risk commands (ssh/curl/rm/interpreters and similar) run automatically. High-risk commands "
+            "(disk/system destruction, destructive options, shell operators, pipe-to-shell patterns) require "
+            "human approval: an interactive terminal shows an approval menu automatically; in non-terminal "
+            "channels, show the exact command to the user and ask them to reply “同意” (or run /confirm <token>), "
+            "then retry the identical command string after approval.",
             {
                 "type": "object",
                 "properties": {
@@ -1288,30 +1305,41 @@ class BuiltinTools:
         """
         if not safety.confirmation_token:
             return False
-        sink = _active_sink.get()
-        if sink is None:
-            return False
-        approved = await sink.on_tool_confirmation(
-            "shell",
-            command=command,
-            risk_level=safety.risk_level,
-            reason=safety.reason,
-            confirmation_token=safety.confirmation_token,
-            scope=authorization_scope,
+        from agent.core.output import _APPROVAL_LOCK
+        from agent.security.shell import (
+            shell_command_confirm,
+            shell_session_allowlist_contains,
         )
-        if not approved:
-            return False
-        active_token = shared._active_cancel_token.get()
-        if active_token is not None and active_token.is_cancelled:
-            return False
-        from agent.security.shell import shell_command_confirm
 
-        return bool(
-            shell_command_confirm(
-                safety.confirmation_token,
+        async with _APPROVAL_LOCK:
+            if shell_session_allowlist_contains(
+                command, scope=authorization_scope
+            ):
+                # A parallel call already obtained human approval for the
+                # identical command in this scope; skip the redundant prompt.
+                return True
+            sink = _active_sink.get()
+            if sink is None:
+                return False
+            approved = await sink.on_tool_confirmation(
+                "shell",
+                command=command,
+                risk_level=safety.risk_level,
+                reason=safety.reason,
+                confirmation_token=safety.confirmation_token,
                 scope=authorization_scope,
             )
-        )
+            if not approved:
+                return False
+            active_token = shared._active_cancel_token.get()
+            if active_token is not None and active_token.is_cancelled:
+                return False
+            return bool(
+                shell_command_confirm(
+                    safety.confirmation_token,
+                    scope=authorization_scope,
+                )
+            )
 
     def _resolve_tool_path(self, path: str) -> tuple[Path, str]:
         return resolve_workspace_path(
@@ -1403,37 +1431,6 @@ class BuiltinTools:
         return moved
 
 
-    def _shell_recovery_hint(
-        self,
-        *,
-        reason: str,
-        output_dir: Path,
-        sandbox_dir: Path,
-    ) -> dict[str, Any] | None:
-        if "absolute path arguments outside the tool cwd boundary" not in reason:
-            return None
-        return {
-            "summary": (
-                "Avoid external absolute path arguments. Re-run with a safe cwd "
-                "and relative command arguments instead of asking the user first."
-            ),
-            "workspace_cwd": str(self.workspace_root),
-            "sandbox_cwd": str(sandbox_dir),
-            "output_dir": str(output_dir),
-            "patterns": [
-                (
-                    "For current project files: set cwd to workspace_cwd and "
-                    "use relative paths in the command."
-                ),
-                (
-                    "For downloads, clones, and generated artifacts: keep the "
-                    "default cwd (sandbox_cwd) and use relative paths, e.g. "
-                    "git clone <url> repo-name."
-                ),
-                "If the external absolute path is truly required, ask the user to approve it.",
-            ],
-        }
-
     async def _shell(
         self,
         command: str,
@@ -1444,6 +1441,12 @@ class BuiltinTools:
         # Security: block dangerous commands before spawning any subprocess.
         extra_blocked: list[str] = (
             self.registry.get_context("shell_blocked_commands") or []
+        )
+        pre_approved: list[str] = (
+            self.registry.get_context("shell_allowed_commands") or []
+        )
+        permission_level: str = str(
+            self.registry.get_context("shell_permission_level") or "ask"
         )
         import agent as agent_module
 
@@ -1466,6 +1469,8 @@ class BuiltinTools:
             extra_blocked,
             allowed_roots=frozenset({self.workspace_root, output_dir}),
             scope=authorization_scope,
+            pre_approved=pre_approved,
+            permission_level=permission_level,
         )
         if safety.requires_confirmation and await self._try_interactive_confirmation(
             safety=safety,
@@ -1481,35 +1486,21 @@ class BuiltinTools:
                 extra_blocked,
                 allowed_roots=frozenset({self.workspace_root, output_dir}),
                 scope=authorization_scope,
+                pre_approved=pre_approved,
+                permission_level=permission_level,
             )
         if not safety.allowed:
             if safety.requires_confirmation:
-                recovery_hint = self._shell_recovery_hint(
-                    reason=safety.reason,
-                    output_dir=output_dir,
-                    sandbox_dir=sandbox_dir,
+                error_message = (
+                    f"Shell command requires confirmation: {safety.reason} "
+                    f"{_SHELL_CONFIRMATION_GUIDANCE}"
                 )
-                extra: dict[str, Any] = {}
-                # Lift the recovery summary into the error string so the LLM
-                # sees the actionable guidance immediately, not buried inside
-                # a nested dict.  The structured dict stays in `recovery_hint`
-                # for callers that want the full detail.
-                error_message = f"Shell command requires confirmation: {safety.reason}"
-                if recovery_hint is not None:
-                    extra["recoverable_by_agent"] = True
-                    extra["recovery_hint"] = recovery_hint
-                    hint_summary = str(recovery_hint.get("summary", "") or "").strip()
-                    if hint_summary:
-                        error_message = (
-                            f"{error_message}. RECOVERY: {hint_summary}"
-                        )
                 return self._error(
                     error_message,
                     command=command,
                     risk_level=safety.risk_level,
                     requires_confirmation=True,
                     confirmation_token=safety.confirmation_token,
-                    **extra,
                 )
             return self._error(
                 f"Shell command rejected: {safety.reason}",

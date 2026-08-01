@@ -176,6 +176,12 @@
   "_tavily_api_key_readme": "Optional. Used by the built-in tavily_search tool. Can be a literal key or '$ENV_VAR'. Leave empty or null to disable Tavily-backed search.",
   "output_dir": null,
   "_output_dir_readme": "null = use default ~/.agent/output. Set to an absolute path to override. Supports ~ and $ENV expansion. All tool/MCP/skill outputs (screenshots, exports, temp files) go here. Subdirectories are created on demand.",
+  "shell_allowed_commands": [],
+  "_shell_allowed_commands_readme": "Persistent shell allowlist: entries that skip the medium-risk confirmation prompt. A full command string (e.g. \"ssh -o BatchMode=yes localhost whoami\") matches that exact command; a bare command name (e.g. \"osascript\") allows every invocation of that command. High-risk commands (mkfs/dd/shutdown/… and shell control operators) remain blocked. Manage at runtime with /allow and /deny.",
+  "permissions": {
+    "shell_level": "ask",
+    "_shell_level_readme": "Default shell permission level for every session: ask = low/medium-risk run automatically, only high-risk (destructive commands/options, shell operators, pipe-to-shell patterns) asks for confirmation, and can run after approval (default); medium = high-risk commands/options/patterns also auto-allowed, operators still ask; high = everything auto-allowed (operators too) except shell_blocked_commands and structural guards; full = alias of high. Change per session with /permissions <level>; persist the default with /permissions default <level>."
+  },
   "channels": {
     "_readme": "External channel configuration. Only one channel may be active at a time. If no channel is enabled the CLI is used by default.",
     "feishu": {

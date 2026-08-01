@@ -120,18 +120,18 @@ def test_shell_confirmation_gate_executes_after_human_approval(
         asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
-    result = _run_with_context(sink, tools=tools, command="mv a b")
+    result = _run_with_context(sink, tools=tools, command="mkfs /dev/disk0")
 
     assert result["ok"] is True
-    assert spawned["argv"][-3:] == ("/bin/sh", "-c", "mv a b")
+    assert spawned["argv"][-3:] == ("/bin/sh", "-c", "mkfs /dev/disk0")
     assert len(sink.asked) == 1
     ask = sink.asked[0]
-    assert ask["command"] == "mv a b"
-    assert ask["risk_level"] == "medium"
+    assert ask["command"] == "mkfs /dev/disk0"
+    assert ask["risk_level"] == "high"
     assert ask["name"] == "shell"
     assert ask["token"]
     scope = ShellAuthorizationScope("cli", "cli", "")
-    assert shell_session_allowlist_contains("mv a b", scope=scope) is True
+    assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is True
 
 
 def test_shell_confirmation_gate_decline_keeps_structured_error(
@@ -149,7 +149,7 @@ def test_shell_confirmation_gate_decline_keeps_structured_error(
         asyncio, "create_subprocess_exec", fake_create_subprocess_exec
     )
 
-    result = _run_with_context(sink, tools=tools, command="mv a b")
+    result = _run_with_context(sink, tools=tools, command="mkfs /dev/disk0")
 
     assert result["ok"] is False
     assert result["requires_confirmation"] is True
@@ -174,7 +174,7 @@ def test_shell_confirmation_gate_declines_after_turn_cancelled(
     )
 
     result = _run_with_context(
-        sink, tools=tools, command="mv a b", cancelled=True
+        sink, tools=tools, command="mkfs /dev/disk0", cancelled=True
     )
 
     assert result["ok"] is False
@@ -313,3 +313,205 @@ def test_tool_progress_renders_bar_in_terminal():
 
     sink.on_tool_end("shell", '{"ok": true, "exit_code": 0, "output": "ok"}')
     assert sink._tool_progress is None
+
+
+def test_parallel_identical_medium_risk_commands_ask_for_consent_once(
+    tmp_path, monkeypatch
+):
+    import agent.shared as shared
+    from agent.core.agent import AgentContext, _active_agent_context
+    from agent.core.output import _active_sink
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_allowlist_contains,
+    )
+
+    tools, _, _, _ = _make_tools(tmp_path)
+    sink = _FakeSink(answer=True)
+    spawned: list = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        spawned.append(args)
+        return FakeProc()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+    ctx = AgentContext(
+        metadata={"session_id": "cli", "channel_name": "cli", "user_id": ""}
+    )
+    agent_token = _active_agent_context.set(ctx)
+    sink_token = _active_sink.set(sink)
+    cancel_token = shared.CancelToken()
+    cancel_var_token = shared._active_cancel_token.set(cancel_token)
+    try:
+
+        async def scenario():
+            return await asyncio.gather(
+                tools._shell("mkfs /dev/disk0", timeout=1),
+                tools._shell("mkfs /dev/disk0", timeout=1),
+            )
+
+        results = asyncio.run(scenario())
+    finally:
+        shared._active_cancel_token.reset(cancel_var_token)
+        _active_sink.reset(sink_token)
+        _active_agent_context.reset(agent_token)
+
+    assert all(result["ok"] is True for result in results)
+    assert len(spawned) == 2
+    assert len(sink.asked) == 1
+    scope = ShellAuthorizationScope("cli", "cli", "")
+    assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is True
+
+
+def test_parallel_consent_flows_are_serialized(tmp_path):
+    import agent.shared as shared
+    from agent.core.agent import AgentContext, _active_agent_context
+    from agent.core.output import _active_sink
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+    )
+
+    tools, _, _, _ = _make_tools(tmp_path)
+    scope = ShellAuthorizationScope("cli", "cli", "")
+
+    class SlowSink(_FakeSink):
+        def __init__(self):
+            super().__init__(answer=True)
+            self.active = 0
+            self.max_active = 0
+
+        async def on_tool_confirmation(self, *args, **kwargs):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            try:
+                await asyncio.sleep(0.05)
+                return self.answer
+            finally:
+                self.active -= 1
+
+    sink = SlowSink()
+    ctx = AgentContext(
+        metadata={"session_id": "cli", "channel_name": "cli", "user_id": ""}
+    )
+    agent_token = _active_agent_context.set(ctx)
+    sink_token = _active_sink.set(sink)
+    cancel_token = shared.CancelToken()
+    cancel_var_token = shared._active_cancel_token.set(cancel_token)
+    try:
+        safety_a = shell_command_check("mkfs /dev/disk0", scope=scope)
+        safety_b = shell_command_check("dd if=/dev/zero of=/dev/disk1", scope=scope)
+
+        async def scenario():
+            return await asyncio.gather(
+                tools._try_interactive_confirmation(
+                    safety=safety_a,
+                    command="mkfs /dev/disk0",
+                    extra_blocked=[],
+                    authorization_scope=scope,
+                ),
+                tools._try_interactive_confirmation(
+                    safety=safety_b,
+                    command="dd if=/dev/zero of=/dev/disk1",
+                    extra_blocked=[],
+                    authorization_scope=scope,
+                ),
+            )
+
+        results = asyncio.run(scenario())
+    finally:
+        shared._active_cancel_token.reset(cancel_var_token)
+        _active_sink.reset(sink_token)
+        _active_agent_context.reset(agent_token)
+
+    assert results == [True, True]
+    assert sink.max_active == 1
+
+
+@pytest.mark.parametrize(
+    "answer, expected",
+    [
+        ("1", True),
+        ("y", True),
+        ("yes", True),
+        ("同意", True),
+        ("批准", True),
+        ("2", False),
+        ("n", False),
+        ("no", False),
+        ("拒绝", False),
+    ],
+)
+def test_approval_menu_choice_maps_answers(answer, expected):
+    from agent.core.output import _approval_choice_accepted
+
+    assert _approval_choice_accepted(answer) is expected
+
+
+@pytest.mark.parametrize("answer", ["1", "2", "y", "n", "同意", "拒绝", " 1 "])
+def test_approval_menu_validator_accepts_known_choices(answer):
+    from prompt_toolkit.document import Document
+
+    from agent.core.output import _APPROVAL_VALIDATOR
+
+    _APPROVAL_VALIDATOR.validate(Document(answer))
+
+
+@pytest.mark.parametrize("answer", ["3", "", "yes please", "0", "同意执行"])
+def test_approval_menu_validator_rejects_unknown_choices(answer):
+    from prompt_toolkit.document import Document
+    from prompt_toolkit.validation import ValidationError
+
+    from agent.core.output import _APPROVAL_VALIDATOR
+
+    with pytest.raises(ValidationError):
+        _APPROVAL_VALIDATOR.validate(Document(answer))
+
+
+def test_consent_prompt_buffers_parallel_tool_rendering(tmp_path):
+    from agent.core.output import CliOutputSink
+
+    console = Console(file=StringIO())
+    sink = CliOutputSink(console)
+
+    sink._approval_active = True
+    sink.on_tool_end("shell", '{"ok": false, "error": "requires confirmation"}')
+    sink.on_tool_progress(
+        "shell", {"status": "running", "elapsed_ms": 9000}
+    )
+    sink.on_heartbeat(elapsed_seconds=9, current_op="tools", op_detail="shell")
+    sink.on_status("模型继续中", level="info")
+
+    assert console.file.getvalue() == ""
+
+    sink._flush_consent_buffer()
+
+    out = console.file.getvalue()
+    assert "requires confirmation" in out
+    assert "模型继续中" in out
+    assert "工具正在执行" in out
+
+
+def test_consent_pending_tracks_approval_lock():
+    import asyncio
+
+    from agent.core.output import _APPROVAL_LOCK, _consent_pending
+
+    async def scenario():
+        assert _consent_pending() is False
+        await _APPROVAL_LOCK.acquire()
+        try:
+            assert _consent_pending() is True
+        finally:
+            _APPROVAL_LOCK.release()
+        assert _consent_pending() is False
+
+    asyncio.run(scenario())

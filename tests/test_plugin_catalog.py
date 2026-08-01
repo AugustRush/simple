@@ -2524,36 +2524,6 @@ def test_recoverable_by_agent_not_flagged_unproductive():
     assert BaseAgent._tool_result_looks_unproductive(plain_error) is True
 
 
-def test_recovery_hint_appears_in_error_message_for_shell_confirmation(tmp_path):
-    """The shell tool lifts recovery_hint.summary into the error string so
-    the LLM sees the actionable guidance immediately, not just in a nested
-    JSON field."""
-    import json as _json
-    from agent.tools.runtime import ToolRegistry
-    from agent.tools.builtin_tools import BuiltinTools
-
-    registry = ToolRegistry()
-    BuiltinTools(memory=None, registry=registry, workspace_root=tmp_path)
-
-    # Force the absolute-path-outside branch.
-    result_json = asyncio.run(
-        registry.call(
-            "shell",
-            {
-                "command": "ls /tmp/some-external-path/file",
-                "intent": "list a file outside the workspace for verification",
-            },
-        )
-    )
-    payload = _json.loads(result_json)
-    assert payload["ok"] is False
-    assert payload.get("recoverable_by_agent") is True
-    # The hint summary should be in the error string, not only nested.
-    assert "RECOVERY:" in payload["error"]
-    assert "safe cwd" in payload["error"] or "relative" in payload["error"]
-
-
-
 # ─── CancelToken cleanup behaviour ────────────────────────────────────────────
 
 

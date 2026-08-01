@@ -73,6 +73,43 @@ def _preview_text(text: object, limit: int = 80) -> str:
 def _interaction_log(event: str, **fields: object) -> None:
     shared._interaction_log("agent", event, **fields)
 
+
+async def _execute_regular_tool_calls(
+    regular_calls: list[tuple[int, dict]],
+    executor: Any,
+) -> list[str]:
+    """Run a batch of non-orchestration tool calls, preserving call order.
+
+    Batches containing a ``shell`` call run sequentially: a medium-risk
+    shell command blocks on the human consent menu, and other tools must
+    not execute or print while that menu is open (parallel results and
+    heartbeats corrupt the prompt).  Pure parallel batches keep the fast
+    ``asyncio.gather`` path.
+    """
+    results: list[str] = [""] * len(regular_calls)
+    if any(tu.get("name") == "shell" for _idx, tu in regular_calls):
+        for (idx, tu) in regular_calls:
+            try:
+                results[idx] = await executor.run(tu)
+            except BaseException as exc:
+                results[idx] = json.dumps(
+                    {"ok": False, "error": f"tool '{tu['name']}' raised: {exc}"}
+                )
+        return results
+    raw = await asyncio.gather(
+        *[executor.run(tu) for _idx, tu in regular_calls],
+        return_exceptions=True,
+    )
+    for (idx, _tu), outcome in zip(regular_calls, raw):
+        if isinstance(outcome, BaseException):
+            results[idx] = json.dumps(
+                {"ok": False, "error": f"tool '{_tu['name']}' raised: {outcome}"}
+            )
+        else:
+            results[idx] = outcome
+    return results
+
+
 @dataclass
 class AgentContext:
     """State for a single agent instance."""
@@ -1995,18 +2032,11 @@ class BaseAgent:
                 self.registry,
                 plugin_catalog=self.plugin_catalog,
             )
-            # D2: return_exceptions=True preserves successes when one tool errors
-            raw = await asyncio.gather(
-                *[regular_executor.run(tu) for _, tu in regular_calls],
-                return_exceptions=True,
+            regular_results = await _execute_regular_tool_calls(
+                regular_calls, regular_executor
             )
-            for (idx, tu), outcome in zip(regular_calls, raw):
-                if isinstance(outcome, BaseException):
-                    results[idx] = json.dumps(
-                        {"ok": False, "error": f"tool '{tu['name']}' raised: {outcome}"}
-                    )
-                else:
-                    results[idx] = outcome
+            for (idx, _tu), outcome in zip(regular_calls, regular_results):
+                results[idx] = outcome
 
         spawn_calls = [
             (idx, tu) for idx, tu in enumerate(tool_uses) if _is_orchestration(tu)
@@ -2992,6 +3022,9 @@ class BaseAgent:
         blocked = parent_ctx.get("shell_blocked_commands")
         if isinstance(blocked, list):
             sub_registry._context["shell_blocked_commands"] = list(blocked)
+        allowed = parent_ctx.get("shell_allowed_commands")
+        if isinstance(allowed, list):
+            sub_registry._context["shell_allowed_commands"] = list(allowed)
         if write_scope:
             sub_registry._context["write_scope"] = list(write_scope)
         sub_registry._context["capability_profile"] = normalized_profile

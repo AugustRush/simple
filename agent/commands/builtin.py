@@ -796,6 +796,210 @@ async def _confirm_handler(
     )
 
 
+def _shell_allowed_commands_from_config() -> list[str]:
+    import agent as agent_module
+
+    cfg, _first_run = agent_module.load_config()
+    value = cfg.get("shell_allowed_commands") or []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _save_shell_allowed_commands(commands: list[str]) -> None:
+    import agent as agent_module
+
+    cfg, _first_run = agent_module.load_config()
+    cfg["shell_allowed_commands"] = commands
+    agent_module.save_config(cfg)
+
+
+def _apply_shell_allowed_commands(
+    context: CommandContext, commands: list[str]
+) -> None:
+    registry = context.components.get("registry")
+    if registry is not None:
+        try:
+            registry.set_context("shell_allowed_commands", list(commands))
+        except Exception:
+            pass
+
+
+async def _allow_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    command = request.args.strip()
+    if not command:
+        return _error("Usage: /allow <command 或命令名>")
+    commands = _shell_allowed_commands_from_config()
+    if command not in commands:
+        commands.append(command)
+    _save_shell_allowed_commands(commands)
+    _apply_shell_allowed_commands(context, commands)
+    return CommandResult(
+        response_text=(
+            f"已加入放行列表：{_markdown_inline(command)}"
+            "（持久生效；完整命令按原文匹配，命令名匹配所有调用）"
+        )
+    )
+
+
+async def _deny_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    command = request.args.strip()
+    if not command:
+        return _error("Usage: /deny <command 或命令名>")
+    commands = _shell_allowed_commands_from_config()
+    remaining = [item for item in commands if item != command]
+    if len(remaining) == len(commands):
+        return _warning(f"放行列表中不存在：{_markdown_inline(command)}")
+    _save_shell_allowed_commands(remaining)
+    _apply_shell_allowed_commands(context, remaining)
+    return CommandResult(
+        response_text=f"已从放行列表移除：{_markdown_inline(command)}"
+    )
+
+
+async def _auto_approve_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_auto_approve_disable,
+        shell_session_auto_approve_enable,
+        shell_session_auto_approve_status,
+    )
+
+    scope = ShellAuthorizationScope(
+        context.session_id,
+        context.channel_name,
+        str(context.metadata.get("user_id") or ""),
+    )
+    arg = request.args.strip().casefold()
+    if arg in ("on", "1", "yes", "true", "开启"):
+        shell_session_auto_approve_enable(scope)
+        return CommandResult(
+            response_text=(
+                "已开启高危自动放行：本会话内高风险命令直接放行"
+                "（操作符/管道模式仍需确认）。"
+            )
+        )
+    if arg in ("off", "0", "no", "false", "关闭"):
+        shell_session_auto_approve_disable(scope)
+        return CommandResult(
+            response_text="已关闭自动放行，恢复默认：高风险命令需要确认。"
+        )
+    if arg in ("status", "?", ""):
+        state = "开启" if shell_session_auto_approve_status(scope) else "关闭"
+        return CommandResult(response_text=f"会话自动放行：{state}")
+    return _error("Usage: /auto-approve on|off|status")
+
+
+def _permission_level_label(level: str) -> str:
+    labels = {
+        "ask": "低/中风险自动执行；高风险（破坏性命令/操作符）需确认",
+        "medium": "高危命令与破坏性选项直接放行；操作符/管道模式仍需确认",
+        "high": "全部自动放行（含操作符）；仅保留配置黑名单与结构拦截",
+        "full": "同 high：全部自动放行（仅保留配置黑名单与结构拦截）",
+    }
+    return labels.get(level, level)
+
+
+def _config_shell_permission_level() -> str:
+    import agent as agent_module
+
+    cfg, _first_run = agent_module.load_config()
+    permissions = cfg.get("permissions") or {}
+    return str(permissions.get("shell_level", "ask") or "ask")
+
+
+def _save_config_shell_permission_level(level: str) -> None:
+    import agent as agent_module
+
+    cfg, _first_run = agent_module.load_config()
+    permissions = cfg.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        cfg["permissions"] = permissions
+    permissions["shell_level"] = level
+    agent_module.save_config(cfg)
+
+
+async def _permissions_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    from agent.security.shell import (
+        PERMISSION_LEVELS,
+        ShellAuthorizationScope,
+        shell_session_permission_get,
+        shell_session_permission_set,
+    )
+
+    scope = ShellAuthorizationScope(
+        context.session_id,
+        context.channel_name,
+        str(context.metadata.get("user_id") or ""),
+    )
+    args = request.args.strip()
+    if not args:
+        config_level = _config_shell_permission_level()
+        session_level = shell_session_permission_get(scope)
+        effective = session_level or config_level
+        lines = ["## Shell 权限等级", ""]
+        for level in PERMISSION_LEVELS:
+            marker = "●" if level == effective else "○"
+            lines.append(f"- {marker} `{level}`：{_permission_level_label(level)}")
+        if session_level:
+            lines.append("")
+            lines.append(
+                f"当前会话覆盖：`{session_level}`（配置默认：`{config_level}`）"
+            )
+        else:
+            lines.append("")
+            lines.append(
+                f"当前生效：`{effective}`（配置默认）。"
+                "用 `/permissions <level>` 切换本会话，"
+                "`/permissions default <level>` 持久化默认值。"
+            )
+        return CommandResult(response_text="\n".join(lines))
+
+    parts = args.split(maxsplit=1)
+    if parts[0].casefold() == "default":
+        if len(parts) != 2 or parts[1].strip().casefold() not in PERMISSION_LEVELS:
+            return _error(
+                "Usage: /permissions default "
+                f"{'|'.join(PERMISSION_LEVELS)}"
+            )
+        level = parts[1].strip().casefold()
+        _save_config_shell_permission_level(level)
+        registry = context.components.get("registry")
+        if registry is not None:
+            try:
+                registry.set_context("shell_permission_level", level)
+            except Exception:
+                pass
+        return CommandResult(
+            response_text=(
+                f"已把默认权限等级持久化为 `{level}`（重启后保留，"
+                "子代理继承该默认值）。"
+            )
+        )
+
+    level = parts[0].strip().casefold()
+    if level not in PERMISSION_LEVELS:
+        return _error(
+            f"Usage: /permissions {'|'.join(PERMISSION_LEVELS)}"
+        )
+    shell_session_permission_set(scope, level)
+    return CommandResult(
+        response_text=(
+            f"会话权限等级已设为 `{level}`（本会话生效，"
+            f"{_permission_level_label(level)}）。"
+        )
+    )
+
+
 def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]:
     async def help_handler(
         request: CommandRequest, context: CommandContext
@@ -882,6 +1086,34 @@ def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]
             _confirm_handler,
             usage="/confirm <token>",
             description="Approve one pending restricted shell command",
+            concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "allow",
+            _allow_handler,
+            usage="/allow <command>",
+            description="Add a command to the persistent shell allowlist (skip confirmation)",
+            concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "deny",
+            _deny_handler,
+            usage="/deny <command>",
+            description="Remove a command from the persistent shell allowlist",
+            concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "auto-approve",
+            _auto_approve_handler,
+            usage="/auto-approve on|off|status",
+            description="Toggle per-session automatic approval for high-risk shell commands",
+            concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "permissions",
+            _permissions_handler,
+            usage="/permissions [level|default <level>]",
+            description="Show or set the shell permission level (ask/medium/high/full)",
             concurrency="anytime",
         ),
         CommandDescriptor(

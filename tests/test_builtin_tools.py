@@ -927,11 +927,11 @@ def test_shell_allows_output_dir_writes(tmp_path):
 def test_shell_returns_confirmation_request_for_restricted_command(tmp_path):
     tools, _, _ = make_builtin_tools(tmp_path)
 
-    result = asyncio.run(tools._shell("mv a b", timeout=1))
+    result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
 
     assert result["ok"] is False
     assert result["requires_confirmation"] is True
-    assert result["risk_level"] == "medium"
+    assert result["risk_level"] == "high"
     assert result["confirmation_token"]
     assert "requires confirmation" in result["error"].lower()
 
@@ -942,21 +942,6 @@ def test_shell_tool_schema_does_not_expose_confirmation_token(tmp_path):
     shell = next(item for item in registry.to_anthropic_format() if item["name"] == "shell")
 
     assert "confirmation_token" not in shell["input_schema"]["properties"]
-
-
-def test_shell_returns_recovery_hint_for_external_absolute_path(tmp_path):
-    tools, _, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
-
-    result = asyncio.run(tools._shell("cat /etc/passwd", timeout=1))
-
-    assert result["ok"] is False
-    assert result["requires_confirmation"] is True
-    assert result["recoverable_by_agent"] is True
-    hint = result["recovery_hint"]
-    assert hint["workspace_cwd"] == str(workspace.resolve())
-    assert hint["sandbox_cwd"] == str((output_dir / "sandbox").resolve())
-    assert "relative command arguments" in hint["summary"]
-    assert any("git clone <url> repo-name" in item for item in hint["patterns"])
 
 
 def test_shell_runs_restricted_command_after_user_scoped_confirmation(
@@ -975,7 +960,7 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
     )
     active = _active_agent_context.set(ctx)
     try:
-        first = asyncio.run(tools._shell("mv a b", timeout=1))
+        first = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
     finally:
         _active_agent_context.reset(active)
     captured = {}
@@ -998,12 +983,12 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
     assert shell_command_confirm(first["confirmation_token"], scope=scope) is True
     active = _active_agent_context.set(ctx)
     try:
-        result = asyncio.run(tools._shell("mv a b", timeout=1))
+        result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
     finally:
         _active_agent_context.reset(active)
 
     assert result["ok"] is True
-    assert captured["argv"][-3:] == ("/bin/sh", "-c", "mv a b")
+    assert captured["argv"][-3:] == ("/bin/sh", "-c", "mkfs /dev/disk0")
     assert captured["argv"][0].endswith("sandbox-exec")
 
 
@@ -1013,7 +998,7 @@ def test_shell_rejects_model_supplied_confirmation_token(tmp_path):
     with pytest.raises(TypeError, match="confirmation_token"):
         asyncio.run(
             tools._shell(
-                "mv a b",
+                "mkfs /dev/disk0",
                 timeout=1,
                 confirmation_token="model-controlled",
             )
@@ -1028,6 +1013,56 @@ def test_shell_rejects_inline_cwd_escape(tmp_path):
     assert result["ok"] is False
     assert result["risk_level"] == "high"
     assert "cwd" in result["error"].lower()
+
+
+def test_shell_allowed_commands_context_skips_confirmation(tmp_path, monkeypatch):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("shell_allowed_commands", ["mkfs /dev/disk0"])
+    spawned = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        spawned.append(args)
+        return FakeProc()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+
+    assert result["ok"] is True
+    assert spawned
+
+
+def test_shell_permission_level_context_skips_confirmation(tmp_path, monkeypatch):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("shell_permission_level", "medium")
+    spawned = []
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        spawned.append(args)
+        return FakeProc()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    result = asyncio.run(tools._shell("mkfs /dev/disk0", timeout=1))
+
+    assert result["ok"] is True
+    assert spawned
 
 
 def test_transcribe_audio_rejects_shell_control_in_template(tmp_path):
@@ -1048,21 +1083,21 @@ def test_transcribe_audio_rejects_shell_control_in_template(tmp_path):
 @pytest.mark.parametrize(
     "command",
     [
-        "sudo rm -rf tmp",
-        "FOO=1 rm -rf tmp",
-        "env rm -rf tmp",
+        "sudo mkfs /dev/disk0",
+        "FOO=1 mkfs /dev/disk0",
+        "env mkfs /dev/disk0",
         "shutdown now",
     ],
 )
-def test_shell_blocks_wrapped_dangerous_commands(tmp_path, command):
+def test_shell_wrapped_high_risk_commands_require_confirmation(
+    tmp_path, command
+):
     tools, _, _ = make_builtin_tools(tmp_path)
 
     result = asyncio.run(tools._shell(command, timeout=1))
 
     assert result["ok"] is False
-    assert "rejected" in result["error"].lower() or result.get(
-        "requires_confirmation"
-    )
+    assert result.get("requires_confirmation") is True
 
 
 def test_tavily_search_requires_api_key(tmp_path):

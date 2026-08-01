@@ -173,6 +173,17 @@ SHELL_BLOCKED_PATTERNS: tuple[str, ...] = HIGH_RISK_PATTERNS + MEDIUM_RISK_PATTE
 
 CONFIRMATION_TTL = timedelta(minutes=5)
 
+# Permission levels, from most restrictive to least.  ``ask`` is the default:
+# low- and medium-risk commands run without confirmation; only high-risk
+# constructs (destructive commands/options, shell operators, pipe-to-shell
+# patterns) ask the human, and they become runnable after approval.  User
+# blacklist and structural guards (cwd escape, command substitution) stay
+# unconditional.  ``medium`` additionally auto-allows high-risk commands,
+# options, and pipe patterns (plain operators still ask); ``high``
+# auto-allows everything except the blacklist and structural guards;
+# ``full`` is an alias of ``high`` for readability.
+PERMISSION_LEVELS: tuple[str, ...] = ("ask", "medium", "high", "full")
+
 
 @dataclass(frozen=True)
 class ShellAuthorizationScope:
@@ -183,6 +194,7 @@ class ShellAuthorizationScope:
 
 @dataclass(frozen=True)
 class PendingShellConfirmation:
+    token: str
     command: str
     scope: ShellAuthorizationScope
     expires_at: datetime
@@ -191,6 +203,8 @@ class PendingShellConfirmation:
 _DEFAULT_SCOPE = ShellAuthorizationScope("default", "cli", "")
 _session_allowlist: dict[tuple[ShellAuthorizationScope, str], datetime] = {}
 _pending_tokens: dict[str, PendingShellConfirmation] = {}
+_session_auto_approve: set[ShellAuthorizationScope] = set()
+_session_permission_levels: dict[ShellAuthorizationScope, str] = {}
 
 
 def _authorization_scope(
@@ -229,6 +243,49 @@ def shell_session_allowlist_clear() -> None:
     """Clear all entries from the session allowlist."""
     _session_allowlist.clear()
     _pending_tokens.clear()
+    _session_auto_approve.clear()
+    _session_permission_levels.clear()
+
+
+def shell_session_auto_approve_enable(scope: ShellAuthorizationScope) -> None:
+    """Skip medium-risk confirmation for every command in one scope."""
+    shell_session_permission_set(scope, "medium")
+
+
+def shell_session_auto_approve_disable(scope: ShellAuthorizationScope) -> None:
+    """Re-enable per-command confirmation for one scope."""
+    shell_session_permission_set(scope, "ask")
+
+
+def shell_session_auto_approve_status(scope: ShellAuthorizationScope) -> bool:
+    """Return True when medium-risk commands bypass confirmation in *scope*."""
+    return shell_session_permission_get(scope) in ("medium", "high", "full")
+
+
+def shell_session_permission_set(
+    scope: ShellAuthorizationScope, level: str
+) -> None:
+    """Override the permission level for one session/channel/user scope."""
+    normalized = str(level or "").strip().casefold()
+    if normalized in PERMISSION_LEVELS:
+        _session_permission_levels[scope] = normalized
+    else:
+        _session_permission_levels.pop(scope, None)
+
+
+def shell_session_permission_get(scope: ShellAuthorizationScope) -> str:
+    """Return the session override ("" when the config default applies)."""
+    return _session_permission_levels.get(scope, "")
+
+
+def _effective_permission_level(
+    scope: ShellAuthorizationScope, permission_level: Optional[str]
+) -> str:
+    session_override = shell_session_permission_get(scope)
+    if session_override:
+        return session_override
+    value = str(permission_level or "ask").strip().casefold()
+    return value if value in PERMISSION_LEVELS else "ask"
 
 
 def shell_session_allowlist_contains(
@@ -298,18 +355,59 @@ def shell_command_confirm(
     return True
 
 
+def shell_pending_for_scope(
+    scope: ShellAuthorizationScope,
+    now: datetime | None = None,
+) -> list[PendingShellConfirmation]:
+    """Return unexpired pending confirmations for one authorization scope."""
+    current = _authorization_time(now)
+    return [
+        record
+        for token, record in list(_pending_tokens.items())
+        if record.scope == scope and record.expires_at > current
+    ]
+
+
+def shell_approve_single_pending(
+    scope: ShellAuthorizationScope,
+    now: datetime | None = None,
+) -> Optional[str]:
+    """Approve the sole pending confirmation for *scope*; return its command.
+
+    Chat approval is unambiguous only when exactly one unexpired pending
+    confirmation exists for the scope.  Returns the normalized approved
+    command when it was redeemed; returns ``None`` when there is nothing
+    pending, several pending records exist (ambiguous), or redemption
+    failed.  Callers must never treat ``None`` as approval.
+    """
+    pending = shell_pending_for_scope(scope, now=now)
+    if len(pending) != 1:
+        return None
+    record = pending[0]
+    if shell_command_confirm(record.token, scope=scope, now=now):
+        return record.command
+    return None
+
+
 def _pending_confirmation(
     command: str,
     *,
     scope: ShellAuthorizationScope,
     now: datetime,
 ) -> str:
+    normalized_command = _normalize_command(command)
     for stale_token, record in list(_pending_tokens.items()):
         if record.expires_at <= now:
             _pending_tokens.pop(stale_token, None)
+        elif record.scope == scope and record.command == normalized_command:
+            # Reuse the outstanding approval instead of minting a fresh token
+            # on every retry; otherwise the human's approval could never be
+            # matched to the next identical attempt.
+            return record.token
     token = str(uuid.uuid4())
     _pending_tokens[token] = PendingShellConfirmation(
-        command=_normalize_command(command),
+        token=token,
+        command=normalized_command,
         scope=scope,
         expires_at=now + CONFIRMATION_TTL,
     )
@@ -568,18 +666,58 @@ def _has_absolute_path_token(
     return False
 
 
-def _command_requires_shell_operator_block(command: str) -> Optional[str]:
+def _shell_operator_guard(command: str) -> Optional[tuple[str, str]]:
+    """Classify shell-operator usage as ``("blocked", reason)`` or
+    ``("confirm", reason)``.
+
+    cwd escapes and command substitution violate the tool contract (the cwd
+    belongs to the tool parameter, and substitution hides the executed text),
+    so they stay hard-blocked.  Plain operators and redirections are
+    high-risk constructs that can be approved at the consent menu when the
+    permission level allows.
+    """
     operator = _find_shell_operator(command)
     if operator is None:
         return None
     words = _iter_command_words(command)
     if any(word in CWD_ESCAPE_COMMANDS for word in words):
-        return "inline cwd changes are blocked; use the shell tool cwd parameter"
+        return (
+            "blocked",
+            "inline cwd changes are blocked; use the shell tool cwd parameter",
+        )
     if operator in {"`", "$("}:
-        return "shell command substitution is blocked for safety"
+        return ("blocked", "shell command substitution is blocked for safety")
     if operator in {">", ">>", "<", "<<"}:
-        return "shell redirection is blocked; use file tools or command arguments"
-    return f"shell control operator '{operator}' is blocked for safety"
+        return (
+            "confirm",
+            "shell redirection requires confirmation "
+            "(use file tools for workspace writes)",
+        )
+    return ("confirm", f"shell control operator '{operator}' requires confirmation")
+
+
+def _command_is_pre_approved(
+    normalized_command: str,
+    argv0: Optional[str],
+    pre_approved: Optional[list[str]] = None,
+) -> bool:
+    """Match a command against the configured allowlist.
+
+    An entry containing a space matches the exact normalized command; a bare
+    entry (no space) matches any invocation of that command name, e.g.
+    ``osascript`` allows every osascript call.  High-risk commands are never
+    affected — they are blocked before this check runs.
+    """
+    for raw_entry in pre_approved or ():
+        entry = _normalize_command(raw_entry)
+        if not entry:
+            continue
+        if " " in entry:
+            if normalized_command == entry:
+                return True
+        elif argv0 is not None and argv0 == entry:
+            return True
+    return False
 
 
 # ── Main entry point ─────────────────────────────────────────────────────────
@@ -590,6 +728,8 @@ def shell_command_is_blocked(
     extra_blocked: Optional[list[str]] = None,
     *,
     allowed_roots: frozenset[Path] | None = None,
+    pre_approved: Optional[list[str]] = None,
+    permission_level: Optional[str] = None,
 ) -> Optional[str]:
     """Return a human-readable block reason if *command* is unsafe.
 
@@ -597,7 +737,11 @@ def shell_command_is_blocked(
     Returns None if allowed, a reason string if blocked.
     """
     result = shell_command_check(
-        command, extra_blocked=extra_blocked, allowed_roots=allowed_roots
+        command,
+        extra_blocked=extra_blocked,
+        allowed_roots=allowed_roots,
+        pre_approved=pre_approved,
+        permission_level=permission_level,
     )
     if result.allowed:
         return None
@@ -611,6 +755,8 @@ def shell_command_check(
     allowed_roots: frozenset[Path] | None = None,
     scope: ShellAuthorizationScope | None = None,
     now: datetime | None = None,
+    pre_approved: Optional[list[str]] = None,
+    permission_level: Optional[str] = None,
 ) -> ShellCheckResult:
     """Classify *command* by risk level and determine whether it may run.
 
@@ -625,11 +771,14 @@ def shell_command_check(
     authorization_scope = _authorization_scope(scope)
     authorization_now = _authorization_time(now)
     normalized_command = _normalize_command(command)
+    effective_level = _effective_permission_level(
+        authorization_scope, permission_level
+    )
 
     # Parse before allowlist and risk checks so malformed input always fails closed.
     try:
         tokens = _parse_command_tokens(command)
-        shell_operator_block = _command_requires_shell_operator_block(command)
+        operator_guard = _shell_operator_guard(command)
         command_index = _resolve_effective_command_index(tokens)
     except _ShellParseError:
         return ShellCheckResult(
@@ -638,16 +787,17 @@ def shell_command_check(
             reason="command could not be parsed safely",
         )
 
-    if shell_operator_block:
-        return ShellCheckResult(
-            allowed=False,
-            risk_level="high",
-            reason=shell_operator_block,
-        )
-
     argv0: Optional[str] = None
     if command_index is not None:
         argv0 = _resolve_effective_command(tokens)
+
+    # ── Structural guards: never confirmable ─────────────────────────────
+    if operator_guard is not None and operator_guard[0] == "blocked":
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason=operator_guard[1],
+        )
 
     # ── Check session allowlist first ────────────────────────────────────
     if shell_session_allowlist_contains(
@@ -661,38 +811,80 @@ def shell_command_check(
             reason="command was confirmed for this session",
         )
 
-    # ── High-risk patterns (literal substring match) ─────────────────────
-    for pattern in HIGH_RISK_PATTERNS:
-        if pattern in command:
-            return ShellCheckResult(
-                allowed=False,
-                risk_level="high",
-                reason=f"command pattern '{pattern}' is blocked for safety",
-            )
-
     if not argv0:
         return ShellCheckResult(
             allowed=True, risk_level="low", reason="empty command"
         )
 
-    # ── High-risk commands ───────────────────────────────────────────────
-    if argv0 in (HIGH_RISK_COMMANDS | extra) or argv0 in extra:
-        # Check if it's in extra_blocked (always high risk)
-        if argv0 in extra and argv0 not in HIGH_RISK_COMMANDS:
-            return ShellCheckResult(
-                allowed=False,
-                risk_level="high",
-                reason=f"command '{argv0}' is blocked by configuration",
-            )
-        if argv0 in HIGH_RISK_COMMANDS:
-            return ShellCheckResult(
-                allowed=False,
-                risk_level="high",
-                reason=f"command '{argv0}' is high risk: disk/system destruction",
-            )
+    # ── User-configured blacklist: unconditional at every level ──────────
+    if argv0 in extra:
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason=f"command '{argv0}' is blocked by configuration",
+        )
+
+    # ── Explicit allowlist entries bypass confirmation ───────────────────
+    if _command_is_pre_approved(normalized_command, argv0, pre_approved):
+        return ShellCheckResult(
+            allowed=True,
+            risk_level="low",
+            reason="command is pre-approved (no confirmation required)",
+        )
+
+    # ── High-risk constructs: confirm at restricted levels ───────────────
+    if effective_level in ("ask", "medium") and (
+        operator_guard is not None and operator_guard[0] == "confirm"
+    ):
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason=operator_guard[1],
+            requires_confirmation=True,
+            confirmation_token=token,
+        )
+
+    if effective_level == "ask":
+        for pattern in HIGH_RISK_PATTERNS:
+            if pattern in command:
+                token = _pending_confirmation(
+                    normalized_command,
+                    scope=authorization_scope,
+                    now=authorization_now,
+                )
+                return ShellCheckResult(
+                    allowed=False,
+                    risk_level="high",
+                    reason=f"command pattern '{pattern}' is high risk",
+                    requires_confirmation=True,
+                    confirmation_token=token,
+                )
 
     high_risk_option = _find_high_risk_option(tokens, command_index)
-    if high_risk_option:
+    if effective_level == "ask" and argv0 in HIGH_RISK_COMMANDS:
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason=f"command '{argv0}' is high risk: disk/system destruction",
+            requires_confirmation=True,
+            confirmation_token=token,
+        )
+    if effective_level == "ask" and high_risk_option:
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
         return ShellCheckResult(
             allowed=False,
             risk_level="high",
@@ -700,112 +892,25 @@ def shell_command_check(
                 f"command option '{argv0} {high_risk_option}' is high risk: "
                 "destructive operation"
             ),
-        )
-
-    if _is_inline_execution(tokens, command_index):
-        token = _pending_confirmation(
-            normalized_command,
-            scope=authorization_scope,
-            now=authorization_now,
-        )
-        return ShellCheckResult(
-            allowed=False,
-            risk_level="medium",
-            reason=f"command '{argv0}' is medium risk: inline code execution",
             requires_confirmation=True,
             confirmation_token=token,
         )
 
-    if _is_script_execution(tokens, command_index):
-        token = _pending_confirmation(
-            normalized_command,
-            scope=authorization_scope,
-            now=authorization_now,
-        )
-        return ShellCheckResult(
-            allowed=False,
-            risk_level="medium",
-            reason=f"command '{argv0}' is medium risk: script execution",
-            requires_confirmation=True,
-            confirmation_token=token,
-        )
-
-    if _has_absolute_path_token(tokens, allowed_roots=allowed_roots):
-        token = _pending_confirmation(
-            normalized_command,
-            scope=authorization_scope,
-            now=authorization_now,
-        )
-        return ShellCheckResult(
-            allowed=False,
-            risk_level="medium",
-            reason="command uses absolute path arguments outside the tool cwd boundary",
-            requires_confirmation=True,
-            confirmation_token=token,
-        )
-
-    # ── Medium-risk commands ─────────────────────────────────────────────
-    if argv0 in MEDIUM_RISK_COMMANDS:
-        token = _pending_confirmation(
-            normalized_command,
-            scope=authorization_scope,
-            now=authorization_now,
-        )
-        risk_descriptions = {
-            "rm": "file deletion",
-            "rmdir": "directory removal",
-            "mv": "file move or overwrite",
-            "cp": "file copy or overwrite",
-            "chmod": "permission change",
-            "chown": "ownership change",
-            "sudo": "privilege escalation",
-            "kill": "process termination",
-            "pkill": "process termination",
-            "killall": "process termination",
-            "ssh": "remote access",
-            "scp": "remote file transfer",
-            "sftp": "remote file transfer",
-            "nc": "raw network access",
-            "netcat": "raw network access",
-            "curl": "network request or download",
-            "wget": "network request or download",
-            "ftp": "network file transfer",
-            "rsync": "file synchronization",
-            "passwd": "password modification",
-            "usermod": "user account modification",
-            "groupadd": "group management",
-            "useradd": "user account modification",
-            "userdel": "user account modification",
-            "groupdel": "group management",
-            "eval": "code execution",
-            "exec": "code execution",
-            "bash": "shell execution",
-            "sh": "shell execution",
-            "zsh": "shell execution",
-            "fish": "shell execution",
-            "pip": "package installation",
-            "pip3": "package installation",
-            "npm": "package or script execution",
-            "yarn": "package or script execution",
-            "pnpm": "package or script execution",
-            "brew": "package installation",
-            "apt": "package installation",
-            "apt-get": "package installation",
-            "dnf": "package installation",
-            "yum": "package installation",
-            "pacman": "package installation",
-            "git": "repository state or network operation",
-        }
-        desc = risk_descriptions.get(argv0, "potentially dangerous operation")
-        return ShellCheckResult(
-            allowed=False,
-            risk_level="medium",
-            reason=f"command '{argv0}' is medium risk: {desc}",
-            requires_confirmation=True,
-            confirmation_token=token,
-        )
-
-    # ── Low-risk: allow ──────────────────────────────────────────────────
+    # ── Allowed: keep the real risk tier for transparency ───────────────
+    risk_level = "low"
+    if (
+        operator_guard is not None and operator_guard[0] == "confirm"
+    ) or argv0 in HIGH_RISK_COMMANDS or high_risk_option or any(
+        pattern in command for pattern in HIGH_RISK_PATTERNS
+    ):
+        risk_level = "high"
+    elif (
+        argv0 in MEDIUM_RISK_COMMANDS
+        or _is_inline_execution(tokens, command_index)
+        or _is_script_execution(tokens, command_index)
+        or _has_absolute_path_token(tokens, allowed_roots=allowed_roots)
+    ):
+        risk_level = "medium"
     return ShellCheckResult(
-        allowed=True, risk_level="low", reason="command is low risk"
+        allowed=True, risk_level=risk_level, reason="command is allowed"
     )

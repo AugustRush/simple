@@ -356,6 +356,8 @@ Key config sections:
 | `tavily_api_key` | Optional Tavily search API key |
 | `output_dir` | Override default `~/.agent/output` |
 | `file_access` | Startup-only workspace read/write policy plus resource limits for file tools (see [File access](#file-access)) |
+| `permissions.shell_level` | Default shell permission level: `ask`, `medium`, `high`, or `full` (see [Shell permissions](#shell-permissions)) |
+| `shell_allowed_commands` | Persistent shell allowlist that skips confirmation (see [Shell permissions](#shell-permissions)) |
 | `assistant_identity` | Deterministic assistant name/role for fact recall |
 | `system_prompt_file` | Load custom system prompt from `.md` or `.txt` |
 
@@ -397,6 +399,59 @@ edit_file(root="workspace", path="agent/config.py",
           expected_revision="sha256:...",
           replacements=[{old_text, new_text, expected_count}])
 ```
+
+### Shell permissions
+
+Medium-risk shell commands (`rm`, `mv`, `ssh`, `curl`, interpreters, script
+files, absolute paths) run automatically. Only **high-risk** constructs —
+destructive commands/options (`mkfs`, `dd`, `shutdown`, `find -delete`),
+shell operators (`;`, `|`, `&&`, redirection), and pipe-to-shell patterns —
+ask the human, and they become runnable after approval.
+
+Permission levels (most → least restrictive):
+
+| Level | Low/medium risk | High-risk commands/options | Operators/patterns |
+|---|---|---|---|
+| `ask` (default) | auto | confirm | confirm |
+| `medium` | auto | auto | confirm |
+| `high` / `full` | auto | auto | auto |
+
+Runtime commands:
+
+| Command | Effect |
+|---|---|
+| `/permissions` | Show the effective level and its description |
+| `/permissions <level>` | Override the level for this session only |
+| `/permissions default <level>` | Persist the config default (applies immediately and after restart) |
+| `/auto-approve on\|off\|status` | Session shortcut for `medium` / `ask` |
+| `/allow <command>` | Persistently allow one command (exact string) or command name (all invocations) |
+| `/deny <command>` | Remove an entry from the persistent allowlist |
+| `/confirm <token>` | Approve one pending confirmation explicitly |
+
+Approval UX: in an interactive terminal a numbered menu appears
+(`1) 批准执行` / `2) 拒绝`, also accepts `y`/`n`/`同意`/`拒绝`); in gateway
+channels (e.g. Feishu) the agent shows the exact command and the user replies
+"同意" (or uses `/confirm <token>`).
+
+Config example:
+
+```json
+{
+  "permissions": { "shell_level": "ask" },
+  "shell_allowed_commands": ["mkfs /dev/disk0", "osascript"]
+}
+```
+
+An entry containing a space matches that exact command; a bare name (like
+`osascript`) allows every invocation of that command. The allowlist and the
+config default apply to sub-agents spawned later; a session-level
+`/permissions` override applies only to that session. Changes made through
+slash commands take effect immediately; editing `config.json` by hand takes
+effect at the next startup.
+
+Unconditional guards that no level can bypass: the `shell_blocked_commands`
+blacklist, cwd escapes (`cd`/`pushd` inside a command), command substitution
+(`` ` ``/`$()`), and commands that cannot be parsed safely.
 
 ## Usage
 
@@ -516,6 +571,11 @@ channels unless marked otherwise.
 | `/skills` | List available skills |
 | `/plugins` | List loaded plugins |
 | `/model [name]` | Show or switch the session model |
+| `/permissions [level\|default <level>]` | Show or set the shell permission level |
+| `/auto-approve on\|off\|status` | Session shortcut for high-risk auto-approval |
+| `/allow <command>` | Add a command to the persistent shell allowlist |
+| `/deny <command>` | Remove a command from the persistent shell allowlist |
+| `/confirm <token>` | Approve one pending restricted shell command |
 | `/export` | Export the current session to Markdown |
 | `/ralph <goal> [--max N] [--verify "cmd"]` | Start a Ralph task |
 | `/ralph list` | List all Ralph tasks |

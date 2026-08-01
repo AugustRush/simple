@@ -256,6 +256,16 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         "shell_blocked_commands",
         list(cfg.get("shell_blocked_commands", [])),
     )
+    registry.set_context(
+        "shell_allowed_commands",
+        list(cfg.get("shell_allowed_commands", [])),
+    )
+    registry.set_context(
+        "shell_permission_level",
+        str(
+            (cfg.get("permissions") or {}).get("shell_level", "ask") or "ask"
+        ),
+    )
     audio_cfg = cfg.get("audio", {})
     audio_transcription_command = ""
     if isinstance(audio_cfg, dict):

@@ -128,6 +128,10 @@ DEFAULT_CONFIG: dict = {
         "max_replacements": 100,
         "max_list_results": 1000,
     },
+    # ── Shell permission level (default for every session) ───────────────
+    "permissions": {
+        "shell_level": "ask",
+    },
 }
 
 
@@ -252,9 +256,34 @@ def _validate_config(cfg: dict) -> list[str]:
         "mcp_servers", "context", "plugins", "channels", "user_tools",
         "system_prompt_file", "output_dir", "tavily_api_key",
         "assistant_identity", "shell_blocked_commands",
+        "shell_allowed_commands",
+        "permissions",
         "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
         "max_truncation_continuations", "file_access",
     })
+
+    allowed_commands = cfg.get("shell_allowed_commands")
+    if allowed_commands is not None:
+        if not isinstance(allowed_commands, list) or not all(
+            isinstance(item, str) and item.strip() for item in allowed_commands
+        ):
+            warnings.append(
+                "'shell_allowed_commands' must be a list of non-empty command strings"
+            )
+
+    permissions_cfg = cfg.get("permissions")
+    if permissions_cfg is not None:
+        if not isinstance(permissions_cfg, dict):
+            warnings.append("'permissions' must be a dict")
+        else:
+            from agent.security.shell import PERMISSION_LEVELS
+
+            shell_level = permissions_cfg.get("shell_level", "ask")
+            if shell_level not in PERMISSION_LEVELS:
+                warnings.append(
+                    f"'permissions.shell_level' must be one of "
+                    f"{', '.join(PERMISSION_LEVELS)}, got '{shell_level}'"
+                )
 
     # ── Top-level unknown keys ────────────────────────────────────────────
     for key in cfg:
@@ -374,6 +403,7 @@ def load_config() -> tuple[dict, bool]:
             "mcp_servers",
             "context",
             "file_access",
+            "permissions",
         ):
             if section not in raw and section in DEFAULT_CONFIG:
                 raw[section] = DEFAULT_CONFIG[section]

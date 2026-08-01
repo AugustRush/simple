@@ -13,6 +13,7 @@ from agent.core.output import (
     _active_assistant_text,
     _active_event_collector,
     _active_sink,
+    _consent_pending,
     _fmt_tool_inputs,
 )
 from agent.plugins.catalog import PostToolEvent, PreToolEvent
@@ -217,6 +218,13 @@ class RegularToolExecutor:
                         "next_timeout_seconds": round(self._stale_timeout_seconds, 3),
                     },
                 )
+                continue
+
+            if _consent_pending():
+                # A medium-risk shell command is waiting for the human at
+                # the consent menu; keep waiting instead of timing out and
+                # silently dropping the consent request.
+                deadline = now + self._stale_timeout_seconds
                 continue
 
             call_task.cancel()

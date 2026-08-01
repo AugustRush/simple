@@ -31,6 +31,15 @@ from agent.shared import CancelToken
 from agent.skills.catalog import SkillCatalog
 
 
+@pytest.fixture(autouse=True)
+def _clear_shell_confirmation_state():
+    from agent.security.shell import shell_session_allowlist_clear
+
+    shell_session_allowlist_clear()
+    yield
+    shell_session_allowlist_clear()
+
+
 async def _noop_handler(
     request: CommandRequest, context: CommandContext
 ) -> CommandResult:
@@ -969,6 +978,10 @@ def test_builtin_registration_defines_portable_scope_and_concurrency() -> None:
         "plugins": ("anytime", frozenset({"all"})),
         "model": ("anytime", frozenset({"all"})),
         "confirm": ("anytime", frozenset({"all"})),
+        "allow": ("anytime", frozenset({"all"})),
+        "deny": ("anytime", frozenset({"all"})),
+        "auto-approve": ("anytime", frozenset({"all"})),
+        "permissions": ("anytime", frozenset({"all"})),
         "quit": ("anytime", frozenset({"cli"})),
         "send": ("anytime", frozenset({"feishu"})),
         "cancel": ("interrupt", frozenset({"all"})),
@@ -1016,7 +1029,7 @@ def test_builtin_confirm_redeems_with_command_context_identity():
     shell_session_allowlist_clear()
     router = _builtin_router()
     scope = ShellAuthorizationScope("s-1", "feishu", "user-1")
-    pending = shell_command_check("mv a b", scope=scope)
+    pending = shell_command_check("mkfs /dev/disk0", scope=scope)
 
     result = _run_builtin(
         router,
@@ -1027,7 +1040,7 @@ def test_builtin_confirm_redeems_with_command_context_identity():
     )
 
     assert result.response_text == "Confirmation accepted. Retry the requested operation."
-    assert shell_command_check("mv a b", scope=scope).allowed is True
+    assert shell_command_check("mkfs /dev/disk0", scope=scope).allowed is True
 
 
 def test_builtin_confirm_rejects_wrong_user_and_invalid_arguments():
@@ -1040,7 +1053,7 @@ def test_builtin_confirm_rejects_wrong_user_and_invalid_arguments():
     shell_session_allowlist_clear()
     router = _builtin_router()
     owner = ShellAuthorizationScope("s-1", "feishu", "user-1")
-    pending = shell_command_check("mv a b", scope=owner)
+    pending = shell_command_check("mkfs /dev/disk0", scope=owner)
 
     wrong_user = _run_builtin(
         router,
@@ -1052,6 +1065,164 @@ def test_builtin_confirm_rejects_wrong_user_and_invalid_arguments():
 
     assert "invalid, expired" in (wrong_user.response_text or "").lower()
     assert usage.response_text == "Usage: /confirm <token>"
+
+
+def test_allow_command_persists_and_applies_to_registry(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+    from agent.commands import CommandRouter, register_builtin_commands
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+
+    class RegistryStub:
+        def __init__(self):
+            self.allowlist = []
+
+        def set_context(self, name, value):
+            if name == "shell_allowed_commands":
+                self.allowlist = list(value)
+
+    registry = RegistryStub()
+    router = CommandRouter()
+    register_builtin_commands(router)
+
+    result = _run_builtin(router, "/allow mv a b", components={"registry": registry})
+
+    assert "mv a b" in result.response_text
+    assert registry.allowlist == ["mv a b"]
+    cfg, _ = load_config()
+    assert cfg.get("shell_allowed_commands") == ["mv a b"]
+
+
+def test_deny_command_removes_from_allowlist(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config, save_config
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    cfg, _ = load_config()
+    cfg["shell_allowed_commands"] = ["mv a b", "osascript"]
+    save_config(cfg)
+
+    router = _builtin_router()
+    result = _run_builtin(router, "/deny mv a b")
+
+    assert "已从放行列表移除" in result.response_text
+    updated, _ = load_config()
+    assert updated.get("shell_allowed_commands") == ["osascript"]
+
+    missing = _run_builtin(router, "/deny never-added")
+    assert "不存在" in (missing.response_text or "")
+
+
+def test_auto_approve_command_toggles_session_scope():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_auto_approve_status,
+    )
+
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+
+    result = _run_builtin(
+        router,
+        "/auto-approve on",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    assert "已开启" in result.response_text
+    assert shell_session_auto_approve_status(scope) is True
+
+    status = _run_builtin(
+        router,
+        "/auto-approve",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    assert "开启" in status.response_text
+
+    result = _run_builtin(
+        router,
+        "/auto-approve off",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    assert "已关闭" in result.response_text
+    assert shell_session_auto_approve_status(scope) is False
+
+
+def test_permissions_command_sets_session_level_and_shows_status():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_permission_get,
+    )
+
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+
+    result = _run_builtin(
+        router,
+        "/permissions full",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    assert "full" in result.response_text
+    assert shell_session_permission_get(scope) == "full"
+    assert shell_command_check("mkfs /dev/disk0", scope=scope).allowed is True
+    assert shell_command_check("echo a; echo b", scope=scope).allowed is True
+
+    status = _run_builtin(
+        router,
+        "/permissions",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    assert "●" in status.response_text
+    assert "full" in status.response_text
+    assert "会话覆盖" in status.response_text
+
+    result = _run_builtin(
+        router,
+        "/permissions ask",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    assert "ask" in result.response_text
+    assert (
+        shell_command_check("mkfs /dev/disk0", scope=scope).requires_confirmation
+        is True
+    )
+
+
+def test_permissions_command_persists_default(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    router = _builtin_router()
+
+    result = _run_builtin(router, "/permissions default high")
+
+    assert "high" in result.response_text
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_level"] == "high"
+
+
+def test_permissions_command_rejects_unknown_level():
+    router = _builtin_router()
+
+    result = _run_builtin(router, "/permissions superuser")
+
+    assert "Usage" in (result.response_text or "")
+
+
+def test_config_validation_accepts_only_known_permission_levels():
+    from agent.config import _validate_config
+
+    warnings = _validate_config({"permissions": {"shell_level": "root"}})
+    assert any("shell_level" in warning for warning in warnings)
+
+    assert _validate_config({"permissions": {"shell_level": "full"}}) == []
 
 
 def test_builtin_ralph_maps_start_list_resume_and_parse_errors():
@@ -3206,3 +3377,147 @@ def test_coordinator_exception_is_stable_and_always_cleans_state() -> None:
     assert state.operation_state == "idle"
     assert state.accepts_interjections is False
     assert sink.drain_count >= 1
+
+
+def test_coordinator_chat_approval_redeems_single_pending_command() -> None:
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_allowlist_contains,
+    )
+
+    scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+    shell_command_check("mkfs /dev/disk0", scope=scope)
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+    sink = _CoordinatorSink()
+
+    asyncio.run(
+        coordinator.handle(_turn("批准"), state, sink)  # type: ignore[arg-type]
+    )
+
+    assert core.calls
+    forwarded = core.calls[0].text
+    assert "mkfs /dev/disk0" in forwarded
+    assert "重试" in forwarded
+    assert any("已批准待确认命令" in text for text, _level in sink.statuses)
+    assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is True
+
+
+@pytest.mark.parametrize(
+    "reply",
+    ["同意", "允许执行", "yes", "approve", " 批准 ", "ok"],
+)
+def test_coordinator_chat_approval_accepts_common_approval_phrases(reply: str) -> None:
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_allowlist_contains,
+    )
+
+    scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+    shell_command_check("mkfs /dev/disk0", scope=scope)
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+    asyncio.run(
+        coordinator.handle(_turn(reply), state, _CoordinatorSink())  # type: ignore[arg-type]
+    )
+
+    assert core.calls
+    assert "mkfs /dev/disk0" in core.calls[0].text
+    assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is True
+
+
+def test_coordinator_chat_approval_is_ignored_without_pending() -> None:
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+    asyncio.run(
+        coordinator.handle(_turn("批准"), state, _CoordinatorSink())  # type: ignore[arg-type]
+    )
+
+    assert core.calls
+    assert core.calls[0].text == "批准"
+
+
+def test_coordinator_chat_approval_refuses_ambiguous_pending() -> None:
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_allowlist_contains,
+    )
+
+    scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+    shell_command_check("mkfs /dev/disk0", scope=scope)
+    shell_command_check("dd if=/dev/zero of=/dev/disk1", scope=scope)
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+    sink = _CoordinatorSink()
+
+    asyncio.run(
+        coordinator.handle(_turn("批准"), state, sink)  # type: ignore[arg-type]
+    )
+
+    assert core.calls
+    assert core.calls[0].text == "批准"
+    assert any("/confirm" in text for text, _level in sink.statuses)
+    assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is False
+    assert (
+        shell_session_allowlist_contains(
+            "dd if=/dev/zero of=/dev/disk1", scope=scope
+        )
+        is False
+    )
+
+
+def test_coordinator_chat_approval_is_scoped_to_session_channel_and_user() -> None:
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_allowlist_contains,
+    )
+
+    scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+    shell_command_check("mkfs /dev/disk0", scope=scope)
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+    turn = TurnInput.from_text(
+        "批准",
+        session_id="s-1",
+        channel_name="feishu",
+        metadata={"user_id": "u-2"},
+    )
+
+    asyncio.run(
+        coordinator.handle(turn, state, _CoordinatorSink())  # type: ignore[arg-type]
+    )
+
+    assert core.calls
+    assert core.calls[0].text == "批准"
+    assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is False
+
+
+def test_coordinator_chat_approval_rejects_long_or_qualified_replies() -> None:
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_allowlist_contains,
+    )
+
+    scope = ShellAuthorizationScope("s-1", "feishu", "u-1")
+    shell_command_check("mkfs /dev/disk0", scope=scope)
+    coordinator, core = _coordinator()
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+    asyncio.run(
+        coordinator.handle(
+            _turn("批准，然后顺便告诉我结果"),
+            state,
+            _CoordinatorSink(),  # type: ignore[arg-type]
+        )
+    )
+
+    assert core.calls
+    assert core.calls[0].text == "批准，然后顺便告诉我结果"
+    assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is False

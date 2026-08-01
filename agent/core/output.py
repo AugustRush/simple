@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import contextvars
 from dataclasses import dataclass, field
+import functools
 import json
+import logging
 import re
 import sys
 import time
 from abc import ABC
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from rich.markdown import Markdown
 from rich.markup import escape as _markup_escape
@@ -18,8 +21,58 @@ from rich.text import Text
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.validation import Validator
+
+logger = logging.getLogger(__name__)
 
 _APPROVAL_PROMPT = PromptSession(history=InMemoryHistory())
+# Serializes concurrent consent flows.  The tool loop runs medium-risk
+# shell calls in parallel (asyncio.gather); the shell tool acquires this
+# lock around its allowlist re-check + sink prompt + token redemption so
+# two prompt_toolkit sessions never share one terminal and an identical
+# command approved by the first parallel call is not asked about twice.
+_APPROVAL_LOCK = asyncio.Lock()
+
+_APPROVAL_ACCEPT_ANSWERS = frozenset({"1", "y", "yes", "同意", "批准"})
+_APPROVAL_DECLINE_ANSWERS = frozenset({"2", "n", "no", "拒绝"})
+_APPROVAL_VALIDATOR = Validator.from_callable(
+    lambda text: text.strip().casefold() in (
+        _APPROVAL_ACCEPT_ANSWERS | _APPROVAL_DECLINE_ANSWERS
+    ),
+    error_message="请输入 1（批准执行）或 2（拒绝）",
+    move_cursor_to_end=True,
+)
+
+
+def _approval_choice_accepted(answer: str) -> bool:
+    """Map an approval-menu answer to consent (True) or decline (False)."""
+    return str(answer or "").strip().casefold() in _APPROVAL_ACCEPT_ANSWERS
+
+
+def _consent_pending() -> bool:
+    """True while a shell consent prompt is open (deadline guard)."""
+    return _APPROVAL_LOCK.locked()
+
+
+def _deferred_during_consent(fn):
+    """Buffer one sink render while an approval menu is on screen.
+
+    Parallel tool calls keep emitting tool results, heartbeats, and progress
+    while the human is deciding; prompt_toolkit and rich must never write to
+    the terminal at the same time, or the menu becomes unreadable.  The
+    buffered renders flush as soon as the consent prompt closes.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        if self._approval_active:
+            self._approval_buffers.append(
+                lambda: fn(self, *args, **kwargs)
+            )
+            return
+        return fn(self, *args, **kwargs)
+
+    return wrapper
 
 # Inline markdown tokens styled per-line while streaming (code, bold,
 # italic, links).  Order matters: ** before * so bold consumes both stars.
@@ -351,6 +404,8 @@ class CliOutputSink(OutputSink):
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._tool_count = 0
         self._tool_start_times: dict[str, float] = {}
+        self._approval_active = False
+        self._approval_buffers: list[Callable[[], None]] = []
         self._progress: Progress | None = None
         self._progress_task: Any = None
         self._tool_progress: Progress | None = None
@@ -396,6 +451,7 @@ class CliOutputSink(OutputSink):
             self._console.print()
             self._line_open = False
 
+    @_deferred_during_consent
     def on_stream_chunk(self, chunk: str) -> None:
         self._stop_activity()
         self._streamed.append(chunk)
@@ -436,6 +492,7 @@ class CliOutputSink(OutputSink):
         self._streamed.clear()
         self._tool_count = 0
 
+    @_deferred_during_consent
     def on_tool_start(self, name: str, inputs: dict) -> None:
         self._stop_activity()
         self._finish_open_line()
@@ -445,6 +502,7 @@ class CliOutputSink(OutputSink):
         self._tool_count += 1
         self._set_activity(f"Running {name}…")
 
+    @_deferred_during_consent
     def on_tool_end(self, name: str, result: str) -> None:
         self._stop_activity()
         if self._tool_progress is not None:
@@ -464,6 +522,7 @@ class CliOutputSink(OutputSink):
         self._console.print(f"{indicator} [dim]{_markup_escape(summary)}[/dim]{elapsed}")
         self._set_activity("Processing results…")
 
+    @_deferred_during_consent
     def on_tool_blocked(self, name: str, reason: str) -> None:
         self._stop_activity()
         self._finish_open_line()
@@ -493,20 +552,43 @@ class CliOutputSink(OutputSink):
         """
         if not self._supports_live_status() or not sys.stdin.isatty():
             return False
-        self._stop_activity()
-        self._finish_open_line()
-        self._console.print(
-            f"[yellow]需要批准的工具操作：[/yellow]"
-            f"[bold]{_markup_escape(_clip_single_line(command, 200))}[/bold]\n"
-            f"[dim]风险等级: {_markup_escape(str(risk_level))} · "
-            f"{_markup_escape(_clip_single_line(str(reason), 160))}[/dim]"
-        )
+        self._approval_active = True
         try:
-            answer = await _APPROVAL_PROMPT.prompt_async("允许执行？[y/N] ")
-        except (KeyboardInterrupt, EOFError):
-            return False
-        return str(answer or "").strip().lower() in {"y", "yes"}
+            self._stop_activity()
+            self._finish_open_line()
+            self._console.print(
+                f"[yellow]需要批准的工具操作：[/yellow]"
+                f"[bold]{_markup_escape(_clip_single_line(command, 200))}[/bold]\n"
+                f"[dim]风险等级: {_markup_escape(str(risk_level))} · "
+                f"{_markup_escape(_clip_single_line(str(reason), 160))}[/dim]"
+            )
+            self._console.print(
+                "  [bold cyan]1)[/bold cyan] 批准执行\n"
+                "  [bold cyan]2)[/bold cyan] 拒绝\n"
+                "[dim]输入 1/2 后按 Enter（也可输入 y/n 或 同意/拒绝）；Ctrl+C 取消[/dim]"
+            )
+            try:
+                answer = await _APPROVAL_PROMPT.prompt_async(
+                    "请选择 1/2 › ",
+                    validator=_APPROVAL_VALIDATOR,
+                )
+            except (KeyboardInterrupt, EOFError):
+                return False
+            return _approval_choice_accepted(answer)
+        finally:
+            self._approval_active = False
+            self._flush_consent_buffer()
 
+    def _flush_consent_buffer(self) -> None:
+        pending = list(self._approval_buffers)
+        self._approval_buffers.clear()
+        for render in pending:
+            try:
+                render()
+            except Exception:
+                logger.exception("deferred consent-render failed")
+
+    @_deferred_during_consent
     def on_tool_progress(self, name: str, progress: Mapping[str, Any]) -> None:
         status = str(progress.get("status") or "running")
         message = str(progress.get("message") or "").strip()
@@ -549,6 +631,7 @@ class CliOutputSink(OutputSink):
             return
         self._console.print(f"[dim]↻ {_markup_escape(_clip_single_line(text, 200))}[/dim]")
 
+    @_deferred_during_consent
     def on_notification(self, title: str, body: str, *, level: str = "info") -> None:
         from rich.panel import Panel
 
@@ -563,11 +646,13 @@ class CliOutputSink(OutputSink):
             )
         )
 
+    @_deferred_during_consent
     def on_info(self, content: Any) -> None:
         self._stop_activity()
         self._finish_open_line()
         self._console.print(content)
 
+    @_deferred_during_consent
     def on_status(self, text: str, *, level: str = "info") -> None:
         self._stop_activity()
         self._finish_open_line()
@@ -578,6 +663,7 @@ class CliOutputSink(OutputSink):
             f"[{color}]{clean}[/{color}]"
         )
 
+    @_deferred_during_consent
     def on_heartbeat(
         self,
         *,
@@ -610,12 +696,14 @@ class CliOutputSink(OutputSink):
             f"[dim]… {_markup_escape(activity_text)}[/dim]"
         )
 
+    @_deferred_during_consent
     def on_error(self, error: str) -> None:
         self._stop_activity()
         self._finish_open_line()
         clean = _markup_escape(_redact_sensitive_text(str(error or "Unknown error")))
         self._console.print(f"[red]Error[/red] [dim]{clean}[/dim]")
 
+    @_deferred_during_consent
     def on_subagent_event(self, event: "SubAgentProgressEvent") -> None:
         if event.kind == "batch_started":
             self._stop_activity()

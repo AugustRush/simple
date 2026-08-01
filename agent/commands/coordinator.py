@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 import logging
 from pathlib import Path
+import re
 import time
 from typing import Any, Callable, Mapping, NotRequired, TypedDict
 
@@ -22,6 +23,38 @@ logger = logging.getLogger(__name__)
 
 _BUSY_MESSAGE = "Session is busy; wait for the current operation to finish."
 _FAILED_MESSAGE = "Command handling failed."
+
+_CHAT_APPROVAL_PHRASES = frozenset(
+    {
+        "批准",
+        "同意",
+        "允许",
+        "确认",
+        "批准执行",
+        "同意执行",
+        "允许执行",
+        "确认执行",
+        "approve",
+        "approved",
+        "yes",
+        "y",
+        "ok",
+        "okay",
+    }
+)
+_CHAT_APPROVAL_MAX_LENGTH = 24
+
+
+def _is_chat_approval_message(text: str) -> bool:
+    """Return True only for a short, unambiguous approval reply."""
+    normalized = re.sub(
+        r"[\s\u3000，。！？!?.,、;；：:·\-_/\\\"'“”‘’()（）\[\]【】]+",
+        "",
+        str(text or ""),
+    ).strip()
+    return bool(normalized) and len(normalized) <= _CHAT_APPROVAL_MAX_LENGTH and (
+        normalized.casefold() in _CHAT_APPROVAL_PHRASES
+    )
 
 
 class _QueueEntry(TypedDict):
@@ -68,6 +101,9 @@ class CommandCoordinator:
                 channel_name=turn_input.channel_name,
                 session_id=turn_input.session_id,
                 metadata=turn_input.metadata,
+            )
+            turn_input = self._maybe_redeem_chat_approval(
+                turn_input, classification, sink
             )
             action = await self._route(
                 classification,
@@ -153,7 +189,7 @@ class CommandCoordinator:
                 state,
                 sink,
                 classification=None,
-                forward_text=classification.text,
+                forward_text=turn_input.text,
                 accepts_interjections=True,
             )
 
@@ -643,6 +679,67 @@ class CommandCoordinator:
             session_id=turn_input.session_id,
             message_id=str(turn_input.metadata.get("message_id", "")),
             metadata=turn_input.metadata,
+        )
+
+    def _maybe_redeem_chat_approval(
+        self,
+        turn_input: TurnInput,
+        classification: CommandClassification,
+        sink: OutputSink,
+    ) -> TurnInput:
+        """Redeem the sole pending shell confirmation for an approval reply.
+
+        A short approval message ("批准", "同意", "yes", …) approves the
+        only pending medium-risk command for this session/channel/user
+        scope, mirroring ``/confirm <token>`` without requiring the human to
+        see a token.  It never accepts a command argument, and it refuses to
+        act when zero or several records are pending (ambiguous).  On
+        success the forwarded text is rewritten to tell the agent which
+        command was approved so it can retry the identical command.
+        """
+        if classification.kind != "text" or not _is_chat_approval_message(
+            turn_input.text
+        ):
+            return turn_input
+
+        from agent.security.shell import (
+            ShellAuthorizationScope,
+            shell_approve_single_pending,
+            shell_pending_for_scope,
+        )
+
+        scope = ShellAuthorizationScope(
+            turn_input.session_id,
+            turn_input.channel_name,
+            str(turn_input.metadata.get("user_id") or ""),
+        )
+        pending = shell_pending_for_scope(scope)
+        if not pending:
+            return turn_input
+        if len(pending) > 1:
+            self._safe_status(
+                sink,
+                f"当前有 {len(pending)} 条命令待确认，无法用“批准”批量放行；"
+                "请使用 /confirm <token> 逐条批准。",
+                level="warning",
+            )
+            return turn_input
+
+        command = shell_approve_single_pending(scope)
+        if command is None:
+            return turn_input
+        self._safe_status(
+            sink,
+            f"已批准待确认命令：{command}。可以用相同命令重试执行。",
+            level="info",
+        )
+        return replace(
+            turn_input,
+            text=(
+                f"用户已批准待确认命令：{command}。"
+                "该命令已加入会话白名单（约 5 分钟有效），"
+                "请用完全相同的命令重试执行。"
+            ),
         )
 
     def _emit_received(

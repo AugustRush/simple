@@ -8714,3 +8714,77 @@ def test_save_config_uses_atomic_replace(monkeypatch, tmp_path):
         "active_provider": "fake"
     }
     assert replace_calls
+
+
+def test_execute_regular_tool_calls_serializes_batches_containing_shell():
+    from agent.core.agent import _execute_regular_tool_calls
+
+    shell_started = asyncio.Event()
+    release_shell = asyncio.Event()
+    other_ran: list[str] = []
+
+    class FakeExecutor:
+        async def run(self, tool_use):
+            name = tool_use["name"]
+            if name == "shell":
+                shell_started.set()
+                await release_shell.wait()
+            else:
+                other_ran.append(name)
+            return json.dumps({"ok": True})
+
+    regular_calls = [
+        (0, {"name": "shell", "input": {"command": "echo ok", "intent": "test"}}),
+        (1, {"name": "read_file", "input": {"path": "x"}}),
+    ]
+
+    async def scenario():
+        task = asyncio.create_task(
+            _execute_regular_tool_calls(regular_calls, FakeExecutor())
+        )
+        await shell_started.wait()
+        await asyncio.sleep(0.05)
+        # While the shell call is blocked (e.g. on the consent menu), the
+        # rest of the batch must not run or print.
+        assert other_ran == []
+        release_shell.set()
+        return await task
+
+    results = asyncio.run(scenario())
+    assert json.loads(results[0]) == {"ok": True}
+    assert json.loads(results[1]) == {"ok": True}
+    assert other_ran == ["read_file"]
+
+
+def test_execute_regular_tool_calls_keeps_parallelism_without_shell():
+    from agent.core.agent import _execute_regular_tool_calls
+
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_ran = asyncio.Event()
+
+    class FakeExecutor:
+        async def run(self, tool_use):
+            if tool_use["name"] == "read_file":
+                first_started.set()
+                await release_first.wait()
+            else:
+                second_ran.set()
+            return json.dumps({"ok": True})
+
+    regular_calls = [
+        (0, {"name": "read_file", "input": {"path": "x"}}),
+        (1, {"name": "list_files", "input": {"path": "."}}),
+    ]
+
+    async def scenario():
+        task = asyncio.create_task(
+            _execute_regular_tool_calls(regular_calls, FakeExecutor())
+        )
+        await first_started.wait()
+        await asyncio.wait_for(second_ran.wait(), timeout=1.0)
+        release_first.set()
+        return await task
+
+    results = asyncio.run(scenario())
+    assert all(json.loads(result) == {"ok": True} for result in results)
