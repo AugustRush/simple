@@ -38,6 +38,134 @@ class ToolDef:
     fn: Callable
     source: str = "runtime"
     capabilities: frozenset[str] = field(default_factory=frozenset)
+    authorizer: Optional[Callable[[dict, "ToolRegistry"], Optional[dict]]] = None
+
+
+# JSON Schema keywords this registry can validate deterministically.  Schemas
+# using any other keyword fall back to legacy behavior instead of pretending
+# they were fully validated.
+_UNSUPPORTED_SCHEMA_KEYWORDS = frozenset(
+    {
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "not",
+        "pattern",
+        "format",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+        "const",
+        "multipleOf",
+        "$ref",
+    }
+)
+
+_JSON_TYPE_MAP = {
+    "string": str,
+    "integer": int,
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def _invalid_request(message: str) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "error": {
+            "code": "invalid_request",
+            "message": message,
+            "details": {},
+            "retryable": False,
+        },
+    }
+
+
+def _schema_has_unsupported_keywords(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return True
+    return any(keyword in schema for keyword in _UNSUPPORTED_SCHEMA_KEYWORDS)
+
+
+def _validate_value(value: Any, schema: Any, field: str) -> Optional[dict]:
+    if _schema_has_unsupported_keywords(schema):
+        return None
+    expected = _JSON_TYPE_MAP.get(schema.get("type", ""))
+    if expected is not None:
+        if schema.get("type") == "integer" and isinstance(value, bool):
+            return _invalid_request(
+                f"invalid value for field '{field}': expected integer"
+            )
+        if not isinstance(value, expected) or (
+            schema.get("type") == "boolean" and not isinstance(value, bool)
+        ):
+            return _invalid_request(
+                f"invalid value for field '{field}': expected "
+                f"{schema.get('type')}, got {type(value).__name__}"
+            )
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and enum_values and value not in enum_values:
+        return _invalid_request(
+            f"invalid value for field '{field}': {value!r} is not one of "
+            + ", ".join(repr(item) for item in enum_values)
+        )
+    minimum = schema.get("minimum")
+    maximum = schema.get("maximum")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if minimum is not None and value < minimum:
+            return _invalid_request(
+                f"invalid value for field '{field}': must be >= {minimum}"
+            )
+        if maximum is not None and value > maximum:
+            return _invalid_request(
+                f"invalid value for field '{field}': must be <= {maximum}"
+            )
+    if schema.get("type") == "array":
+        items_schema = schema.get("items")
+        if isinstance(items_schema, dict) and isinstance(value, list):
+            for index, item in enumerate(value):
+                error = _validate_value(item, items_schema, f"{field}[{index}]")
+                if error is not None:
+                    return error
+    return None
+
+
+def _validate_tool_input(tool_input: Any, schema: Any) -> Optional[dict]:
+    if not isinstance(tool_input, dict):
+        return _invalid_request("tool input must be an object")
+    if _schema_has_unsupported_keywords(schema) or schema.get("type") != "object":
+        return None  # unsupported schema shape -> legacy behavior
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return None
+    for key in schema.get("required", []):
+        # A property that declares a default is supplied by the handler when
+        # absent, so it is not a hard requirement regardless of the schema's
+        # legacy "required" list.
+        prop_schema = properties.get(key)
+        if isinstance(prop_schema, dict) and "default" in prop_schema:
+            continue
+        if key not in tool_input:
+            return _invalid_request(f"missing required field: {key}")
+    if schema.get("additionalProperties") is False:
+        unknown = sorted(set(tool_input) - set(properties))
+        if unknown:
+            return _invalid_request(
+                "unknown field(s): " + ", ".join(unknown)
+            )
+    for key, value in tool_input.items():
+        prop_schema = properties.get(key)
+        if prop_schema is None:
+            continue
+        error = _validate_value(value, prop_schema, key)
+        if error is not None:
+            return error
+    return None
 
 
 class ToolRegistry:
@@ -55,7 +183,8 @@ class ToolRegistry:
         ("builtin", "web_search"): frozenset({"read"}),
         ("builtin", "web_fetch"): frozenset({"read"}),
         ("builtin", "tavily_search"): frozenset({"read"}),
-        ("builtin", "write_file"): frozenset({"workspace_write"}),
+        ("builtin", "write_file"): frozenset({"output_write"}),
+        ("builtin", "edit_file"): frozenset({"output_write"}),
         ("builtin", "clean_output"): frozenset({"output_write"}),
         ("builtin", "clear_context"): frozenset({"state_write"}),
         ("builtin", "shell"): frozenset({"shell", "requires_intent"}),
@@ -93,6 +222,9 @@ class ToolRegistry:
         replace: bool = False,
         source: str = "runtime",
         capabilities: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None = None,
+        authorizer: Optional[
+            Callable[[dict, "ToolRegistry"], Optional[dict]]
+        ] = None,
     ):
         if name in self._tools:
             existing = self._tools[name]
@@ -113,6 +245,7 @@ class ToolRegistry:
             fn=fn,
             source=source,
             capabilities=self._coerce_capabilities(name, source, capabilities),
+            authorizer=authorizer,
         )
         self._prompt_generation += 1
 
@@ -173,6 +306,14 @@ class ToolRegistry:
                 merged_context.update(self._context)
                 override_registry = owner_registry
                 override_token = owner_registry._context_override.set(merged_context)
+            validation_error = _validate_tool_input(tool_input, self._tools[tool_name].parameters)
+            if validation_error is not None:
+                return json.dumps(validation_error, ensure_ascii=False)
+            authorizer = self._tools[tool_name].authorizer
+            if authorizer is not None:
+                denial = authorizer(tool_input, self)
+                if denial is not None:
+                    return json.dumps(denial, ensure_ascii=False)
             if self._tool_has_safe_kwargs(tool_input):
                 if asyncio.iscoroutinefunction(fn):
                     result = await fn(**tool_input)

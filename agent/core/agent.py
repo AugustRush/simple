@@ -2967,9 +2967,9 @@ class BaseAgent:
             )
         allowed_capabilities: set[str] | None = None
         if normalized_profile in {"read_only", "research"}:
-            allowed_capabilities = {"read"}
+            allowed_capabilities = {"read", "output_write"}
         elif normalized_profile == "implementation":
-            allowed_capabilities = {"read"}
+            allowed_capabilities = {"read", "output_write"}
             if write_scope:
                 allowed_capabilities.add("workspace_write")
         for name, tool_def in tools_snapshot.items():

@@ -22,7 +22,7 @@ from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
 from agent.security.network import fetch_public_http_url
 from agent.security.shell import shell_command_uses_shell_features
-from agent.tools.files import FileAccessPolicy, FileService
+from agent.tools.files import FileAccessPolicy, FileService, write_scope_allows
 
 from .executor import report_tool_progress
 from .runtime import ToolRegistry
@@ -244,6 +244,7 @@ class BuiltinTools:
                 "additionalProperties": False,
             },
             self._write_file,
+            authorizer=self._file_mutation_authorizer,
             source="builtin",
         )
 
@@ -369,6 +370,7 @@ class BuiltinTools:
                 "additionalProperties": False,
             },
             self._edit_file,
+            authorizer=self._file_mutation_authorizer,
             source="builtin",
         )
 
@@ -495,6 +497,7 @@ class BuiltinTools:
                     "prompt": {
                         "type": "string",
                         "description": "Backward-compatible content field. Defaults to a literal message unless action_type=agent_task.",
+                        "default": "",
                     },
                     "action_type": {
                         "type": "string",
@@ -542,7 +545,7 @@ class BuiltinTools:
                         "description": "optional override: standalone or channel",
                     },
                 },
-                "required": ["name", "trigger_type", "prompt"],
+                "required": ["name", "trigger_type"],
             },
             self._schedule_create,
             source="builtin",
@@ -1205,6 +1208,53 @@ class BuiltinTools:
 
     def _error(self, message: str, **payload: Any) -> dict[str, Any]:
         return {"ok": False, "error": message, **payload}
+
+    def _file_mutation_authorizer(
+        self,
+        tool_input: dict[str, Any],
+        registry: ToolRegistry,
+    ) -> dict[str, Any] | None:
+        """Call-aware authorization for root-dependent file mutations.
+
+        ``write_file``/``edit_file`` carry the base ``output_write``
+        capability and are available in every Agent profile for
+        ``output_dir``.  A workspace target additionally requires the
+        ``workspace_write`` capability (implementation profile with an
+        explicit write_scope), the startup workspace write switch, and
+        containment in the effective write scope.
+        """
+        if tool_input.get("root") != "workspace":
+            return None
+        profile = registry.get_context("capability_profile")
+        if profile is not None and profile != "full":
+            if profile != "implementation":
+                return self._structured_access_denied(
+                    "workspace writes require the workspace_write capability"
+                )
+            scope = registry.get_context("write_scope") or ()
+            path = tool_input.get("path", "")
+            if not write_scope_allows(scope, path):
+                return self._structured_access_denied(
+                    f"path is outside the effective write scope: {path}"
+                )
+        policy = registry.get_context("file_access_policy")
+        if policy is not None and not policy.workspace_write:
+            return self._structured_access_denied(
+                "workspace writes are disabled by the file access policy"
+            )
+        return None
+
+    @staticmethod
+    def _structured_access_denied(message: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "error": {
+                "code": "access_denied",
+                "message": message,
+                "details": {},
+                "retryable": False,
+            },
+        }
 
     def _resolve_tool_path(self, path: str) -> tuple[Path, str]:
         return resolve_workspace_path(

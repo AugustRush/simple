@@ -393,6 +393,220 @@ def test_registry_round_trip_create_edit_read(tmp_path):
     assert (output / "note.txt").read_text(encoding="utf-8") == "alpha\ngamma\n"
 
 
+def test_tool_schema_validation_rejects_invalid_inputs(tmp_path):
+    tools, registry, workspace = make_builtin_tools(tmp_path)
+    (workspace / "a.txt").write_text("x", encoding="utf-8")
+
+    missing = json.loads(
+        asyncio.run(registry.call("read_file", {"root": "workspace"}))
+    )
+    assert missing["error"]["code"] == "invalid_request"
+    assert "missing required field: path" in missing["error"]["message"]
+
+    unknown = json.loads(
+        asyncio.run(
+            registry.call(
+                "read_file",
+                {"root": "workspace", "path": "a.txt", "bogus": 1},
+            )
+        )
+    )
+    assert unknown["error"]["code"] == "invalid_request"
+    assert "unknown field" in unknown["error"]["message"]
+
+    wrong_type = json.loads(
+        asyncio.run(
+            registry.call(
+                "read_file",
+                {"root": "workspace", "path": "a.txt", "start_line": "1"},
+            )
+        )
+    )
+    assert wrong_type["error"]["code"] == "invalid_request"
+
+    bad_enum = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {"root": "bogus", "path": "a.txt", "mode": "create", "content": "x"},
+            )
+        )
+    )
+    assert bad_enum["error"]["code"] == "invalid_request"
+
+
+def test_tool_schema_validation_no_coercion_and_integer_bounds():
+    from agent import ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(
+        "bounded",
+        "bounded tool",
+        {
+            "type": "object",
+            "properties": {"n": {"type": "integer", "minimum": 1}},
+            "required": ["n"],
+        },
+        lambda n: {"ok": True, "n": n},
+    )
+
+    coerced = json.loads(asyncio.run(registry.call("bounded", {"n": "5"})))
+    assert coerced["error"]["code"] == "invalid_request"
+
+    below = json.loads(asyncio.run(registry.call("bounded", {"n": 0})))
+    assert below["error"]["code"] == "invalid_request"
+
+    ok = json.loads(asyncio.run(registry.call("bounded", {"n": 5})))
+    assert ok == {"ok": True, "n": 5}
+
+
+def test_schema_validation_runs_before_authorizer_and_handler():
+    from agent import ToolRegistry
+
+    calls = []
+
+    def authorizer(tool_input, registry):
+        calls.append(("authorizer", tool_input))
+        return None
+
+    registry = ToolRegistry()
+    registry.register(
+        "guarded",
+        "guarded tool",
+        {
+            "type": "object",
+            "properties": {"n": {"type": "integer"}},
+            "required": ["n"],
+            "additionalProperties": False,
+        },
+        lambda n: calls.append(("handler", n)) or {"ok": True},
+        authorizer=authorizer,
+    )
+
+    invalid = json.loads(asyncio.run(registry.call("guarded", {"n": "bad"})))
+    assert invalid["error"]["code"] == "invalid_request"
+    assert calls == []
+
+    valid = json.loads(asyncio.run(registry.call("guarded", {"n": 3})))
+    assert valid == {"ok": True}
+    assert calls == [("authorizer", {"n": 3}), ("handler", 3)]
+
+
+def test_authorizer_denial_is_returned_unchanged():
+    from agent import ToolRegistry
+
+    denial = {
+        "ok": False,
+        "error": {
+            "code": "access_denied",
+            "message": "blocked by authorizer",
+            "details": {"reason": "test"},
+            "retryable": False,
+        },
+    }
+
+    def authorizer(tool_input, registry):
+        return denial
+
+    registry = ToolRegistry()
+    registry.register(
+        "guarded",
+        "guarded tool",
+        {"type": "object", "properties": {}},
+        lambda: {"ok": True},
+        authorizer=authorizer,
+    )
+
+    result = json.loads(asyncio.run(registry.call("guarded", {})))
+    assert result == denial
+
+
+def test_file_mutation_authorizer_allows_output_dir_for_read_only(tmp_path):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    registry.set_context("capability_profile", "read_only")
+
+    output_write = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {"root": "output_dir", "path": "a.txt", "mode": "create", "content": "x"},
+            )
+        )
+    )
+    assert output_write["ok"] is True
+
+    workspace_write = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {"root": "workspace", "path": "a.txt", "mode": "create", "content": "x"},
+            )
+        )
+    )
+    assert workspace_write["error"]["code"] == "access_denied"
+
+
+def test_file_mutation_authorizer_enforces_implementation_scope(tmp_path):
+    from agent import BuiltinTools, MemoryPalace, ToolRegistry
+    from agent.tools.files import FileAccessPolicy, FileService
+
+    registry = ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    policy = FileAccessPolicy.from_config(
+        {"workspace": {"read": True, "write": True}},
+        workspace_root=workspace,
+        output_root=output,
+    )
+    service = FileService(
+        policy,
+        write_scope=lambda: registry.get_context("write_scope") or (),
+    )
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    BuiltinTools(
+        memory,
+        registry,
+        workspace_root=workspace,
+        output_dir=output,
+        file_service=service,
+    )
+    registry.set_context("file_access_policy", policy)
+    registry.set_context("capability_profile", "implementation")
+    registry.set_context("write_scope", ["src/app.py"])
+
+    inside = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {
+                    "root": "workspace",
+                    "path": "src/app.py",
+                    "mode": "create",
+                    "content": "print('x')\n",
+                },
+            )
+        )
+    )
+    assert inside["ok"] is True
+    assert (workspace / "src" / "app.py").read_text() == "print('x')\n"
+
+    outside = json.loads(
+        asyncio.run(
+            registry.call(
+                "write_file",
+                {"root": "workspace", "path": "other.txt", "mode": "create", "content": "x"},
+            )
+        )
+    )
+    assert outside["error"]["code"] == "access_denied"
+    assert "write scope" in outside["error"]["message"]
+
+
 def test_registry_call_returns_structured_builtin_payloads(tmp_path):
     tools, registry, workspace = make_builtin_tools(tmp_path)
     path = workspace / "note.txt"

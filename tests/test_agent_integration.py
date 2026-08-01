@@ -3311,6 +3311,107 @@ def test_spawn_agent_restricts_subagent_tools_for_read_only_profile(monkeypatch)
     assert observed["tools"] == ["read_file"]
 
 
+def test_read_only_subagent_keeps_output_mutation_tools(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    class _FakeMemory:
+        def write(self, *args, **kwargs):
+            return None
+
+        def read(self, *args, **kwargs):
+            return ""
+
+        def search(self, *args, **kwargs):
+            return []
+
+        def read_index(self):
+            return ""
+
+    registry = agent_module.ToolRegistry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    agent_module.BuiltinTools(
+        _FakeMemory(),
+        registry,
+        workspace_root=workspace,
+        output_dir=output,
+    )
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+
+    observed = {}
+
+    async def fake_send_message(self, ctx, user_message, stream_callback=None):
+        observed["tools"] = sorted(self.registry.list_tools())
+        write_result = json.loads(
+            await self.registry.call(
+                "write_file",
+                {
+                    "root": "output_dir",
+                    "path": "artifact.txt",
+                    "mode": "create",
+                    "content": "made",
+                },
+            )
+        )
+        observed["revision"] = write_result["new_revision"]
+        observed["write_ok"] = write_result["ok"]
+        observed["edit_ok"] = json.loads(
+            await self.registry.call(
+                "edit_file",
+                {
+                    "root": "output_dir",
+                    "path": "artifact.txt",
+                    "expected_revision": write_result["new_revision"],
+                    "replacements": [
+                        {"old_text": "made", "new_text": "edited", "expected_count": 1}
+                    ],
+                },
+            )
+        )["ok"]
+        workspace_result = json.loads(
+            await self.registry.call(
+                "write_file",
+                {
+                    "root": "workspace",
+                    "path": "forbidden.txt",
+                    "mode": "create",
+                    "content": "blocked",
+                },
+            )
+        )
+        observed["workspace_code"] = workspace_result["error"]["code"]
+        return agent_module.AgentResult(agent_id="sub", content="ok")
+
+    monkeypatch.setattr(agent_module.BaseAgent, "send_message", fake_send_message)
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "spawn_agent",
+                {
+                    "role": "critic",
+                    "task": "inspect",
+                    "capability_profile": "read_only",
+                },
+            )
+        )
+    )
+
+    assert payload["ok"] is True
+    assert "write_file" in observed["tools"]
+    assert "edit_file" in observed["tools"]
+    assert observed["write_ok"] is True
+    assert observed["edit_ok"] is True
+    assert observed["workspace_code"] == "access_denied"
+    assert (output / "artifact.txt").read_text(encoding="utf-8") == "edited"
+    assert not (workspace / "forbidden.txt").exists()
+
+
 def test_spawn_agent_validates_expected_output_contract(monkeypatch):
     import agent as agent_module
 

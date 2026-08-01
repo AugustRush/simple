@@ -1465,6 +1465,17 @@ def _scope_contains(scope: str, rel_path: str) -> bool:
     return rel_path == scope or rel_path.startswith(scope + "/")
 
 
+def write_scope_allows(
+    scope: Sequence[str | Path],
+    rel_path: str,
+) -> bool:
+    """Return True when ``rel_path`` is contained in the effective scope."""
+    return any(
+        _scope_contains(normalized, rel_path)
+        for normalized in _normalize_write_scope(scope)
+    )
+
+
 def _encode_request_text(content: Any, *, limits: FileAccessLimits) -> bytes:
     if not isinstance(content, str):
         raise FileServiceError("invalid_request", "content must be a string")
