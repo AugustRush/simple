@@ -804,6 +804,76 @@ def test_tui_output_pane_captures_ansi_and_tracks_last_line():
     assert pane.cursor_position().x == 0
 
 
+def test_tui_output_pane_scrolls_through_history():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=4)
+    pane.write("a\nb\nc\nd\ne")
+    assert pane.cursor_position().y == 4
+
+    pane.scroll_up(lines=1)
+    assert pane.cursor_position().y == 3
+    pane.scroll_up(lines=10)
+    assert pane.cursor_position().y == 3
+
+    pane.scroll_down(lines=1)
+    assert pane.cursor_position().y == 4
+
+    pane.scroll_top()
+    assert pane.cursor_position().y == 3
+    pane.scroll_bottom()
+    assert pane.cursor_position().y == 4
+
+
+def test_tui_output_pane_keeps_manual_scroll_when_new_output_arrives():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=4)
+    pane.write("a\nb\nc\nd\ne")
+    pane.scroll_up(lines=10)  # manual scroll to the top
+    assert pane.cursor_position().y == 3
+
+    pane.write("f\n")
+    assert pane.cursor_position().y == 3  # view stays put while scrolled up
+
+    pane.scroll_bottom()
+    assert pane.cursor_position().y == 5
+    pane.write("g\n")
+    assert pane.cursor_position().y == 6  # follows the newest output again
+
+
+def test_tui_mouse_wheel_scrolls_output_pane():
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
+
+    from agent.tui import _OutputPane, _ScrollableOutputWindow
+
+    pane = _OutputPane(view_height=4)
+    pane.write("1\n2\n3\n4\n5")
+    window = _ScrollableOutputWindow(pane, FormattedTextControl(pane.fragments))
+
+    window._mouse_handler(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.SCROLL_UP,
+            button=0,
+            modifiers=frozenset(),
+        )
+    )
+    assert pane.cursor_position().y == 3
+
+    window._mouse_handler(
+        MouseEvent(
+            position=Point(x=0, y=0),
+            event_type=MouseEventType.SCROLL_DOWN,
+            button=0,
+            modifiers=frozenset(),
+        )
+    )
+    assert pane.cursor_position().y == 4
+
+
 def test_tui_session_submits_input_through_queue(tmp_path):
     import asyncio
 

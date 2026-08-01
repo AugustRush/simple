@@ -20,6 +20,7 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import BeforeInput
 from prompt_toolkit.layout.screen import Point
+from prompt_toolkit.mouse_events import MouseEventType
 
 from rich.console import Console
 
@@ -33,18 +34,32 @@ class _OutputPane:
     the newest output instead of scrolling back to the top.
     """
 
-    def __init__(self, on_write: Optional[Callable[[], None]] = None) -> None:
+    def __init__(
+        self,
+        on_write: Optional[Callable[[], None]] = None,
+        *,
+        view_height: Optional[int] = None,
+    ) -> None:
         self._on_write = on_write
         self._raw = ""
         self._fragments: StyleAndTextTuples = []
         self._dirty = False
+        self._fixed_view_height = view_height
+        # Top line of the visible window; 0 = beginning, max = newest output.
+        self._scroll_top = 0
+        self._follow_bottom = True
+        self._window: Optional[Any] = None
+
+    def attach_window(self, window: Any) -> None:
+        self._window = window
 
     def write(self, text: str) -> int:
         if text:
             self._raw += text
             self._dirty = True
-            if self._on_write is not None:
-                self._on_write()
+            if self._follow_bottom:
+                self._scroll_top = self._max_scroll()
+            self._notify()
         return len(text)
 
     def flush(self) -> None:
@@ -60,8 +75,79 @@ class _OutputPane:
         return self._fragments
 
     def cursor_position(self) -> Point:
-        lines = self._raw.split("\n")
-        return Point(x=0, y=max(0, len(lines) - 1))
+        return Point(
+            x=0,
+            y=min(self._scroll_top + self._view_height() - 1, self._last_line()),
+        )
+
+    def scroll_up(self, lines: int = 3) -> None:
+        """Scroll the view backwards into the conversation history."""
+        self._follow_bottom = False
+        self._scroll_top = max(0, self._scroll_top - lines)
+        self._notify()
+
+    def scroll_down(self, lines: int = 3) -> None:
+        """Scroll the view towards the newest output."""
+        self._scroll_top = min(self._scroll_top + lines, self._max_scroll())
+        if self._scroll_top >= self._max_scroll():
+            self._follow_bottom = True
+        self._notify()
+
+    def scroll_top(self) -> None:
+        self._follow_bottom = False
+        self._scroll_top = 0
+        self._notify()
+
+    def scroll_bottom(self) -> None:
+        self._follow_bottom = True
+        self._scroll_top = self._max_scroll()
+        self._notify()
+
+    def vertical_scroll(self, window: Any) -> int:
+        """Window hook: keep the rendered scroll in sync with the pane."""
+        info = getattr(window, "render_info", None)
+        height = getattr(info, "window_height", None) or self._view_height()
+        return min(self._scroll_top, max(0, self._last_line() - height + 1))
+
+    def _last_line(self) -> int:
+        return max(0, len(self._raw.split("\n")) - 1)
+
+    def _view_height(self) -> int:
+        if self._fixed_view_height is not None:
+            return max(1, self._fixed_view_height)
+        from prompt_toolkit.application.current import get_app
+
+        try:
+            rows = get_app().output.get_size().rows
+        except Exception:
+            rows = 40
+        return max(1, rows - 2)
+
+    def _max_scroll(self) -> int:
+        return max(0, self._last_line() - self._view_height() + 1)
+
+    def _notify(self) -> None:
+        if self._window is not None:
+            self._window.vertical_scroll = self._scroll_top
+        if self._on_write is not None:
+            self._on_write()
+
+
+class _ScrollableOutputWindow(Window):
+    """Output window that maps the mouse wheel to conversation scrolling."""
+
+    def __init__(self, pane: _OutputPane, *args: Any, **kwargs: Any) -> None:
+        self._output_pane = pane
+        super().__init__(*args, **kwargs)
+
+    def _mouse_handler(self, mouse_event: Any):
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            self._output_pane.scroll_up(lines=3)
+            return None
+        if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            self._output_pane.scroll_down(lines=3)
+            return None
+        return super()._mouse_handler(mouse_event)
 
 
 class TuiSession:
@@ -104,21 +190,23 @@ class TuiSession:
             layout=Layout(container=self._build_layout()),
             key_bindings=self._build_key_bindings(),
             full_screen=True,
-            mouse_support=False,
+            mouse_support=True,
         )
 
     # ── Layout ────────────────────────────────────────────────────────────
 
     def _build_layout(self):
-        output_window = Window(
+        output_window = _ScrollableOutputWindow(
+            self._pane,
             FormattedTextControl(
                 self._pane.fragments,
                 get_cursor_position=self._pane.cursor_position,
             ),
             wrap_lines=True,
             always_hide_cursor=True,
-            get_vertical_scroll=lambda window: 10**9,
+            get_vertical_scroll=self._pane.vertical_scroll,
         )
+        self._pane.attach_window(output_window)
         input_window = Window(
             BufferControl(
                 buffer=self._buffer,
@@ -129,7 +217,8 @@ class TuiSession:
         )
         hint_window = Window(
             FormattedTextControl(
-                "Enter 发送 · 输入 / 实时筛选命令 · Ctrl+C 取消 · Ctrl+D 退出"
+                "Enter 发送 · 输入 / 实时筛选命令 · ↑/↓ 或翻页滚动对话 · "
+                "Ctrl+C 取消 · Ctrl+D 退出"
             ),
             height=1,
             style="class:bottom-hint",
@@ -168,6 +257,7 @@ class TuiSession:
             buffer.append_to_history()
             text = buffer.text
             buffer.reset()
+            self._pane.scroll_bottom()
             self._submit(text)
 
         @kb.add("up")
@@ -175,12 +265,32 @@ class TuiSession:
             buffer = event.app.current_buffer
             if buffer.complete_state is not None:
                 buffer.complete_previous()
+            elif not buffer.text:
+                self._pane.scroll_up(lines=3)
 
         @kb.add("down")
         def _down(event: Any) -> None:
             buffer = event.app.current_buffer
             if buffer.complete_state is not None:
                 buffer.complete_next()
+            elif not buffer.text:
+                self._pane.scroll_down(lines=3)
+
+        @kb.add("pageup")
+        def _page_up(event: Any) -> None:
+            self._pane.scroll_up(lines=10)
+
+        @kb.add("pagedown")
+        def _page_down(event: Any) -> None:
+            self._pane.scroll_down(lines=10)
+
+        @kb.add("home")
+        def _home(event: Any) -> None:
+            self._pane.scroll_top()
+
+        @kb.add("end")
+        def _end(event: Any) -> None:
+            self._pane.scroll_bottom()
 
         @kb.add("c-c")
         @kb.add(Keys.SIGINT)
