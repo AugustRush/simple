@@ -30,11 +30,20 @@ git, HuggingFace, MCP servers, …) all need to persist their own cache and
 state somewhere, and treating every such location as an attacker-exposed
 special case is unmaintainable.  The profile therefore treats the user's
 per-user cache/state directories (``~/.cache``, ``~/.npm``, ``~/.local``,
-``~/.config`` and ``~/Library/Caches``) as writable by default — they hold
-recreatable tool state, not user documents.  Everything else under the home
-directory (documents, ``~/.ssh``, ``~/.aws``, ``~/.gitconfig``, the
-workspace) stays read-only unless explicitly listed in the approved write
-scope.
+``~/.config``, ``~/Library/Caches`` and ``~/Library/Application Support``)
+as writable by default — they hold recreatable tool state and app data, not
+user documents.  Everything else under the home directory (documents,
+``~/.ssh``, ``~/.aws``, ``~/.gitconfig``, the workspace) stays read-only
+unless explicitly listed in the approved write scope.
+
+GUI/rendering workloads (headless Chrome, Electron, Skia/Canvas screenshots,
+…) additionally need a small set of system facilities that the ``deny
+default`` profile would otherwise block: the process-local mach bootstrap
+namespace (crashpad/XPC handshakes use unique per-run names, so they cannot
+be enumerated), the ability to issue app-sandbox file extensions, and
+read access to the user's preferences.  These are allowed as a category —
+not per tool — and are the same facilities every App Store-style GUI app
+gets from ``application.sb``.
 
 On a platform where an enforcing adapter cannot be constructed, sandboxed
 modes fail closed instead of running unsandboxed.
@@ -157,10 +166,14 @@ def _seatbelt_literal(value: str) -> str:
 
 
 def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
-    workspace = str(request.workspace_root)
-    output = str(request.output_root)
-    scratch = str(request.scratch_dir)
-    internal = str(request.output_root / ".simple-internal")
+    # Use canonical paths: /var is a symlink to /private/var on macOS, and a
+    # rule written for one spelling silently fails to match the other.
+    workspace = str(request.workspace_root.resolve(strict=False))
+    output = str(request.output_root.resolve(strict=False))
+    scratch = str(request.scratch_dir.resolve(strict=False))
+    internal = str(
+        (request.output_root / ".simple-internal").resolve(strict=False)
+    )
 
     lines = [
         "(version 1)",
@@ -213,17 +226,33 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
     # (npm, pip, uv, git, HuggingFace, MCP servers, …) persist their state
     # there, and treating each tool as a special case does not scale.  Home
     # documents and dotfiles outside these directories stay read-only.
-    home = str(request.home_dir)
+    home = str(request.home_dir.resolve(strict=False))
     for cache_dir in (
         home + "/.cache",
         home + "/.npm",
         home + "/.local",
         home + "/.config",
         home + "/Library/Caches",
+        home + "/Library/Application Support",
     ):
         literal = _seatbelt_literal(cache_dir)
         lines.append(f'(allow file-read* (subpath "{literal}"))')
         lines.append(f'(allow file-write* (subpath "{literal}"))')
+    # GUI/rendering applications need the process-local mach bootstrap
+    # namespace (unique per-run crashpad/XPC names cannot be enumerated),
+    # app-sandbox file extensions, preference reads, and device-node writes
+    # (/dev/null).  Allowed as a category — same facilities App Store GUI
+    # apps get from application.sb.
+    lines.extend(
+        (
+            "(allow mach-bootstrap)",
+            "(allow mach-register)",
+            "(allow mach-lookup)",
+            "(allow file-issue-extension)",
+            "(allow user-preference-read)",
+            '(allow file-write* (subpath "/dev"))',
+        )
+    )
     # Approved write_scope entries become writable; the rest of the workspace
     # stays read-only (or hidden when workspace reads are disabled).
     for scope in request.write_scope:
@@ -235,13 +264,13 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
         candidate = request.workspace_root / scope
         if _path_is_within(candidate, request.workspace_root):
             lines.append(
-                f'(allow file-write* (subpath "{_seatbelt_literal(str(candidate))}"))'
+                f'(allow file-write* (subpath "{_seatbelt_literal(str(candidate.resolve(strict=False)))}"))'
             )
             continue
         candidate = request.output_root / scope
         if _path_is_within(candidate, request.output_root):
             lines.append(
-                f'(allow file-write* (subpath "{_seatbelt_literal(str(candidate))}"))'
+                f'(allow file-write* (subpath "{_seatbelt_literal(str(candidate.resolve(strict=False)))}"))'
             )
     if request.devices and request.mode != SANDBOX_MODE_NONE:
         lines.extend(_DEVICE_SANDBOX_RULES)

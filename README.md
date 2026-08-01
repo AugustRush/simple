@@ -433,7 +433,13 @@ Writes are allowed by category, not per tool: the sandbox lets the agent
 persist tool state under the user cache/state directories (`~/.cache`,
 `~/.npm`, `~/.local`, `~/.config`, `~/Library/Caches`) so npm installs,
 HuggingFace downloads, pip/uv caches and MCP servers work without carving
-out a special case for each tool. Home documents and sensitive dotfiles
+out a special case for each tool. `~/Library/Application Support` is
+writable as the macOS counterpart of `~/.config` (Chrome/Electron crashpad
+state and app data live there). GUI/rendering workloads (headless Chrome,
+Electron screenshots, Skia/Canvas rendering) additionally get the
+process-local mach bootstrap namespace, app-sandbox file extensions and
+preference reads as a category — the same facilities App Store GUI apps
+receive from `application.sb`. Home documents and sensitive dotfiles
 (`~/.ssh`, `~/.aws`, `~/.gitconfig`, …) remain read-only, as does the
 workspace unless a `write_scope` explicitly allows it.
 

@@ -166,7 +166,14 @@ def test_profile_allows_home_cache_and_config_writes_by_default(tmp_path):
     profile = _macos_seatbelt_profile(request)
     home = request.home_dir
 
-    for sub in (".cache", ".npm", ".local", ".config", "Library/Caches"):
+    for sub in (
+        ".cache",
+        ".npm",
+        ".local",
+        ".config",
+        "Library/Caches",
+        "Library/Application Support",
+    ):
         literal = str(home / sub)
         assert f'file-write* (subpath "{literal}")' in profile
         assert f'file-read* (subpath "{literal}")' in profile
@@ -177,6 +184,18 @@ def test_profile_allows_home_cache_and_config_writes_by_default(tmp_path):
     documents = home / "Documents"
     assert f'file-write* (subpath "{ssh_dir}")' not in profile
     assert f'file-write* (subpath "{documents}")' not in profile
+
+
+def test_profile_allows_gui_app_system_services(tmp_path):
+    """GUI/rendering apps get the mach/preferences facilities they need."""
+    profile = _macos_seatbelt_profile(_request(tmp_path))
+
+    assert "(allow mach-bootstrap)" in profile
+    assert "(allow mach-register)" in profile
+    assert "(allow mach-lookup)" in profile
+    assert "(allow file-issue-extension)" in profile
+    assert "(allow user-preference-read)" in profile
+    assert '(allow file-write* (subpath "/dev"))' in profile
 
 
 def test_profile_cache_rules_use_request_home_dir(tmp_path):
@@ -246,6 +265,21 @@ def test_sandbox_allows_writes_to_user_cache_dirs(tmp_path):
     target = cache / "cache-write-test"
 
     result = _run_in_sandbox(request, f"touch {target}")
+
+    assert result.returncode == 0, result.stderr
+    assert target.exists()
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_allows_writes_to_application_support(tmp_path):
+    import shlex
+
+    request = _request(tmp_path, home_dir=tmp_path / "home")
+    app_support = request.home_dir / "Library" / "Application Support"
+    app_support.mkdir(parents=True)
+    target = app_support / "app-state-write-test"
+
+    result = _run_in_sandbox(request, f"touch {shlex.quote(str(target))}")
 
     assert result.returncode == 0, result.stderr
     assert target.exists()
