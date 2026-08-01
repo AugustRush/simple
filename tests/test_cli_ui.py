@@ -2,6 +2,7 @@
 
 import asyncio
 from io import StringIO
+from types import SimpleNamespace
 
 import pytest
 
@@ -648,14 +649,54 @@ def test_cli_command_completer_filters_live_and_respects_scope(monkeypatch):
             for completion in completer.get_completions(Document(text), None)
         ]
 
+    assert "/permissions" in suggested("/")
+    assert "/allow" in suggested("/")
     assert "/permissions" in suggested("/p")
     assert "/plugins" in suggested("/p")
     assert "/permissions" in suggested("/perm")
     assert "/export" in suggested("/x")
-    assert suggested("/") == []
     assert suggested("/zzz") == []
     assert "/send" not in suggested("/s")
     assert suggested("/Users/shike") == []
+
+
+class _FakeMenuBuffer:
+    def __init__(self, text):
+        self.text = text
+        self.complete_state = SimpleNamespace(current_completion=object())
+        self.applied = False
+        self.handled = False
+
+    def apply_completion(self, completion):
+        self.applied = True
+
+    def validate_and_handle(self):
+        self.handled = True
+
+
+class _FakeMenuEvent:
+    def __init__(self, text):
+        self.current_buffer = _FakeMenuBuffer(text)
+
+
+def test_enter_on_bare_slash_skips_completion_and_submits():
+    from agent.cli import _accept_completion_or_submit
+
+    event = _FakeMenuEvent("/")
+    _accept_completion_or_submit(event)
+
+    assert event.current_buffer.applied is False
+    assert event.current_buffer.handled is True
+
+
+def test_enter_on_partial_command_applies_highlighted_completion():
+    from agent.cli import _accept_completion_or_submit
+
+    event = _FakeMenuEvent("/p")
+    _accept_completion_or_submit(event)
+
+    assert event.current_buffer.applied is True
+    assert event.current_buffer.handled is True
 
 
 def test_interactive_loop_bare_slash_opens_command_menu(monkeypatch, tmp_path):

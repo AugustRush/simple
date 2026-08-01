@@ -68,9 +68,9 @@ _cli_prompt_session: Optional[PromptSession] = None
 def _accept_completion_or_submit(event: Any) -> None:
     """Enter accepts the highlighted completion when a menu is open."""
     buffer = event.current_buffer
-    if buffer.complete_state is not None:
+    if buffer.complete_state is not None and buffer.text.strip() != "/":
         buffer.apply_completion(buffer.complete_state.current_completion)
-        buffer.complete_state = None
+    buffer.complete_state = None
     buffer.validate_and_handle()
 
 
@@ -140,6 +140,7 @@ def _cli_command_completer() -> Optional[Completer]:
 class _SlashCommandCompleter(Completer):
     """Live command palette: typing "/p" narrows to matching commands.
 
+    A bare "/" offers every command; each extra character narrows the list.
     Prefix matches win (so "/p" suggests /permissions and /plugins); when no
     command starts with the query, matches inside the name as a fallback.
     The palette only completes a single "/word" token, so paths like
@@ -151,21 +152,22 @@ class _SlashCommandCompleter(Completer):
 
     def get_completions(self, document: Any, complete_event: Any):
         word = document.get_word_before_cursor(WORD=True)
-        if not word.startswith("/") or word == "/" or "/" in word[1:]:
+        if not word.startswith("/") or "/" in word[1:]:
             return
         query = word[1:].casefold()
         if not query:
-            return
-        prefix_matches = [
-            descriptor
-            for descriptor in self._descriptors
-            if descriptor.name.startswith(query)
-        ]
-        candidates = prefix_matches or [
-            descriptor
-            for descriptor in self._descriptors
-            if query in descriptor.name
-        ]
+            candidates = self._descriptors
+        else:
+            prefix_matches = [
+                descriptor
+                for descriptor in self._descriptors
+                if descriptor.name.startswith(query)
+            ]
+            candidates = prefix_matches or [
+                descriptor
+                for descriptor in self._descriptors
+                if query in descriptor.name
+            ]
         for descriptor in candidates:
             usage = descriptor.usage or f"/{descriptor.name}"
             meta = usage + (
