@@ -1145,6 +1145,28 @@ def test_session_sandbox_override_unsandboxes(tmp_path, monkeypatch):
     assert spawned[0][0] == "/bin/sh"
 
 
+def test_shell_devices_defaults_open_and_can_be_disabled(tmp_path, monkeypatch):
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    spawned = _fake_proc_spawn(monkeypatch)
+
+    result = asyncio.run(tools._shell("mv a b", timeout=1))
+
+    assert result["ok"] is True
+    assert spawned
+    profile_path = spawned[0][2]
+    profile = Path(profile_path).read_text(encoding="utf-8")
+    assert '(allow iokit-open)' in profile
+    assert '(global-name "com.apple.Metal")' in profile
+
+    registry.set_context("shell_devices", False)
+    spawned.clear()
+    result = asyncio.run(tools._shell("mv a b", timeout=1))
+    assert result["ok"] is True
+    assert spawned
+    profile = Path(spawned[0][2]).read_text(encoding="utf-8")
+    assert '(allow iokit-open)' not in profile
+
+
 def test_transcribe_audio_rejects_shell_control_in_template(tmp_path):
     tools, reg, workspace = make_builtin_tools(tmp_path)
     audio = workspace / "sample.wav"

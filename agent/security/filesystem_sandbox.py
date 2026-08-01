@@ -18,6 +18,13 @@ Three sandbox modes link to the permission levels:
   whole machine including GPU/IOKit.  Only meaningful with permission level
   ``full``; the caller enforces that linkage.
 
+``ShellSandboxRequest.devices`` controls device/service access (Metal/IOKit
+mach services) inside a sandboxed run (``restricted`` or ``read_all``): it
+defaults to open, the same posture the profile already takes for network.
+Seatbelt can expose the GPU services (the same mechanism App Store sandboxes
+use), so local MLX/GPU workloads work without opening writes or disabling
+confirmation; set it to ``False`` for the strictest posture.
+
 On a platform where an enforcing adapter cannot be constructed, sandboxed
 modes fail closed instead of running unsandboxed.
 """
@@ -46,6 +53,13 @@ SANDBOX_MODES: tuple[str, ...] = (
     SANDBOX_MODE_NONE,
 )
 
+_DEVICE_SANDBOX_RULES: tuple[str, ...] = (
+    '(allow mach-lookup (global-name "com.apple.IOAccelerator"))',
+    '(allow mach-lookup (global-name "com.apple.Metal"))',
+    '(allow mach-lookup (global-name "com.apple.MTLCompilerService"))',
+    "(allow iokit-open)",
+)
+
 
 @dataclass(frozen=True)
 class ShellSandboxRequest:
@@ -58,6 +72,7 @@ class ShellSandboxRequest:
     write_scope: tuple[str, ...]
     scratch_dir: Path
     mode: str = SANDBOX_MODE_READ_ALL
+    devices: bool = True
 
 
 @dataclass(frozen=True)
@@ -201,6 +216,8 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
             lines.append(
                 f'(allow file-write* (subpath "{_seatbelt_literal(str(candidate))}"))'
             )
+    if request.devices and request.mode != SANDBOX_MODE_NONE:
+        lines.extend(_DEVICE_SANDBOX_RULES)
     lines.append("(allow mach-lookup (global-name \"com.apple.system.logger\"))")
     lines.append(
         "(allow mach-lookup "

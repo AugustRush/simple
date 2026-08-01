@@ -1480,6 +1480,9 @@ class BuiltinTools:
         if sandbox_mode == SANDBOX_MODE_NONE and effective_level != "full":
             sandbox_mode = "read_all"
         unsandboxed = sandbox_mode == SANDBOX_MODE_NONE
+        shell_devices = bool(
+            self.registry.get_context("shell_devices", True)
+        )
 
         output_dir = self._process_output_dir()
         sandbox_dir = self._sandbox_dir()
@@ -1567,6 +1570,7 @@ class BuiltinTools:
                         write_scope=write_scope,
                         scratch_dir=scratch_dir,
                         mode=sandbox_mode,
+                        devices=shell_devices,
                     )
                 )
             except SandboxUnavailableError as exc:

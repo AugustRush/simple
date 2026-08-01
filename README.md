@@ -358,6 +358,7 @@ Key config sections:
 | `file_access` | Startup-only workspace read/write policy plus resource limits for file tools (see [File access](#file-access)) |
 | `permissions.shell_level` | Default shell permission level: `ask`, `medium`, `high`, or `full` (see [Shell permissions](#shell-permissions)) |
 | `permissions.shell_sandbox` | OS sandbox mode: `restricted`, `read_all` (default), or `none` (danger-full-access, `full` level only) |
+| `permissions.shell_devices` | Device/service access (Metal/IOKit) inside the sandbox; **default `true`** (set `false` for the strictest posture) |
 | `shell_allowed_commands` | Persistent shell allowlist that skips confirmation (see [Shell permissions](#shell-permissions)) |
 | `assistant_identity` | Deterministic assistant name/role for fact recall |
 | `system_prompt_file` | Load custom system prompt from `.md` or `.txt` |
@@ -427,6 +428,22 @@ Shell sandbox modes:
 | `restricted` | System dirs + workspace/output only | output/scratch/approved scope | Most locked down |
 | `read_all` (default) | **Whole machine** | output/scratch/approved scope | Local tooling (miniconda, caches) works; writes stay safe |
 | `none` | Everything | Everything | Danger-full-access: no OS sandbox, GPU/Metal reachable. **Only valid with `shell_level: full`** |
+
+Device/service access (Metal/IOKit — GPU, local ML) is open by default inside
+the sandbox, the same posture the profile already takes for network.  The
+seatbelt profile opens the Metal/IOKit services (the same mechanism App
+Store sandboxes use) while reads stay open and writes stay scoped:
+
+```json
+{
+  "permissions": { "shell_level": "ask", "shell_sandbox": "read_all", "shell_devices": true }
+}
+```
+
+With this configuration the TTS skill's local generation works end-to-end
+inside the sandbox (verified on macOS), and high-risk commands still ask for
+confirmation.  Set `shell_devices: false` if you want to deny device access
+while keeping file reads/writes as configured.
 
 Runtime commands:
 

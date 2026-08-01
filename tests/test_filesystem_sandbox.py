@@ -23,6 +23,7 @@ def _request(
     workspace_write=False,
     write_scope=(),
     mode="read_all",
+    devices=True,
 ):
     workspace = tmp_path / "workspace"
     output = tmp_path / "output"
@@ -34,6 +35,7 @@ def _request(
         write_scope=tuple(write_scope),
         scratch_dir=output / "sandbox" / "tmp",
         mode=mode,
+        devices=devices,
     )
 
 
@@ -95,8 +97,28 @@ def test_restricted_mode_has_no_read_all_rule(tmp_path):
     assert '(allow file-read* (subpath "/"))' not in profile
 
 
+def test_device_rules_open_by_default_and_can_be_disabled(tmp_path):
+    default = _macos_seatbelt_profile(_request(tmp_path, mode="read_all"))
+    disabled = _macos_seatbelt_profile(
+        _request(tmp_path, mode="read_all", devices=False)
+    )
+
+    assert '(allow iokit-open)' in default
+    assert '(global-name "com.apple.Metal")' in default
+    assert '(global-name "com.apple.IOAccelerator")' in default
+    assert '(allow iokit-open)' not in disabled
+
+
+def test_device_rules_added_in_restricted_mode_too(tmp_path):
+    profile = _macos_seatbelt_profile(
+        _request(tmp_path, mode="restricted", devices=True)
+    )
+
+    assert '(allow iokit-open)' in profile
+
+
 def test_none_mode_builds_unsandboxed_command(tmp_path):
-    request = _request(tmp_path, mode="none")
+    request = _request(tmp_path, mode="none", devices=True)
     sandbox = build_sandbox_command(request)
 
     assert sandbox.argv_prefix == ()

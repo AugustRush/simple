@@ -211,3 +211,21 @@ access".  Permission level and sandbox are now linked:
 - Unsandboxed runs skip file-policy gating and workspace artifact
   relocation; they keep `shell_blocked_commands`, cwd-escape, command
   substitution, and parse-fail-closed guards.
+
+## P9: GPU Inside the Sandbox (follow-up)
+
+`full + none` unlocks GPU/Metal but gives up the whole sandbox.  A middle
+ground was verified empirically: seatbelt can expose the GPU services the
+same way App Store sandboxes do.  Device/service access is **open by
+default** (matching the already-open network posture): `permissions.shell_devices`
+(default `true`) adds Metal/IOKit allowances (`com.apple.IOAccelerator`,
+`com.apple.Metal`, `com.apple.MTLCompilerService`, `iokit-open`) to the
+`restricted`/`read_all` profile, keeping reads/writes and confirmation gates
+intact.  Set `shell_devices: false` for the strictest posture.
+
+Verified on macOS M2 Max: with `ask` + `read_all` + `shell_devices: true`, the
+local Qwen3-TTS 1.7B MLX generation completes inside the sandbox and writes
+its wav to the scratch/output dir; the only denied operation is an
+unnecessary HuggingFace cache pointer write, which the tool ignores.  A
+model that is not cached yet still needs a one-time download from the user's
+own terminal (the sandbox does not write to `~/.cache/huggingface`).

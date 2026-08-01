@@ -132,6 +132,7 @@ DEFAULT_CONFIG: dict = {
     "permissions": {
         "shell_level": "ask",
         "shell_sandbox": "read_all",
+        "shell_devices": True,
     },
 }
 
@@ -298,6 +299,9 @@ def _validate_config(cfg: dict) -> list[str]:
                     "'permissions.shell_sandbox' 'none' requires "
                     "'permissions.shell_level' 'full'; falling back to 'read_all'"
                 )
+            shell_devices = permissions_cfg.get("shell_devices", True)
+            if not isinstance(shell_devices, bool):
+                warnings.append("'permissions.shell_devices' must be a boolean")
 
     # ── Top-level unknown keys ────────────────────────────────────────────
     for key in cfg:

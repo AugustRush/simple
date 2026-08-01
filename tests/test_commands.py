@@ -1263,7 +1263,10 @@ def test_permissions_sandbox_command_sets_session_override():
     assert shell_session_sandbox_get(scope) == "none"
 
 
-def test_permissions_sandbox_none_requires_full():
+def test_permissions_sandbox_none_requires_full(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
     from agent.security.shell import (
         ShellAuthorizationScope,
         shell_session_sandbox_get,
@@ -1318,6 +1321,17 @@ def test_config_validation_links_sandbox_none_to_full_level():
     assert _validate_config(
         {"permissions": {"shell_level": "full", "shell_sandbox": "none"}}
     ) == []
+
+
+def test_config_validation_rejects_non_boolean_shell_devices():
+    from agent.config import _validate_config
+
+    warnings = _validate_config(
+        {"permissions": {"shell_devices": "yes"}}
+    )
+    assert any("shell_devices" in warning for warning in warnings)
+
+    assert _validate_config({"permissions": {"shell_devices": False}}) == []
 
 
 def test_builtin_ralph_maps_start_list_resume_and_parse_errors():
