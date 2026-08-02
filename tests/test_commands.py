@@ -1155,12 +1155,15 @@ def test_deny_command_removes_from_allowlist(monkeypatch, tmp_path):
     assert "不存在" in (missing.response_text or "")
 
 
-def test_auto_approve_command_toggles_session_scope():
+def test_auto_approve_command_persists_default(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
     from agent.security.shell import (
         ShellAuthorizationScope,
-        shell_session_auto_approve_status,
+        shell_session_permission_get,
     )
 
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
     router = _builtin_router()
     scope = ShellAuthorizationScope("s-1", "cli", "u-1")
 
@@ -1171,7 +1174,9 @@ def test_auto_approve_command_toggles_session_scope():
         metadata={"user_id": "u-1"},
     )
     assert "已开启" in result.response_text
-    assert shell_session_auto_approve_status(scope) is True
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_level"] == "medium"
+    assert shell_session_permission_get(scope) == ""
 
     status = _run_builtin(
         router,
@@ -1188,10 +1193,49 @@ def test_auto_approve_command_toggles_session_scope():
         metadata={"user_id": "u-1"},
     )
     assert "已关闭" in result.response_text
-    assert shell_session_auto_approve_status(scope) is False
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_level"] == "ask"
 
 
-def test_permissions_command_sets_session_level_and_shows_status():
+def test_auto_approve_session_subcommand_only_session(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_permission_get,
+    )
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+
+    result = _run_builtin(
+        router,
+        "/auto-approve session on",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    assert "仅本会话" in result.response_text
+    assert shell_session_permission_get(scope) == "medium"
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_level"] == "ask"
+
+    result = _run_builtin(
+        router,
+        "/auto-approve session off",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    assert "仅本会话" in result.response_text
+    assert shell_session_permission_get(scope) == "ask"
+
+
+def test_permissions_command_sets_session_level_and_shows_status(
+    monkeypatch, tmp_path
+):
+    from agent import shared as agent_shared
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
     from agent.security.shell import (
         ShellAuthorizationScope,
         shell_command_check,
@@ -1203,7 +1247,7 @@ def test_permissions_command_sets_session_level_and_shows_status():
 
     result = _run_builtin(
         router,
-        "/permissions full",
+        "/permissions session full",
         session_id="s-1",
         metadata={"user_id": "u-1"},
     )
@@ -1224,7 +1268,7 @@ def test_permissions_command_sets_session_level_and_shows_status():
 
     result = _run_builtin(
         router,
-        "/permissions ask",
+        "/permissions session ask",
         session_id="s-1",
         metadata={"user_id": "u-1"},
     )
@@ -1233,6 +1277,38 @@ def test_permissions_command_sets_session_level_and_shows_status():
         shell_command_check("mkfs /dev/disk0", scope=scope).requires_confirmation
         is True
     )
+
+
+def test_permissions_command_persists_level(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_permission_get,
+    )
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+
+    # a stale session override must not mask the newly persisted default
+    _run_builtin(
+        router,
+        "/permissions session ask",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    result = _run_builtin(
+        router,
+        "/permissions full",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+
+    assert "full" in result.response_text
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_level"] == "full"
+    assert shell_session_permission_get(scope) == ""
 
 
 def test_permissions_command_persists_default(monkeypatch, tmp_path):
@@ -1278,7 +1354,42 @@ def test_permissions_status_shows_sandbox_mode(monkeypatch, tmp_path):
     assert "read_all" in result.response_text
 
 
-def test_permissions_sandbox_command_sets_session_override():
+def test_permissions_sandbox_session_subcommand_only_session(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_sandbox_get,
+    )
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+    _run_builtin(
+        router,
+        "/permissions session full",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+
+    result = _run_builtin(
+        router,
+        "/permissions sandbox session none",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+
+    assert "仅本会话" in result.response_text
+    assert shell_session_sandbox_get(scope) == "none"
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_sandbox"] == "read_all"
+
+
+def test_permissions_sandbox_command_persists_mode(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
     from agent.security.shell import (
         ShellAuthorizationScope,
         shell_session_sandbox_get,
@@ -1300,12 +1411,16 @@ def test_permissions_sandbox_command_sets_session_override():
         metadata={"user_id": "u-1"},
     )
 
-    assert "none" in result.response_text
-    assert shell_session_sandbox_get(scope) == "none"
+    assert "持久化" in result.response_text
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_level"] == "full"
+    assert cfg["permissions"]["shell_sandbox"] == "none"
+    assert shell_session_sandbox_get(scope) == ""
 
 
 def test_permissions_sandbox_none_requires_full(monkeypatch, tmp_path):
     from agent import shared as agent_shared
+    from agent.config import load_config
 
     monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
     from agent.security.shell import (
@@ -1325,6 +1440,79 @@ def test_permissions_sandbox_none_requires_full(monkeypatch, tmp_path):
 
     assert "full" in (result.response_text or "")
     assert shell_session_sandbox_get(scope) == ""
+    cfg, _ = load_config()
+    assert cfg["permissions"]["shell_sandbox"] == "read_all"
+
+
+def test_permissions_reset_restores_builtin_defaults(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_permission_get,
+        shell_session_sandbox_get,
+    )
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    router = _builtin_router()
+    scope = ShellAuthorizationScope("s-1", "cli", "u-1")
+    _run_builtin(
+        router,
+        "/permissions full",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    _run_builtin(
+        router,
+        "/permissions sandbox none",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    _run_builtin(
+        router,
+        "/permissions session ask",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+    _run_builtin(
+        router,
+        "/permissions sandbox session restricted",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+
+    result = _run_builtin(
+        router,
+        "/permissions reset",
+        session_id="s-1",
+        metadata={"user_id": "u-1"},
+    )
+
+    assert "ask" in result.response_text
+    assert "read_all" in result.response_text
+    cfg, _ = load_config()
+    permissions = cfg.get("permissions") or {}
+    assert "shell_level" not in permissions
+    assert "shell_sandbox" not in permissions
+    assert shell_session_permission_get(scope) == ""
+    assert shell_session_sandbox_get(scope) == ""
+
+
+def test_permissions_reset_partial_target(monkeypatch, tmp_path):
+    from agent import shared as agent_shared
+    from agent.config import load_config
+
+    monkeypatch.setattr(agent_shared, "CONFIG_FILE", tmp_path / "config.json")
+    router = _builtin_router()
+    _run_builtin(router, "/permissions full")
+    _run_builtin(router, "/permissions sandbox none")
+
+    result = _run_builtin(router, "/permissions reset level")
+
+    assert "ask" in result.response_text
+    cfg, _ = load_config()
+    assert "shell_level" not in cfg["permissions"]
+    assert cfg["permissions"]["shell_sandbox"] == "none"
 
 
 def test_permissions_persists_default_sandbox(monkeypatch, tmp_path):

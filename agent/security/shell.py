@@ -280,6 +280,11 @@ def shell_session_permission_get(scope: ShellAuthorizationScope) -> str:
     return _session_permission_levels.get(scope, "")
 
 
+def shell_session_permission_clear(scope: ShellAuthorizationScope) -> None:
+    """Remove the session permission override so the config default applies."""
+    _session_permission_levels.pop(scope, None)
+
+
 def _effective_permission_level(
     scope: ShellAuthorizationScope, permission_level: Optional[str]
 ) -> str:
@@ -314,6 +319,11 @@ def shell_session_sandbox_set(
 def shell_session_sandbox_get(scope: ShellAuthorizationScope) -> str:
     """Return the session sandbox override ("" = config default applies)."""
     return _session_sandbox_modes.get(scope, "")
+
+
+def shell_session_sandbox_clear(scope: ShellAuthorizationScope) -> None:
+    """Remove the session sandbox override so the config default applies."""
+    _session_sandbox_modes.pop(scope, None)
 
 
 def shell_session_allowlist_contains(

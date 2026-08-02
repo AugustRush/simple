@@ -467,12 +467,15 @@ Runtime commands:
 
 | Command | Effect |
 |---|---|
-| `/permissions` | Show the effective level and its description |
-| `/permissions <level>` | Override the level for this session only |
-| `/permissions default <level>` | Persist the config default (applies immediately and after restart) |
-| `/permissions sandbox <mode>` | Override the sandbox mode for this session (`none` requires `full`) |
-| `/permissions default sandbox <mode>` | Persist the default sandbox mode |
-| `/auto-approve on\|off\|status` | Session shortcut for `medium` / `ask` |
+| `/permissions` | Show the effective level/sandbox, config default, and any session override |
+| `/permissions <level>` | Persist the config default and apply it immediately (survives restart; sub-agents inherit) |
+| `/permissions session <level>` | Override the level for this session only |
+| `/permissions sandbox <mode>` | Persist the default sandbox mode and apply it immediately (`none` requires `full`) |
+| `/permissions sandbox session <mode>` | Override the sandbox mode for this session only |
+| `/permissions default <level\|sandbox <mode>>` | Explicit alias for the persistent form |
+| `/permissions reset [level\|sandbox]` | Restore the built-in defaults (`ask` / `read_all`) and clear session overrides |
+| `/auto-approve on\|off\|status` | Persist the `medium` / `ask` shortcut |
+| `/auto-approve session on\|off` | Apply the shortcut to this session only |
 | `/allow <command>` | Persistently allow one command (exact string) or command name (all invocations) |
 | `/deny <command>` | Remove an entry from the persistent allowlist |
 | `/confirm <token>` | Approve one pending confirmation explicitly |
@@ -493,10 +496,10 @@ Config example:
 
 An entry containing a space matches that exact command; a bare name (like
 `osascript`) allows every invocation of that command. The allowlist and the
-config default apply to sub-agents spawned later; a session-level
-`/permissions` override applies only to that session. Changes made through
-slash commands take effect immediately; editing `config.json` by hand takes
-effect at the next startup.
+config default apply to sub-agents spawned later; a `session`-scoped
+`/permissions` override applies only to that session and is lost on restart.
+Permission changes made through slash commands persist and take effect
+immediately; editing `config.json` by hand takes effect at the next startup.
 
 For true machine-wide execution (local GPU/MLX workloads, arbitrary home
 directory access), set `"shell_level": "full"` **and**
