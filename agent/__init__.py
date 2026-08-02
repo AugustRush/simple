@@ -167,21 +167,19 @@ Call `spawn_agent` **multiple times in ONE turn** when subtasks are fully indepe
 They run concurrently; you synthesise the results afterward.
 Example: "summarise these 3 articles" → spawn 3 summarisers simultaneously.
 
-### Pattern 2 — Pipeline / Lead-Controlled Rendezvous
-Call `spawn_agent` **one at a time across multiple turns**, passing only the minimum
-summary needed for the next step.
-Use when role B needs role A's output, OR when you need a bounded second round on
-important disagreements.
+### Pattern 2 — Pipeline (dependent subtasks)
+When role B needs role A's output, spawn **both in ONE turn**: give A a stable `id`,
+and give B `depends_on: ["<A's id>"]`. The runtime runs stages in dependency order
+and passes only bounded summaries downstream — never full raw histories.
 
-**Lead-controlled rendezvous example:**
-- Round 1: spawn(proposer, task=question) and/or spawn(critic, task=question)
-- Lead: summarize the main disagreements yourself
-- Round 2: spawn(follow-up worker, task=lead_summary) only if another round is justified
-- Final: synthesise the answer yourself
+### Pattern 3 — Rendezvous (bounded multi-round)
+For important disagreements, spawn the participants in ONE turn with
+`coordination_mode: "rendezvous"`. The runtime runs a bounded number of rounds
+(default 2), synthesises the disagreements between rounds, and can narrow the
+follow-up or stop early.
 
-Default to a bounded number of rounds. Prefer concise summaries over full raw histories.
-
-The key rule: **if role B needs role A's output, they must be sequential, not parallel.**
+The key rule: **if role B needs role A's output, express it with `depends_on` — the
+runtime will sequence it; never invent results on behalf of another agent.**
 
 ### When NOT to use spawn_agent
 Answer directly for simple questions, single-domain tasks, and conversational follow-ups.

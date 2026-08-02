@@ -18,6 +18,7 @@ class SubtaskSpec:
     task: str
     depends_on: list[str] = field(default_factory=list)
     expected_output: str = ""
+    system_suffix: str = ""
     output_contract: dict[str, Any] = field(default_factory=dict)
     write_scope: list[str] = field(default_factory=list)
     capability_profile: str = "read_only"
@@ -137,6 +138,17 @@ def validate_subtask_specs(
             raise ValueError(
                 f"subtask {spec_id} has unsupported capability_profile: {spec.capability_profile!r}"
             )
+        if profile == "implementation" and not spec.write_scope:
+            raise ValueError(
+                f"subtask {spec_id} has capability_profile 'implementation' but no "
+                "write_scope; workspace writes require an explicit write_scope"
+            )
+        if mode == "rendezvous" and spec.early_exit:
+            raise ValueError(
+                f"subtask {spec_id} uses early_exit, which is not supported for "
+                "rendezvous subtasks (rendezvous is a bounded convergence protocol, "
+                "not a winner-take-all fan-out)"
+            )
         if spec.timeout_seconds and (
             not math.isfinite(float(spec.timeout_seconds))
             or float(spec.timeout_seconds) <= 0
@@ -187,6 +199,44 @@ def _failed_result(spec: SubtaskSpec, error: str) -> SubtaskResult:
     )
 
 
+def _cancelled_result(spec: SubtaskSpec) -> SubtaskResult:
+    return _failed_result(
+        spec,
+        "cancelled: another agent triggered early exit",
+    )
+
+
+async def _run_cancellable(
+    semaphore: asyncio.Semaphore,
+    early_exit_event: asyncio.Event | None,
+    spec: SubtaskSpec,
+    operation: Callable[[], Awaitable[SubtaskResult]],
+) -> SubtaskResult:
+    """Run one subtask under the semaphore with a uniform cancellation contract.
+
+    Early-exit cancellation must be translated into a graceful cancelled
+    result instead of a propagated CancelledError.  The try/except has to wrap
+    semaphore acquisition too: a task cancelled while queued on the semaphore
+    would otherwise raise CancelledError from ``sem.acquire()`` and abort the
+    whole batch.  A genuine external cancellation (no early-exit event) is
+    re-raised unchanged.
+    """
+    try:
+        async with semaphore:
+            if early_exit_event is not None and early_exit_event.is_set():
+                return _cancelled_result(spec)
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                if early_exit_event is not None and early_exit_event.is_set():
+                    return _cancelled_result(spec)
+                raise
+    except asyncio.CancelledError:
+        if early_exit_event is not None and early_exit_event.is_set():
+            return _cancelled_result(spec)
+        raise
+
+
 async def run_parallel_subtasks(
     specs: list[SubtaskSpec],
     *,
@@ -208,15 +258,7 @@ async def run_parallel_subtasks(
     early_exit_triggered = False
 
     async def _run(index: int, spec: SubtaskSpec) -> tuple[int, SubtaskResult]:
-        async with sem:
-            if early_exit_event.is_set():
-                return index, SubtaskResult(
-                    id=spec.id,
-                    ok=False,
-                    content="",
-                    tool_calls_made=[],
-                    error="cancelled: another agent triggered early exit",
-                )
+        async def operation() -> SubtaskResult:
             try:
                 if spec.timeout_seconds and spec.timeout_seconds > 0:
                     result = await asyncio.wait_for(executor(spec), timeout=spec.timeout_seconds)
@@ -230,16 +272,6 @@ async def run_parallel_subtasks(
                     tool_calls_made=[],
                     error=f"subtask timed out after {spec.timeout_seconds}s",
                 )
-            except asyncio.CancelledError:
-                if early_exit_event.is_set():
-                    return index, SubtaskResult(
-                        id=spec.id,
-                        ok=False,
-                        content="",
-                        tool_calls_made=[],
-                        error="cancelled: another agent triggered early exit",
-                    )
-                raise
             except Exception as exc:
                 result = SubtaskResult(
                     id=spec.id,
@@ -248,7 +280,10 @@ async def run_parallel_subtasks(
                     tool_calls_made=[],
                     error=str(exc) or exc.__class__.__name__,
                 )
-            return index, result
+            return result
+
+        result = await _run_cancellable(sem, early_exit_event, spec, operation)
+        return index, result
 
     results: list[SubtaskResult | None] = [None] * len(specs)
     completed_count = 0
@@ -316,6 +351,8 @@ async def run_pipeline_subtasks(
     validate_subtask_specs(specs, mode="pipeline")
     concurrency = max(1, int(max_concurrency or len(specs) or 1))
     semaphore = asyncio.Semaphore(concurrency)
+    early_exit_event = asyncio.Event()
+    early_exit_triggered = False
     pending = {spec.id: spec for spec in specs}
     summaries: dict[str, str] = {}
     successful_results: dict[str, SubtaskResult] = {}
@@ -332,6 +369,17 @@ async def run_pipeline_subtasks(
             if any(dep in failed_ids for dep in spec.depends_on)
         ]
         if blocked_ids:
+            blocked_specs = [pending[spec_id] for spec_id in blocked_ids]
+            _emit_progress(
+                progress_callback,
+                "phase_note",
+                execution_mode="pipeline",
+                phase_kind="skipped",
+                skipped_ids=blocked_ids,
+                skipped_roles=[spec.role for spec in blocked_specs],
+                reason="upstream stage failed",
+                spec_count=len(specs),
+            )
             for spec_id in blocked_ids:
                 pending.pop(spec_id)
                 failed_ids.add(spec_id)
@@ -366,20 +414,18 @@ async def run_pipeline_subtasks(
             ready_roles=[spec.role for _, spec in ready],
             spec_count=len(specs),
         )
-        async def run_ready(spec: SubtaskSpec) -> SubtaskResult:
-            async with semaphore:
+        async def run_ready(index: int, spec: SubtaskSpec) -> tuple[int, SubtaskResult]:
+            async def operation() -> SubtaskResult:
                 try:
-                    operation = _invoke_pipeline_executor(
+                    invoked = _invoke_pipeline_executor(
                         executor,
                         spec,
                         {dep: summaries[dep] for dep in spec.depends_on},
                         {dep: successful_results[dep] for dep in spec.depends_on},
                     )
                     if spec.timeout_seconds:
-                        return await asyncio.wait_for(operation, spec.timeout_seconds)
-                    return await operation
-                except asyncio.CancelledError:
-                    raise
+                        return await asyncio.wait_for(invoked, spec.timeout_seconds)
+                    return await invoked
                 except asyncio.TimeoutError:
                     return _failed_result(
                         spec,
@@ -388,15 +434,40 @@ async def run_pipeline_subtasks(
                 except Exception as exc:
                     return _failed_result(spec, str(exc) or exc.__class__.__name__)
 
-        stage_tasks = [asyncio.create_task(run_ready(spec)) for _, spec in ready]
+            result = await _run_cancellable(
+                semaphore,
+                early_exit_event,
+                spec,
+                operation,
+            )
+            return index, result
+
+        stage_tasks = [
+            asyncio.create_task(run_ready(index, spec))
+            for index, (_, spec) in enumerate(ready)
+        ]
+        stage_results: list[SubtaskResult | None] = [None] * len(ready)
         try:
-            stage_results = await asyncio.gather(*stage_tasks)
+            for future in asyncio.as_completed(stage_tasks):
+                index, result = await future
+                stage_results[index] = result
+                if (
+                    result.ok
+                    and ready[index][1].early_exit
+                    and not early_exit_triggered
+                ):
+                    early_exit_triggered = True
+                    early_exit_event.set()
+                    for task in stage_tasks:
+                        if not task.done():
+                            task.cancel()
         except BaseException:
             for task in stage_tasks:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*stage_tasks, return_exceptions=True)
             raise
+        stage_results = [result for result in stage_results if result is not None]
         succeeded_count = sum(1 for result in stage_results if result.ok)
         failed_count = len(stage_results) - succeeded_count
         hard_failed_count = sum(
@@ -416,6 +487,7 @@ async def run_pipeline_subtasks(
             succeeded_count=succeeded_count,
             failed_count=failed_count,
             halted=hard_failed_count > 0,
+            early_exit_triggered=early_exit_triggered,
             spec_count=len(specs),
         )
         for (spec_id, spec), result in zip(ready, stage_results):
@@ -430,6 +502,11 @@ async def run_pipeline_subtasks(
                 continue
             summaries[spec.id] = result.summary
             successful_results[spec.id] = result
+        if early_exit_triggered:
+            for spec_id, spec in pending.items():
+                results.append(_cancelled_result(spec))
+            pending.clear()
+            break
     if telemetry is not None:
         telemetry.update(
             {
@@ -439,6 +516,7 @@ async def run_pipeline_subtasks(
                 "completed_count": len(results),
                 "skipped_count": len(specs) - len(results),
                 "max_concurrency": concurrency,
+                "early_exit_triggered": early_exit_triggered,
                 "write_scope_count": write_scope_count,
                 "write_scope_check_seconds": write_scope_check_seconds,
                 "duration_seconds": time.perf_counter() - started_at,

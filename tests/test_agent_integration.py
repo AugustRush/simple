@@ -2248,8 +2248,9 @@ def test_clear_context_is_applied_after_tool_batch_and_uses_current_request(
     assert all(message["role"] != "tool" for message in observed_messages[1])
 
 
-def test_orchestration_planner_defaults_without_orchestration_skill(monkeypatch, tmp_path):
+def test_orchestration_planner_uses_shipped_builtin_skill(monkeypatch, tmp_path):
     import agent as agent_module
+    from agent.orchestration.planner import OrchestrationPlanner
 
     cfg = _minimal_cfg()
 
@@ -2268,7 +2269,20 @@ def test_orchestration_planner_defaults_without_orchestration_skill(monkeypatch,
     skill_catalog = components["skill_catalog"]
     bundle = skill_catalog.get("multi-agent-orchestration")
 
-    assert bundle is None  # skill was removed — planner uses defaults
+    # The planner-only orchestration skill ships with the package, so the
+    # planner's advisory keyword guidance is active in production.
+    assert bundle is not None
+    assert bundle.source == "builtin"
+    assert bundle.disable_model_invocation is True
+    planner = OrchestrationPlanner.from_skill_catalog(skill_catalog)
+    decision = planner.decide(
+        "请做一轮正反辩论，再给最终判断",
+        tools_enabled=True,
+        has_spawn_agent=True,
+    )
+    assert decision.mode == "explicit"
+    assert "rendezvous" in decision.guidance
+    assert decision.max_rendezvous_rounds == 2
 
 
 def test_system_prompt_keeps_spawn_agent_as_only_public_delegation_tool(
@@ -4093,6 +4107,7 @@ def test_execute_subtask_spec_passes_expected_output_and_constraints_to_spawn_ag
                 role="implementer",
                 task="patch the file",
                 expected_output="Return a concise diff summary.",
+                system_suffix="Be extra conservative.",
                 output_contract={
                     "format": "json",
                     "required_keys": ["summary"],
@@ -4107,6 +4122,7 @@ def test_execute_subtask_spec_passes_expected_output_and_constraints_to_spawn_ag
     assert observed["task"] == "patch the file"
     assert observed["kwargs"] == {
         "expected_output": "Return a concise diff summary.",
+        "system_suffix": "Be extra conservative.",
         "output_contract": {
             "format": "json",
             "required_keys": ["summary"],

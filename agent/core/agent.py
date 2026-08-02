@@ -29,6 +29,7 @@ from agent.orchestration.runtime import (
     run_parallel_subtasks as _run_parallel_subtasks,
     run_pipeline_subtasks as _run_pipeline_subtasks,
     run_rendezvous_round as _run_rendezvous_round,
+    validate_subtask_specs,
     CAPABILITY_PROFILES,
 )
 from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlanner
@@ -317,6 +318,14 @@ class BaseAgent:
                 )
             return f"Pipeline stage {stage_index} finished: {succeeded} succeeded"
 
+        if kind == "phase_note" and mode == "pipeline":
+            if payload.get("phase_kind") == "skipped":
+                skipped = len(payload.get("skipped_ids") or [])
+                roles = self._format_role_list(list(payload.get("skipped_roles", [])))
+                reason = str(payload.get("reason", "") or "")
+                suffix = f" ({reason})" if reason else ""
+                return f"Pipeline: {skipped} blocked agents skipped{suffix}: {roles}"
+
         if kind == "phase_started" and mode == "rendezvous":
             round_index = int(payload.get("phase_index", 0) or 0)
             round_total = int(payload.get("phase_total", 0) or 0)
@@ -421,6 +430,7 @@ class BaseAgent:
         payload = await self._execute_agent(
             role=spec.role,
             task=spec.task,
+            system_suffix=spec.system_suffix,
             expected_output=spec.expected_output,
             output_contract=dict(spec.output_contract) if spec.output_contract else None,
             write_scope=list(spec.write_scope) if spec.write_scope else None,
@@ -628,7 +638,8 @@ class BaseAgent:
             f'"stop": true_or_false, '
             f'"continue_with": ["agent_id", ...] or null}}\n\n'
             f"- summary: synthesize the key insights, conflicts, and consensus\n"
-            f"- stop: true if consensus is clear or further rounds would not add value\n"
+            f"- stop: JSON boolean (true or false, never a string) — true if consensus "
+            f"is clear or further rounds would not add value\n"
             f"- continue_with: null to keep all agents, or a list of agent IDs to "
             f"select specific agents for the next round"
         )
@@ -639,21 +650,12 @@ class BaseAgent:
                 max_tokens=1024,
             )
             if resp_text:
-                # Strip markdown code fences if present
-                if resp_text.startswith("```"):
-                    resp_text = resp_text.split("\n", 1)[-1]
-                    if resp_text.endswith("```"):
-                        resp_text = resp_text[:-3].strip()
-                directive_data = json.loads(resp_text)
-                return RendezvousDirective(
-                    summary=str(directive_data.get("summary", "")),
-                    stop=bool(directive_data.get("stop", False)),
-                    continue_with=(
-                        list(directive_data["continue_with"])
-                        if isinstance(directive_data.get("continue_with"), list)
-                        else None
-                    ),
+                directive = self._parse_rendezvous_directive(
+                    resp_text,
+                    known_ids={result.id for result in results},
                 )
+                if directive is not None:
+                    return directive
         # Fallback: original string concatenation
         summary_lines = []
         for result in results:
@@ -665,6 +667,65 @@ class BaseAgent:
         return RendezvousDirective(
             summary="\n".join(summary_lines),
             summary_quality="concatenation",
+        )
+
+    @staticmethod
+    def _parse_rendezvous_directive(
+        resp_text: str,
+        *,
+        known_ids: set[str],
+    ) -> RendezvousDirective | None:
+        """Parse and normalize a rendezvous synthesis response.
+
+        The model's output is free-form, so every field is validated and
+        normalized instead of being trusted verbatim: ``stop`` only becomes
+        True for an explicit true-like value, ``continue_with`` is filtered to
+        known subtask ids (falling back to "keep everyone" when the selection
+        is empty or unknown), and anything malformed returns None so the
+        caller uses its deterministic fallback.
+        """
+        text = str(resp_text or "").strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            if text.endswith("```"):
+                text = text[:-3].strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        summary = str(data.get("summary", "") or "")
+        raw_stop = data.get("stop")
+        if isinstance(raw_stop, bool):
+            stop = raw_stop
+        elif isinstance(raw_stop, str):
+            stop = str(raw_stop).strip().lower() in {"true", "yes", "1"}
+        elif isinstance(raw_stop, (int, float)):
+            stop = bool(raw_stop)
+        else:
+            stop = False
+        raw_continue = data.get("continue_with")
+        if raw_continue is None:
+            continue_with = None
+        elif isinstance(raw_continue, str):
+            continue_with = [raw_continue] if raw_continue in known_ids else None
+        elif isinstance(raw_continue, list):
+            selected = [
+                str(item)
+                for item in raw_continue
+                if str(item or "").strip()
+            ]
+            known = [item for item in selected if item in known_ids]
+            continue_with = known or None
+        else:
+            continue_with = None
+        return RendezvousDirective(
+            summary=summary,
+            stop=stop,
+            continue_with=continue_with,
         )
 
     @staticmethod
@@ -969,6 +1030,7 @@ class BaseAgent:
             task=task,
             depends_on=depends_on,
             expected_output=str(tool_input.get("expected_output", "") or ""),
+            system_suffix=str(tool_input.get("system_suffix", "") or ""),
             output_contract=self._normalize_output_contract(
                 self._mapping_dict(tool_input.get("output_contract"))
             ),
@@ -1025,6 +1087,10 @@ class BaseAgent:
 
         run_id = shared._new_id()
         specs = [replace(spec, run_id=run_id) for spec in specs]
+        # Validate the graph before dispatch for every mode — including the
+        # single-spawn "direct" path, which the per-mode runtimes would
+        # otherwise skip.
+        validate_subtask_specs(specs)
 
         execution_mode = self._derive_execution_mode_from_spawn_calls(spawn_calls)
         telemetry: dict[str, Any] = {
@@ -1203,6 +1269,13 @@ class BaseAgent:
                 if round_index > 1
                 else spec
             )
+            # Scope per-round LTM observations so repeated rounds of the same
+            # agent do not collide under one run id.
+            if adjusted.run_id:
+                adjusted = replace(
+                    adjusted,
+                    run_id=f"{adjusted.run_id}#r{round_index}",
+                )
             return await self._execute_subtask_spec(adjusted)
 
         return await _run_rendezvous_round(
@@ -3551,14 +3624,19 @@ class BaseAgent:
                     "write_scope": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional list of files or directories this sub-agent may modify.",
+                        "description": (
+                            "Files or directories this sub-agent may modify. Workspace writes are "
+                            "only enabled through an explicit write_scope; required when "
+                            "capability_profile is 'implementation'."
+                        ),
                     },
                     "capability_profile": {
                         "type": "string",
                         "enum": sorted(CAPABILITY_PROFILES),
                         "description": (
                             "Optional capability profile. Use 'read_only' for analysis workers "
-                            "and 'implementation' for code-changing workers."
+                            "and 'implementation' for code-changing workers. 'implementation' "
+                            "requires an explicit write_scope so the worker can modify workspace files."
                         ),
                     },
                     "depends_on": {
@@ -3579,9 +3657,10 @@ class BaseAgent:
                     "early_exit": {
                         "type": "boolean",
                         "description": (
-                            "When true, if this agent succeeds, cancel all other "
-                            "still-running agents in the same batch. Use for tasks "
-                            "where any single finding completes the goal."
+                            "When true, if this agent succeeds the whole batch stops: still-running "
+                            "agents are cancelled and later pipeline stages are skipped. Use for "
+                            "tasks where any single finding completes the goal. Supported for "
+                            "parallel and pipeline subtasks, not rendezvous."
                         ),
                     },
                     "timeout_seconds": {
