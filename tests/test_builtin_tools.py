@@ -827,7 +827,7 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
     assert result["ok"] is True
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
     assert captured["env"]["AGENT_WORKSPACE_ROOT"]
-    assert captured["cwd"] == str((tmp_path / "output" / "sandbox").resolve())
+    assert captured["cwd"] == str((tmp_path / "output").resolve())
     assert captured["env"]["AGENT_SANDBOX_DIR"] == str((tmp_path / "output" / "sandbox").resolve())
 
 
@@ -855,7 +855,7 @@ def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch)
     result = asyncio.run(tools._shell("echo ok", timeout=1))
 
     assert result["ok"] is True
-    assert captured["cwd"] == str((shared_module.DEFAULT_OUTPUT_DIR / "sandbox").resolve())
+    assert captured["cwd"] == str(shared_module.DEFAULT_OUTPUT_DIR.resolve())
     assert captured["cwd"] != str(workspace.resolve())
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(shared_module.DEFAULT_OUTPUT_DIR.resolve())
 
@@ -884,6 +884,100 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
 
     assert result["ok"] is True
     assert captured["cwd"] == str(output_dir.resolve())
+
+
+def test_shell_resolves_relative_cwd_inside_declared_root(tmp_path, monkeypatch):
+    tools, _reg, workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"ok", b"")
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured["cwd"] = kwargs.get("cwd")
+        return FakeProc()
+
+    monkeypatch.setattr(
+        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
+    )
+
+    asyncio.run(tools._shell("echo ok", timeout=1, root="workspace", cwd="sub"))
+    assert captured["cwd"] == str((workspace / "sub").resolve())
+
+    asyncio.run(tools._shell("echo ok", timeout=1, root="output_dir", cwd="sub"))
+    assert captured["cwd"] == str((output_dir / "sub").resolve())
+
+
+def test_shell_rejects_relative_cwd_escaping_declared_root(tmp_path):
+    tools, _reg, _workspace, output_dir = make_builtin_tools_with_output_dir(tmp_path)
+
+    result = asyncio.run(
+        tools._shell(
+            "echo ok",
+            timeout=1,
+            root="output_dir",
+            cwd="../workspace",
+        )
+    )
+
+    assert result["ok"] is False
+    assert "escapes root" in result["error"]
+
+
+def test_shell_rejects_unknown_root(tmp_path):
+    tools, _reg, _workspace = make_builtin_tools(tmp_path)
+
+    result = asyncio.run(tools._shell("echo ok", timeout=1, root="bogus"))
+
+    assert result["ok"] is False
+    assert "root" in result["error"]
+
+
+def test_shell_output_domain_relocates_workspace_files_without_sandbox(tmp_path):
+    tools, registry, workspace, output_dir = make_builtin_tools_with_output_dir(
+        tmp_path
+    )
+    registry.set_context("shell_permission_level", "full")
+    registry.set_context("shell_sandbox_mode", "none")
+
+    result = asyncio.run(
+        tools._shell(
+            f"mkdir -p {workspace}/polluted && "
+            f"touch {workspace}/polluted/new.txt",
+            timeout=10,
+            root="output_dir",
+            cwd=".",
+        )
+    )
+
+    assert result["ok"] is True
+    assert not (workspace / "polluted" / "new.txt").exists()
+    assert (output_dir / "workspace-artifacts" / "polluted" / "new.txt").exists()
+    assert result["moved_artifacts"]
+
+
+def test_shell_workspace_domain_keeps_files_without_sandbox(tmp_path):
+    tools, registry, workspace, _output_dir = make_builtin_tools_with_output_dir(
+        tmp_path
+    )
+    registry.set_context("shell_permission_level", "full")
+    registry.set_context("shell_sandbox_mode", "none")
+
+    result = asyncio.run(
+        tools._shell(
+            "mkdir -p newdir && touch newdir/new.txt",
+            timeout=10,
+            root="workspace",
+            cwd=".",
+        )
+    )
+
+    assert result["ok"] is True
+    assert (workspace / "newdir" / "new.txt").exists()
+    assert result["moved_artifacts"] == []
 
 
 def test_shell_blocks_workspace_write_by_default(tmp_path):
@@ -942,6 +1036,9 @@ def test_shell_tool_schema_does_not_expose_confirmation_token(tmp_path):
     shell = next(item for item in registry.to_anthropic_format() if item["name"] == "shell")
 
     assert "confirmation_token" not in shell["input_schema"]["properties"]
+    root_schema = shell["input_schema"]["properties"]["root"]
+    assert root_schema["enum"] == ["output_dir", "workspace"]
+    assert root_schema["default"] == "output_dir"
 
 
 def test_shell_runs_restricted_command_after_user_scoped_confirmation(

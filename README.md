@@ -442,6 +442,14 @@ reopens it, and the agent's internal bookkeeping.  GUI/rendering workloads
 facilities App Store GUI apps get from `application.sb` (process-local mach
 bootstrap, app-sandbox file extensions, preference reads).
 
+The shell tool takes a `root` parameter (`output_dir` by default, or
+`workspace`) and resolves relative `cwd` values inside that root.  Generated
+and downloaded files therefore land in the configured output directory, not
+the repository.  When a call is scoped to `output_dir` and still creates new
+files inside the workspace (for example via absolute paths), the tool moves
+them to `output_dir/workspace-artifacts/` — this invariant holds even when
+the OS sandbox is disabled.
+
 One limitation is architectural: seatbelt cannot nest — a tool that installs
 its own OS sandbox (headless Chrome, Electron) must disable it
 (`--no-sandbox` / `ELECTRON_DISABLE_SANDBOX=1`) or run unsandboxed

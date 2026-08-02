@@ -207,7 +207,7 @@ def test_build_components_wires_output_dir(monkeypatch, tmp_path):
 
     # output_dir in system prompt
     assert str(tmp_path / "output") in components["system_prompt"]
-    assert "Avoid absolute path arguments in shell commands" in components["system_prompt"]
+    assert "`root` parameter (`output_dir` or `workspace`)" in components["system_prompt"]
     assert "git clone <url> repo-name" in components["system_prompt"]
 
     # clean_output registered

@@ -707,26 +707,20 @@ def _compose_system_prompt(
                     "Every shell tool call must include an `intent` input that explains what that exact command "
                     "will do and why it is necessary. Do not rely on surrounding prose as the shell intent."
                 )
-                sandbox_hint = (
-                    f"{output_dir}/sandbox"
-                    if output_dir is not None
-                    else f"{shared.DEFAULT_OUTPUT_DIR}/sandbox"
+                lines.append(
+                    "The shell tool takes a `root` parameter (`output_dir` or "
+                    "`workspace`); the default root is the configured output "
+                    f"directory ({output_dir or shared.DEFAULT_OUTPUT_DIR}), NOT "
+                    f"the workspace root ({workspace_root}). Relative `cwd` values "
+                    "resolve inside that root, so downloads, clones, and generated "
+                    "artifacts stay in the output directory."
                 )
                 lines.append(
-                    "Shell commands run inside an OS filesystem sandbox. The default "
-                    f"cwd is an isolated sandbox directory under output_dir "
-                    f"({sandbox_hint}), NOT the workspace root ({workspace_root}). "
-                    "Writes are blocked outside output_dir and the approved workspace "
-                    "write_scope, so downloads, clones, and generated artifacts must "
-                    "use relative paths under the sandbox/output directory. Only set "
-                    "cwd explicitly when you need to operate on workspace files."
-                )
-                lines.append(
-                    "Avoid absolute path arguments in shell commands. For current project files, "
-                    f"set shell cwd to the workspace root ({workspace_root}) and use relative paths. "
-                    "For external repos, downloads, and build artifacts, keep the default sandbox cwd "
-                    "and use relative targets such as `git clone <url> repo-name`; run follow-up "
-                    "commands with cwd set to the cloned directory under the sandbox/output directory."
+                    "For current project files use `root=workspace` with relative "
+                    "paths; for downloads and build artifacts keep `root=output_dir` "
+                    "and use relative targets such as `git clone <url> repo-name`; "
+                    "run follow-up commands with `cwd` set to the directory you "
+                    "created."
                 )
             if "send_file" in builtin_names:
                 lines.append(

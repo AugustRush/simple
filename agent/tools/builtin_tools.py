@@ -265,9 +265,15 @@ class BuiltinTools:
                         "description": "Timeout in seconds (default 300, max 3600). Use 600+ for large downloads or long builds.",
                         "default": 300,
                     },
+                    "root": {
+                        "type": "string",
+                        "enum": ["output_dir", "workspace"],
+                        "default": "output_dir",
+                        "description": "Security domain for this shell call. output_dir (default) is for generated, downloaded, and temporary files and resolves inside the configured output directory; workspace is for project-file operations and resolves inside the workspace root.",
+                    },
                     "cwd": {
                         "type": "string",
-                        "description": "Optional working directory. Defaults to an isolated sandbox directory (AGENT_SANDBOX_DIR) so downloads, clones, and generated artifacts never pollute the workspace. For current project files, set cwd to the workspace root and use relative command arguments; for external clones/downloads, keep the default cwd and use relative paths.",
+                        "description": "Optional working directory. Relative paths resolve inside root (default: the root itself). Absolute paths are accepted only when inside the workspace or output directory.",
                     },
                 },
                 "required": ["command", "intent"],
@@ -1692,6 +1698,7 @@ class BuiltinTools:
         command: str,
         intent: str = "",
         timeout: int = 300,
+        root: str = "output_dir",
         cwd: Optional[str] = None,
     ) -> dict[str, Any]:
         # Security: block dangerous commands before spawning any subprocess.
@@ -1797,14 +1804,47 @@ class BuiltinTools:
         write_scope = _normalize_write_scope(
             self.registry.get_context("write_scope") or ()
         )
-        resolved_cwd = sandbox_dir
+        root = str(root or "output_dir").strip().casefold()
+        if root not in ("workspace", "output_dir"):
+            return self._error(
+                "Shell root must be 'workspace' or 'output_dir'",
+                command=command,
+            )
         if cwd:
-            resolved_cwd, _root_kind = self._resolve_output_path(cwd)
+            candidate = Path(cwd).expanduser()
+            if candidate.is_absolute():
+                resolved_cwd, call_root = resolve_workspace_path(
+                    candidate,
+                    workspace_root=self.workspace_root,
+                    output_dir=output_dir,
+                )
+            else:
+                base = self.workspace_root if root == "workspace" else output_dir
+                resolved_cwd, _ = resolve_workspace_path(
+                    base / candidate,
+                    workspace_root=self.workspace_root,
+                    output_dir=output_dir,
+                )
+                if not path_contains(base, resolved_cwd):
+                    return self._error(
+                        f"Shell cwd '{cwd}' escapes root '{root}'",
+                        command=command,
+                    )
+                call_root = root
+        else:
+            if root == "workspace":
+                resolved_cwd, call_root = self.workspace_root, "workspace"
+            else:
+                resolved_cwd, call_root = output_dir, "output_dir"
+
         sandbox = None
+        workspace_before: set[Path] | None = None
         if unsandboxed:
-            # Danger-full-access: no OS sandbox, no file-policy gating, and no
-            # artifact relocation — the child owns the whole machine.
-            workspace_before = None
+            # Danger-full-access: the OS sandbox is off, but the file-domain
+            # invariant still holds at the tool layer — output-domain calls
+            # must not leave new files in the workspace.
+            if call_root == "output_dir":
+                workspace_before = self._workspace_file_snapshot()
         else:
             if not workspace_read and self._path_is_inside_workspace(
                 resolved_cwd
@@ -1843,11 +1883,6 @@ class BuiltinTools:
             env["AGENT_SANDBOX_DIR"] = str(sandbox_dir)
             if sandbox is not None:
                 env.update(sandbox.env_updates)
-            workspace_before: set[Path] | None = None
-            if sandbox is not None and self._path_is_inside_workspace(
-                resolved_cwd
-            ):
-                workspace_before = self._workspace_file_snapshot()
             proc = await asyncio.create_subprocess_exec(
                 *(sandbox.argv_prefix if sandbox is not None else ()),
                 "/bin/sh",
@@ -1931,6 +1966,8 @@ class BuiltinTools:
                         result += f"\n- ... {len(moved_artifacts) - 20} more"
             return self._ok(
                 command=command,
+                root=call_root,
+                cwd=str(resolved_cwd),
                 output=result or "(no output)",
                 exit_code=proc.returncode,
                 moved_artifacts=moved_artifacts,
