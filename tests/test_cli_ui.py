@@ -818,6 +818,29 @@ def test_tui_output_pane_parses_split_escape_sequences():
     assert pane.cursor_position().y == 1
 
 
+def test_tui_output_pane_partial_escape_before_newline_keeps_counts_aligned():
+    from prompt_toolkit.layout.controls import FormattedTextControl
+
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=4)
+    pane.write("hello\x1b[")
+    pane.write("\nworld")
+
+    # The abandoned partial escape must not swallow the newline, and the
+    # line counter must match what prompt_toolkit will actually render.
+    joined = "".join(text for _style, text in pane.fragments())
+    assert joined == "hello\nworld"
+    assert pane.cursor_position().y == 1
+
+    control = FormattedTextControl(
+        pane.fragments,
+        get_cursor_position=pane.cursor_position,
+    )
+    content = control.create_content(80, None)
+    assert content.cursor_position.y < content.line_count
+
+
 def test_tui_output_pane_tracks_lines_incrementally():
     from agent.tui import _OutputPane
 

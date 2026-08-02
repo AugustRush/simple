@@ -64,6 +64,13 @@ class _OutputPane:
     def write(self, text: str) -> int:
         if not text:
             return 0
+        # A newline can never continue an escape sequence.  If a partial
+        # escape is still buffered, the stream abandoned it; drop it so the
+        # ANSI parser does not swallow the newline as an unsupported CSI
+        # character (which would desynchronize the line counter from the
+        # rendered content).
+        if self._pending_escape and text.startswith("\n"):
+            self._pending_escape = ""
         # Parse incrementally: re-parsing the whole conversation on every
         # write is O(total output) per render and makes the UI unusable once
         # the session grows.  A trailing partial escape sequence is held and
@@ -76,8 +83,15 @@ class _OutputPane:
             self._pending_escape = tail.group(0)
             chunk = chunk[: tail.start()]
         if chunk:
-            self._fragments.extend(list(to_formatted_text(ANSI(chunk))))
-        self._line_count += text.count("\n")
+            parsed = list(to_formatted_text(ANSI(chunk)))
+            self._fragments.extend(parsed)
+            # Line accounting comes from what the parser actually emitted,
+            # never from the raw input: the cursor must always point at a
+            # real rendered line, even if the parser drops characters from a
+            # malformed escape stream.
+            self._line_count += sum(
+                item[1].count("\n") for item in parsed if len(item) >= 2
+            )
         if self._follow_bottom:
             self._scroll_top = self._max_scroll()
         self._notify()
