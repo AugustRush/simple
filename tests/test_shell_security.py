@@ -680,3 +680,73 @@ def test_session_sandbox_override_is_scoped_and_validated():
 
     shell_session_sandbox_set(scope, "bogus")
     assert shell_session_sandbox_get(scope) == ""
+
+
+# ── A refusal must be terminal ───────────────────────────────────────────────
+
+
+def _consent_scope():
+    from agent.security.shell import ShellAuthorizationScope
+
+    return ShellAuthorizationScope("cli", "cli", "")
+
+
+_DANGEROUS = "echo start && rm -rf ~/Documents/taxes"
+
+
+def test_declined_command_cannot_be_redeemed_by_a_later_approval():
+    """A refused request must not stay redeemable.
+
+    Regression: declining left the pending token alive for its full 5-minute
+    TTL, so any later approval reply ("yes", "批准") to some *other* question
+    redeemed the very command the human had just refused.
+    """
+    from agent.security.shell import (
+        shell_approve_single_pending,
+        shell_command_check,
+        shell_pending_for_scope,
+        shell_pending_reject,
+        shell_session_allowlist_contains,
+    )
+
+    scope = _consent_scope()
+    result = shell_command_check(_DANGEROUS, scope=scope)
+    assert result.requires_confirmation is True
+    assert len(shell_pending_for_scope(scope)) == 1
+
+    assert shell_pending_reject(result.confirmation_token, scope=scope) is True
+    assert shell_pending_for_scope(scope) == []
+
+    # A later approval reply must find nothing to redeem.
+    assert shell_approve_single_pending(scope) is None
+    assert shell_session_allowlist_contains(_DANGEROUS, scope=scope) is False
+
+
+def test_reject_is_scoped_and_idempotent():
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_pending_reject,
+    )
+
+    scope = _consent_scope()
+    result = shell_command_check(_DANGEROUS, scope=scope)
+    token = result.confirmation_token
+
+    other = ShellAuthorizationScope("other", "cli", "")
+    assert shell_pending_reject(token, scope=other) is False, "cross-scope reject"
+    assert shell_pending_reject(token, scope=scope) is True
+    assert shell_pending_reject(token, scope=scope) is False, "second reject is a no-op"
+
+
+def test_approval_path_is_unaffected_by_the_reject_capability():
+    from agent.security.shell import (
+        shell_approve_single_pending,
+        shell_command_check,
+        shell_session_allowlist_contains,
+    )
+
+    scope = _consent_scope()
+    shell_command_check(_DANGEROUS, scope=scope)
+    assert shell_approve_single_pending(scope) is not None
+    assert shell_session_allowlist_contains(_DANGEROUS, scope=scope) is True

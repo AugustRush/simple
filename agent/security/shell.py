@@ -393,6 +393,24 @@ def shell_command_confirm(
     return True
 
 
+def shell_pending_reject(
+    token: str,
+    *,
+    scope: ShellAuthorizationScope,
+) -> bool:
+    """Retire one pending token because the human refused it.
+
+    A refusal has to be a terminal state.  Without this the record simply stays
+    pending until its TTL lapses, so a later unrelated approval reply ("yes",
+    "批准") can redeem the very command the human just declined.
+    """
+    stored = _pending_tokens.get(str(token))
+    if stored is None or stored.scope != scope:
+        return False
+    _pending_tokens.pop(str(token), None)
+    return True
+
+
 def shell_pending_for_scope(
     scope: ShellAuthorizationScope,
     now: datetime | None = None,

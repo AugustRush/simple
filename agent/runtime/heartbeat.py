@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import uuid
@@ -97,10 +96,11 @@ def _now_iso() -> str:
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
-    tmp.replace(path)
+    """Delegates to the one durable-write primitive.
+
+    This used to be a second, independent copy of write-tmp-then-rename.  Two
+    implementations of one guarantee means hardening either leaves the other
+    behind — exactly what happened: neither had ``fsync``, and fixing one would
+    have silently skipped heartbeats.
+    """
+    shared._atomic_write_json(path, payload)

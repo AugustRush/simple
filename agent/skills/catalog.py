@@ -499,7 +499,9 @@ class SkillCatalog:
                     user_invocable=user_invocable,
                     disable_model_invocation=disable_model_invocation,
                 )
-                skill_file.write_text(content, encoding="utf-8")
+                # Create-only (guarded by the exists() check above), but use the
+                # durable primitive anyway so the rule needs no per-site reasoning.
+                shared._atomic_write_text(skill_file, content)
                 self.reload()
                 bundle = self.get(skill_id)
                 return {
@@ -567,7 +569,9 @@ class SkillCatalog:
                     user_invocable=final_user_inv,
                     disable_model_invocation=final_disable_model,
                 )
-                skill_file.write_text(content, encoding="utf-8")
+                # Durable primitive: this overwrites a skill the user may have
+                # authored, so a truncating write can destroy it outright.
+                shared._atomic_write_text(skill_file, content)
                 self.reload()
                 updated = self.get(bundle.id)
                 return {
@@ -634,8 +638,9 @@ class SkillCatalog:
                     "error": "Use update_skill to modify SKILL.md, not write_skill_file",
                 }
             try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
+                # Durable primitive: this path also overwrites existing resource
+                # files, so it needs the same all-or-nothing replacement.
+                shared._atomic_write_text(target, content)
                 self.reload()
                 return {
                     "ok": True,

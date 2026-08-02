@@ -3895,3 +3895,109 @@ def test_coordinator_chat_approval_rejects_long_or_qualified_replies() -> None:
     assert core.calls
     assert core.calls[0].text == "批准，然后顺便告诉我结果"
     assert shell_session_allowlist_contains("mkfs /dev/disk0", scope=scope) is False
+
+
+# ── Only a plausible command attempt is routed as a command ─────────────────
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/Users/shike/Desktop/simple/agent/cli.py:817: something",
+        "/usr/local/bin/python --version",
+        "/tmp/x.log",
+        "/etc/hosts",
+        "//TODO: fix this",
+        "/ leading space then text",
+        "/home/u/a.py:12:  return x",
+    ],
+)
+def test_pasted_paths_reach_the_model_as_text(text):
+    """A paste must not be swallowed as an unknown command.
+
+    Regression: any text starting with "/" was parsed as a command, and an
+    unresolved name produced "Unknown command" with forward_text=None — so a
+    pasted path, grep hit, or diff line was discarded instead of being sent to
+    the model.
+    """
+    from agent.commands.router import CommandRouter
+
+    assert CommandRouter().classify(text).kind == "text"
+
+
+@pytest.mark.parametrize("text", ["/hepl", "/modle deepseek", "/nonexistent-cmd"])
+def test_mistyped_command_names_still_get_feedback(text):
+    """Typo feedback is the reason unknown_slash exists; keep it."""
+    from agent.commands.router import CommandRouter
+
+    assert CommandRouter().classify(text).kind == "unknown_slash"
+
+
+def test_unknown_explicit_skill_reference_still_reports_an_error():
+    from agent.commands.router import CommandRouter
+
+    classification = CommandRouter().classify("/skill quality/reviw")
+    assert classification.kind == "unknown_slash"
+    assert classification.skill_error == "unknown"
+
+
+def _phrase_approval_outcome(*, menu_available: bool):
+    """Run the chat-approval path against a sink with/without a menu."""
+    from dataclasses import dataclass, field, replace as dc_replace
+    from agent.commands.coordinator import CommandCoordinator
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_command_check,
+        shell_session_allowlist_clear,
+        shell_session_allowlist_contains,
+    )
+
+    dangerous = "echo hi && rm -rf ~/Documents/taxes"
+    scope = ShellAuthorizationScope("cli", "cli", "")
+    shell_session_allowlist_clear()
+    shell_command_check(dangerous, scope=scope)
+
+    @dataclass
+    class _Classification:
+        kind: str = "text"
+
+    @dataclass
+    class _TurnInput:
+        text: str = "yes"
+        session_id: str = "cli"
+        channel_name: str = "cli"
+        metadata: dict = field(default_factory=dict)
+
+    class _Sink:
+        interactive_confirmation = menu_available
+
+        def on_status(self, *args, **kwargs):
+            return None
+
+    coordinator = CommandCoordinator.__new__(CommandCoordinator)
+    turn_input = _TurnInput()
+    result = coordinator._maybe_redeem_chat_approval(
+        turn_input, _Classification(), _Sink()
+    )
+    redeemed = shell_session_allowlist_contains(dangerous, scope=scope)
+    shell_session_allowlist_clear()
+    return redeemed, result.text != "yes"
+
+
+def test_phrase_approval_is_inert_when_an_interactive_menu_exists():
+    """A bare "yes" is ambiguous — it may answer some other question.
+
+    Where the human can be prompted at the moment of the side effect, phrase
+    matching must not run in parallel, or the weakest consent channel silently
+    becomes the operative one.
+    """
+    redeemed, rewritten = _phrase_approval_outcome(menu_available=True)
+    assert redeemed is False
+    assert rewritten is False
+
+
+def test_phrase_approval_still_works_where_no_menu_is_possible():
+    """Chat transports cannot prompt, so the phrase path must remain."""
+    redeemed, rewritten = _phrase_approval_outcome(menu_available=False)
+    assert redeemed is True
+    assert rewritten is True

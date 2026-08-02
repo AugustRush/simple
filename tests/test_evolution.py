@@ -353,3 +353,55 @@ def test_apply_best_prompt_rejects_path_traversal_versions(tmp_path, monkeypatch
 
     assert prompt == agent_module.DEFAULT_SYSTEM_PROMPT
     assert not (prompts_dir / "best.md").exists()
+
+
+def test_rule_store_save_replaces_the_whole_set_durably(tmp_path, monkeypatch):
+    """``_save`` rewrites every rule in place, so a torn write drops all of them."""
+    from pathlib import Path
+
+    from agent._builtin.plugins.evolution.rules import RuleStore
+
+    rules_file = tmp_path / "rules.jsonl"
+    store = RuleStore(rules_file=rules_file)
+    for index in range(6):
+        store.add_rule(f"rule number {index}", source_failures=[f"f{index}"])
+
+    observed: list[int] = []
+    real_replace = Path.replace
+
+    def observing_replace(self, target):
+        if Path(target).name == "rules.jsonl" and Path(target).exists():
+            observed.append(len(Path(target).read_text(encoding="utf-8").splitlines()))
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", observing_replace)
+
+    store.add_rule("one more rule", source_failures=["f6"])
+
+    assert len(store._load()) == 7
+    # Went through the durable primitive, and the pre-write state was complete.
+    assert observed == [6]
+    assert [p.name for p in tmp_path.iterdir()] == ["rules.jsonl"]
+
+
+def test_rule_store_logs_when_it_drops_an_unreadable_rule_line(tmp_path, caplog):
+    """Skipping one bad line is right; doing it silently is not.
+
+    A silent skip makes a learned rule vanish with no way to distinguish that
+    from never having learned it.
+    """
+    import logging
+
+    from agent._builtin.plugins.evolution.rules import RuleStore
+
+    rules_file = tmp_path / "rules.jsonl"
+    store = RuleStore(rules_file=rules_file)
+    good = store.add_rule("keep me", source_failures=["f0"])
+    with rules_file.open("a", encoding="utf-8") as handle:
+        handle.write('{"id": "broken", "rule": \n')
+
+    with caplog.at_level(logging.WARNING, logger="agent"):
+        loaded = store._load()
+
+    assert [r.id for r in loaded] == [good.id]
+    assert "unreadable rule line" in caplog.text

@@ -88,3 +88,51 @@ def test_list_skill_files_rejects_escapes_and_unknown_fields(tmp_path):
     missing = _call(registry, "list_skill_files", {"skill_name": "nope"})
     assert missing["ok"] is False
     assert "not found" in missing["error"]
+
+
+def test_skill_overwrites_are_durable_replacements(tmp_path, monkeypatch):
+    """Both writers overwrite files a user may have authored by hand.
+
+    A truncating write can destroy the previous version outright, so each has to
+    replace all-or-nothing: a reader sees the old file or the new one.
+    """
+    registry = ToolRegistry()
+    catalog = _catalog_with_files(tmp_path, "demo", ["notes.md"])
+    catalog.register_tools(registry)
+
+    skill_md = tmp_path / "skills" / "demo" / "SKILL.md"
+    notes = tmp_path / "skills" / "demo" / "notes.md"
+
+    replaced: list[str] = []
+    real_replace = Path.replace
+
+    def observing_replace(self, target):
+        replaced.append(Path(target).name)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", observing_replace)
+
+    updated = _call(
+        registry,
+        "update_skill",
+        {"skill_id": "demo", "instructions": "Revised instructions."},
+    )
+    assert updated["ok"] is True
+    assert "Revised instructions." in skill_md.read_text(encoding="utf-8")
+
+    written = _call(
+        registry,
+        "write_skill_file",
+        {"skill_name": "demo", "path": "notes.md", "content": "fresh data"},
+    )
+    assert written["ok"] is True
+    assert notes.read_text(encoding="utf-8") == "fresh data"
+
+    # Both went through the durable primitive, not an in-place truncation.
+    assert replaced == ["SKILL.md", "notes.md"]
+    leftovers = [
+        p.name
+        for p in (tmp_path / "skills" / "demo").iterdir()
+        if p.name.startswith(".")
+    ]
+    assert leftovers == []

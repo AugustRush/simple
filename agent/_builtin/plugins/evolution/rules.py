@@ -14,10 +14,13 @@ to the pre-rule baseline, it is promoted to *active*; otherwise it is
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from agent import shared
 from typing import Optional
 
 from agent.lexical import keyword_terms
@@ -137,11 +140,19 @@ class RuleStore:
                 data = json.loads(line)
                 rules.append(BehaviorRule(**data))
             except Exception:
-                pass  # skip corrupt lines
+                # Skipping is right — one bad line must not cost every rule —
+                # but it has to be audible.  A silent skip makes a learned rule
+                # vanish with no way to tell that from never having learned it.
+                logging.getLogger("agent").warning(
+                    "dropping unreadable rule line in %s", self._path, exc_info=True
+                )
         return rules
 
     def _save(self, rules: list[BehaviorRule]) -> None:
-        self._path.write_text(
+        # Durable primitive: this rewrites the whole rule set in place, so a
+        # truncating write can drop every rule at once.
+        shared._atomic_write_text(
+            self._path,
             "\n".join(json.dumps(asdict(r), ensure_ascii=False) for r in rules) + "\n",
             encoding="utf-8",
         )

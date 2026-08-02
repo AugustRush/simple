@@ -253,3 +253,48 @@ def test_ltm_store_legacy_cleanup_preserves_unrelated_json_and_markdown(tmp_path
 
     assert custom_json.exists()
     assert custom_md.exists()
+
+
+def test_export_jsonl_replaces_the_file_durably(tmp_path, monkeypatch):
+    """The export is a full in-place rewrite.
+
+    A truncating write leaves a reader a short memory file that parses fine and
+    is simply missing entries — silent, partial memory loss.  So the export goes
+    through the durable primitive, and a reader never observes a shortened file.
+    """
+    from pathlib import Path
+
+    from agent import MemoryPalace
+
+    palace = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    # Distinct loci: write() upserts one note per (chapter, name), so reusing a
+    # name would overwrite rather than accumulate.
+    for index in range(12):
+        palace.write("identity", f"user-{index}", f"fact number {index}")
+
+    observed: list[int] = []
+    real_replace = Path.replace
+
+    def observing_replace(self, target):
+        # The only instant the reader's view can change.
+        if Path(target).name == "memory.jsonl" and Path(target).exists():
+            observed.append(len(Path(target).read_text(encoding="utf-8").splitlines()))
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", observing_replace)
+
+    first = palace.export_jsonl()
+    before = len(first.read_text(encoding="utf-8").splitlines())
+    palace.write("identity", "user-extra", "one more fact")
+    second = palace.export_jsonl()
+    after = len(second.read_text(encoding="utf-8").splitlines())
+
+    assert before == 12
+    assert after == before + 1
+    # Proves it went through the durable primitive, and every observed
+    # intermediate state was a complete file.
+    assert observed == [before]
+    assert [p.name for p in (tmp_path / "memory").iterdir() if p.name.startswith(".")] == []

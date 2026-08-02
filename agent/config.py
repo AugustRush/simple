@@ -72,6 +72,10 @@ DEFAULT_CONFIG: dict = {
     # ── Multi-agent orchestration ─────────────────────────────────────────
     "orchestration": {
         "max_parallel_agents": shared.DEFAULT_MAX_PARALLEL_AGENTS,
+        # Total sub-agents one turn may run, independent of concurrency.
+        # 0 derives it from max_parallel_agents.
+        "max_agents_per_turn": 0,
+        # Total wall-clock budget for one sub-agent, retries included.
         "sub_agent_timeout_seconds": shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS,
         "turn_hook_timeout_seconds": shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
     },

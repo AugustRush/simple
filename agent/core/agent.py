@@ -220,6 +220,8 @@ class BaseAgent:
         self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
         self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self.sub_agent_retries = shared.DEFAULT_SUB_AGENT_RETRIES
+        # 0 = derive from max_parallel_agents (see _max_agents_per_turn).
+        self.max_agents_per_turn = 0
         self.max_tool_call_iterations = shared.MAX_TOOL_CALL_ITERATIONS
         self.max_truncation_continuations = (
             shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS
@@ -355,6 +357,11 @@ class BaseAgent:
             round_index = int(payload.get("phase_index", 0) or 0)
             round_total = int(payload.get("phase_total", 0) or 0)
             continue_count = int(payload.get("continue_count", 0) or 0)
+            if bool(payload.get("final")):
+                return (
+                    f"Lead synthesis complete after round "
+                    f"{round_index}/{round_total}"
+                )
             if bool(payload.get("stop")):
                 return (
                     f"Lead summary after round {round_index}/{round_total}: "
@@ -1046,7 +1053,20 @@ class BaseAgent:
             continue_on_failure=bool(tool_input.get("continue_on_failure", False)),
         )
 
-    def _spawn_result_payload(self, spec: SubtaskSpec, result: SubtaskResult) -> str:
+    def _max_agents_per_turn(self) -> int:
+        """Total sub-agents one turn may run, independent of concurrency."""
+        configured = int(getattr(self, "max_agents_per_turn", 0) or 0)
+        if configured > 0:
+            return configured
+        return max(8, int(self.max_parallel_agents) * 4)
+
+    def _spawn_result_payload(
+        self,
+        spec: SubtaskSpec,
+        result: SubtaskResult,
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> str:
         content_limit = self._result_content_limit()
         payload: dict[str, Any] = {
             "ok": result.ok,
@@ -1066,6 +1086,8 @@ class BaseAgent:
             payload["error"] = self._bounded_text(result.error, 1000)
         if result.artifact_ref:
             payload["artifact_ref"] = result.artifact_ref
+        if extra:
+            payload.update(extra)
         return json.dumps(payload, ensure_ascii=False)
 
     async def _run_orchestrated_spawn_calls(
@@ -1091,6 +1113,17 @@ class BaseAgent:
         # single-spawn "direct" path, which the per-mode runtimes would
         # otherwise skip.
         validate_subtask_specs(specs)
+        # max_parallel_agents bounds concurrency, not total work: a single
+        # model turn emitting N spawn calls runs all N to completion.  Cap the
+        # batch so one turn cannot fan out unboundedly, and fail loudly so the
+        # model can replan into fewer, broader subtasks.
+        agent_budget = self._max_agents_per_turn()
+        if len(specs) > agent_budget:
+            raise ValueError(
+                f"too many sub-agents in one turn: {len(specs)} requested but the "
+                f"limit is {agent_budget}; group the work into fewer, broader "
+                "subtasks or run them across separate turns"
+            )
 
         execution_mode = self._derive_execution_mode_from_spawn_calls(spawn_calls)
         telemetry: dict[str, Any] = {
@@ -1130,6 +1163,17 @@ class BaseAgent:
         active_runs = _active_orchestration_runs.get()
         if active_runs is not None:
             active_runs.append({"run_id": run_id, "results": list(executed)})
+        # A rendezvous run's deliverable is the lead synthesis, not the raw
+        # final-round positions.  Attach it to the first payload (all tool
+        # results for a turn reach the model in one block, so the rest only
+        # need a pointer).
+        synthesis = str(telemetry.get("lead_summary") or "").strip()
+        synthesis_attached = False
+        missing_reason = (
+            "skipped because an upstream pipeline stage failed"
+            if execution_mode == "pipeline"
+            else f"no result produced by the {execution_mode} run"
+        )
         payloads: list[str] = []
         for spec in specs:
             result = results_by_id.get(spec.id)
@@ -1140,13 +1184,29 @@ class BaseAgent:
                             "ok": False,
                             "role": spec.role,
                             "task": spec.task,
-                            "error": "skipped because an upstream pipeline stage failed",
+                            "error": missing_reason,
                         },
                         ensure_ascii=False,
                     )
                 )
                 continue
-            payloads.append(self._spawn_result_payload(spec, result))
+            extra: dict[str, Any] | None = None
+            if synthesis:
+                if not synthesis_attached:
+                    extra = {
+                        "run_synthesis": self._bounded_text(synthesis, 4000),
+                        "run_synthesis_quality": str(
+                            telemetry.get("summary_quality") or ""
+                        ),
+                    }
+                    synthesis_attached = True
+                else:
+                    extra = {
+                        "run_synthesis": (
+                            "see run_synthesis on the first result of this run"
+                        )
+                    }
+            payloads.append(self._spawn_result_payload(spec, result, extra=extra))
         return payloads, telemetry
 
     def _derive_execution_mode_from_spawn_calls(
@@ -1311,13 +1371,31 @@ class BaseAgent:
             tools,
             output_max_tokens=output_budget,
         )
-        return await self._transport.create(
+        response = await self._transport.create(
             model=self._effective_model(ctx),
             max_tokens=output_budget,
             system=ctx.system_prompt,
             messages=ctx.messages,
             tools=tools,
         )
+        self._observe_provider_usage(ctx, response)
+        return response
+
+    def _retrieval_token_budget(self) -> int:
+        """How much of the window automatic retrieval may claim.
+
+        Retrieval is injected into the system prompt, which compaction never
+        touches, so an unbounded injection is not merely wasteful — it
+        permanently occupies room the conversation needs, and a large enough one
+        drives the input budget negative and hard-fails every turn.  A fraction
+        of the window keeps the failure mode impossible by construction rather
+        than relying on stored memories staying short.
+        """
+        configured = int(getattr(self, "max_retrieval_tokens", 0) or 0)
+        if configured > 0:
+            return configured
+        usable = max(0, int(self.context_window) - int(self.max_tokens))
+        return max(1024, int(usable * shared.RETRIEVAL_BUDGET_FRACTION))
 
     def _input_token_budget(
         self,
@@ -1373,6 +1451,34 @@ class BaseAgent:
             raise ContextLimitError(
                 f"provider input estimate {estimate} is not below budget {budget}"
             )
+        # Record what this payload was predicted to cost so the provider's exact
+        # count can calibrate the estimator once the call returns.  The provider
+        # charges for system prompt and tool schemas too, so the comparable
+        # prediction is messages + overhead.
+        output_budget = self.max_tokens if output_max_tokens is None else int(
+            output_max_tokens
+        )
+        overhead = self.context_window - output_budget - budget
+        ctx.metadata["_predicted_input_tokens"] = estimate + max(0, overhead)
+
+    def _observe_provider_usage(self, ctx: "AgentContext", response: Any) -> None:
+        """Feed the provider's exact input count back into the estimator.
+
+        Without this the character heuristic never learns: it carries the same
+        systematic bias for the life of the process, and the only signal that it
+        was wrong is a provider-side failure.
+        """
+        predicted = int(ctx.metadata.pop("_predicted_input_tokens", 0) or 0)
+        if predicted <= 0:
+            return
+        context_manager = self._context_manager_for(ctx)
+        if context_manager is None:
+            return
+        with shared._suppress_with_log("token calibration skipped"):
+            actual = self._transport.observed_input_tokens(response)
+            if not actual:
+                return
+            context_manager.consolidation.observe_actual_usage(predicted, actual)
 
     def _next_structured_output_budget(
         self,
@@ -2147,11 +2253,31 @@ class BaseAgent:
             )
             completed = 0
             try:
-                raw_spawn, runtime_metrics = await self._run_orchestrated_spawn_calls(
-                    spawn_calls,
-                    orchestration_decision
-                    or OrchestrationDecision(mode="explicit"),
-                )
+                try:
+                    raw_spawn, runtime_metrics = await self._run_orchestrated_spawn_calls(
+                        spawn_calls,
+                        orchestration_decision
+                        or OrchestrationDecision(mode="explicit"),
+                    )
+                except ValueError as exc:
+                    # The batch was rejected before any child ran (bad graph,
+                    # overlapping write scopes, over the per-turn agent cap).
+                    # This is a correctable model input error, so report it as
+                    # tool results rather than aborting the turn — otherwise the
+                    # user loses the whole turn to a mistake the model could fix.
+                    batch_metrics["rejected"] = str(exc)
+                    raw_spawn = [
+                        json.dumps(
+                            {
+                                "ok": False,
+                                "role": str(tu.get("input", {}).get("role", "") or ""),
+                                "error": f"sub-agent batch rejected: {exc}",
+                            },
+                            ensure_ascii=False,
+                        )
+                        for _, tu in spawn_calls
+                    ]
+                    runtime_metrics = {}
                 completed = len(raw_spawn)
                 batch_metrics.update(runtime_metrics)
             finally:
@@ -2322,6 +2448,7 @@ class BaseAgent:
                 user_message,
                 current_messages=ctx.messages,
                 current_turn_id=str(ctx.metadata.get("turn_id") or ""),
+                token_budget=self._retrieval_token_budget(),
             )
             if retrieved:
                 ctx.system_prompt = (
@@ -3042,7 +3169,7 @@ class BaseAgent:
         function; the transport handles both.
         """
         self._prepare_provider_context(ctx, tools)
-        return await self._transport.stream(
+        response, text = await self._transport.stream(
             model=self._effective_model(ctx),
             max_tokens=self.max_tokens,
             system=ctx.system_prompt,
@@ -3050,6 +3177,8 @@ class BaseAgent:
             tools=tools,
             callback=callback,
         )
+        self._observe_provider_usage(ctx, response)
+        return response, text
 
     # ── Sub-agent construction helpers (used by _execute_agent and
     # register_spawn_capability) ───────────────────────────────────────
@@ -3309,7 +3438,18 @@ class BaseAgent:
         max_attempts = max(0, retries) + 1
         result = None
         started_at = time.monotonic()  # overwritten per attempt; init for type-checker
+        # sub_agent_timeout_seconds bounds the whole subtask, not each attempt.
+        # Giving every retry a fresh full timeout would let one subtask consume
+        # attempts x timeout of wall clock while still reporting the
+        # single-attempt figure as its deadline.
+        total_budget = float(self.sub_agent_timeout_seconds)
+        budget_deadline = time.monotonic() + total_budget
+        failure_payload: dict[str, Any] | None = None
         for attempt in range(1, max_attempts + 1):
+            remaining_budget = budget_deadline - time.monotonic()
+            if attempt > 1 and remaining_budget <= 0:
+                # Budget exhausted — stop retrying instead of overrunning it.
+                break
             if attempt > 1:
                 sub_ctx = _fresh_sub_ctx()
                 self._emit_subagent_event(
@@ -3329,28 +3469,31 @@ class BaseAgent:
             try:
                 result = await asyncio.wait_for(
                     sub_agent.send_message(sub_ctx, shaped_task),
-                    timeout=self.sub_agent_timeout_seconds,
+                    timeout=max(0.0, budget_deadline - time.monotonic()),
                 )
                 break  # success — exit retry loop
             except asyncio.TimeoutError:
-                if attempt < max_attempts:
-                    continue
                 partial = ""
                 for msg in reversed(sub_ctx.messages):
                     if msg.get("role") == "assistant" and msg.get("content"):
                         partial = str(msg["content"])[:500]
                         break
+                spent = time.monotonic() + total_budget - budget_deadline
                 payload: dict[str, Any] = {
                     "ok": False,
                     "role": role,
                     "task": shaped_task,
                     "timed_out": True,
                     "error": (
-                        f"sub-agent timed out after {self.sub_agent_timeout_seconds}s"
+                        f"sub-agent exhausted its {total_budget:g}s budget after "
+                        f"{spent:.1f}s across {attempt} attempt(s)"
                     ),
                 }
                 if partial:
                     payload["partial_content"] = partial
+                failure_payload = payload
+                # A timeout consumes the remaining budget, so there is nothing
+                # left to retry with; report instead of silently overrunning.
                 elapsed = time.monotonic() - started_at
                 self._emit_subagent_event(
                     SubAgentProgressEvent(
@@ -3368,14 +3511,17 @@ class BaseAgent:
                 )
                 return payload
             except Exception as e:
-                if attempt < max_attempts:
-                    continue
                 payload = {
                     "ok": False,
                     "role": role,
                     "task": shaped_task,
                     "error": f"sub-agent failed: {self._format_agent_error(e)}",
                 }
+                failure_payload = payload
+                if attempt < max_attempts:
+                    # Retry a transient failure only while budget remains; the
+                    # check at the top of the loop enforces that.
+                    continue
                 elapsed = time.monotonic() - started_at
                 self._emit_subagent_event(
                     SubAgentProgressEvent(
@@ -3393,9 +3539,15 @@ class BaseAgent:
                 )
                 return payload
 
-        # If we reach here, the for-loop hit `break` after a successful attempt;
-        # all failure paths return inside the loop body above.
-        assert result is not None
+        if result is None:
+            # The loop exited without success: either the budget ran out before
+            # a retry could start, or the last attempt failed.
+            return failure_payload or {
+                "ok": False,
+                "role": role,
+                "task": shaped_task,
+                "error": "sub-agent produced no result",
+            }
         payload: dict[str, Any] = {
             "ok": result.error is None,
             "role": role,

@@ -2022,3 +2022,306 @@ def test_consolidate_still_prints_messages_compressed_when_messages_present(
 
     captured = capsys.readouterr()
     assert "Messages compressed" in captured.out
+
+
+# ── Cost model: the estimator must price content the way the provider does ──
+
+
+def test_image_block_priced_by_provider_cost_not_base64_length(tmp_path):
+    """Providers charge for an image by rendered dimensions, not transport size.
+
+    Pricing `len(base64)/4` reported a 1.5MB screenshot as ~512k tokens — 320x
+    its real cost — which alone can exceed any budget and evict a whole
+    conversation for one attachment.
+    """
+    import base64
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    estimates = []
+    for kilobytes in (100, 500, 1500):
+        data = base64.b64encode(b"\x00" * (kilobytes * 1024)).decode()
+        estimates.append(
+            engine.estimate_tokens(
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": data,
+                                },
+                            }
+                        ],
+                    }
+                ]
+            )
+        )
+    # Cost must not scale with payload size, and must stay near the real ceiling.
+    assert len(set(estimates)) == 1, f"image cost scaled with bytes: {estimates}"
+    assert estimates[0] <= engine.MAX_IMAGE_TOKENS + 32
+
+
+def test_inline_base64_source_priced_as_image(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    block = {"type": "unknown_kind", "source": {"data": "A" * 400_000}}
+    estimate = engine.estimate_tokens([{"role": "user", "content": [block]}])
+    assert estimate <= engine.MAX_IMAGE_TOKENS + 32
+
+
+def test_text_blocks_still_counted_verbatim(tmp_path):
+    """Only opaque payloads get the fixed price; real text must still be read."""
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    short = engine.estimate_tokens([{"role": "user", "content": "hi"}])
+    long = engine.estimate_tokens([{"role": "user", "content": "hi" * 5000}])
+    assert long > short * 10
+
+
+# ── Calibration: the estimator must learn from the provider's exact count ──
+
+
+def test_calibration_corrects_underestimate_immediately(tmp_path):
+    """An underestimate causes a provider hard-failure, so correct it at once."""
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    messages = [{"role": "user", "content": "def f(x):\n    return x\n" * 200}]
+    raw = engine.estimate_tokens(messages)
+    true_cost = int(raw * 1.5)
+
+    engine.observe_actual_usage(raw, true_cost)
+    assert engine.estimate_tokens(messages) >= true_cost
+    # A fixed real cost must reach a fixed point, not run away.
+    for _ in range(5):
+        engine.observe_actual_usage(engine.estimate_tokens(messages), true_cost)
+    settled = engine.estimate_tokens(messages)
+    assert settled == true_cost
+
+
+def test_calibration_stays_neutral_when_estimator_is_accurate(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    messages = [{"role": "user", "content": "hello world " * 300}]
+    for _ in range(50):
+        estimate = engine.estimate_tokens(messages)
+        engine.observe_actual_usage(estimate, estimate)
+    assert abs(engine.token_calibration - 1.0) < 0.001
+
+
+def test_calibration_relaxes_overestimate_slowly_and_respects_bounds(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    engine.token_calibration = 2.0
+    messages = [{"role": "user", "content": "hello world " * 200}]
+    first = engine.estimate_tokens(messages)
+    engine.observe_actual_usage(first, first // 2)
+    # One overestimate sample must not collapse the multiplier in a single step.
+    assert 1.8 < engine.token_calibration < 2.0
+    for _ in range(200):
+        engine.observe_actual_usage(engine.estimate_tokens(messages), 1)
+    assert engine.token_calibration >= engine._MIN_CALIBRATION
+
+    engine.observe_actual_usage(first, first * 100)
+    assert engine.token_calibration <= engine._MAX_CALIBRATION
+
+
+def test_calibration_ignores_unusable_samples(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    before = engine.token_calibration
+    for estimated, actual in ((0, 100), (100, 0), (-5, 100), (100, -5)):
+        engine.observe_actual_usage(estimated, actual)
+    assert engine.token_calibration == before
+
+
+# ── Eviction must be visible: the model cannot retrieve what it cannot know ──
+
+
+def _long_conversation(turns=6, filler=400):
+    messages = []
+    for index in range(turns):
+        messages.append({"role": "user", "content": f"question {index} " + "x" * filler})
+        messages.append({"role": "assistant", "content": f"answer {index} " + "y" * filler})
+    return messages
+
+
+def _notices(messages):
+    from agent.memory.system import ContextManager
+
+    return [
+        message
+        for message in messages
+        if isinstance(message.get("content"), str)
+        and message["content"].startswith(ContextManager._EVICTION_SENTINEL)
+    ]
+
+
+def test_compaction_leaves_a_retrievable_eviction_notice(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = _long_conversation()
+    compacted = ctx_mgr.compact_messages(messages, input_token_budget=400)
+
+    assert len(compacted) < len(messages)
+    notices = _notices(compacted)
+    assert len(notices) == 1, "eviction must not be silent"
+    # The notice has to name the recovery path, or it is just an apology.
+    assert "context_retrieve" in notices[0]["content"]
+
+
+def test_eviction_notices_do_not_accumulate_and_count_cumulatively(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    first = ctx_mgr.compact_messages(_long_conversation(4), input_token_budget=400)
+    first_count = int(_notices(first)[0]["content"].split()[1])
+
+    grown = list(first) + _long_conversation(3)
+    second = ctx_mgr.compact_messages(grown, input_token_budget=400)
+    assert len(_notices(second)) == 1, "notices must collapse, not stack"
+    second_count = int(_notices(second)[0]["content"].split()[1])
+    assert second_count > first_count
+
+
+def test_eviction_notice_never_pushes_result_over_budget(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    for budget in (200, 400, 900):
+        compacted = ctx_mgr.compact_messages(
+            _long_conversation(8, filler=300), input_token_budget=budget
+        )
+        assert ctx_mgr.consolidation.estimate_tokens(compacted) < budget
+
+
+def test_eviction_notice_is_omitted_rather_than_failing_a_tight_budget(tmp_path):
+    """The notice is an aid; it must never be the reason compaction fails."""
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "x" * 400},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new request"},
+    ]
+    compacted = ctx_mgr.compact_messages(messages, input_token_budget=40)
+    assert compacted, "compaction must still succeed under a tiny budget"
+    assert ctx_mgr.consolidation.estimate_tokens(compacted) < 40
+
+
+def test_compaction_with_notice_preserves_pairing_and_is_stable(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "old question " + "x" * 2000},
+        {"role": "assistant", "content": "old answer " + "y" * 2000},
+        {"role": "user", "content": "use a tool"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "read", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "result"}
+            ],
+        },
+        {"role": "user", "content": "final question"},
+    ]
+    compacted = ctx_mgr.compact_messages(messages, input_token_budget=700)
+
+    uses, results = set(), set()
+    for message in compacted:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if block.get("type") == "tool_use":
+                uses.add(block["id"])
+            if block.get("type") == "tool_result":
+                results.add(block["tool_use_id"])
+    assert uses == results, "notice insertion broke tool_use/tool_result pairing"
+    # Re-compacting an already-compacted list must be a no-op.
+    again = ctx_mgr.compact_messages(compacted, input_token_budget=700)
+    assert len(again) == len(compacted)
+
+
+def _store_verbose_memories(ctx_mgr, count, repeat):
+    from agent import LTMEntry
+
+    body = "The deployment pipeline uses blue-green with health checks. " * repeat
+    for index in range(count):
+        ctx_mgr.store.add_entry(
+            LTMEntry(
+                id=f"e{index}",
+                content=f"deployment fact {index}: {body}",
+                importance=0.9,
+                category="knowledge",
+                created_at="2026-01-01T00:00:00Z",
+                updated_at="2026-01-01T00:00:00Z",
+                entity="system",
+                memory_type="fact",
+            )
+        )
+
+
+def test_retrieval_is_bounded_by_tokens_not_entry_count(tmp_path):
+    """top_k bounds the entry count, which says nothing about size.
+
+    Five verbose memories measured ~112k tokens.  Because retrieval is injected
+    into the system prompt — which compaction never touches — an unbounded
+    injection either starves the conversation of room or drives the input budget
+    negative and hard-fails the turn.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    _store_verbose_memories(ctx_mgr, count=10, repeat=400)
+    query = "how does the deployment pipeline work?"
+
+    unbounded = ctx_mgr.retrieve_implicit_context(query)
+    bounded = ctx_mgr.retrieve_implicit_context(query, token_budget=2000)
+
+    estimate = ctx_mgr.consolidation.estimate_tokens
+    unbounded_cost = estimate([{"role": "system", "content": unbounded}])
+    bounded_cost = estimate([{"role": "system", "content": bounded}])
+
+    assert unbounded_cost > 10_000, "fixture is not large enough to be meaningful"
+    assert bounded_cost <= 2000
+    assert "omitted" in bounded
+
+
+def test_retrieval_budget_spends_on_entries_rather_than_dropping_the_section(tmp_path):
+    """A verbose memory must not cost the other hits their place.
+
+    Dropping the whole LTM section when one entry overflows would discard the
+    remaining hits for free, so the budget is spent at entry granularity.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    # ~314 tokens per entry, so a 900-token budget admits some but not all.
+    _store_verbose_memories(ctx_mgr, count=6, repeat=20)
+    query = "how does the deployment pipeline work?"
+
+    generous = ctx_mgr.retrieve_implicit_context(query, token_budget=100_000)
+    tight = ctx_mgr.retrieve_implicit_context(query, token_budget=900)
+
+    assert generous.count("- [knowledge") >= 3
+    kept = tight.count("- [knowledge")
+    assert 1 <= kept < generous.count("- [knowledge")
+    assert "omitted" in tight
+
+
+def test_retrieval_budget_default_leaves_room_for_the_conversation(tmp_path):
+    """The default budget is a fraction of the window, not the whole thing."""
+    import agent as agent_module
+
+    class _Agent(agent_module.BaseAgent):
+        def __init__(self):
+            pass
+
+    agent = _Agent()
+    agent.context_window = 128_000
+    agent.max_tokens = 8192
+
+    budget = agent._retrieval_token_budget()
+    usable = 128_000 - 8192
+
+    assert budget == max(1024, int(usable * agent_module.RETRIEVAL_BUDGET_FRACTION))
+    assert budget < usable // 2, "retrieval must not be able to claim the window"
+
+    agent.max_retrieval_tokens = 4096
+    assert agent._retrieval_token_budget() == 4096

@@ -34,6 +34,33 @@ class FetchResponse:
 Resolver = Callable[..., list[tuple[Any, ...]]]
 ConnectionFactory = Callable[[ResolvedEndpoint, str, float], Any]
 
+# Headers that carry caller authority and must not survive a hop to a different
+# origin: a redirect target is chosen by the *server*, not by the caller, so
+# replaying credentials to it hands them to whoever controls that redirect.
+_ORIGIN_BOUND_HEADERS = frozenset(
+    {"authorization", "cookie", "proxy-authorization", "www-authenticate"}
+)
+
+
+def _origin(endpoint: ResolvedEndpoint) -> tuple[str, str, int]:
+    return (endpoint.scheme, endpoint.hostname.lower(), endpoint.port)
+
+
+def _strip_origin_bound_headers(
+    headers: Mapping[str, str],
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    kept = {
+        name: value
+        for name, value in headers.items()
+        if name.lower() not in _ORIGIN_BOUND_HEADERS
+    }
+    dropped = tuple(
+        sorted(
+            name for name in headers if name.lower() in _ORIGIN_BOUND_HEADERS
+        )
+    )
+    return kept, dropped
+
 
 def _canonical_public_address(raw: str) -> str:
     try:
@@ -206,12 +233,14 @@ def fetch_public_http_url(
     connection_factory: ConnectionFactory = _default_connection_factory,
     on_progress: Optional[Callable[[int, Optional[int]], None]] = None,
     headers: Optional[Mapping[str, str]] = None,
+    on_headers_dropped: Optional[Callable[[tuple[str, ...], str], None]] = None,
 ) -> FetchResponse:
     if max_bytes <= 0:
         raise ValueError("max_bytes must be positive")
     if max_redirects < 0:
         raise ValueError("max_redirects cannot be negative")
     current_url = url
+    origin: Optional[tuple[str, str, int]] = None
     request_headers = {
         "User-Agent": "Mozilla/5.0 (compatible; PersonalAgent/1.0)",
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -220,11 +249,22 @@ def fetch_public_http_url(
     }
 
     for hop in range(max_redirects + 1):
-        first = resolve_public_endpoint(current_url, resolver=resolver)
+        # Resolve once, validate, then connect to a validated address.  This
+        # single step is what defeats DNS rebinding: the socket is pinned to an
+        # address that passed _canonical_public_address, so no second lookup can
+        # redirect it.  Resolving twice and comparing answer sets added no
+        # protection on top of pinning — and did reject safe traffic, because a
+        # round-robin CDN legitimately returns a different answer set on
+        # consecutive queries.
         endpoint = resolve_public_endpoint(current_url, resolver=resolver)
-        if first.addresses != endpoint.addresses:
-            raise UnsafeNetworkTarget("DNS answers changed before connection")
-
+        if origin is None:
+            origin = _origin(endpoint)
+        elif _origin(endpoint) != origin:
+            # The server chose this destination, so caller credentials stop here.
+            request_headers, dropped = _strip_origin_bound_headers(request_headers)
+            if dropped and on_headers_dropped is not None:
+                on_headers_dropped(dropped, current_url)
+            origin = _origin(endpoint)
         connection = connection_factory(endpoint, endpoint.addresses[0], timeout)
         response = None
         try:

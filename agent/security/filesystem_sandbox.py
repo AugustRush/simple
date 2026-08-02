@@ -59,6 +59,8 @@ import shutil
 import sys
 import uuid
 
+from agent import shared
+
 
 class SandboxUnavailableError(RuntimeError):
     """Raised when no enforcing filesystem sandbox can be constructed."""
@@ -163,18 +165,24 @@ def build_sandbox_command(
 def _build_macos_sandbox_command(request: ShellSandboxRequest) -> SandboxCommand:
     profile_dir = request.output_root / ".simple-internal" / "sandbox"
     profile_dir.mkdir(parents=True, exist_ok=True)
-    request_key = hashlib.sha256(
-        (
-            f"{request.workspace_root}\0{request.output_root}\0"
-            f"{request.workspace_read}\0{request.workspace_write}\0"
-            f"{','.join(request.write_scope)}\0{request.scratch_dir}"
-        ).encode("utf-8")
-    ).hexdigest()[:32]
+    # Key the cache on the profile *content*, not on a hand-listed subset of the
+    # request fields.  A manual list silently drifts from what the profile is
+    # actually a function of: `mode`, `devices` and `home_dir` were all absent,
+    # so a `restricted` run reused a previously written `read_all` profile and
+    # was granted host-wide reads, `devices=False` kept `iokit-open`, and two
+    # different home directories shared one profile whose deny rules named only
+    # the first user's home.  Hashing the rendered profile cannot drift.
+    profile_text = _macos_seatbelt_profile(request)
+    request_key = hashlib.sha256(profile_text.encode("utf-8")).hexdigest()[:32]
     profile_path = profile_dir / f"shell-{request_key}.sb"
     if not profile_path.exists():
-        profile_path.write_text(
-            _macos_seatbelt_profile(request), encoding="utf-8"
-        )
+        # Durably, not just atomically.  A concurrent shell must never exec a
+        # partially written profile — but because the name is content-keyed, an
+        # unflushed write that survives a crash as a zero-length file is worse:
+        # the `exists()` check above then skips rewriting it forever, and every
+        # later run with this request shape execs an empty profile.  Fails closed
+        # rather than open, so it breaks the shell instead of opening it up.
+        shared._atomic_write_text(profile_path, profile_text)
     request.scratch_dir.mkdir(parents=True, exist_ok=True)
     return SandboxCommand(
         argv_prefix=(_MACOS_SANDBOX_EXEC, "-f", str(profile_path)),
@@ -288,10 +296,23 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
         lines.append(
             f'(deny file-write* (subpath "{_seatbelt_literal(workspace)}"))'
         )
-    # Protected user data (documents, media, keychains, credentials).
+    # Protected user data (documents, media, keychains, credentials).  Each path
+    # is denied under BOTH spellings: seatbelt enforces on the canonical path, so
+    # a relocated directory — ~/Documents symlinked to an external volume, a
+    # Dropbox/iCloud folder — would otherwise slip through a rule that names only
+    # the symlink.  Denying the symlink path too keeps the rule effective if the
+    # link is created after this profile was rendered.
+    protected: list[str] = []
     for sub in _PROTECTED_HOME_SUBDIRS:
-        literal = _seatbelt_literal(f"{home}/{sub}")
-        lines.append(f'(deny file-write* (subpath "{literal}"))')
+        link_path = Path(f"{home}/{sub}")
+        for spelling in (link_path, link_path.resolve(strict=False)):
+            candidate = str(spelling)
+            if candidate not in protected:
+                protected.append(candidate)
+    for candidate in protected:
+        lines.append(
+            f'(deny file-write* (subpath "{_seatbelt_literal(candidate)}"))'
+        )
     # Approved write_scope entries reopen paths after their denies.
     for scope in request.write_scope:
         if scope == "*":

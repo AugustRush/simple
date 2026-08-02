@@ -456,3 +456,123 @@ def test_scratch_env_points_inside_output(tmp_path):
     )
     assert sandbox.env_updates["TMP"] == sandbox.env_updates["TMPDIR"]
     assert sandbox.env_updates["TEMP"] == sandbox.env_updates["TMPDIR"]
+
+
+# ── The profile cache key must cover everything the profile depends on ───────
+
+
+def _profile_path(request):
+    return Path(build_sandbox_command(request).argv_prefix[-1])
+
+
+@_NEEDS_SANDBOX
+def test_cached_profile_is_keyed_by_sandbox_mode(tmp_path):
+    """A hand-listed cache key drifts from what the profile depends on.
+
+    `mode` was absent from the key, so a `restricted` request reused a
+    previously written `read_all` profile and silently received host-wide reads
+    — the sandbox mode the caller selected was not the one enforced.
+    """
+    permissive = _request(tmp_path, mode="read_all")
+    strict = _request(tmp_path, mode="restricted")
+
+    permissive_path = _profile_path(permissive)
+    strict_path = _profile_path(strict)
+
+    assert permissive_path != strict_path
+    open_all = '(allow file-read* (subpath "/"))'
+    assert open_all in permissive_path.read_text()
+    assert open_all not in strict_path.read_text()
+
+
+@_NEEDS_SANDBOX
+def test_cached_profile_is_keyed_by_device_access(tmp_path):
+    with_devices = _profile_path(_request(tmp_path, devices=True))
+    without_devices = _profile_path(_request(tmp_path, devices=False))
+
+    assert with_devices != without_devices
+    assert "(allow iokit-open)" in with_devices.read_text()
+    assert "(allow iokit-open)" not in without_devices.read_text()
+
+
+@_NEEDS_SANDBOX
+def test_cached_profile_is_keyed_by_home_dir(tmp_path):
+    """Two homes must not share a profile whose denies name only one of them."""
+    alice = _profile_path(_request(tmp_path, home_dir=tmp_path / "alice"))
+    bob = _profile_path(_request(tmp_path, home_dir=tmp_path / "bob"))
+
+    assert alice != bob
+    assert str(tmp_path / "bob" / "Documents") in bob.read_text()
+    assert str(tmp_path / "alice" / "Documents") not in bob.read_text()
+
+
+@_NEEDS_SANDBOX
+def test_identical_requests_reuse_one_profile(tmp_path):
+    """Keying on content must not defeat caching for equivalent requests."""
+    first = _profile_path(_request(tmp_path, mode="restricted"))
+    second = _profile_path(_request(tmp_path, mode="restricted"))
+    assert first == second
+
+
+# ── Protected user data must stay protected when relocated ──────────────────
+
+
+def test_protected_paths_are_denied_under_both_spellings(tmp_path):
+    """Seatbelt enforces on canonical paths.
+
+    A relocated home directory — ~/Documents symlinked to an external volume, a
+    Dropbox or iCloud folder — slips through a deny rule that names only the
+    symlink, because the kernel checks the resolved path.  Both spellings are
+    therefore denied.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    external = tmp_path / "external" / "Docs"
+    external.mkdir(parents=True)
+    (home / "Documents").symlink_to(external)
+
+    profile = _macos_seatbelt_profile(_request(tmp_path, home_dir=home))
+
+    assert f'(deny file-write* (subpath "{home / "Documents"}"))' in profile
+    assert f'(deny file-write* (subpath "{external}"))' in profile
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_blocks_writes_through_a_relocated_documents_dir(tmp_path):
+    """The OS-enforced version of the invariant above."""
+    real_tmp = Path(tmp_path).resolve()
+    home = real_tmp / "home"
+    home.mkdir(exist_ok=True)
+    external = real_tmp / "external" / "Docs"
+    external.mkdir(parents=True, exist_ok=True)
+    (home / "Documents").symlink_to(external)
+    secret = external / "tax.txt"
+    secret.write_text("secret", encoding="utf-8")
+
+    request = _request(tmp_path, home_dir=home)
+
+    # Through the symlink...
+    via_link = _run_in_sandbox(request, f"echo pwned > {home / 'Documents' / 'tax.txt'}")
+    assert via_link.returncode != 0
+    assert secret.read_text(encoding="utf-8") == "secret"
+
+    # ...and through the canonical path.
+    via_real = _run_in_sandbox(request, f"echo pwned > {secret}")
+    assert via_real.returncode != 0
+    assert secret.read_text(encoding="utf-8") == "secret"
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_denies_writes_to_protected_credential_files(tmp_path):
+    """subpath does match a regular file, so credential files are covered."""
+    real_tmp = Path(tmp_path).resolve()
+    home = real_tmp / "home"
+    home.mkdir(exist_ok=True)
+    netrc = home / ".netrc"
+    netrc.write_text("machine example login me", encoding="utf-8")
+
+    request = _request(tmp_path, home_dir=home)
+    result = _run_in_sandbox(request, f"echo pwned > {netrc}")
+
+    assert result.returncode != 0
+    assert netrc.read_text(encoding="utf-8") == "machine example login me"

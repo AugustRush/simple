@@ -13,12 +13,16 @@ Design:
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import math
 import re
 from collections import Counter
 from pathlib import Path
 from typing import Any
+
+from agent import shared
 
 
 # Seed is intentionally empty. The classifier starts with uniform priors (score = 0.5
@@ -185,17 +189,40 @@ class ContentFilter:
         return inst
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=2))
+        """Persist durably. Concurrency here is normal, not exotic.
+
+        ``learn_and_persist`` offloads this to a thread while the event loop
+        constructs sub-agents that each ``load`` the same path, and a parent and
+        its children can persist at once.  An in-place ``write_text`` truncates
+        first, so those readers saw an empty file and callers raced each other
+        into invalid JSON that then loaded as a blank classifier forever.
+        """
+        shared._atomic_write_json(path, self.to_dict(), indent=2)
 
     @classmethod
     def load(cls, path: Path) -> "ContentFilter":
-        if path.is_file():
-            try:
-                return cls.from_dict(json.loads(path.read_text()))
-            except Exception:
-                pass
-        return cls()
+        """Load the classifier, or start fresh if there is nothing to load.
+
+        Absent and unreadable are different events.  No file is the ordinary
+        first-run case.  A file that exists but will not parse means learned
+        state was lost, which is worth a log line and worth keeping the evidence
+        for — silently substituting an empty classifier turns data loss into an
+        invisible capability regression.
+        """
+        if not path.is_file():
+            return cls()
+        try:
+            return cls.from_dict(json.loads(path.read_text()))
+        except Exception:
+            logging.getLogger("agent").warning(
+                "content filter at %s is unreadable; starting from an empty "
+                "classifier and preserving the file for inspection",
+                path,
+                exc_info=True,
+            )
+            with contextlib.suppress(OSError):
+                path.replace(path.with_name(f"{path.name}.corrupt"))
+            return cls()
 
     # ── statistics ───────────────────────────────────────────────────────────
 

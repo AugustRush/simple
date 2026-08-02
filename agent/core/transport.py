@@ -120,6 +120,23 @@ class ModelTransport(abc.ABC):
         """Return true when a truncated response contains partial tool protocol."""
         return False
 
+    @staticmethod
+    def observed_input_tokens(response: Any) -> Optional[int]:
+        """The provider's exact input-token count for the call, if reported.
+
+        This is the only ground truth available for what a payload actually
+        cost.  Both supported providers report it on every response, under
+        different names, so the base implementation reads either.
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return None
+        for attribute in ("input_tokens", "prompt_tokens"):
+            value = getattr(usage, attribute, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
+
     # ── Message-history shaping ────────────────────────────────────────
 
     @abc.abstractmethod

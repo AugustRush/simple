@@ -5,6 +5,7 @@ from contextlib import suppress
 from pathlib import Path
 import re
 import shutil
+import threading
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -57,6 +58,17 @@ class _OutputPane:
         self._window: Optional[Any] = None
         self._rows_cache_value = 40
         self._rows_cache_time = 0.0
+        # write() and the scroll mutators do read-modify-write on _fragments,
+        # _line_count, _pending_escape and _scroll_top.  The background memory
+        # worker is a daemon thread that prints to shared.CONSOLE, which is
+        # rebound to the TUI console for the session — so these run concurrently
+        # with the event loop.  Rich's own lock only serializes whole print()
+        # calls, which is incidental protection this class does not control.
+        self._lock = threading.RLock()
+        # Last bottom position the renderer reported, in logical lines.  Wrap
+        # information only exists at render time, so the pane has to remember
+        # it for scroll operations that happen between renders.
+        self._rendered_bottom = 0
 
     def attach_window(self, window: Any) -> None:
         self._window = window
@@ -64,6 +76,10 @@ class _OutputPane:
     def write(self, text: str) -> int:
         if not text:
             return 0
+        with self._lock:
+            return self._write_locked(text)
+
+    def _write_locked(self, text: str) -> int:
         # A newline can never continue an escape sequence.  If a partial
         # escape is still buffered, the stream abandoned it; drop it so the
         # ANSI parser does not swallow the newline as an unsupported CSI
@@ -114,32 +130,84 @@ class _OutputPane:
 
     def scroll_up(self, lines: int = 3) -> None:
         """Scroll the view backwards into the conversation history."""
-        self._follow_bottom = False
-        self._scroll_top = max(0, self._scroll_top - lines)
+        with self._lock:
+            self._follow_bottom = False
+            self._scroll_top = max(0, self._scroll_top - lines)
         self._notify()
 
     def scroll_down(self, lines: int = 3) -> None:
         """Scroll the view towards the newest output."""
-        self._scroll_top = min(self._scroll_top + lines, self._max_scroll())
-        if self._scroll_top >= self._max_scroll():
-            self._follow_bottom = True
+        with self._lock:
+            bottom = self._known_bottom()
+            self._scroll_top = min(self._scroll_top + lines, bottom)
+            if self._scroll_top >= bottom:
+                self._follow_bottom = True
         self._notify()
 
     def scroll_top(self) -> None:
-        self._follow_bottom = False
-        self._scroll_top = 0
+        with self._lock:
+            self._follow_bottom = False
+            self._scroll_top = 0
         self._notify()
 
     def scroll_bottom(self) -> None:
-        self._follow_bottom = True
-        self._scroll_top = self._max_scroll()
+        with self._lock:
+            self._follow_bottom = True
+            self._scroll_top = self._known_bottom()
         self._notify()
 
+    def _known_bottom(self) -> int:
+        """Best available bottom position, in logical lines.
+
+        Prefers what the renderer last reported (which accounts for wrapping)
+        and falls back to logical accounting before the first render.
+        """
+        return max(self._rendered_bottom, self._max_scroll())
+
     def vertical_scroll(self, window: Any) -> int:
-        """Window hook: keep the rendered scroll in sync with the pane."""
+        """Window hook: keep the rendered scroll in sync with the pane.
+
+        ``vertical_scroll`` is a *logical* line index, but the window renders
+        with ``wrap_lines=True``, so one logical line can occupy several display
+        rows.  Clamping with the logical line count therefore pins the view too
+        high whenever output is wider than the terminal — the newest lines end up
+        below the viewport even while following the bottom.  The bound is
+        computed from real wrapped heights when the renderer can supply them.
+        """
         info = getattr(window, "render_info", None)
         height = getattr(info, "window_height", None) or self._view_height()
-        return min(self._scroll_top, max(0, self._last_line() - height + 1))
+        bound = self._max_logical_scroll(info, height)
+        # _scroll_top is maintained during write() from logical line counts,
+        # before any renderer exists.  While following the bottom the renderer
+        # is the authority on where the bottom actually is, so use its bound
+        # directly — and remember it, so a subsequent scroll_up() starts from
+        # the real bottom instead of the stale logical value.
+        with self._lock:
+            self._rendered_bottom = bound
+            if self._follow_bottom:
+                self._scroll_top = bound
+                return bound
+            return min(self._scroll_top, bound)
+
+    def _max_logical_scroll(self, info: Any, height: int) -> int:
+        """Largest logical top line whose wrapped tail still fills the window."""
+        last_line = self._last_line()
+        get_height_for_line = getattr(info, "get_height_for_line", None)
+        if not callable(get_height_for_line):
+            return max(0, last_line - height + 1)
+        rows = 0
+        line = last_line
+        # Walk backwards until the accumulated display rows fill the viewport.
+        # Bounded by `height` iterations: every line costs at least one row.
+        while line >= 0:
+            try:
+                rows += max(1, int(get_height_for_line(line)))
+            except Exception:
+                return max(0, last_line - height + 1)
+            if rows >= height:
+                return line if rows == height else min(line + 1, last_line)
+            line -= 1
+        return 0
 
     def _last_line(self) -> int:
         return self._line_count

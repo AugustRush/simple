@@ -1,6 +1,8 @@
 """Tests for the content filter defense layers."""
 
 import json
+import logging
+
 import pytest
 
 from agent.security.content_filter import (
@@ -92,6 +94,101 @@ class TestContentFilter:
         cf = ContentFilter.load(tmp_path / "nonexistent.json")
         assert cf.alpha == 0.1
         assert cf.score("anything") == 0.5
+
+    def test_concurrent_saves_never_leave_an_unreadable_model(self, tmp_path):
+        """A parent and its sub-agents persist the same path concurrently.
+
+        ``learn_and_persist`` offloads the save to a thread, so two instances
+        writing at once is the normal case, not an exotic one.  An in-place
+        truncating write interleaved them into invalid JSON that then loaded as
+        a permanently blank classifier.
+        """
+        import threading
+
+        path = tmp_path / "filter.json"
+        big = ContentFilter()
+        big.learn_batch([f"parent risky {i}" for i in range(2000)], is_risky=True)
+        small = ContentFilter()
+        small.learn_batch(["child risky"], is_risky=True)
+        acceptable = [big.to_dict(), small.to_dict()]
+
+        for _ in range(12):
+            path.unlink(missing_ok=True)
+            writers = [
+                threading.Thread(target=big.save, args=(path,)),
+                threading.Thread(target=small.save, args=(path,)),
+            ]
+            for w in writers:
+                w.start()
+            for w in writers:
+                w.join()
+
+            # Whoever wins, the file must be one writer's complete output.
+            assert json.loads(path.read_text(encoding="utf-8")) in acceptable
+
+        # No scratch files left beside real state.
+        assert [p.name for p in tmp_path.iterdir()] == ["filter.json"]
+
+    def test_concurrent_load_during_save_never_sees_an_empty_classifier(self, tmp_path):
+        """Sub-agents are constructed concurrently and each one loads this file."""
+        import threading
+
+        path = tmp_path / "filter.json"
+        trained = ContentFilter()
+        trained.learn_batch(["rm -rf / --no-preserve-root"] * 40, is_risky=True)
+        trained.save(path)
+
+        replacement = ContentFilter()
+        replacement.learn_batch(
+            [f"risky pattern {i}" for i in range(3000)], is_risky=True
+        )
+
+        observed: list[int] = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                observed.append(ContentFilter.load(path).stats["risky_examples"])
+
+        t = threading.Thread(target=reader)
+        t.start()
+        try:
+            for _ in range(10):
+                replacement.save(path)
+        finally:
+            stop.set()
+            t.join()
+
+        assert observed, "reader never sampled the file"
+        # Every sample is one of the two real models, never a blank one.
+        assert 0 not in observed
+
+    def test_load_of_a_corrupt_model_warns_and_preserves_the_evidence(
+        self, tmp_path, caplog
+    ):
+        """Absent and unreadable are different events.
+
+        Missing is the ordinary first-run case.  Present-but-unparseable means
+        learned state was lost; silently substituting an empty classifier turns
+        data loss into an invisible capability regression.
+        """
+        path = tmp_path / "filter.json"
+        path.write_text('{"safe_counts": {"a": 1}, "risky_c', encoding="utf-8")
+
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            cf = ContentFilter.load(path)
+
+        assert cf.stats["risky_examples"] == 0
+        assert "unreadable" in caplog.text
+        # The bad file is kept for inspection rather than silently overwritten.
+        assert not path.exists()
+        assert (tmp_path / "filter.json.corrupt").is_file()
+
+    def test_load_missing_file_stays_silent(self, tmp_path, caplog):
+        """First run is not an error and must not log like one."""
+        with caplog.at_level(logging.WARNING, logger="agent"):
+            ContentFilter.load(tmp_path / "nonexistent.json")
+        assert caplog.text == ""
 
     def test_stats(self):
         cf = ContentFilter()

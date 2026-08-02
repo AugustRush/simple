@@ -49,6 +49,7 @@ PluginCatalog = agent_module.PluginCatalog
 SchedulerDelivery = agent_module.SchedulerDelivery
 SchedulerService = agent_module.SchedulerService
 SchedulerStore = agent_module.SchedulerStore
+SessionEvent = agent_module.SessionEvent
 SkillCatalog = agent_module.SkillCatalog
 StagingBuffer = agent_module.StagingBuffer
 TriggerSpec = agent_module.TriggerSpec
@@ -424,6 +425,37 @@ async def _build_quiet_cli_components(cfg: dict) -> dict:
     return await builder(cfg)
 
 
+class _SinkLogHandler(logging.Handler):
+    """Route log records through the CLI console instead of raw stderr.
+
+    The interactive CLI never called ``_configure_runtime_logging`` (only the
+    gateway does), so the root logger had no handlers and ``logging.lastResort``
+    wrote full tracebacks straight to stderr.  Two consequences: while the TUI
+    owns the screen those writes bypass the output pane and corrupt the
+    full-screen layout, and the text skips the sink's redaction pass entirely.
+
+    Redaction is best-effort — it matches ``key=value`` shapes, not a secret
+    mentioned in prose — so the guarantee here is about output *ownership*: one
+    channel owns the screen, and log records travel through it.
+    """
+
+    def __init__(self, console: Any) -> None:
+        super().__init__(level=logging.WARNING)
+        self._console = console
+
+    def emit(self, record: logging.LogRecord) -> None:
+        from agent.core.output import _redact_sensitive_text
+
+        try:
+            text = _redact_sensitive_text(self.format(record))
+            self._console.print(
+                f"[dim]{markup_escape(text)}[/dim]",
+                soft_wrap=True,
+            )
+        except Exception:  # pragma: no cover - never let logging kill a turn
+            self.handleError(record)
+
+
 def _configure_runtime_logging() -> None:
     root_logger = logging.getLogger()
     if not root_logger.handlers:
@@ -625,6 +657,18 @@ def _tui_enabled() -> bool:
     return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
 
+def _owns_process_sigint(*, tui_active: bool) -> bool:
+    """Whether this mode should install the process-level SIGINT handler.
+
+    Ctrl+C must have exactly one owner.  In TUI mode prompt_toolkit installs its
+    own SIGINT handler routed to ``_tui_cancel_callback``; installing the
+    process-level handler as well makes both fire for a single keypress, so
+    ``_sigint_count`` reaches 2 immediately and the first Ctrl+C escalates
+    straight to force-cancel.  There, the key binding is the sole owner.
+    """
+    return not tui_active
+
+
 def _tui_cancel_callback() -> None:
     """TUI Ctrl+C: cancel the running turn, or exit when idle."""
     global _sigint_count
@@ -690,6 +734,7 @@ async def _interactive_loop_coro(
             console,
             live_status=tui is None,
             echo_input=tui is not None,
+            tui_active=tui is not None,
         )
     finally:
         shared.CONSOLE = original_console
@@ -702,6 +747,7 @@ async def _interactive_loop_body(
     *,
     live_status: bool = True,
     echo_input: bool = False,
+    tui_active: bool = False,
 ):
     """Main interactive chat loop."""
     global _current_cancel_token
@@ -807,7 +853,20 @@ async def _interactive_loop_body(
     # Notify all plugins that the session has started.
     plugin_catalog.fire_session_start(components)
 
-    old_sigint = signal.signal(signal.SIGINT, _cli_sigint_handler)
+    old_sigint = (
+        signal.signal(signal.SIGINT, _cli_sigint_handler)
+        if _owns_process_sigint(tui_active=tui_active)
+        else None
+    )
+    # Give log records an owner for the life of the session, so nothing reaches
+    # raw stderr behind the console's back.
+    _root_logger = logging.getLogger()
+    _log_handler: Optional[logging.Handler] = None
+    _previous_last_resort = logging.lastResort
+    if not _root_logger.handlers:
+        _log_handler = _SinkLogHandler(console)
+        _root_logger.addHandler(_log_handler)
+        logging.lastResort = None  # type: ignore[assignment]
     try:
         while True:
             try:
@@ -830,7 +889,13 @@ async def _interactive_loop_body(
             if echo_input:
                 console.print(f"[green]›[/green] {markup_escape(user_input)}")
 
-            _turn_sink = CliOutputSink(console, live_status=live_status)
+            # The TUI cannot host a live spinner but can prompt for consent, so
+            # the two capabilities are declared separately.
+            _turn_sink = CliOutputSink(
+                console,
+                live_status=live_status,
+                can_prompt=True,
+            )
             try:
                 ctx.metadata["skill_catalog"] = skill_catalog
                 if not user_input.lstrip().startswith("/"):
@@ -852,7 +917,11 @@ async def _interactive_loop_body(
                 _current_cancel_token = None
 
     finally:
-        signal.signal(signal.SIGINT, old_sigint)
+        if _log_handler is not None:
+            _root_logger.removeHandler(_log_handler)
+            logging.lastResort = _previous_last_resort  # type: ignore[assignment]
+        if old_sigint is not None:
+            signal.signal(signal.SIGINT, old_sigint)
         if memory_worker:
             memory_worker.stop()
             await memory_worker.wait()

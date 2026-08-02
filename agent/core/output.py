@@ -410,9 +410,21 @@ class OutputSink(ABC):
 class CliOutputSink(OutputSink):
     """Rich-console implementation of OutputSink for the CLI channel."""
 
-    def __init__(self, console: Any, *, live_status: bool = True) -> None:
+    def __init__(
+        self,
+        console: Any,
+        *,
+        live_status: bool = True,
+        can_prompt: bool | None = None,
+    ) -> None:
         self._console = console
         self._live_status = live_status
+        # Whether a human can be prompted for consent.  This is NOT the same
+        # capability as rendering a live spinner: the full-screen TUI cannot
+        # host a spinner but prompts fine (via prompt_toolkit's in_terminal).
+        # Deriving consent from the spinner flag silently disables the approval
+        # menu on the default interactive path.
+        self._can_prompt = live_status if can_prompt is None else bool(can_prompt)
         self._streamed: list[str] = []
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._tool_count = 0
@@ -450,9 +462,16 @@ class CliOutputSink(OutputSink):
             and callable(getattr(self._console, "print", None))
         )
 
+    def _supports_consent_prompt(self) -> bool:
+        return bool(
+            self._can_prompt
+            and getattr(self._console, "is_terminal", False)
+            and sys.stdin.isatty()
+        )
+
     @property
     def interactive_confirmation(self) -> bool:
-        return bool(self._supports_live_status() and sys.stdin.isatty())
+        return self._supports_consent_prompt()
 
     def _set_activity(self, text: str) -> None:
         if not self._supports_live_status():
@@ -574,17 +593,21 @@ class CliOutputSink(OutputSink):
         model can never fabricate it (the token is validated separately by
         shell.py).
         """
-        if not self._supports_live_status() or not sys.stdin.isatty():
+        if not self._supports_consent_prompt():
             return False
         self._approval_active = True
         try:
             self._stop_activity()
             self._finish_open_line()
+            # The command is shown in full, wrapped rather than clipped: the
+            # approval allowlists the entire string, so eliding its tail would
+            # let a long benign prefix hide the part that actually matters.
             self._console.print(
-                f"[yellow]需要批准的工具操作：[/yellow]"
-                f"[bold]{_markup_escape(_clip_single_line(command, 200))}[/bold]\n"
+                f"[yellow]需要批准的工具操作：[/yellow]\n"
+                f"[bold]{_markup_escape(str(command))}[/bold]\n"
                 f"[dim]风险等级: {_markup_escape(str(risk_level))} · "
-                f"{_markup_escape(_clip_single_line(str(reason), 160))}[/dim]"
+                f"{_markup_escape(_clip_single_line(str(reason), 160))}[/dim]",
+                soft_wrap=False,
             )
             self._console.print(
                 "  [bold cyan]1)[/bold cyan] 批准执行\n"

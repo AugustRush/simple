@@ -1570,6 +1570,7 @@ class BuiltinTools:
         from agent.core.output import _APPROVAL_LOCK
         from agent.security.shell import (
             shell_command_confirm,
+            shell_pending_reject,
             shell_session_allowlist_contains,
         )
 
@@ -1592,9 +1593,19 @@ class BuiltinTools:
                 scope=authorization_scope,
             )
             if not approved:
+                # Refusal is terminal: retire the token so no later approval
+                # reply can redeem the command the human just declined.
+                shell_pending_reject(
+                    safety.confirmation_token,
+                    scope=authorization_scope,
+                )
                 return False
             active_token = shared._active_cancel_token.get()
             if active_token is not None and active_token.is_cancelled:
+                shell_pending_reject(
+                    safety.confirmation_token,
+                    scope=authorization_scope,
+                )
                 return False
             return bool(
                 shell_command_confirm(

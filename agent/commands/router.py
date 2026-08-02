@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import difflib
 import inspect
 import logging
+import re
 import threading
 from typing import Any, Iterable, Literal, Mapping, TypeAlias
 
@@ -16,6 +17,12 @@ logger = logging.getLogger(__name__)
 
 _SYNC_PLUGIN_CAPACITY = 4
 _SYNC_PLUGIN_GATE = threading.BoundedSemaphore(_SYNC_PLUGIN_CAPACITY)
+
+# Shape of a plausible *mistyped* command name, used only to decide whether an
+# unresolved "/x" deserves "unknown command" feedback or is simply user text.
+# Anything that resolves to a real command or skill never reaches this test, so
+# multi-segment skill ids (``/quality/review``) are unaffected.
+_TYPO_CANDIDATE_RE = re.compile(r"[A-Za-z0-9_:-]+")
 
 ClassificationKind: TypeAlias = Literal["command", "skill", "unknown_slash", "text"]
 CommandSource: TypeAlias = Literal["core", "plugin"]
@@ -54,6 +61,9 @@ def parse_command(
         return None
 
     command_text = stripped[1:]
+    # The name must follow the slash immediately: "/ foo" is prose, not a call.
+    if command_text[:1].isspace():
+        return None
     parts = command_text.split(maxsplit=1)
     name = parts[0] if parts else ""
     args = parts[1] if len(parts) == 2 else ""
@@ -462,6 +472,13 @@ class CommandRouter:
                 skill_error="unknown",
                 suggestions=self._skill_suggestions(parsed_skill.skill_ref),
             )
+        # Nothing resolved.  "Unknown command" feedback is only useful when the
+        # input plausibly *was* a command attempt — a typo like "/hepl".  A
+        # pasted path, URL, or code line is not a typo of anything, and routing
+        # it as a command silently swallows the turn instead of sending it to
+        # the model.
+        if not _TYPO_CANDIDATE_RE.fullmatch(request.name):
+            return CommandClassification(kind="text", text=text)
         return CommandClassification(
             kind="unknown_slash",
             text=text,

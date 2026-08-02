@@ -334,6 +334,12 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         0,
         int(orch_cfg.get("sub_agent_retries", shared.DEFAULT_SUB_AGENT_RETRIES)),
     )
+    # Bounds total sub-agents per turn, not concurrency.  0 means "derive from
+    # max_parallel_agents".
+    agent.max_agents_per_turn = max(
+        0,
+        int(orch_cfg.get("max_agents_per_turn", 0)),
+    )
     agent.max_tool_call_iterations = _bounded_int(
         cfg.get("max_tool_call_iterations", shared.MAX_TOOL_CALL_ITERATIONS),
         default=shared.MAX_TOOL_CALL_ITERATIONS,

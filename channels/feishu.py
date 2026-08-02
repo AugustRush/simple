@@ -36,6 +36,7 @@ Configuration in ``~/.agent/config.json``::
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import inspect
 import json
@@ -65,6 +66,9 @@ LARK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 FEISHU_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
 _ATTACHMENT_CANCEL_GRACE_SECONDS = 0.05
 _ATTACHMENT_MAX_IN_FLIGHT = 2
+# Soft cap on remembered message ids. Soft because an in-flight id is never
+# evicted: double-processing a live message is worse than overshooting here.
+_DEDUP_CACHE_LIMIT = 1000
 _ATTACHMENT_BATCH_CAPACITY = threading.BoundedSemaphore(
     _ATTACHMENT_MAX_IN_FLIGHT
 )
@@ -1841,8 +1845,12 @@ class FeishuChannel(Channel):
         self._output_dir: Optional[Path] = None
         self._input_dir: Path = shared.AGENT_HOME / "input" / "feishu"
         self._input_dir_explicit = False
-        # Ordered LRU cache for message-id deduplication
-        self._processed_ids: OrderedDict[str, None] = OrderedDict()
+        # Ordered LRU cache for message-id deduplication.  The value is the
+        # in-flight flag: True while a message is being processed, False once it
+        # has settled.  Both states reject a duplicate; the distinction is that
+        # an in-flight id must never be evicted, or a concurrent redelivery
+        # would start a second run of a message already being handled.
+        self._processed_ids: OrderedDict[str, bool] = OrderedDict()
         self._stop_event: Optional[asyncio.Event] = None
         self._active_sinks: list[FeishuOutputSink] = []
 
@@ -2193,20 +2201,28 @@ class FeishuChannel(Channel):
 
     async def _on_message(self, data: Any) -> None:
         """Process one incoming Feishu message event (main event loop)."""
+        # Bound outside the try so the except/finally can always run.
+        message_id: str = ""
+        sink: FeishuOutputSink | None = None
+        claimed = False
+        failed = False
         try:
             event = data.event
             message = event.message
             sender = event.sender
 
-            # ── Deduplication ────────────────────────────────────────────────
-            message_id: str = message.message_id
+            # ── Duplicate check (claim happens later, after filtering) ───────
+            message_id = message.message_id
             if message_id in self._processed_ids:
                 return
-            self._processed_ids[message_id] = None
-            while len(self._processed_ids) > 1000:
-                self._processed_ids.popitem(last=False)
 
             # ── Skip bot self-messages ───────────────────────────────────────
+            # Deliberately before the claim.  Every filter between here and the
+            # claim is a pure function of the message, so a redelivery reaches
+            # the identical verdict without needing a cache slot.  Claiming
+            # first let filtered traffic evict real ids from a 1000-entry cache:
+            # measured, 1200 bot messages evicted a real id, and its redelivery
+            # was then processed a second time — a duplicate reply to the user.
             if sender.sender_type == "bot":
                 return
 
@@ -2236,6 +2252,33 @@ class FeishuChannel(Channel):
                 if self._config.group_policy != "open":
                     logger.debug("Feishu: skipping group message (not mentioned)")
                     return
+
+            # ── Claim the message, then promise the user we have it ──────────
+            # The claim marks this id in-flight.  It goes here, immediately
+            # before the first side effect, so only messages we actually intend
+            # to process consume a cache slot.
+            if not self._claim_message(message_id):
+                return
+            claimed = True
+
+            # Build the reply surface before anything that can fail.  The
+            # reaction below is a promise to the user that we have their
+            # message; everything after it therefore owes them a result or an
+            # error.  The sink needs only metadata, not parsed content, so it
+            # can exist this early — and without it a failure during download or
+            # parsing left the user with a reaction and permanent silence.
+            reply_to = chat_id if is_group_chat else sender_id
+            sink = self.create_sink(
+                IncomingMessage(
+                    text="",
+                    channel_name="feishu",
+                    metadata={
+                        "chat_id": reply_to,
+                        "chat_type": chat_type,
+                        "message_id": message_id,
+                    },
+                )
+            )
 
             # ── Add reaction immediately so the user knows we got it ─────────
             await self._add_reaction(message_id, self._config.react_emoji)
@@ -2283,9 +2326,11 @@ class FeishuChannel(Channel):
             if not content:
                 return
 
-            # ── Route to handler with per-chat serialisation ─────────────────
-            # Group chats reply to the group (chat_id); DMs reply to the user
-            reply_to = chat_id if is_group_chat else sender_id
+            # ── Route to handler ─────────────────────────────────────────────
+            # Turn serialisation is the coordinator's job, not the channel's:
+            # concurrency here is deliberate so a /cancel can reach an in-flight
+            # turn, while CommandCoordinator queues ordinary messages as
+            # interjections when the session is already active.
             msg_obj = IncomingMessage(
                 text=content,
                 channel_name="feishu",
@@ -2314,7 +2359,6 @@ class FeishuChannel(Channel):
             )
 
             if self._handler:
-                sink = self.create_sink(msg_obj)
                 _interaction_log(
                     "message_dispatched",
                     message_id=message_id,
@@ -2324,10 +2368,62 @@ class FeishuChannel(Channel):
                 await self._handler(msg_obj, sink)
 
         except Exception as exc:
+            failed = True
             _interaction_log("message_processing_failed", error=str(exc))
             logger.error("Feishu: error processing message: %s", exc)
+            # We already reacted, so the user is waiting.  Say so rather than
+            # going quiet, and release the claim so a redelivery can retry.
+            await self._report_processing_failure(sink)
+        finally:
+            if claimed:
+                # Any non-exceptional exit — including an early return because
+                # the message had no usable content — is a real decision and
+                # settles the id.  Only a failure releases it for retry.
+                if failed:
+                    self._release_message(message_id)
+                else:
+                    self._settle_message(message_id)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _claim_message(self, message_id: str) -> bool:
+        """Take exclusive ownership of *message_id*, or False if already taken."""
+        if message_id in self._processed_ids:
+            return False
+        self._processed_ids[message_id] = True
+        self._evict_settled_ids()
+        return True
+
+    def _settle_message(self, message_id: str) -> None:
+        """Mark a claim finished: still deduplicated, now evictable."""
+        if message_id in self._processed_ids:
+            self._processed_ids[message_id] = False
+
+    def _release_message(self, message_id: str) -> None:
+        """Drop a claim after failure so a redelivery of it can be retried."""
+        self._processed_ids.pop(message_id, None)
+
+    def _evict_settled_ids(self) -> None:
+        """Trim the cache, never evicting an id that is still in flight."""
+        while len(self._processed_ids) > _DEDUP_CACHE_LIMIT:
+            for candidate, in_flight in self._processed_ids.items():
+                if not in_flight:
+                    del self._processed_ids[candidate]
+                    break
+            else:
+                # Everything is in flight.  Overshooting the soft limit is far
+                # better than evicting a live claim and double-processing it.
+                return
+
+    async def _report_processing_failure(self, sink: "FeishuOutputSink | None") -> None:
+        """Tell the user the turn failed, if we got far enough to have a surface."""
+        if sink is None:
+            return
+        with contextlib.suppress(Exception):
+            sink.on_error(
+                "Sorry — I couldn't process that message. Please try again."
+            )
+            await sink.drain()
 
     def _is_bot_mentioned(self, message: Any) -> bool:
         """Return True if the bot is @mentioned in *message*."""

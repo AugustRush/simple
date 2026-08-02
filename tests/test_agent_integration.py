@@ -5336,11 +5336,16 @@ def test_base_agent_emits_rendezvous_phase_events(monkeypatch):
     assert phase_started[0].metrics["phase_index"] == 1
     assert phase_started[0].metrics["phase_total"] == 2
     assert phase_started[1].metrics["phase_index"] == 2
+    # A synthesis runs after EVERY round: the first primes round 2, the last is
+    # the run's deliverable.
     phase_notes = [event for event in sink.events if event.kind == "phase_note"]
-    assert len(phase_notes) == 1
+    assert len(phase_notes) == 2
     assert phase_notes[0].metrics["execution_mode"] == "rendezvous"
     assert phase_notes[0].metrics["phase_kind"] == "lead_summary"
     assert phase_notes[0].metrics["continue_count"] == 2
+    assert phase_notes[0].metrics["final"] is False
+    assert phase_notes[1].metrics["final"] is True
+    assert phase_notes[1].metrics["continue_count"] == 0
 
 
 def test_base_agent_runs_internal_rendezvous_with_lead_selected_structured_results(
@@ -8732,6 +8737,72 @@ def test_save_config_uses_atomic_replace(monkeypatch, tmp_path):
     assert replace_calls
 
 
+def test_atomic_write_text_fsyncs_both_the_file_and_its_directory(monkeypatch, tmp_path):
+    """Rename gives atomicity; only fsync gives durability.
+
+    Without these the rename can be visible while the bytes it points at are
+    still in the page cache, so a crash leaves a short file that every reader
+    accepts as authoritative.
+    """
+    from agent import shared
+
+    synced_fds: list[int] = []
+    real_fsync = shared.os.fsync
+
+    def recording_fsync(fd):
+        synced_fds.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(shared.os, "fsync", recording_fsync)
+
+    target = tmp_path / "nested" / "state.json"
+    shared._atomic_write_text(target, '{"a": 1}')
+
+    assert target.read_text(encoding="utf-8") == '{"a": 1}'
+    # One for the file's contents, one for the parent's directory entry.
+    assert len(synced_fds) == 2
+
+
+def test_atomic_write_text_leaves_no_scratch_file_when_the_write_fails(
+    monkeypatch, tmp_path
+):
+    """A stale temp file beside real state reads as a partial write to an operator."""
+    from agent import shared
+
+    def exploding_replace(self, target):
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(Path, "replace", exploding_replace)
+
+    target = tmp_path / "state.json"
+    with pytest.raises(OSError):
+        shared._atomic_write_text(target, "payload")
+
+    assert not target.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_heartbeat_shares_the_single_durable_write_primitive(monkeypatch, tmp_path):
+    """Two implementations of one guarantee means hardening one skips the other."""
+    from agent import shared
+    from agent.runtime import heartbeat
+
+    calls: list[Path] = []
+    real = shared._atomic_write_json
+
+    def recording(path, payload, *, indent=None):
+        calls.append(Path(path))
+        return real(path, payload, indent=indent)
+
+    monkeypatch.setattr(shared, "_atomic_write_json", recording)
+
+    target = tmp_path / "hb.json"
+    heartbeat._atomic_write_json(target, {"state": "alive"})
+
+    assert calls == [target]
+    assert json.loads(target.read_text(encoding="utf-8")) == {"state": "alive"}
+
+
 def test_execute_regular_tool_calls_serializes_batches_containing_shell():
     from agent.core.agent import _execute_regular_tool_calls
 
@@ -8804,3 +8875,83 @@ def test_execute_regular_tool_calls_keeps_parallelism_without_shell():
 
     results = asyncio.run(scenario())
     assert all(json.loads(result) == {"ok": True} for result in results)
+
+
+def test_provider_usage_calibrates_the_token_estimator(tmp_path):
+    """The estimator must learn from the provider's exact input count.
+
+    Without this the character heuristic keeps the same systematic bias for the
+    life of the process, and the only signal it was wrong is a provider-side
+    failure.
+    """
+    import agent as agent_module
+
+    store = agent_module.LTMStore(context_dir=tmp_path / "context")
+    manager = agent_module.ContextManager(
+        store=store,
+        retriever=agent_module.LocalRetriever(),
+        consolidation=agent_module.ConsolidationEngine(store=store),
+        staging=agent_module.StagingBuffer(
+            context_dir=tmp_path / "context", session_id="calib"
+        ),
+    )
+
+    class _Usage:
+        input_tokens = 900
+
+    class _Response:
+        usage = _Usage()
+
+    from agent.core.transport import AnthropicTransport
+
+    class Transport(AnthropicTransport):
+        def __init__(self):
+            pass
+
+        async def create(self, **kwargs):
+            return _Response()
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="anthropic",
+        context_window=100_000,
+        max_tokens=1_000,
+    )
+    agent.context_manager = manager
+    agent._transport = Transport()
+    ctx = agent_module.AgentContext(
+        system_prompt="s" * 40,
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    assert manager.consolidation.token_calibration == 1.0
+    asyncio.run(agent._create(ctx, []))
+    # The payload really cost 900 tokens but was predicted far lower, so the
+    # estimator must have corrected upward.
+    assert manager.consolidation.token_calibration > 1.0
+    # And the prediction marker must not leak into later turns.
+    assert "_predicted_input_tokens" not in ctx.metadata
+
+
+def test_observed_input_tokens_reads_either_provider_field():
+    import agent as agent_module
+
+    class _AnthropicUsage:
+        input_tokens = 123
+
+    class _OpenAIUsage:
+        prompt_tokens = 456
+
+    class _Resp:
+        def __init__(self, usage):
+            self.usage = usage
+
+    from agent.core.transport import ModelTransport
+
+    read = ModelTransport.observed_input_tokens
+    assert read(_Resp(_AnthropicUsage())) == 123
+    assert read(_Resp(_OpenAIUsage())) == 456
+    assert read(_Resp(None)) is None
+    assert read(object()) is None

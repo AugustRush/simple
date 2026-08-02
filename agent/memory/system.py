@@ -237,7 +237,12 @@ class MemoryPalace:
             json.dumps(entry.to_dict(), ensure_ascii=False)
             for entry in entries
         ]
-        path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+        # Durable primitive, not write_text: this replaces a complete export in
+        # place, so a truncating write leaves a reader a short memory file that
+        # parses fine and is simply missing entries.
+        agent_module._atomic_write_text(
+            path, ("\n".join(lines) + "\n") if lines else "", encoding="utf-8"
+        )
         if path == self._export_path:
             self._export_dirty = False
         return path
@@ -2521,8 +2526,37 @@ class ConsolidationEngine:
         # cjk_chars_per_token: CJK chars per token (Hanzi/Kana/Hangul, default 1)
         self.chars_per_token: float = max(0.1, float(chars_per_token))
         self.cjk_chars_per_token: float = max(0.1, float(cjk_chars_per_token))
+        # Multiplier correcting the character heuristic toward the provider's
+        # actual accounting.  Starts neutral and is adjusted from observed usage
+        # (see observe_actual_usage); 1.0 means "heuristic used as-is".
+        self.token_calibration: float = 1.0
+        self._calibration_samples: int = 0
 
     # ── Trigger ───────────────────────────────────────────────────────────────
+
+    # Providers charge for an image by its rendered dimensions, not by the
+    # length of its base64 transport encoding.  Anthropic caps a single image at
+    # roughly 1.6k tokens; OpenAI's high-detail tiling lands in the same order of
+    # magnitude.  Estimating `len(base64)/4` instead reports a 1.5MB image as
+    # ~512k tokens — 320x its real cost — which alone can exceed any budget and
+    # force the whole conversation to be evicted for one screenshot.
+    MAX_IMAGE_TOKENS = 1600
+
+    @classmethod
+    def _non_text_block_tokens(
+        cls, block: dict, count_text: Callable[[str], int]
+    ) -> int:
+        """Cost of a non-text content block under the provider's price model."""
+        block_type = str(block.get("type") or "")
+        if block_type in {"image", "input_image", "image_url"}:
+            return cls.MAX_IMAGE_TOKENS
+        source = block.get("source")
+        if isinstance(source, dict) and source.get("data") is not None:
+            # An inline base64 payload of unknown type: price it as an image
+            # rather than by transport length.
+            return cls.MAX_IMAGE_TOKENS
+        # Anything else genuinely is text the provider reads verbatim.
+        return count_text(json.dumps(block, ensure_ascii=False, default=str))
 
     def estimate_tokens(self, messages: list[dict]) -> int:
         """Token estimate with CJK-awareness.
@@ -2544,7 +2578,7 @@ class ConsolidationEngine:
                 non_cjk / self.chars_per_token
             )
 
-        total = 0
+        total = 0.0
         for msg in messages:
             # Provider chat protocols charge a small envelope cost per message
             # even when content is empty.
@@ -2565,20 +2599,44 @@ class ConsolidationEngine:
                         total += _count(
                             json.dumps(tool_input, ensure_ascii=False, default=str)
                         )
-                    # Image/source blocks are provider-visible context too. Count
-                    # their serialized payload rather than silently treating them
-                    # as free; this is conservative for APIs that tokenize images
-                    # by dimensions instead of base64 length.
                     if not text_value and tool_input is None:
-                        total += _count(
-                            json.dumps(block, ensure_ascii=False, default=str)
-                        )
+                        total += self._non_text_block_tokens(block, _count)
             tool_calls = msg.get("tool_calls")
             if tool_calls:
                 total += _count(
                     json.dumps(tool_calls, ensure_ascii=False, default=str)
                 )
-        return total
+        return int(total * self.token_calibration)
+
+    # Bounds on the learned multiplier.  A heuristic that needs more than a 4x
+    # correction is broken in a way calibration should not paper over, and one
+    # below 1.0 would make the estimator claim text is cheaper than the
+    # character floor — neither is worth trusting.
+    _MIN_CALIBRATION = 1.0
+    _MAX_CALIBRATION = 4.0
+
+    def observe_actual_usage(self, estimated: int, actual: int) -> None:
+        """Correct the heuristic from the provider's exact count.
+
+        The loss here is asymmetric: underestimating means a payload reaches the
+        provider over its limit and the call hard-fails, while overestimating
+        only wastes budget.  So an underestimate is corrected immediately and in
+        full, and an overestimate is relaxed slowly.
+        """
+        if estimated <= 0 or actual <= 0:
+            return
+        observed_ratio = actual / estimated
+        # Undo the multiplier already applied, to recover the ratio the raw
+        # heuristic would need.
+        needed = observed_ratio * self.token_calibration
+        if needed > self.token_calibration:
+            updated = needed  # underestimate: jump straight to safety
+        else:
+            updated = self.token_calibration + 0.1 * (needed - self.token_calibration)
+        self.token_calibration = min(
+            self._MAX_CALIBRATION, max(self._MIN_CALIBRATION, updated)
+        )
+        self._calibration_samples += 1
 
     def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
         return self.estimate_tokens(messages) >= int(
@@ -3475,12 +3533,50 @@ class ContextManager:
             )
         return repaired
 
+    # Identified by a text sentinel rather than a custom message key: both
+    # Anthropic and OpenAI reject unknown fields on a message object.
+    _EVICTION_SENTINEL = "[context-eviction]"
+
+    @classmethod
+    def _eviction_notice(cls, dropped_count: int) -> dict:
+        return {
+            "role": "user",
+            "content": (
+                f"{cls._EVICTION_SENTINEL} {dropped_count} earlier message(s) were "
+                "dropped to fit the input budget. They are recoverable: use "
+                "context_retrieve to search this session before assuming anything "
+                "about them, rather than guessing or asking the user to repeat."
+            ),
+        }
+
+    @classmethod
+    def _strip_eviction_notices(cls, messages: list[dict]) -> tuple[list[dict], int]:
+        """Remove prior notices and report how many messages they accounted for."""
+        kept: list[dict] = []
+        dropped = 0
+        for message in messages:
+            content = message.get("content")
+            if (
+                message.get("role") == "user"
+                and isinstance(content, str)
+                and content.startswith(cls._EVICTION_SENTINEL)
+            ):
+                head = content[len(cls._EVICTION_SENTINEL):].strip().split(" ", 1)[0]
+                if head.isdigit():
+                    dropped += int(head)
+                continue
+            kept.append(message)
+        return kept, dropped
+
     def compact_messages(
         self, messages: list[dict], *, input_token_budget: int
     ) -> list[dict]:
         budget = int(input_token_budget)
         if budget <= 0:
             raise ContextLimitError("provider input token budget is not positive")
+        # Collapse any prior notice into a running count so repeated compactions
+        # report cumulative loss instead of stacking notices.
+        messages, dropped_before = self._strip_eviction_notices(messages)
         messages = self._repair_tool_history(messages)
         newest_request_index = next(
             (
@@ -3515,11 +3611,25 @@ class ContextManager:
                 raise ContextLimitError("complete conversation context exceeds input budget")
             retained.remove(removable)
             compacted = materialize()
+        kept_indexes = {item for unit in retained for item in unit}
+        dropped_now = dropped_before + sum(
+            1 for index in range(len(messages)) if index not in kept_indexes
+        )
+        if dropped_now:
+            # Evicted turns remain reachable through staging and the durable
+            # store, but the model cannot retrieve what it does not know is
+            # missing, so leave an explicit notice.  The notice is an aid, not a
+            # requirement: if it does not fit alongside the conversation it is
+            # omitted rather than allowed to fail the compaction it describes.
+            notice = self._eviction_notice(dropped_now)
+            if self.consolidation.estimate_tokens([notice] + compacted) < budget:
+                compacted = [notice] + compacted
         if len(compacted) != len(messages):
             _emit_consolidation(
                 "compaction",
                 messages_before=len(messages),
                 messages_after=len(compacted),
+                messages_dropped=dropped_now,
             )
         return compacted
 
@@ -3697,7 +3807,12 @@ class ContextManager:
             )
         return "\n".join(lines)
 
-    def retrieve_ltm_context(self, query: str, top_k: int = shared.RETRIEVAL_TOP_K) -> str:
+    def retrieve_ltm_context(
+        self,
+        query: str,
+        top_k: int = shared.RETRIEVAL_TOP_K,
+        token_budget: Optional[int] = None,
+    ) -> str:
         """Return top-K relevant LTM entries as an injectable string.
 
         Two-stage retrieval:
@@ -3734,11 +3849,32 @@ class ContextManager:
         top = [entry for entry, score in scored[:top_k] if score > 0]
         if not top:
             return ""
-        lines = ["## Retrieved Context (from long-term memory)"]
+        header = "## Retrieved Context (from long-term memory)"
+        lines = [header]
+        if token_budget is None or token_budget <= 0:
+            for e in top:
+                anchor = f"{e.category}/{e.entity}" if e.entity else e.category
+                lines.append(f"- [{anchor}] {e.content}")
+            return "\n".join(lines)
+        # Fit at entry granularity.  Dropping the whole section because one
+        # verbose memory overflowed would discard the other four for free, so
+        # spend the budget on the highest-scoring entries that fit and say how
+        # many were left out.
+        estimate = self.consolidation.estimate_tokens
+        used = estimate([{"role": "system", "content": header}])
+        omitted = 0
         for e in top:
             anchor = f"{e.category}/{e.entity}" if e.entity else e.category
-            lines.append(f"- [{anchor}] {e.content}")
-        return "\n".join(lines)
+            line = f"- [{anchor}] {e.content}"
+            cost = estimate([{"role": "system", "content": line}])
+            if used + cost > token_budget:
+                omitted += 1
+                continue
+            lines.append(line)
+            used += cost
+        if omitted:
+            lines.append(f"- [{omitted} lower-ranked memor(ies) omitted: over budget]")
+        return "\n".join(lines) if len(lines) > 1 else ""
 
     def _recent_session_context(
         self,
@@ -4358,15 +4494,23 @@ class ContextManager:
         top_k: int = shared.RETRIEVAL_TOP_K,
         current_messages: Optional[list[dict]] = None,
         current_turn_id: str = "",
+        token_budget: Optional[int] = None,
     ) -> str:
         """Return context for automatic prompt injection.
 
         Keep routine prompt augmentation focused on LTM, and only include the
         in-session staging buffer when the user is explicitly asking to recall
         recent conversation.
+
+        ``token_budget`` bounds the result in the same currency as every other
+        payload decision.  ``top_k`` bounds the *count* of entries, which says
+        nothing about their size: five verbose memories measured 112k tokens,
+        and because this text is injected into the system prompt — which
+        compaction never touches — that either starved the conversation of room
+        or drove the input budget negative and hard-failed the turn.
         """
         plan = self._plan_query(query)
-        sections = []
+        sections: list[str] = []
         assistant_identity = self._assistant_identity_context()
         if assistant_identity:
             sections.append(assistant_identity)
@@ -4395,10 +4539,58 @@ class ContextManager:
             plan=plan,
             has_fact_hits=bool(facts),
         )
-        ltm = self.retrieve_ltm_context(query, top_k=top_k) if include_freeform else ""
+        # Give LTM whatever the higher-priority sections left unspent, so a
+        # verbose memory is trimmed to fit rather than dropped wholesale.
+        ltm = ""
+        if include_freeform:
+            spent = 0
+            if token_budget:
+                spent = sum(
+                    self.consolidation.estimate_tokens(
+                        [{"role": "system", "content": section}]
+                    )
+                    for section in sections
+                )
+            ltm = self.retrieve_ltm_context(
+                query,
+                top_k=top_k,
+                token_budget=(max(0, token_budget - spent) if token_budget else None),
+            )
         if ltm:
             sections.append(ltm)
-        return "\n\n".join(sections)
+        return self._fit_sections_to_budget(sections, token_budget)
+
+    def _fit_sections_to_budget(
+        self, sections: list[str], token_budget: Optional[int]
+    ) -> str:
+        """Join sections, dropping whole ones that exceed the budget.
+
+        Sections arrive in priority order (identity, working state, recent
+        turns, facts, then free-form LTM), so shedding from the tail drops the
+        least important material first.  Dropping a whole section beats
+        truncating mid-sentence: half a remembered fact still reads as a
+        complete one, which is worse than its absence.  A notice records what
+        was shed so the omission is visible rather than silent.
+        """
+        if token_budget is None or token_budget <= 0 or not sections:
+            return "\n\n".join(sections)
+        estimate = self.consolidation.estimate_tokens
+        kept: list[str] = []
+        dropped = 0
+        used = 0
+        for section in sections:
+            cost = estimate([{"role": "system", "content": section}])
+            if used + cost > token_budget:
+                dropped += 1
+                continue
+            kept.append(section)
+            used += cost
+        if dropped:
+            kept.append(
+                f"[{dropped} lower-priority context section(s) omitted to fit the "
+                f"{token_budget}-token retrieval budget]"
+            )
+        return "\n\n".join(kept)
 
     # ── Consolidation ─────────────────────────────────────────────────────────
 

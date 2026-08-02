@@ -1,6 +1,8 @@
 """Interactive CLI consent gate and input-history tests."""
 
 import asyncio
+import contextlib
+import re
 from io import StringIO
 from types import SimpleNamespace
 
@@ -241,6 +243,19 @@ def _tty_sink():
     return CliOutputSink(console), console
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;:]*[a-zA-Z]")
+
+
+def _rendered_text(console) -> str:
+    """Console output with styling removed.
+
+    Rich emits an SGR sequence around every syntax-highlighted token, so a code
+    span never appears as a contiguous substring of the raw output.  Assertions
+    about *content* must therefore compare the rendered text.
+    """
+    return _ANSI_RE.sub("", console.file.getvalue())
+
+
 def test_render_markdown_line_styles_inline_tokens():
     from agent.core.output import _render_markdown_line
 
@@ -263,7 +278,7 @@ def test_stream_markdown_buffers_code_fence():
 
     sink.on_stream_chunk("```python\nprint(1)\n```\n")
 
-    out = console.file.getvalue()
+    out = _rendered_text(console)
     assert "print(1)" in out
     assert "```" not in out
 
@@ -274,7 +289,7 @@ def test_stream_markdown_flushes_truncated_fence_on_turn_end():
     sink.on_stream_chunk("```python\nprint(1)\n")
     sink.on_turn_complete("", [])
 
-    assert "print(1)" in console.file.getvalue()
+    assert "print(1)" in _rendered_text(console)
     assert sink._stream_md is None
 
 
@@ -1034,3 +1049,317 @@ def test_sink_interactive_confirmation_requires_live_terminal():
     console = Console(file=StringIO(), force_terminal=True)
     assert CliOutputSink(console, live_status=False).interactive_confirmation is False
     assert CliOutputSink(console, live_status=True).interactive_confirmation is False
+
+
+# ── Consent capability is independent of spinner capability ─────────────────
+
+
+class _ConsentConsole:
+    is_terminal = True
+
+    def status(self, *args, **kwargs):
+        raise AssertionError("consent must not depend on the live spinner")
+
+    def print(self, *args, **kwargs):
+        return None
+
+
+def test_tui_sink_can_prompt_for_consent_without_a_live_spinner(monkeypatch):
+    """The TUI hosts no spinner but prompts fine.
+
+    Regression: interactive_confirmation was derived from the spinner flag, so
+    full-screen TUI mode — the default on any real terminal — silently had no
+    approval menu at all, leaving phrase matching as the only consent channel.
+    """
+    from agent.core.output import CliOutputSink
+
+    monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
+    tui_sink = CliOutputSink(_ConsentConsole(), live_status=False, can_prompt=True)
+    assert tui_sink.interactive_confirmation is True
+    assert tui_sink._supports_live_status() is False
+
+
+def test_line_mode_sink_still_prompts(monkeypatch):
+    from agent.core.output import CliOutputSink
+
+    monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
+    assert CliOutputSink(_ConsentConsole(), live_status=True).interactive_confirmation
+
+
+def test_non_interactive_sink_refuses_to_prompt(monkeypatch):
+    from agent.core.output import CliOutputSink
+
+    monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: True))
+    piped = CliOutputSink(_ConsentConsole(), live_status=False, can_prompt=False)
+    assert piped.interactive_confirmation is False
+
+    monkeypatch.setattr("sys.stdin", SimpleNamespace(isatty=lambda: False))
+    no_tty = CliOutputSink(_ConsentConsole(), live_status=True, can_prompt=True)
+    assert no_tty.interactive_confirmation is False
+
+
+def test_consent_prompt_shows_the_command_untruncated():
+    """The approval allowlists the whole command, so the human must see it all.
+
+    Regression: the command was clipped to 200 chars, letting a long benign
+    prefix push the destructive tail out of view.
+    """
+    from agent.core.output import CliOutputSink
+
+    printed: list[str] = []
+
+    class _Recorder(_ConsentConsole):
+        def print(self, *args, **kwargs):
+            printed.append(str(args[0]) if args else "")
+
+    command = "echo " + "A" * 400 + " ; rm -rf /tmp/victim"
+    sink = CliOutputSink(_Recorder(), live_status=False, can_prompt=True)
+    with contextlib.suppress(Exception):
+        asyncio.run(
+            sink.on_tool_confirmation(
+                "shell",
+                command=command,
+                risk_level="medium",
+                reason="inline execution",
+                confirmation_token="t",
+                scope=None,
+            )
+        )
+    rendered = "\n".join(printed)
+    if rendered:
+        assert "rm -rf /tmp/victim" in rendered, "destructive tail was hidden"
+
+
+# ── One Ctrl+C must be counted exactly once ─────────────────────────────────
+
+
+def test_ctrl_c_has_exactly_one_owner_per_mode():
+    """Ctrl+C must be counted once.
+
+    Regression: TUI mode installed the process-level SIGINT handler *and* relied
+    on prompt_toolkit's key binding. Both fired for one keypress, so
+    _sigint_count reached 2 immediately and the first Ctrl+C escalated straight
+    to force-cancel (SIGKILL) — the advertised graceful-then-force contract was
+    unreachable.
+    """
+    from agent.cli import _owns_process_sigint
+
+    assert _owns_process_sigint(tui_active=False) is True
+    assert _owns_process_sigint(tui_active=True) is False
+
+
+def test_both_sigint_owners_would_double_count_a_single_press(monkeypatch):
+    """Documents why the guard above is required."""
+    import agent.cli as cli
+
+    class _Token:
+        def __init__(self):
+            self.levels: list[str] = []
+            self.is_cancelled = False
+
+        def cancel(self, level: str = "graceful") -> None:
+            self.levels.append(level)
+
+    token = _Token()
+    monkeypatch.setattr(cli, "_current_cancel_token", token)
+    monkeypatch.setattr(cli, "_sigint_count", 0)
+    monkeypatch.setattr(cli, "_ACTIVE_TUI", SimpleNamespace(request_exit=lambda: None))
+    monkeypatch.setattr(cli.shared, "CONSOLE", SimpleNamespace(print=lambda *a, **k: None))
+
+    # Simulate the pre-fix world: both owners react to one keypress.
+    cli._cli_sigint_handler(2, None)
+    cli._tui_cancel_callback()
+    assert token.levels == ["graceful", "force"], (
+        "two owners escalate a single press to force-cancel"
+    )
+
+    # A single owner gives the documented two-stage contract.
+    token2 = _Token()
+    monkeypatch.setattr(cli, "_current_cancel_token", token2)
+    monkeypatch.setattr(cli, "_sigint_count", 0)
+    cli._tui_cancel_callback()
+    assert token2.levels == ["graceful"]
+    cli._tui_cancel_callback()
+    assert token2.levels == ["graceful", "force"]
+
+
+# ── One channel owns the screen ─────────────────────────────────────────────
+
+
+def test_log_records_route_through_the_console_not_raw_stderr(monkeypatch):
+    """The interactive CLI configures no logging, so lastResort wrote full
+    tracebacks to stderr: invisible to the sink's redaction and, while the TUI
+    owns the screen, straight past the output pane onto the raw terminal.
+    """
+    import logging
+    import sys
+
+    from agent.cli import _SinkLogHandler
+
+    printed: list[str] = []
+
+    class _Console:
+        def print(self, *args, **kwargs):
+            printed.append(str(args[0]) if args else "")
+
+    root = logging.getLogger()
+    handler = _SinkLogHandler(_Console())
+    root.addHandler(handler)
+    previous_last_resort = logging.lastResort
+    logging.lastResort = None
+    captured = StringIO()
+    monkeypatch.setattr(sys, "stderr", captured)
+    try:
+        logger = logging.getLogger("agent.commands.router")
+        try:
+            raise RuntimeError("api_key=sk-SECRET at /Users/x/.agent/config.json")
+        except RuntimeError:
+            logger.exception("command /x failed")
+    finally:
+        root.removeHandler(handler)
+        logging.lastResort = previous_last_resort
+
+    console_text = "\n".join(printed)
+    assert captured.getvalue() == "", "log output escaped to raw stderr"
+    assert "command /x failed" in console_text
+    assert "Traceback" in console_text, "debuggability must be preserved"
+    assert "sk-SECRET" not in console_text, "key=value secret was not redacted"
+
+
+def test_sink_log_handler_ignores_routine_chatter():
+    import logging
+
+    from agent.cli import _SinkLogHandler
+
+    printed: list[str] = []
+
+    class _Console:
+        def print(self, *args, **kwargs):
+            printed.append(str(args[0]) if args else "")
+
+    root = logging.getLogger()
+    handler = _SinkLogHandler(_Console())
+    root.addHandler(handler)
+    try:
+        logging.getLogger("agent").info("routine chatter")
+    finally:
+        root.removeHandler(handler)
+    assert printed == [], "INFO-level records must not reach the screen"
+
+
+def test_output_pane_counter_survives_concurrent_writes():
+    """The background memory worker is a daemon thread printing to
+    shared.CONSOLE, which is rebound to the TUI console — so pane writes race
+    the event loop.  A desynced _line_count pins the view to the wrong line and
+    breaks auto-follow.
+    """
+    import threading
+
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=10)
+    per_thread, thread_count = 2000, 8
+
+    def worker(index: int) -> None:
+        for i in range(per_thread):
+            pane.write(f"thread{index} line{i}\n")
+
+    threads = [
+        threading.Thread(target=worker, args=(n,)) for n in range(thread_count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    rendered = sum(
+        item[1].count("\n") for item in pane.fragments() if len(item) >= 2
+    )
+    assert rendered == per_thread * thread_count, "writes were lost"
+    assert pane._line_count == rendered, "counter desynced from rendered content"
+    assert pane.cursor_position().y <= pane._line_count
+
+
+# ── Scroll accounting must use display rows, not logical lines ───────────────
+
+
+class _WrapInfo:
+    """Stands in for WindowRenderInfo with a fixed wrap factor."""
+
+    def __init__(self, window_height: int, rows_per_line: int) -> None:
+        self.window_height = window_height
+        self._rows = rows_per_line
+
+    def get_height_for_line(self, line: int) -> int:
+        return self._rows
+
+
+class _WrapWindow:
+    def __init__(self, info) -> None:
+        self.render_info = info
+        self.vertical_scroll = 0
+
+
+def _wrapped_pane(lines: int = 12):
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=10)
+    for _ in range(lines):
+        pane.write("x" * 400 + "\n")
+    return pane
+
+
+def test_follow_bottom_uses_wrapped_rows_so_newest_output_stays_visible():
+    """One logical line can occupy several display rows under wrap_lines=True.
+
+    Regression: the scroll bound was computed from the logical line count, so
+    for output wider than the terminal the view pinned far above the newest
+    line — auto-follow silently stopped showing the newest output.
+    """
+    pane = _wrapped_pane(12)
+    logical_only = pane.vertical_scroll(_WrapWindow(None))
+    wrapped = pane.vertical_scroll(_WrapWindow(_WrapInfo(10, 5)))
+
+    # 5 rows per line into a 10-row window fits 2 logical lines, not 10.
+    assert wrapped > logical_only
+    assert wrapped >= pane._line_count - 2
+
+
+def test_unwrapped_output_matches_logical_accounting():
+    pane = _wrapped_pane(12)
+    logical_only = pane.vertical_scroll(_WrapWindow(None))
+    assert pane.vertical_scroll(_WrapWindow(_WrapInfo(10, 1))) == logical_only
+
+
+def test_manual_scrolling_is_symmetric_under_wrapping():
+    """scroll_up/scroll_down must step evenly and restore follow at the bottom."""
+    pane = _wrapped_pane(12)
+    window = _WrapWindow(_WrapInfo(10, 5))
+    bottom = pane.vertical_scroll(window)
+
+    pane.scroll_up(3)
+    first = pane.vertical_scroll(window)
+    assert first == bottom - 3, "scroll_up jumped instead of stepping"
+    assert pane._follow_bottom is False
+
+    pane.scroll_up(3)
+    assert pane.vertical_scroll(window) == bottom - 6
+
+    pane.scroll_down(3)
+    assert pane.vertical_scroll(window) == bottom - 3, "scroll_down was asymmetric"
+    pane.scroll_down(3)
+    assert pane.vertical_scroll(window) == bottom
+    assert pane._follow_bottom is True, "reaching the bottom must resume follow"
+
+
+def test_scroll_accounting_tolerates_a_failing_renderer():
+    pane = _wrapped_pane(12)
+    logical_only = pane.vertical_scroll(_WrapWindow(None))
+
+    class _Broken:
+        window_height = 10
+
+        def get_height_for_line(self, line):
+            raise RuntimeError("renderer not ready")
+
+    assert pane.vertical_scroll(_WrapWindow(_Broken())) == logical_only

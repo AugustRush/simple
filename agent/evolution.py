@@ -371,8 +371,11 @@ class EvolutionEngine:
         existing = list(shared.PROMPTS_DIR.glob("system_v*.md"))
         new_version_num = len(existing) + 1
         new_path = shared.PROMPTS_DIR / f"system_v{new_version_num}.md"
-        new_path.write_text(
-            f"<!-- version: v{new_version_num} -->\n{new_prompt}", encoding="utf-8"
+        # Durable primitive.  Note this name can still collide: the version is
+        # derived from the file *count*, so with v1 and v3 present the next write
+        # is v3 again.  That is a naming defect, not a write defect.
+        shared._atomic_write_text(
+            new_path, f"<!-- version: v{new_version_num} -->\n{new_prompt}"
         )
 
         shared.CONSOLE.print(
@@ -429,8 +432,9 @@ class EvolutionEngine:
         # Generate safe filename
         safe_name = re.sub(r"[^a-z0-9_]", "_", description.lower()[:30])
         tool_path = shared.TOOLS_DIR / f"auto_{safe_name}.py"
-        shared.TOOLS_DIR.mkdir(parents=True, exist_ok=True)
-        tool_path.write_text(code, encoding="utf-8")
+        # Durable primitive: two descriptions can sanitize to the same name, so
+        # this overwrites an existing generated tool rather than always creating.
+        shared._atomic_write_text(tool_path, code)
 
         shared.CONSOLE.print(f"[green]Tool saved to {tool_path}[/green]")
         return f"Tool generated and saved to {tool_path}"

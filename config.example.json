@@ -105,7 +105,12 @@
         "  chars_per_token: non-CJK characters per token (Latin/ASCII, default 4).",
         "  cjk_chars_per_token: CJK characters per token (Hanzi/Kana/Hangul, default 1).",
         "  Increase chars_per_token for shorter English text or code-heavy sessions.",
-        "  Increase cjk_chars_per_token if consolidation triggers too aggressively for Chinese/Japanese."
+        "  Increase cjk_chars_per_token if consolidation triggers too aggressively for Chinese/Japanese.",
+        "  These are only the starting point: every provider response reports its exact input",
+        "  token count, and the estimator calibrates itself against it during the session.",
+        "  Calibration corrects an underestimate immediately (an underestimate means a call",
+        "  hard-fails at the provider) and relaxes an overestimate slowly, so these ratios",
+        "  rarely need hand-tuning. Images are priced at their provider cost, not base64 length."
       ],
       "token_ratio": 0.70,
       "keep_last_messages": 6,
@@ -150,6 +155,19 @@
     ],
     "poll_seconds": 30,
     "lease_seconds": 300
+  },
+  "orchestration": {
+    "_readme": [
+      "Multi-agent orchestration bounds.",
+      "max_parallel_agents: how many sub-agents may run at the same time.",
+      "max_agents_per_turn: total sub-agents one turn may run, independent of concurrency; 0 derives it from max_parallel_agents (4x, minimum 8). A batch over the limit is rejected before any child starts.",
+      "sub_agent_timeout_seconds: total wall-clock budget for one sub-agent including all retry attempts.",
+      "sub_agent_retries: extra attempts for a transient failure, spent from the same budget. Read-only and research profiles only."
+    ],
+    "max_parallel_agents": 3,
+    "max_agents_per_turn": 0,
+    "sub_agent_timeout_seconds": 1800,
+    "sub_agent_retries": 0
   },
   "audio": {
     "_readme": [

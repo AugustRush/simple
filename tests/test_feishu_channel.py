@@ -3130,3 +3130,120 @@ def _selective_import_error(name, *args, **kwargs):
     if "channels.feishu" in name:
         raise ImportError("mocked import error")
     return builtins.__import__(name, *args, **kwargs)
+
+
+def _dedup_event(message_id, text, *, sender_type="user", msg_type="text"):
+    message = MagicMock()
+    message.message_id = message_id
+    message.chat_id = "oc_chat"
+    message.chat_type = "p2p"
+    message.message_type = msg_type
+    message.content = json.dumps(
+        {"text": text} if msg_type == "text" else {"image_key": "img_1"}
+    )
+    message.mentions = []
+    sender = MagicMock()
+    sender.sender_type = sender_type
+    sender.sender_id.open_id = "ou_sender"
+    data = MagicMock()
+    data.event.message = message
+    data.event.sender = sender
+    return data
+
+
+def test_feishu_filtered_messages_do_not_consume_dedup_slots():
+    """Only messages we intend to process may occupy the dedup cache.
+
+    Every filter before the claim is a pure function of the message, so a
+    redelivery reaches the identical verdict without needing a slot.  Claiming
+    first let filtered traffic evict real ids from the bounded cache, and a
+    redelivery of an evicted id was then processed a second time — the user got
+    a duplicate reply.
+    """
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._handler = AsyncMock()
+
+    async def scenario():
+        with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+            channel, "_download_message_attachments", new=AsyncMock(return_value=())
+        ), patch.object(channel, "create_sink", side_effect=lambda m: MagicMock()):
+            await channel._on_message(_dedup_event("real-1", "hello"))
+            for index in range(1200):
+                await channel._on_message(
+                    _dedup_event(f"bot-{index}", "noise", sender_type="bot")
+                )
+            assert "real-1" in channel._processed_ids
+            assert len(channel._processed_ids) == 1
+
+            # Redelivery of the real message is still recognised as a duplicate.
+            await channel._on_message(_dedup_event("real-1", "hello"))
+
+    asyncio.run(scenario())
+
+    assert channel._handler.await_count == 1
+
+
+def test_feishu_reports_failure_and_allows_retry_after_the_reaction():
+    """The reaction is a promise; a later failure owes the user an answer.
+
+    Before this, a failure between the reaction and the handler had no reply
+    surface (the sink was built later), so the user saw an emoji and permanent
+    silence — and because the id was already marked processed, a redelivery was
+    refused too.
+    """
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+    channel._handler = AsyncMock()
+    sinks = []
+
+    def make_sink(msg):
+        sink = MagicMock()
+        sink.drain = AsyncMock()
+        sinks.append(sink)
+        return sink
+
+    async def exploding_download(**kwargs):
+        raise RuntimeError("resource download failed")
+
+    async def scenario():
+        with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+            channel, "_download_message_attachments", new=exploding_download
+        ), patch.object(channel, "create_sink", side_effect=make_sink):
+            await channel._on_message(
+                _dedup_event("m-1", "x", msg_type="image")
+            )
+
+        assert sinks, "no reply surface existed at failure time"
+        assert sinks[0].on_error.call_count == 1
+        # Claim released, so a redelivery is a retry rather than a silent drop.
+        assert "m-1" not in channel._processed_ids
+
+        with patch.object(channel, "_add_reaction", new=AsyncMock()), patch.object(
+            channel, "_download_message_attachments", new=AsyncMock(return_value=())
+        ), patch.object(channel, "create_sink", side_effect=make_sink):
+            await channel._on_message(_dedup_event("m-1", "x"))
+
+    asyncio.run(scenario())
+
+    assert channel._handler.await_count == 1
+
+
+def test_feishu_in_flight_ids_are_never_evicted():
+    """Evicting a live claim would let a concurrent redelivery double-process it."""
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._client = MagicMock()
+
+    for index in range(5):
+        assert channel._claim_message(f"live-{index}") is True
+
+    # Far past the soft cap, but every id is still in flight.
+    channel._processed_ids.update({f"live-{i}": True for i in range(5)})
+    channel._evict_settled_ids()
+
+    assert all(f"live-{i}" in channel._processed_ids for i in range(5))
+
+    # Once settled, an id becomes evictable but still deduplicates.
+    channel._settle_message("live-0")
+    assert channel._processed_ids["live-0"] is False
+    assert channel._claim_message("live-0") is False

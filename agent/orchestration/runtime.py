@@ -54,6 +54,11 @@ class RendezvousDirective:
 RuntimeProgressCallback = Callable[[str, dict[str, Any]], None]
 CAPABILITY_PROFILES = frozenset({"read_only", "research", "implementation", "full"})
 
+# The single error text produced by runtime-initiated cancellation.  Telemetry
+# matches this exactly rather than substring-searching for "cancelled", which
+# would also count a child's own error that merely mentions the word.
+CANCELLED_ERROR = "cancelled: another agent triggered early exit"
+
 
 def _emit_progress(
     progress_callback: RuntimeProgressCallback | None,
@@ -200,10 +205,7 @@ def _failed_result(spec: SubtaskSpec, error: str) -> SubtaskResult:
 
 
 def _cancelled_result(spec: SubtaskSpec) -> SubtaskResult:
-    return _failed_result(
-        spec,
-        "cancelled: another agent triggered early exit",
-    )
+    return _failed_result(spec, CANCELLED_ERROR)
 
 
 async def _run_cancellable(
@@ -304,7 +306,7 @@ async def run_parallel_subtasks(
                     if not t.done():
                         t.cancel()
             cancelled_count = sum(
-                1 for r in results if r is not None and "cancelled" in (r.error or "")
+                1 for r in results if r is not None and r.error == CANCELLED_ERROR
             )
             _emit_progress(
                 progress_callback,
@@ -549,6 +551,7 @@ async def run_rendezvous_round(
     rounds = max(1, int(max_rounds))
     all_results: list[SubtaskResult] = []
     lead_summary = ""
+    summary_quality = ""
     lead_structured_context: dict[str, Any] | None = None
     active_specs = list(specs)
     rounds_completed = 0
@@ -619,37 +622,46 @@ async def run_rendezvous_round(
             failed_count=failed_count,
             spec_count=len(specs),
         )
-        if round_index < rounds:
-            directive = summarize(round_results)
-            if inspect.isawaitable(directive):
-                directive = await directive
-            if isinstance(directive, str):
-                directive = RendezvousDirective(summary=directive)
-            lead_summary = directive.summary
-            lead_structured_context = directive.structured_context
-            if directive.continue_with is None:
-                next_specs = list(specs)
-            else:
-                selected_ids = set(directive.continue_with)
-                next_specs = [spec for spec in specs if spec.id in selected_ids]
-            _emit_progress(
-                progress_callback,
-                "phase_note",
-                execution_mode="rendezvous",
-                phase_kind="lead_summary",
-                phase_index=round_index,
-                phase_total=rounds,
-                continue_count=len(next_specs),
-                continue_ids=[spec.id for spec in next_specs],
-                continue_roles=[spec.role for spec in next_specs],
-                stop=directive.stop,
-                spec_count=len(specs),
-            )
-            if directive.stop:
-                break
-            active_specs = next_specs
-            if not active_specs:
-                break
+        # Synthesis runs after EVERY round, including the last one.  The lead
+        # summary is the deliverable of a rendezvous — a convergence protocol
+        # that returned only the raw final-round positions would be an
+        # expensive parallel run.  On non-final rounds it also primes the
+        # next round.
+        directive = summarize(round_results)
+        if inspect.isawaitable(directive):
+            directive = await directive
+        if isinstance(directive, str):
+            directive = RendezvousDirective(summary=directive)
+        lead_summary = directive.summary
+        lead_structured_context = directive.structured_context
+        summary_quality = directive.summary_quality
+        is_final_round = round_index >= rounds or directive.stop
+        if is_final_round:
+            next_specs = []
+        elif directive.continue_with is None:
+            next_specs = list(specs)
+        else:
+            selected_ids = set(directive.continue_with)
+            next_specs = [spec for spec in specs if spec.id in selected_ids]
+        _emit_progress(
+            progress_callback,
+            "phase_note",
+            execution_mode="rendezvous",
+            phase_kind="lead_summary",
+            phase_index=round_index,
+            phase_total=rounds,
+            continue_count=len(next_specs),
+            continue_ids=[spec.id for spec in next_specs],
+            continue_roles=[spec.role for spec in next_specs],
+            stop=directive.stop or is_final_round,
+            final=is_final_round,
+            spec_count=len(specs),
+        )
+        if is_final_round:
+            break
+        active_specs = next_specs
+        if not active_specs:
+            break
 
     if telemetry is not None:
         telemetry.update(
@@ -658,6 +670,11 @@ async def run_rendezvous_round(
                 "spec_count": len(specs),
                 "rounds_completed": rounds_completed,
                 "result_count": len(all_results),
+                # The synthesis is the run's deliverable; publish it so the
+                # caller can forward it to the parent model.
+                "lead_summary": lead_summary,
+                "summary_quality": summary_quality,
+                "lead_structured_context": lead_structured_context,
                 "write_scope_count": write_scope_count,
                 "write_scope_check_seconds": write_scope_check_seconds,
                 "duration_seconds": time.perf_counter() - started_at,

@@ -102,6 +102,9 @@ CHARS_PER_TOKEN = 4
 SLEEP_TOKEN_RATIO = 0.70
 DECAY_FACTOR = 0.95
 RETRIEVAL_TOP_K = 5
+# Share of the usable window automatic retrieval may occupy.  top_k bounds the
+# entry *count*, which says nothing about size; this bounds the actual cost.
+RETRIEVAL_BUDGET_FRACTION = 0.15
 STAGING_DIR = CONTEXT_DIR / "_staging"
 RECENT_SESSION_TURNS = 6
 PALACE_DB_FILE = CONTEXT_DIR / "palace.db"
@@ -247,10 +250,56 @@ def _new_id() -> str:
 
 
 def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
+    """Replace ``path`` with ``content`` as one indivisible, durable step.
+
+    ``rename`` alone buys atomicity — a reader sees the whole old file or the
+    whole new one, never a truncation in progress.  It does not buy durability:
+    without ``fsync`` the rename can be visible while the bytes it points at are
+    still only in the page cache, so a crash yields an empty or short file that
+    every reader accepts as authoritative.  Both syncs are needed, and for
+    different reasons: the file so its contents survive, the parent directory so
+    the *entry* does.
+
+    This is the single durable-write primitive.  Anything persisting state the
+    next process start will read must go through it rather than
+    ``Path.write_text``, which truncates in place and has neither property.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    tmp.write_text(content, encoding=encoding)
-    tmp.replace(path)
+    try:
+        with open(tmp, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+    except BaseException:
+        # Never leave the scratch file behind: these live beside real state and
+        # a stale one is indistinguishable from a partial write to an operator.
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Force a directory entry to disk; best-effort, not all platforms allow it."""
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(path: Path, payload: object, *, indent: int | None = None) -> None:
+    """Durably persist ``payload`` as JSON. Shares one primitive with text."""
+    _atomic_write_text(
+        path, json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=indent)
+    )
 
 
 def _latency_trace_enabled() -> bool:
@@ -420,6 +469,7 @@ __all__ = [
     "CHARS_PER_TOKEN",
     "SLEEP_TOKEN_RATIO",
     "DECAY_FACTOR",
+    "RETRIEVAL_BUDGET_FRACTION",
     "RETRIEVAL_TOP_K",
     "DEFAULT_CONTEXT_WINDOW",
     "STAGING_DIR",

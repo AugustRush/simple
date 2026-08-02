@@ -701,6 +701,13 @@ class CommandCoordinator:
             turn_input.text
         ):
             return turn_input
+        # Phrase approval exists for transports that cannot prompt a human at
+        # the moment of the side effect (chat channels).  Where an interactive
+        # menu is available it must not run in parallel: a bare "yes" is
+        # ambiguous — it may answer some other question the agent asked — and
+        # allowing it would make the weakest consent channel the operative one.
+        if getattr(sink, "interactive_confirmation", False):
+            return turn_input
 
         from agent.security.shell import (
             ShellAuthorizationScope,
