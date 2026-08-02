@@ -5,16 +5,18 @@ from contextlib import suppress
 from pathlib import Path
 import re
 import shutil
+import sys
 import threading
 import time
 from typing import Any, Awaitable, Callable, Optional
 
+from prompt_toolkit import PromptSession
 from prompt_toolkit.application import Application
 from prompt_toolkit.application.current import get_app_or_none
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, DynamicCompleter
 from prompt_toolkit.formatted_text import ANSI, StyleAndTextTuples, to_formatted_text
-from prompt_toolkit.history import FileHistory
+from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout
@@ -23,12 +25,80 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import BeforeInput
 from prompt_toolkit.layout.screen import Point
+from prompt_toolkit.mouse_events import MouseButton
 from prompt_toolkit.mouse_events import MouseEventType
 
 from rich.console import Console
 
 
 _TRAILING_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-9;?]*)?$")
+
+# Terminal sequences Rich emits that prompt_toolkit's ANSI parser cannot
+# interpret: live redraws (progress bars, spinners) use ``\r`` plus erase-line
+# (``CSI K``), cursor show/hide (``CSI ?25 l/h``) would leak as raw digits, and
+# OSC 8 hyperlinks (``OSC 8 ; ... ; ST``) would leak as ``8;;file://...`` text.
+# Erase-line is already dropped by the parser; strip the rest explicitly so the
+# visible path text survives without control-sequence garbage.
+_LIVE_REDRAW_SEQUENCES_RE = re.compile(
+    r"\x1b\[[0-9]*K|\x1b\[\?25[hl]|\x1b\][^\x1b]*\x1b\\"
+)
+
+_PATH_MENU_PROMPT = PromptSession(history=InMemoryHistory())
+
+# Paths shown in output lines: either an explicit ``path=`` value (quoted or
+# bare, absolute or relative) or a bare absolute/``~/`` path in prose.
+_PATH_EXTRACT_RE = re.compile(
+    r"path=(?:'([^']+)'|\"([^\"]+)\"|([^\s'\"，。]+))"
+    r"|((?:/|~/)[^\s'\"，。]+)"
+)
+_PATH_TRAILING_PUNCT = ",.;:!?)]}，。；：！？）】」』"
+
+
+def _paths_from_line(text: str) -> list[tuple[str, Path]]:
+    """Existing local paths mentioned in one output line, in order."""
+    found: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for match in _PATH_EXTRACT_RE.finditer(text):
+        raw = next((group for group in match.groups() if group), "")
+        raw = raw.strip().rstrip(_PATH_TRAILING_PUNCT).strip("\"'")
+        if not raw:
+            continue
+        try:
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path = path.resolve(strict=False)
+        except (OSError, ValueError):
+            continue
+        if not path.exists():
+            continue
+        uri = path.as_uri()
+        if uri in seen:
+            continue
+        seen.add(uri)
+        found.append((raw, path))
+    return found
+
+
+async def _copy_to_clipboard(path: Path) -> bool:
+    """Copy a path string to the system clipboard."""
+    if sys.platform == "darwin":
+        args = ["pbcopy"]
+    elif sys.platform.startswith("win"):
+        args = ["clip"]
+    else:
+        args = ["xclip", "-selection", "clipboard"]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await process.communicate(str(path).encode("utf-8"))
+        return process.returncode == 0
+    except (FileNotFoundError, OSError):
+        return False
 
 
 class _OutputPane:
@@ -99,19 +169,46 @@ class _OutputPane:
             self._pending_escape = tail.group(0)
             chunk = chunk[: tail.start()]
         if chunk:
-            parsed = list(to_formatted_text(ANSI(chunk)))
-            self._fragments.extend(parsed)
-            # Line accounting comes from what the parser actually emitted,
-            # never from the raw input: the cursor must always point at a
-            # real rendered line, even if the parser drops characters from a
-            # malformed escape stream.
-            self._line_count += sum(
-                item[1].count("\n") for item in parsed if len(item) >= 2
-            )
+            # Rich live displays redraw the current line with "\r" plus an
+            # erase-line sequence.  Emulate the terminal instead of appending
+            # every frame: "\r\n" is an ordinary newline, and a segment after a
+            # bare "\r" replaces the current logical line.
+            chunk = chunk.replace("\r\n", "\n")
+            chunk = _LIVE_REDRAW_SEQUENCES_RE.sub("", chunk)
+            for index, segment in enumerate(chunk.split("\r")):
+                if not segment:
+                    continue
+                if index > 0:
+                    self._replace_current_line()
+                parsed = list(to_formatted_text(ANSI(segment)))
+                self._fragments.extend(parsed)
+                # Line accounting comes from what the parser actually emitted,
+                # never from the raw input: the cursor must always point at a
+                # real rendered line, even if the parser drops characters from
+                # a malformed escape stream.
+                self._line_count += sum(
+                    item[1].count("\n") for item in parsed if len(item) >= 2
+                )
         if self._follow_bottom:
             self._scroll_top = self._max_scroll()
         self._notify()
         return len(text)
+
+    def _replace_current_line(self) -> None:
+        """Drop fragments belonging to the unterminated current line.
+
+        Called after a carriage return: the incoming segment redraws the line
+        from column 0, so everything after the last newline is discarded.  The
+        truncated content contains no newline, so ``_line_count`` stays valid.
+        """
+        while self._fragments:
+            frag = self._fragments[-1]
+            if len(frag) >= 2 and "\n" in frag[1]:
+                cut = frag[1].rfind("\n")
+                if cut >= 0:
+                    self._fragments[-1] = (frag[0], frag[1][: cut + 1]) + frag[2:]
+                return
+            self._fragments.pop()
 
     def flush(self) -> None:
         return None
@@ -212,6 +309,35 @@ class _OutputPane:
     def _last_line(self) -> int:
         return self._line_count
 
+    def logical_line_at(self, screen_y: int) -> int:
+        """Logical line index visible at a screen row inside the window."""
+        info = getattr(self._window, "render_info", None)
+        get_height = getattr(info, "get_height_for_line", None)
+        line = max(0, self._scroll_top)
+        remaining = max(0, int(screen_y))
+        while remaining > 0:
+            try:
+                height = (
+                    max(1, int(get_height(line))) if callable(get_height) else 1
+                )
+            except Exception:
+                height = 1
+            if remaining < height:
+                break
+            remaining -= height
+            line += 1
+        return min(line, self._line_count)
+
+    def line_text(self, line_index: int) -> str:
+        """Plain text of one logical output line."""
+        joined = "".join(
+            item[1] for item in self._fragments if len(item) >= 2
+        )
+        lines = joined.split("\n")
+        if 0 <= line_index < len(lines):
+            return lines[line_index]
+        return ""
+
     def _view_height(self) -> int:
         if self._fixed_view_height is not None:
             return max(1, self._fixed_view_height)
@@ -242,8 +368,15 @@ class _OutputPane:
 class _ScrollableOutputWindow(Window):
     """Output window that maps the mouse wheel to conversation scrolling."""
 
-    def __init__(self, pane: _OutputPane, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        pane: _OutputPane,
+        *args: Any,
+        context_menu: Optional[Callable[[int, str, Point], None]] = None,
+        **kwargs: Any,
+    ) -> None:
         self._output_pane = pane
+        self._context_menu = context_menu
         super().__init__(*args, **kwargs)
 
     def _mouse_handler(self, mouse_event: Any):
@@ -253,6 +386,18 @@ class _ScrollableOutputWindow(Window):
         if mouse_event.event_type == MouseEventType.SCROLL_DOWN:
             self._output_pane.scroll_down(lines=3)
             return None
+        if (
+            mouse_event.event_type == MouseEventType.MOUSE_DOWN
+            and mouse_event.button == MouseButton.RIGHT
+            and self._context_menu is not None
+        ):
+            line_index = self._output_pane.logical_line_at(mouse_event.position.y)
+            self._context_menu(
+                line_index,
+                self._output_pane.line_text(line_index),
+                mouse_event.position,
+            )
+            return True
         return super()._mouse_handler(mouse_event)
 
 
@@ -279,6 +424,7 @@ class TuiSession:
         self._busy = busy
         self._input_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self._app_exit_requested = False
+        self._path_menu_open = False
 
         self._pane = _OutputPane(on_write=self._request_redraw)
         width = console_width or max(80, shutil.get_terminal_size().columns)
@@ -314,6 +460,7 @@ class TuiSession:
             wrap_lines=True,
             always_hide_cursor=True,
             get_vertical_scroll=self._pane.vertical_scroll,
+            context_menu=self._handle_output_context_menu,
         )
         self._pane.attach_window(output_window)
         input_window = Window(
@@ -342,6 +489,79 @@ class TuiSession:
                 ),
             ],
         )
+
+    # ── Right-click path menu ──────────────────────────────────────────────
+
+    def _handle_output_context_menu(
+        self, line_index: int, text: str, position: Point
+    ) -> None:
+        paths = _paths_from_line(text)
+        if not paths:
+            self.console.print(
+                "[dim]该行未检测到可打开的本地路径（右键菜单）[/dim]"
+            )
+            return
+        if self._path_menu_open:
+            return
+        app = get_app_or_none()
+        if app is None:
+            return
+        self._path_menu_open = True
+        app.create_background_task(self._run_path_menu(paths))
+
+    async def _run_path_menu(self, paths: list[tuple[str, Path]]) -> None:
+        """Show a right-click menu: open, reveal in Finder, or copy."""
+        from agent.commands.builtin import _launch_path
+        from prompt_toolkit.application.run_in_terminal import in_terminal
+
+        status = ""
+        try:
+            async with in_terminal():
+                selected = paths[0]
+                if len(paths) > 1:
+                    print("检测到多个路径：")
+                    for index, (display, _path) in enumerate(paths, start=1):
+                        print(f"  {index}) {display}")
+                    answer = await _PATH_MENU_PROMPT.prompt_async(
+                        "选择路径（回车=1）› "
+                    )
+                    choice = int(answer.strip() or "1")
+                    if not 1 <= choice <= len(paths):
+                        return
+                    selected = paths[choice - 1]
+
+                display, path = selected
+                print(f"路径：{display}")
+                print(
+                    "  1) 打开\n"
+                    "  2) 在访达中显示\n"
+                    "  3) 复制路径\n"
+                    "  0) 取消"
+                )
+                answer = await _PATH_MENU_PROMPT.prompt_async("选择操作 › ")
+                action = str(answer or "").strip().casefold()
+                if action in ("1", "open", "打开"):
+                    result = await _launch_path(path, reveal=False)
+                    status = result.response_text or ""
+                elif action in ("2", "reveal", "finder", "在访达中显示"):
+                    result = await _launch_path(path, reveal=True)
+                    status = result.response_text or ""
+                elif action in ("3", "copy", "复制"):
+                    copied = await _copy_to_clipboard(path)
+                    status = (
+                        f"已复制到剪贴板：{display}"
+                        if copied
+                        else "复制失败：缺少系统剪贴板命令。"
+                    )
+                else:
+                    return
+        except (KeyboardInterrupt, EOFError, ValueError):
+            return
+        finally:
+            self._path_menu_open = False
+
+        if status:
+            self.console.print(f"[dim]{status}[/dim]")
 
     # ── Key bindings ──────────────────────────────────────────────────────
 

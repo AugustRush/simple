@@ -212,6 +212,56 @@ def test_summarize_tool_result_redacts_error_secrets():
     assert "token=[REDACTED]" in summary
 
 
+def test_summarize_tool_result_keeps_full_path_unclipped():
+    long_path = "/tmp/" + "d" * 200
+    ok, summary = _summarize_tool_result(
+        json.dumps({"ok": True, "path": long_path, "items": 3})
+    )
+
+    assert ok is True
+    assert long_path in summary
+    assert "…" not in summary
+
+
+def test_path_uri_resolves_local_paths():
+    from agent.core.output import _path_uri
+
+    assert _path_uri("/tmp/app.html") == Path("/tmp/app.html").resolve().as_uri()
+    assert _path_uri("README.md") == (Path.cwd() / "README.md").as_uri()
+    assert _path_uri("not a path\x00") is None
+
+
+def test_render_path_links_styles_path_spans_as_links():
+    from agent.core.output import _render_path_links
+
+    rendered = _render_path_links("path=/tmp/app.html · items=3", style="dim")
+
+    assert "/tmp/app.html" in rendered.plain
+    assert any(
+        "link file://" in str(span.style) for span in rendered.spans
+    )
+
+
+def test_cli_output_sink_tool_end_emits_clickable_path_link():
+    from io import StringIO
+
+    from rich.console import Console
+
+    from agent.core.output import CliOutputSink
+
+    console = Console(file=StringIO(), force_terminal=True, color_system="standard")
+    sink = CliOutputSink(console)
+    sink.on_tool_end(
+        "write_file",
+        json.dumps({"ok": True, "path": "/tmp/app.html", "bytes_written": 1200}),
+    )
+
+    out = console.file.getvalue()
+    assert "\x1b]8;" in out  # OSC 8 hyperlink emitted
+    assert Path("/tmp/app.html").resolve().as_uri() in out
+    assert "/tmp/app.html" in out
+
+
 def test_cli_output_sink_begin_and_complete_create_clear_turn_boundary():
     sink, console = _make_sink()
     sink.begin_turn()
@@ -247,6 +297,7 @@ def test_cli_output_sink_live_heartbeat_updates_in_place():
         def __init__(self):
             super().__init__()
             self.statuses = []
+            self.file = SimpleNamespace(isatty=lambda: True)
 
         def status(self, label, spinner="dots"):
             status = _Status(label)
@@ -307,6 +358,50 @@ def test_cli_output_sink_dedupes_duplicate_batch_progress_events():
         line for line in console.lines if "Sub-agents running: 0/3 completed" in line
     ]
     assert len(matching) == 1
+
+
+def test_cli_output_sink_non_live_batch_started_prints_message_without_progress():
+    """A non-live sink must not create a Rich Progress bar.
+
+    Regression: the sub-agent Progress was created unconditionally, so the
+    full-screen TUI console (force_terminal, non-TTY file) received Rich's
+    ``\r``-based live redraws and accumulated them as garbage.
+    """
+    sink, console = _make_sink()
+    sink.on_subagent_event(
+        SubAgentProgressEvent(
+            kind="batch_started",
+            total=5,
+            message="Starting 5 sub-agents via pipeline (limit 3): a, b, c",
+        )
+    )
+
+    assert sink._progress is None
+    assert any("Starting 5 sub-agents" in line for line in console.lines)
+
+
+def test_cli_output_sink_live_batch_uses_progress_bar():
+    from io import StringIO
+
+    from rich.console import Console
+
+    class _TTYStringIO(StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    console = Console(file=_TTYStringIO(), force_terminal=True)
+    sink = CliOutputSink(console)
+    sink.on_subagent_event(
+        SubAgentProgressEvent(
+            kind="batch_started",
+            total=5,
+            message="Starting 5 sub-agents",
+        )
+    )
+
+    assert sink._progress is not None
+    assert sink._progress_task is not None
+    sink._progress.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import secrets
 import stat
+import sys
 from typing import Any, Mapping
 
 from agent import shared
@@ -767,6 +768,71 @@ async def _send_handler(
     )
 
 
+def _resolve_user_path(raw: str) -> Path | None:
+    """Resolve a user-supplied path for /open or /reveal."""
+    value = raw.strip().strip("'\"")
+    if not value or value.startswith("-"):
+        return None
+    try:
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path.resolve(strict=False)
+    except (OSError, ValueError):
+        return None
+
+
+async def _launch_path(path: Path, *, reveal: bool) -> CommandResult:
+    """Open a local path, or reveal it in the system file manager."""
+    if sys.platform == "darwin":
+        args = ["open", "-R", str(path)] if reveal else ["open", str(path)]
+        verb = "在访达中显示" if reveal else "打开"
+    elif sys.platform.startswith("win"):
+        args = (
+            ["explorer", "/select,", str(path)]
+            if reveal
+            else ["cmd", "/c", "start", "", str(path)]
+        )
+        verb = "在资源管理器中显示" if reveal else "打开"
+    else:
+        args = ["xdg-open", str(path.parent if reveal else path)]
+        verb = "在文件管理器中显示" if reveal else "打开"
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return_code = await process.wait()
+    except (FileNotFoundError, OSError):
+        return _error(f"无法{verb}：缺少系统打开命令。")
+    if return_code != 0:
+        return _error(f"无法{verb}：{_markdown_inline(str(path))}")
+    return CommandResult(response_text=f"已{verb}：{_markdown_inline(str(path))}")
+
+
+async def _open_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    target = _resolve_user_path(request.args)
+    if target is None:
+        return _error("用法：/open <文件或目录路径>")
+    if not target.exists():
+        return _error(f"文件或目录不存在：{_markdown_inline(str(target))}")
+    return await _launch_path(target, reveal=False)
+
+
+async def _reveal_handler(
+    request: CommandRequest, context: CommandContext
+) -> CommandResult:
+    target = _resolve_user_path(request.args)
+    if target is None:
+        return _error("用法：/reveal <文件或目录路径>")
+    if not target.exists():
+        return _error(f"文件或目录不存在：{_markdown_inline(str(target))}")
+    return await _launch_path(target, reveal=True)
+
+
 async def _coordinator_owned_handler(
     request: CommandRequest, context: CommandContext
 ) -> CommandResult:
@@ -1460,6 +1526,23 @@ def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]
             usage="/send <path>",
             description="Send a file from the output directory",
             scopes=frozenset({"feishu"}),
+            concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "open",
+            _open_handler,
+            usage="/open <文件或目录路径>",
+            description="Open a file or directory with the default app",
+            scopes=frozenset({"cli"}),
+            concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "reveal",
+            _reveal_handler,
+            aliases=("finder",),
+            usage="/reveal <文件或目录路径>",
+            description="Reveal a file in the system file manager (Finder on macOS)",
+            scopes=frozenset({"cli"}),
             concurrency="anytime",
         ),
         CommandDescriptor(

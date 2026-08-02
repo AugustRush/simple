@@ -239,7 +239,11 @@ def test_cli_prompt_session_persists_history(monkeypatch, tmp_path):
 def _tty_sink():
     from agent.core.output import CliOutputSink
 
-    console = Console(file=StringIO(), force_terminal=True)
+    class _TTYStringIO(StringIO):
+        def isatty(self) -> bool:
+            return True
+
+    console = Console(file=_TTYStringIO(), force_terminal=True)
     return CliOutputSink(console), console
 
 
@@ -856,6 +860,67 @@ def test_tui_output_pane_partial_escape_before_newline_keeps_counts_aligned():
     assert content.cursor_position.y < content.line_count
 
 
+def test_tui_output_pane_collapses_live_redraw_stream():
+    """Rich live displays rewrite the line with \\r; the pane must not
+    accumulate every frame as separate garbage text."""
+    from agent.tui import _OutputPane
+
+    frame = "Starting 5 sub-agents via pipeline (limit 3): a, b, c, d, e"
+    pane = _OutputPane(view_height=4)
+    pane.write("\x1b[?25l" + frame)
+    for _ in range(9):
+        pane.write("\r\x1b[2K" + frame)
+    pane.write("\r\x1b[2K" + frame + "\n\x1b[?25h")
+
+    joined = "".join(text for _style, text in pane.fragments())
+    assert joined == frame + "\n"
+    assert "\r" not in joined
+    assert "25l" not in joined and "25h" not in joined
+    assert joined.count(frame) == 1
+    assert pane.cursor_position().y == 1
+
+
+def test_tui_output_pane_redraw_replaces_current_line():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=4)
+    pane.write("old long line\n")
+    pane.write("prefix\r\x1b[2Knew short")
+    pane.write("\r\x1b[2Kreplaced")
+
+    joined = "".join(text for _style, text in pane.fragments())
+    assert joined == "old long line\nreplaced"
+    assert pane.cursor_position().y == 1
+
+
+def test_tui_output_pane_handles_crlf_as_plain_newline():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=4)
+    pane.write("line one\r\nline two\r\n")
+
+    joined = "".join(text for _style, text in pane.fragments())
+    assert joined == "line one\nline two\n"
+    assert pane.cursor_position().y == 2
+
+
+def test_tui_output_pane_strips_osc8_hyperlinks_keeps_path_text():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=4)
+    pane.write(
+        "\x1b]8;id=1;file:///tmp/app.html\x1b\\"
+        "path=/tmp/app.html"
+        "\x1b]8;;\x1b\\\n"
+    )
+
+    joined = "".join(text for _style, text in pane.fragments())
+    assert joined == "path=/tmp/app.html\n"
+    assert "\x1b" not in joined
+    assert "8;;" not in joined
+    assert pane.cursor_position().y == 1
+
+
 def test_tui_output_pane_tracks_lines_incrementally():
     from agent.tui import _OutputPane
 
@@ -936,6 +1001,124 @@ def test_tui_mouse_wheel_scrolls_output_pane():
         )
     )
     assert pane.cursor_position().y == 4
+
+
+def test_output_pane_logical_line_mapping_and_line_text():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=3)
+    for index in range(6):
+        pane.write(f"line{index}\n")
+
+    pane.scroll_top()
+    assert pane.logical_line_at(0) == 0
+    assert pane.logical_line_at(2) == 2
+    assert pane.line_text(2) == "line2"
+
+    pane.scroll_bottom()
+    assert pane.logical_line_at(0) == 4
+    assert pane.line_text(4) == "line4"
+    assert pane.line_text(99) == ""
+
+
+def test_paths_from_line_extracts_existing_paths(tmp_path):
+    from pathlib import Path
+
+    from agent.tui import _paths_from_line
+
+    real = tmp_path / "real.txt"
+    real.write_text("x", encoding="utf-8")
+
+    paths = _paths_from_line(f"✓ path={real} · items=3")
+    assert [str(path) for _display, path in paths] == [str(real)]
+
+    spaced = tmp_path / "a b.txt"
+    spaced.write_text("x", encoding="utf-8")
+    assert _paths_from_line(f"path='{spaced}'")[0][0] == str(spaced)
+
+    deduped = _paths_from_line(f"see {real} and {real}")
+    assert len(deduped) == 1
+
+    missing = _paths_from_line(f"path={tmp_path / 'nope.txt'}")
+    assert missing == []
+
+
+def test_output_window_right_click_invokes_context_menu():
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.layout.controls import FormattedTextControl
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+
+    from agent.tui import _OutputPane, _ScrollableOutputWindow
+
+    pane = _OutputPane(view_height=4)
+    pane.write("first\nsecond path=/tmp/app.html\nthird")
+    calls: list[tuple[int, str, Point]] = []
+
+    window = _ScrollableOutputWindow(
+        pane,
+        FormattedTextControl(pane.fragments),
+        context_menu=lambda line_index, text, position: calls.append(
+            (line_index, text, position)
+        ),
+    )
+
+    window._mouse_handler(
+        MouseEvent(
+            position=Point(x=4, y=1),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.RIGHT,
+            modifiers=frozenset(),
+        )
+    )
+    assert len(calls) == 1
+    assert calls[0][0] == 1
+    assert "path=/tmp/app.html" in calls[0][1]
+
+    window._mouse_handler(
+        MouseEvent(
+            position=Point(x=4, y=1),
+            event_type=MouseEventType.MOUSE_UP,
+            button=MouseButton.RIGHT,
+            modifiers=frozenset(),
+        )
+    )
+    assert len(calls) == 1  # release must not open the menu a second time
+
+    window._mouse_handler(
+        MouseEvent(
+            position=Point(x=4, y=1),
+            event_type=MouseEventType.MOUSE_DOWN,
+            button=MouseButton.LEFT,
+            modifiers=frozenset(),
+        )
+    )
+    assert len(calls) == 1  # left click must not open the menu
+
+
+def test_copy_to_clipboard_pipes_path(monkeypatch):
+    import sys
+    from pathlib import Path
+
+    from agent.tui import _copy_to_clipboard
+
+    captured: dict = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+        async def communicate(self, data):
+            captured["data"] = data
+
+    async def _fake_exec(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(sys, "platform", "darwin")
+
+    assert asyncio.run(_copy_to_clipboard(Path("/tmp/x.txt"))) is True
+    assert captured["args"][0] == "pbcopy"
+    assert captured["data"] == b"/tmp/x.txt"
 
 
 def test_tui_session_submits_input_through_queue(tmp_path):

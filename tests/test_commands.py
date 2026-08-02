@@ -1025,6 +1025,8 @@ def test_builtin_registration_defines_portable_scope_and_concurrency() -> None:
         "permissions": ("anytime", frozenset({"all"})),
         "quit": ("anytime", frozenset({"cli"})),
         "send": ("anytime", frozenset({"feishu"})),
+        "open": ("anytime", frozenset({"cli"})),
+        "reveal": ("anytime", frozenset({"cli"})),
         "cancel": ("interrupt", frozenset({"all"})),
         "now": ("interrupt", frozenset({"all"})),
         "ralph": ("idle_only", frozenset({"all"})),
@@ -1032,17 +1034,93 @@ def test_builtin_registration_defines_portable_scope_and_concurrency() -> None:
 
     for name, policy in expected.items():
         route = router.classify(
-            f"/{name}", channel_name="feishu" if name == "send" else "cli"
+            f"/{name}",
+            channel_name="feishu" if name == "send" else "cli",
         )
         assert route.kind == "command"
         assert route.descriptor is not None
         assert (route.descriptor.concurrency, route.descriptor.scopes) == policy
+    assert router.classify("/finder", channel_name="cli").descriptor.name == "reveal"
     assert router.classify("/exit", channel_name="cli").descriptor.name == "quit"
     assert router.classify("/q", channel_name="cli").descriptor.name == "quit"
     assert router.classify("/history", channel_name="cli").descriptor.name == "sessions"
     ralph = router.classify("/ralph", channel_name="cli")
     assert ralph.kind == "command"
     assert ralph.descriptor.accepts_interjections is True
+
+
+def test_builtin_open_opens_existing_path_with_default_app(tmp_path, monkeypatch):
+    import sys
+
+    target = tmp_path / "hello.txt"
+    target.write_text("hi", encoding="utf-8")
+    calls: list[tuple] = []
+
+    class _FakeProcess:
+        async def wait(self) -> int:
+            return 0
+
+    async def _fake_exec(*args, **kwargs):
+        calls.append(args)
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    result = _run_builtin(_builtin_router(), f"/open {target}")
+
+    assert result.level == "info"
+    assert str(target) in (result.response_text or "")
+    assert calls
+    if sys.platform == "darwin":
+        assert calls[0][:2] == ("open", str(target))
+    else:
+        assert calls[0][-1] == str(target)
+
+
+def test_builtin_reveal_uses_reveal_flag_or_parent_dir(tmp_path, monkeypatch):
+    import sys
+
+    target = tmp_path / "hello.txt"
+    target.write_text("hi", encoding="utf-8")
+    calls: list[tuple] = []
+
+    class _FakeProcess:
+        async def wait(self) -> int:
+            return 0
+
+    async def _fake_exec(*args, **kwargs):
+        calls.append(args)
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    result = _run_builtin(_builtin_router(), f"/reveal {target}")
+
+    assert result.level == "info"
+    if sys.platform == "darwin":
+        assert "在访达中显示" in (result.response_text or "")
+    assert calls
+    if sys.platform == "darwin":
+        assert calls[0][:3] == ("open", "-R", str(target))
+    else:
+        assert calls[0][-1] == str(target.parent)
+
+
+def test_builtin_finder_alias_routes_to_reveal():
+    router = _builtin_router()
+    route = router.classify("/finder /tmp", channel_name="cli")
+    assert route.kind == "command"
+    assert route.descriptor is not None
+    assert route.descriptor.name == "reveal"
+
+
+def test_builtin_open_rejects_missing_path_and_usage_errors(tmp_path):
+    missing = _run_builtin(_builtin_router(), f"/open {tmp_path / 'nope.txt'}")
+    assert missing.level == "error"
+
+    usage = _run_builtin(_builtin_router(), "/open")
+    assert usage.level == "error"
+
+    dash = _run_builtin(_builtin_router(), "/open -R")
+    assert dash.level == "error"
 
 
 def test_builtin_help_uses_live_descriptors_and_channel_scope() -> None:

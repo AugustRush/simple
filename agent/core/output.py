@@ -280,7 +280,13 @@ def _summarize_tool_result(result: str) -> tuple[bool | None, str]:
     ):
         value = payload.get(key)
         if value is not None and value != "":
-            parts.append(f"{label}={_clip_single_line(value, 72)}")
+            if key == "path":
+                # Keep the whole path: it is the payload of the line, and a
+                # clipped tail would render as a broken clickable link.
+                clean = _redact_sensitive_text(str(value)).replace("\n", "↵")
+                parts.append(f"{label}={clean}")
+            else:
+                parts.append(f"{label}={_clip_single_line(value, 72)}")
     if parts:
         return True, " · ".join(parts)
 
@@ -288,6 +294,54 @@ def _summarize_tool_result(result: str) -> tuple[bool | None, str]:
     if output:
         return True, _clip_single_line(output)
     return True, "Completed"
+
+
+_SUMMARY_PATH_RE = re.compile(
+    r"path=(?:'(?P<sq>[^']*)'|\"(?P<dq>[^\"]*)\"|(?P<bare>[^ ·\n]+))"
+)
+
+
+def _path_uri(value: str) -> str | None:
+    """Best-effort ``file://`` URI for a displayed local path.
+
+    Returns None when the value cannot be treated as a filesystem path, in
+    which case the caller should render it as plain text.
+    """
+    candidate = str(value).strip().rstrip("…")
+    if not candidate:
+        return None
+    try:
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return path.resolve(strict=False).as_uri()
+    except (OSError, ValueError):
+        return None
+
+
+def _render_path_links(text: str, *, style: str = "") -> Text:
+    """Render summary text, turning ``path=...`` spans into clickable links.
+
+    Rich emits OSC 8 hyperlinks for ``link`` styles, so terminals that support
+    them (iTerm2, VS Code, Warp, WezTerm, kitty) open the file on click.  The
+    TUI pane strips the OSC sequences and keeps the underlined path text.
+    """
+    out = Text(style=style)
+    position = 0
+    for match in _SUMMARY_PATH_RE.finditer(text):
+        out.append(text[position : match.start()])
+        value = match.group("sq") or match.group("dq") or match.group("bare")
+        uri = _path_uri(value)
+        if uri is None:
+            out.append(match.group(0))
+        else:
+            out.append(
+                match.group(0),
+                style=f"{style} underline link {uri}",
+            )
+        position = match.end()
+    out.append(text[position:])
+    return out
 
 
 class OutputSink(ABC):
@@ -450,9 +504,22 @@ class CliOutputSink(OutputSink):
         self._set_activity("Preparing response…")
 
     def _supports_live_status(self) -> bool:
+        # ``is_terminal`` alone is not enough: the full-screen TUI console is
+        # force-marked as a terminal so Rich emits ANSI, but its backing file is
+        # the output pane, not a TTY.  A live render there (Rich Progress /
+        # Status) writes ``\r``-based redraws that the pane accumulates as
+        # garbage instead of updating a line, so live status requires a real
+        # TTY file behind the console.
+        console_file = getattr(self._console, "file", None)
+        file_isatty = bool(
+            console_file is not None
+            and callable(getattr(console_file, "isatty", None))
+            and console_file.isatty()
+        )
         return bool(
             self._live_status
             and getattr(self._console, "is_terminal", False)
+            and file_isatty
             and callable(getattr(self._console, "status", None))
         )
 
@@ -557,12 +624,18 @@ class CliOutputSink(OutputSink):
         if start is not None:
             elapsed = f" [dim]({time.monotonic() - start:.1f}s)[/dim]"
         ok, summary = _summarize_tool_result(result)
-        indicator = (
-            "[green]✓[/green]"
-            if ok is True
-            else "[red]✗[/red]" if ok is False else "[dim]·[/dim]"
-        )
-        self._console.print(f"{indicator} [dim]{_markup_escape(summary)}[/dim]{elapsed}")
+        line = Text()
+        if ok is True:
+            line.append("✓", style="green")
+        elif ok is False:
+            line.append("✗", style="red")
+        else:
+            line.append("·", style="dim")
+        line.append(" ")
+        line.append_text(_render_path_links(summary, style="dim"))
+        if elapsed:
+            line.append_text(Text.from_markup(elapsed))
+        self._console.print(line)
         self._set_activity("Processing results…")
 
     @_deferred_during_consent
@@ -763,7 +836,7 @@ class CliOutputSink(OutputSink):
         if event.kind == "batch_started":
             self._stop_activity()
             self._last_batch_progress_key = None
-            if event.total > 1:
+            if event.total > 1 and self._supports_live_status():
                 self._progress = Progress(
                     TextColumn("[progress.description]{task.description}"),
                     BarColumn(),
