@@ -382,8 +382,10 @@ def test_build_components_passes_output_dir_to_mcp_env(monkeypatch, tmp_path):
     assert client.extra_env["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
 
 
-def test_mcp_client_defaults_server_cwd_to_output_dir(monkeypatch, tmp_path):
-    """MCP stdio servers default to AGENT_OUTPUT_DIR instead of the project cwd."""
+def test_mcp_client_defaults_cwd_and_redirects_stderr_to_output_dir(
+    monkeypatch, tmp_path
+):
+    """MCP process cwd and diagnostics stay inside AGENT_OUTPUT_DIR."""
     import asyncio
 
     from agent.tools import runtime as runtime_module
@@ -394,11 +396,14 @@ def test_mcp_client_defaults_server_cwd_to_output_dir(monkeypatch, tmp_path):
     class _AsyncContext:
         def __init__(self, value):
             self.value = value
+            self.entered_by = None
 
         async def __aenter__(self):
+            self.entered_by = asyncio.current_task()
             return self.value
 
         async def __aexit__(self, exc_type, exc, tb):
+            assert asyncio.current_task() is self.entered_by
             return False
 
     class _FakeSession:
@@ -408,8 +413,11 @@ def test_mcp_client_defaults_server_cwd_to_output_dir(monkeypatch, tmp_path):
         async def list_tools(self):
             return type("ToolsResult", (), {"tools": []})()
 
-    def fake_stdio_client(params):
+    def fake_stdio_client(params, *, errlog):
         captured["params"] = params
+        captured["errlog"] = errlog
+        errlog.write("server diagnostic\n")
+        errlog.flush()
         return _AsyncContext(("read", "write"))
 
     monkeypatch.setattr(runtime_module.mcp, "stdio_client", fake_stdio_client)
@@ -420,14 +428,23 @@ def test_mcp_client_defaults_server_cwd_to_output_dir(monkeypatch, tmp_path):
     )
 
     client = runtime_module.MCPClient(runtime_module.ToolRegistry())
-    asyncio.run(
-        client.connect_from_config(
+
+    async def scenario():
+        await client.connect_from_config(
             {"mcp_servers": [{"name": "demo", "command": "fake"}]},
             extra_env={"AGENT_OUTPUT_DIR": str(output_dir)},
         )
-    )
+        await client.close()
+
+    asyncio.run(scenario())
 
     assert captured["params"].cwd == str(output_dir)
+    assert captured["errlog"].name == str(
+        output_dir / "mcp-logs" / "demo.stderr.log"
+    )
+    assert (
+        output_dir / "mcp-logs" / "demo.stderr.log"
+    ).read_text(encoding="utf-8") == "server diagnostic\n"
 
 
 def test_build_components_bootstraps_assistant_identity_fact(monkeypatch, tmp_path):

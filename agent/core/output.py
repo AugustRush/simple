@@ -12,7 +12,7 @@ import time
 from abc import ABC
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 from rich.markdown import Markdown
 from rich.markup import escape as _markup_escape
@@ -470,15 +470,21 @@ class CliOutputSink(OutputSink):
         *,
         live_status: bool = True,
         can_prompt: bool | None = None,
+        confirmation_prompt: Callable[[], Awaitable[str]] | None = None,
     ) -> None:
         self._console = console
         self._live_status = live_status
         # Whether a human can be prompted for consent.  This is NOT the same
         # capability as rendering a live spinner: the full-screen TUI cannot
-        # host a spinner but prompts fine (via prompt_toolkit's in_terminal).
+        # host a spinner but prompts through its own input queue.
         # Deriving consent from the spinner flag silently disables the approval
         # menu on the default interactive path.
         self._can_prompt = live_status if can_prompt is None else bool(can_prompt)
+        # Full-screen TUI mode already owns a prompt_toolkit Application.  It
+        # supplies its input queue here so consent does not start a nested
+        # PromptSession, leave the alternate screen, and repeatedly redraw the
+        # approval line.
+        self._confirmation_prompt = confirmation_prompt
         self._streamed: list[str] = []
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._tool_count = 0
@@ -533,7 +539,7 @@ class CliOutputSink(OutputSink):
         return bool(
             self._can_prompt
             and getattr(self._console, "is_terminal", False)
-            and sys.stdin.isatty()
+            and (self._confirmation_prompt is not None or sys.stdin.isatty())
         )
 
     @property
@@ -688,18 +694,30 @@ class CliOutputSink(OutputSink):
                 "[dim]输入 1/2 后按 Enter（也可输入 y/n 或 同意/拒绝）；Ctrl+C 取消[/dim]"
             )
 
-            async def _prompt() -> str:
-                return await _APPROVAL_PROMPT.prompt_async(
-                    "请选择 1/2 › ",
-                    validator=_APPROVAL_VALIDATOR,
-                )
-
             try:
-                if get_app_or_none() is not None:
-                    async with in_terminal():
-                        answer = await _prompt()
+                if self._confirmation_prompt is not None:
+                    while True:
+                        answer = await self._confirmation_prompt()
+                        normalized = str(answer or "").strip().casefold()
+                        if normalized in (
+                            _APPROVAL_ACCEPT_ANSWERS | _APPROVAL_DECLINE_ANSWERS
+                        ):
+                            break
+                        self._console.print(
+                            "[yellow]请输入 1（批准执行）或 2（拒绝）[/yellow]"
+                        )
                 else:
-                    answer = await _prompt()
+                    async def _prompt() -> str:
+                        return await _APPROVAL_PROMPT.prompt_async(
+                            "请选择 1/2 › ",
+                            validator=_APPROVAL_VALIDATOR,
+                        )
+
+                    if get_app_or_none() is not None:
+                        async with in_terminal():
+                            answer = await _prompt()
+                    else:
+                        answer = await _prompt()
             except (KeyboardInterrupt, EOFError):
                 return False
             return _approval_choice_accepted(answer)

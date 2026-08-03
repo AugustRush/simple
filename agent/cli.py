@@ -25,6 +25,7 @@ from prompt_toolkit.filters.app import has_completions
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
 
 import agent as agent_module
 from agent import shared
@@ -129,6 +130,16 @@ async def _ask_user_input() -> str:
         completer=_cli_command_completer(),
         complete_while_typing=True,
     )
+
+
+async def _ask_tui_confirmation_input() -> str:
+    """Read consent from the active TUI without queuing a new user turn."""
+    if _ACTIVE_TUI is None:
+        return await _ask_user_input()
+    answer = await _ACTIVE_TUI.ask_async(during_turn=True)
+    if answer is None:
+        raise EOFError
+    return answer
 
 
 # ── Interactive command selection menu ────────────────────────────────
@@ -728,14 +739,29 @@ async def _interactive_loop_coro(
     if tui is not None:
         shared.CONSOLE = console
     try:
-        await _interactive_loop_body(
-            components,
-            cfg,
-            console,
-            live_status=tui is None,
-            echo_input=tui is not None,
-            tui_active=tui is not None,
-        )
+        if tui is None:
+            # Background work (notably MCP connection completion) can print
+            # while prompt_async owns the input line.  prompt_toolkit's proxy
+            # renders such output above the prompt and restores the user's
+            # partially typed text instead of letting both share one row.
+            with patch_stdout(raw=True):
+                await _interactive_loop_body(
+                    components,
+                    cfg,
+                    console,
+                    live_status=True,
+                    echo_input=False,
+                    tui_active=False,
+                )
+        else:
+            await _interactive_loop_body(
+                components,
+                cfg,
+                console,
+                live_status=False,
+                echo_input=True,
+                tui_active=True,
+            )
     finally:
         shared.CONSOLE = original_console
 
@@ -895,6 +921,9 @@ async def _interactive_loop_body(
                 console,
                 live_status=live_status,
                 can_prompt=True,
+                confirmation_prompt=(
+                    _ask_tui_confirmation_input if tui_active else None
+                ),
             )
             try:
                 ctx.metadata["skill_catalog"] = skill_catalog

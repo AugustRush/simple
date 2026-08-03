@@ -37,6 +37,28 @@ def make_ctx_manager(tmp_path, idle_seconds=300, min_messages=4):
     )
 
 
+def test_memory_clear_suppresses_current_turn_re_persistence(tmp_path):
+    from agent import BaseAgent
+
+    manager = make_ctx_manager(tmp_path)
+    manager.mark_activity()
+    manager.staging.append("user", "clear memory")
+    manager.on_memory_cleared()
+
+    BaseAgent._post_turn_maintenance(
+        ctx_mgr=manager,
+        agent=object(),
+        ctx=object(),
+        user_content="clear memory",
+        assistant_content="memory cleared",
+    )
+
+    assert manager.staging.count() == 0
+    assert manager.store.recent_conversation_turns(session_id="test-session") == []
+    assert manager.should_session_end_sleep() is False
+    assert manager.consume_memory_clear_suppression() is False
+
+
 # ── Durable conversation history tests ───────────────────────────────────────
 
 

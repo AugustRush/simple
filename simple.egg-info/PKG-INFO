@@ -371,6 +371,10 @@ Key config sections:
 | `tavily_api_key` | Optional Tavily search API key |
 | `output_dir` | Override default `~/.agent/output` |
 | `file_access` | Startup-only workspace read/write policy plus resource limits for file tools (see [File access](#file-access)) |
+| `permissions.shell_level` | Default shell permission level: `ask`, `medium`, `high`, or `full` (see [Shell permissions](#shell-permissions)) |
+| `permissions.shell_sandbox` | OS sandbox mode: `restricted`, `read_all` (default), or `none` (danger-full-access, `full` level only) |
+| `permissions.shell_devices` | Device/service access (Metal/IOKit) inside the sandbox; **default `true`** (set `false` for the strictest posture) |
+| `shell_allowed_commands` | Persistent shell allowlist that skips confirmation (see [Shell permissions](#shell-permissions)) |
 | `assistant_identity` | Deterministic assistant name/role for fact recall |
 | `system_prompt_file` | Load custom system prompt from `.md` or `.txt` |
 
@@ -412,6 +416,133 @@ edit_file(root="workspace", path="agent/config.py",
           expected_revision="sha256:...",
           replacements=[{old_text, new_text, expected_count}])
 ```
+
+### Shell permissions
+
+Medium-risk shell commands (`rm`, `mv`, `ssh`, `curl`, interpreters, script
+files, absolute paths) run automatically. Only **high-risk** constructs —
+destructive commands/options (`mkfs`, `dd`, `shutdown`, `find -delete`),
+shell operators (`;`, `|`, `&&`, redirection), and pipe-to-shell patterns —
+ask the human, and they become runnable after approval.
+
+The permission level and the OS sandbox are linked: the level decides what
+asks for confirmation, and the sandbox decides what the command may touch.
+
+Permission levels (most → least restrictive):
+
+| Level | Low/medium risk | High-risk commands/options | Operators/patterns |
+|---|---|---|---|
+| `ask` (default) | auto | confirm | confirm |
+| `medium` | auto | auto | confirm |
+| `high` / `full` | auto | auto | auto |
+
+Shell sandbox modes:
+
+| Mode | Reads | Writes | Notes |
+|---|---|---|---|
+| `restricted` | System dirs + workspace/output only | Open by default; user data + workspace denied | Reads are the locked-down axis |
+| `read_all` (default) | **Whole machine** | Open by default; user data + workspace denied | Local tooling just works; documents/credentials stay write-protected |
+| `none` | Everything | Everything | Danger-full-access: no OS sandbox, GPU/Metal reachable. **Only valid with `shell_level: full`** |
+
+Writes are **open by default** — the sandbox protects user data, not tool
+behavior.  There is no per-tool allowlist (npm caches, HuggingFace downloads,
+Chrome/Electron state, MCP servers and temp dirs all just work).  The only
+write denials are protected user-data surfaces: documents/media
+(`~/Documents`, `~/Desktop`, `~/Downloads`, `~/Movies`, `~/Music`,
+`~/Pictures`), keychains and personal library data, credentials
+(`~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.git-credentials`,
+`~/.netrc`, `~/.gitconfig`), the workspace unless a `write_scope` explicitly
+reopens it, and the agent's internal bookkeeping.  GUI/rendering workloads
+(headless Chrome, Electron screenshots) receive the generic system
+facilities App Store GUI apps get from `application.sb` (process-local mach
+bootstrap, app-sandbox file extensions, preference reads).
+
+The shell tool takes a `root` parameter (`output_dir` by default, or
+`workspace`) and resolves relative `cwd` values inside that root.  Generated
+and downloaded files therefore land in the configured output directory, not
+the repository.  When a call is scoped to `output_dir` and still creates new
+files inside the workspace (for example via absolute paths), the tool moves
+them to `output_dir/workspace-artifacts/` — this invariant holds even when
+the OS sandbox is disabled.
+
+One limitation is architectural: seatbelt cannot nest — a tool that installs
+its own OS sandbox (headless Chrome, Electron) must disable it
+(`--no-sandbox` / `ELECTRON_DISABLE_SANDBOX=1`) or run unsandboxed
+(`shell_sandbox: none` with `shell_level: full`).
+
+Device/service access (Metal/IOKit — GPU, local ML) is open by default inside
+the sandbox, the same posture the profile already takes for network.  The
+seatbelt profile opens the Metal/IOKit services (the same mechanism App
+Store sandboxes use) while reads stay open and writes stay scoped:
+
+```json
+{
+  "permissions": { "shell_level": "ask", "shell_sandbox": "read_all", "shell_devices": true }
+}
+```
+
+With this configuration the TTS skill's local generation works end-to-end
+inside the sandbox (verified on macOS), and high-risk commands still ask for
+confirmation.  Set `shell_devices: false` if you want to deny device access
+while keeping file reads/writes as configured.
+
+Runtime commands:
+
+| Command | Effect |
+|---|---|
+| `/permissions` | Show the effective level/sandbox, config default, and any session override |
+| `/permissions <level>` | Persist the config default and apply it immediately (survives restart; sub-agents inherit) |
+| `/permissions session <level>` | Override the level for this session only |
+| `/permissions sandbox <mode>` | Persist the default sandbox mode and apply it immediately (`none` requires `full`) |
+| `/permissions sandbox session <mode>` | Override the sandbox mode for this session only |
+| `/permissions default <level\|sandbox <mode>>` | Explicit alias for the persistent form |
+| `/permissions reset [level\|sandbox]` | Restore the built-in defaults (`ask` / `read_all`) and clear session overrides |
+| `/auto-approve on\|off\|status` | Persist the `medium` / `ask` shortcut |
+| `/auto-approve session on\|off` | Apply the shortcut to this session only |
+| `/allow <command>` | Persistently allow one command (exact string) or command name (all invocations) |
+| `/deny <command>` | Remove an entry from the persistent allowlist |
+| `/confirm <token>` | Approve one pending confirmation explicitly |
+
+Approval UX: in an interactive terminal a numbered menu appears
+(`1) 批准执行` / `2) 拒绝`, also accepts `y`/`n`/`同意`/`拒绝`); in gateway
+channels (e.g. Feishu) the agent shows the exact command and the user replies
+"同意" (or uses `/confirm <token>`).
+
+Config example:
+
+```json
+{
+  "permissions": { "shell_level": "ask", "shell_sandbox": "read_all" },
+  "shell_allowed_commands": ["mkfs /dev/disk0", "osascript"]
+}
+```
+
+An entry containing a space matches that exact command; a bare name (like
+`osascript`) allows every invocation of that command. The allowlist and the
+config default apply to sub-agents spawned later; a `session`-scoped
+`/permissions` override applies only to that session and is lost on restart.
+Permission changes made through slash commands persist and take effect
+immediately; editing `config.json` by hand takes effect at the next startup.
+
+For true machine-wide execution (local GPU/MLX workloads, arbitrary home
+directory access), set `"shell_level": "full"` **and**
+`"shell_sandbox": "none"`:
+
+```json
+{
+  "permissions": { "shell_level": "full", "shell_sandbox": "none" }
+}
+```
+
+This disables `sandbox-exec` entirely for shell commands — the agent can then
+read and write anything on the machine, exactly like your own terminal.
+`none` is refused unless the level is `full`, and the `shell_blocked_commands`
+blacklist plus structural guards (cwd escapes, command substitution, parse
+failures) still apply.
+
+Unconditional guards that no level can bypass: the `shell_blocked_commands`
+blacklist, cwd escapes (`cd`/`pushd` inside a command), command substitution
+(`` ` ``/`$()`), and commands that cannot be parsed safely.
 
 ## Usage
 
@@ -518,6 +649,30 @@ uv run simple memory tidy                # AI-assisted memory reorganization
 Commands are handled by a shared runtime coordinator and work across all
 channels unless marked otherwise.
 
+In the interactive CLI, typing a `/`-command opens a live command palette
+right in the input line: a bare `/` shows every command, and each extra
+character narrows the list (e.g. `/p` → `/permissions`, `/plugins`),
+updating on every keystroke. Use `↑`/`↓` to move, Enter to run the
+highlighted command, `Tab` to complete, and Esc to dismiss. Typing `/` and
+pressing Enter (instead of a longer command) opens the full browse menu;
+commands with fixed options (e.g. `/permissions`, `/auto-approve`) show a
+second menu for the argument there.
+
+In a real terminal the interactive CLI runs in a full-screen layout: the
+conversation, tool traces and markdown stream in the upper pane, while the
+input line stays docked at the bottom of the terminal and never scrolls
+away. Your submitted input is echoed into the pane in the same `›` style as
+the classic prompt, so the conversation reads exactly as before. The
+slash-command palette and permission menus all work from that bottom line;
+the output pane scrolls through the whole conversation with `↑`/`↓` (when
+the input is empty), `PgUp`/`PgDn` or the mouse wheel, and `Home`/`End` jump
+to the top or newest message. While a turn is running, typing still works:
+Enter queues the message (shown as `⏎ 已排队…` in the pane) and it is sent
+when the turn finishes, and `Ctrl+C` cancels the running turn. Rendering is
+incremental, so long conversations do not slow the input down. `Ctrl+D`
+exits. When stdin/stdout are not a terminal (pipes, scripts, tests), the CLI
+falls back to the classic line-by-line prompt automatically.
+
 ### Shared (all channels)
 
 | Command | Description |
@@ -531,6 +686,11 @@ channels unless marked otherwise.
 | `/skills` | List available skills |
 | `/plugins` | List loaded plugins |
 | `/model [name]` | Show or switch the session model |
+| `/permissions [level\|default <level>]` | Show or set the shell permission level |
+| `/auto-approve on\|off\|status` | Session shortcut for high-risk auto-approval |
+| `/allow <command>` | Add a command to the persistent shell allowlist |
+| `/deny <command>` | Remove a command from the persistent shell allowlist |
+| `/confirm <token>` | Approve one pending restricted shell command |
 | `/export` | Export the current session to Markdown |
 | `/ralph <goal> [--max N] [--verify "cmd"]` | Start a Ralph task |
 | `/ralph list` | List all Ralph tasks |
@@ -543,6 +703,8 @@ channels unless marked otherwise.
 
 | Command | Description |
 |---|---|
+| `/` | Open the interactive command selection menu |
+| `Tab` | Complete the `/`-command currently being typed |
 | `/quit` (`/exit`, `/q`) | Exit the CLI |
 | `Ctrl+C` | Interrupt a blocking operation (force cancel) |
 
@@ -758,6 +920,17 @@ Place plugins under `~/.agent/plugins/`. User plugins with the same name overrid
 ```json
 {"plugins": {"evolution": {"enabled": false}}}
 ```
+
+`install_plugin` clones a git URL or copies a local path into
+`~/.agent/plugins/<name>/`, then hot-reloads the catalog. Reinstalling an
+existing name requires `replace: true` (upgrade); a failed clone, validation
+or reload rolls back automatically and restores the previous version. Plugins
+with executable content (Python `__init__.py`, MCP servers, hooks) are treated
+as arbitrary code: the CLI shows an approval menu before activation, and in
+gateway channels the agent asks the user to reply "同意" (a pending record is
+created and redeemed by the coordinator), after which the identical source
+must be retried. Declarative-only plugins (skills/commands without Python,
+MCP or hooks) install without confirmation.
 
 ## Runtime Architecture
 

@@ -423,6 +423,7 @@ class TuiSession:
         self._cancel_callback = cancel_callback
         self._busy = busy
         self._input_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+        self._accepting_during_busy = 0
         self._app_exit_requested = False
         self._path_menu_open = False
 
@@ -670,15 +671,22 @@ class TuiSession:
             with suppress(asyncio.CancelledError):
                 await app_task
 
-    async def ask_async(self) -> Optional[str]:
+    async def ask_async(self, *, during_turn: bool = False) -> Optional[str]:
         """Return the next submitted input line (None when exiting)."""
-        return await self._input_queue.get()
+        if during_turn:
+            self._accepting_during_busy += 1
+        try:
+            return await self._input_queue.get()
+        finally:
+            if during_turn:
+                self._accepting_during_busy -= 1
 
     def _submit(self, text: Optional[str]) -> None:
         if (
             text
             and self._busy is not None
             and self._busy()
+            and not self._accepting_during_busy
         ):
             # The loop only reads input between turns; make queued input
             # visible so Enter during a running turn does not look dead.

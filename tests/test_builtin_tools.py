@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,6 +93,47 @@ def test_registry_rejects_cross_source_replace():
             replace=True,
             source="user_tool:demo",
         )
+
+
+def test_memory_clear_uses_human_confirmation_and_storage_api(tmp_path):
+    from agent.core.agent import AgentContext, _active_agent_context
+    from agent.core.output import _active_sink
+
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    tools.memory.write("identity", "user", "Prefers concise responses")
+
+    class ApprovingSink:
+        interactive_confirmation = True
+
+        def __init__(self):
+            self.calls = []
+
+        async def on_tool_confirmation(self, name, **kwargs):
+            self.calls.append((name, kwargs))
+            return True
+
+    sink = ApprovingSink()
+    cleared = []
+    context_manager = SimpleNamespace(
+        on_memory_cleared=lambda: cleared.append(True)
+    )
+    context_token = _active_agent_context.set(
+        AgentContext(metadata={"context_manager": context_manager})
+    )
+    sink_token = _active_sink.set(sink)
+    try:
+        result = json.loads(asyncio.run(registry.call("memory_clear", {})))
+    finally:
+        _active_sink.reset(sink_token)
+        _active_agent_context.reset(context_token)
+
+    assert result["ok"] is True
+    assert result["deleted_by_store"]["memory_items"] == 1
+    assert tools.memory.store.all_entries() == []
+    assert sink.calls[0][0] == "memory_clear"
+    assert "不可恢复" in sink.calls[0][1]["reason"]
+    assert cleared == [True]
+    assert registry.tool_capabilities("memory_clear") == frozenset({"state_write"})
 
 
 def test_file_tool_schemas_are_rooted_and_closed(tmp_path):

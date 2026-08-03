@@ -971,6 +971,8 @@ MCP (Model Context Protocol) servers are configured via:
 2. Plugin-bundled `mcp_servers` in `plugin.json`
 
 Connected tools are injected into the runtime registry and appear in the composed system prompt.
+MCP server stderr is written to `<output_dir>/mcp-logs/<server>.stderr.log` so
+server diagnostics cannot overwrite the interactive CLI input line.
 
 ## Project Layout
 

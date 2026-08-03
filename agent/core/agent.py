@@ -3068,6 +3068,11 @@ class BaseAgent:
         prevents the two call sites from diverging.
         """
         if ctx_mgr:
+            consume_suppression = getattr(
+                ctx_mgr, "consume_memory_clear_suppression", None
+            )
+            if callable(consume_suppression) and consume_suppression():
+                return
             if record_kwargs is None:
                 record_kwargs = {}
             record_turn_result = getattr(ctx_mgr, "record_turn_result", None)

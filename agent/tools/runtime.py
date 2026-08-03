@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shlex
 import signal
+import subprocess
 import time
 import traceback
 import urllib.request
@@ -191,6 +192,7 @@ class ToolRegistry:
         ("builtin", "transcribe_audio"): frozenset({"read"}),
         ("builtin", "send_file"): frozenset({"side_effect"}),
         ("builtin", "memory_write"): frozenset({"state_write"}),
+        ("builtin", "memory_clear"): frozenset({"state_write"}),
         ("builtin", "schedule_create"): frozenset({"state_write"}),
         ("builtin", "schedule_delete"): frozenset({"state_write"}),
         ("runtime:skill", "activate_skill"): frozenset({"read"}),
@@ -382,7 +384,11 @@ class MCPClient:
     def __init__(self, registry: ToolRegistry):
         self.registry = registry
         self._sessions = []
-        self._stack = AsyncExitStack()
+        # AnyIO cancel scopes must be exited by the task that entered them.
+        # Each stdio server therefore owns its context managers in a dedicated
+        # task which remains alive until ``close()`` signals shutdown.
+        self._server_tasks: list[asyncio.Task[None]] = []
+        self._shutdown = asyncio.Event()
         self._configured_servers = 0
         self._connected_servers = 0
         self._failed_servers = 0
@@ -410,9 +416,33 @@ class MCPClient:
                 )
 
     async def _connect_server(self, cfg: dict):
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[None] = loop.create_future()
+        task = asyncio.create_task(
+            self._run_server(cfg, ready),
+            name=f"mcp-server-{self._safe_name(str(cfg.get('name') or 'mcp'))}",
+        )
+        self._server_tasks.append(task)
+        try:
+            await ready
+        except asyncio.CancelledError:
+            # If startup itself is cancelled, do not leave an unowned stdio
+            # process behind.  The owner task performs its own context unwind.
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+
+    async def _run_server(
+        self,
+        cfg: dict,
+        ready: asyncio.Future[None],
+    ) -> None:
+        """Own one MCP server's complete enter/wait/exit lifecycle."""
         command = str(cfg.get("command", "")).strip()
         if not command:
-            raise ValueError("MCP server config requires 'command'")
+            if not ready.done():
+                ready.set_exception(ValueError("MCP server config requires 'command'"))
+            return
 
         server_name = self._safe_name(
             str(cfg.get("name") or Path(command).name or "mcp")
@@ -429,18 +459,57 @@ class MCPClient:
             env=merged_env or None,
             cwd=str(cwd) if cwd else None,
         )
-        read_stream, write_stream = await self._stack.enter_async_context(
-            mcp.stdio_client(params)
-        )
-        session = await self._stack.enter_async_context(
-            mcp.ClientSession(read_stream, write_stream)
-        )
-        await session.initialize()
-        self._sessions.append({"name": server_name, "session": session})
+        try:
+            async with AsyncExitStack() as stack:
+                # The MCP SDK otherwise binds the child process' stderr
+                # directly to the real terminal.  Keep diagnostics, but route
+                # them away from prompt_toolkit's live input line.
+                errlog = self._open_server_errlog(stack, server_name)
+                read_stream, write_stream = await stack.enter_async_context(
+                    mcp.stdio_client(params, errlog=errlog)
+                )
+                session = await stack.enter_async_context(
+                    mcp.ClientSession(read_stream, write_stream)
+                )
+                await session.initialize()
+                self._sessions.append({"name": server_name, "session": session})
 
-        tools_result = await session.list_tools()
-        for tool in getattr(tools_result, "tools", []):
-            self._register_tool(server_name, session, tool)
+                tools_result = await session.list_tools()
+                for tool in getattr(tools_result, "tools", []):
+                    self._register_tool(server_name, session, tool)
+                if not ready.done():
+                    ready.set_result(None)
+                await self._shutdown.wait()
+        except asyncio.CancelledError:
+            if not ready.done():
+                ready.cancel()
+            raise
+        except Exception as exc:
+            if not ready.done():
+                ready.set_exception(exc)
+            else:
+                shared.CONSOLE.print(
+                    f"[yellow]MCP server stopped ({server_name}): {exc}[/yellow]"
+                )
+
+    def _open_server_errlog(self, stack: AsyncExitStack, server_name: str):
+        """Return a process-compatible stderr target owned by this client."""
+        output_dir = str(self._extra_env.get("AGENT_OUTPUT_DIR", "") or "").strip()
+        if not output_dir:
+            return subprocess.DEVNULL
+        try:
+            log_dir = Path(output_dir) / "mcp-logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return stack.enter_context(
+                (log_dir / f"{server_name}.stderr.log").open(
+                    "a", encoding="utf-8"
+                )
+            )
+        except OSError:
+            # A logging failure must not prevent an otherwise healthy MCP
+            # server from connecting, and falling back to the terminal would
+            # reintroduce the input-line corruption this guard prevents.
+            return subprocess.DEVNULL
 
     def _register_tool(self, server_name: str, session: Any, tool: Any) -> None:
         original_name = str(getattr(tool, "name", "")).strip()
@@ -492,7 +561,10 @@ class MCPClient:
         }
 
     async def close(self) -> None:
-        await self._stack.aclose()
+        self._shutdown.set()
+        if self._server_tasks:
+            await asyncio.gather(*self._server_tasks, return_exceptions=True)
+            self._server_tasks.clear()
 
 
 class _UserToolRegistryFacade:

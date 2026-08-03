@@ -549,6 +549,20 @@ class BuiltinTools:
         )
 
         r.register(
+            "memory_clear",
+            (
+                "Permanently clear all durable long-term memory, retrievable "
+                "conversation history, facts, working-state snapshots, and pending "
+                "memory consolidation. Use when the user asks to clear/erase/forget "
+                "all memory. This tool asks the human for interactive approval itself; "
+                "do not use shell/SQLite and do not ask for a separate chat confirmation."
+            ),
+            {"type": "object", "properties": {}, "required": []},
+            self._memory_clear,
+            source="builtin",
+        )
+
+        r.register(
             "context_retrieve",
             (
                 "Search long-term context memory for relevant information. "
@@ -2248,6 +2262,50 @@ class BuiltinTools:
 
     def _memory_index(self) -> dict[str, Any]:
         return self._ok(content=self.memory.read_index())
+
+    async def _memory_clear(self) -> dict[str, Any]:
+        """Clear memory only after consent from the active human sink."""
+        from agent.core.output import _APPROVAL_LOCK
+
+        sink = _active_sink.get()
+        if sink is None or not getattr(sink, "interactive_confirmation", False):
+            return self._error(
+                "Clearing memory requires interactive human approval.",
+                requires_confirmation=True,
+            )
+        async with _APPROVAL_LOCK:
+            approved = await sink.on_tool_confirmation(
+                "memory_clear",
+                command=(
+                    "永久清空全部长期记忆、可检索对话历史、事实索引、"
+                    "工作状态和待整理记忆"
+                ),
+                risk_level="high",
+                reason="该操作不可恢复",
+                confirmation_token="",
+                scope=None,
+            )
+        if not approved:
+            return self._error("Memory clear was declined by the user.")
+
+        context_manager = None
+        with contextlib.suppress(Exception):
+            from agent.core.agent import _active_agent_context
+
+            active_ctx = _active_agent_context.get()
+            context_manager = (
+                active_ctx.metadata.get("context_manager")
+                if active_ctx is not None
+                else None
+            )
+        if context_manager is not None:
+            context_manager.on_memory_cleared()
+        deleted = self.memory.clear()
+        return self._ok(
+            action="clear",
+            deleted=sum(deleted.values()),
+            deleted_by_store=deleted,
+        )
 
     def _context_retrieve(self, query: str, top_k: int = 5) -> dict[str, Any]:
         context_manager = self.context_manager

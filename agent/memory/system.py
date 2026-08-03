@@ -224,6 +224,14 @@ class MemoryPalace:
         path = self.export_jsonl()
         return path.read_text(encoding="utf-8") if path.exists() else ""
 
+    def clear(self) -> dict[str, int]:
+        """Clear durable, model-retrievable memory through the storage API."""
+        deleted = self.store.clear_persistent_memory()
+        self._export_dirty = True
+        self.export_jsonl()
+        self._files_since_tidy = 0
+        return deleted
+
     def export_jsonl(self, path: Optional[Path] = None) -> Path:
         path = path or self._export_path
         if path == self._export_path and path.exists() and not self._export_dirty:
@@ -806,6 +814,36 @@ class LTMStore:
                 pass
         self._thread_connections = {}
         self._local = threading.local()
+
+    def clear_persistent_memory(self) -> dict[str, int]:
+        """Atomically delete all model-retrievable memory state."""
+        tables = (
+            "memory_items_fts",
+            "memory_items",
+            "fact_assertions",
+            "resolved_facts",
+            "conversation_turns",
+            "session_working_state",
+            "agent_events",
+            "staging_turns",
+        )
+        deleted: dict[str, int] = {}
+        with self._connect() as conn:
+            existing = {
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            for table in tables:
+                if table not in existing:
+                    deleted[table] = 0
+                    continue
+                row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+                deleted[table] = int(row["count"] if row else 0)
+                conn.execute(f"DELETE FROM {table}")
+        self._meta = {"categories": [], "total_entries": 0}
+        return deleted
 
     def _ensure_schema(self) -> None:
         with self._connect() as conn:
@@ -2973,7 +3011,23 @@ class ContextManager:
         self._lock = threading.RLock()
         self._jobs: deque[dict[str, Any]] = deque()
         self._processing_job = False
+        self._suppress_next_turn_persistence = False
         self.last_working_state_recovery_trace: dict[str, Any] = {}
+
+    def on_memory_cleared(self) -> None:
+        """Drop queued extraction work and keep the clearing turn forgotten."""
+        with self._lock:
+            self._jobs.clear()
+            self._needs_consolidation = False
+            self._last_activity = 0.0
+            self._suppress_next_turn_persistence = True
+        self.staging.clear_all()
+
+    def consume_memory_clear_suppression(self) -> bool:
+        with self._lock:
+            suppress = self._suppress_next_turn_persistence
+            self._suppress_next_turn_persistence = False
+            return suppress
 
     @staticmethod
     def _coerce_consolidation_result(result: Any) -> ConsolidationResult:

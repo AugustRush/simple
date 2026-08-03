@@ -69,6 +69,36 @@ def test_memory_palace_exports_user_jsonl(tmp_path):
     assert '"content": "Prefers concise responses"' in lines[0]
 
 
+def test_memory_palace_clear_removes_durable_memory_and_pending_staging(tmp_path):
+    from agent import LTMStore, MemoryPalace, StagingBuffer
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir, memory_dir=tmp_path / "memory")
+    palace = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=context_dir,
+        store=store,
+    )
+    staging = StagingBuffer(context_dir=context_dir, session_id="cli")
+    store.add_entry(make_entry())
+    store.write_conversation_exchange(
+        session_id="cli",
+        user_content="Remember this",
+        assistant_content="Stored",
+    )
+    staging.append("user", "pending memory")
+
+    deleted = palace.clear()
+
+    assert deleted["memory_items"] == 1
+    assert deleted["conversation_turns"] == 2
+    assert deleted["staging_turns"] == 1
+    assert store.all_entries() == []
+    assert store.recent_conversation_turns(session_id="cli") == []
+    assert staging.count() == 0
+    assert palace.read_index() == ""
+
+
 def test_memory_palace_does_not_create_chapter_dirs(tmp_path):
     from agent import MemoryPalace
 

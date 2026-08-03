@@ -1173,6 +1173,28 @@ def test_tui_submit_echoes_queued_input_when_busy(tmp_path):
     assert "已排队" not in idle_text
 
 
+def test_tui_does_not_mark_confirmation_input_as_queued(tmp_path):
+    from agent.tui import TuiSession
+
+    tui = TuiSession(
+        history_path=tmp_path / "confirmation_history",
+        completer_factory=lambda: None,
+        cancel_callback=lambda: None,
+        busy=lambda: True,
+        console_width=80,
+    )
+
+    async def scenario():
+        pending = asyncio.create_task(tui.ask_async(during_turn=True))
+        await asyncio.sleep(0)
+        tui._submit("1")
+        assert await pending == "1"
+
+    asyncio.run(scenario())
+    rendered = "".join(text for _style, text in tui._pane.fragments())
+    assert "已排队" not in rendered
+
+
 def test_tui_request_exit_queues_none_and_is_idempotent(tmp_path):
     import asyncio
 
@@ -1212,6 +1234,34 @@ def test_ask_user_input_uses_active_tui(monkeypatch):
     monkeypatch.setattr(cli, "_ACTIVE_TUI", FakeTui(None))
     with pytest.raises(EOFError):
         asyncio.run(cli._ask_user_input())
+
+
+def test_line_mode_wraps_background_output_with_prompt_toolkit_proxy(monkeypatch):
+    """Async MCP status output must render above, not inside, the input line."""
+    import agent.cli as cli
+
+    events: list[str] = []
+
+    class _PatchStdout:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, exc_type, exc, tb):
+            events.append("exit")
+
+    async def fake_body(*args, **kwargs):
+        events.append("body")
+
+    monkeypatch.setattr(
+        cli,
+        "patch_stdout",
+        lambda *, raw: _PatchStdout() if raw else None,
+    )
+    monkeypatch.setattr(cli, "_interactive_loop_body", fake_body)
+
+    asyncio.run(cli._interactive_loop_coro({}, {}, None))
+
+    assert events == ["enter", "body", "exit"]
 
 
 def test_sink_disables_live_status_but_keeps_stream_markdown():
@@ -1260,6 +1310,49 @@ def test_tui_sink_can_prompt_for_consent_without_a_live_spinner(monkeypatch):
     tui_sink = CliOutputSink(_ConsentConsole(), live_status=False, can_prompt=True)
     assert tui_sink.interactive_confirmation is True
     assert tui_sink._supports_live_status() is False
+
+
+def test_tui_consent_reuses_existing_input_queue(monkeypatch):
+    """A full-screen TUI must not start a nested prompt_toolkit session."""
+    from agent.core import output as output_module
+    from agent.core.output import CliOutputSink
+
+    answers = iter(["invalid", "1"])
+    received: list[str] = []
+
+    async def tui_ask():
+        answer = next(answers)
+        received.append(answer)
+        return answer
+
+    async def nested_prompt_must_not_run(*args, **kwargs):
+        raise AssertionError("nested PromptSession must not run in TUI mode")
+
+    monkeypatch.setattr(
+        output_module._APPROVAL_PROMPT,
+        "prompt_async",
+        nested_prompt_must_not_run,
+    )
+    sink = CliOutputSink(
+        _ConsentConsole(),
+        live_status=False,
+        can_prompt=True,
+        confirmation_prompt=tui_ask,
+    )
+
+    approved = asyncio.run(
+        sink.on_tool_confirmation(
+            "shell",
+            command="sqlite3 palace.db 'DELETE FROM memory_items'",
+            risk_level="high",
+            reason="destructive memory reset",
+            confirmation_token="token",
+            scope=None,
+        )
+    )
+
+    assert approved is True
+    assert received == ["invalid", "1"]
 
 
 def test_line_mode_sink_still_prompts(monkeypatch):

@@ -9,12 +9,14 @@ agent/evolution.py
 agent/lexical.py
 agent/pathing.py
 agent/shared.py
+agent/tui.py
 agent/_builtin/plugins/evolution/__init__.py
 agent/_builtin/plugins/evolution/detector.py
 agent/_builtin/plugins/evolution/plugin.json
 agent/_builtin/plugins/evolution/rules.py
 agent/_builtin/skills/README.md
 agent/_builtin/skills/daily-summary/SKILL.md
+agent/_builtin/skills/multi-agent-orchestration/SKILL.md
 agent/_builtin/skills/remote-agent/SKILL.md
 agent/_builtin/skills/skill-manager/SKILL.md
 agent/_builtin/skills/skill-manager/scripts/init_skill.py
@@ -57,6 +59,7 @@ agent/security/__init__.py
 agent/security/content_filter.py
 agent/security/filesystem_sandbox.py
 agent/security/network.py
+agent/security/plugin_approval.py
 agent/security/shell.py
 agent/skills/__init__.py
 agent/skills/catalog.py
@@ -78,6 +81,7 @@ tests/test_attachments.py
 tests/test_background_memory.py
 tests/test_builtin_tools.py
 tests/test_channel_layer.py
+tests/test_cli_ui.py
 tests/test_commands.py
 tests/test_consolidation.py
 tests/test_content_filter.py
@@ -92,6 +96,7 @@ tests/test_ltm_store.py
 tests/test_memory_benchmark.py
 tests/test_memory_palace_store.py
 tests/test_network_security.py
+tests/test_orchestration.py
 tests/test_output_dir.py
 tests/test_plugin_catalog.py
 tests/test_ralph.py
