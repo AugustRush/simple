@@ -296,6 +296,10 @@ class EvolutionPlugin:
                 level="error",
                 error=generation_result,
             )
+        if isinstance(generation_result, str) and generation_result.startswith(
+            "Tool generated for review"
+        ):
+            return CommandResult(response_text=generation_result)
         user_tool_catalog = components.get("user_tool_catalog")
         if user_tool_catalog is not None and components.get("user_tools_enabled", False):
             user_tool_catalog.load_into_registry(components["registry"])

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
@@ -10,6 +11,7 @@ from .store import SchedulerStore
 
 
 UTC = timezone.utc
+logger = logging.getLogger(__name__)
 
 
 class SchedulerService:
@@ -34,14 +36,59 @@ class SchedulerService:
             raise ValueError("lease_seconds must be at least 3")
         self.max_concurrent_runs = max(1, int(max_concurrent_runs))
 
+    async def _store_call(self, method_name: str, *args, **kwargs):
+        """Run SQLite work off-loop using a connection owned by that thread."""
+        if type(self.store) is not SchedulerStore:
+            operation = asyncio.create_task(
+                asyncio.to_thread(getattr(self.store, method_name), *args, **kwargs)
+            )
+        else:
+            def invoke():
+                thread_store = SchedulerStore(db_path=self.store.db_path)
+                try:
+                    return getattr(thread_store, method_name)(*args, **kwargs)
+                finally:
+                    thread_store.close()
+
+            operation = asyncio.create_task(asyncio.to_thread(invoke))
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled. Wait for it so a claim/complete
+            # cannot commit after the scheduler has reported itself stopped.
+            with contextlib.suppress(Exception):
+                await operation
+            raise
+
     async def run_once(self, now: Optional[datetime] = None) -> int:
         current = (now or datetime.now(UTC)).astimezone(UTC)
-        self.store.disable_duplicate_enabled_tasks(current)
-        claimed = self.store.claim_due_tasks(
-            now=current,
-            limit=10,
-            lease_seconds=self.lease_seconds,
+        await self._store_call("disable_duplicate_enabled_tasks", current)
+        claim_operation = asyncio.create_task(
+            self._store_call(
+                "claim_due_tasks",
+                now=current,
+                limit=10,
+                lease_seconds=self.lease_seconds,
+            )
         )
+        try:
+            claimed = await asyncio.shield(claim_operation)
+        except asyncio.CancelledError as cancelled:
+            claimed = await self._await_store_completion(claim_operation)
+            cleanup = asyncio.gather(
+                *(
+                    self._store_call(
+                        "release_claim",
+                        item.task.id,
+                        item.run.id,
+                        now=datetime.now(UTC),
+                        reason="scheduler stopped after claiming task",
+                    )
+                    for item in claimed
+                )
+            )
+            await self._await_store_completion(cleanup)
+            raise cancelled
         if claimed:
             sem = asyncio.Semaphore(self.max_concurrent_runs)
 
@@ -52,9 +99,22 @@ class SchedulerService:
             await asyncio.gather(*[_run_item(item) for item in claimed])
         return len(claimed)
 
+    @staticmethod
+    async def _await_store_completion(operation: asyncio.Future):
+        while True:
+            try:
+                return await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                continue
+
     async def run_forever(self) -> None:
         while True:
-            await self.run_once()
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Scheduler iteration failed; retrying after poll interval")
             await asyncio.sleep(self.poll_seconds)
 
     async def _renew_lease(self, task, run, lost_ownership: asyncio.Event, now) -> None:
@@ -62,7 +122,8 @@ class SchedulerService:
         while True:
             await asyncio.sleep(interval)
             try:
-                renewed = self.store.renew_lease(
+                renewed = await self._store_call(
+                    "renew_lease",
                     task.id,
                     run.id,
                     now=now(),
@@ -93,8 +154,9 @@ class SchedulerService:
             with contextlib.suppress(asyncio.CancelledError):
                 await ownership_waiter
 
-    def _complete_interrupted(self, task, run, now, reason: str) -> None:
-        self.store.complete_run(
+    async def _complete_interrupted(self, task, run, now, reason: str) -> None:
+        await self._store_call(
+            "complete_run",
             task.id,
             run.id,
             finished_at=now(),
@@ -102,9 +164,11 @@ class SchedulerService:
             error=reason,
         )
 
-    def _owns_unexpired_lease(self, task, run, now) -> bool:
+    async def _owns_unexpired_lease(self, task, run, now) -> bool:
         try:
-            return self.store.owns_unexpired_lease(task.id, run.id, now=now())
+            return await self._store_call(
+                "owns_unexpired_lease", task.id, run.id, now=now()
+            )
         except Exception:
             return False
 
@@ -138,10 +202,10 @@ class SchedulerService:
                 raise ValueError(f"Unsupported task kind: {task.kind}")
 
             result = await self._await_while_owned(execution, lost_ownership)
-            if lost_ownership.is_set() or not self._owns_unexpired_lease(
+            if lost_ownership.is_set() or not await self._owns_unexpired_lease(
                 task, run, run_now
             ):
-                self._complete_interrupted(
+                await self._complete_interrupted(
                     task, run, run_now, "scheduler lease ownership lost before delivery"
                 )
                 return
@@ -149,10 +213,10 @@ class SchedulerService:
             delivery_result = await self._await_while_owned(
                 self._deliver(task, run, result), lost_ownership
             )
-            if lost_ownership.is_set() or not self._owns_unexpired_lease(
+            if lost_ownership.is_set() or not await self._owns_unexpired_lease(
                 task, run, run_now
             ):
-                self._complete_interrupted(
+                await self._complete_interrupted(
                     task, run, run_now, "scheduler lease ownership lost during delivery"
                 )
                 return
@@ -174,7 +238,8 @@ class SchedulerService:
             status = "succeeded" if successful_delivery else "failed"
             if not successful_delivery and not delivery_error:
                 delivery_error = f"unexpected delivery status: {delivery_status or 'empty'}"
-            self.store.complete_run(
+            await self._store_call(
+                "complete_run",
                 task.id,
                 run.id,
                 finished_at=run_now(),
@@ -191,7 +256,8 @@ class SchedulerService:
                 or "scheduler lease ownership lost" in str(exc)
                 else "failed"
             )
-            self.store.complete_run(
+            await self._store_call(
+                "complete_run",
                 task.id,
                 run.id,
                 finished_at=run_now(),

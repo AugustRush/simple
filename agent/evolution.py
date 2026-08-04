@@ -369,11 +369,13 @@ class EvolutionEngine:
 
         # Save new version
         existing = list(shared.PROMPTS_DIR.glob("system_v*.md"))
-        new_version_num = len(existing) + 1
+        versions = [
+            int(match.group(1))
+            for path in existing
+            if (match := re.fullmatch(r"system_v(\d+)\.md", path.name))
+        ]
+        new_version_num = max(versions, default=0) + 1
         new_path = shared.PROMPTS_DIR / f"system_v{new_version_num}.md"
-        # Durable primitive.  Note this name can still collide: the version is
-        # derived from the file *count*, so with v1 and v3 present the next write
-        # is v3 again.  That is a naming defect, not a write defect.
         shared._atomic_write_text(
             new_path, f"<!-- version: v{new_version_num} -->\n{new_prompt}"
         )
@@ -384,7 +386,7 @@ class EvolutionEngine:
         return new_prompt
 
     async def generate_tool(self, description: str, registry: ToolRegistry) -> str:
-        """Generate a new tool plugin with syntax validation before saving."""
+        """Generate a tool candidate that cannot be imported before review."""
         prompt = (
             f"Generate a Python tool plugin for: {description}\n\n"
             "Requirements:\n"
@@ -429,15 +431,19 @@ class EvolutionEngine:
                 f"Tool generation failed: syntax error at line {e.lineno}: {e.msg}"
             )
 
-        # Generate safe filename
+        # Generated Python is untrusted even when it parses. Keep it outside the
+        # catalog's ``*.py`` discovery pattern until a human reviews and renames it.
         safe_name = re.sub(r"[^a-z0-9_]", "_", description.lower()[:30])
-        tool_path = shared.TOOLS_DIR / f"auto_{safe_name}.py"
+        tool_path = shared.TOOLS_DIR / f"auto_{safe_name}.py.pending"
         # Durable primitive: two descriptions can sanitize to the same name, so
         # this overwrites an existing generated tool rather than always creating.
         shared._atomic_write_text(tool_path, code)
 
-        shared.CONSOLE.print(f"[green]Tool saved to {tool_path}[/green]")
-        return f"Tool generated and saved to {tool_path}"
+        shared.CONSOLE.print(f"[green]Tool candidate saved for review: {tool_path}[/green]")
+        return (
+            f"Tool generated for review at {tool_path}. "
+            "Review it, then rename the file to end in .py to activate it."
+        )
 
     def apply_best_prompt(self) -> str:
         """Load the best prompt from history."""

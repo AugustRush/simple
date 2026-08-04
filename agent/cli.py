@@ -32,6 +32,7 @@ from agent import shared
 from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
+from agent.runtime.lock import AgentHomeBusyError, acquire_agent_home_lock
 from agent.shared import CancelToken
 from agent.tui import TuiSession
 
@@ -1003,33 +1004,54 @@ async def _interactive_loop_body(
                 )
             except Exception as exc:
                 shared.CONSOLE.print(f"[dim]Plugin session_end error: {exc}[/dim]")
+        if ctx_mgr is not None:
+            close_staging = getattr(ctx_mgr.staging, "close", None)
+            if callable(close_staging):
+                close_staging()
 
     shared.CONSOLE.print("\n[dim]Session closed.[/dim]")
+
+
+def _acquire_home_lock_or_exit(mode: str):
+    """Enforce one live owner per agent home before touching any of its state.
+
+    Acquired before ``load_config`` so first-run setup — which writes
+    ``config.json`` — is covered too.
+    """
+    try:
+        return acquire_agent_home_lock(mode)
+    except AgentHomeBusyError as exc:
+        shared.CONSOLE.print(f"[red]{markup_escape(str(exc))}[/red]")
+        raise typer.Exit(1)
 
 
 @app.callback(invoke_without_command=True)
 def main_callback(ctx: typer.Context):
     """Enter interactive chat when no subcommand is given."""
     if ctx.invoked_subcommand is None:
-        cfg, first_run = agent_module.load_config()
-        if first_run:
-            if not agent_module._first_run_setup():
-                raise typer.Exit(0)
-            # Reload after potential edits
-            cfg, _ = agent_module.load_config()
+        home_lock = _acquire_home_lock_or_exit("cli")
+        try:
+            cfg, first_run = agent_module.load_config()
+            if first_run:
+                if not agent_module._first_run_setup():
+                    raise typer.Exit(0)
+                # Reload after potential edits
+                cfg, _ = agent_module.load_config()
 
-        async def _run():
-            try:
-                components = await _build_quiet_cli_components(cfg)
-            except RuntimeError as exc:
-                shared.CONSOLE.print(f"[red]Error: {exc}[/red]")
-                raise typer.Exit(1)
-            try:
-                await _interactive_loop(components, cfg)
-            finally:
-                await agent_module._close_components(components)
+            async def _run():
+                try:
+                    components = await _build_quiet_cli_components(cfg)
+                except RuntimeError as exc:
+                    shared.CONSOLE.print(f"[red]Error: {exc}[/red]")
+                    raise typer.Exit(1)
+                try:
+                    await _interactive_loop(components, cfg)
+                finally:
+                    await agent_module._close_components(components)
 
-        asyncio.run(_run())
+            asyncio.run(_run())
+        finally:
+            home_lock.release()
 
 
 @app.command()
@@ -1051,6 +1073,8 @@ def gateway(
     """
     if isinstance(name, str):
         shared._set_agent_home(Path.home() / f".agent-{name}")
+    # After _set_agent_home so --name instances lock their own home.
+    home_lock = _acquire_home_lock_or_exit("gateway")
     cfg, first_run = agent_module.load_config()
     _configure_runtime_logging()
     if first_run:
@@ -1103,7 +1127,10 @@ def gateway(
                 await agent_module._close_components(scheduler_components)
             await agent_module._close_components(components)
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    finally:
+        home_lock.release()
 
 
 @app.command()

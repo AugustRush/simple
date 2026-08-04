@@ -92,7 +92,7 @@ _ASSISTANT_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f UTC")
 
 
 def _new_id() -> str:
@@ -326,6 +326,9 @@ class StagingBuffer:
         self.context_dir = context_dir
         self._sqlite_backed = path is None
         self.path = path or (context_dir / "_staging" / f"{self.session_id}.jsonl")
+        self._connection_lock = threading.Lock()
+        self._thread_connections: dict[int, sqlite3.Connection] = {}
+        self._closed = False
         if self._sqlite_backed:
             self.context_dir.mkdir(parents=True, exist_ok=True)
             self._db_path = self.context_dir / "palace.db"
@@ -340,11 +343,33 @@ class StagingBuffer:
 
     def _connect(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA journal_mode=WAL")
-            self._local.conn = conn
+            with self._connection_lock:
+                if self._closed:
+                    raise RuntimeError("staging buffer is closed")
+                conn = sqlite3.connect(self._db_path, check_same_thread=False)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode=WAL")
+                self._local.conn = conn
+                tid = threading.get_ident()
+                old = self._thread_connections.get(tid)
+                if old is not None and old is not conn:
+                    with contextlib.suppress(Exception):
+                        old.close()
+                self._thread_connections[tid] = conn
         return self._local.conn
+
+    def close(self) -> None:
+        """Close every SQLite connection opened by this staging buffer."""
+        if not self._sqlite_backed:
+            return
+        with self._connection_lock:
+            self._closed = True
+            connections = list(self._thread_connections.values())
+            self._thread_connections.clear()
+            self._local = threading.local()
+        for conn in connections:
+            with contextlib.suppress(Exception):
+                conn.close()
 
     def _ensure_sqlite_schema(self) -> None:
         with self._connect() as conn:
@@ -2002,8 +2027,12 @@ class LTMStore:
                     normalized.updated_at,
                 ),
             )
-
-        self.resolve_fact(normalized.subject, normalized.predicate, normalized.scope)
+            self.resolve_fact(
+                normalized.subject,
+                normalized.predicate,
+                normalized.scope,
+                _conn=conn,
+            )
         return normalized
 
     def read_fact_assertions(
@@ -2034,13 +2063,18 @@ class LTMStore:
         subject: str,
         predicate: str,
         scope: str = "global",
+        *,
+        _conn: Optional[sqlite3.Connection] = None,
     ) -> Optional[ResolvedFact]:
         normalized_subject = _normalize_fact_part(subject)
         normalized_predicate = _normalize_fact_part(predicate)
         normalized_scope = _normalize_fact_part(scope, "global")
         key = _fact_key(normalized_subject, normalized_predicate, normalized_scope)
 
-        with self._connect() as conn:
+        connection_context = (
+            contextlib.nullcontext(_conn) if _conn is not None else self._connect()
+        )
+        with connection_context as conn:
             rows = conn.execute(
                 """
                 SELECT *
@@ -4683,6 +4717,8 @@ class ContextManager:
                 self._processing_job = False
             return False
 
+        staging_buffer: Optional[StagingBuffer] = None
+        is_primary_staging = True
         try:
             staging_buffer, is_primary_staging = self._job_staging(job)
             reason = str(job.get("reason", "?"))
@@ -4753,6 +4789,8 @@ class ContextManager:
             _emit_consolidation("failed", reason="exception", error=str(exc))
             raise
         finally:
+            if staging_buffer is not None and not is_primary_staging:
+                staging_buffer.close()
             with self._lock:
                 self._processing_job = False
 
@@ -4861,6 +4899,8 @@ class BackgroundMemoryWorker:
 
     def _run(self) -> None:
         client = self.client_factory() if self.client_factory else self.client
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
             while not self._stop_event.is_set():
                 # Consume the wake signal before deciding whether to run, so a
@@ -4878,7 +4918,7 @@ class BackgroundMemoryWorker:
                         )
                         if not should_run:
                             break
-                        processed = asyncio.run(self._process_job(client))
+                        processed = loop.run_until_complete(self._process_job(client))
                         if not processed:
                             break
                         if not on_demand:
@@ -4898,6 +4938,12 @@ class BackgroundMemoryWorker:
             aclose = getattr(client, "aclose", None)
             if self.client_factory and callable(aclose):
                 try:
-                    asyncio.run(aclose())
+                    loop.run_until_complete(aclose())
                 except Exception:
                     pass
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()

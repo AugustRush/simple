@@ -775,5 +775,9 @@ async def _close_components(components: dict) -> None:
     if mcp_client is not None:
         await mcp_client.close()
     ctx_mgr = components.get("context_manager")
-    if ctx_mgr is not None and hasattr(ctx_mgr, "store"):
-        ctx_mgr.store.close()
+    if ctx_mgr is not None:
+        staging = getattr(ctx_mgr, "staging", None)
+        if staging is not None and hasattr(staging, "close"):
+            staging.close()
+        if hasattr(ctx_mgr, "store"):
+            ctx_mgr.store.close()

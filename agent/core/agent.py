@@ -92,7 +92,9 @@ async def _execute_regular_tool_calls(
         for (idx, tu) in regular_calls:
             try:
                 results[idx] = await executor.run(tu)
-            except BaseException as exc:
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
                 results[idx] = json.dumps(
                     {"ok": False, "error": f"tool '{tu['name']}' raised: {exc}"}
                 )
@@ -102,10 +104,14 @@ async def _execute_regular_tool_calls(
         return_exceptions=True,
     )
     for (idx, _tu), outcome in zip(regular_calls, raw):
-        if isinstance(outcome, BaseException):
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+        if isinstance(outcome, Exception):
             results[idx] = json.dumps(
                 {"ok": False, "error": f"tool '{_tu['name']}' raised: {outcome}"}
             )
+        elif isinstance(outcome, BaseException):
+            raise outcome
         else:
             results[idx] = outcome
     return results

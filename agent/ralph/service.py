@@ -255,8 +255,14 @@ class RalphService:
                 )
             return result
         finally:
-            if result is not None and result.durability_error is None:
-                self._stage_memory(result.task, summaries, session_state)
+            if (
+                result is not None
+                and result.durability_error is None
+                and summaries
+            ):
+                await asyncio.to_thread(
+                    self._stage_memory, result.task, summaries, session_state
+                )
 
     def _persist_terminal(
         self,
@@ -265,12 +271,13 @@ class RalphService:
         status: RalphTaskStatus,
         message: str,
     ) -> RalphRunResult:
-        task.status = status
-        task.last_error = message if status in (
+        candidate = _clone_task(task)
+        candidate.status = status
+        candidate.last_error = message if status in (
             RalphTaskStatus.INTERRUPTED,
             RalphTaskStatus.FAILED,
         ) else None
-        return self._save_or_error(task, durable_task) or RalphRunResult(_clone_task(task))
+        return self._save_or_error(candidate, durable_task) or RalphRunResult(candidate)
 
     def _save_or_error(
         self, task: RalphTask, durable_task: RalphTask
@@ -337,21 +344,15 @@ async def _persist_terminal_after_cancellation(
     task: RalphTask,
     durable_task: RalphTask,
 ) -> RalphRunResult:
-    persistence = asyncio.create_task(
-        asyncio.to_thread(
-            service._persist_terminal,
-            task,
-            durable_task,
-            RalphTaskStatus.INTERRUPTED,
-            "Ralph run was cancelled",
-        )
+    # The task file is small and saved atomically. Persist synchronously at this
+    # exceptional boundary so cancellation cannot abandon an unkillable worker
+    # thread whose late os.replace() could overwrite a resumed task.
+    return service._persist_terminal(
+        task,
+        durable_task,
+        RalphTaskStatus.INTERRUPTED,
+        "Ralph run was cancelled",
     )
-    while not persistence.done():
-        try:
-            return await asyncio.shield(persistence)
-        except asyncio.CancelledError:
-            continue
-    return persistence.result()
 
 
 def _default_context_factory() -> Any:

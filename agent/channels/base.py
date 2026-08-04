@@ -190,13 +190,14 @@ class ChannelRunner:
         try:
             await asyncio.gather(*tasks)
         finally:
-            for t in tasks:
-                t.cancel()
             for ch in self._channels:
                 try:
                     await ch.stop()
                 except Exception:
                     pass
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -286,6 +287,11 @@ class ChannelRunner:
                     agent_module.CONSOLE.print(
                         f"[dim]Plugin session_end error: {exc}[/dim]"
                     )
+            for session in sessions.values():
+                staging = getattr(session.context_manager, "staging", None)
+                close = getattr(staging, "close", None)
+                if callable(close):
+                    close()
 
     def _make_message_handler(
         self, sessions: dict[str, RuntimeSessionState]

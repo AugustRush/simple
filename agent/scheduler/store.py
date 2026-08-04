@@ -50,6 +50,7 @@ class SchedulerStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
 
     def close(self) -> None:
@@ -479,6 +480,50 @@ class SchedulerStore:
                 ),
             )
         return cursor.rowcount == 1
+
+    def release_claim(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        now: datetime,
+        reason: str,
+    ) -> bool:
+        """Release an unexecuted claim without consuming its scheduled occurrence."""
+        now = now.astimezone(UTC)
+        with self._immediate_transaction():
+            row = self._conn.execute(
+                """
+                SELECT r.scheduled_for
+                FROM scheduled_tasks t
+                JOIN scheduled_task_runs r
+                  ON r.id = t.active_run_id AND r.task_id = t.id
+                WHERE t.id = ? AND t.active_run_id = ? AND r.status = 'running'
+                """,
+                (task_id, run_id),
+            ).fetchone()
+            if row is None:
+                return False
+            task_cursor = self._conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET next_run_at = ?, lease_until = NULL, active_run_id = NULL,
+                    updated_at = ?
+                WHERE id = ? AND active_run_id = ?
+                """,
+                (row["scheduled_for"], _iso(now), task_id, run_id),
+            )
+            if task_cursor.rowcount != 1:
+                return False
+            self._conn.execute(
+                """
+                UPDATE scheduled_task_runs
+                SET status = 'interrupted', error = ?, finished_at = ?, updated_at = ?
+                WHERE id = ? AND task_id = ? AND status = 'running'
+                """,
+                (reason, _iso(now), _iso(now), run_id, task_id),
+            )
+        return True
 
     def owns_unexpired_lease(
         self, task_id: str, run_id: str, *, now: datetime

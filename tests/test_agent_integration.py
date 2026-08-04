@@ -8877,6 +8877,21 @@ def test_execute_regular_tool_calls_keeps_parallelism_without_shell():
     assert all(json.loads(result) == {"ok": True} for result in results)
 
 
+def test_execute_regular_tool_calls_propagates_cancellation():
+    from agent.core.agent import _execute_regular_tool_calls
+
+    class FakeExecutor:
+        async def run(self, tool_use):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            _execute_regular_tool_calls(
+                [(0, {"name": "shell"})], FakeExecutor()
+            )
+        )
+
+
 def test_provider_usage_calibrates_the_token_estimator(tmp_path):
     """The estimator must learn from the provider's exact input count.
 

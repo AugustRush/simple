@@ -1672,6 +1672,8 @@ class BuiltinTools:
         if not workspace_root.exists():
             return files
         for path in workspace_root.rglob("*"):
+            if path.is_symlink():
+                continue
             resolved = path.resolve(strict=False)
             if path.is_dir():
                 if path.name in {".git", "__pycache__", ".pytest_cache"}:
@@ -2121,6 +2123,7 @@ class BuiltinTools:
                     "AGENT_WORKSPACE_ROOT": str(self.workspace_root),
                 },
                 cwd=str(output_dir),
+                start_new_session=True,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             transcript = stdout.decode(errors="replace").strip()
@@ -2156,23 +2159,38 @@ class BuiltinTools:
     async def _terminate_process(self, proc: Any) -> None:
         if proc is None:
             return
-        try:
-            if hasattr(os, "killpg") and getattr(proc, "pid", None):
-                os.killpg(proc.pid, signal.SIGTERM)
-            elif hasattr(proc, "terminate"):
-                proc.terminate()
-        except ProcessLookupError:
-            return
-        except Exception:
-            if hasattr(proc, "kill"):
-                try:
-                    proc.kill()
-                except Exception:
-                    return
+        if getattr(proc, "returncode", None) is None:
+            try:
+                if hasattr(os, "killpg") and getattr(proc, "pid", None):
+                    os.killpg(proc.pid, signal.SIGTERM)
+                elif hasattr(proc, "terminate"):
+                    proc.terminate()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                if hasattr(proc, "terminate"):
+                    with contextlib.suppress(Exception):
+                        proc.terminate()
         try:
             await asyncio.wait_for(proc.communicate(), timeout=1)
+            return
+        except asyncio.TimeoutError:
+            pass
         except Exception:
             return
+        try:
+            if hasattr(os, "killpg") and getattr(proc, "pid", None):
+                os.killpg(proc.pid, signal.SIGKILL)
+            elif hasattr(proc, "kill"):
+                proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            if hasattr(proc, "kill"):
+                with contextlib.suppress(Exception):
+                    proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.communicate()
 
     def _read_file(
         self,
@@ -2517,7 +2535,10 @@ class BuiltinTools:
     ) -> dict[str, Any]:
         if self._output_dir is None:
             return self._error("Output directory not configured")
-        target = self._output_dir / subdir if subdir else self._output_dir
+        output_dir = self._output_dir.expanduser().resolve(strict=False)
+        target = (output_dir / subdir).resolve(strict=False) if subdir else output_dir
+        if not path_contains(output_dir, target):
+            return self._error("subdir must stay inside the output directory")
         if not target.is_dir():
             return self._ok(deleted=0, message=f"Directory does not exist: {target}")
         now = time.time()

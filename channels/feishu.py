@@ -64,6 +64,7 @@ logger = logging.getLogger(__name__)
 
 LARK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 FEISHU_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
+FEISHU_STOP_DRAIN_TIMEOUT_SECONDS = 30.0
 _ATTACHMENT_CANCEL_GRACE_SECONDS = 0.05
 _ATTACHMENT_MAX_IN_FLIGHT = 2
 # Soft cap on remembered message ids. Soft because an in-flight id is never
@@ -1296,10 +1297,11 @@ class FeishuOutputSink(OutputSink):
         path = Path(file_path)
         file_type = self._FILE_TYPE_MAP.get(path.suffix.lower(), "stream")
         try:
-            if not path.exists():
+            try:
+                size_bytes = path.stat().st_size
+            except FileNotFoundError:
                 logger.error("Feishu file upload skipped, file not found: %s", path)
                 return None
-            size_bytes = path.stat().st_size
             if size_bytes > FEISHU_UPLOAD_MAX_BYTES:
                 logger.error(
                     "Feishu file upload skipped, file too large for Feishu upload: path=%s size=%s limit=%s",
@@ -1853,6 +1855,8 @@ class FeishuChannel(Channel):
         self._processed_ids: OrderedDict[str, bool] = OrderedDict()
         self._stop_event: Optional[asyncio.Event] = None
         self._active_sinks: list[FeishuOutputSink] = []
+        self._message_futures: set[Any] = set()
+        self._message_futures_lock = threading.Lock()
 
     @staticmethod
     def _register_optional_event(builder: Any, method_name: str, handler: Any) -> Any:
@@ -1959,22 +1963,42 @@ class FeishuChannel(Channel):
     async def stop(self) -> None:
         """Stop the WebSocket connection gracefully with draining."""
         self._running = False
-        if self._stop_event is not None:
-            self._stop_event.set()
-        # Drain all active sinks so in-flight messages are delivered
-        for sink in self._active_sinks:
-            try:
-                await sink.drain()
-            except Exception:
-                pass
-        self._active_sinks.clear()
         if self._ws_thread is not None and self._ws_thread.is_alive():
-            self._ws_thread.join(timeout=5.0)
+            await asyncio.to_thread(self._ws_thread.join, 5.0)
             if self._ws_thread.is_alive():
                 logger.warning(
                     "Feishu WebSocket thread did not exit within timeout "
                     "(ws_client.start() still blocking)"
                 )
+        with self._message_futures_lock:
+            message_futures = list(self._message_futures)
+        if message_futures:
+            wrapped = [asyncio.wrap_future(future) for future in message_futures]
+            _done, pending = await asyncio.wait(
+                wrapped, timeout=FEISHU_STOP_DRAIN_TIMEOUT_SECONDS
+            )
+            if pending:
+                logger.warning(
+                    "Cancelling %s Feishu message handler(s) after drain timeout",
+                    len(pending),
+                )
+                for future in pending:
+                    future.cancel()
+                _done, still_pending = await asyncio.wait(pending, timeout=1.0)
+                if still_pending:
+                    logger.warning(
+                        "%s Feishu message handler(s) ignored cancellation",
+                        len(still_pending),
+                    )
+        # Drain all active sinks so in-flight messages are delivered
+        for sink in self._active_sinks:
+            try:
+                await asyncio.wait_for(sink.drain(), timeout=5.0)
+            except Exception:
+                pass
+        self._active_sinks.clear()
+        if self._stop_event is not None:
+            self._stop_event.set()
         logger.info("Feishu bot stopped")
 
     def set_output_dir(self, output_dir: Optional[Path]) -> None:
@@ -2184,8 +2208,17 @@ class FeishuChannel(Channel):
 
     def _on_message_sync(self, data: Any) -> None:
         """Called from the WebSocket thread; schedules async processing."""
-        if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        if not self._running or not self._loop or not self._loop.is_running():
+            return
+        future = asyncio.run_coroutine_threadsafe(self._on_message(data), self._loop)
+        with self._message_futures_lock:
+            self._message_futures.add(future)
+
+        def settled(done: Any) -> None:
+            with self._message_futures_lock:
+                self._message_futures.discard(done)
+
+        future.add_done_callback(settled)
 
     def _on_reaction_created(self, data: Any) -> None:
         """Ignore reaction-created events to avoid SDK 'processor not found' noise."""
@@ -2440,14 +2473,6 @@ class FeishuChannel(Channel):
             ).startswith("ou_"):
                 return True
         return False
-
-    def _resolve_send_path(self, raw_path: str) -> Optional[Path]:
-        candidate = Path(os.path.expandvars(raw_path)).expanduser()
-        if candidate.is_absolute():
-            return candidate.resolve()
-        if self._output_dir is not None:
-            return (self._output_dir / candidate).resolve()
-        return candidate.resolve()
 
     async def _add_reaction(self, message_id: str, emoji_type: str) -> None:
         loop = asyncio.get_running_loop()

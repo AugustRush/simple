@@ -1,5 +1,7 @@
 """Tests for StagingBuffer — append/read/clear/persistence."""
 
+import sqlite3
+
 import pytest
 
 
@@ -117,6 +119,19 @@ def test_default_staging_persists_in_sqlite_without_jsonl_file(tmp_path):
         "sqlite turn",
         "sqlite reply",
     ]
+
+
+def test_sqlite_staging_close_releases_connections(tmp_path):
+    from agent import StagingBuffer
+
+    buf = StagingBuffer(context_dir=tmp_path / "context", session_id="session-1")
+    connection = buf._connect()
+
+    buf.close()
+
+    assert buf._thread_connections == {}
+    with pytest.raises(sqlite3.ProgrammingError):
+        connection.execute("SELECT 1")
 
 
 def test_count_does_not_depend_on_read_all(tmp_path, monkeypatch):

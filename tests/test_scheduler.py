@@ -380,6 +380,122 @@ def test_scheduler_service_executes_due_agent_prompt_task_and_persists_run(tmp_p
     assert refreshed.active_run_id is None
 
 
+def test_scheduler_run_forever_recovers_after_iteration_error(tmp_path):
+    from agent.scheduler import SchedulerService, SchedulerStore
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("executor should not run")
+
+    service = SchedulerService(
+        store=SchedulerStore(db_path=tmp_path / "scheduler.db"),
+        agent_executor=unused,
+        system_executor=unused,
+        delivery=unused,
+        poll_seconds=0.001,
+    )
+    calls = 0
+    recovered = asyncio.Event()
+
+    async def flaky_run_once(now=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient failure")
+        recovered.set()
+        return 0
+
+    service.run_once = flaky_run_once
+
+    async def scenario():
+        task = asyncio.create_task(service.run_forever())
+        await asyncio.wait_for(recovered.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert calls >= 2
+
+
+def test_scheduler_cancellation_releases_claim_committed_in_worker(tmp_path):
+    from agent.scheduler import SchedulerService, SchedulerStore
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("executor should not run")
+
+    service = SchedulerService(
+        store=SchedulerStore(db_path=tmp_path / "scheduler.db"),
+        agent_executor=unused,
+        system_executor=unused,
+        delivery=unused,
+    )
+    claim_started = asyncio.Event()
+    release_claim = asyncio.Event()
+    completed: list[tuple[str, str, str]] = []
+    claimed = SimpleNamespace(
+        task=SimpleNamespace(id="task-1"),
+        run=SimpleNamespace(id="run-1"),
+    )
+
+    async def fake_store_call(method_name, *args, **kwargs):
+        if method_name == "disable_duplicate_enabled_tasks":
+            return 0
+        if method_name == "claim_due_tasks":
+            claim_started.set()
+            await release_claim.wait()
+            return [claimed]
+        if method_name == "release_claim":
+            completed.append((args[0], args[1], "interrupted"))
+            return True
+        raise AssertionError(method_name)
+
+    service._store_call = fake_store_call
+
+    async def scenario():
+        pending = asyncio.create_task(service.run_once())
+        await claim_started.wait()
+        pending.cancel()
+        release_claim.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    asyncio.run(scenario())
+    assert completed == [("task-1", "run-1", "interrupted")]
+
+
+def test_release_claim_restores_scheduled_occurrence(tmp_path):
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    scheduled_for = datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc)
+    task = store.create_task(
+        NewScheduledTask(
+            name="retry-after-shutdown",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once(scheduled_for.isoformat(), "UTC"),
+            payload={"prompt": "run"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+    claim = store.claim_due_tasks(scheduled_for, lease_seconds=30)[0]
+
+    assert store.release_claim(
+        task.id,
+        claim.run.id,
+        now=scheduled_for,
+        reason="scheduler stopped",
+    )
+
+    refreshed = store.get_task(task.id)
+    runs = store.list_runs(task.id)
+    assert refreshed is not None
+    assert refreshed.active_run_id is None
+    assert refreshed.next_run_at == scheduled_for
+    assert runs[0].status == "interrupted"
+    assert runs[0].error == "scheduler stopped"
+
+
 def test_scheduler_service_coalesces_missed_interval_runs(tmp_path):
     from agent.scheduler import (
         DeliveryTarget,

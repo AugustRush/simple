@@ -1,5 +1,7 @@
 """Tests for structured fact assertions and resolved facts."""
 
+import pytest
+
 
 def test_fact_store_creates_fact_tables(tmp_path):
     from agent import LTMStore
@@ -45,6 +47,29 @@ def test_add_fact_assertion_keeps_append_only_history(tmp_path):
 
     assert [assertion.id for assertion in assertions] == ["fact-1", "fact-2"]
     assert [assertion.value for assertion in assertions] == ["Afu", "Afu"]
+
+
+def test_add_fact_assertion_rolls_back_when_resolution_fails(tmp_path, monkeypatch):
+    from agent import FactAssertion, LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+
+    def fail_resolution(*args, **kwargs):
+        raise RuntimeError("resolution failed")
+
+    monkeypatch.setattr(store, "resolve_fact", fail_resolution)
+
+    with pytest.raises(RuntimeError, match="resolution failed"):
+        store.add_fact_assertion(
+            FactAssertion(
+                id="fact-rollback",
+                subject="assistant",
+                predicate="name",
+                value="Afu",
+            )
+        )
+
+    assert store.read_fact_assertions(subject="assistant", predicate="name") == []
 
 
 def test_resolve_fact_materializes_latest_winner_for_fact_key(tmp_path):

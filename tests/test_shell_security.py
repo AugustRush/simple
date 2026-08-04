@@ -128,13 +128,13 @@ def test_shell_confirmation_rejects_expired_pending_token():
         "bash --noprofile -c 'echo ok'",
     ],
 )
-def test_shell_security_inline_execution_runs_automatically(command):
+def test_shell_security_inline_execution_requires_confirmation(command):
     from agent.security.shell import shell_command_check
 
     result = shell_command_check(command)
 
-    assert result.allowed is True
-    assert result.requires_confirmation is False
+    assert result.allowed is False
+    assert result.requires_confirmation is True
 
 
 @pytest.mark.parametrize(
@@ -145,15 +145,15 @@ def test_shell_security_inline_execution_runs_automatically(command):
         "perl -e'print 1'",
     ],
 )
-def test_shell_security_attached_execution_flags_run_automatically(
+def test_shell_security_attached_execution_flags_require_confirmation(
     command,
 ):
     from agent.security.shell import shell_command_check
 
     result = shell_command_check(command)
 
-    assert result.allowed is True
-    assert result.requires_confirmation is False
+    assert result.allowed is False
+    assert result.requires_confirmation is True
 
 
 @pytest.mark.parametrize(
@@ -161,8 +161,8 @@ def test_shell_security_attached_execution_flags_run_automatically(
     [
         # Destructive option inside env-split payload: high-risk, confirmable.
         ('env -S "find . -delete"', "confirm"),
-        # Inline interpreter payload: medium-risk, now auto-allowed.
-        ('env -S "python3.11 -I -c print(1)"', "allowed"),
+        # Inline interpreter payload crosses a parser boundary and must confirm.
+        ('env -S "python3.11 -I -c print(1)"', "confirm"),
     ],
 )
 def test_shell_security_classifies_env_split_string_payloads(command, expected):
@@ -182,7 +182,7 @@ def test_shell_security_classifies_env_split_string_payloads(command, expected):
     ("command", "expected"),
     [
         (r"env -Sfind\ .\ -delete", "confirm"),
-        ('env --split-string="python3.11 -c print(1)"', "allowed"),
+        ('env --split-string="python3.11 -c print(1)"', "confirm"),
         ("env -iu HOME find . -delete", "confirm"),
     ],
 )
@@ -269,13 +269,13 @@ def test_shell_security_interpreter_flags_without_scripts_stay_low(command):
         "bash -O extglob -c 'echo ok'",
     ],
 )
-def test_shell_security_interpreter_option_values_run_automatically(command):
+def test_shell_security_interpreter_option_values_require_confirmation(command):
     from agent.security.shell import shell_command_check
 
     result = shell_command_check(command)
 
-    assert result.allowed is True
-    assert result.requires_confirmation is False
+    assert result.allowed is False
+    assert result.requires_confirmation is True
 
 
 def test_shell_security_high_risk_command_options_require_confirmation():

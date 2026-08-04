@@ -169,6 +169,39 @@ def test_rewrite_system_prompt_uses_openai_chat_api(tmp_path, monkeypatch):
     assert list(prompts_dir.glob("system_v*.md"))
 
 
+def test_rewrite_system_prompt_uses_next_available_version(tmp_path, monkeypatch):
+    import asyncio
+    import agent as agent_module
+    from agent import EvolutionEngine, MemoryPalace
+
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "system_v1.md").write_text("one", encoding="utf-8")
+    (prompts_dir / "system_v3.md").write_text("three", encoding="utf-8")
+    sessions_file = tmp_path / "sessions.jsonl"
+    sessions_file.write_text(
+        '{"score": 4, "critique": "weak", "improvements": ["improve"]}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
+    monkeypatch.setattr(agent_module, "SESSIONS_FILE", sessions_file)
+
+    engine = EvolutionEngine(
+        client=_FakeOpenAIClient(),
+        model="qwen",
+        memory=MemoryPalace(
+            base_dir=tmp_path / "memory",
+            context_dir=tmp_path / "context",
+        ),
+        api_format="openai",
+    )
+
+    asyncio.run(engine.rewrite_system_prompt())
+
+    assert (prompts_dir / "system_v4.md").exists()
+    assert (prompts_dir / "system_v3.md").read_text(encoding="utf-8") == "three"
+
+
 def test_rewrite_system_prompt_handles_structured_session_records(tmp_path, monkeypatch):
     import asyncio
     import agent as agent_module
@@ -316,9 +349,10 @@ def test_generate_tool_uses_openai_chat_api(tmp_path, monkeypatch):
 
     result = asyncio.run(engine.generate_tool("hello world tool", ToolRegistry()))
 
-    assert "Tool generated and saved" in result
+    assert "Tool generated for review" in result
     assert client.chat.completions.calls
-    assert list(tools_dir.glob("auto_*.py"))
+    assert list(tools_dir.glob("auto_*.py.pending"))
+    assert not list(tools_dir.glob("auto_*.py"))
 
 
 def test_apply_best_prompt_rejects_path_traversal_versions(tmp_path, monkeypatch):

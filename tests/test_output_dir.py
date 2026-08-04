@@ -170,6 +170,21 @@ def test_clean_output_nonexistent_dir(tmp_path):
     assert result["deleted"] == 0
 
 
+def test_clean_output_rejects_path_outside_output_dir(tmp_path):
+    from agent import ToolRegistry, BuiltinTools
+
+    output = tmp_path / "output"
+    output.mkdir()
+    outside = tmp_path / "keep.txt"
+    outside.write_text("keep")
+
+    bt = BuiltinTools(_StubMemory(), ToolRegistry(), output_dir=output)
+    result = bt._clean_output(subdir="..")
+
+    assert result["ok"] is False
+    assert outside.read_text() == "keep"
+
+
 def test_clean_output_not_registered_when_no_output_dir():
     from agent import ToolRegistry, BuiltinTools
 

@@ -921,6 +921,21 @@ def shell_command_check(
                     confirmation_token=token,
                 )
 
+    inline_execution = _is_inline_execution(tokens, command_index)
+    if effective_level == "ask" and inline_execution:
+        token = _pending_confirmation(
+            normalized_command,
+            scope=authorization_scope,
+            now=authorization_now,
+        )
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason="inline interpreter code cannot be safely classified",
+            requires_confirmation=True,
+            confirmation_token=token,
+        )
+
     high_risk_option = _find_high_risk_option(tokens, command_index)
     if effective_level == "ask" and argv0 in HIGH_RISK_COMMANDS:
         token = _pending_confirmation(
@@ -962,7 +977,7 @@ def shell_command_check(
         risk_level = "high"
     elif (
         argv0 in MEDIUM_RISK_COMMANDS
-        or _is_inline_execution(tokens, command_index)
+        or inline_execution
         or _is_script_execution(tokens, command_index)
         or _has_absolute_path_token(tokens, allowed_roots=allowed_roots)
     ):

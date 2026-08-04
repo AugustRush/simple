@@ -1022,6 +1022,24 @@ def test_shell_workspace_domain_keeps_files_without_sandbox(tmp_path):
     assert result["moved_artifacts"] == []
 
 
+def test_workspace_artifact_relocation_does_not_follow_symlinks(tmp_path):
+    tools, _registry, workspace, _output_dir = make_builtin_tools_with_output_dir(
+        tmp_path
+    )
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    link = workspace / "secret-link"
+    link.symlink_to(outside)
+
+    moved = tools._move_new_workspace_files_to_output_dir(
+        before=set(), cwd=workspace
+    )
+
+    assert moved == []
+    assert outside.read_text(encoding="utf-8") == "secret"
+    assert link.is_symlink()
+
+
 def test_shell_blocks_workspace_write_by_default(tmp_path):
     from agent.security.filesystem_sandbox import detect_sandbox_support
 
