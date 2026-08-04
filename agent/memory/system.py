@@ -178,10 +178,15 @@ class MemoryPalace:
         self,
         tidy_interval: int = shared.MEMORY_TIDY_INTERVAL,
         tidy_threshold: int = shared.MEMORY_TIDY_FILE_THRESHOLD,
-        base_dir: Path = shared.MEMORY_DIR,
-        context_dir: Path = shared.CONTEXT_DIR,
+        base_dir: Optional[Path] = None,
+        context_dir: Optional[Path] = None,
         store: Optional["LTMStore"] = None,
     ):
+        # Resolve at call time so a ``--name`` home switch (via
+        # ``_set_agent_home``) is honoured even though shared was imported long
+        # before the CLI command ran.
+        base_dir = base_dir or shared.MEMORY_DIR
+        context_dir = context_dir or shared.CONTEXT_DIR
         self.store = store or LTMStore(context_dir=context_dir, memory_dir=base_dir)
         self.base_dir = self.store.memory_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
@@ -319,13 +324,13 @@ class StagingBuffer:
     def __init__(
         self,
         path: Optional[Path] = None,
-        context_dir: Path = shared.CONTEXT_DIR,
+        context_dir: Optional[Path] = None,
         session_id: Optional[str] = None,
     ):
         self.session_id = session_id or _new_id()
-        self.context_dir = context_dir
+        self.context_dir = context_dir or shared.CONTEXT_DIR
         self._sqlite_backed = path is None
-        self.path = path or (context_dir / "_staging" / f"{self.session_id}.jsonl")
+        self.path = path or (self.context_dir / "_staging" / f"{self.session_id}.jsonl")
         self._connection_lock = threading.Lock()
         self._thread_connections: dict[int, sqlite3.Connection] = {}
         self._closed = False
@@ -780,10 +785,13 @@ class LTMStore:
 
     def __init__(
         self,
-        context_dir: Path = shared.CONTEXT_DIR,
+        context_dir: Optional[Path] = None,
         max_categories: int = shared.MAX_CATEGORIES,
-        memory_dir: Path = shared.MEMORY_DIR,
+        memory_dir: Optional[Path] = None,
     ):
+        # Resolve at call time for the same reason as MemoryPalace/StagingBuffer.
+        context_dir = context_dir or shared.CONTEXT_DIR
+        memory_dir = memory_dir or shared.MEMORY_DIR
         self.dir = context_dir
         self.max_categories = max_categories
         self.memory_dir = memory_dir

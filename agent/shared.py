@@ -22,7 +22,11 @@ def _resolve_agent_home() -> Path:
 
 
 def _set_agent_home(home: Path) -> None:
-    """Override AGENT_HOME and all derived paths (for CLI --home support)."""
+    """Override AGENT_HOME and all derived paths (for CLI --home support).
+
+    Prefer ``agent._set_agent_home`` from CLI entry points: it also refreshes
+    the module-level ``agent.TASKS_DIR`` mirror for Ralph tasks.
+    """
     global AGENT_HOME, MEMORY_DIR, SKILLS_DIR, TOOLS_DIR, PACKAGE_ROOT
     global BUILTIN_SKILLS_DIR, PROMPTS_DIR, RL_DIR, SCHEDULER_DIR
     global SCHEDULER_DB_FILE, CONFIG_FILE, INDEX_FILE, SESSIONS_FILE

@@ -122,6 +122,20 @@ from .security.shell import (
 
 # ── Ralph Loop ────────────────────────────────────────────────────────────────
 TASKS_DIR = AGENT_HOME / "tasks"
+
+
+def _set_agent_home(home: Path) -> None:
+    """Switch to a different agent home (``--name`` multi-instance support).
+
+    ``shared._set_agent_home`` rewrites the shared derived paths; this wrapper
+    additionally refreshes TASKS_DIR (the Ralph task store), which is captured
+    here at import time and would otherwise keep pointing at the original home.
+    """
+    _shared._set_agent_home(home)
+    global TASKS_DIR
+    TASKS_DIR = _shared.SCHEDULER_DIR
+
+
 from .ralph import (
     RALPH_COMPLETION_PROMISE,
     RALPH_DEFAULT_MAX_ITERATIONS,

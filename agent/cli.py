@@ -1067,12 +1067,12 @@ def gateway(
 
     Use --name to run multiple isolated instances::
 
-        simple gateway --name prod    # -> ~/.agent/prod/
-        simple gateway --name dev     # -> ~/.agent/dev/
+        simple gateway --name prod    # -> ~/.agent-prod/
+        simple gateway --name dev     # -> ~/.agent-dev/
         simple gateway                # -> ~/.agent/
     """
     if isinstance(name, str):
-        shared._set_agent_home(Path.home() / f".agent-{name}")
+        agent_module._set_agent_home(Path.home() / f".agent-{name}")
     # After _set_agent_home so --name instances lock their own home.
     home_lock = _acquire_home_lock_or_exit("gateway")
     cfg, first_run = agent_module.load_config()
@@ -1486,7 +1486,7 @@ def scheduler(
 ):
     """Run the persistent scheduler service."""
     if isinstance(name, str):
-        shared._set_agent_home(Path.home() / f".agent-{name}")
+        agent_module._set_agent_home(Path.home() / f".agent-{name}")
     cfg, first_run = agent_module.load_config()
     if first_run:
         if not agent_module._first_run_setup():
