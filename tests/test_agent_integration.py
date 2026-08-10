@@ -7730,6 +7730,7 @@ def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
 
 
 def test_generate_tool_does_not_reload_user_tools_when_disabled():
+    """Loading is the engine's job, and it honours the approval policy."""
     import asyncio
     import agent as agent_module
     from agent._builtin.plugins.evolution import EvolutionPlugin
@@ -7738,11 +7739,11 @@ def test_generate_tool_does_not_reload_user_tools_when_disabled():
 
     class _FakeEvolution:
         async def generate_tool(self, description, registry):
-            return "generated"
+            return {"ok": True, "tool_id": "demo", "summary_text": "Created demo."}
 
     class _ReloadShouldNotRun:
-        def load_into_registry(self, registry):
-            raise AssertionError("user tools are disabled")
+        def load_into_registry(self, registry, **kwargs):
+            raise AssertionError("the command must not bypass the approval policy")
 
     plugin._engine = _FakeEvolution()
     components = {

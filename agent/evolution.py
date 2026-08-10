@@ -68,6 +68,73 @@ class SessionExperience:
         )
 
 
+# Any fence the model might reach for: ```python, ```py, ```python3, or bare.
+_FENCE_RE = re.compile(
+    r"```[ \t]*(?:python3?|py)?[ \t]*\r?\n(.*?)(?:```|\Z)",
+    re.DOTALL | re.IGNORECASE,
+)
+_REQUIRES_RE = re.compile(r"^#\s*requires?\s*:\s*(.+)$", re.IGNORECASE)
+_TOOL_ID_HEADER_RE = re.compile(r"^#\s*tool[_ -]?id\s*:\s*(.+)$", re.IGNORECASE)
+
+
+def _extract_python_source(text: str) -> str:
+    """Pull the module out of a model reply, fenced or not.
+
+    Models fence inconsistently and sometimes wrap prose around the code, so
+    this accepts every fence spelling — including one the model forgot to
+    close — and falls back to the whole reply when there is no fence at all.
+    """
+    blocks = [block.strip() for block in _FENCE_RE.findall(str(text or ""))]
+    blocks = [block for block in blocks if block]
+    if blocks:
+        # More than one block usually means example + answer; the module is
+        # the substantial one.
+        return max(blocks, key=len)
+    return str(text or "").strip()
+
+
+def _declared_requirements(code: str) -> list[str]:
+    """Packages named by a leading ``# requires:`` comment.
+
+    One bad token discards the whole header rather than the token: a hostile
+    or malformed line splits into fragments that can individually look like
+    valid package names, and installing the survivors of a line we already
+    know we misread is not a defensible thing to do.
+    """
+    from agent.tools import user_tools
+
+    requirements: list[str] = []
+    for line in str(code or "").splitlines()[:10]:
+        match = _REQUIRES_RE.match(line.strip())
+        if match is None:
+            continue
+        header: list[str] = []
+        for item in re.split(r"[,\s]+", match.group(1).strip()):
+            spec = item.strip()
+            if not spec or spec.lower() in {"none", "n/a", "-"}:
+                continue
+            if user_tools.validate_requirement(spec) is not None:
+                header = []
+                break
+            header.append(spec)
+        requirements.extend(header)
+    return requirements
+
+
+def _requested_tool_id(code: str) -> str:
+    """Module stem named by a leading ``# tool_id:`` comment, if valid."""
+    from agent.tools import user_tools
+
+    for line in str(code or "").splitlines()[:10]:
+        match = _TOOL_ID_HEADER_RE.match(line.strip())
+        if match is None:
+            continue
+        candidate = user_tools.normalize_tool_id(match.group(1))
+        if candidate and user_tools.validate_tool_id(candidate) is None:
+            return candidate
+    return ""
+
+
 class EvolutionEngine:
     """Self-evolution: scoring, prompt rewriting, tool generation."""
 
@@ -385,65 +452,156 @@ class EvolutionEngine:
         )
         return new_prompt
 
-    async def generate_tool(self, description: str, registry: ToolRegistry) -> str:
-        """Generate a tool candidate that cannot be imported before review."""
+    async def generate_tool(self, description: str, registry: ToolRegistry) -> dict:
+        """Write, verify, and activate a user tool for *description*.
+
+        The model only produces a candidate module; every consequence — the
+        third-party packages it needs, importing it, making it callable — goes
+        through :mod:`agent.tools.user_tools`, so a generated tool installs
+        into the agent's isolated dependency directory and never becomes
+        callable without passing an out-of-process import check first.
+        """
+        from agent.tools import user_tools
+
+        catalog, _ = user_tools.resolve_catalog(registry)
+        tools_root = Path(getattr(catalog, "root", shared.TOOLS_DIR))
+
+        attempts = 2
+        feedback = ""
+        last: dict = {
+            "ok": False,
+            "error": "Tool generation failed: no code was produced",
+        }
+
+        for _ in range(attempts):
+            raw = await self.generate_text(
+                self._tool_generation_prompt(description, feedback),
+                max_tokens=8192,
+            )
+            code = _extract_python_source(raw)
+            if not code:
+                last = {
+                    "ok": False,
+                    "error": "Tool generation failed: the model returned no code",
+                }
+                feedback = "You returned no Python source. Output the module only."
+                continue
+
+            source_error = user_tools.validate_source(code)
+            if source_error:
+                last = {
+                    "ok": False,
+                    "error": f"Tool generation failed: {source_error}",
+                    "code": code,
+                }
+                feedback = f"The previous attempt was rejected: {source_error}"
+                continue
+
+            tool_id = _requested_tool_id(code) or user_tools.normalize_tool_id(
+                description
+            )
+            if user_tools.validate_tool_id(tool_id) is not None:
+                tool_id = f"generated_tool_{abs(hash(description)) % 10_000}"
+
+            # Declared dependencies install into ~/.agent/tools/_deps before the
+            # probe runs, so "needs a package" is not reported as "broken tool".
+            dependency_error = await self._install_declared_requirements(code)
+            if dependency_error:
+                last = {"ok": False, "error": dependency_error, "code": code}
+                break
+
+            existing = user_tools.tool_path(tool_id, tools_root).exists()
+            result = await user_tools.author_tool(
+                tool_id, code, registry=registry, replace=existing
+            )
+            result.setdefault("code", code)
+            result.setdefault("tool_id", tool_id)
+            if result.get("ok") or result.get("requires_confirmation"):
+                return result
+            last = result
+            # Only a mechanical failure is worth another model round-trip; a
+            # decline is the user's answer, not a defect to retry around.
+            if result.get("stage") not in ("validate", "probe"):
+                break
+            feedback = (
+                f"The previous attempt failed: {result.get('error', '')}\n"
+                f"{result.get('recovery_hint', '')}".strip()
+            )
+
+        error = str(last.get("error", "Tool generation failed"))
+        if not error.startswith("Tool generation failed"):
+            error = f"Tool generation failed: {error}"
+        last["error"] = error
+        last["ok"] = False
+        return last
+
+    def _tool_generation_prompt(self, description: str, feedback: str) -> str:
+        """The contract a generated module actually has to satisfy."""
         prompt = (
-            f"Generate a Python tool plugin for: {description}\n\n"
-            "Requirements:\n"
-            "1. Output a complete Python module with a callable register(registry) entrypoint\n"
-            "2. register(registry) must register exactly one async tool function\n"
-            "3. Use this pattern:\n"
+            "Write a Python module that adds one tool to an AI agent.\n\n"
+            f"The tool must do this: {description}\n\n"
+            "Hard requirements:\n"
+            "1. Define a top-level `def register(registry):` (not async). The "
+            "agent calls it once at load time.\n"
+            "2. Inside it, call `registry.register(name, description, "
+            "parameters, fn)` once per tool. `name` is a lowercase identifier, "
+            "`parameters` is a JSON Schema object, and `fn` is an async "
+            "function accepting exactly the schema's properties as keyword "
+            "arguments.\n"
+            "3. `fn` returns a string or a JSON-serializable dict, and catches "
+            "its own exceptions, returning a readable error string instead of "
+            "raising.\n"
+            "4. Module-level code must be cheap: imports and definitions only. "
+            "No network calls, no input(), no sys.exit(), nothing that blocks. "
+            "It is imported to check it works.\n"
+            "5. If the tool needs third-party packages, put a single comment "
+            "line `# requires: pkg1, pkg2` at the very top. They are installed "
+            "into the agent's private dependency directory. Never write "
+            "install commands or subprocess pip calls into the module.\n"
+            "6. Add `# tool_id: <lowercase_identifier>` as the second line — it "
+            "names the file this module is saved as.\n\n"
+            "Shape:\n"
             "```python\n"
+            "# requires: none\n"
+            "# tool_id: word_count\n"
+            "\n"
             "def register(registry):\n"
-            "    async def tool_function(**kwargs):\n"
-            "        return 'result'\n"
+            "    async def word_count(text: str) -> str:\n"
+            "        try:\n"
+            "            return f'{len(text.split())} words'\n"
+            "        except Exception as exc:\n"
+            "            return f'word_count failed: {exc}'\n"
             "\n"
             "    registry.register(\n"
-            "        'tool_name',\n"
-            "        'What this tool does',\n"
-            "        {'type': 'object', 'properties': {...}, 'required': [...]},\n"
-            "        tool_function,\n"
+            "        'word_count',\n"
+            "        'Count the words in a piece of text.',\n"
+            "        {\n"
+            "            'type': 'object',\n"
+            "            'properties': {'text': {'type': 'string', "
+            "'description': 'Text to count.'}},\n"
+            "            'required': ['text'],\n"
+            "        },\n"
+            "        word_count,\n"
             "    )\n"
-            "```\n"
-            "4. The tool function must be async\n"
-            "5. Add proper error handling\n"
-            "6. Return either a string or a JSON-serializable dict\n\n"
-            "Output ONLY the Python code, no explanation."
+            "```\n\n"
+            "Output only the module source in one ```python block. No prose."
         )
+        if feedback:
+            prompt = f"{prompt}\n\nFix this before answering again:\n{feedback}"
+        return prompt
 
-        code = await self.generate_text(prompt, max_tokens=2048)
+    async def _install_declared_requirements(self, code: str) -> str:
+        """Install the module's `# requires:` packages; error text on failure."""
+        from agent.tools import user_tools
 
-        # Extract code from markdown code block if present
-        code_match = re.search(r"```python\n(.*?)```", code, re.DOTALL)
-        if code_match:
-            code = code_match.group(1)
-
-        # Validate syntax before saving — a syntax error would crash the
-        # agent on next launch when the tool is loaded.
-        import ast
-        try:
-            ast.parse(code)
-        except SyntaxError as e:
-            shared.CONSOLE.print(
-                f"[red]Generated tool has a syntax error: {e}[/red]"
-            )
-            return (
-                f"Tool generation failed: syntax error at line {e.lineno}: {e.msg}"
-            )
-
-        # Generated Python is untrusted even when it parses. Keep it outside the
-        # catalog's ``*.py`` discovery pattern until a human reviews and renames it.
-        safe_name = re.sub(r"[^a-z0-9_]", "_", description.lower()[:30])
-        tool_path = shared.TOOLS_DIR / f"auto_{safe_name}.py.pending"
-        # Durable primitive: two descriptions can sanitize to the same name, so
-        # this overwrites an existing generated tool rather than always creating.
-        shared._atomic_write_text(tool_path, code)
-
-        shared.CONSOLE.print(f"[green]Tool candidate saved for review: {tool_path}[/green]")
-        return (
-            f"Tool generated for review at {tool_path}. "
-            "Review it, then rename the file to end in .py to activate it."
-        )
+        for requirement in _declared_requirements(code):
+            outcome = await user_tools.install_dependency(requirement)
+            if not outcome.get("ok"):
+                return (
+                    f"Tool generation failed: could not install dependency "
+                    f"'{requirement}': {outcome.get('error', 'unknown error')}"
+                )
+        return ""
 
     def apply_best_prompt(self) -> str:
         """Load the best prompt from history."""

@@ -350,7 +350,7 @@ Key config sections:
 | `audio.transcription_command` | External STT argv-style command template (`{path}`, `{language}` placeholders; shell operators are rejected) |
 | `mcp_servers` | MCP server definitions (name, command, args, env) |
 | `plugins` | Per-plugin enable/disable (`{"evolution": {"enabled": false}}`) |
-| `user_tools.enabled` | Opt in to trusted Python tools from `~/.agent/tools/*.py` |
+| `user_tools.enabled` | Trust every Python tool in `~/.agent/tools/*.py`. Off by default; individually approved tools load either way (see [Authoring user tools](#authoring-user-tools)) |
 | `evolution` | Enable/disable session scoring and rule learning |
 | `scheduler` | Poll/lease/concurrency settings |
 | `tavily_api_key` | Optional Tavily search API key |
@@ -703,6 +703,9 @@ falls back to the classic line-by-line prompt automatically.
 
 Plugins contribute additional slash commands at startup. Common ones include
 `/evolve` and `/generate-tool` from the built-in evolution plugin.
+`/generate-tool <description>` writes a user tool, verifies it, and — after you
+approve it — activates it in the running session; see
+[Authoring user tools](#authoring-user-tools).
 
 `/help` is generated from the live descriptor set and automatically reflects
 which commands are available in each channel.
@@ -733,19 +736,47 @@ output sink.
 | Shell | `shell` |
 | Files | `read_file`, `write_file`, `edit_file`, `list_files`, `send_file` |
 | Media | `transcribe_audio` |
-| Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index` |
+| Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index`, `set_identity` |
 | Context | `context_retrieve` |
 | Scheduling | `schedule_create`, `schedule_list`, `schedule_delete` |
 | Web | `web_search`, `web_fetch`, `tavily_search` |
 | Output | `clean_output` |
 | Orchestration | `spawn_agent` |
 | Skills | `activate_skill`, `list_skill_files`, `read_skill_file`, `create_skill`, `update_skill`, `delete_skill`, `write_skill_file` |
+| User tools | `create_tool`, `update_tool`, `delete_tool`, `list_tools`, `install_tool_dependency` |
 
 Also registered at runtime:
 
 - MCP tools from configured `mcp_servers` and plugin-bundled MCP servers
 - Trusted user tools from `~/.agent/tools/*.py` when `user_tools.enabled=true`
-- Auto-generated tools via `/generate-tool`
+- Individually approved user tools, even when `user_tools.enabled` is false
+- Tools written by `create_tool` or `/generate-tool`
+
+### Authoring user tools
+
+A user tool is a Python module in `~/.agent/tools/` exposing
+`register(registry)`. `create_tool` / `update_tool` are the supported way to
+write one; `/generate-tool <description>` has the model write it first and then
+takes the same path. Both enforce the same pipeline:
+
+1. **Structural validation** — the source must parse and must define a
+   top-level `register(registry)` that actually registers something.
+2. **Out-of-process import probe** — the module is imported in a subprocess and
+   reports the tools it registers, so a module that raises, blocks, or exits
+   cannot take the live session with it.
+3. **Human confirmation** — activation runs the module inside the agent
+   process, so it requires an explicit approval. The approval is recorded
+   against a hash of the file's contents in `~/.agent/tools/.approved.json`: it
+   survives restarts, and editing the file revokes it.
+4. **Hot load** — on approval the tool is registered in the running session; no
+   restart and no manual file renaming.
+
+Third-party packages go through `install_tool_dependency`, which runs
+`pip install --target ~/.agent/tools/_deps`. That directory is prepended to
+`sys.path` when tools load, so a tool's dependency never enters the active
+project or the ambient interpreter. Installing packages from the `shell` tool
+(`pip install`, `uv add`, `poetry add`, …) requires confirmation at every
+permission level for the same reason.
 
 Behaviour guarantees:
 
@@ -753,7 +784,8 @@ Behaviour guarantees:
 - Shell commands are risk-classified: high-risk commands are rejected, restricted commands return a confirmation token before they may run
 - Shell working-directory changes must use the tool `cwd` parameter; inline `cd`/shell control operators are rejected
 - Audio transcription commands are executed as argv, not via shell string interpolation
-- User Python tools are not loaded by default; enabling them trusts and executes local Python code in-process
+- User Python tools are not loaded by default; enabling them trusts and executes local Python code in-process, and individual tools can instead be approved one at a time by content hash
+- Third-party packages for user tools install into `~/.agent/tools/_deps`, never into the active project or the ambient interpreter
 - Tool payloads are structured JSON where possible
 - Shell calls are timeout-bounded and security-checked
 - Shell commands are validated against a blocked list (`rm`, `dd`, `mkfs`, `shred`, etc.)

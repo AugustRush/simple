@@ -381,17 +381,25 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         if isinstance(user_tools_cfg, dict)
         else False
     )
-    loaded_user_tools: list[str] = []
-    if user_tools_enabled:
-        loaded_user_tools = user_tool_catalog.load_into_registry(registry)
-        if loaded_user_tools and announce:
+    # Two admission modes, never zero.  Enabling user_tools trusts the whole
+    # directory; leaving it off still loads the individual tools the user
+    # approved by hand, so a tool created and confirmed in an earlier session
+    # keeps working instead of silently vanishing on restart.
+    loaded_user_tools = user_tool_catalog.load_into_registry(
+        registry, require_approval=not user_tools_enabled
+    )
+    if announce:
+        if loaded_user_tools:
+            scope = "all" if user_tools_enabled else "approved"
             console.print(
-                "[green]User tools loaded:[/green] " + ", ".join(loaded_user_tools)
+                f"[green]User tools loaded ({scope}):[/green] "
+                + ", ".join(loaded_user_tools)
             )
-    elif announce:
-        console.print(
-            "[dim]User Python tools disabled; set user_tools.enabled=true to load trusted ~/.agent/tools/*.py[/dim]"
-        )
+        elif not user_tools_enabled:
+            console.print(
+                "[dim]No approved user tools; create one with create_tool, or set "
+                "user_tools.enabled=true to load every ~/.agent/tools/*.py[/dim]"
+            )
     agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
     base_system_prompt = system_prompt
 

@@ -114,6 +114,12 @@ def test_background_worker_stop_cancels_active_job_cleanly(capsys):
 
 
 def test_process_one_job_materializes_resolved_fact_from_identity_entry(tmp_path):
+    """Consolidated identity prose becomes a fact, so a restart still has it.
+
+    It becomes ``identity_note`` and not ``name``: reading a name out of a
+    paragraph is a judgement about what a sentence means, and only a deliberate
+    ``set_identity`` call states that.
+    """
     from agent import LTMEntry
 
     ctx_mgr, staging = _build_context_manager(tmp_path)
@@ -143,9 +149,11 @@ def test_process_one_job_materializes_resolved_fact_from_identity_entry(tmp_path
 
     asyncio.run(run_once())
 
-    facts = ctx_mgr.store.read_resolved_facts(subject="assistant", predicate="name")
+    facts = ctx_mgr.store.read_resolved_facts(
+        subject="assistant", predicate="identity_note"
+    )
 
-    assert [fact.value for fact in facts] == ["阿福"]
+    assert [fact.value for fact in facts] == ["助手的名字是阿福"]
 
 
 def test_process_one_job_preserves_turns_appended_during_consolidation(tmp_path):

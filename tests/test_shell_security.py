@@ -227,7 +227,9 @@ def test_shell_security_script_execution_runs_automatically(
         "perl script.pl",
         "php script.php",
         "osascript control.scpt",
-        "python3 -m pip install requests",
+        # `-m` is module execution, not inline code. (Not an install: those are
+        # gated separately — see the package-install tests below.)
+        "python3 -m pytest tests",
         "python3 -",
     ],
 )
@@ -750,3 +752,76 @@ def test_approval_path_is_unaffected_by_the_reject_capability():
     shell_command_check(_DANGEROUS, scope=scope)
     assert shell_approve_single_pending(scope) is not None
     assert shell_session_allowlist_contains(_DANGEROUS, scope=scope) is True
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "pip install markdown",
+        "pip3 install markdown",
+        "python -m pip install markdown",
+        "python3 -mpip install markdown",
+        "pip uninstall markdown",
+        "uv add markdown",
+        "uv remove markdown",
+        "uv pip install markdown",
+        "poetry add markdown",
+        "poetry remove markdown",
+        "pipenv install markdown",
+    ],
+)
+def test_package_installs_need_confirmation_even_at_full_permission(command):
+    """The bug this guards: a tool's dependency silently entering the project."""
+    from agent.security.shell import shell_command_check
+
+    result = shell_command_check(command, permission_level="full")
+
+    assert result.allowed is False, command
+    assert result.requires_confirmation is True
+    assert result.confirmation_token
+    assert "install_tool_dependency" in result.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        # Installing somewhere the project does not own is the supported path.
+        "pip install --target /tmp/deps markdown",
+        "pip install --target=/tmp/deps markdown",
+        "uv pip install --target /tmp/deps markdown",
+        # Restoring an environment from an existing manifest changes no manifest.
+        "uv sync",
+        "uv lock",
+        "uv run pytest",
+        "poetry install",
+        "pipenv install",
+        # Read-only package commands.
+        "pip list",
+        "pip show markdown",
+        # Unrelated ecosystems keep their existing treatment.
+        "npm install lodash",
+    ],
+)
+def test_non_mutating_package_commands_stay_allowed(command):
+    from agent.security.shell import shell_command_check
+
+    result = shell_command_check(command, permission_level="full")
+
+    assert result.allowed is True, f"{command}: {result.reason}"
+
+
+def test_package_install_confirmation_is_redeemable_for_the_session():
+    """Deliberate project dependency work stays possible — it just needs a yes."""
+    from agent.security.shell import (
+        shell_approve_single_pending,
+        shell_command_check,
+    )
+
+    scope = _consent_scope()
+    first = shell_command_check("uv add markdown", scope=scope, permission_level="full")
+    assert first.requires_confirmation is True
+
+    assert shell_approve_single_pending(scope) is not None
+
+    second = shell_command_check("uv add markdown", scope=scope, permission_level="full")
+    assert second.allowed is True

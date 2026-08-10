@@ -961,11 +961,15 @@ def test_evolution_generate_tool_reloads_recomposes_and_returns_status(monkeypat
     class Engine:
         async def generate_tool(self, description, registry):
             calls.append((description, registry))
-            return "generated.py"
+            return {
+                "ok": True,
+                "tool_id": "release_checker",
+                "summary_text": "Created user tool 'release_checker'.",
+            }
 
     class UserTools:
-        def load_into_registry(self, registry):
-            calls.append(("reload", registry))
+        def load_into_registry(self, registry, **kwargs):
+            raise AssertionError("the engine owns loading, not the command")
 
     class ForbiddenConsole:
         def print(self, *args, **kwargs):
@@ -1002,10 +1006,12 @@ def test_evolution_generate_tool_reloads_recomposes_and_returns_status(monkeypat
         state,
     )
 
-    assert calls == [("Build a Release Checker", registry), ("reload", registry)]
+    assert calls == [("Build a Release Checker", registry)]
     assert state.ctx.system_prompt == "COMPOSED::evolved base"
     assert state.system_prompt_override == "COMPOSED::evolved base"
-    assert result.response_text == "Tool generated and command catalog refreshed."
+    assert result.response_text == (
+        "Created user tool 'release_checker'. Command catalog refreshed."
+    )
 
 
 def test_evolution_generate_tool_propagates_engine_failure_without_reload(
@@ -1022,10 +1028,10 @@ def test_evolution_generate_tool_propagates_engine_failure_without_reload(
     class Engine:
         async def generate_tool(self, description, registry):
             calls.append("generate")
-            return failure
+            return {"ok": False, "error": failure, "stage": "validate"}
 
     class UserTools:
-        def load_into_registry(self, registry):
+        def load_into_registry(self, registry, **kwargs):
             calls.append("reload")
 
     def compose(*args, **kwargs):
@@ -1057,7 +1063,41 @@ def test_evolution_generate_tool_propagates_engine_failure_without_reload(
     assert state.ctx.system_prompt == "old"
 
 
+def test_evolution_generate_tool_surfaces_pending_confirmation_as_warning():
+    """An unapproved tool is a question for the user, not a command failure."""
+    from types import SimpleNamespace
+
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+
+    guidance = "工具 `demo` 已通过检查,请回复『同意』后重试。"
+
+    class Engine:
+        async def generate_tool(self, description, registry):
+            return {
+                "ok": False,
+                "cancelled": True,
+                "requires_confirmation": True,
+                "confirmation_guidance": guidance,
+                "stage": "approval",
+            }
+
+    plugin = EvolutionPlugin()
+    plugin._engine = Engine()
+
+    result = _run_evolution_command(
+        plugin,
+        "/generate-tool demo",
+        {"registry": object()},
+        SimpleNamespace(ctx=SimpleNamespace(system_prompt="old")),
+    )
+
+    assert result.response_text == guidance
+    assert result.level == "warning"
+    assert not result.error
+
+
 def test_evolution_stats_returns_markdown_text_without_console(monkeypatch):
+
     from types import SimpleNamespace
 
     import agent._builtin.plugins.evolution as evolution_module

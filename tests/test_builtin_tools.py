@@ -1888,3 +1888,46 @@ def test_schedule_create_is_idempotent_for_same_task_signature(tmp_path):
     assert second["task"]["id"] == first["task"]["id"]
     assert second["task"]["existing"] is True
     assert [task.id for task in tasks] == [first["task"]["id"]]
+
+
+def test_set_identity_records_a_setting_the_prompt_reads_back(tmp_path):
+    tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    result = json.loads(
+        asyncio.run(
+            registry.call(
+                "set_identity",
+                {"name": "小八", "persona": "一位可爱的小女孩"},
+            )
+        )
+    )
+
+    assert result["ok"] is True
+    assert result["applied"] == {"name": "小八", "identity_note": "一位可爱的小女孩"}
+    resolved = {
+        fact.predicate: fact.value
+        for fact in tools.memory.store.read_resolved_facts(subject="assistant")
+    }
+    assert resolved["name"] == "小八"
+    assert resolved["identity_note"] == "一位可爱的小女孩"
+
+
+def test_set_identity_needs_something_to_set(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    result = json.loads(asyncio.run(registry.call("set_identity", {})))
+
+    assert result["ok"] is False
+    assert "at least one" in result["error"]
+
+
+def test_set_identity_clears_a_field_with_an_empty_string(tmp_path):
+    tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    asyncio.run(registry.call("set_identity", {"role": "编程助手"}))
+    asyncio.run(registry.call("set_identity", {"role": ""}))
+
+    assert (
+        tools.memory.store.read_resolved_facts(subject="assistant", predicate="role")
+        == []
+    )

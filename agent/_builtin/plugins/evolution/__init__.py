@@ -285,24 +285,24 @@ class EvolutionPlugin:
                 level="warning",
             )
         description = parts[1].strip()
-        generation_result = await self._engine.generate_tool(
+        outcome = await self._engine.generate_tool(
             description, components["registry"]
         )
-        if isinstance(generation_result, str) and generation_result.startswith(
-            "Tool generation failed:"
-        ):
-            return CommandResult(
-                response_text=generation_result,
-                level="error",
-                error=generation_result,
+        # The engine owns validation, dependency installation, approval, and
+        # loading; this handler only turns its verdict into a channel reply.
+        if not isinstance(outcome, dict):
+            outcome = {"ok": False, "error": str(outcome)}
+        if not outcome.get("ok"):
+            message = str(
+                outcome.get("confirmation_guidance")
+                or outcome.get("error")
+                or "Tool generation failed."
             )
-        if isinstance(generation_result, str) and generation_result.startswith(
-            "Tool generated for review"
-        ):
-            return CommandResult(response_text=generation_result)
-        user_tool_catalog = components.get("user_tool_catalog")
-        if user_tool_catalog is not None and components.get("user_tools_enabled", False):
-            user_tool_catalog.load_into_registry(components["registry"])
+            if outcome.get("requires_confirmation"):
+                return CommandResult(response_text=message, level="warning")
+            return CommandResult(
+                response_text=message, level="error", error=message
+            )
         state = self._current_state(components)
         base_prompt = getattr(
             state,
@@ -318,8 +318,12 @@ class EvolutionPlugin:
         ctx = self._current_ctx(components)
         if ctx is not None:
             ctx.system_prompt = system_prompt
+        summary = str(
+            outcome.get("summary_text")
+            or f"Tool '{outcome.get('tool_id', '')}' created."
+        )
         return CommandResult(
-            response_text="Tool generated and command catalog refreshed."
+            response_text=f"{summary} Command catalog refreshed."
         )
 
     async def _handle_stats(self, raw_cmd: str, components: dict) -> Any:

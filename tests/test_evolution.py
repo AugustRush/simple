@@ -328,31 +328,157 @@ def test_parse_tool_outcomes_reads_all_anthropic_tool_results():
     ]
 
 
-def test_generate_tool_uses_openai_chat_api(tmp_path, monkeypatch):
-    import asyncio
-    import agent as agent_module
-    from agent import EvolutionEngine, MemoryPalace, ToolRegistry
+_SAMPLE_TOOL_SOURCE = '''```python
+# requires: none
+# tool_id: hello_world
+
+def register(registry):
+    async def hello_world(name: str) -> str:
+        try:
+            return f"hello {name}"
+        except Exception as exc:
+            return f"hello_world failed: {exc}"
+
+    registry.register(
+        "hello_world",
+        "Greet someone.",
+        {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Who."}},
+            "required": ["name"],
+        },
+        hello_world,
+    )
+```'''
+
+
+class _CodeGeneratingCompletions:
+    def __init__(self, content):
+        self.calls = []
+        self._content = content
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return _FakeOpenAIResponse(self._content)
+
+
+class _CodeGeneratingClient:
+    def __init__(self, content=_SAMPLE_TOOL_SOURCE):
+        self.chat = type(
+            "Chat", (), {"completions": _CodeGeneratingCompletions(content)}
+        )()
+
+
+def _tool_engine(client, tmp_path, monkeypatch):
+    from agent import EvolutionEngine, MemoryPalace
+    from agent import shared
 
     tools_dir = tmp_path / "tools"
-    monkeypatch.setattr(agent_module, "TOOLS_DIR", tools_dir)
-
-    client = _FakeOpenAIClient()
-    engine = EvolutionEngine(
-        client=client,
-        model="qwen",
-        memory=MemoryPalace(
-            base_dir=tmp_path / "memory",
-            context_dir=tmp_path / "context",
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(shared, "TOOLS_DIR", tools_dir)
+    return (
+        EvolutionEngine(
+            client=client,
+            model="qwen",
+            memory=MemoryPalace(
+                base_dir=tmp_path / "memory",
+                context_dir=tmp_path / "context",
+            ),
+            api_format="openai",
         ),
-        api_format="openai",
+        tools_dir,
     )
 
-    result = asyncio.run(engine.generate_tool("hello world tool", ToolRegistry()))
 
-    assert "Tool generated for review" in result
+def test_generate_tool_activates_after_approval(tmp_path, monkeypatch):
+    import asyncio
+    from agent import ToolRegistry
+    from agent.security import tool_approval
+
+    async def _approve(**kwargs):
+        return True, False
+
+    monkeypatch.setattr(tool_approval, "confirm_tool_activation", _approve)
+
+    client = _CodeGeneratingClient()
+    engine, tools_dir = _tool_engine(client, tmp_path, monkeypatch)
+    registry = ToolRegistry()
+
+    result = asyncio.run(engine.generate_tool("greet someone", registry))
+
+    assert result["ok"] is True, result
+    assert result["tool_id"] == "hello_world"
+    assert (tools_dir / "hello_world.py").is_file()
+    # The candidate never lingers outside the catalog's discovery pattern.
+    assert not list(tools_dir.glob(".candidate_*"))
+    assert not list(tools_dir.glob("*.pending"))
+    # And it is callable in this session, not merely written to disk.
+    assert "hello_world" in registry.list_tools()
     assert client.chat.completions.calls
-    assert list(tools_dir.glob("auto_*.py.pending"))
-    assert not list(tools_dir.glob("auto_*.py"))
+
+
+def test_generate_tool_does_not_activate_without_approval(tmp_path, monkeypatch):
+    """A tool nobody approved must not become a file the catalog can load."""
+    import asyncio
+    from agent import ToolRegistry
+
+    client = _CodeGeneratingClient()
+    engine, tools_dir = _tool_engine(client, tmp_path, monkeypatch)
+    registry = ToolRegistry()
+
+    result = asyncio.run(engine.generate_tool("greet someone", registry))
+
+    assert result["ok"] is False
+    assert result["cancelled"] is True
+    assert not list(tools_dir.glob("*.py"))
+    assert "hello_world" not in registry.list_tools()
+
+
+def test_generate_tool_rejects_source_without_register(tmp_path, monkeypatch):
+    import asyncio
+    from agent import ToolRegistry
+
+    client = _CodeGeneratingClient("```python\nx = 1\n```")
+    engine, tools_dir = _tool_engine(client, tmp_path, monkeypatch)
+
+    result = asyncio.run(engine.generate_tool("useless tool", ToolRegistry()))
+
+    assert result["ok"] is False
+    assert result["error"].startswith("Tool generation failed:")
+    assert "register" in result["error"]
+    assert not list(tools_dir.glob("*.py"))
+    # A rejected first attempt is retried once with the failure fed back.
+    assert len(client.chat.completions.calls) == 2
+
+
+def test_extract_python_source_handles_fence_variants():
+    from agent.evolution import _extract_python_source
+
+    assert _extract_python_source("```py\ndef register(r): pass\n```") == (
+        "def register(r): pass"
+    )
+    assert _extract_python_source("Here you go:\n```PYTHON\nx = 1\n```\nDone") == "x = 1"
+    # An unclosed fence still yields the code rather than nothing.
+    assert _extract_python_source("```python\nx = 2\n") == "x = 2"
+    # No fence at all: the reply is the module.
+    assert _extract_python_source("x = 3") == "x = 3"
+    # Example block plus the real answer: the substantial block wins.
+    assert (
+        _extract_python_source("```python\npass\n```\n```python\ndef register(r):\n    r.register()\n```")
+        == "def register(r):\n    r.register()"
+    )
+
+
+def test_declared_requirements_parses_and_filters_header():
+    from agent.evolution import _declared_requirements
+
+    assert _declared_requirements("# requires: markdown, httpx>=0.27\nx = 1") == [
+        "markdown",
+        "httpx>=0.27",
+    ]
+    assert _declared_requirements("# requires: none\nx = 1") == []
+    # Anything that is not a plain requirement is dropped, never shelled out.
+    assert _declared_requirements("# requires: ./evil; rm -rf /\nx = 1") == []
 
 
 def test_apply_best_prompt_rejects_path_traversal_versions(tmp_path, monkeypatch):

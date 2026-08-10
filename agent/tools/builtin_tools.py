@@ -501,6 +501,42 @@ class BuiltinTools:
         )
 
         r.register(
+            "set_identity",
+            "Set who the assistant is (or record who the user is). Use this "
+            "whenever the user names, renames, or redefines the persona — the "
+            "newest setting replaces the old one.",
+            {
+                "type": "object",
+                "properties": {
+                    "subject": {
+                        "type": "string",
+                        "enum": ["assistant", "user"],
+                        "description": "Whose identity this is. Defaults to assistant.",
+                        "default": "assistant",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "What they are called. Omit to leave unchanged.",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Their role, e.g. '编程助手'. Omit to leave unchanged.",
+                    },
+                    "persona": {
+                        "type": "string",
+                        "description": (
+                            "Free-text persona/setting in the user's own wording, "
+                            "e.g. '一位可爱的小女孩'. Omit to leave unchanged."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+            self._set_identity,
+            source="builtin",
+        )
+
+        r.register(
             "memory_read",
             "Read a memory chapter file.",
             {
@@ -914,6 +950,204 @@ class BuiltinTools:
             self._list_installed_plugins,
             source="builtin",
         )
+
+        # ── User tool authoring ──────────────────────────────────────────
+        #
+        # This is the supported way to answer "build me a tool that ...".
+        # Writing a .py file with write_file/shell does NOT create a tool,
+        # and installing packages with pip/uv from the shell would mutate
+        # the user's project — use install_tool_dependency instead.
+
+        r.register(
+            "create_tool",
+            (
+                "Create a new reusable user tool from Python source and activate it for "
+                "this and future sessions. USE THIS whenever the user asks to build, add, "
+                "or generate a tool/capability — never hand-write a .py file into the "
+                "tools directory and never pip-install from the shell. The module must "
+                "define `register(registry)` that calls "
+                "`registry.register(name, description, json_schema, async_fn)` for each "
+                "tool it provides. The source is syntax-checked, then imported in a "
+                "separate process to prove it loads, then shown to the user for approval "
+                "before anything runs in the agent. Third-party imports must be installed "
+                "first with install_tool_dependency."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "tool_id": {
+                        "type": "string",
+                        "description": (
+                            "Module id under ~/.agent/tools (lowercase letters, digits, "
+                            "underscores), e.g. 'markdown_to_html'."
+                        ),
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": (
+                            "Complete Python module source defining register(registry). "
+                            "Tool functions must be async and accept keyword arguments "
+                            "matching their JSON schema."
+                        ),
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "Required. What this tool does and why the user needs it.",
+                    },
+                },
+                "required": ["tool_id", "code", "intent"],
+            },
+            self._create_tool,
+            source="builtin",
+            capabilities=("state_write", "requires_intent"),
+        )
+
+        r.register(
+            "update_tool",
+            (
+                "Replace the source of an existing user tool and reactivate it. Same "
+                "validation and approval path as create_tool; because approval is bound "
+                "to the file's contents, a changed tool is re-confirmed."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "tool_id": {
+                        "type": "string",
+                        "description": "Existing tool module id under ~/.agent/tools.",
+                    },
+                    "code": {
+                        "type": "string",
+                        "description": "Complete replacement module source defining register(registry).",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "Required. What is changing and why.",
+                    },
+                },
+                "required": ["tool_id", "code", "intent"],
+            },
+            self._update_tool,
+            source="builtin",
+            capabilities=("state_write", "requires_intent"),
+        )
+
+        r.register(
+            "delete_tool",
+            "Delete a user tool, revoke its approval, and unload it from the session.",
+            {
+                "type": "object",
+                "properties": {
+                    "tool_id": {
+                        "type": "string",
+                        "description": "Tool module id under ~/.agent/tools.",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "Required. Why this tool is being removed.",
+                    },
+                },
+                "required": ["tool_id", "intent"],
+            },
+            self._delete_tool,
+            source="builtin",
+            capabilities=("state_write", "requires_intent"),
+        )
+
+        r.register(
+            "list_tools",
+            (
+                "List user tools on disk with their approval and load state, plus the "
+                "packages installed in the isolated tool dependency directory. Use before "
+                "creating a tool to check whether one already exists."
+            ),
+            {"type": "object", "properties": {}, "required": []},
+            self._list_user_tools,
+            source="builtin",
+        )
+
+        r.register(
+            "install_tool_dependency",
+            (
+                "Install a Python package that a user tool needs. The package goes into "
+                "the agent's isolated dependency directory (~/.agent/tools/_deps) and is "
+                "importable by user tools. This is the ONLY supported way to add a Python "
+                "dependency: running pip/uv/poetry from the shell would modify the "
+                "user's project or the ambient interpreter and is blocked."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "package": {
+                        "type": "string",
+                        "description": (
+                            "Distribution name with optional extras and one version "
+                            "constraint, e.g. 'markdown', 'httpx[http2]', 'markdown>=3.5'."
+                        ),
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": "Required. Which tool needs this package and why.",
+                    },
+                },
+                "required": ["package", "intent"],
+            },
+            self._install_tool_dependency,
+            source="builtin",
+            capabilities=("state_write", "requires_intent"),
+        )
+
+    # ── User tool authoring implementations ───────────────────────────────
+
+    async def _create_tool(
+        self, tool_id: str, code: str, intent: str = ""
+    ) -> dict:
+        from agent.tools import user_tools
+
+        normalized = user_tools.normalize_tool_id(tool_id)
+        if not normalized:
+            return {
+                "ok": False,
+                "error": (
+                    f"Could not derive a usable module id from '{tool_id}'. Use "
+                    "lowercase letters, digits, and underscores."
+                ),
+            }
+        return await user_tools.author_tool(
+            normalized, code, registry=self.registry, replace=False
+        )
+
+    async def _update_tool(
+        self, tool_id: str, code: str, intent: str = ""
+    ) -> dict:
+        from agent.tools import user_tools
+
+        normalized = user_tools.normalize_tool_id(tool_id)
+        if not normalized:
+            return {"ok": False, "error": f"Invalid tool id '{tool_id}'"}
+        return await user_tools.author_tool(
+            normalized, code, registry=self.registry, replace=True
+        )
+
+    async def _delete_tool(self, tool_id: str, intent: str = "") -> dict:
+        from agent.tools import user_tools
+
+        normalized = user_tools.normalize_tool_id(tool_id)
+        if not normalized:
+            return {"ok": False, "error": f"Invalid tool id '{tool_id}'"}
+        return user_tools.remove_tool(normalized, registry=self.registry)
+
+    def _list_user_tools(self) -> dict:
+        from agent.tools import user_tools
+
+        return user_tools.describe_tools(self.registry)
+
+    async def _install_tool_dependency(
+        self, package: str, intent: str = ""
+    ) -> dict:
+        from agent.tools import user_tools
+
+        return await user_tools.install_dependency(package)
 
     # ── Plugin install / uninstall implementations ────────────────────────
 
@@ -2264,6 +2498,25 @@ class BuiltinTools:
             path=f"{normalized}/{name}",
             bytes=len(content.encode("utf-8")),
         )
+
+    def _set_identity(
+        self,
+        subject: str = "assistant",
+        name: Optional[str] = None,
+        role: Optional[str] = None,
+        persona: Optional[str] = None,
+    ) -> dict[str, Any]:
+        if name is None and role is None and persona is None:
+            return self._error(
+                "Nothing to set: provide at least one of name, role, or persona."
+            )
+        try:
+            applied = self.memory.set_identity(
+                subject=subject, name=name, role=role, persona=persona
+            )
+        except ValueError as exc:
+            return self._error(str(exc))
+        return self._ok(subject=subject, applied=applied)
 
     def _memory_read(self, chapter: str, name: str) -> dict[str, Any]:
         content = self.memory.read(chapter, name)

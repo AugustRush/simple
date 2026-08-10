@@ -50,6 +50,7 @@ agent/ralph/verify.py
 agent/runtime/__init__.py
 agent/runtime/contracts.py
 agent/runtime/heartbeat.py
+agent/runtime/lock.py
 agent/scheduler/__init__.py
 agent/scheduler/delivery.py
 agent/scheduler/models.py
@@ -61,6 +62,7 @@ agent/security/filesystem_sandbox.py
 agent/security/network.py
 agent/security/plugin_approval.py
 agent/security/shell.py
+agent/security/tool_approval.py
 agent/skills/__init__.py
 agent/skills/catalog.py
 agent/tools/__init__.py
@@ -68,6 +70,7 @@ agent/tools/builtin_tools.py
 agent/tools/executor.py
 agent/tools/files.py
 agent/tools/runtime.py
+agent/tools/user_tools.py
 channels/__init__.py
 channels/feishu.py
 simple.egg-info/PKG-INFO
@@ -91,6 +94,7 @@ tests/test_feishu_channel.py
 tests/test_file_service.py
 tests/test_filesystem_sandbox.py
 tests/test_heartbeat.py
+tests/test_home_lock.py
 tests/test_lexical.py
 tests/test_ltm_store.py
 tests/test_memory_benchmark.py

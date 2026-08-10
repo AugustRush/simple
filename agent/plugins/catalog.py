@@ -232,6 +232,7 @@ _OUR_TO_CC_TOOL_NAME = {
     # Memory & context
     "memory_read": "Read",
     "memory_write": "Write",
+    "set_identity": "Write",
     "memory_search": "Grep",
     # Web
     "web_search": "WebSearch",

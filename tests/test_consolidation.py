@@ -1655,7 +1655,8 @@ def test_retrieve_implicit_context_includes_assistant_identity_after_restart(tmp
     assert "assistant.name = 阿福" in result
 
 
-def test_record_turn_persists_assistant_identity_fact_before_consolidation(tmp_path):
+def test_set_identity_survives_restart(tmp_path):
+    """Identity is a setting, so it must be there before anything is asked."""
     from agent import (
         LTMStore,
         ConsolidationEngine,
@@ -1667,17 +1668,7 @@ def test_record_turn_persists_assistant_identity_fact_before_consolidation(tmp_p
     context_dir = tmp_path / "context"
     memory_dir = tmp_path / "memory"
     store = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
-    ctx_mgr = ContextManager(
-        store=store,
-        retriever=LocalRetriever(),
-        consolidation=ConsolidationEngine(store=store),
-        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
-    )
-
-    ctx_mgr.record_turn(
-        user_content="以后你叫阿福。",
-        assistant_content="好，从现在开始我叫阿福。",
-    )
+    store.set_identity(name="阿福", persona="一只可爱的小狗")
 
     reloaded_store = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
     reloaded_ctx = ContextManager(
@@ -1688,27 +1679,139 @@ def test_record_turn_persists_assistant_identity_fact_before_consolidation(tmp_p
     )
 
     result = reloaded_ctx.retrieve_implicit_context(
-        "你叫什么名字",
+        "今天天气怎么样",  # nothing to do with identity — it is injected anyway
         top_k=1,
         current_messages=[],
     )
 
     assert "assistant.name = 阿福" in result
+    assert "一只可爱的小狗" in result
 
 
-def test_record_turn_extracts_identity_from_assistant_message_alone(tmp_path):
+def test_later_set_identity_replaces_the_earlier_one(tmp_path):
+    """The reported bug: a new persona was set and the restart kept the old."""
+    from agent import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.set_identity(name="小八", persona="一只可爱的小狗")
+    store.set_identity(persona="一位可爱的小女孩")
+
+    resolved = {
+        fact.predicate: fact.value
+        for fact in store.read_resolved_facts(subject="assistant")
+    }
+
+    assert resolved["identity_note"] == "一位可爱的小女孩"
+    # A field the second call left alone keeps its value.
+    assert resolved["name"] == "小八"
+
+
+def test_set_identity_outranks_an_older_consolidated_note(tmp_path):
+    """A deliberate setting beats whatever consolidation extracted before it."""
+    from agent import LTMEntry, LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.add_entry(
+        LTMEntry(
+            id="consolidated-note",
+            category="identity",
+            entity="assistant",
+            memory_type="self_identity",
+            content="助手设定为一只可爱的小狗。",
+            importance=0.9,
+            created_at="2026-04-13 10:00:00.000000 UTC",
+            updated_at="2026-04-13 10:00:00.000000 UTC",
+        )
+    )
+    store.set_identity(persona="一位可爱的小女孩")
+
+    facts = store.read_resolved_facts(subject="assistant", predicate="identity_note")
+
+    assert [fact.value for fact in facts] == ["一位可爱的小女孩"]
+
+
+def test_conversation_prose_never_sets_identity(tmp_path):
+    """Chat is not a setting. Guessing from it renamed the agent "什么"."""
     ctx_mgr = make_ctx_manager(tmp_path)
 
     ctx_mgr.record_turn(
-        user_content="请介绍一下你自己。",
+        user_content="你叫什么名字？",
         assistant_content="你好，我叫阿福。",
     )
 
-    facts = ctx_mgr.store.read_resolved_facts(
-        subject="assistant",
-        predicate="name",
+    assert ctx_mgr.store.read_resolved_facts(subject="assistant", predicate="name") == []
+    assert ctx_mgr.store.read_resolved_facts(subject="user", predicate="name") == []
+
+
+def test_manual_identity_note_reaches_the_startup_prompt(tmp_path):
+    """A hand-written note used to surface only if a query happened to ask."""
+    from agent import (
+        LTMStore,
+        ConsolidationEngine,
+        LocalRetriever,
+        ContextManager,
+        StagingBuffer,
     )
-    assert [fact.value for fact in facts] == ["阿福"]
+
+    context_dir = tmp_path / "context"
+    memory_dir = tmp_path / "memory"
+    store = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
+    store.upsert_manual_note("identity", "assistant", "助手设定为一位可爱的小女孩。")
+
+    reloaded_store = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
+    reloaded_ctx = ContextManager(
+        store=reloaded_store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=reloaded_store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-2"),
+    )
+
+    result = reloaded_ctx.retrieve_implicit_context(
+        "今天天气怎么样",
+        top_k=1,
+        current_messages=[],
+    )
+
+    assert "一位可爱的小女孩" in result
+
+
+def test_startup_retracts_facts_left_by_the_removed_extractor(tmp_path):
+    """An existing store carries guesses from code that no longer exists."""
+    from agent import FactAssertion, LTMStore
+
+    context_dir = tmp_path / "context"
+    memory_dir = tmp_path / "memory"
+    store = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
+    store.add_fact_assertion(
+        FactAssertion(
+            id="scraped-from-a-question",
+            subject="assistant",
+            predicate="name",
+            value="什么",
+            source_kind="user_statement",
+            confidence=1.0,
+        )
+    )
+    assert store.read_resolved_facts(subject="assistant", predicate="name")
+
+    reloaded = LTMStore(context_dir=context_dir, memory_dir=memory_dir)
+
+    assert reloaded.read_resolved_facts(subject="assistant", predicate="name") == []
+    # And the slot is free for a real setting.
+    reloaded.set_identity(name="小八")
+    assert [
+        fact.value
+        for fact in reloaded.read_resolved_facts(subject="assistant", predicate="name")
+    ] == ["小八"]
+
+
+def test_set_identity_rejects_a_subject_it_does_not_own(tmp_path):
+    from agent import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+
+    with pytest.raises(ValueError):
+        store.set_identity(subject="某个第三方", name="X")
 
 
 def test_retrieve_implicit_context_excludes_conflicted_assistant_identity(tmp_path):

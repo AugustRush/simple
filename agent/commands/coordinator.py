@@ -726,20 +726,40 @@ class CommandCoordinator:
         )
         # Plugin installs with executable content use the same chat-approval
         # pattern: one unexpired pending record for the scope, redeemable by
-        # a short approval reply.
+        # a short approval reply.  User-tool activations share the store, so
+        # the redemption message has to name the right side effect.
         plugin_pending = plugin_install_pending_for_scope(scope)
         if plugin_pending:
             if len(plugin_pending) > 1:
                 self._safe_status(
                     sink,
-                    f"当前有 {len(plugin_pending)} 个插件安装待确认，无法用“批准”批量放行；"
-                    "请逐次确认。",
+                    f"当前有 {len(plugin_pending)} 个待确认的安装/激活操作，"
+                    "无法用“批准”批量放行；请逐次确认。",
                     level="warning",
                 )
                 return turn_input
             source = plugin_install_approve_single(scope)
             if source is None:
                 return turn_input
+            from agent.security.tool_approval import (
+                describe_tool_source,
+                is_tool_source,
+            )
+
+            if is_tool_source(source):
+                tool_id = describe_tool_source(source)
+                self._safe_status(
+                    sink,
+                    f"已批准激活用户工具：{tool_id}。可以用相同参数重试。",
+                    level="info",
+                )
+                return replace(
+                    turn_input,
+                    text=(
+                        f"用户已批准激活工具：{tool_id}。"
+                        "请用完全相同的参数重新调用 create_tool（或 update_tool）。"
+                    ),
+                )
             self._safe_status(
                 sink,
                 f"已批准待确认插件安装：{source}。可以用相同的 source 重试。",

@@ -625,6 +625,120 @@ def _find_shell_operator(command: str) -> Optional[str]:
     return None
 
 
+# ── Python environment mutation ──────────────────────────────────────────────
+#
+# Installing a package is a durable change to something the agent does not own:
+# the user's project manifest, its lockfile, or the interpreter every other
+# program on the machine shares.  The agent reaches for it most often for its
+# own convenience — a generated tool wants a library — and that motive should
+# never spend the user's project.  `install_tool_dependency` covers that case
+# without touching anything outside ``~/.agent/tools/_deps``, so these commands
+# are worth a human decision even when the session is otherwise unrestricted.
+
+_PYTHON_COMMAND_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
+
+#: Flags that redirect an install away from the ambient/project environment.
+_INSTALL_ISOLATION_FLAGS = ("--target", "-t", "--prefix", "--root")
+
+_MANIFEST_SUBCOMMANDS = {"add", "remove"}
+
+
+def _install_targets_isolated_dir(args: list[str]) -> bool:
+    return any(
+        arg == flag or arg.startswith(f"{flag}=")
+        for arg in args
+        for flag in _INSTALL_ISOLATION_FLAGS
+    )
+
+
+def _first_subcommand(args: list[str]) -> str:
+    for arg in args:
+        if not arg.startswith("-"):
+            return arg
+    return ""
+
+
+def _pip_mutation_reason(args: list[str], label: str) -> Optional[str]:
+    subcommand = _first_subcommand(args)
+    if subcommand not in {"install", "uninstall"}:
+        return None
+    if subcommand == "install" and _install_targets_isolated_dir(args):
+        return None
+    return (
+        f"'{label} {subcommand}' changes the Python environment shared with "
+        "the user's project. To give an agent tool a library, use the "
+        "install_tool_dependency tool, which installs into the agent's "
+        "private dependency directory instead."
+    )
+
+
+def _environment_mutation_reason(
+    tokens: list[str], command_index: int
+) -> Optional[str]:
+    """Why this command would mutate the project or ambient Python env."""
+    words = tokens[command_index:]
+    if not words:
+        return None
+    name = os.path.basename(words[0].strip().lstrip("./"))
+    args = words[1:]
+
+    # `python -m pip install x` is the same act as `pip install x`.
+    if _PYTHON_COMMAND_RE.fullmatch(name):
+        if args and args[0] == "-m" and len(args) > 1:
+            name, args = os.path.basename(args[1]), args[2:]
+        elif args and args[0].startswith("-m") and len(args[0]) > 2:
+            name, args = os.path.basename(args[0][2:]), args[1:]
+        else:
+            return None
+
+    if name in {"pip", "pip3"}:
+        return _pip_mutation_reason(args, name)
+
+    if name == "uv":
+        subcommand = _first_subcommand(args)
+        if subcommand == "pip":
+            rest = args[args.index("pip") + 1 :]
+            return _pip_mutation_reason(rest, "uv pip")
+        if subcommand in _MANIFEST_SUBCOMMANDS:
+            return (
+                f"'uv {subcommand}' rewrites the project's pyproject.toml and "
+                "uv.lock. If this is for an agent tool rather than the "
+                "project, use the install_tool_dependency tool instead."
+            )
+        return None
+
+    if name == "poetry":
+        subcommand = _first_subcommand(args)
+        if subcommand in _MANIFEST_SUBCOMMANDS:
+            return (
+                f"'poetry {subcommand}' rewrites the project's pyproject.toml "
+                "and poetry.lock. If this is for an agent tool rather than "
+                "the project, use the install_tool_dependency tool instead."
+            )
+        return None
+
+    if name == "pipenv":
+        subcommand = _first_subcommand(args)
+        if subcommand not in {"install", "uninstall"}:
+            return None
+        # A bare `pipenv install` restores the existing Pipfile; naming a
+        # package is what edits it.
+        named = [
+            arg
+            for arg in args[args.index(subcommand) + 1 :]
+            if not arg.startswith("-")
+        ]
+        if subcommand == "install" and not named:
+            return None
+        return (
+            f"'pipenv {subcommand}' rewrites the project's Pipfile. If this "
+            "is for an agent tool rather than the project, use the "
+            "install_tool_dependency tool instead."
+        )
+
+    return None
+
+
 def _is_inline_execution(tokens: list[str], command_index: int) -> bool:
     command_name = os.path.basename(tokens[command_index].strip().lstrip("./"))
     for pattern, execution_flags, options_with_values in _INLINE_INTERPRETERS:
@@ -887,6 +1001,26 @@ def shell_command_check(
             risk_level="low",
             reason="command is pre-approved (no confirmation required)",
         )
+
+    # ── Python environment mutation: confirm at every level ──────────────
+    # Deliberately not gated on `effective_level`.  A permissive session means
+    # the user trusts the agent inside its sandbox, not that the agent may
+    # rewrite the project's dependencies on its own initiative.
+    if command_index is not None:
+        environment_reason = _environment_mutation_reason(tokens, command_index)
+        if environment_reason is not None:
+            token = _pending_confirmation(
+                normalized_command,
+                scope=authorization_scope,
+                now=authorization_now,
+            )
+            return ShellCheckResult(
+                allowed=False,
+                risk_level="high",
+                reason=environment_reason,
+                requires_confirmation=True,
+                confirmation_token=token,
+            )
 
     # ── High-risk constructs: confirm at restricted levels ───────────────
     if effective_level in ("ask", "medium") and (

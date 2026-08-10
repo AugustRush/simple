@@ -26,6 +26,7 @@ import mcp
 from agent import shared
 from agent.core.output import OutputSink, _active_sink
 from agent.pathing import path_contains, resolve_workspace_path
+from agent.tools import user_tools
 
 _active_schedule_target: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("_active_schedule_target", default=None)
@@ -192,6 +193,7 @@ class ToolRegistry:
         ("builtin", "transcribe_audio"): frozenset({"read"}),
         ("builtin", "send_file"): frozenset({"side_effect"}),
         ("builtin", "memory_write"): frozenset({"state_write"}),
+        ("builtin", "set_identity"): frozenset({"state_write"}),
         ("builtin", "memory_clear"): frozenset({"state_write"}),
         ("builtin", "schedule_create"): frozenset({"state_write"}),
         ("builtin", "schedule_delete"): frozenset({"state_write"}),
@@ -356,6 +358,11 @@ class ToolRegistry:
         """Capabilities declared by a registered tool (empty if unknown)."""
         tool = self._tools.get(name)
         return tool.capabilities if tool is not None else frozenset()
+
+    def tool_source(self, name: str) -> str:
+        """Registration source of a tool (empty when it is not registered)."""
+        tool = self._tools.get(name)
+        return tool.source if tool is not None else ""
 
     def tools_with_capability(self, capability: str) -> list[str]:
         return [name for name, t in self._tools.items() if capability in t.capabilities]
@@ -594,17 +601,58 @@ class _UserToolRegistryFacade:
 
 
 class UserToolCatalog:
-    """Discover and load user-authored Python tool plugins."""
+    """Discover and load user-authored Python tool plugins.
+
+    Loading executes local Python inside the live session, so the catalog
+    admits a module only when the whole directory is trusted
+    (``user_tools.enabled=true``) or the individual file was approved by
+    content hash.  Approval survives restarts; editing the file does not
+    survive approval.
+    """
 
     def __init__(self, root: Optional[Path] = None):
         self.root = root or shared.TOOLS_DIR
 
-    def load_into_registry(self, registry: ToolRegistry) -> list[str]:
+    @property
+    def deps_dir(self) -> Path:
+        return user_tools.deps_dir(self.root)
+
+    def discover(self) -> list[Path]:
+        """Tool modules on disk, excluding ``_deps`` and other private paths."""
+        if not self.root.is_dir():
+            return []
+        return [
+            path
+            for path in sorted(self.root.rglob("*.py"))
+            if user_tools.is_tool_module(path, self.root)
+        ]
+
+    def tool_id_for(self, path: Path) -> str:
+        return path.relative_to(self.root).with_suffix("").as_posix()
+
+    def load_into_registry(
+        self,
+        registry: ToolRegistry,
+        *,
+        require_approval: bool = False,
+    ) -> list[str]:
+        """Import every admissible tool module and register what it provides.
+
+        With *require_approval* set, only files whose current contents match a
+        recorded approval are loaded — the mode used when ``user_tools`` is
+        not globally enabled, so a tool the user explicitly approved keeps
+        working across restarts without trusting the whole directory.
+        """
         self.root.mkdir(parents=True, exist_ok=True)
+        user_tools.ensure_deps_on_path(self.root)
         registry.unregister_by_source_prefix("user_tool:")
         loaded: list[str] = []
-        for tool_file in sorted(self.root.rglob("*.py")):
-            plugin_id = tool_file.relative_to(self.root).with_suffix("").as_posix()
+        for tool_file in self.discover():
+            plugin_id = self.tool_id_for(tool_file)
+            if require_approval and not user_tools.is_approved(
+                plugin_id, user_tools.file_digest(tool_file), self.root
+            ):
+                continue
             source = f"user_tool:{plugin_id}"
             try:
                 module_name = f"agent_user_tool_{uuid.uuid4().hex}"

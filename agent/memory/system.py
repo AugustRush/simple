@@ -25,6 +25,7 @@ class ContextLimitError(RuntimeError):
 
 
 _FACT_SOURCE_PRECEDENCE = {
+    "identity_directive": 0,
     "user_statement": 0,
     "direct_user": 0,
     "correction": 1,
@@ -79,16 +80,24 @@ _FACT_QUERY_PREDICATE_ALIASES: dict[str, tuple[str, ...]] = {
         "你是什么",
     ),
 }
-_ASSISTANT_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:以后)?你(?:就)?叫([^\s，。,！!?？；;:：]{1,40})"),
-    re.compile(r"你的名字是([^\s，。,！!?？；;:：]{1,40})"),
-    re.compile(r"助手的名字是([^\s，。,！!?？；;:：]{1,40})"),
-    re.compile(r"agent(?:'s)? name is\s+([A-Za-z0-9_-]{1,40})", re.I),
-    re.compile(r"我叫([^\s，。,！!?？；;:：]{1,40})"),
-    re.compile(r"我的名字是([^\s，。,！!?？；;:：]{1,40})"),
-    re.compile(r"(?:my name is|you can call me|i am)\s+([A-Za-z0-9_-]{1,40})", re.I),
-    re.compile(r"(?:your name is|i(?:'ll| will) call you)\s+([A-Za-z0-9_-]{1,40})", re.I),
+# Identity is a setting, so the newest statement of it wins outright and
+# source authority only breaks ties.  Everywhere else a trusted source still
+# outranks a fresher guess.
+_IDENTITY_PREDICATES: tuple[str, ...] = ("name", "role", "identity_note")
+_IDENTITY_SUBJECTS: frozenset[str] = frozenset({"assistant", "user"})
+_RECENCY_GOVERNED_FACTS: frozenset[tuple[str, str]] = frozenset(
+    (subject, predicate)
+    for subject in _IDENTITY_SUBJECTS
+    for predicate in _IDENTITY_PREDICATES
 )
+# Source kinds retired with the pattern-matching identity extractor.  Rows they
+# left behind are not evidence any more, because the code that judged them no
+# longer exists — see LTMStore._retract_inferred_identity_facts.
+_RETIRED_INFERENCE_SOURCE_KINDS: tuple[str, ...] = ("user_statement", "conversation_turn")
+_ASSISTANT_IDENTITY_ENTITIES: frozenset[str] = frozenset(
+    {"assistant", "assistant_identity", "self", "agent"}
+)
+_IDENTITY_NOTE_MAX_CHARS = 600
 
 
 def _now() -> str:
@@ -154,18 +163,17 @@ def _load_fact_value(value_json: str) -> Any:
     return json.loads(value_json)
 
 
-def _extract_assistant_name(text: str) -> str:
-    clean = str(text or "").strip()
-    if not clean:
-        return ""
-    for pattern in _ASSISTANT_NAME_PATTERNS:
-        match = pattern.search(clean)
-        if not match:
-            continue
-        candidate = match.group(1).strip().strip("“”\"'.,!?，。！？：:；;()[]{}")
-        if candidate:
-            return candidate
-    return ""
+def _identity_note_value(text: str) -> str:
+    """The prose of an identity entry, fit to sit in a system prompt.
+
+    Kept verbatim apart from a length bound: tone and persona live in the exact
+    wording, and this module has no business deciding which parts of what the
+    user wrote are the "real" identity.
+    """
+    note = str(text or "").strip()
+    if len(note) > _IDENTITY_NOTE_MAX_CHARS:
+        note = note[:_IDENTITY_NOTE_MAX_CHARS].rstrip() + "…"
+    return note
 
 
 def _lexical_terms(text: str) -> list[str]:
@@ -202,6 +210,19 @@ class MemoryPalace:
         self.store.upsert_manual_note(chapter, name, content, append=append)
         self._files_since_tidy += 1
         self._export_dirty = True
+
+    def set_identity(
+        self,
+        *,
+        subject: str = "assistant",
+        name: Optional[str] = None,
+        role: Optional[str] = None,
+        persona: Optional[str] = None,
+    ) -> dict[str, str]:
+        """Set who the assistant (or the user) is. Later settings override earlier."""
+        return self.store.set_identity(
+            subject=subject, name=name, role=role, persona=persona
+        )
 
     def read(self, chapter: str, name: str) -> str:
         chapter = normalize_memory_chapter(chapter, shared.LEGACY_MEMORY_ALIASES)
@@ -806,10 +827,102 @@ class LTMStore:
         self._ensure_schema()
         self._ensure_fts_index()
         self._cleanup_legacy_artifacts()
+        self._repair_assistant_identity_facts()
         self._meta = {"categories": [], "total_entries": 0}
         self._refresh_indexes()
 
     # ── Persistence ───────────────────────────────────────────────────────────
+
+    def _repair_assistant_identity_facts(self) -> None:
+        """Reconcile stored identity facts with the writers that exist today.
+
+        Two kinds of damage accumulate in an existing store and neither heals
+        on its own, because a fact is only ever written — never revisited.
+
+        The pattern-matching extractor that used to read names out of chat is
+        gone.  Everything it asserted was a guess made by code that no longer
+        exists, and some of those guesses ("你叫什么" → name "什么") were
+        recorded at the highest authority the store has, so nothing later could
+        dislodge them.  Retract the lot by provenance rather than by inspecting
+        values: which rows are unsound is a question about where they came
+        from, and answering it by re-judging the text would just reinstate the
+        guessing this removed.
+
+        An identity note written by hand produced no fact at all, so the last
+        machine-extracted note stayed current long after the user replaced it.
+        Derive the missing facts now, keyed on the entry they came from so a
+        second run adds nothing.
+
+        Best-effort by construction: a store that cannot be repaired is still a
+        store that works, and refusing to start over stale identity would be a
+        far worse failure than carrying it.
+        """
+        try:
+            with self._connect() as conn:
+                retracted = self._retract_inferred_identity_facts(conn)
+                derived = self._derive_missing_identity_facts(conn)
+            for subject, predicate in retracted | derived:
+                self.resolve_fact(subject, predicate)
+        except sqlite3.Error:
+            return
+
+    def _retract_inferred_identity_facts(
+        self, conn: sqlite3.Connection
+    ) -> set[tuple[str, str]]:
+        subject_slots = ",".join("?" * len(_IDENTITY_SUBJECTS))
+        source_slots = ",".join("?" * len(_RETIRED_INFERENCE_SOURCE_KINDS))
+        params = tuple(sorted(_IDENTITY_SUBJECTS)) + _RETIRED_INFERENCE_SOURCE_KINDS
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT subject, predicate FROM fact_assertions
+            WHERE subject IN ({subject_slots})
+              AND source_kind IN ({source_slots})
+              AND status != 'archived'
+            """,
+            params,
+        ).fetchall()
+        if not rows:
+            return set()
+        conn.execute(
+            f"""
+            UPDATE fact_assertions SET status = 'archived', updated_at = ?
+            WHERE subject IN ({subject_slots})
+              AND source_kind IN ({source_slots})
+              AND status != 'archived'
+            """,
+            (_now(),) + params,
+        )
+        return {(str(row["subject"]), str(row["predicate"])) for row in rows}
+
+    def _derive_missing_identity_facts(
+        self, conn: sqlite3.Connection
+    ) -> set[tuple[str, str]]:
+        entity_slots = ",".join("?" * len(_ASSISTANT_IDENTITY_ENTITIES))
+        rows = conn.execute(
+            f"""
+            SELECT * FROM memory_items
+            WHERE category = 'identity' AND entity IN ({entity_slots})
+              AND status NOT IN ('archived', 'superseded')
+            """,
+            tuple(sorted(_ASSISTANT_IDENTITY_ENTITIES)),
+        ).fetchall()
+        if not rows:
+            return set()
+        known = {
+            (str(row["source_id"]), str(row["predicate"]))
+            for row in conn.execute(
+                "SELECT source_id, predicate FROM fact_assertions WHERE subject = 'assistant'"
+            ).fetchall()
+        }
+        touched: set[tuple[str, str]] = set()
+        for row in rows:
+            entry = self._row_to_entry(row)
+            for fact in self._fact_assertions_from_entry(entry):
+                if (str(fact.source_id), fact.predicate) in known:
+                    continue
+                self._insert_fact_assertion(conn, fact)
+                touched.add((fact.subject, fact.predicate))
+        return touched
 
     def _connect(self) -> sqlite3.Connection:
         """Return a thread-local singleton connection with WAL mode enabled.
@@ -1466,42 +1579,48 @@ class LTMStore:
         return self._row_to_entry(row) if row else None
 
     def _fact_assertions_from_entry(self, entry: LTMEntry) -> list[FactAssertion]:
+        """Derive the identity *prose* an identity entry states, and only that.
+
+        An entry is free text — a paragraph the user or consolidation wrote.
+        Reading a name out of it means deciding what a sentence means, which is
+        the model's job, not this module's; the extractor that used to try
+        renamed the agent "什么" the first time somebody asked it its name.  So
+        an entry contributes ``identity_note`` verbatim and nothing else.
+        ``name`` and ``role`` come only from deliberate settings: config
+        bootstrap and :meth:`set_identity`.
+        """
         facts: list[FactAssertion] = []
         category = self.normalize_category_name(entry.category)
         entity = self._normalize_entity(entry.entity, category)
-        memory_type = str(entry.memory_type or "").strip().lower()
-        if category == "identity" and entity == "assistant":
-            name = _extract_assistant_name(entry.content)
-            if name:
-                facts.append(
-                    FactAssertion(
-                        id=_new_id(),
-                        subject="assistant",
-                        predicate="name",
-                        value=name,
-                        source_kind="consolidation_extract",
-                        source_id=entry.id,
-                        source_session=entry.source_session,
-                        confidence=float(entry.confidence or 1.0),
-                        created_at=entry.created_at or _now(),
-                        updated_at=entry.updated_at or _now(),
-                    )
-                )
-            elif memory_type in {"self_identity", "assistant_identity"}:
-                facts.append(
-                    FactAssertion(
-                        id=_new_id(),
-                        subject="assistant",
-                        predicate="identity_note",
-                        value=entry.content,
-                        source_kind="consolidation_extract",
-                        source_id=entry.id,
-                        source_session=entry.source_session,
-                        confidence=float(entry.confidence or 1.0),
-                        created_at=entry.created_at or _now(),
-                        updated_at=entry.updated_at or _now(),
-                    )
-                )
+        # The assistant's identity is filed under several entities depending on
+        # who wrote it: consolidation uses "assistant", a deliberate memory
+        # write uses whatever name the caller passed.  Missing the latter meant
+        # every hand-written identity update produced no fact at all, so the
+        # first machine-extracted one stayed authoritative forever.
+        if category != "identity" or entity not in _ASSISTANT_IDENTITY_ENTITIES:
+            return facts
+        note = _identity_note_value(entry.content)
+        if not note:
+            return facts
+        source_kind = (
+            "manual_write"
+            if str(entry.source_session or "").strip() == "manual_memory_write"
+            else "consolidation_extract"
+        )
+        facts.append(
+            FactAssertion(
+                id=_new_id(),
+                subject="assistant",
+                predicate="identity_note",
+                value=note,
+                source_kind=source_kind,
+                source_id=entry.id,
+                source_session=entry.source_session,
+                confidence=float(entry.confidence or 1.0),
+                created_at=entry.created_at or _now(),
+                updated_at=entry.updated_at or _now(),
+            )
+        )
         return facts
 
     def write_entries(self, category: str, entries: list[LTMEntry]) -> None:
@@ -1973,12 +2092,34 @@ class LTMStore:
         return [self._row_to_agent_runtime_event(row) for row in reversed(rows)]
 
     @staticmethod
-    def _fact_assertion_core_score(assertion: FactAssertion) -> tuple[int, float, str]:
+    def _fact_assertion_core_score(
+        assertion: FactAssertion,
+    ) -> tuple[str, int, float, str]:
+        """Rank competing assertions of the same fact; highest wins.
+
+        For most facts a trusted source outranks a fresher one, so precedence
+        leads.  Identity is different: it is a setting the user changes, and a
+        setting is last-write-wins.  Letting precedence lead there meant an
+        early statement pinned the identity permanently — a later correction
+        arriving through any weaker channel could never displace it.
+
+        ``created_at`` still trails the tuple for the non-identity case, so two
+        assertions written in the same instant tie on every component and the
+        caller declares a conflict rather than picking arbitrarily.
+        """
         precedence = _FACT_SOURCE_PRECEDENCE.get(str(assertion.source_kind or "").strip().lower(), 9)
-        return (-precedence, float(assertion.confidence or 0.0), assertion.created_at or "")
+        created_at = assertion.created_at or ""
+        key = (
+            _normalize_fact_part(assertion.subject),
+            _normalize_fact_part(assertion.predicate),
+        )
+        recency = created_at if key in _RECENCY_GOVERNED_FACTS else ""
+        return (recency, -precedence, float(assertion.confidence or 0.0), created_at)
 
     @classmethod
-    def _fact_assertion_total_score(cls, assertion: FactAssertion) -> tuple[int, float, str, str]:
+    def _fact_assertion_total_score(
+        cls, assertion: FactAssertion
+    ) -> tuple[str, int, float, str, str]:
         return (*cls._fact_assertion_core_score(assertion), assertion.id)
 
     def add_fact_assertion(self, assertion: FactAssertion) -> FactAssertion:
@@ -2008,33 +2149,7 @@ class LTMStore:
         )
 
         with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO fact_assertions (
-                    id, subject, predicate, value_json, value_type, scope,
-                    source_kind, source_id, source_session, channel, confidence,
-                    status, valid_from, valid_to, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    normalized.id,
-                    normalized.subject,
-                    normalized.predicate,
-                    _dump_fact_value(normalized.value),
-                    normalized.value_type,
-                    normalized.scope,
-                    normalized.source_kind,
-                    normalized.source_id,
-                    normalized.source_session,
-                    normalized.channel,
-                    normalized.confidence,
-                    normalized.status,
-                    normalized.valid_from,
-                    normalized.valid_to,
-                    normalized.created_at,
-                    normalized.updated_at,
-                ),
-            )
+            self._insert_fact_assertion(conn, normalized)
             self.resolve_fact(
                 normalized.subject,
                 normalized.predicate,
@@ -2042,6 +2157,39 @@ class LTMStore:
                 _conn=conn,
             )
         return normalized
+
+    @staticmethod
+    def _insert_fact_assertion(
+        conn: sqlite3.Connection, assertion: FactAssertion
+    ) -> None:
+        """Write one assertion row. Does not re-resolve — callers decide when."""
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO fact_assertions (
+                id, subject, predicate, value_json, value_type, scope,
+                source_kind, source_id, source_session, channel, confidence,
+                status, valid_from, valid_to, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                assertion.id,
+                _normalize_fact_part(assertion.subject),
+                _normalize_fact_part(assertion.predicate),
+                _dump_fact_value(assertion.value),
+                assertion.value_type or _fact_value_type(assertion.value),
+                _normalize_fact_part(assertion.scope, "global"),
+                _normalize_fact_part(assertion.source_kind, "manual_write"),
+                assertion.source_id,
+                assertion.source_session,
+                assertion.channel,
+                assertion.confidence,
+                _normalize_fact_part(assertion.status, "active"),
+                assertion.valid_from,
+                assertion.valid_to,
+                assertion.created_at or _now(),
+                assertion.updated_at or _now(),
+            ),
+        )
 
     def read_fact_assertions(
         self,
@@ -2230,6 +2378,79 @@ class LTMStore:
             ).fetchone()
         return row is not None
 
+    def set_identity(
+        self,
+        *,
+        subject: str = "assistant",
+        name: Optional[str] = None,
+        role: Optional[str] = None,
+        persona: Optional[str] = None,
+    ) -> dict[str, str]:
+        """Record identity as a deliberate setting, last write wins.
+
+        This is the only way ``name`` and ``role`` enter the store apart from
+        config bootstrap.  Identity is something the user *sets*, not something
+        the system infers from prose, so the caller states the value outright
+        and it supersedes whatever was there — no pattern matching, no scoring
+        an old value against a new one.
+
+        Fields left as ``None`` are untouched; passing an empty string clears
+        that field by superseding it with nothing.
+        """
+        normalized_subject = _normalize_fact_part(subject, "assistant")
+        if normalized_subject not in _IDENTITY_SUBJECTS:
+            raise ValueError(
+                f"identity subject must be one of {sorted(_IDENTITY_SUBJECTS)}"
+            )
+        updates = {"name": name, "role": role, "identity_note": persona}
+        applied: dict[str, str] = {}
+        for predicate, raw in updates.items():
+            if raw is None:
+                continue
+            value = str(raw).strip()
+            if predicate == "identity_note":
+                value = _identity_note_value(value)
+            if not value:
+                self.retract_facts(normalized_subject, predicate)
+                applied[predicate] = ""
+                continue
+            self.add_fact_assertion(
+                FactAssertion(
+                    id=_new_id(),
+                    subject=normalized_subject,
+                    predicate=predicate,
+                    value=value,
+                    source_kind="identity_directive",
+                    source_session="set_identity",
+                    confidence=1.0,
+                )
+            )
+            applied[predicate] = value
+        return applied
+
+    def retract_facts(self, subject: str, predicate: str, scope: str = "global") -> int:
+        """Archive every assertion behind one fact and drop the resolved row."""
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE fact_assertions SET status = 'archived', updated_at = ?
+                WHERE subject = ? AND predicate = ? AND scope = ?
+                  AND status != 'archived'
+                """,
+                (
+                    _now(),
+                    _normalize_fact_part(subject),
+                    _normalize_fact_part(predicate),
+                    _normalize_fact_part(scope, "global"),
+                ),
+            )
+            archived = cursor.rowcount or 0
+            conn.execute(
+                "DELETE FROM resolved_facts WHERE fact_key = ?",
+                (_fact_key(subject, predicate, scope),),
+            )
+        return archived
+
     def upsert_manual_note(
         self, category: str, entity: str, content: str, append: bool = False
     ) -> LTMEntry:
@@ -2260,6 +2481,12 @@ class LTMStore:
         with self._connect() as conn:
             affected_categories = self._write_entry_row(conn, entry)
         self._sync_after_mutation(affected_categories)
+        # A hand-written identity note is the most deliberate statement of
+        # identity there is.  Skipping fact derivation here left it invisible
+        # to the startup prompt, which reads facts — the note only surfaced
+        # later, if a query happened to route to free-form memory.
+        for fact in self._fact_assertions_from_entry(entry):
+            self.add_fact_assertion(fact)
         return entry
 
     def all_entries(self) -> list[LTMEntry]:
@@ -3177,35 +3404,6 @@ class ContextManager:
             allow_freeform_fallback=True,
         )
 
-    def _extract_turn_fact_assertions(
-        self,
-        *,
-        role: str,
-        content: str,
-        session_id: str,
-        channel: str,
-        source_id: str = "",
-    ) -> list[FactAssertion]:
-        name = _extract_assistant_name(content)
-        if not name:
-            return []
-        normalized_role = str(role or "").strip().lower()
-        return [
-            FactAssertion(
-                id=_new_id(),
-                subject="assistant",
-                predicate="name",
-                value=name,
-                source_kind=(
-                    "user_statement" if normalized_role == "user" else "conversation_turn"
-                ),
-                source_id=source_id,
-                source_session=session_id,
-                channel=channel,
-                confidence=1.0 if normalized_role == "user" else 0.8,
-            )
-        ]
-
     def record_turn(
         self,
         *,
@@ -3251,26 +3449,6 @@ class ContextManager:
             reply_to_id=reply_to_id,
             metadata=metadata,
         )
-        if not write_result.changed:
-            return write_result
-        if write_result.user_created:
-            for assertion in self._extract_turn_fact_assertions(
-                role="user",
-                content=user_content,
-                session_id=session_id,
-                channel=channel,
-                source_id=message_id,
-            ):
-                self.store.add_fact_assertion(assertion)
-        if write_result.assistant_created:
-            for assertion in self._extract_turn_fact_assertions(
-                role="assistant",
-                content=assistant_content,
-                session_id=session_id,
-                channel=channel,
-                source_id=reply_to_id or message_id,
-            ):
-                self.store.add_fact_assertion(assertion)
         return write_result
 
     def begin_turn(
@@ -3294,14 +3472,6 @@ class ContextManager:
         )
         if not write_result.user_created:
             return False
-        for assertion in self._extract_turn_fact_assertions(
-            role="user",
-            content=user_content,
-            session_id=session_id,
-            channel=channel,
-            source_id=message_id,
-        ):
-            self.store.add_fact_assertion(assertion)
         return True
 
     def idle_elapsed(self) -> float:

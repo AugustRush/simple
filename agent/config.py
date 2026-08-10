@@ -731,6 +731,32 @@ def _compose_system_prompt(
                     "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "
                     "instead of claiming file delivery is unsupported."
                 )
+            if "set_identity" in builtin_names:
+                lines.append(
+                    "When the user gives you a name, a role, or a persona — or "
+                    "changes one you already have — call `set_identity` in that "
+                    "same turn. Agreeing in prose does not persist anything: "
+                    "identity is read back from `set_identity` on every restart, "
+                    "and the newest call replaces the previous setting. Use "
+                    "`subject=user` to record what the user tells you about "
+                    "themselves."
+                )
+            if "create_tool" in builtin_names:
+                lines.append(
+                    "When the user asks for a new capability or tool, use "
+                    "`create_tool` (or `update_tool`). Writing a .py file with "
+                    "`write_file` or `shell` does not create a tool — only "
+                    "`create_tool` validates it, checks that it imports, asks "
+                    "the user to approve it, and loads it into this session."
+                )
+                lines.append(
+                    "If a tool you are writing needs a third-party package, use "
+                    "`install_tool_dependency`. Never install packages for a "
+                    "tool with `pip`, `uv add`, or `poetry add` from the shell: "
+                    "those change the user's own project or Python environment, "
+                    "while `install_tool_dependency` keeps the package in the "
+                    "agent's private dependency directory."
+                )
         lines.append(
             "Agent-managed paths are separate from the workspace root: "
             f"user tools live in {shared.TOOLS_DIR}, "
