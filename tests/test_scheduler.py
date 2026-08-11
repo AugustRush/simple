@@ -1049,8 +1049,8 @@ def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_
         async def drain(self):
             sent["drained"] = True
 
-    monkeypatch.setattr("channels.feishu.FeishuOutputSink", _FakeSink)
-    monkeypatch.setattr("channels.feishu.build_feishu_client", lambda config: object())
+    monkeypatch.setattr("agent.channels.feishu.FeishuOutputSink", _FakeSink)
+    monkeypatch.setattr("agent.channels.feishu.build_feishu_client", lambda config: object())
 
     delivery = SchedulerDelivery(
         cfg={

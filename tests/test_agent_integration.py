@@ -6934,7 +6934,7 @@ def test_configure_runtime_logging_enables_interaction_loggers(monkeypatch):
         for name in (
             "agent.channels.base",
             "agent.core.agent",
-            "channels.feishu",
+            "agent.channels.feishu",
         )
     }
     try:
@@ -6947,7 +6947,7 @@ def test_configure_runtime_logging_enables_interaction_loggers(monkeypatch):
         assert calls["format"]
         assert logging.getLogger("agent.channels.base").level == logging.INFO
         assert logging.getLogger("agent.core.agent").level == logging.INFO
-        assert logging.getLogger("channels.feishu").level == logging.INFO
+        assert logging.getLogger("agent.channels.feishu").level == logging.INFO
     finally:
         root_logger.handlers[:] = original_root_handlers
         for name, level in original_levels.items():
@@ -8971,3 +8971,79 @@ def test_observed_input_tokens_reads_either_provider_field():
     assert read(_Resp(_OpenAIUsage())) == 456
     assert read(_Resp(None)) is None
     assert read(object()) is None
+
+
+def _streaming_agent():
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent.llm_max_retries = 3
+    agent.llm_retry_base_delay = 0
+    return agent
+
+
+def test_streaming_retry_does_not_replay_text_already_shown(monkeypatch):
+    import agent as agent_module
+
+    agent = _streaming_agent()
+    attempts = 0
+    shown: list[str] = []
+
+    async def failing_stream(ctx, tools, callback):
+        nonlocal attempts
+        attempts += 1
+        callback("你好，我在")
+        raise ConnectionError("connection reset by peer")
+
+    monkeypatch.setattr(agent, "_stream_response", failing_stream)
+
+    result = asyncio.run(
+        agent.send_message(
+            agent_module.AgentContext(system_prompt="system"),
+            "hi",
+            stream_callback=shown.append,
+        )
+    )
+
+    # A replay would print the same prefix a second time; sinks cannot unsay it.
+    assert attempts == 1
+    assert shown == ["你好，我在"]
+    assert result.error
+
+
+def test_streaming_retries_when_nothing_was_streamed_yet(monkeypatch):
+    import agent as agent_module
+
+    agent = _streaming_agent()
+    attempts = 0
+    shown: list[str] = []
+
+    async def flaky_stream(ctx, tools, callback):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ConnectionError("connection reset by peer")
+        callback("你好")
+        return (
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("你好", None))]
+            ),
+            "你好",
+        )
+
+    monkeypatch.setattr(agent, "_stream_response", flaky_stream)
+
+    result = asyncio.run(
+        agent.send_message(
+            agent_module.AgentContext(system_prompt="system"),
+            "hi",
+            stream_callback=shown.append,
+        )
+    )
+
+    assert attempts == 2
+    assert shown == ["你好"]
+    assert result.error is None
+    assert result.content == "你好"

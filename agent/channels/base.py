@@ -396,7 +396,7 @@ def _build_gateway_channels(cfg: dict) -> list[Channel]:
     feishu_cfg = cfg.get("channels", {}).get("feishu", {})
     if feishu_cfg.get("enabled"):
         try:
-            from channels.feishu import FeishuChannel, FeishuConfig  # noqa: PLC0415
+            from agent.channels.feishu import FeishuChannel, FeishuConfig  # noqa: PLC0415
 
             known_fields = FeishuConfig.__dataclass_fields__
             filtered = {k: v for k, v in feishu_cfg.items() if k in known_fields}

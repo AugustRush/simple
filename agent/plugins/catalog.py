@@ -20,6 +20,12 @@ CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
 USER_PLUGINS_DIR = shared.USER_PLUGINS_DIR
 
+# Synchronous plugin hooks run on a small dedicated pool.  A hook that blows
+# past its timeout keeps its worker until it returns on its own (see
+# ``_call_hook_with_timeout``), so the pool needs enough headroom that one
+# misbehaving plugin cannot stall hooks for every other plugin.
+PLUGIN_HOOK_POOL_WORKERS = 4
+
 
 def _safe_float(value: Any, default: float) -> float:
     """Parse *value* as float, returning *default* on failure."""
@@ -854,7 +860,17 @@ async def _call_hook_with_timeout(
     try:
         result = await asyncio.wait_for(future, timeout=timeout_seconds)
     except asyncio.TimeoutError:
-        future.cancel()
+        # cancel() only helps while the call is still queued — a thread that
+        # has already entered the hook cannot be interrupted.  Say so, because
+        # the worker it occupies is unavailable until the hook returns on its
+        # own, and a hook that never returns costs the pool a slot for good.
+        if not future.cancel():
+            shared.CONSOLE.print(
+                f"[dim]Plugin hook "
+                f"'{getattr(hook, '__qualname__', hook)}' exceeded "
+                f"{timeout_seconds:.2f}s and is still running; its worker "
+                f"thread stays blocked until it returns[/dim]"
+            )
         raise
     return await _maybe_await_with_timeout(result, timeout_seconds)
 
@@ -889,7 +905,8 @@ class PluginCatalog:
         self._turn_hook_timeout_seconds = max(0.0, float(turn_hook_timeout_seconds))
         self._reload_lock = asyncio.Lock()
         self._hook_executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="agent-plugin-hook"
+            max_workers=PLUGIN_HOOK_POOL_WORKERS,
+            thread_name_prefix="agent-plugin-hook",
         )
         # name → (plugin_object, PluginMeta)
         self._plugins: dict[str, tuple[Any, PluginMeta]] = {}
@@ -1263,6 +1280,15 @@ class PluginCatalog:
         return [dict(value, key=key) for key, value in self._agent_defs.items()]
 
     # ── Hot reload ───────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """Release the hook thread pool.  Safe to call more than once.
+
+        Queued-but-unstarted hooks are dropped.  Hooks already running cannot
+        be interrupted, so this does not wait for them — a plugin that hangs
+        would otherwise hold up shutdown indefinitely.
+        """
+        self._hook_executor.shutdown(wait=False, cancel_futures=True)
 
     async def reload(self, components: dict) -> dict:
         """Serialize plugin reload transactions for this catalog instance."""

@@ -33,7 +33,7 @@ class SchedulerDelivery:
     ) -> str:
         if target.target_type != "feishu_chat":
             raise ValueError(f"Unsupported channel target: {target.target_type}")
-        from channels.feishu import FeishuConfig, FeishuOutputSink, build_feishu_client
+        from agent.channels.feishu import FeishuConfig, FeishuOutputSink, build_feishu_client
 
         feishu_cfg = self.cfg.get("channels", {}).get("feishu", {})
         if not feishu_cfg.get("app_id") or not feishu_cfg.get("app_secret"):

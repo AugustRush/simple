@@ -24,6 +24,13 @@ class ContextLimitError(RuntimeError):
     """Raised when complete provider context cannot fit its input budget."""
 
 
+# How long a SQLite connection waits for a competing writer before giving up.
+# WAL mode allows concurrent readers but only one writer; the background
+# memory worker and the synchronous-tool pool both write to palace.db, so
+# without this they would surface transient "database is locked" errors.
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
 _FACT_SOURCE_PRECEDENCE = {
     "identity_directive": 0,
     "user_statement": 0,
@@ -375,6 +382,11 @@ class StagingBuffer:
                 conn = sqlite3.connect(self._db_path, check_same_thread=False)
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA journal_mode=WAL")
+                # WAL permits one writer at a time; without a busy timeout a
+                # concurrent writer (background memory worker, or two tools
+                # dispatched into the sync-tool pool) fails immediately with
+                # "database is locked" instead of waiting its turn.
+                conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
                 self._local.conn = conn
                 tid = threading.get_ident()
                 old = self._thread_connections.get(tid)
@@ -828,8 +840,8 @@ class LTMStore:
         self._ensure_fts_index()
         self._cleanup_legacy_artifacts()
         self._repair_assistant_identity_facts()
-        self._meta = {"categories": [], "total_entries": 0}
-        self._refresh_indexes()
+        # Populated on first read of ``_meta``; None means "stale".
+        self._category_stats_cache: Optional[dict] = None
 
     # ── Persistence ───────────────────────────────────────────────────────────
 
@@ -939,6 +951,9 @@ class LTMStore:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
+            # See StagingBuffer._connect: WAL allows a single writer, so
+            # concurrent writers must wait rather than fail outright.
+            conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
             self._local.conn = conn
             tid = threading.get_ident()
             # If thread ID was reused, close the stale connection first.
@@ -988,7 +1003,7 @@ class LTMStore:
                 row = conn.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
                 deleted[table] = int(row["count"] if row else 0)
                 conn.execute(f"DELETE FROM {table}")
-        self._meta = {"categories": [], "total_entries": 0}
+        self._category_stats_cache = None
         return deleted
 
     def _ensure_schema(self) -> None:
@@ -1454,7 +1469,22 @@ class LTMStore:
         return {row["category"] for row in rows if row["category"] not in shared.PALACE_LOCI}
 
     def _refresh_indexes(self) -> None:
-        self._meta = self._category_stats()
+        """Mark derived category stats stale; they are recomputed on demand."""
+        self._category_stats_cache = None
+
+    @property
+    def _meta(self) -> dict:
+        """Category stats, computed lazily and cached until the next write.
+
+        This used to be recomputed eagerly inside every mutation — a full
+        ``GROUP BY`` scan of ``memory_items`` per stored fact, per delete, per
+        consolidation round — even though nothing reads it between writes.
+        Callers that want fresh numbers go through ``list_categories()``,
+        which queries directly.
+        """
+        if self._category_stats_cache is None:
+            self._category_stats_cache = self._category_stats()
+        return self._category_stats_cache
 
     def _category_stats(self) -> dict:
         with self._connect() as conn:
@@ -1484,7 +1514,9 @@ class LTMStore:
         }
 
     def _sync_after_mutation(self, categories: set[str]) -> None:
-        self._meta = self._category_stats()
+        # Only invalidate: the stats are derived, and recomputing them here
+        # made every write pay for a table scan no caller had asked for.
+        self._category_stats_cache = None
 
     def _sync_category_snapshot(self, category: str) -> None:
         """Compatibility no-op: user-visible memory is exported as JSONL."""

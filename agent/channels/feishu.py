@@ -43,6 +43,7 @@ import json
 import logging
 import mimetypes
 import os
+import random
 import re
 import threading
 import time
@@ -65,6 +66,15 @@ logger = logging.getLogger(__name__)
 LARK_AVAILABLE = importlib.util.find_spec("lark_oapi") is not None
 FEISHU_UPLOAD_MAX_BYTES = 30 * 1024 * 1024
 FEISHU_STOP_DRAIN_TIMEOUT_SECONDS = 30.0
+# Reconnect back-off for the WebSocket long connection.  A fixed delay makes a
+# persistent failure (revoked credentials, DNS outage) reconnect forever at the
+# same rate; growing the delay keeps a broken bot from hammering the endpoint
+# while still recovering quickly from a blip.
+FEISHU_WS_RECONNECT_BASE_SECONDS = 1.0
+FEISHU_WS_RECONNECT_MAX_SECONDS = 60.0
+# A connection that lived at least this long counts as healthy, so the next
+# failure starts back-off over rather than inheriting the previous streak.
+FEISHU_WS_HEALTHY_CONNECTION_SECONDS = 30.0
 _ATTACHMENT_CANCEL_GRACE_SECONDS = 0.05
 _ATTACHMENT_MAX_IN_FLIGHT = 2
 # Soft cap on remembered message ids. Soft because an in-flight id is never
@@ -75,6 +85,20 @@ _ATTACHMENT_BATCH_CAPACITY = threading.BoundedSemaphore(
 )
 _ATTACHMENT_BATCH_CAPACITY_LOCK = threading.Lock()
 _ATTACHMENT_BATCH_CAPACITY_ERROR = "Feishu attachment upload capacity exhausted"
+
+
+def _ws_reconnect_delay(failures: int) -> float:
+    """Back-off before the reconnect that follows *failures* consecutive drops.
+
+    Doubles per failure up to a cap, then jitters ±20% so a fleet of bots
+    restarted together does not reconnect in lockstep.
+    """
+    # Clamp the exponent: `failures` keeps climbing for a permanently broken
+    # bot, and 2**large would overflow the float conversion.
+    exponent = min(max(0, failures), 16)
+    delay = FEISHU_WS_RECONNECT_BASE_SECONDS * (2 ** exponent)
+    # Jitter first, then clamp, so the cap is a true ceiling.
+    return min(delay * random.uniform(0.8, 1.2), FEISHU_WS_RECONNECT_MAX_SECONDS)
 
 
 def _cleanup_attachment_path(path: Path) -> None:
@@ -1842,6 +1866,9 @@ class FeishuChannel(Channel):
         self._client: Any = None
         self._ws_thread: Optional[threading.Thread] = None
         self._running = False
+        # Set by stop() to cut a reconnect back-off short instead of waiting
+        # out the full sleep.
+        self._ws_wakeup = threading.Event()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._handler: Optional[Callable] = None
         self._output_dir: Optional[Path] = None
@@ -1884,6 +1911,7 @@ class FeishuChannel(Channel):
         import lark_oapi as lark  # type: ignore[import]
 
         self._running = True
+        self._ws_wakeup.clear()
         self._stop_event = asyncio.Event()
         self._loop = asyncio.get_running_loop()
         self._handler = handler
@@ -1934,25 +1962,44 @@ class FeishuChannel(Channel):
         # loop rather than the already-running main loop (which would raise
         # "This event loop is already running").
         def _run_ws() -> None:
-            import time
             import lark_oapi.ws.client as _ws_mod  # type: ignore[import]
 
             ws_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(ws_loop)
             _ws_mod.loop = ws_loop
+            failures = 0
             try:
                 while self._running:
+                    connected_at = time.monotonic()
                     try:
                         ws_client.start()
                     except Exception as exc:
                         logger.warning("Feishu WebSocket error: %s", exc)
-                    if self._running:
-                        time.sleep(5)  # back-off before reconnect
+                    if not self._running:
+                        break
+                    if (
+                        time.monotonic() - connected_at
+                        >= FEISHU_WS_HEALTHY_CONNECTION_SECONDS
+                    ):
+                        failures = 0
+                    delay = _ws_reconnect_delay(failures)
+                    failures += 1
+                    logger.info(
+                        "Reconnecting Feishu WebSocket in %.1fs (failure #%d)",
+                        delay,
+                        failures,
+                    )
+                    # Interruptible: stop() sets the event so shutdown does not
+                    # have to wait out the back-off.
+                    self._ws_wakeup.wait(delay)
             finally:
                 ws_loop.close()
 
+        # Daemon: stop() already acknowledges that ``ws_client.start()`` may
+        # never return, and a non-daemon thread in that state wedges
+        # interpreter shutdown — the process would hang instead of exiting.
         self._ws_thread = threading.Thread(
-            target=_run_ws, daemon=False, name="feishu-ws"
+            target=_run_ws, daemon=True, name="feishu-ws"
         )
         self._ws_thread.start()
         logger.info("Feishu bot started (WebSocket long connection)")
@@ -1963,6 +2010,7 @@ class FeishuChannel(Channel):
     async def stop(self) -> None:
         """Stop the WebSocket connection gracefully with draining."""
         self._running = False
+        self._ws_wakeup.set()
         if self._ws_thread is not None and self._ws_thread.is_alive():
             await asyncio.to_thread(self._ws_thread.join, 5.0)
             if self._ws_thread.is_alive():

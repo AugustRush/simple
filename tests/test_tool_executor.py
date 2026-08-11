@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from agent.core.output import EventCollector, _active_event_collector, _active_sink
 from agent.tools.executor import RegularToolExecutor, report_tool_progress
@@ -351,3 +352,112 @@ def test_regular_tool_executor_timeout_includes_operation_metadata():
     ]
     assert events[1].fields["operation_id"] == events[2].fields["operation_id"]
     assert events[1].fields["timeout_seconds"] == 0.01
+
+
+# ── Synchronous tools run off the event loop ─────────────────────────────────
+
+
+def _register_sync(registry, name, fn, *, properties=None):
+    registry.register(
+        name,
+        name,
+        {"type": "object", "properties": properties or {}, "required": []},
+        fn,
+        source="builtin",
+    )
+
+
+def test_sync_tool_does_not_block_the_event_loop():
+    registry = ToolRegistry()
+
+    def slow(**_kwargs):
+        time.sleep(0.2)
+        return {"ok": True}
+
+    _register_sync(registry, "slow", slow)
+
+    async def run():
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            await registry.call("slow", {})
+        finally:
+            beat.cancel()
+        return ticks
+
+    # Inline dispatch would starve the heartbeat entirely.
+    assert asyncio.run(run()) > 5
+
+
+def test_sync_tool_timeout_is_enforced_by_the_executor():
+    registry = ToolRegistry()
+
+    def slow(**_kwargs):
+        time.sleep(0.5)
+        return {"ok": True}
+
+    _register_sync(registry, "slow", slow)
+
+    async def run():
+        collector = EventCollector()
+        token = _active_event_collector.set(collector)
+        try:
+            result = await RegularToolExecutor(
+                registry, timeout_seconds=0.02, stale_timeout_seconds=0.02
+            ).run({"name": "slow", "input": {}})
+        finally:
+            _active_event_collector.reset(token)
+        return result, collector.drain()
+
+    result, events = asyncio.run(run())
+
+    assert json.loads(result)["ok"] is False
+    assert "tool_timed_out" in [event.name for event in events]
+
+
+def test_sync_tools_in_one_batch_run_concurrently():
+    registry = ToolRegistry()
+
+    def slow(**_kwargs):
+        time.sleep(0.15)
+        return {"ok": True}
+
+    _register_sync(registry, "slow", slow)
+
+    async def run():
+        started = time.monotonic()
+        await asyncio.gather(*(registry.call("slow", {}) for _ in range(3)))
+        return time.monotonic() - started
+
+    # Serialised on the loop this would take ~0.45s.
+    assert asyncio.run(run()) < 0.35
+
+
+def test_sync_tool_sees_the_callers_context():
+    registry = ToolRegistry()
+    seen = []
+
+    def peek(**_kwargs):
+        seen.append(_active_sink.get(None))
+        return {"ok": True}
+
+    _register_sync(registry, "peek", peek)
+    sink = _RecordingSink()
+
+    async def run():
+        token = _active_sink.set(sink)
+        try:
+            await registry.call("peek", {})
+        finally:
+            _active_sink.reset(token)
+
+    asyncio.run(run())
+
+    assert seen == [sink]

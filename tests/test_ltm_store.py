@@ -532,3 +532,33 @@ def test_upsert_manual_note_uses_non_truncated_generated_ids(tmp_path):
     entry = store.upsert_manual_note("identity", "user", "Prefers concise responses")
 
     assert len(entry.id) > 8
+
+
+def test_writes_do_not_recompute_category_stats(tmp_path, monkeypatch):
+    store = make_store(tmp_path)
+    scans = 0
+    real_stats = store._category_stats
+
+    def counting_stats():
+        nonlocal scans
+        scans += 1
+        return real_stats()
+
+    monkeypatch.setattr(store, "_category_stats", counting_stats)
+
+    for index in range(20):
+        store.add_entry(make_entry(cid=f"e{index}", content=f"fact {index}"))
+
+    # Each write used to trigger a full GROUP BY over memory_items.
+    assert scans == 0
+
+    # …and the derived view is still correct once something actually asks.
+    assert store._meta["total_entries"] == 20
+    assert scans == 1
+
+    # Cached until the next mutation, then recomputed on demand.
+    assert store._meta["total_entries"] == 20
+    assert scans == 1
+    store.add_entry(make_entry(cid="e20", content="fact 20"))
+    assert store._meta["total_entries"] == 21
+    assert scans == 2

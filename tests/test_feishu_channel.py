@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from channels.feishu import (
+from agent.channels.feishu import (
     FeishuChannel,
     FeishuConfig,
     FeishuOutputSink,
@@ -645,7 +645,7 @@ def test_feishu_thread_start_failure_settles_and_forgets_pending_batch(tmp_path)
         receipt = sink.queue_attachment(attachment)
 
         with patch(
-            "channels.feishu.threading.Thread.start",
+            "agent.channels.feishu.threading.Thread.start",
             side_effect=RuntimeError("thread start failed"),
         ):
             with pytest.raises(RuntimeError, match="thread start failed"):
@@ -686,7 +686,7 @@ def test_feishu_worker_can_finish_before_thread_start_reports_failure(tmp_path):
             raise RuntimeError("start failed after worker ran")
 
         with patch(
-            "channels.feishu.threading.Thread.start",
+            "agent.channels.feishu.threading.Thread.start",
             new=start_then_fail,
         ):
             with pytest.raises(RuntimeError, match="start failed after worker ran"):
@@ -709,7 +709,7 @@ def test_feishu_attachment_batches_are_globally_bounded_across_sinks(
 ):
     async def scenario() -> None:
         monkeypatch.setattr(
-            "channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            "agent.channels.feishu._ATTACHMENT_BATCH_CAPACITY",
             threading.BoundedSemaphore(2),
             raising=False,
         )
@@ -817,7 +817,7 @@ def test_feishu_batch_reserves_global_capacity_for_each_attachment(
 ):
     async def scenario() -> None:
         monkeypatch.setattr(
-            "channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            "agent.channels.feishu._ATTACHMENT_BATCH_CAPACITY",
             threading.BoundedSemaphore(2),
         )
         release_worker = threading.Event()
@@ -912,7 +912,7 @@ def test_feishu_excess_command_returns_and_cleans_while_capacity_is_blocked(
 ):
     async def scenario() -> None:
         monkeypatch.setattr(
-            "channels.feishu._ATTACHMENT_BATCH_CAPACITY",
+            "agent.channels.feishu._ATTACHMENT_BATCH_CAPACITY",
             threading.BoundedSemaphore(1),
         )
         release_worker = threading.Event()
@@ -1129,7 +1129,7 @@ def test_feishu_flush_cancellation_returns_before_sync_uploader_and_defers_clean
         sink._upload_file_sync = MagicMock(side_effect=blocking_upload)
         sink._do_send = MagicMock()
         monkeypatch.setattr(
-            "channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
+            "agent.channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
             0.01,
             raising=False,
         )
@@ -1231,7 +1231,7 @@ def test_feishu_sync_worker_cleans_deferred_snapshot_after_event_loop_closes(
     sink._do_send = MagicMock()
     receipt = sink.queue_attachment(attachment)
     monkeypatch.setattr(
-        "channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
+        "agent.channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
         0.01,
     )
 
@@ -1301,7 +1301,7 @@ def test_feishu_cancellation_cleans_never_started_upload_when_executor_saturated
         sink._upload_file_sync = MagicMock(side_effect=blocking_upload)
         sink._do_send = MagicMock()
         monkeypatch.setattr(
-            "channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
+            "agent.channels.feishu._ATTACHMENT_CANCEL_GRACE_SECONDS",
             0.01,
         )
         blocker_started = threading.Event()
@@ -1636,7 +1636,7 @@ def test_feishu_sink_subagent_event_schedules_process_card_update():
 
 def test_feishu_sink_latency_trace_logs_scheduled_work(monkeypatch, caplog):
     monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
-    caplog.set_level(logging.WARNING, logger="channels.feishu")
+    caplog.set_level(logging.WARNING, logger="agent.channels.feishu")
     sink = _make_feishu_sink()
     sink.streaming = True
     loop = asyncio.new_event_loop()
@@ -1669,7 +1669,7 @@ def test_feishu_sink_latency_trace_logs_scheduled_work(monkeypatch, caplog):
 
 def test_feishu_sink_latency_trace_logs_finish_turn(monkeypatch, caplog):
     monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
-    caplog.set_level(logging.WARNING, logger="channels.feishu")
+    caplog.set_level(logging.WARNING, logger="agent.channels.feishu")
     sink = _make_feishu_sink()
     sink.streaming = False
     loop = asyncio.new_event_loop()
@@ -2454,7 +2454,7 @@ def test_feishu_sink_reply_used_first_then_create():
 
 def test_feishu_sink_latency_trace_logs_api_send(monkeypatch, caplog):
     monkeypatch.setenv("SIMPLE_TRACE_LATENCY", "1")
-    caplog.set_level(logging.WARNING, logger="channels.feishu")
+    caplog.set_level(logging.WARNING, logger="agent.channels.feishu")
     sink = _make_feishu_sink()
 
     mock_resp = MagicMock()
@@ -2470,7 +2470,7 @@ def test_feishu_sink_latency_trace_logs_api_send(monkeypatch, caplog):
 
 
 def test_feishu_sink_logs_send_success(caplog):
-    caplog.set_level(logging.INFO, logger="channels.feishu")
+    caplog.set_level(logging.INFO, logger="agent.channels.feishu")
     sink = _make_feishu_sink()
 
     mock_resp = MagicMock()
@@ -2591,7 +2591,7 @@ def test_is_bot_mentioned_human_mention_only():
 
 def test_feishu_channel_start_raises_without_lark():
     channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
-    with patch("channels.feishu.LARK_AVAILABLE", False):
+    with patch("agent.channels.feishu.LARK_AVAILABLE", False):
         with pytest.raises(RuntimeError, match="lark-oapi"):
             asyncio.run(channel.start(lambda msg, sink: True))
 
@@ -3097,15 +3097,15 @@ def test_build_gateway_channels_falls_back_to_empty_on_import_error():
         }
     }
     import sys
-    import channels.feishu as _feishu_mod  # ensure loaded
+    import agent.channels.feishu as _feishu_mod  # ensure loaded
 
-    saved = sys.modules.pop("channels.feishu")
+    saved = sys.modules.pop("agent.channels.feishu")
     try:
-        sys.modules["channels.feishu"] = None  # type: ignore[assignment]
+        sys.modules["agent.channels.feishu"] = None  # type: ignore[assignment]
         channels = _build_gateway_channels(cfg)
         assert channels == []  # no fallback to CLI
     finally:
-        sys.modules["channels.feishu"] = saved
+        sys.modules["agent.channels.feishu"] = saved
 
 
 def test_missing_feishu_dependency_hint_mentions_uv_tool_env(monkeypatch):
@@ -3127,7 +3127,7 @@ def test_missing_feishu_dependency_hint_mentions_uv_tool_env(monkeypatch):
 def _selective_import_error(name, *args, **kwargs):
     import builtins
 
-    if "channels.feishu" in name:
+    if "agent.channels.feishu" in name:
         raise ImportError("mocked import error")
     return builtins.__import__(name, *args, **kwargs)
 
@@ -3247,3 +3247,41 @@ def test_feishu_in_flight_ids_are_never_evicted():
     channel._settle_message("live-0")
     assert channel._processed_ids["live-0"] is False
     assert channel._claim_message("live-0") is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket reconnect back-off
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_ws_reconnect_delay_grows_and_stays_under_the_cap():
+    from agent.channels.feishu import (
+        FEISHU_WS_RECONNECT_BASE_SECONDS,
+        FEISHU_WS_RECONNECT_MAX_SECONDS,
+        _ws_reconnect_delay,
+    )
+
+    first = _ws_reconnect_delay(0)
+    assert 0.8 * FEISHU_WS_RECONNECT_BASE_SECONDS <= first
+    assert first <= 1.2 * FEISHU_WS_RECONNECT_BASE_SECONDS
+
+    # Doubling, so a later failure waits strictly longer than an earlier one
+    # even at the unlucky ends of the two jitter ranges.
+    assert _ws_reconnect_delay(3) > _ws_reconnect_delay(0)
+
+    # A bot that never recovers must not overflow or exceed the ceiling.
+    for failures in (16, 100, 5000):
+        assert 0 < _ws_reconnect_delay(failures) <= FEISHU_WS_RECONNECT_MAX_SECONDS
+
+
+def test_ws_reconnect_backoff_is_interrupted_by_stop():
+    channel = FeishuChannel(FeishuConfig(app_id="x", app_secret="y"))
+    channel._running = True
+    channel._ws_wakeup.clear()
+
+    asyncio.run(channel.stop())
+
+    # stop() must wake a thread parked in the back-off sleep, otherwise
+    # shutdown waits out the full delay (up to a minute).
+    assert channel._ws_wakeup.is_set()
+    assert channel._running is False

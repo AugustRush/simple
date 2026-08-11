@@ -1016,7 +1016,7 @@ server diagnostics cannot overwrite the interactive CLI input line.
 │   ├── tools/          # ToolRegistry, BuiltinTools, MCPClient, UserToolCatalog, executor
 │   ├── runtime/        # AgentCore, TurnInput, TurnResult, TurnExecution, TurnRunner
 │   ├── orchestration/  # OrchestrationPlanner, parallel/pipeline/rendezvous execution
-│   ├── channels/       # Channel ABC, CliChannel, ChannelRunner
+│   ├── channels/       # Channel ABC, CliChannel, ChannelRunner, Feishu/Lark channel
 │   ├── scheduler/      # SchedulerService, SchedulerStore, triggers, delivery
 │   ├── security/       # Shell command blocking (chmod/kill/eval/python -c)
 │   ├── skills/         # SkillBundle, SkillCatalog, skill parsing, hot-reload
@@ -1028,8 +1028,6 @@ server diagnostics cannot overwrite the interactive CLI input line.
 │   ├── evolution.py    # Session scoring, prompt rewriting, tool generation
 │   ├── shared.py       # Paths, defaults, tracing, multi-instance support
 │   └── pathing.py      # Path resolution and workspace containment
-├── channels/
-│   └── feishu.py       # Feishu/Lark channel + output sink
 ├── scripts/
 │   └── benchmark_memory.py
 ├── tests/

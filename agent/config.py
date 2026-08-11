@@ -807,3 +807,6 @@ async def _close_components(components: dict) -> None:
             staging.close()
         if hasattr(ctx_mgr, "store"):
             ctx_mgr.store.close()
+    plugin_catalog = components.get("plugin_catalog")
+    if plugin_catalog is not None and hasattr(plugin_catalog, "close"):
+        plugin_catalog.close()

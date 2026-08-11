@@ -418,7 +418,7 @@ async def _command_menu(router: CommandRouter) -> Optional[str]:
 _INTERACTION_LOGGER_NAMES = (
     "agent.channels.base",
     "agent.core.agent",
-    "channels.feishu",
+    "agent.channels.feishu",
 )
 
 

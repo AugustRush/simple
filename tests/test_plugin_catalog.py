@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import pytest
+import threading
 import time
 import textwrap
 from pathlib import Path
@@ -3348,3 +3349,44 @@ def test_manifest_component_paths_for_skills_commands_agents(tmp_path):
     assert [name for name, _ in catalog.get_bundled_skills()] == ["custom-paths"]
     assert "custom-paths:deploy" in catalog.get_slash_commands()
     assert catalog.get_agent_definition("plugin:custom-paths:reviewer") is not None
+
+
+def test_catalog_close_releases_the_hook_pool(tmp_path):
+    from agent import PluginCatalog
+
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    catalog.close()
+
+    # Shut down for real: submitting again raises rather than silently
+    # spawning a thread that nothing will ever join.
+    with pytest.raises(RuntimeError):
+        catalog._hook_executor.submit(lambda: None)
+
+    catalog.close()  # idempotent
+
+
+def test_hook_timeout_reports_that_the_worker_is_still_blocked(capsys):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from agent.plugins.catalog import _call_hook_with_timeout
+
+    release = threading.Event()
+    pool = ThreadPoolExecutor(max_workers=1)
+
+    def wedged():
+        release.wait(5)
+
+    async def run():
+        with pytest.raises(asyncio.TimeoutError):
+            await _call_hook_with_timeout(
+                wedged, timeout_seconds=0.02, executor=pool
+            )
+        release.set()
+
+    try:
+        asyncio.run(run())
+        # The warning is the only signal that the pool just lost a worker.
+        assert "still running" in capsys.readouterr().out
+    finally:
+        release.set()
+        pool.shutdown(wait=True)

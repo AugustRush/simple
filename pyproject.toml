@@ -31,7 +31,7 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["agent*", "channels*"]
+include = ["agent*"]
 
 [tool.setuptools.package-data]
 agent = [

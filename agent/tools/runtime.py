@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextvars
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
+from functools import partial
 import html
 import importlib.util
 import json
@@ -12,6 +15,7 @@ import re
 import shlex
 import signal
 import subprocess
+import threading
 import time
 import traceback
 import urllib.request
@@ -31,6 +35,71 @@ from agent.tools import user_tools
 _active_schedule_target: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("_active_schedule_target", default=None)
 )
+
+# ── Synchronous tool dispatch ────────────────────────────────────────────────
+#
+# Most tools (file I/O, memory/SQLite, scheduler CRUD) are plain sync
+# functions.  Calling them inline stalls the whole event loop: channel
+# heartbeats stop, other sessions' messages queue up, and — worst — the
+# ToolExecutor's own timeout/progress machinery cannot run, so
+# ``tool_timeout_seconds`` silently does not apply to them.  Dispatching
+# through a dedicated pool keeps the loop responsive and makes those
+# timeouts real.
+#
+# The pool is deliberately *not* the loop's default executor: channels
+# (notably Feishu) push their blocking SDK calls through
+# ``run_in_executor(None, ...)``, and a burst of slow tools must not be able
+# to starve message delivery.
+_SYNC_TOOL_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_SYNC_TOOL_EXECUTOR_LOCK = threading.Lock()
+
+
+def _sync_tool_max_workers() -> int:
+    configured = os.environ.get("SIMPLE_SYNC_TOOL_WORKERS", "").strip()
+    if configured.isdigit() and int(configured) > 0:
+        return int(configured)
+    return max(4, min(16, (os.cpu_count() or 4) * 2))
+
+
+def sync_tool_executor() -> ThreadPoolExecutor:
+    """Return the process-wide pool used to run synchronous tools."""
+    global _SYNC_TOOL_EXECUTOR
+    if _SYNC_TOOL_EXECUTOR is None:
+        with _SYNC_TOOL_EXECUTOR_LOCK:
+            if _SYNC_TOOL_EXECUTOR is None:
+                _SYNC_TOOL_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=_sync_tool_max_workers(),
+                    thread_name_prefix="agent-sync-tool",
+                )
+                # Runs before ThreadPoolExecutor's own atexit join (LIFO), so
+                # tools still sitting in the queue are dropped rather than
+                # started during interpreter shutdown.
+                atexit.register(shutdown_sync_tool_executor)
+    return _SYNC_TOOL_EXECUTOR
+
+
+def shutdown_sync_tool_executor(wait: bool = False) -> None:
+    """Tear the pool down at process shutdown.  Safe to call more than once."""
+    global _SYNC_TOOL_EXECUTOR
+    with _SYNC_TOOL_EXECUTOR_LOCK:
+        executor, _SYNC_TOOL_EXECUTOR = _SYNC_TOOL_EXECUTOR, None
+    if executor is not None:
+        executor.shutdown(wait=wait, cancel_futures=True)
+
+
+async def _call_sync_tool(fn: Callable, *args: Any, **kwargs: Any) -> Any:
+    """Run a blocking tool off-loop, preserving the caller's context.
+
+    ``copy_context()`` carries ``_active_sink``, ``_active_agent_context`` and
+    the registry's ``_context_override`` into the worker thread, so tools that
+    resolve per-turn state keep seeing the turn that invoked them.
+    """
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(
+        sync_tool_executor(), partial(ctx.run, partial(fn, *args, **kwargs))
+    )
+
 
 @dataclass
 class ToolDef:
@@ -322,14 +391,14 @@ class ToolRegistry:
                 if asyncio.iscoroutinefunction(fn):
                     result = await fn(**tool_input)
                 else:
-                    result = fn(**tool_input)
+                    result = await _call_sync_tool(fn, **tool_input)
             else:
                 # MCP tools and others with non-identifier parameter names
                 # can't use ** unpacking — pass the dict directly.
                 if asyncio.iscoroutinefunction(fn):
                     result = await fn(tool_input)
                 else:
-                    result = fn(tool_input)
+                    result = await _call_sync_tool(fn, tool_input)
             if isinstance(result, (dict, list)):
                 return json.dumps(result, ensure_ascii=False)
             return "" if result is None else str(result)

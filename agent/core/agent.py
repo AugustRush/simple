@@ -187,6 +187,36 @@ class _TaskLocalContextStack:
 _ = _TaskLocalContextStack  # publicly importable for any third-party caller
 
 
+class _StreamEmissionTracker:
+    """Wraps a stream callback and remembers whether text reached the user.
+
+    Retrying an LLM call replays it from the beginning.  For a *streaming*
+    call that means every chunk is pushed to the sink a second time, and
+    sinks are append-only: the CLI has already written the first attempt's
+    text to the terminal, so there is nothing to take back.  A transient
+    error after the first chunk therefore has to surface as a failure rather
+    than silently produce a doubled reply.
+
+    The wrapper is a plain callable, not a coroutine function, so it works
+    for sync and async callbacks alike — transports await the *result* when
+    it is awaitable rather than inspecting the callable.
+    """
+
+    __slots__ = ("_callback", "emitted")
+
+    def __init__(self, callback: Callable[[str], Any]):
+        self._callback = callback
+        self.emitted = False
+
+    def nothing_emitted(self) -> bool:
+        return not self.emitted
+
+    def __call__(self, chunk: str) -> Any:
+        if chunk:
+            self.emitted = True
+        return self._callback(chunk)
+
+
 class BaseAgent:
     """Core agent: streams Claude, handles tool_use loop."""
 
@@ -1780,8 +1810,13 @@ class BaseAgent:
                 )
             return None
 
-    async def _with_llm_retry(self, fn, *args, **kwargs):
-        """Call *fn* with retry on transient LLM API errors."""
+    async def _with_llm_retry(self, fn, *args, can_retry=None, **kwargs):
+        """Call *fn* with retry on transient LLM API errors.
+
+        ``can_retry`` is an optional predicate consulted before each retry.
+        Streaming callers use it to veto a replay once output has already
+        reached the user (see ``_StreamEmissionTracker``).
+        """
         last_exc = None
         for attempt in range(self.llm_max_retries + 1):
             try:
@@ -1789,6 +1824,13 @@ class BaseAgent:
             except Exception as exc:
                 last_exc = exc
                 if attempt >= self.llm_max_retries or not self._is_llm_retryable(exc):
+                    raise
+                if can_retry is not None and not can_retry():
+                    logger.warning(
+                        "LLM API error after partial output; not retrying "
+                        "(a replay would duplicate what the user already saw): %s",
+                        exc,
+                    )
                     raise
                 delay = self.llm_retry_base_delay * (2 ** attempt)
                 logger.warning(
@@ -2731,9 +2773,14 @@ class BaseAgent:
                         # so /now (force-cancel) aborts the HTTP request mid-flight.
                         # Graceful cancel waits for the call to finish naturally.
                         if stream_callback:
+                            tracked_callback = _StreamEmissionTracker(stream_callback)
                             llm_task = asyncio.create_task(
                                 self._with_llm_retry(
-                                    self._stream_response, ctx, tools, stream_callback
+                                    self._stream_response,
+                                    ctx,
+                                    tools,
+                                    tracked_callback,
+                                    can_retry=tracked_callback.nothing_emitted,
                                 )
                             )
                         else:

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 import json
 from pathlib import Path
 import sqlite3
-from typing import Optional
+import threading
+from typing import Callable, Optional, TypeVar
 
 from agent import shared
 from .models import (
@@ -31,6 +33,29 @@ def _iso(value: Optional[datetime]) -> Optional[str]:
     return value.astimezone(UTC).isoformat()
 
 
+_F = TypeVar("_F", bound=Callable)
+
+
+def _synchronized(method: _F) -> _F:
+    """Serialize a store method against the shared SQLite connection.
+
+    One ``SchedulerStore`` is reached from several threads: the scheduler
+    loop, channel workers, and — since synchronous tools moved off the event
+    loop — any thread in the sync-tool pool.  ``check_same_thread=False``
+    only silences sqlite3's ownership check; it does not make a connection
+    safe to share, because a multi-statement transaction on one thread would
+    interleave with statements issued from another.  Holding the lock for a
+    whole call keeps each operation atomic.
+    """
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
+
+
 def _dt(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
@@ -46,13 +71,15 @@ class SchedulerStore:
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.db_path)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
 
+    @_synchronized
     def close(self) -> None:
         self._conn.close()
 
@@ -163,6 +190,7 @@ class SchedulerStore:
             updated_at=_dt(row["updated_at"]),
         )
 
+    @_synchronized
     def create_task(
         self, task: NewScheduledTask, now: Optional[datetime] = None
     ) -> ScheduledTask:
@@ -200,6 +228,7 @@ class SchedulerStore:
         assert created is not None
         return created
 
+    @_synchronized
     def find_matching_task(self, task: NewScheduledTask) -> Optional[ScheduledTask]:
         row = self._conn.execute(
             """
@@ -236,6 +265,7 @@ class SchedulerStore:
         ).fetchone()
         return self._task_from_row(row) if row else None
 
+    @_synchronized
     def disable_duplicate_enabled_tasks(
         self, now: Optional[datetime] = None
     ) -> int:
@@ -278,12 +308,14 @@ class SchedulerStore:
             )
         return len(duplicate_ids)
 
+    @_synchronized
     def list_tasks(self) -> list[ScheduledTask]:
         rows = self._conn.execute(
             "SELECT * FROM scheduled_tasks ORDER BY created_at ASC"
         ).fetchall()
         return [self._task_from_row(row) for row in rows]
 
+    @_synchronized
     def get_task(self, task_id: str) -> Optional[ScheduledTask]:
         row = self._conn.execute(
             "SELECT * FROM scheduled_tasks WHERE id = ? LIMIT 1",
@@ -291,6 +323,7 @@ class SchedulerStore:
         ).fetchone()
         return self._task_from_row(row) if row else None
 
+    @_synchronized
     def list_runs(self, task_id: str) -> list[TaskRun]:
         rows = self._conn.execute(
             """
@@ -302,6 +335,7 @@ class SchedulerStore:
         ).fetchall()
         return [self._run_from_row(row) for row in rows]
 
+    @_synchronized
     def claim_due_tasks(
         self, now: datetime, limit: int = 10, lease_seconds: int = 300
     ) -> list[ClaimedTask]:
@@ -392,6 +426,7 @@ class SchedulerStore:
                 )
         return claimed
 
+    @_synchronized
     def recover_stale_runs(self, now: datetime) -> int:
         now = now.astimezone(UTC)
         with self._immediate_transaction():
@@ -444,6 +479,7 @@ class SchedulerStore:
             recovered += 1
         return recovered
 
+    @_synchronized
     def renew_lease(
         self,
         task_id: str,
@@ -481,6 +517,7 @@ class SchedulerStore:
             )
         return cursor.rowcount == 1
 
+    @_synchronized
     def release_claim(
         self,
         task_id: str,
@@ -525,6 +562,7 @@ class SchedulerStore:
             )
         return True
 
+    @_synchronized
     def owns_unexpired_lease(
         self, task_id: str, run_id: str, *, now: datetime
     ) -> bool:
@@ -546,6 +584,7 @@ class SchedulerStore:
         ).fetchone()
         return row is not None
 
+    @_synchronized
     def complete_run(
         self,
         task_id: str,
@@ -610,6 +649,7 @@ class SchedulerStore:
                 raise RuntimeError("owned scheduler run disappeared during completion")
         return True
 
+    @_synchronized
     def set_enabled(self, task_id: str, enabled: bool) -> None:
         now = datetime.now(UTC)
         with self._conn:
@@ -622,6 +662,7 @@ class SchedulerStore:
                 (1 if enabled else 0, _iso(now), task_id),
             )
 
+    @_synchronized
     def delete_task(self, task_id: str) -> None:
         with self._conn:
             self._conn.execute(
