@@ -471,6 +471,7 @@ class CliOutputSink(OutputSink):
         live_status: bool = True,
         can_prompt: bool | None = None,
         confirmation_prompt: Callable[[], Awaitable[str]] | None = None,
+        status_callback: Callable[[str], None] | None = None,
     ) -> None:
         self._console = console
         self._live_status = live_status
@@ -485,6 +486,11 @@ class CliOutputSink(OutputSink):
         # PromptSession, leave the alternate screen, and repeatedly redraw the
         # approval line.
         self._confirmation_prompt = confirmation_prompt
+        # In-place status surface owned by the frontend (the TUI's status row).
+        # A Rich live status cannot be used there — its ``\r`` redraws would
+        # accumulate in the append-only output pane — so the frontend renders
+        # the text itself and this sink only supplies it.
+        self._status_callback = status_callback
         self._streamed: list[str] = []
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._tool_count = 0
@@ -546,10 +552,18 @@ class CliOutputSink(OutputSink):
     def interactive_confirmation(self) -> bool:
         return self._supports_consent_prompt()
 
+    def _has_status_surface(self) -> bool:
+        """True when progress can be shown without appending to the output."""
+        return self._status_callback is not None or self._supports_live_status()
+
     def _set_activity(self, text: str) -> None:
+        label_text = _clip_single_line(text, 160)
+        if self._status_callback is not None:
+            self._status_callback(label_text)
+            return
         if not self._supports_live_status():
             return
-        label = f"[dim]{_markup_escape(_clip_single_line(text, 160))}[/dim]"
+        label = f"[dim]{_markup_escape(label_text)}[/dim]"
         if self._activity is None:
             self._activity = self._console.status(label, spinner="dots")
             self._activity.start()
@@ -557,6 +571,8 @@ class CliOutputSink(OutputSink):
         self._activity.update(label)
 
     def _stop_activity(self) -> None:
+        if self._status_callback is not None:
+            self._status_callback("")
         if self._activity is None:
             return
         self._activity.stop()
@@ -772,7 +788,7 @@ class CliOutputSink(OutputSink):
         if text == self._last_tool_progress:
             return
         self._last_tool_progress = text
-        if self._supports_live_status():
+        if self._has_status_surface():
             self._set_activity(text)
             return
         self._console.print(f"[dim]↻ {_markup_escape(_clip_single_line(text, 200))}[/dim]")
@@ -822,7 +838,11 @@ class CliOutputSink(OutputSink):
             return
         now = time.monotonic()
         op = str(current_op or "working")
-        if op == self._last_heartbeat_op and now - self._last_heartbeat_at < 10.0:
+        # An in-place status row can be refreshed cheaply, so the elapsed
+        # counter stays live.  Without one every tick costs a printed line, so
+        # repeats of the same operation are throttled hard.
+        repeat_interval = 1.0 if self._has_status_surface() else 10.0
+        if op == self._last_heartbeat_op and now - self._last_heartbeat_at < repeat_interval:
             return
         self._last_heartbeat_at = now
         self._last_heartbeat_op = op
@@ -835,7 +855,7 @@ class CliOutputSink(OutputSink):
         detail = f" · {op_detail}" if op_detail else ""
         pending = f" · {pending_messages} 条新消息待处理" if pending_messages else ""
         activity_text = f"{label} ({elapsed_seconds:.0f}s){detail}{pending}"
-        if self._supports_live_status():
+        if self._has_status_surface():
             self._set_activity(activity_text)
             return
         self._console.print(

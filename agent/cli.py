@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import signal
 import sys
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import typer
 from rich.markdown import Markdown
@@ -762,6 +762,7 @@ async def _interactive_loop_coro(
                 live_status=False,
                 echo_input=True,
                 tui_active=True,
+                status_callback=tui.set_status,
             )
     finally:
         shared.CONSOLE = original_console
@@ -775,6 +776,7 @@ async def _interactive_loop_body(
     live_status: bool = True,
     echo_input: bool = False,
     tui_active: bool = False,
+    status_callback: Optional[Callable[[str], None]] = None,
 ):
     """Main interactive chat loop."""
     global _current_cancel_token
@@ -916,8 +918,9 @@ async def _interactive_loop_body(
             if echo_input:
                 console.print(f"[green]›[/green] {markup_escape(user_input)}")
 
-            # The TUI cannot host a live spinner but can prompt for consent, so
-            # the two capabilities are declared separately.
+            # The TUI cannot host a live spinner but can prompt for consent and
+            # owns an in-place status row, so the three capabilities are
+            # declared separately.
             _turn_sink = CliOutputSink(
                 console,
                 live_status=live_status,
@@ -925,6 +928,7 @@ async def _interactive_loop_body(
                 confirmation_prompt=(
                     _ask_tui_confirmation_input if tui_active else None
                 ),
+                status_callback=status_callback,
             )
             try:
                 ctx.metadata["skill_catalog"] = skill_catalog
@@ -945,6 +949,11 @@ async def _interactive_loop_body(
                 _turn_sink.on_error(str(e))
             finally:
                 _current_cancel_token = None
+                # A cancelled turn can unwind without ever reaching
+                # on_turn_complete, and a status row left spinning would claim
+                # the agent is still working.
+                if status_callback is not None:
+                    status_callback("")
 
     finally:
         if _log_handler is not None:

@@ -1531,7 +1531,11 @@ def test_output_pane_counter_survives_concurrent_writes():
     """
     import threading
 
-    from agent.tui import _OutputPane
+    from agent.tui import (
+        _MAX_SCROLLBACK_LINES,
+        _SCROLLBACK_TRIM_SLACK,
+        _OutputPane,
+    )
 
     pane = _OutputPane(view_height=10)
     per_thread, thread_count = 2000, 8
@@ -1551,9 +1555,111 @@ def test_output_pane_counter_survives_concurrent_writes():
     rendered = sum(
         item[1].count("\n") for item in pane.fragments() if len(item) >= 2
     )
-    assert rendered == per_thread * thread_count, "writes were lost"
+    # The writes far exceed the scrollback cap, so the pane keeps a trailing
+    # window of them.  What has to hold is that the counter still describes
+    # exactly what is in the fragment list, trimming included.
+    assert _MAX_SCROLLBACK_LINES <= rendered <= _MAX_SCROLLBACK_LINES + _SCROLLBACK_TRIM_SLACK
     assert pane._line_count == rendered, "counter desynced from rendered content"
     assert pane.cursor_position().y <= pane._line_count
+
+
+# ── Scrollback cap ──────────────────────────────────────────────────────────
+
+
+def _pane_text(pane) -> str:
+    return "".join(item[1] for item in pane.fragments() if len(item) >= 2)
+
+
+def test_write_coalesces_same_style_runs():
+    """The ANSI parser emits one fragment per character.
+
+    Everything downstream is per-fragment — prompt_toolkit splits, copies and
+    hashes the whole list on every redraw — so 26 characters must not become
+    26 tuples.
+    """
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=10)
+    pane.write("plain \x1b[31mred text\x1b[0m plain again\n")
+
+    assert pane.fragments() == [
+        ("", "plain "),
+        ("ansired", "red text"),
+        ("", " plain again\n"),
+    ]
+
+
+def test_scrollback_is_capped_and_keeps_the_newest_lines():
+    """An uncapped pane makes every redraw cost grow with the whole session.
+
+    prompt_toolkit re-splits, re-copies and hashes the entire fragment list on
+    each render, so the pane keeps a trailing window instead of the transcript.
+    """
+    from agent.tui import (
+        _MAX_SCROLLBACK_LINES,
+        _SCROLLBACK_TRIM_SLACK,
+        _OutputPane,
+    )
+
+    pane = _OutputPane(view_height=10)
+    total = _MAX_SCROLLBACK_LINES + _SCROLLBACK_TRIM_SLACK + 700
+    for i in range(total):
+        pane.write(f"line {i}\n")
+
+    text = _pane_text(pane)
+    assert pane._line_count == text.count("\n")
+    assert pane._line_count <= _MAX_SCROLLBACK_LINES + _SCROLLBACK_TRIM_SLACK
+
+    assert f"line {total - 1}\n" in text, "the newest output must survive"
+    assert "line 0\n" not in text, "the oldest output must be the part dropped"
+    # No half-line left at the front: the cut lands on a line boundary.
+    assert text.startswith("line ")
+
+
+def test_trimming_shifts_the_scroll_position_with_the_content():
+    """Logical indices are relative to the fragment list, so they must shift.
+
+    A reader parked in the middle of the transcript would otherwise silently
+    jump backwards through the conversation every time the pane trimmed.
+    """
+    from agent.tui import (
+        _MAX_SCROLLBACK_LINES,
+        _SCROLLBACK_TRIM_SLACK,
+        _OutputPane,
+    )
+
+    pane = _OutputPane(view_height=10)
+    for i in range(_MAX_SCROLLBACK_LINES + _SCROLLBACK_TRIM_SLACK):
+        pane.write(f"line {i}\n")
+
+    pane.scroll_up(lines=200)
+    parked = pane.line_text(pane._scroll_top)
+    assert parked.startswith("line ")
+
+    for i in range(400):
+        pane.write(f"tail {i}\n")
+
+    assert pane._line_count <= _MAX_SCROLLBACK_LINES + _SCROLLBACK_TRIM_SLACK
+    assert pane.line_text(pane._scroll_top) == parked, "the view slid off its line"
+
+
+def test_line_text_reads_one_line_without_copying_the_pane():
+    from agent.tui import _OutputPane
+
+    pane = _OutputPane(view_height=10)
+    pane.write("first\nsecond\n")
+    pane.write("thi")
+    pane.write("rd tail\nfourth\n")
+
+    assert pane.line_text(0) == "first"
+    assert pane.line_text(1) == "second"
+    # A line split across two write() calls spans several fragments.
+    assert pane.line_text(2) == "third tail"
+    assert pane.line_text(3) == "fourth"
+    # The unterminated line after the last newline, and out-of-range lookups.
+    assert pane.line_text(4) == ""
+    assert pane.line_text(99) == ""
+    assert pane.line_text(-1) == ""
 
 
 # ── Scroll accounting must use display rows, not logical lines ───────────────
@@ -1639,3 +1745,343 @@ def test_scroll_accounting_tolerates_a_failing_renderer():
             raise RuntimeError("renderer not ready")
 
     assert pane.vertical_scroll(_WrapWindow(_Broken())) == logical_only
+
+
+# ── Terminal resize follow-through ──────────────────────────────────────────
+
+
+def _tui(tmp_path, **kwargs):
+    from agent.tui import TuiSession
+
+    return TuiSession(
+        history_path=tmp_path / "cli_history",
+        completer_factory=lambda: None,
+        cancel_callback=lambda: None,
+        **kwargs,
+    )
+
+
+def test_console_width_follows_terminal_resize(tmp_path, monkeypatch):
+    """Rich wraps at print time, so a stale width mis-wraps every later line."""
+    import os
+    import agent.tui as tui_module
+
+    size = os.terminal_size((100, 40))
+    monkeypatch.setattr(tui_module.shutil, "get_terminal_size", lambda *a: size)
+    tui = _tui(tmp_path)
+    assert tui.console.width == 100
+
+    size = os.terminal_size((60, 40))
+    # The width check is throttled; a resize between checks is not missed, it
+    # is just applied at the next one.
+    tui._width_checked_at = 0.0
+    tui._output_fragments()
+    assert tui.console.width == 60
+
+    size = os.terminal_size((140, 40))
+    tui._width_checked_at = 0.0
+    tui._output_fragments()
+    assert tui.console.width == 140
+
+
+def test_console_width_check_is_throttled(tmp_path, monkeypatch):
+    import os
+    import agent.tui as tui_module
+
+    size = os.terminal_size((100, 40))
+    monkeypatch.setattr(tui_module.shutil, "get_terminal_size", lambda *a: size)
+    tui = _tui(tmp_path)
+    tui._output_fragments()  # arms the throttle
+
+    size = os.terminal_size((60, 40))
+    tui._output_fragments()
+    assert tui.console.width == 100, "width was re-polled on every render"
+
+
+def test_explicit_console_width_is_pinned(tmp_path, monkeypatch):
+    import os
+    import agent.tui as tui_module
+
+    monkeypatch.setattr(
+        tui_module.shutil, "get_terminal_size", lambda *a: os.terminal_size((60, 40))
+    )
+    tui = _tui(tmp_path, console_width=80)
+    tui._width_checked_at = 0.0
+    tui._output_fragments()
+
+    assert tui.console.width == 80
+
+
+def test_console_width_survives_a_failing_terminal_probe(tmp_path, monkeypatch):
+    import agent.tui as tui_module
+
+    def _boom(*args):
+        raise OSError("no tty")
+
+    monkeypatch.setattr(tui_module.shutil, "get_terminal_size", lambda *a: _FakeSize())
+    tui = _tui(tmp_path)
+    monkeypatch.setattr(tui_module.shutil, "get_terminal_size", _boom)
+    tui._width_checked_at = 0.0
+    tui._output_fragments()
+
+    assert tui.console.width == 100
+
+
+class _FakeSize:
+    columns = 100
+    lines = 40
+
+
+# ── Multi-line input ────────────────────────────────────────────────────────
+
+
+def _containers(node):
+    """Every container in a layout tree, parents before children."""
+    yield node
+    for child in node.get_children():
+        yield from _containers(child)
+
+
+def _ruled_input(container):
+    """The HSplit bracketing the input window between two rules."""
+    from prompt_toolkit.layout.containers import HSplit
+    from prompt_toolkit.layout.controls import BufferControl
+
+    for node in _containers(container):
+        if not isinstance(node, HSplit) or len(node.children) != 3:
+            continue
+        if isinstance(getattr(node.children[1], "content", None), BufferControl):
+            return node
+    raise AssertionError("the input window is not bracketed by rules")
+
+
+def test_input_is_bracketed_by_rules(tmp_path):
+    from prompt_toolkit.layout.controls import BufferControl
+
+    from agent.tui import _RULE_CHAR
+
+    tui = _tui(tmp_path, console_width=80)
+    top, body, bottom = _ruled_input(tui._build_layout()).children
+
+    assert isinstance(body.content, BufferControl)
+    assert top.char == bottom.char == _RULE_CHAR
+    assert top.height == bottom.height == 1, "chrome must cost two rows, no more"
+    assert top.width is None and bottom.width is None, "rules span the full width"
+
+
+def _key_handlers(tui):
+    """Key-binding handlers by function name (key reprs are not stable)."""
+    return {
+        binding.handler.__name__: binding.handler
+        for binding in tui._build_key_bindings().bindings
+    }
+
+
+def test_input_window_grows_with_the_buffer(tmp_path):
+    import asyncio
+
+    from agent.tui import _INPUT_MAX_ROWS
+
+    async def scenario():
+        tui = _tui(tmp_path, console_width=80)
+        assert tui._input_height() == 1
+
+        tui._buffer.insert_text("one\ntwo\nthree")
+        assert tui._input_height() == 3, "a pasted block must be visible, not hidden"
+
+        tui._buffer.insert_text("\n" * 20)
+        assert tui._input_height() == _INPUT_MAX_ROWS, "input must not eat the transcript"
+
+    asyncio.run(scenario())
+
+
+def test_alt_enter_composes_a_newline_and_enter_submits(tmp_path):
+    import asyncio
+
+    async def scenario():
+        tui = _tui(tmp_path, console_width=80)
+        handlers = _key_handlers(tui)
+        event = SimpleNamespace(app=SimpleNamespace(current_buffer=tui._buffer))
+
+        handlers["_newline"](event)
+        tui._buffer.insert_text("second")
+        assert tui._buffer.text == "\nsecond"
+        assert tui._buffer.document.line_count == 2
+
+        handlers["_enter"](event)
+        assert tui._buffer.text == ""
+        assert await tui.ask_async() == "\nsecond"
+
+    asyncio.run(scenario())
+
+
+def test_arrows_move_the_cursor_inside_a_multiline_draft(tmp_path):
+    import asyncio
+
+    async def scenario():
+        tui = _tui(tmp_path, console_width=80)
+        handlers = _key_handlers(tui)
+        event = SimpleNamespace(app=SimpleNamespace(current_buffer=tui._buffer))
+        scrolled = []
+        tui._pane.scroll_up = lambda **kwargs: scrolled.append("up")
+        tui._pane.scroll_down = lambda **kwargs: scrolled.append("down")
+
+        tui._buffer.insert_text("one\ntwo")
+        assert tui._buffer.document.cursor_position_row == 1
+
+        handlers["_up"](event)
+        assert tui._buffer.document.cursor_position_row == 0
+        handlers["_down"](event)
+        assert tui._buffer.document.cursor_position_row == 1
+        assert scrolled == [], "a draft in the buffer must not scroll the transcript"
+
+        tui._buffer.reset()
+        handlers["_up"](event)
+        handlers["_down"](event)
+        assert scrolled == ["up", "down"], "an empty buffer still scrolls the transcript"
+
+    asyncio.run(scenario())
+
+
+# ── Status row ──────────────────────────────────────────────────────────────
+
+
+def test_status_row_is_collapsed_while_idle(tmp_path):
+    tui = _tui(tmp_path, console_width=80)
+
+    assert tui._status_height() == 0
+    assert tui._status_fragments() == []
+
+
+def test_status_row_renders_a_spinner_and_the_text(tmp_path):
+    from agent.tui import _SPINNER_FRAMES
+
+    tui = _tui(tmp_path, console_width=80)
+    tui.set_status("模型正在生成 (3s)")
+
+    assert tui._status_height() == 1
+    fragments = tui._status_fragments()
+    assert fragments[0][1].strip() in _SPINNER_FRAMES
+    assert fragments[1][1] == "模型正在生成 (3s)"
+
+    tui.set_status("")
+    assert tui._status_height() == 0
+
+
+def test_status_spinner_animates_then_stops_when_cleared(tmp_path):
+    import asyncio
+
+    from agent.tui import _STATUS_TICK_SECONDS
+
+    async def scenario():
+        tui = _tui(tmp_path, console_width=80)
+        tui.set_status("running")
+        first = tui._status_fragments()[0][1]
+        await asyncio.sleep(_STATUS_TICK_SECONDS * 2.5)
+        assert tui._status_fragments()[0][1] != first, "spinner never advanced"
+        assert tui._status_task is not None
+
+        tui.set_status("")
+        await asyncio.sleep(_STATUS_TICK_SECONDS * 2)
+        assert tui._status_task is None, "an idle session must cost no redraws"
+
+    asyncio.run(scenario())
+
+
+def test_status_row_normalizes_multiline_text(tmp_path):
+    """The row is one line high; embedded newlines would corrupt the layout."""
+    tui = _tui(tmp_path, console_width=80)
+    tui.set_status("running\nsecond line   spaced")
+
+    assert tui._status_fragments()[1][1] == "running second line spaced"
+
+
+def test_status_row_survives_being_set_outside_an_event_loop(tmp_path):
+    tui = _tui(tmp_path, console_width=80)
+    tui.set_status("no loop here")
+
+    assert tui._status_text == "no loop here"
+    assert tui._status_task is None
+
+
+# ── Sink → status row wiring ────────────────────────────────────────────────
+
+
+def _status_sink():
+    from agent.core.output import CliOutputSink
+
+    statuses = []
+    console = Console(file=StringIO(), force_terminal=True)
+    sink = CliOutputSink(
+        console,
+        live_status=False,
+        can_prompt=True,
+        status_callback=statuses.append,
+    )
+    return sink, statuses, console
+
+
+def test_heartbeat_updates_the_status_row_instead_of_the_transcript():
+    sink, statuses, console = _status_sink()
+
+    sink.on_heartbeat(elapsed_seconds=3.0, current_op="LLM")
+
+    assert statuses == ["模型正在生成 (3s)"]
+    assert console.file.getvalue() == "", "progress must not enter the scrollback"
+
+
+def test_heartbeat_keeps_the_elapsed_counter_live_on_a_status_row():
+    """Without a status row each tick costs a printed line, so it is throttled."""
+    sink, statuses, _ = _status_sink()
+
+    sink.on_heartbeat(elapsed_seconds=3.0, current_op="LLM")
+    sink._last_heartbeat_at -= 1.5
+    sink.on_heartbeat(elapsed_seconds=5.0, current_op="LLM")
+
+    assert statuses == ["模型正在生成 (3s)", "模型正在生成 (5s)"]
+
+
+def test_heartbeat_without_a_status_surface_still_throttles_hard():
+    from agent.core.output import CliOutputSink
+
+    console = Console(file=StringIO(), force_terminal=True)
+    sink = CliOutputSink(console, live_status=False)
+
+    sink.on_heartbeat(elapsed_seconds=3.0, current_op="LLM")
+    sink._last_heartbeat_at -= 1.5
+    sink.on_heartbeat(elapsed_seconds=5.0, current_op="LLM")
+
+    assert console.file.getvalue().count("模型正在生成") == 1
+
+
+def test_tool_lifecycle_drives_the_status_row():
+    sink, statuses, _ = _status_sink()
+
+    sink.begin_turn()
+    sink.on_tool_start("bash", {"command": "ls"})
+    sink.on_tool_end("bash", '{"ok": true}')
+    sink.on_turn_complete("done", [])
+
+    assert statuses[0] == "Preparing response…"
+    assert "Running bash…" in statuses
+    assert statuses[-1] == "", "the row must clear when the turn ends"
+
+
+def test_tool_progress_updates_the_status_row():
+    sink, statuses, console = _status_sink()
+
+    sink.on_tool_progress("fetch", {"status": "running", "current": 2, "total": 10})
+
+    assert statuses and "fetch" in statuses[-1]
+    assert console.file.getvalue() == ""
+
+
+def test_status_callback_is_optional_and_line_mode_is_unchanged():
+    from agent.core.output import CliOutputSink
+
+    console = Console(file=StringIO(), force_terminal=True)
+    sink = CliOutputSink(console, live_status=False)
+
+    assert sink._has_status_surface() is False
+    sink.on_heartbeat(elapsed_seconds=3.0, current_op="LLM")
+    assert "模型正在生成" in console.file.getvalue()

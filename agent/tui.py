@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from itertools import groupby
 from pathlib import Path
 import re
 import shutil
@@ -20,13 +21,20 @@ from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.layout import Layout
-from prompt_toolkit.layout.containers import Float, FloatContainer, HSplit, Window
+from prompt_toolkit.layout.containers import (
+    AnyContainer,
+    Float,
+    FloatContainer,
+    HSplit,
+    Window,
+)
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import BeforeInput
 from prompt_toolkit.layout.screen import Point
 from prompt_toolkit.mouse_events import MouseButton
 from prompt_toolkit.mouse_events import MouseEventType
+from prompt_toolkit.styles import Style
 
 from rich.console import Console
 
@@ -52,6 +60,53 @@ _PATH_EXTRACT_RE = re.compile(
     r"|((?:/|~/)[^\s'\"，。]+)"
 )
 _PATH_TRAILING_PUNCT = ",.;:!?)]}，。；：！？）】」』"
+
+# Input window growth bounds.  A single row hides everything but the last line
+# of a pasted block, and an unbounded input line would push the conversation
+# off-screen, so the window grows with the buffer up to a fixed ceiling.  The
+# ceiling is two rows below the total footprint budget because the rules above
+# and below the input each cost a row.
+_INPUT_MIN_ROWS = 1
+_INPUT_MAX_ROWS = 6
+
+# Horizontal rules bracketing the input.  Two lines are enough to separate the
+# input from the transcript above and the hint below; a full box would add two
+# columns of chrome and a corner-drawing widget for no extra clarity.
+_RULE_CHAR = "─"
+
+# Braille spinner shown on the status row.  ``_STATUS_TICK_SECONDS`` is the
+# redraw cadence while a status is active: fast enough to read as motion,
+# slow enough that a long turn does not repaint the output pane 30×/second.
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+_STATUS_TICK_SECONDS = 0.12
+
+# How often the console width is re-checked against the terminal.  Resizes are
+# human-paced, so polling once per render would be pure overhead.
+_WIDTH_SYNC_INTERVAL_SECONDS = 0.5
+_MIN_CONSOLE_WIDTH = 20
+
+# Scrollback cap for the output pane.  prompt_toolkit re-splits, re-copies and
+# hashes the *entire* fragment list on every render, so the cost of a redraw
+# grows with the whole session: ~3.7 ms at 5000 lines, ~12 ms at 20000.  With
+# the spinner redrawing several times a second an uncapped pane turns a long
+# session into a permanent CPU load, so the oldest lines are dropped.  The
+# slack means the O(len) splice is amortised over many writes instead of being
+# paid on every line once the cap is reached.
+_MAX_SCROLLBACK_LINES = 5000
+_SCROLLBACK_TRIM_SLACK = 500
+
+# The rules are chrome, not content: ``ansibrightblack`` keeps them legible on
+# both light and dark terminals without competing with the text between them.
+_TUI_STYLE = Style.from_dict({"input-rule": "ansibrightblack"})
+
+
+def _ruled(body: AnyContainer) -> HSplit:
+    """Bracket ``body`` between two full-width horizontal rules."""
+
+    def rule() -> Window:
+        return Window(char=_RULE_CHAR, height=1, style="class:input-rule")
+
+    return HSplit([rule(), body, rule()])
 
 
 def _paths_from_line(text: str) -> list[tuple[str, Path]]:
@@ -99,6 +154,29 @@ async def _copy_to_clipboard(path: Path) -> bool:
         return process.returncode == 0
     except (FileNotFoundError, OSError):
         return False
+
+
+def _coalesce_fragments(fragments: StyleAndTextTuples) -> StyleAndTextTuples:
+    """Merge neighbouring fragments that share a style.
+
+    prompt_toolkit's ANSI parser emits **one fragment per character**, so an
+    unmerged pane holds ~44 tuples per rendered line.  Everything downstream is
+    per-fragment — the renderer splits, copies and hashes the whole list each
+    redraw, and reading a single line means walking it — so collapsing runs
+    here is worth an order of magnitude to both.
+    """
+    merged: StyleAndTextTuples = []
+    for style, group in groupby(
+        fragments, key=lambda item: item[0] if len(item) == 2 else None
+    ):
+        run = list(group)
+        # ``None`` marks fragments carrying a mouse handler; those are kept as
+        # they are, since merging would drop the handler of all but one.
+        if style is None or len(run) == 1:
+            merged.extend(run)
+        else:
+            merged.append((style, "".join(item[1] for item in run)))
+    return merged
 
 
 class _OutputPane:
@@ -180,7 +258,7 @@ class _OutputPane:
                     continue
                 if index > 0:
                     self._replace_current_line()
-                parsed = list(to_formatted_text(ANSI(segment)))
+                parsed = _coalesce_fragments(to_formatted_text(ANSI(segment)))
                 self._fragments.extend(parsed)
                 # Line accounting comes from what the parser actually emitted,
                 # never from the raw input: the cursor must always point at a
@@ -189,10 +267,52 @@ class _OutputPane:
                 self._line_count += sum(
                     item[1].count("\n") for item in parsed if len(item) >= 2
                 )
+        self._trim_scrollback_locked()
         if self._follow_bottom:
             self._scroll_top = self._max_scroll()
         self._notify()
         return len(text)
+
+    def _trim_scrollback_locked(self) -> None:
+        """Drop the oldest lines once the pane exceeds the scrollback cap.
+
+        Every logical index the pane hands out — ``_scroll_top``, the renderer's
+        remembered bottom, the line index behind a right-click — is relative to
+        the current fragment list, so they all shift by however many lines were
+        dropped.  A reader parked far enough up the transcript to be trimmed
+        away is moved to the new top rather than left pointing at nothing.
+        """
+        if self._line_count <= _MAX_SCROLLBACK_LINES + _SCROLLBACK_TRIM_SLACK:
+            return
+        drop = self._line_count - _MAX_SCROLLBACK_LINES
+        removed = 0
+        for index, item in enumerate(self._fragments):
+            text = item[1] if len(item) >= 2 else ""
+            newlines = text.count("\n")
+            if removed + newlines < drop:
+                removed += newlines
+                continue
+            # The cut lands inside this fragment: keep the tail after the last
+            # dropped newline, and discard everything before it.
+            cut = -1
+            for _ in range(drop - removed):
+                cut = text.find("\n", cut + 1)
+            tail = text[cut + 1 :]
+            if tail:
+                self._fragments[index] = (item[0], tail) + item[2:]
+                del self._fragments[:index]
+            else:
+                del self._fragments[: index + 1]
+            removed = drop
+            break
+        else:
+            # Unreachable while _line_count tracks the parsed newlines; if the
+            # two ever disagree, resetting is better than an inconsistent index.
+            self._fragments.clear()
+            removed = self._line_count
+        self._line_count -= removed
+        self._scroll_top = max(0, self._scroll_top - removed)
+        self._rendered_bottom = max(0, self._rendered_bottom - removed)
 
     def _replace_current_line(self) -> None:
         """Drop fragments belonging to the unterminated current line.
@@ -217,7 +337,15 @@ class _OutputPane:
         return False
 
     def fragments(self) -> StyleAndTextTuples:
-        return self._fragments
+        """Snapshot of the pane contents for the renderer.
+
+        A copy, not the live list: trimming splices from the front while the
+        background memory worker may be writing, and a reader iterating the
+        list through a splice would skip fragments.  The cap keeps the copy
+        cheap, and prompt_toolkit tuples the whole list per render regardless.
+        """
+        with self._lock:
+            return list(self._fragments)
 
     def cursor_position(self) -> Point:
         return Point(
@@ -329,14 +457,44 @@ class _OutputPane:
         return min(line, self._line_count)
 
     def line_text(self, line_index: int) -> str:
-        """Plain text of one logical output line."""
-        joined = "".join(
-            item[1] for item in self._fragments if len(item) >= 2
-        )
-        lines = joined.split("\n")
-        if 0 <= line_index < len(lines):
-            return lines[line_index]
-        return ""
+        """Plain text of one logical output line.
+
+        Skips whole fragments with a single ``count`` and only walks character
+        offsets inside the one that holds the line.  Joining the pane into one
+        string and splitting it — the obvious implementation — copies the whole
+        transcript on every right-click.
+        """
+        if line_index < 0:
+            return ""
+        parts: list[str] = []
+        line = 0
+        for item in self.fragments():
+            if len(item) < 2:
+                continue
+            text = item[1]
+            count = text.count("\n")
+            if count and line + count < line_index:
+                line += count
+                continue
+            if not count:
+                if line == line_index:
+                    parts.append(text)
+                continue
+            pos = 0
+            while True:
+                newline = text.find("\n", pos)
+                if newline < 0:
+                    if line == line_index:
+                        parts.append(text[pos:])
+                    break
+                if line == line_index:
+                    parts.append(text[pos:newline])
+                    return "".join(parts)
+                line += 1
+                pos = newline + 1
+            if line > line_index:
+                break
+        return "".join(parts)
 
     def _view_height(self) -> int:
         if self._fixed_view_height is not None:
@@ -427,8 +585,20 @@ class TuiSession:
         self._app_exit_requested = False
         self._path_menu_open = False
 
+        # Status row state.  ``_status_text`` empty means the row is collapsed
+        # to zero height, so an idle session looks exactly as before.
+        self._status_text = ""
+        self._status_frame = 0
+        self._status_task: Optional[asyncio.Task] = None
+
         self._pane = _OutputPane(on_write=self._request_redraw)
-        width = console_width or max(80, shutil.get_terminal_size().columns)
+        # An explicit width pins the console (tests, non-tty embedding); the
+        # default follows the real terminal and keeps following it on resize.
+        self._pinned_console_width = console_width
+        self._width_checked_at = 0.0
+        width = console_width or max(
+            _MIN_CONSOLE_WIDTH, shutil.get_terminal_size().columns
+        )
         self.console = Console(
             file=self._pane,
             force_terminal=True,
@@ -444,6 +614,7 @@ class TuiSession:
         self._app = Application(
             layout=Layout(container=self._build_layout()),
             key_bindings=self._build_key_bindings(),
+            style=_TUI_STYLE,
             full_screen=True,
             mouse_support=True,
             min_redraw_interval=0.03,
@@ -455,7 +626,7 @@ class TuiSession:
         output_window = _ScrollableOutputWindow(
             self._pane,
             FormattedTextControl(
-                self._pane.fragments,
+                self._output_fragments,
                 get_cursor_position=self._pane.cursor_position,
             ),
             wrap_lines=True,
@@ -464,24 +635,37 @@ class TuiSession:
             context_menu=self._handle_output_context_menu,
         )
         self._pane.attach_window(output_window)
+        status_window = Window(
+            FormattedTextControl(self._status_fragments),
+            height=self._status_height,
+            style="class:status-line",
+        )
         input_window = Window(
             BufferControl(
                 buffer=self._buffer,
                 input_processors=[BeforeInput("› ")],
             ),
-            height=1,
+            height=self._input_height,
+            wrap_lines=True,
             style="class:input-line",
         )
         hint_window = Window(
             FormattedTextControl(
-                "Enter 发送 · 输入 / 实时筛选命令 · ↑/↓ 或翻页滚动对话 · "
-                "Ctrl+C 取消 · Ctrl+D 退出"
+                "Enter 发送 · Alt+Enter 换行 · 输入 / 实时筛选命令 · "
+                "↑/↓ 或翻页滚动对话 · Ctrl+C 取消 · Ctrl+D 退出"
             ),
             height=1,
             style="class:bottom-hint",
         )
         return FloatContainer(
-            content=HSplit([output_window, input_window, hint_window]),
+            content=HSplit(
+                [
+                    output_window,
+                    status_window,
+                    _ruled(input_window),
+                    hint_window,
+                ]
+            ),
             floats=[
                 Float(
                     xcursor=True,
@@ -490,6 +674,112 @@ class TuiSession:
                 ),
             ],
         )
+
+    def _output_fragments(self) -> StyleAndTextTuples:
+        """Output-pane content, re-syncing the console width on every render.
+
+        The renderer is the only thing guaranteed to run after a terminal
+        resize — prompt_toolkit redraws from its SIGWINCH handler without
+        firing ``on_invalidate`` — so the width check rides along here.
+        """
+        self._sync_console_width()
+        return self._pane.fragments()
+
+    def _sync_console_width(self) -> None:
+        """Keep the rich console as wide as the terminal actually is.
+
+        Rich decides line wrapping at print time from ``console.width``.  A
+        width frozen at construction means every line printed after a resize
+        wraps for the old terminal: too-long lines overflow a narrowed window
+        and a widened one keeps a dead margin.
+        """
+        if self._pinned_console_width is not None:
+            return
+        now = time.monotonic()
+        if now - self._width_checked_at < _WIDTH_SYNC_INTERVAL_SECONDS:
+            return
+        self._width_checked_at = now
+        app = get_app_or_none()
+        columns: Optional[int] = None
+        if app is not None:
+            try:
+                columns = app.output.get_size().columns
+            except Exception:
+                columns = None
+        if not columns:
+            try:
+                columns = shutil.get_terminal_size().columns
+            except OSError:
+                return
+        width = max(_MIN_CONSOLE_WIDTH, int(columns))
+        if width != self.console.width:
+            self.console.width = width
+
+    # ── Input sizing ──────────────────────────────────────────────────────
+
+    def _input_height(self) -> int:
+        """Grow the input window with the buffer, up to a fixed ceiling.
+
+        The buffer is multiline (prompt_toolkit's default), so a pasted block
+        or a composed paragraph really is several lines; a one-row window would
+        show only the line the cursor happens to be on.
+        """
+        lines = self._buffer.document.line_count
+        return max(_INPUT_MIN_ROWS, min(_INPUT_MAX_ROWS, lines))
+
+    # ── Status row ────────────────────────────────────────────────────────
+
+    def _status_height(self) -> int:
+        return 1 if self._status_text else 0
+
+    def _status_fragments(self) -> StyleAndTextTuples:
+        if not self._status_text:
+            return []
+        frame = _SPINNER_FRAMES[self._status_frame % len(_SPINNER_FRAMES)]
+        return [
+            ("class:status-spinner", f" {frame} "),
+            ("class:status-text", self._status_text),
+        ]
+
+    def set_status(self, text: str) -> None:
+        """Show (or, with empty text, hide) the in-place status row.
+
+        This is the TUI's replacement for a Rich spinner: the output pane is an
+        append-only transcript, so anything printed there to signal progress
+        stays in the scrollback forever.  The status row is redrawn instead.
+        """
+        text = " ".join(str(text or "").split())
+        if text == self._status_text:
+            return
+        self._status_text = text
+        if text:
+            self._start_status_ticker()
+        self._request_redraw()
+
+    def _start_status_ticker(self) -> None:
+        if self._status_task is not None and not self._status_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._status_task = loop.create_task(self._animate_status())
+
+    async def _animate_status(self) -> None:
+        """Advance the spinner while a status is showing, then stop.
+
+        The task exits as soon as the status clears, so an idle session costs
+        no redraws at all.
+        """
+        try:
+            while self._status_text:
+                await asyncio.sleep(_STATUS_TICK_SECONDS)
+                self._status_frame += 1
+                self._request_redraw()
+        except asyncio.CancelledError:
+            raise
+        finally:
+            self._status_task = None
 
     # ── Right-click path menu ──────────────────────────────────────────────
 
@@ -590,6 +880,11 @@ class TuiSession:
             self._pane.scroll_bottom()
             self._submit(text)
 
+        @kb.add("escape", "enter")
+        def _newline(event: Any) -> None:
+            """Alt+Enter composes a new line instead of submitting."""
+            event.app.current_buffer.insert_text("\n")
+
         @kb.add("up")
         def _up(event: Any) -> None:
             buffer = event.app.current_buffer
@@ -597,6 +892,10 @@ class TuiSession:
                 buffer.complete_previous()
             elif not buffer.text:
                 self._pane.scroll_up(lines=3)
+            elif buffer.document.line_count > 1:
+                # Multi-line drafts need in-buffer navigation; scrolling the
+                # transcript here would strand the cursor on the last line.
+                buffer.cursor_up()
 
         @kb.add("down")
         def _down(event: Any) -> None:
@@ -605,6 +904,8 @@ class TuiSession:
                 buffer.complete_next()
             elif not buffer.text:
                 self._pane.scroll_down(lines=3)
+            elif buffer.document.line_count > 1:
+                buffer.cursor_down()
 
         @kb.add("pageup")
         def _page_up(event: Any) -> None:
@@ -665,6 +966,12 @@ class TuiSession:
                 task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            self._status_text = ""
+            status_task = self._status_task
+            if status_task is not None and not status_task.done():
+                status_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await status_task
             app = get_app_or_none()
             if app is self._app and app._is_running:
                 app.exit(result=None)
