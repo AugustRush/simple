@@ -23,6 +23,7 @@ agent/_builtin/skills/skill-manager/scripts/init_skill.py
 agent/_builtin/skills/skill-manager/scripts/quick_validate.py
 agent/channels/__init__.py
 agent/channels/base.py
+agent/channels/feishu.py
 agent/commands/__init__.py
 agent/commands/builtin.py
 agent/commands/coordinator.py
@@ -35,7 +36,16 @@ agent/core/output.py
 agent/core/transport.py
 agent/domain/__init__.py
 agent/memory/__init__.py
+agent/memory/_helpers.py
+agent/memory/consolidation.py
+agent/memory/context.py
+agent/memory/models.py
+agent/memory/palace.py
+agent/memory/retrieval.py
+agent/memory/staging.py
+agent/memory/store.py
 agent/memory/system.py
+agent/memory/worker.py
 agent/orchestration/__init__.py
 agent/orchestration/planner.py
 agent/orchestration/runtime.py
@@ -71,8 +81,6 @@ agent/tools/executor.py
 agent/tools/files.py
 agent/tools/runtime.py
 agent/tools/user_tools.py
-channels/__init__.py
-channels/feishu.py
 simple.egg-info/PKG-INFO
 simple.egg-info/SOURCES.txt
 simple.egg-info/dependency_links.txt
@@ -99,6 +107,7 @@ tests/test_lexical.py
 tests/test_ltm_store.py
 tests/test_memory_benchmark.py
 tests/test_memory_palace_store.py
+tests/test_multi_instance.py
 tests/test_network_security.py
 tests/test_orchestration.py
 tests/test_output_dir.py
@@ -112,3 +121,4 @@ tests/test_single_file_layout.py
 tests/test_skill_tools.py
 tests/test_staging.py
 tests/test_tool_executor.py
+tests/test_user_tools.py
