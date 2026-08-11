@@ -793,11 +793,14 @@ def test_empty_scope_filter_returns_no_memory_entries(tmp_path):
 
 
 def test_retention_bounds_active_run_scratch_entries(tmp_path, monkeypatch):
-    import agent.memory.system as memory_system
+    # Patch the module that *reads* these constants.  ``agent.memory.system`` is
+    # only a re-export façade, so rebinding a name there leaves the copy that
+    # ``apply_retention`` closes over untouched.
+    import agent.memory.store as memory_store
     from agent import LTMEntry, LTMStore
 
-    monkeypatch.setattr(memory_system, "_RUN_SCRATCH_MAX_ACTIVE", 3)
-    monkeypatch.setattr(memory_system, "_RUN_SCRATCH_RETENTION_DAYS", 3650)
+    monkeypatch.setattr(memory_store, "_RUN_SCRATCH_MAX_ACTIVE", 3)
+    monkeypatch.setattr(memory_store, "_RUN_SCRATCH_RETENTION_DAYS", 3650)
     store = LTMStore(context_dir=tmp_path / "context")
     for index in range(5):
         store.add_entry(
