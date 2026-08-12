@@ -149,7 +149,9 @@ def build_context_manager(corpus: list[dict[str, Any]], tmp_dir: Path):
     )
 
 
-def evaluate(cases_path: Path, *, pad: int = DEFAULT_PAD) -> dict[str, Any]:
+def evaluate(
+    cases_path: Path, *, pad: int = DEFAULT_PAD, multi_query: bool = False
+) -> dict[str, Any]:
     payload = json.loads(cases_path.read_text(encoding="utf-8"))
     labeled = payload["corpus"]
     cases = payload["cases"]
@@ -157,7 +159,9 @@ def evaluate(cases_path: Path, *, pad: int = DEFAULT_PAD) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory() as raw_tmp:
         manager = build_context_manager(corpus, Path(raw_tmp))
-        results = [_run_case(manager, case) for case in cases]
+        results = [
+            _run_case(manager, case, multi_query=multi_query) for case in cases
+        ]
 
     return {
         "cases_file": str(cases_path.relative_to(ROOT)),
@@ -172,9 +176,15 @@ def evaluate(cases_path: Path, *, pad: int = DEFAULT_PAD) -> dict[str, Any]:
     }
 
 
-def _run_case(manager: ContextManager, case: dict[str, Any]) -> dict[str, Any]:
+def _run_case(
+    manager: ContextManager, case: dict[str, Any], *, multi_query: bool = False
+) -> dict[str, Any]:
     query = case["query"]
     relevant = set(case.get("relevant", []))
+    # `multi_query` models what a pull-based agent does: re-ask in the
+    # memory's own wording rather than passing the user's sentence verbatim.
+    if multi_query and case.get("alt_queries"):
+        query = [case["query"], *case["alt_queries"]]
     # The production call.  Ask for more than the largest cutoff so recall@5
     # is not truncated by the default top_k.
     ranked = manager.rank_ltm_entries(query, top_k=max(CUTOFFS))
@@ -182,7 +192,10 @@ def _run_case(manager: ContextManager, case: dict[str, Any]) -> dict[str, Any]:
     # Stage-1 ceiling: an entry the candidate fetch misses can never be
     # recovered by ranking, so a miss here and a miss in the ranking are
     # different bugs with different fixes.
-    candidate_ids = {e.id for e in manager.ltm_candidates(query, top_k=max(CUTOFFS))}
+    probes = query if isinstance(query, list) else [query]
+    candidate_ids = {
+        e.id for p in probes for e in manager.ltm_candidates(p, top_k=max(CUTOFFS))
+    }
     reachable = bool(relevant) and bool(relevant & candidate_ids)
 
     hits = {k: len(relevant & set(retrieved[:k])) for k in CUTOFFS}
@@ -196,7 +209,7 @@ def _run_case(manager: ContextManager, case: dict[str, Any]) -> dict[str, Any]:
             break
 
     return {
-        "query": query,
+        "query": case["query"],
         "tags": case.get("tags", []),
         "is_negative": not relevant,
         "relevant": sorted(relevant),
@@ -412,6 +425,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--save-baseline", action="store_true")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--multi-query",
+        action="store_true",
+        help="use each case's alt_queries too (models a pull-based agent)",
+    )
     parser.add_argument("--json", action="store_true", help="emit raw JSON")
     parser.add_argument(
         "--harvest",
@@ -425,7 +443,7 @@ def main(argv: list[str] | None = None) -> int:
         harvest(Path(args.harvest), LOCAL_CASES)
         return 0
 
-    report = evaluate(args.cases, pad=args.pad)
+    report = evaluate(args.cases, pad=args.pad, multi_query=args.multi_query)
 
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))

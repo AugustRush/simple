@@ -23,7 +23,6 @@
     "  multi        more than one memory is correct",
     "  negative     nothing should be retrieved; measures false-positive rate"
   ],
-
   "corpus": [
     {
       "id": "id-lang-pref",
@@ -57,7 +56,6 @@
       "importance": 0.6,
       "content": "用户在深圳，时区 UTC+8，习惯用中文提问但代码注释用英文。"
     },
-
     {
       "id": "proj-simple",
       "category": "projects",
@@ -82,7 +80,6 @@
       "importance": 0.6,
       "content": "Decided to keep memory in SQLite with FTS5 rather than adding a vector database, to avoid an external dependency for a single-user workload."
     },
-
     {
       "id": "task-next-review",
       "category": "tasks",
@@ -99,7 +96,6 @@
       "importance": 0.6,
       "content": "Pending: move user-generated tools out of the agent process into the shell sandbox, since exec_module gives them full access to config.json."
     },
-
     {
       "id": "concept-bm25",
       "category": "concepts",
@@ -116,7 +112,6 @@
       "importance": 0.5,
       "content": "macOS seatbelt resolves overlapping rules last-match-wins, so a deny must come after the broad allow it narrows."
     },
-
     {
       "id": "ep-auth-debug",
       "category": "episodes",
@@ -157,7 +152,6 @@
       "importance": 0.3,
       "content": "Ran three sub-agents in parallel to audit the security, memory, and orchestration layers; merged their findings into a single ranked review."
     },
-
     {
       "id": "dist-cache-1",
       "category": "episodes",
@@ -182,7 +176,6 @@
       "importance": 0.4,
       "content": "讨论了缓存键应该按内容 hash 还是按输入字段列举，结论是手写字段列表一定会漂，应该让渲染函数只能读到 key 里的东西。"
     },
-
     {
       "id": "noise-shell-1",
       "category": "episodes",
@@ -216,138 +209,308 @@
       "content": "sub-agent [reviewer] task: audit the retrieval layer\n\nresult: The two-stage pipeline recomputes BM25 over candidates that were already selected by the query, which flattens IDF for exactly the terms the user asked about. Recommend supplying corpus-level document frequencies from the store, and note that the second stage's only genuinely new signal is the importance multiplier."
     }
   ],
-
   "cases": [
     {
       "query": "用户叫什么名字",
-      "relevant": ["id-name"],
-      "tags": ["fact", "lexical"]
+      "relevant": [
+        "id-name"
+      ],
+      "tags": [
+        "fact",
+        "lexical"
+      ]
     },
     {
       "query": "我在哪家公司做什么工作",
-      "relevant": ["id-name"],
-      "tags": ["fact", "paraphrase"]
+      "relevant": [
+        "id-name"
+      ],
+      "tags": [
+        "fact",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "August 大疆 iOS",
+        "用户 工作 公司"
+      ]
     },
     {
       "query": "回复应该多长",
-      "relevant": ["id-lang-pref"],
-      "tags": ["fact", "cross-lingual", "paraphrase"]
+      "relevant": [
+        "id-lang-pref"
+      ],
+      "tags": [
+        "fact",
+        "cross-lingual",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "reply length concise sentences"
+      ]
     },
     {
       "query": "should I use emoji in my replies",
-      "relevant": ["id-lang-pref"],
-      "tags": ["fact", "lexical"]
+      "relevant": [
+        "id-lang-pref"
+      ],
+      "tags": [
+        "fact",
+        "lexical"
+      ],
+      "alt_queries": [
+        "回复 emoji 偏好"
+      ]
     },
     {
       "query": "你叫什么",
-      "relevant": ["id-self"],
-      "tags": ["fact", "paraphrase"]
+      "relevant": [
+        "id-self"
+      ],
+      "tags": [
+        "fact",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "assistant name",
+        "小简 identity"
+      ]
     },
     {
       "query": "what timezone is the user in",
-      "relevant": ["id-tz"],
-      "tags": ["fact", "cross-lingual"]
+      "relevant": [
+        "id-tz"
+      ],
+      "tags": [
+        "fact",
+        "cross-lingual"
+      ],
+      "alt_queries": [
+        "用户 时区 深圳"
+      ]
     },
-
     {
       "query": "Simple 项目用什么管理依赖",
-      "relevant": ["proj-simple"],
-      "tags": ["fact", "lexical"]
+      "relevant": [
+        "proj-simple"
+      ],
+      "tags": [
+        "fact",
+        "lexical"
+      ]
     },
     {
       "query": "为什么没有用向量数据库",
-      "relevant": ["proj-db-choice"],
-      "tags": ["fact", "cross-lingual", "paraphrase"]
+      "relevant": [
+        "proj-db-choice"
+      ],
+      "tags": [
+        "fact",
+        "cross-lingual",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "vector database decision SQLite FTS5"
+      ]
     },
     {
       "query": "MIMO 什么时候提测",
-      "relevant": ["proj-mimo-release"],
-      "tags": ["fact", "paraphrase"]
+      "relevant": [
+        "proj-mimo-release"
+      ],
+      "tags": [
+        "fact",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "MIMO CSDK 提测 开发准出"
+      ]
     },
     {
       "query": "还有什么待办没做",
-      "relevant": ["task-next-review", "task-sandbox"],
-      "tags": ["fact", "multi", "paraphrase"]
+      "relevant": [
+        "task-next-review",
+        "task-sandbox"
+      ],
+      "tags": [
+        "fact",
+        "multi",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "next step pending",
+        "待办 下一步"
+      ]
     },
-
     {
       "query": "IDF 为什么会塌成零",
-      "relevant": ["concept-bm25"],
-      "tags": ["fact", "lexical"]
+      "relevant": [
+        "concept-bm25"
+      ],
+      "tags": [
+        "fact",
+        "lexical"
+      ]
     },
     {
       "query": "seatbelt 规则的优先级是怎么算的",
-      "relevant": ["concept-seatbelt"],
-      "tags": ["fact", "cross-lingual"]
+      "relevant": [
+        "concept-seatbelt"
+      ],
+      "tags": [
+        "fact",
+        "cross-lingual"
+      ],
+      "alt_queries": [
+        "seatbelt last-match-wins rules"
+      ]
     },
-
     {
       "query": "上次那个鉴权失败的问题最后是什么原因",
-      "relevant": ["ep-auth-debug"],
-      "tags": ["episode", "paraphrase"]
+      "relevant": [
+        "ep-auth-debug"
+      ],
+      "tags": [
+        "episode",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "鉴权失败 证书过期 FAIL_AUTH"
+      ]
     },
     {
       "query": "刚才我们聊过飞书网关怎么配的吗",
-      "relevant": ["ep-feishu-setup"],
-      "tags": ["episode", "cross-lingual", "paraphrase"]
+      "relevant": [
+        "ep-feishu-setup"
+      ],
+      "tags": [
+        "episode",
+        "cross-lingual",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "Feishu gateway setup"
+      ]
     },
     {
       "query": "之前优化检索性能提升了多少",
-      "relevant": ["ep-perf-tuning"],
-      "tags": ["episode", "paraphrase"]
+      "relevant": [
+        "ep-perf-tuning"
+      ],
+      "tags": [
+        "episode",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "检索 性能 优化 毫秒"
+      ]
     },
     {
       "query": "终端输出太长刷屏那次怎么解决的",
-      "relevant": ["ep-tui-layout"],
-      "tags": ["episode", "paraphrase"]
+      "relevant": [
+        "ep-tui-layout"
+      ],
+      "tags": [
+        "episode",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "TUI 布局 回滚缓冲区"
+      ]
     },
-
     {
       "query": "system prompt 的缓存键少了什么",
-      "relevant": ["dist-cache-1"],
-      "tags": ["distractor", "lexical"]
+      "relevant": [
+        "dist-cache-1"
+      ],
+      "tags": [
+        "distractor",
+        "lexical"
+      ]
     },
     {
       "query": "sandbox profile 被复用是因为缓存键少了哪些字段",
-      "relevant": ["dist-cache-2"],
-      "tags": ["distractor", "lexical"]
+      "relevant": [
+        "dist-cache-2"
+      ],
+      "tags": [
+        "distractor",
+        "lexical"
+      ]
     },
     {
       "query": "缓存键应该按内容 hash 还是列字段",
-      "relevant": ["dist-cache-3"],
-      "tags": ["distractor", "lexical"]
+      "relevant": [
+        "dist-cache-3"
+      ],
+      "tags": [
+        "distractor",
+        "lexical"
+      ]
     },
-
     {
       "query": "shell 的 medium 风险到底拦不拦",
-      "relevant": ["noise-shell-1"],
-      "tags": ["episode", "lexical"]
+      "relevant": [
+        "noise-shell-1"
+      ],
+      "tags": [
+        "episode",
+        "lexical"
+      ]
     },
     {
       "query": "多实例之间为什么没隔离开",
-      "relevant": ["noise-plugin-1"],
-      "tags": ["episode", "paraphrase"]
+      "relevant": [
+        "noise-plugin-1"
+      ],
+      "tags": [
+        "episode",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "evolution 插件 实例 隔离"
+      ]
     },
     {
       "query": "临时目录泄漏了多少个",
-      "relevant": ["noise-scratch"],
-      "tags": ["episode", "cross-lingual", "paraphrase"]
+      "relevant": [
+        "noise-scratch"
+      ],
+      "tags": [
+        "episode",
+        "cross-lingual",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "scratch directory leak"
+      ]
     },
     {
       "query": "子 agent 对检索层的审查结论是什么",
-      "relevant": ["noise-sub-obs"],
-      "tags": ["episode", "cross-lingual", "paraphrase"]
+      "relevant": [
+        "noise-sub-obs"
+      ],
+      "tags": [
+        "episode",
+        "cross-lingual",
+        "paraphrase"
+      ],
+      "alt_queries": [
+        "sub-agent retrieval audit"
+      ]
     },
-
     {
       "query": "明天深圳天气怎么样",
       "relevant": [],
-      "tags": ["negative"]
+      "tags": [
+        "negative"
+      ]
     },
     {
       "query": "how do I make sourdough bread",
       "relevant": [],
-      "tags": ["negative"]
+      "tags": [
+        "negative"
+      ]
     }
   ]
 }

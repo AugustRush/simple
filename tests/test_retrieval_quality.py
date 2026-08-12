@@ -121,3 +121,126 @@ def test_filler_never_answers_a_labeled_case(report):
     """Filler must be a distractor, never accidentally the correct answer."""
     labeled_ids = {r for case in report["results"] for r in case["relevant"]}
     assert not any(entry_id.startswith("filler-") for entry_id in labeled_ids)
+
+
+# ── Multi-query retrieval ──────────────────────────────────────────────────
+#
+# The dominant retrieval failure is not ranking. It is that a single
+# unmodified user message is a poor query against a lexical index: measured
+# here, 7 of 7 stage-1 misses were recoverable by re-asking in the memory's
+# own wording or language. Hence `queries` is plural.
+
+
+@pytest.fixture(scope="module")
+def multi_report():
+    return evaluate(DEFAULT_CASES, multi_query=True)
+
+
+def test_reformulation_lifts_the_stage_one_ceiling(report, multi_report):
+    """Stage 1 was the ceiling; re-asking removes it.
+
+    This is the measurement behind making `context_retrieve` take a list.
+    Note it is an upper bound: the reformulations are authored, so it shows
+    what the pull model can reach, not what a given model will produce.
+    """
+    assert report["overall"]["candidate_recall"] < 0.80
+    assert multi_report["overall"]["candidate_recall"] > 0.95
+    assert multi_report["overall"]["miss_rate"] < report["overall"]["miss_rate"]
+
+
+def test_reformulation_fixes_the_semantic_tags_specifically(multi_report):
+    """cross-lingual and paraphrase are where lexical search fails alone."""
+    for tag in ("cross-lingual", "paraphrase"):
+        assert multi_report["by_tag"][tag]["mrr"] > 0.9, tag
+
+
+def _tools_with_memory(tmp_path):
+    """BuiltinTools wired to a real ContextManager, as production has it."""
+    from agent import BuiltinTools, LTMStore, MemoryPalace, ToolRegistry
+    from agent.memory.consolidation import ConsolidationEngine
+    from agent.memory.context import ContextManager
+    from agent.memory.retrieval import LocalRetriever
+    from agent.memory.staging import StagingBuffer
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(session_id="t", context_dir=tmp_path / "context"),
+    )
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory", context_dir=tmp_path / "context"
+    )
+    return BuiltinTools(
+        memory=memory, registry=ToolRegistry(), context_manager=manager
+    )
+
+
+def test_a_bare_string_is_one_query_not_a_bag_of_characters(tmp_path):
+    """A model filling an array parameter with a string is routine.
+
+    Iterating a str yields characters, silently turning one good query into
+    dozens of one-character queries that match nearly everything.
+    """
+    tools = _tools_with_memory(tmp_path)
+
+    result = tools._context_retrieve(queries="kubernetes deployment")
+    assert result["queries"] == ["kubernetes deployment"]
+
+    result = tools._context_retrieve(queries=["a", "b"], query="c")
+    assert result["queries"] == ["a", "b", "c"]
+
+
+def test_empty_search_tells_the_model_to_reformulate(tmp_path):
+    """An empty result is more often a bad query than an absent memory.
+
+    Without saying so, the model concludes "no record" and tells the user.
+    """
+    tools = _tools_with_memory(tmp_path)
+
+    result = tools._context_retrieve(queries=["zzzz nonexistent qqqq"])
+    assert result["count"] == 0
+    assert "lexical" in result["hint"]
+
+
+def test_missing_queries_is_an_explicit_error(tmp_path):
+    tools = _tools_with_memory(tmp_path)
+
+    result = tools._context_retrieve()
+    assert result["ok"] is False
+
+
+def test_multi_query_keeps_each_entry_best_score(tmp_path):
+    """Union with max-per-entry, not concatenation.
+
+    Concatenating phrasings dilutes IDF across terms belonging to different
+    formulations and can rank worse than any single phrasing alone.
+    """
+    from agent import LTMEntry, LTMStore
+    from agent.memory.consolidation import ConsolidationEngine
+    from agent.memory.context import ContextManager
+    from agent.memory.retrieval import LocalRetriever
+    from agent.memory.staging import StagingBuffer
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    store.add_entries(
+        [
+            LTMEntry("zh", "用户在大疆做 iOS 开发", 0.5, "identity",
+                     created_at="2026-01-01", updated_at="2026-01-01"),
+            LTMEntry("en", "The user works on camera firmware", 0.5, "identity",
+                     created_at="2026-01-01", updated_at="2026-01-01"),
+        ]
+    )
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(session_id="t", context_dir=tmp_path / "context"),
+    )
+
+    # Neither phrasing alone finds both; together they do.
+    assert {e.id for e in manager.rank_ltm_entries("大疆")} == {"zh"}
+    assert {e.id for e in manager.rank_ltm_entries("camera firmware")} == {"en"}
+    both = {e.id for e in manager.rank_ltm_entries(["大疆", "camera firmware"])}
+    assert both == {"zh", "en"}

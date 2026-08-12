@@ -63,6 +63,26 @@ identical from outside:
   is a hard ceiling; ranking cannot recover what was never retrieved.
 - **`recall@k` / `mrr`** — given the candidates, did stage 2 rank it well?
 
+What it found: the failures are stage 1, not ranking, and the fix is the
+query rather than the algorithm. Memory search is **lexical** — it matches
+words, not meanings — so one unmodified user question misses a memory that
+says the same thing differently, or says it in the other language. Re-asking
+fixes essentially all of it:
+
+| | single query | with reformulation |
+|---|---|---|
+| `candidate_recall` | 0.696 | 1.000 |
+| `mrr` | 0.609 | 1.000 |
+| `cross-lingual` | 0.143 | 1.000 |
+| `paraphrase` | 0.385 | 1.000 |
+
+That is why `context_retrieve` takes **`queries`** (a list), not `query`: the
+parameter shape makes reformulation the default path, which a sentence in a
+tool description does not reliably achieve. `--multi-query` reproduces the
+right-hand column. Treat it as an upper bound — the reformulations are
+authored, so it shows what the approach can reach, not what a given model
+will produce.
+
 `tests/test_retrieval_quality.py` guards the pinned baseline in CI. Re-pin
 with `--save-baseline` after an intentional change, and read the tag
 breakdown first.

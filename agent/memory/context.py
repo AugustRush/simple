@@ -902,52 +902,67 @@ class ContextManager:
 
     def rank_ltm_entries(
         self,
-        query: str,
+        query: str | list[str],
         top_k: int = shared.RETRIEVAL_TOP_K,
     ) -> list[LTMEntry]:
         """Return the top-K entries for *query*, highest-scoring first.
 
-        The ranking half of :meth:`retrieve_ltm_context`, split out so that
-        retrieval quality can be measured.  Formatting a string is a
-        presentation concern; which entries come back and in what order is
-        the thing that decides whether the agent remembers correctly, and it
-        needs to be observable by an evaluation harness without
-        reimplementing the pipeline (a reimplementation measures itself, not
-        production).
+        *query* may be several phrasings.  This is the single highest-value
+        thing the retrieval layer can offer, because the dominant failure is
+        not ranking — it is that one unmodified user message is a bad query
+        against a lexical index.  Measured on the eval set, 7 of 7 stage-1
+        misses were recoverable by re-asking in the memory's own wording or
+        language ("我在哪家公司做什么工作" finds nothing; "August 大疆 iOS"
+        finds it).  The information was always reachable; the query was the
+        problem.
+
+        Candidates are unioned across phrasings and each entry keeps its best
+        score, rather than concatenating the phrasings into one string —
+        concatenation dilutes IDF across terms that belong to different
+        formulations and ends up ranking worse than any single one of them.
 
         Two-stage retrieval:
           1. :meth:`ltm_candidates` fetches a broad candidate set via FTS5.
-          2. LocalRetriever re-ranks candidates with importance-boosted BM25,
-             using document frequencies measured over the **whole store**.
+          2. LocalRetriever re-ranks candidates by relevance, using document
+             frequencies measured over the **whole store**.
           3. Routed categories receive a small score bonus rather than hard
              filtering.
-
-        Stage 2 used to compute IDF over the stage-1 candidates.  Those
-        candidates are precisely the documents that matched the query, so
-        every query term had df ≈ N among them and scored ~0 IDF: the
-        re-ranker systematically ignored the words the user actually asked
-        about and sorted on incidental vocabulary instead.  Passing real
-        corpus statistics is what makes the second stage informative.
         """
-        scopes = ["global", f"session:{self.staging.session_id}"]
-        candidates = self.ltm_candidates(query, top_k)
-        if not candidates:
+        queries = [query] if isinstance(query, str) else list(query)
+        queries = [str(q).strip() for q in queries if str(q).strip()]
+        if not queries:
             return []
-        categories = self._route_categories(query)
-        corpus = self.store.corpus_stats(self.retriever.tokenize(query), scopes=scopes)
-        scored = self.retriever.score(query, candidates, corpus)
-        if categories:
-            routed = set(categories)
-            scored = [
-                (entry, score * (1.15 if entry.category in routed else 1.0))
-                for entry, score in scored
-            ]
-            scored.sort(key=lambda item: item[1], reverse=True)
+
+        scopes = ["global", f"session:{self.staging.session_id}"]
+        best: dict[str, float] = {}
+        entries: dict[str, LTMEntry] = {}
+        routed: set[str] = set()
+
+        for one in queries:
+            candidates = self.ltm_candidates(one, top_k)
+            if not candidates:
+                continue
+            routed.update(self._route_categories(one))
+            corpus = self.store.corpus_stats(
+                self.retriever.tokenize(one), scopes=scopes
+            )
+            for entry, score in self.retriever.score(one, candidates, corpus):
+                if score > best.get(entry.id, 0.0):
+                    best[entry.id] = score
+                    entries[entry.id] = entry
+
+        if not best:
+            return []
+        scored = [
+            (entries[entry_id], score * (1.15 if entries[entry_id].category in routed else 1.0))
+            for entry_id, score in best.items()
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
         return [entry for entry, score in scored[:top_k] if score > 0]
 
     def retrieve_ltm_context(
         self,
-        query: str,
+        query: str | list[str],
         top_k: int = shared.RETRIEVAL_TOP_K,
         token_budget: Optional[int] = None,
     ) -> str:
@@ -1564,12 +1579,24 @@ class ContextManager:
 
     def retrieve_context(
         self,
-        query: str,
+        query: str | list[str],
         top_k: int = shared.RETRIEVAL_TOP_K,
         *,
         exclude_message_id: str = "",
     ) -> str:
-        """Return explicit context lookup results across active session and LTM."""
+        """Return explicit context lookup results across active session and LTM.
+
+        *query* may be several phrasings; see :meth:`rank_ltm_entries` for why
+        that is the highest-value knob in this layer.  The session/fact
+        lookups use the first phrasing (they match structured subjects rather
+        than free text, so extra wordings add nothing), while the free-text
+        LTM search unions all of them.
+        """
+        queries = [query] if isinstance(query, str) else list(query)
+        queries = [str(q).strip() for q in queries if str(q).strip()]
+        if not queries:
+            return ""
+        query = queries[0]
         plan = self._plan_query(query)
         sections = []
         history = self.retrieve_history_context(
@@ -1593,7 +1620,11 @@ class ContextManager:
             plan=plan,
             has_fact_hits=bool(facts),
         )
-        ltm = self.retrieve_ltm_context(query, top_k=top_k) if include_freeform else ""
+        ltm = (
+            self.retrieve_ltm_context(queries, top_k=top_k)
+            if include_freeform
+            else ""
+        )
         if ltm:
             sections.append(ltm)
         return "\n\n".join(sections)

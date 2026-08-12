@@ -747,6 +747,18 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "writable for generated artifacts. The `file_access` configuration "
                 "is loaded only at startup — changing it requires a restart."
             )
+        if "context_retrieve" in builtin_names:
+            lines.append(
+                "Memory search is LEXICAL, not semantic: `context_retrieve` "
+                "finds memories that share WORDS with the query, not ones that "
+                "merely mean the same thing. When the context already in this "
+                "turn does not answer the question, call it with SEVERAL "
+                "phrasings in `queries` — including the other language, and the "
+                "concrete nouns the memory itself would use — before telling "
+                "the user you have no record. A memory written in English will "
+                "not match a Chinese question, and one empty search proves "
+                "nothing."
+            )
         if "schedule_create" in builtin_names:
             lines.append(
                 "If the user asks for a reminder, delayed follow-up, or recurring future message, "

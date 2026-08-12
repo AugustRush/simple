@@ -607,14 +607,38 @@ class BuiltinTools:
             (
                 "Search long-term context memory for relevant information. "
                 "Use to recall past facts, user preferences, project context, "
-                "or any information consolidated from previous sessions."
+                "or any information consolidated from previous sessions. "
+                "ALSO use it when the context already injected into this turn "
+                "does not contain what you need — do not tell the user you "
+                "have no record until you have searched.\n"
+                "The index is LEXICAL, not semantic: it finds memories that "
+                "share WORDS with your query, not ones that merely mean the "
+                "same thing. So pass SEVERAL phrasings in `queries`, not just "
+                "the user's question verbatim:\n"
+                "- the other language (a memory written in English will not "
+                "match a Chinese question, and vice versa)\n"
+                "- the concrete words the memory itself would use "
+                "(for 'which company do I work at', try the employer's name)\n"
+                "- distinctive nouns rather than the question's phrasing"
             ),
             {
                 "type": "object",
                 "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Two to four different phrasings of what you are "
+                            "looking for. More phrasings find more; they are "
+                            "unioned, so a wrong guess costs nothing."
+                        ),
+                    },
                     "query": {
                         "type": "string",
-                        "description": "Search query to retrieve relevant context",
+                        "description": (
+                            "Single query (legacy). Prefer `queries` — one "
+                            "phrasing is what makes lexical search miss."
+                        ),
                     },
                     "top_k": {
                         "type": "integer",
@@ -622,7 +646,7 @@ class BuiltinTools:
                         "default": 5,
                     },
                 },
-                "required": ["query"],
+                "required": [],
             },
             self._context_retrieve,
             source="builtin",
@@ -2605,7 +2629,39 @@ class BuiltinTools:
             deleted_by_store=deleted,
         )
 
-    def _context_retrieve(self, query: str, top_k: int = 5) -> dict[str, Any]:
+    def _context_retrieve(
+        self,
+        queries: Optional[list[str] | str] = None,
+        query: str = "",
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        """Search LTM with one or more phrasings.
+
+        Plural by design.  The dominant retrieval failure is not ranking but
+        that a single unmodified question is a poor query against a lexical
+        index; measured on the eval set, 7 of 7 stage-1 misses were
+        recoverable by re-asking in the memory's own wording or language.
+        Encoding that in the parameter shape makes reformulation the default
+        path, which prose in a tool description does not reliably achieve.
+
+        ``queries`` accepts a bare string as well as a list.  A model filling
+        an array parameter with a single string is routine, and iterating a
+        str yields its characters — silently turning one good query into
+        dozens of one-character ones that match everything.
+        """
+        if isinstance(queries, str):
+            queries = [queries] if queries.strip() else []
+        wanted = [str(q).strip() for q in (queries or []) if str(q).strip()]
+        if query and str(query).strip():
+            wanted.append(str(query).strip())
+        # Preserve order, drop duplicates.
+        seen: set[str] = set()
+        wanted = [q for q in wanted if not (q in seen or seen.add(q))]
+        if not wanted:
+            return self._error(
+                "Provide `queries` (preferred) or `query`.",
+                hint="Pass 2-4 phrasings, including the other language.",
+            )
         context_manager = self.context_manager
         current_turn_id = ""
         # Tool definitions are shared across multiplexed sessions. Resolve the
@@ -2624,13 +2680,32 @@ class BuiltinTools:
         if context_manager is None:
             return self._error("Context manager not available.")
         result = context_manager.retrieve_context(
-            query,
+            wanted,
             top_k=top_k,
             exclude_message_id=current_turn_id,
         )
         sections = [s for s in result.split("\n\n") if s.strip()] if result else []
+        if not sections:
+            # Feedback at the point of failure: an empty result is far more
+            # often a badly-shaped query than an absent memory, and without
+            # saying so the model concludes "no record" and tells the user.
+            return self._ok(
+                queries=wanted,
+                count=0,
+                content="",
+                sections=[],
+                hint=(
+                    "Nothing matched. This index is lexical, so try again with "
+                    "different WORDS before concluding the memory is absent: "
+                    "the other language, the concrete nouns the memory would "
+                    "use, or a name rather than a description."
+                ),
+            )
         return self._ok(
-            query=query, count=len(sections), content=result, sections=sections
+            queries=wanted,
+            count=len(sections),
+            content=result,
+            sections=sections,
         )
 
     def _schedule_store(self) -> SchedulerStore:
