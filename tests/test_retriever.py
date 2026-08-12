@@ -85,7 +85,17 @@ def test_retrieve_returns_empty_for_no_match():
     assert len(result) == 0
 
 
-def test_importance_boosts_ranking():
+def test_importance_does_not_influence_relevance_ranking():
+    """Ranking is relevance only; importance is a retention prior.
+
+    This test previously asserted the opposite. The multiplier was removed
+    after measuring it: on the eval set, ablating it improved MRR
+    0.587 -> 0.609, and a permutation test over 120 random reassignments of
+    the same values put the real assignment at the 3rd percentile (p ~ 0.97
+    that a random shuffle ranks at least as well). Importance anti-correlates
+    with document length, and BM25 already applies a length prior, so the
+    multiplier double-counted it.
+    """
     from agent import LocalRetriever, LTMEntry
 
     r = LocalRetriever()
@@ -93,8 +103,25 @@ def test_importance_boosts_ranking():
         LTMEntry("low", "python code function", 0.1, "c", "now", "now"),
         LTMEntry("high", "python code function", 0.9, "c", "now", "now"),
     ]
-    result = r.retrieve("python code", entries, top_k=2)
-    assert result[0].id == "high"
+    scored = r.score("python code", entries)
+    by_id = {entry.id: score for entry, score in scored}
+
+    assert by_id["low"] == by_id["high"], (
+        "equally relevant entries must score equally regardless of importance"
+    )
+
+
+def test_importance_still_orders_results_when_there_is_no_query():
+    """With no relevance signal, the retention prior is all there is."""
+    from agent import LocalRetriever, LTMEntry
+
+    r = LocalRetriever()
+    entries = [
+        LTMEntry("low", "some memory", 0.1, "c", "now", "now"),
+        LTMEntry("high", "another memory", 0.9, "c", "now", "now"),
+    ]
+    ranked = r.retrieve("", entries, top_k=2)
+    assert [e.id for e in ranked] == ["high", "low"]
 
 
 def test_retrieve_respects_top_k():

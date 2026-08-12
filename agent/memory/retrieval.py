@@ -34,7 +34,32 @@ class CorpusStats:
 
 
 class LocalRetriever:
-    """BM25-lite retrieval with importance boosting. Pure stdlib, no external deps."""
+    """BM25-lite relevance ranking. Pure stdlib, no external deps.
+
+    Deliberately *only* relevance.  Scores used to be multiplied by
+    ``(1 + entry.importance)``, which conflated two different questions:
+
+    - **ranking** — given this query, which memory is most relevant?
+    - **retention** — with limited space, which memory should I forget?
+
+    Importance answers the second well and the first not at all, and mixing
+    them made ranking worse.  Measured on the eval set: ablating the boost
+    improved MRR (0.587 -> 0.609), and a permutation test over 120 random
+    reassignments of the same importance values put the real assignment at
+    the 3rd percentile — p ~ 0.97 that a random shuffle ranks at least as
+    well.  It was not noise; it was worse than noise.
+
+    The mechanism is visible in any real store: importance anti-correlates
+    almost perfectly with document length (self_identity 0.95 / 30 chars,
+    notes 0.80 / 222, session summaries 0.48 / 458, sub-agent observations
+    0.31 / 2850).  BM25 *already* applies a length prior through its ``dl /
+    avg_dl`` normalization, so multiplying by importance double-counted it —
+    short entries were promoted twice for the same reason, pushing longer
+    but genuinely relevant entries down.
+
+    Importance is still carried on the entry and still drives decay and
+    eviction, which is the job it is actually good at.
+    """
 
     K1: float = 1.5
     B: float = 0.75
@@ -50,7 +75,7 @@ class LocalRetriever:
         entries: list[LTMEntry],
         corpus: Optional[CorpusStats] = None,
     ) -> list[tuple[LTMEntry, float]]:
-        """Score entries against query using BM25-lite + importance boost.
+        """Score entries against *query* by relevance alone.
 
         *corpus* supplies store-wide document frequencies.  Without it the
         frequencies fall back to the candidate list, which only ranks
@@ -61,7 +86,13 @@ class LocalRetriever:
             return []
         query_terms = self.tokenize(query)
         if not query_terms:
-            return [(e, e.importance) for e in entries]
+            # No query means no relevance signal exists; fall back to the
+            # retention prior, which is what importance is for.
+            return sorted(
+                ((e, e.importance) for e in entries),
+                key=lambda item: item[1],
+                reverse=True,
+            )
 
         N = len(entries)
         df: dict[str, int] = {}
@@ -103,8 +134,7 @@ class LocalRetriever:
                 )
                 bm25 += _idf(term) * tf_norm
 
-            # Importance acts as a multiplicative boost
-            scored.append((entry, bm25 * (1.0 + entry.importance)))
+            scored.append((entry, bm25))
 
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored
