@@ -358,6 +358,7 @@ Key config sections:
 | `file_access` | Startup-only workspace read/write policy plus resource limits for file tools (see [File access](#file-access)) |
 | `permissions.shell_level` | Default shell permission level: `ask`, `medium`, `high`, or `full` (see [Shell permissions](#shell-permissions)) |
 | `permissions.shell_sandbox` | OS sandbox mode: `restricted`, `read_all` (default), or `none` (danger-full-access, `full` level only) |
+| `permissions.shell_secret_paths` | Extra home-relative paths the sandboxed shell may neither read nor write (e.g. `[".ssh", ".docker", ".kube"]`); extends the built-in secret set |
 | `permissions.shell_devices` | Device/service access (Metal/IOKit) inside the sandbox; **default `true`** (set `false` for the strictest posture) |
 | `shell_allowed_commands` | Persistent shell allowlist that skips confirmation (see [Shell permissions](#shell-permissions)) |
 | `assistant_identity` | Deterministic assistant name/role for fact recall |
@@ -425,22 +426,52 @@ Shell sandbox modes:
 
 | Mode | Reads | Writes | Notes |
 |---|---|---|---|
-| `restricted` | System dirs + workspace/output only | Open by default; user data + workspace denied | Reads are the locked-down axis |
-| `read_all` (default) | **Whole machine** | Open by default; user data + workspace denied | Local tooling just works; documents/credentials stay write-protected |
+| `restricted` | System dirs + workspace/output only | Open by default; secrets, autostart, user data + workspace denied | Reads are the locked-down axis |
+| `read_all` (default) | **Whole machine except secrets** | Open by default; secrets, autostart, user data + workspace denied | Local tooling just works; credentials stay unreadable |
 | `none` | Everything | Everything | Danger-full-access: no OS sandbox, GPU/Metal reachable. **Only valid with `shell_level: full`** |
 
-Writes are **open by default** — the sandbox protects user data, not tool
-behavior.  There is no per-tool allowlist (npm caches, HuggingFace downloads,
-Chrome/Electron state, MCP servers and temp dirs all just work).  The only
-write denials are protected user-data surfaces: documents/media
-(`~/Documents`, `~/Desktop`, `~/Downloads`, `~/Movies`, `~/Music`,
-`~/Pictures`), keychains and personal library data, credentials
-(`~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.git-credentials`,
-`~/.netrc`, `~/.gitconfig`), the workspace unless a `write_scope` explicitly
-reopens it, and the agent's internal bookkeeping.  GUI/rendering workloads
-(headless Chrome, Electron screenshots) receive the generic system
-facilities App Store GUI apps get from `application.sb` (process-local mach
-bootstrap, app-sandbox file extensions, preference reads).
+Writes are **open by default** — there is no per-tool allowlist (npm caches,
+HuggingFace downloads, Chrome/Electron state, MCP servers and temp dirs all
+just work).  The explicit denials name three asset classes, chosen by what an
+attacker gains rather than by where the user files things:
+
+**1. Secrets — denied for read *and* write.**  A write boundary does nothing
+for a credential: the damaging act is reading it and shipping it out, and the
+sandbox allows unrestricted network.  Covers `~/.aws`, `~/.azure`, `~/.gnupg`,
+`~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/gcloud`,
+`~/Library/Keychains`, `~/.claude.json`, and the agent's own home (its
+`config.json` holds your provider API keys).
+
+`~/.ssh`, `~/.docker` and `~/.kube` are **not** read-denied by default —
+`git push` over SSH, `docker` and `kubectl` all need them, and a default that
+breaks `git push` just gets switched off wholesale.  Add them when the
+instance does not need those tools:
+
+```json
+{ "permissions": { "shell_secret_paths": [".ssh", ".docker", ".kube"] } }
+```
+
+**2. Later-executed code — write denied.**  Escaping a write sandbox never
+means defeating seatbelt; it means leaving a line for the user's next login
+shell to run.  Covers shell rc files (`~/.zshrc`, `~/.zshenv`, `~/.zprofile`,
+`~/.bashrc`, `~/.profile`, `~/.config/fish`, …), launchd drop points
+(`~/Library/LaunchAgents`, `/Library/LaunchDaemons`, …) and PATH directories
+(`/usr/local/bin`, `/opt/homebrew/bin`, `~/.local/bin`, `~/bin`).
+
+**3. User data — write denied.**  Documents/media (`~/Documents`, `~/Desktop`,
+`~/Downloads`, `~/Movies`, `~/Music`, `~/Pictures`), personal library data,
+the workspace unless a `write_scope` explicitly reopens it, and the agent's
+internal bookkeeping.
+
+GUI/rendering workloads (headless Chrome, Electron screenshots) receive the
+generic system facilities App Store GUI apps get from `application.sb`
+(process-local mach bootstrap, app-sandbox file extensions, preference reads).
+
+> **What this sandbox is for.** It contains accidents and injected
+> instructions, not a determined attacker who already has code execution.
+> Reads outside the secret set stay open in `read_all`, and network egress is
+> unrestricted — so a command that genuinely wants to exfiltrate something no
+> list anticipated can. Use `restricted` when that matters.
 
 The shell tool takes a `root` parameter (`output_dir` by default, or
 `workspace`) and resolves relative `cwd` values inside that root.  Generated

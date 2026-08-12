@@ -30,13 +30,30 @@ data**, not tool behavior.  Writes are open by default, so every local tool
 (npm, pip, uv, git, HuggingFace, Chrome/Electron, MCP servers, …) can
 persist caches, app state and temp files without a per-tool carve-out —
 enumerating what each tool needs is unmaintainable and always one tool
-behind.  The only explicit write denials are protected user-data surfaces:
-documents/media, keychains and credentials (``~/.ssh``, ``~/.aws``,
-``~/.git-credentials``, …), the workspace unless an approved ``write_scope``
-reopens it, and the agent's internal bookkeeping.  GUI/rendering workloads
-also receive the generic system facilities (process-local mach bootstrap,
-app-sandbox file extensions, preference reads) that App Store GUI apps get
-from ``application.sb``.
+behind.  The explicit denials name three asset classes, chosen by what an
+attacker gains rather than by what the user filed where:
+
+- **secrets** (``_SECRET_HOME_SUBDIRS``) — denied for *read* as well as
+  write.  A write boundary does nothing for a credential; the damaging act
+  is reading it and shipping it out, and this profile allows unrestricted
+  network.  ``permissions.shell_secret_paths`` extends the set.
+- **later-executed code** (``_AUTOSTART_HOME_SUBDIRS``,
+  ``_AUTOSTART_SYSTEM_DIRS``) — shell rc files, launchd drop points and PATH
+  directories.  Escaping a write sandbox never means defeating the sandbox;
+  it means leaving a line for the user's next login shell to run.
+- **user data** (``_PROTECTED_HOME_SUBDIRS``) — documents and media, plus
+  the workspace unless an approved ``write_scope`` reopens it, plus the
+  agent's own home (its config file holds provider API keys) and internal
+  bookkeeping.
+
+GUI/rendering workloads also receive the generic system facilities
+(process-local mach bootstrap, app-sandbox file extensions, preference
+reads) that App Store GUI apps get from ``application.sb``.
+
+Reads outside the secret set stay open in ``read_all`` mode.  That is a
+deliberate boundary, not an oversight: this sandbox contains *accidents and
+injected instructions*, not a determined attacker with code execution, who
+can always read something interesting that no list anticipated.
 
 One limitation is architectural, not configurable: seatbelt has no
 operation for starting a *second* sandbox, so a tool that installs its own
@@ -51,12 +68,15 @@ modes fail closed instead of running unsandboxed.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 import hashlib
 import os
 from pathlib import Path
 import shutil
 import sys
+import time
+from typing import Iterable
 import uuid
 
 from agent import shared
@@ -108,6 +128,68 @@ _PROTECTED_HOME_SUBDIRS: tuple[str, ...] = (
     ".netrc",
 )
 
+# Secrets: denied for **read** as well as write.  Write protection alone does
+# nothing for a credential — the damaging act is reading `id_rsa` or an API
+# key and shipping it somewhere, and this profile allows unrestricted network.
+# So the asset class that needs a read boundary is credentials, not documents.
+#
+# The default set is chosen for near-zero collateral: no build, test or
+# package-manager workflow reads these, so denying them breaks nothing.
+# ``~/.ssh``, ``~/.docker`` and ``~/.kube`` are deliberately NOT here even
+# though they hold credentials — ``git push`` over SSH, ``docker`` and
+# ``kubectl`` all need to read them, and a default that breaks ``git push``
+# would just get switched off wholesale.  Add them via
+# ``permissions.shell_secret_paths`` when the session does not need those
+# tools; that config extends this tuple rather than replacing it.
+_SECRET_HOME_SUBDIRS: tuple[str, ...] = (
+    "Library/Keychains",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".git-credentials",
+    ".netrc",
+    ".config/gh",
+    ".config/gcloud",
+    ".claude.json",
+)
+
+# Write-denied because the file is *executed later*, outside this sandbox.
+# The escape from a write-sandbox is never the sandbox itself: it is dropping
+# a line into something the user's next login shell, launchd, or PATH lookup
+# will run with full privileges.  Protecting `~/Documents` while leaving
+# `~/.zshrc` writable protects the wrong asset.
+_AUTOSTART_HOME_SUBDIRS: tuple[str, ...] = (
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".config/fish",
+    ".config/zsh",
+    ".local/bin",
+    "bin",
+    "Library/LaunchAgents",
+    "Library/LaunchDaemons",
+)
+
+# Same rationale, host-wide: PATH directories and launchd drop points.
+_AUTOSTART_SYSTEM_DIRS: tuple[str, ...] = (
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/Library/LaunchAgents",
+    "/Library/LaunchDaemons",
+    "/Library/StartupItems",
+    "/etc/periodic",
+    "/private/etc/periodic",
+)
+
 
 @dataclass(frozen=True)
 class ShellSandboxRequest:
@@ -122,6 +204,13 @@ class ShellSandboxRequest:
     mode: str = SANDBOX_MODE_READ_ALL
     devices: bool = True
     home_dir: Path = field(default_factory=lambda: Path.home())
+    #: Home-relative paths denied for read as well as write, on top of
+    #: ``_SECRET_HOME_SUBDIRS``.  Comes from ``permissions.shell_secret_paths``.
+    extra_secret_paths: tuple[str, ...] = ()
+    #: The agent's own home (``~/.agent`` or ``~/.agent-<name>``).  Denied for
+    #: read and write because ``config.json`` holds provider API keys;
+    #: ``output_root`` and ``scratch_dir`` are reopened inside it.
+    agent_home: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -197,6 +286,25 @@ def _build_macos_sandbox_command(request: ShellSandboxRequest) -> SandboxCommand
 
 def _seatbelt_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _both_spellings(paths: Iterable[str]) -> list[str]:
+    """Expand each path to its literal and canonical spelling, order-stable.
+
+    Seatbelt enforces on the canonical path, so a relocated directory — a
+    ``~/Documents`` symlinked to an external volume, a Dropbox/iCloud folder,
+    ``/var`` vs ``/private/var`` — slips through a rule that names only one
+    spelling.  Emitting both keeps the rule effective whichever way the link
+    exists, including when it is created after this profile was rendered.
+    """
+    expanded: list[str] = []
+    for raw in paths:
+        link_path = Path(raw)
+        for spelling in (link_path, link_path.resolve(strict=False)):
+            candidate = str(spelling)
+            if candidate not in expanded:
+                expanded.append(candidate)
+    return expanded
 
 
 def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
@@ -276,12 +384,48 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
     )
 
     # Inverted write policy: open by default (tools persist caches/app state
-    # anywhere), then deny only the protected user-data surfaces.  Seatbelt
-    # resolves overlapping rules last-match-wins, so the denies below must
-    # follow this default-open allow, and write_scope re-opens must follow
-    # their denies.
+    # anywhere), then deny the three asset classes that matter.  Seatbelt
+    # resolves overlapping rules last-match-wins, so every deny below must
+    # follow this default-open allow, and each re-open must follow its deny.
     lines.append('(allow file-write* (subpath "/"))')
-    # Internal bookkeeping (locks, profiles, scratch internals) stays hidden.
+
+    # 1. Secrets — read AND write denied.  Denying only writes leaves the
+    #    actual attack (read a credential, POST it out over the open network)
+    #    fully available, so the read rule is the load-bearing one here.
+    for candidate in _both_spellings(
+        f"{home}/{sub}"
+        for sub in (*_SECRET_HOME_SUBDIRS, *request.extra_secret_paths)
+    ):
+        literal = _seatbelt_literal(candidate)
+        lines.append(f'(deny file-read* (subpath "{literal}"))')
+        lines.append(f'(deny file-write* (subpath "{literal}"))')
+
+    # 2. Later-executed code — write denied.  A writable ~/.zshrc or PATH
+    #    directory turns any sandboxed write into unsandboxed execution the
+    #    next time the user opens a shell, which defeats every rule above.
+    for candidate in _both_spellings(
+        [f"{home}/{sub}" for sub in _AUTOSTART_HOME_SUBDIRS]
+        + list(_AUTOSTART_SYSTEM_DIRS)
+    ):
+        lines.append(
+            f'(deny file-write* (subpath "{_seatbelt_literal(candidate)}"))'
+        )
+
+    # 3a. The agent's own home: config.json holds provider API keys, and the
+    #     memory/scheduler databases are the agent's integrity.  output_root
+    #     and scratch normally live inside it, so they are reopened next.
+    if request.agent_home is not None:
+        for candidate in _both_spellings([str(request.agent_home)]):
+            literal = _seatbelt_literal(candidate)
+            lines.append(f'(deny file-read* (subpath "{literal}"))')
+            lines.append(f'(deny file-write* (subpath "{literal}"))')
+        for reopened in (output, scratch):
+            literal = _seatbelt_literal(reopened)
+            lines.append(f'(allow file-read* (subpath "{literal}"))')
+            lines.append(f'(allow file-write* (subpath "{literal}"))')
+
+    # 3b. Internal bookkeeping (locks, profiles, scratch internals) stays
+    #     hidden.  Must follow the output_root re-open above: it lives inside.
     lines.append(
         f'(deny file-read* (subpath "{_seatbelt_literal(internal)}"))'
     )
@@ -296,20 +440,10 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
         lines.append(
             f'(deny file-write* (subpath "{_seatbelt_literal(workspace)}"))'
         )
-    # Protected user data (documents, media, keychains, credentials).  Each path
-    # is denied under BOTH spellings: seatbelt enforces on the canonical path, so
-    # a relocated directory — ~/Documents symlinked to an external volume, a
-    # Dropbox/iCloud folder — would otherwise slip through a rule that names only
-    # the symlink.  Denying the symlink path too keeps the rule effective if the
-    # link is created after this profile was rendered.
-    protected: list[str] = []
-    for sub in _PROTECTED_HOME_SUBDIRS:
-        link_path = Path(f"{home}/{sub}")
-        for spelling in (link_path, link_path.resolve(strict=False)):
-            candidate = str(spelling)
-            if candidate not in protected:
-                protected.append(candidate)
-    for candidate in protected:
+    # 4. Protected user data (documents, media, personal library data).
+    for candidate in _both_spellings(
+        f"{home}/{sub}" for sub in _PROTECTED_HOME_SUBDIRS
+    ):
         lines.append(
             f'(deny file-write* (subpath "{_seatbelt_literal(candidate)}"))'
         )
@@ -343,13 +477,63 @@ def _path_is_within(candidate: Path, root: Path) -> bool:
         return False
 
 
+#: A scratch dir left behind by a hard kill is reclaimed once it is older
+#: than this.  Generous compared with the shell tool's own timeout, so a
+#: long-running command can never have its TMPDIR swept out from under it.
+_SCRATCH_MAX_AGE_SECONDS = 6 * 3600
+
+
 def new_scratch_dir(output_root: Path) -> Path:
-    """Create a private public scratch directory under ``output_root``."""
+    """Create a private scratch directory to use as the child's TMPDIR.
+
+    Also reclaims stale siblings.  Callers pair this with
+    :func:`release_scratch_dir` for the normal path, but a SIGKILL skips
+    every ``finally`` in the process — so the age sweep here is what keeps
+    the directory from growing without bound across crashes.
+    """
     scratch_root = output_root / "sandbox"
     scratch_root.mkdir(parents=True, exist_ok=True)
+    reclaim_stale_scratch_dirs(scratch_root)
     scratch = scratch_root / f"tmp-{uuid.uuid4().hex[:12]}"
     scratch.mkdir()
     return scratch
+
+
+def release_scratch_dir(scratch: Path | None) -> None:
+    """Remove a scratch directory once its command has finished.
+
+    Every shell call gets a *fresh* scratch dir, so nothing can legitimately
+    depend on its contents surviving the call that created it.
+    """
+    if scratch is None:
+        return
+    with contextlib.suppress(OSError):
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def reclaim_stale_scratch_dirs(
+    scratch_root: Path,
+    *,
+    max_age_seconds: float = _SCRATCH_MAX_AGE_SECONDS,
+    now: float | None = None,
+) -> int:
+    """Delete ``tmp-*`` scratch dirs older than *max_age_seconds*."""
+    current = time.time() if now is None else now
+    reclaimed = 0
+    with contextlib.suppress(OSError):
+        for entry in scratch_root.iterdir():
+            if not entry.name.startswith("tmp-") or not entry.is_dir():
+                continue
+            try:
+                age = current - entry.stat().st_mtime
+            except OSError:
+                continue
+            if age <= max_age_seconds:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                reclaimed += 1
+    return reclaimed
 
 
 __all__ = [
@@ -359,4 +543,6 @@ __all__ = [
     "build_sandbox_command",
     "detect_sandbox_support",
     "new_scratch_dir",
+    "reclaim_stale_scratch_dirs",
+    "release_scratch_dir",
 ]

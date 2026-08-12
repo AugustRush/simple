@@ -30,9 +30,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_RL_DIR = Path.home() / ".agent" / "rl"
-_FAILURES_FILE = _RL_DIR / "failures.jsonl"
 _RULE_EXTRACTION_THRESHOLD = 3  # corrections before we try to extract a rule
+
+
+def _failures_file() -> Path:
+    """Resolve the failure-log path at call time, never at import time.
+
+    See ``rules._rules_file``: ``--name`` rewrites ``shared.RL_DIR`` after
+    this module is imported, so an import-time constant would pin every
+    named instance to the default instance's home.
+    """
+    from agent import shared
+
+    return shared.RL_DIR / "failures.jsonl"
 
 
 def _now() -> str:
@@ -136,8 +146,9 @@ class EvolutionPlugin:
             }
             self._pending_failures.append(failure)
             try:
-                _FAILURES_FILE.parent.mkdir(parents=True, exist_ok=True)
-                with open(_FAILURES_FILE, "a", encoding="utf-8") as fh:
+                failures_file = _failures_file()
+                failures_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(failures_file, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(failure, ensure_ascii=False) + "\n")
             except Exception as exc:
                 _console().print(

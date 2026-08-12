@@ -200,8 +200,10 @@
     "shell_level": "ask",
     "shell_sandbox": "read_all",
     "shell_devices": true,
+    "shell_secret_paths": [],
     "_shell_level_readme": "Default shell permission level for every session: ask = low/medium-risk run automatically, only high-risk (destructive commands/options, shell operators, pipe-to-shell patterns) asks for confirmation, and can run after approval (default); medium = high-risk commands/options/patterns also auto-allowed, operators still ask; high = everything auto-allowed (operators too) except shell_blocked_commands and structural guards; full = alias of high plus the only level that may combine with shell_sandbox=none. Change per session with /permissions <level>; persist the default with /permissions default <level>.",
     "_shell_sandbox_readme": "OS sandbox for shell descendants: restricted = reads limited to system dirs + workspace/output; read_all (default) = reads open on the whole machine, writes still limited to output/workspace scope; none = no sandbox at all (danger-full-access, incl. GPU/Metal) and only valid together with shell_level=full. Change per session with /permissions sandbox <mode>; persist with /permissions default sandbox <mode>.",
+    "_shell_secret_paths_readme": "Extra home-relative paths the sandboxed shell may neither read nor write, on top of the built-in secret set (~/.aws, ~/.azure, ~/.gnupg, ~/.netrc, ~/.git-credentials, ~/.config/gh, ~/.config/gcloud, ~/Library/Keychains, and the agent's own home). Add \".ssh\", \".docker\" or \".kube\" when this instance does not need git-over-ssh, docker or kubectl \u2014 they hold credentials but are excluded by default because denying them breaks those tools outright.",
     "_shell_devices_readme": "Device/service access (Metal/IOKit/mach services) inside the sandbox. Open by default, matching the network posture, so local ML workloads (MLX/TTS/LLM) work without disabling the sandbox; set false for the strictest posture (reads/writes are still governed by shell_sandbox)."
   },
   "channels": {

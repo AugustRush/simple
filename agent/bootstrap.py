@@ -277,6 +277,16 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         "shell_devices",
         bool((cfg.get("permissions") or {}).get("shell_devices", True)),
     )
+    registry.set_context(
+        "shell_secret_paths",
+        tuple(
+            str(entry).strip()
+            for entry in (
+                (cfg.get("permissions") or {}).get("shell_secret_paths") or ()
+            )
+            if str(entry).strip()
+        ),
+    )
     audio_cfg = cfg.get("audio", {})
     audio_transcription_command = ""
     if isinstance(audio_cfg, dict):

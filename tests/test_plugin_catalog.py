@@ -1380,8 +1380,11 @@ def test_evolution_plugin_compose_lazily_loads_rules(tmp_path, monkeypatch):
     """Startup prompt composition should include persisted active rules."""
     from agent._builtin.plugins.evolution import EvolutionPlugin
     import agent._builtin.plugins.evolution.rules as rules_mod
+    from agent import shared as _shared
 
-    monkeypatch.setattr(rules_mod, "_RULES_FILE", tmp_path / "rules.jsonl")
+    # Redirect the agent home's rl dir, not a module constant: the paths are
+    # resolved per call so that `--name` instances stay isolated.
+    monkeypatch.setattr(_shared, "RL_DIR", tmp_path)
     store = rules_mod.RuleStore()
     rule = store.add_rule("Always verify learned rules are injected.", [])
     rule.status = "active"
@@ -1397,8 +1400,9 @@ def test_evolution_plugin_extract_rule_sets_pre_correction_baseline(tmp_path, mo
     from agent._builtin.plugins.evolution import EvolutionPlugin
     import agent._builtin.plugins.evolution as evolution_mod
     import agent._builtin.plugins.evolution.rules as rules_mod
+    from agent import shared as _shared
 
-    monkeypatch.setattr(evolution_mod, "_FAILURES_FILE", tmp_path / "failures.jsonl")
+    monkeypatch.setattr(_shared, "RL_DIR", tmp_path)
     store = rules_mod.RuleStore(rules_file=tmp_path / "rules.jsonl")
 
     class _FakeEngine:
@@ -1425,8 +1429,9 @@ def test_evolution_plugin_rejects_prompt_injection_rule_text(tmp_path, monkeypat
     from agent._builtin.plugins.evolution import EvolutionPlugin
     import agent._builtin.plugins.evolution as evolution_mod
     import agent._builtin.plugins.evolution.rules as rules_mod
+    from agent import shared as _shared
 
-    monkeypatch.setattr(evolution_mod, "_FAILURES_FILE", tmp_path / "failures.jsonl")
+    monkeypatch.setattr(_shared, "RL_DIR", tmp_path)
     store = rules_mod.RuleStore(rules_file=tmp_path / "rules.jsonl")
 
     class _FakeEngine:

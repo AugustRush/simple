@@ -10,8 +10,30 @@ from pathlib import Path
 from typing import Optional
 
 # ── Risk-level classification ────────────────────────────────────────────────
+#
+# These tables classify; they do not authorize.  The enforcement boundary for
+# shell execution is the OS sandbox in ``filesystem_sandbox.py`` — an
+# unbypassable rule about what the child process may touch — not a list of
+# command names, which is defeated by any spelling the list did not
+# anticipate (``rm`` vs ``find -delete`` vs ``python -c 'os.unlink(...)'``).
+#
+# What the tables below actually drive:
+#   - ``HIGH_RISK_COMMANDS`` / ``HIGH_RISK_PATTERNS`` / ``_HIGH_RISK_OPTIONS``
+#     require confirmation at permission level ``ask`` (the default) and are
+#     auto-allowed at ``medium`` and above.  Nothing here is blocked
+#     unconditionally.
+#   - ``MEDIUM_RISK_COMMANDS`` drives the ``risk_level`` label only.  It gates
+#     nothing at any permission level: these commands run without
+#     confirmation, and the sandbox is what bounds their damage.  The label
+#     reaches the user through the consent UI and tool output.
+#
+# Only two things are refused outright regardless of level: the
+# user-configured blacklist (``extra_blocked``), and the structural guards in
+# ``_shell_operator_guard`` (inline ``cd``, command substitution) — those
+# violate the tool contract rather than being merely risky.
 
-# Commands listed here are blocked unconditionally (high risk).
+# Commands whose damage is immediate and hard to undo.  Confirmed at level
+# "ask"; auto-allowed from "medium" up.
 HIGH_RISK_COMMANDS: frozenset[str] = frozenset(
     {
         "mkfs",
@@ -27,7 +49,10 @@ HIGH_RISK_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
-# Commands that require user confirmation (medium risk).
+# Commands that carry real consequences but are ordinary in development work.
+# LABEL ONLY — this set does not gate execution at any permission level; it
+# feeds ``ShellCheckResult.risk_level`` so the UI can show what a command
+# touches.  Their blast radius is bounded by the OS sandbox, not by this list.
 MEDIUM_RISK_COMMANDS: frozenset[str] = frozenset(
     {
         "rm",
@@ -76,7 +101,8 @@ MEDIUM_RISK_COMMANDS: frozenset[str] = frozenset(
     }
 )
 
-# Dangerous shell patterns checked as literal substrings (high risk).
+# Dangerous shell patterns checked as literal substrings.  Confirmed at level
+# "ask"; auto-allowed from "medium" up.
 HIGH_RISK_PATTERNS: tuple[str, ...] = (
     # pipe-to-shell
     "curl | sh",
@@ -163,11 +189,6 @@ HIGH_RISK_SHELL_OPERATORS: frozenset[str] = frozenset(
 )
 
 CWD_ESCAPE_COMMANDS: frozenset[str] = frozenset({"cd", "pushd", "popd"})
-
-# ── Backward-compatible aliases ──────────────────────────────────────────────
-
-SHELL_BLOCKED_COMMANDS: frozenset[str] = HIGH_RISK_COMMANDS | MEDIUM_RISK_COMMANDS
-SHELL_BLOCKED_PATTERNS: tuple[str, ...] = HIGH_RISK_PATTERNS + MEDIUM_RISK_PATTERNS
 
 # ── Session allowlist ───────────────────────────────────────────────────────
 

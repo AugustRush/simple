@@ -18,7 +18,10 @@ from agent.core.output import _active_event_collector
 
 CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
-USER_PLUGINS_DIR = shared.USER_PLUGINS_DIR
+# No USER_PLUGINS_DIR mirror here on purpose: it is derived from AGENT_HOME,
+# which `--name` rewrites after this module is imported.  Read
+# `shared.USER_PLUGINS_DIR` at the point of use instead.  (PLUGINS_DIR is the
+# package's own _builtin directory and does not move.)
 
 # Synchronous plugin hooks run on a small dedicated pool.  A hook that blows
 # past its timeout keeps its worker until it returns on its own (see

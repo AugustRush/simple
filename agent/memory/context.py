@@ -886,8 +886,16 @@ class ContextManager:
 
         Two-stage retrieval:
           1. SQLite FTS5 fetches a broad candidate set via BM25.
-          2. LocalRetriever re-ranks candidates with importance-boosted BM25.
+          2. LocalRetriever re-ranks candidates with importance-boosted BM25,
+             using document frequencies measured over the **whole store**.
           3. Routed categories receive a small score bonus rather than hard filtering.
+
+        Stage 2 used to compute IDF over the stage-1 candidates.  Those
+        candidates are precisely the documents that matched the query, so
+        every query term had df ≈ N among them and scored ~0 IDF: the
+        re-ranker systematically ignored the words the user actually asked
+        about and sorted on incidental vocabulary instead.  Passing real
+        corpus statistics is what makes the second stage informative.
 
         This keeps keyword routing useful without hiding relevant memories that
         live outside the routed categories.
@@ -904,7 +912,8 @@ class ContextManager:
             candidates = self.store.read_entries("episodes", scopes=scopes)[: top_k * 3]
         if not candidates:
             return ""
-        scored = self.retriever.score(query, candidates)
+        corpus = self.store.corpus_stats(self.retriever.tokenize(query), scopes=scopes)
+        scored = self.retriever.score(query, candidates, corpus)
         if categories:
             routed = set(categories)
             scored = [

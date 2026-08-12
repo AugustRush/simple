@@ -30,8 +30,18 @@ EVAL_THRESHOLD = 10
 # Correction-rate improvement required to promote a rule (absolute drop).
 IMPROVEMENT_DELTA = 0.05
 
-_RL_DIR = Path.home() / ".agent" / "rl"
-_RULES_FILE = _RL_DIR / "rules.jsonl"
+def _rules_file() -> Path:
+    """Resolve the rules path at call time, never at import time.
+
+    ``shared.RL_DIR`` is rewritten by ``--name`` (multi-instance isolation).
+    Binding it into a module constant captures whichever home happened to be
+    active when this module was first imported, which for a plugin is before
+    the CLI has parsed ``--name`` — so every named instance silently shared
+    the default instance's rules.
+    """
+    from agent import shared
+
+    return shared.RL_DIR / "rules.jsonl"
 
 _RULE_STOPWORDS = {
     "always",
@@ -123,7 +133,7 @@ class RuleStore:
     """Persistent store for learned behavioral rules."""
 
     def __init__(self, rules_file: Optional[Path] = None) -> None:
-        self._path = rules_file or _RULES_FILE
+        self._path = rules_file or _rules_file()
         self._path.parent.mkdir(parents=True, exist_ok=True)
 
     # ── Persistence ────────────────────────────────────────────────────────────

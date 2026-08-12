@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import json
 import os
 import re
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import anthropic
 from rich.panel import Panel
@@ -15,6 +16,11 @@ from rich.prompt import Prompt
 
 import agent as agent_module
 from agent import shared
+
+if TYPE_CHECKING:
+    from agent.plugins.catalog import PluginCatalog
+    from agent.skills.catalog import SkillCatalog
+    from agent.tools.runtime import ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
 
@@ -137,6 +143,12 @@ DEFAULT_CONFIG: dict = {
         "shell_level": "ask",
         "shell_sandbox": "read_all",
         "shell_devices": True,
+        # Extra home-relative paths the sandboxed shell may neither read nor
+        # write, on top of the built-in secret set.  Add ".ssh", ".docker" or
+        # ".kube" here when this instance does not need git-over-ssh, docker
+        # or kubectl — they hold credentials but are excluded by default
+        # because denying them breaks those tools outright.
+        "shell_secret_paths": [],
     },
 }
 
@@ -619,160 +631,217 @@ def _load_system_prompt(cfg: dict) -> str:
     return DEFAULT_SYSTEM_PROMPT
 
 
-# Module-level cache for static portion of system prompt.
-# The cache key captures all inputs that affect the static block;
-# time-dependent and plugin-injected content is always recomputed.
-_system_prompt_cache_key: tuple = ()
+# Module-level cache for the static portion of the system prompt.
+#
+# The cache key used to be a hand-listed subset of the inputs, and it had
+# already drifted: `supports_vision` (read from the registry context, which
+# does not bump `_prompt_generation`) and `shared.TOOLS_DIR`/`SKILLS_DIR`
+# (rewritten by `--name`) were both absent, so a cached block could outlive
+# the values it was rendered from.  `filesystem_sandbox` hit the same bug
+# and fixed it by keying on content.
+#
+# The fix here is structural rather than "add the missing fields": the
+# renderer below takes a `_StaticPromptInputs` and may read nothing else, so
+# the key cannot drift from the body without failing to compile.  Adding a
+# new input means adding a field, which puts it in the key by construction.
+_system_prompt_cache_key: "_StaticPromptInputs | None" = None
 _system_prompt_cache_value: str = ""
+
+
+@dataclass(frozen=True)
+class _StaticPromptInputs:
+    """Every value the cached static block is a function of.
+
+    Hashable and compared by value, so it doubles as the cache key.
+    """
+
+    base_prompt: str
+    #: (name, description, source) per tool — the registry's own
+    #: `_prompt_generation` counter is not enough, because `set_context`
+    #: mutates prompt-visible state without bumping it.
+    tools: tuple[tuple[str, str, str], ...]
+    skill_lines: tuple[str, ...]
+    workspace_root: Optional[Path]
+    output_dir: Optional[Path]
+    supports_vision: bool
+    tools_dir: str
+    skills_dir: str
+    default_output_dir: str
+
+
+def _static_prompt_inputs(
+    base_prompt: str,
+    registry: "ToolRegistry",
+    workspace_root: Optional[Path],
+    output_dir: Optional[Path],
+    skill_catalog: Optional["SkillCatalog"],
+) -> _StaticPromptInputs:
+    return _StaticPromptInputs(
+        base_prompt=base_prompt,
+        tools=tuple(
+            (name, tool.description, tool.source)
+            for name, tool in sorted(registry._tools.items())
+        ),
+        skill_lines=tuple(skill_catalog.summary_lines()) if skill_catalog else (),
+        workspace_root=workspace_root,
+        output_dir=output_dir,
+        supports_vision=bool(registry.get_context("supports_vision")),
+        tools_dir=str(shared.TOOLS_DIR),
+        skills_dir=str(shared.SKILLS_DIR),
+        default_output_dir=str(shared.DEFAULT_OUTPUT_DIR),
+    )
+
+
+def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
+    """Render the cached block from *inputs* and nothing else.
+
+    Reading any other state here silently reintroduces the drift this
+    structure exists to prevent.
+    """
+    groups: dict[str, list[tuple[str, str]]] = {
+        "builtin": [],
+        "mcp": [],
+        "runtime": [],
+    }
+    for name, description, source in inputs.tools:
+        if source == "builtin":
+            groups["builtin"].append((name, description))
+        elif source.startswith("mcp:"):
+            groups["mcp"].append((name, description))
+        else:
+            groups["runtime"].append((name, description))
+
+    workspace_root = inputs.workspace_root
+    output_dir = inputs.output_dir
+
+    def _format_group(items: list[tuple[str, str]]) -> str:
+        return "; ".join(f"{name}: {description}" for name, description in items)
+
+    lines = [
+        "## Active Capabilities",
+        "Use only tools that are actually listed for this agent instance.",
+        "When the user asks what you can do, what tools you have, or what capabilities are available, explicitly summarize the active tools below by name and purpose. Mention MCP tools when present.",
+    ]
+    if groups["builtin"]:
+        lines.append("Built-in tools: " + _format_group(groups["builtin"]))
+    if groups["mcp"]:
+        lines.append("Connected MCP tools: " + _format_group(groups["mcp"]))
+    if groups["runtime"]:
+        lines.append("Runtime tools: " + _format_group(groups["runtime"]))
+    lines.extend(inputs.skill_lines)
+    if workspace_root:
+        builtin_names = {n for n, _ in groups["builtin"]}
+        if any(
+            n in builtin_names
+            for n in ("read_file", "write_file", "list_files", "edit_file")
+        ):
+            lines.append(
+                "File tools take an explicit `root` (`workspace` or `output_dir`) "
+                "and a root-relative `path`; absolute paths and path traversal "
+                "are rejected. `read_file` returns a bounded line window plus an "
+                "exact `revision`; pass that revision back as `expected_revision` "
+                "to `write_file` or `edit_file` before mutating, and reread after "
+                "any conflict. The workspace is read-only by default and workspace "
+                "writes additionally require the startup `file_access` policy plus "
+                "an explicit `write_scope`; `output_dir` is always readable and "
+                "writable for generated artifacts. The `file_access` configuration "
+                "is loaded only at startup — changing it requires a restart."
+            )
+        if "schedule_create" in builtin_names:
+            lines.append(
+                "If the user asks for a reminder, delayed follow-up, or recurring future message, "
+                "use the schedule tools instead of saying you cannot act in the future."
+            )
+            lines.append(
+                "Use `action_type=message` for literal future messages, "
+                "`action_type=agent_task` for future work to execute later, and "
+                "`action_type=system_job` for internal maintenance. "
+                "Do not pretend the scheduled action has already run."
+            )
+        if "shell" in builtin_names:
+            lines.append(
+                "Every shell tool call must include an `intent` input that explains what that exact command "
+                "will do and why it is necessary. Do not rely on surrounding prose as the shell intent."
+            )
+            lines.append(
+                "The shell tool takes a `root` parameter (`output_dir` or "
+                "`workspace`); the default root is the configured output "
+                f"directory ({output_dir or inputs.default_output_dir}), NOT "
+                f"the workspace root ({workspace_root}). Relative `cwd` values "
+                "resolve inside that root, so downloads, clones, and generated "
+                "artifacts stay in the output directory."
+            )
+            lines.append(
+                "For current project files use `root=workspace` with relative "
+                "paths; for downloads and build artifacts keep `root=output_dir` "
+                "and use relative targets such as `git clone <url> repo-name`; "
+                "run follow-up commands with `cwd` set to the directory you "
+                "created."
+            )
+        if "send_file" in builtin_names:
+            lines.append(
+                "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "
+                "instead of claiming file delivery is unsupported."
+            )
+        if "set_identity" in builtin_names:
+            lines.append(
+                "When the user gives you a name, a role, or a persona — or "
+                "changes one you already have — call `set_identity` in that "
+                "same turn. Agreeing in prose does not persist anything: "
+                "identity is read back from `set_identity` on every restart, "
+                "and the newest call replaces the previous setting. Use "
+                "`subject=user` to record what the user tells you about "
+                "themselves."
+            )
+        if "create_tool" in builtin_names:
+            lines.append(
+                "When the user asks for a new capability or tool, use "
+                "`create_tool` (or `update_tool`). Writing a .py file with "
+                "`write_file` or `shell` does not create a tool — only "
+                "`create_tool` validates it, checks that it imports, asks "
+                "the user to approve it, and loads it into this session."
+            )
+            lines.append(
+                "If a tool you are writing needs a third-party package, use "
+                "`install_tool_dependency`. Never install packages for a "
+                "tool with `pip`, `uv add`, or `poetry add` from the shell: "
+                "those change the user's own project or Python environment, "
+                "while `install_tool_dependency` keeps the package in the "
+                "agent's private dependency directory."
+            )
+    lines.append(
+        "Agent-managed paths are separate from the workspace root: "
+        f"user tools live in {inputs.tools_dir}, "
+        f"user skills live in {inputs.skills_dir}."
+    )
+    if output_dir:
+        lines.append(
+            f"Output directory for generated files (screenshots, exports, temp): {output_dir}"
+        )
+    if inputs.supports_vision:
+        lines.append(
+            "This agent supports vision. When the user sends images, you can see and "
+            "analyze them directly — describe what you observe before taking action."
+        )
+    return inputs.base_prompt.rstrip() + "\n\n" + "\n".join(lines)
 
 
 def _compose_system_prompt(
     base_prompt: str,
-    registry: ToolRegistry,
+    registry: "ToolRegistry",
     workspace_root: Optional[Path] = None,
     output_dir: Optional[Path] = None,
-    skill_catalog: Optional[SkillCatalog] = None,
-    plugin_catalog: Optional[PluginCatalog] = None,
+    skill_catalog: Optional["SkillCatalog"] = None,
+    plugin_catalog: Optional["PluginCatalog"] = None,
 ) -> str:
     global _system_prompt_cache_key, _system_prompt_cache_value
 
-    # Build cache key from all stable inputs
-    cache_key = (
-        base_prompt,
-        getattr(registry, '_prompt_generation', 0),
-        getattr(skill_catalog, '_prompt_generation', 0) if skill_catalog is not None else 0,
-        workspace_root,
-        output_dir,
+    inputs = _static_prompt_inputs(
+        base_prompt, registry, workspace_root, output_dir, skill_catalog
     )
-
-    # Rebuild static block only when cache key changes
-    if cache_key != _system_prompt_cache_key:
-        groups: dict[str, list[tuple[str, str]]] = {
-            "builtin": [],
-            "mcp": [],
-            "runtime": [],
-        }
-        for name, tool in sorted(registry._tools.items()):
-            source = tool.source
-            if source == "builtin":
-                groups["builtin"].append((name, tool.description))
-            elif source.startswith("mcp:"):
-                groups["mcp"].append((name, tool.description))
-            else:
-                groups["runtime"].append((name, tool.description))
-
-        def _format_group(items: list[tuple[str, str]]) -> str:
-            return "; ".join(f"{name}: {description}" for name, description in items)
-
-        lines = [
-            "## Active Capabilities",
-            "Use only tools that are actually listed for this agent instance.",
-            "When the user asks what you can do, what tools you have, or what capabilities are available, explicitly summarize the active tools below by name and purpose. Mention MCP tools when present.",
-        ]
-        if groups["builtin"]:
-            lines.append("Built-in tools: " + _format_group(groups["builtin"]))
-        if groups["mcp"]:
-            lines.append("Connected MCP tools: " + _format_group(groups["mcp"]))
-        if groups["runtime"]:
-            lines.append("Runtime tools: " + _format_group(groups["runtime"]))
-        if skill_catalog:
-            lines.extend(skill_catalog.summary_lines())
-        if workspace_root:
-            builtin_names = {n for n, _ in groups["builtin"]}
-            if any(
-                n in builtin_names
-                for n in ("read_file", "write_file", "list_files", "edit_file")
-            ):
-                lines.append(
-                    "File tools take an explicit `root` (`workspace` or `output_dir`) "
-                    "and a root-relative `path`; absolute paths and path traversal "
-                    "are rejected. `read_file` returns a bounded line window plus an "
-                    "exact `revision`; pass that revision back as `expected_revision` "
-                    "to `write_file` or `edit_file` before mutating, and reread after "
-                    "any conflict. The workspace is read-only by default and workspace "
-                    "writes additionally require the startup `file_access` policy plus "
-                    "an explicit `write_scope`; `output_dir` is always readable and "
-                    "writable for generated artifacts. The `file_access` configuration "
-                    "is loaded only at startup — changing it requires a restart."
-                )
-            if "schedule_create" in builtin_names:
-                lines.append(
-                    "If the user asks for a reminder, delayed follow-up, or recurring future message, "
-                    "use the schedule tools instead of saying you cannot act in the future."
-                )
-                lines.append(
-                    "Use `action_type=message` for literal future messages, "
-                    "`action_type=agent_task` for future work to execute later, and "
-                    "`action_type=system_job` for internal maintenance. "
-                    "Do not pretend the scheduled action has already run."
-                )
-            if "shell" in builtin_names:
-                lines.append(
-                    "Every shell tool call must include an `intent` input that explains what that exact command "
-                    "will do and why it is necessary. Do not rely on surrounding prose as the shell intent."
-                )
-                lines.append(
-                    "The shell tool takes a `root` parameter (`output_dir` or "
-                    "`workspace`); the default root is the configured output "
-                    f"directory ({output_dir or shared.DEFAULT_OUTPUT_DIR}), NOT "
-                    f"the workspace root ({workspace_root}). Relative `cwd` values "
-                    "resolve inside that root, so downloads, clones, and generated "
-                    "artifacts stay in the output directory."
-                )
-                lines.append(
-                    "For current project files use `root=workspace` with relative "
-                    "paths; for downloads and build artifacts keep `root=output_dir` "
-                    "and use relative targets such as `git clone <url> repo-name`; "
-                    "run follow-up commands with `cwd` set to the directory you "
-                    "created."
-                )
-            if "send_file" in builtin_names:
-                lines.append(
-                    "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "
-                    "instead of claiming file delivery is unsupported."
-                )
-            if "set_identity" in builtin_names:
-                lines.append(
-                    "When the user gives you a name, a role, or a persona — or "
-                    "changes one you already have — call `set_identity` in that "
-                    "same turn. Agreeing in prose does not persist anything: "
-                    "identity is read back from `set_identity` on every restart, "
-                    "and the newest call replaces the previous setting. Use "
-                    "`subject=user` to record what the user tells you about "
-                    "themselves."
-                )
-            if "create_tool" in builtin_names:
-                lines.append(
-                    "When the user asks for a new capability or tool, use "
-                    "`create_tool` (or `update_tool`). Writing a .py file with "
-                    "`write_file` or `shell` does not create a tool — only "
-                    "`create_tool` validates it, checks that it imports, asks "
-                    "the user to approve it, and loads it into this session."
-                )
-                lines.append(
-                    "If a tool you are writing needs a third-party package, use "
-                    "`install_tool_dependency`. Never install packages for a "
-                    "tool with `pip`, `uv add`, or `poetry add` from the shell: "
-                    "those change the user's own project or Python environment, "
-                    "while `install_tool_dependency` keeps the package in the "
-                    "agent's private dependency directory."
-                )
-        lines.append(
-            "Agent-managed paths are separate from the workspace root: "
-            f"user tools live in {shared.TOOLS_DIR}, "
-            f"user skills live in {shared.SKILLS_DIR}."
-        )
-        if output_dir:
-            lines.append(
-                f"Output directory for generated files (screenshots, exports, temp): {output_dir}"
-            )
-        if registry.get_context("supports_vision"):
-            lines.append(
-                "This agent supports vision. When the user sends images, you can see and "
-                "analyze them directly — describe what you observe before taking action."
-            )
-        _system_prompt_cache_value = base_prompt.rstrip() + "\n\n" + "\n".join(lines)
-        _system_prompt_cache_key = cache_key
+    if inputs != _system_prompt_cache_key:
+        _system_prompt_cache_value = _render_static_prompt(inputs)
+        _system_prompt_cache_key = inputs
 
     # Always recompute dynamic footer (time-dependent content)
     result = _system_prompt_cache_value

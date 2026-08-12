@@ -27,6 +27,7 @@ from agent.security.filesystem_sandbox import (
     ShellSandboxRequest,
     build_sandbox_command,
     new_scratch_dir,
+    release_scratch_dir,
 )
 from agent.security.shell import shell_command_uses_shell_features
 from agent.tools.files import (
@@ -2099,6 +2100,7 @@ class BuiltinTools:
                 resolved_cwd, call_root = output_dir, "output_dir"
 
         sandbox = None
+        scratch_dir: Optional[Path] = None
         workspace_before: set[Path] | None = None
         if unsandboxed:
             # Danger-full-access: the OS sandbox is off, but the file-domain
@@ -2127,6 +2129,10 @@ class BuiltinTools:
                         scratch_dir=scratch_dir,
                         mode=sandbox_mode,
                         devices=shell_devices,
+                        extra_secret_paths=tuple(
+                            self.registry.get_context("shell_secret_paths") or ()
+                        ),
+                        agent_home=shared.AGENT_HOME,
                     )
                 )
             except SandboxUnavailableError as exc:
@@ -2250,6 +2256,13 @@ class BuiltinTools:
             return self._error(f"Invalid shell input: {e}", command=command)
         except Exception as e:
             return self._error(f"Shell command failed: {e}", command=command)
+        finally:
+            # The scratch dir is this command's TMPDIR.  Every call gets a
+            # fresh one, so nothing can depend on it outliving the call —
+            # and without this the directory (plus whatever the command
+            # wrote into it) leaked once per shell invocation, unbounded for
+            # a long-running gateway.
+            release_scratch_dir(scratch_dir)
 
     def _send_file(self, path: str) -> dict[str, Any]:
         try:

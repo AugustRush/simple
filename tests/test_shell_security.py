@@ -825,3 +825,64 @@ def test_package_install_confirmation_is_redeemable_for_the_session():
 
     second = shell_command_check("uv add markdown", scope=scope, permission_level="full")
     assert second.allowed is True
+
+
+# ── What the risk tables actually enforce ──────────────────────────────────
+#
+# These tables previously carried comments claiming they blocked or required
+# confirmation.  Neither was true, and a comment cannot be run.  These tests
+# pin the real semantics so the next reader trusts the behaviour, not the
+# prose — and so a change in behaviour has to be deliberate.
+
+
+def test_medium_risk_table_gates_nothing_at_any_level():
+    """MEDIUM_RISK_COMMANDS is a display label, not an authorization gate."""
+    from agent.security.shell import ShellAuthorizationScope, shell_command_check
+
+    scope = ShellAuthorizationScope("medium-label", "cli", "")
+    for level in ("ask", "medium", "high", "full"):
+        for command in ("rm -r build", "sudo id", "curl https://x.com", "chmod 600 f"):
+            result = shell_command_check(command, scope=scope, permission_level=level)
+            assert result.allowed is True, (command, level)
+            assert result.requires_confirmation is False, (command, level)
+
+
+def test_medium_risk_table_still_labels_the_result():
+    from agent.security.shell import ShellAuthorizationScope, shell_command_check
+
+    scope = ShellAuthorizationScope("medium-label-2", "cli", "")
+    result = shell_command_check("rm -r build", scope=scope, permission_level="ask")
+    assert result.risk_level == "medium"
+
+
+def test_high_risk_commands_are_confirmable_not_unconditionally_blocked():
+    from agent.security.shell import ShellAuthorizationScope, shell_command_check
+
+    scope = ShellAuthorizationScope("high-confirm", "cli", "")
+    asked = shell_command_check("dd if=/dev/zero of=x", scope=scope, permission_level="ask")
+    assert asked.allowed is False
+    assert asked.requires_confirmation is True  # confirmable, not blocked
+
+    permissive = shell_command_check(
+        "dd if=/dev/zero of=x", scope=scope, permission_level="medium"
+    )
+    assert permissive.allowed is True
+
+
+def test_only_blacklist_and_structural_guards_are_unconditional():
+    """The two refusals that survive every permission level."""
+    from agent.security.shell import ShellAuthorizationScope, shell_command_check
+
+    scope = ShellAuthorizationScope("unconditional", "cli", "")
+    for level in ("ask", "medium", "high", "full"):
+        blacklisted = shell_command_check(
+            "banned --now", ["banned"], scope=scope, permission_level=level
+        )
+        assert blacklisted.allowed is False
+        assert blacklisted.requires_confirmation is False
+
+        substitution = shell_command_check(
+            "echo $(whoami)", scope=scope, permission_level=level
+        )
+        assert substitution.allowed is False
+        assert substitution.requires_confirmation is False

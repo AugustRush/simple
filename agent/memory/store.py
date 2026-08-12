@@ -14,6 +14,8 @@ from typing import Any, Optional
 from agent import shared
 from agent.lexical import LATIN_TOKEN_RE
 
+from .retrieval import CorpusStats
+
 from ._helpers import (
     SQLITE_BUSY_TIMEOUT_MS,
     _ASSISTANT_IDENTITY_ENTITIES,
@@ -43,6 +45,12 @@ from .models import (
     ResolvedFact,
     SessionWorkingState,
 )
+
+#: Documents scanned to estimate CJK n-gram document frequency.  Sampling
+#: makes the cost independent of store size; 2000 rows bound the relative
+#: error on a df/N ratio well below what a logarithm can distinguish.
+_CJK_DF_SAMPLE_SIZE = 2000
+
 
 class LTMStore:
     """SQLite-backed long-term memory with JSON and markdown projections."""
@@ -1862,6 +1870,113 @@ class LTMStore:
                 _merge(conn.execute(sql, params).fetchall())
 
         return list(results_by_id.values())[: limit * 6]
+
+    def corpus_stats(
+        self,
+        terms: list[str],
+        scopes: Optional[list[str]] = None,
+    ) -> "CorpusStats":
+        """Corpus-wide document frequencies for *terms*, plus the corpus size.
+
+        BM25's IDF is only meaningful relative to a corpus.  Computing it over
+        an already-retrieved candidate list inverts the signal: those
+        candidates were selected *because* they match the query, so every
+        query term has df ≈ N there and scores near zero IDF — the retriever
+        ends up ignoring exactly the words the user asked about.
+
+        Counting is **bounded**, not exact.  IDF is a logarithm, so all of its
+        discriminative power sits in the low-df regime: "3 documents vs 300"
+        moves the score a lot, "3,000 vs 8,000" moves it by a hair.
+
+        The two term kinds get different treatment because their matching
+        costs differ by orders of magnitude:
+
+        - Latin tokens match through the FTS index, so an exact count is
+          cheap; it is merely capped so a ubiquitous term cannot cost a full
+          scan.
+        - CJK n-grams match with ``LIKE '%x%'``, which no index can serve —
+          an exact count is a full table scan *per term*, and one Chinese
+          query expands to ~25 n-grams.  Estimating df from a single bounded
+          sample of documents gives the ratio df/N (all IDF actually needs)
+          at a cost independent of store size, with one query for every term
+          instead of one per term.
+        """
+        if not terms:
+            return CorpusStats(total_documents=0, document_frequencies={})
+
+        latin_terms = [term for term in terms if LATIN_TOKEN_RE.fullmatch(term)]
+        # Mirror search_entries' own CJK cap so df is measured over the same
+        # terms that actually drive retrieval.
+        cjk_terms = [term for term in terms if term not in latin_terms][:12]
+        scope_clause = ""
+        scope_params: list[Any] = []
+        if scopes:
+            scope_clause = f" AND scope IN ({','.join('?' for _ in scopes)})"
+            scope_params = [str(scope) for scope in scopes]
+
+        frequencies: dict[str, int] = {}
+        with self._connect() as conn:
+            total = int(
+                conn.execute(
+                    "SELECT count(*) FROM memory_items "
+                    "WHERE status NOT IN ('archived', 'superseded')" + scope_clause,
+                    scope_params,
+                ).fetchone()[0]
+                or 0
+            )
+            # A term in more than ~10% of the store carries no useful IDF.
+            cap = max(64, total // 10)
+
+            for term in latin_terms:
+                escaped = term.replace('"', '""')
+                row = conn.execute(
+                    f"""
+                    SELECT count(*) FROM (
+                        SELECT 1
+                        FROM memory_items_fts
+                        JOIN memory_items AS m ON m.id = memory_items_fts.memory_id
+                        WHERE memory_items_fts MATCH ?
+                          AND m.status NOT IN ('archived', 'superseded')
+                        {scope_clause.replace(" AND scope", " AND m.scope")}
+                        LIMIT {cap}
+                    )
+                    """,
+                    [f'"{escaped}"*', *scope_params],
+                ).fetchone()
+                found = int(row[0] or 0) if row else 0
+                # Hit the cap → treat as ubiquitous rather than guessing.
+                frequencies[term] = total if found >= cap else found
+
+            if cjk_terms and total:
+                sample_size = min(total, _CJK_DF_SAMPLE_SIZE)
+                # `ORDER BY id` is a stable pseudo-random sample, not a
+                # chronological one: ids are `uuid4().hex[:12]`, so ordering
+                # by them is uncorrelated with content or age.  A sequential
+                # id scheme would bias this toward the oldest memories.
+                rows = conn.execute(
+                    """
+                    SELECT content, entity, category
+                    FROM memory_items
+                    WHERE status NOT IN ('archived', 'superseded')
+                    """
+                    + scope_clause
+                    + " ORDER BY id LIMIT ?",
+                    [*scope_params, sample_size],
+                ).fetchall()
+                haystacks = [
+                    f"{row['content']}\n{row['entity']}\n{row['category']}"
+                    for row in rows
+                ]
+                observed = len(haystacks) or 1
+                for term in cjk_terms:
+                    hits = sum(1 for text in haystacks if term in text)
+                    # Scale the sample ratio back up to the whole corpus.
+                    frequencies[term] = min(total, round(total * hits / observed))
+            else:
+                for term in cjk_terms:
+                    frequencies[term] = 0
+
+        return CorpusStats(total_documents=total, document_frequencies=frequencies)
 
     # ── Maintenance ───────────────────────────────────────────────────────────
 

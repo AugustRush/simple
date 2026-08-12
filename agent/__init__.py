@@ -112,8 +112,6 @@ from .shared import (
     _with_task_context,
 )
 from .security.shell import (
-    SHELL_BLOCKED_COMMANDS as _SHELL_BLOCKED_COMMANDS,
-    SHELL_BLOCKED_PATTERNS as _SHELL_BLOCKED_PATTERNS,
     shell_command_check as _shell_command_check,
     shell_command_is_blocked as _shell_command_is_blocked,
 )

@@ -12,7 +12,6 @@ import inspect
 import json
 import logging
 from pathlib import Path
-import re
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -32,10 +31,11 @@ from agent.orchestration.runtime import (
     validate_subtask_specs,
     CAPABILITY_PROFILES,
 )
+from agent.orchestration import contracts
 from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlanner
 from agent.pathing import canonicalize_user_path, resolve_workspace_path
 from agent.plugins.catalog import PluginCatalog
-from agent.runtime.heartbeat import HeartbeatWriter
+from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry
@@ -215,6 +215,45 @@ class _StreamEmissionTracker:
         if chunk:
             self.emitted = True
         return self._callback(chunk)
+
+
+@dataclass
+class _ContentFilterRecovery:
+    """The rollback state a provider content-filter block needs.
+
+    A provider can reject a request because of what a *tool result* contained.
+    Recovering means un-sending the last protocol unit and resending it with
+    the offending output summarized.  That requires remembering what was last
+    submitted, and carrying the recovered response into the next loop
+    iteration so it is consumed instead of issuing a fresh LLM call.
+
+    That is three pieces of state with one lifecycle.  They used to be three
+    loose locals threaded through a 500-line function, cleared at four
+    separate sites — where forgetting one clears the rollback point and turns
+    a recoverable block into a failed turn.  Naming the state machine makes
+    the invariant ("submission recorded ⇒ rollback possible") checkable.
+    """
+
+    submitted_tool_uses: list[dict] | None = None
+    submitted_results: list[str] | None = None
+    pending_response: Any | None = None
+
+    def record_submission(
+        self, tool_uses: list[dict], results: list[str]
+    ) -> None:
+        """Note what just went to the provider, so it can be rolled back."""
+        self.submitted_tool_uses = list(tool_uses)
+        self.submitted_results = list(results)
+
+    def forget_submission(self) -> None:
+        """Drop the rollback point — nothing recoverable is outstanding."""
+        self.submitted_tool_uses = None
+        self.submitted_results = None
+
+    def take_pending_response(self) -> Any | None:
+        """Consume a recovered response exactly once."""
+        response, self.pending_response = self.pending_response, None
+        return response
 
 
 class BaseAgent:
@@ -778,55 +817,25 @@ class BaseAgent:
         return BaseAgent._append_named_block(
             task,
             "Expected output contract:",
-            [
-                expected_output,
-                "Return the final deliverable inside this exact block:",
-                "<deliverable>",
-                "<your deliverable here>",
-                "</deliverable>",
-            ],
+            [expected_output, *contracts.DELIVERABLE_INSTRUCTIONS],
         )
 
     @staticmethod
     def _mapping_dict(value: Any) -> dict[str, Any]:
-        if isinstance(value, dict):
-            return dict(value)
-        return {}
+        return contracts.mapping_dict(value)
 
     @staticmethod
     def _normalize_output_contract(output_contract: dict[str, Any] | None) -> dict[str, Any]:
-        contract = BaseAgent._mapping_dict(output_contract)
-        format_name = str(contract.get("format", "") or "").strip().lower()
-        required_keys = [
-            str(item)
-            for item in contract.get("required_keys", [])
-            if str(item).strip()
-        ]
-        required_files = [
-            str(item)
-            for item in contract.get("required_files", [])
-            if str(item).strip()
-        ]
-        normalized: dict[str, Any] = {}
-        if format_name:
-            normalized["format"] = format_name
-        if required_keys:
-            normalized["required_keys"] = required_keys
-        if required_files:
-            normalized["required_files"] = required_files
-        return normalized
+        return contracts.OutputContract.parse(output_contract).to_dict()
 
     @staticmethod
     def _output_contract_requires_deliverable(
         expected_output: str,
         output_contract: dict[str, Any] | None,
     ) -> bool:
-        contract = BaseAgent._normalize_output_contract(output_contract)
-        return bool(
-            str(expected_output or "").strip()
-            or contract.get("format") == "json"
-            or contract.get("required_keys")
-        )
+        return contracts.OutputContract.parse(
+            output_contract
+        ).requires_deliverable(expected_output)
 
     @classmethod
     def _with_output_contract(
@@ -835,54 +844,18 @@ class BaseAgent:
         expected_output: str,
         output_contract: dict[str, Any] | None,
     ) -> str:
-        contract = cls._normalize_output_contract(output_contract)
+        contract = contracts.OutputContract.parse(output_contract)
         if not expected_output and not contract:
             return task
-        requires_deliverable = cls._output_contract_requires_deliverable(
-            expected_output,
-            contract,
+        return cls._append_named_block(
+            task,
+            "Expected output contract:",
+            contracts.contract_instructions(expected_output, contract),
         )
-        lines: list[str] = []
-        if expected_output:
-            lines.append(expected_output)
-        if contract.get("format") == "json":
-            lines.append("The deliverable inside <deliverable> must be a JSON object.")
-        required_keys = contract.get("required_keys", [])
-        if required_keys:
-            lines.append(
-                "The JSON deliverable must include these keys: "
-                + ", ".join(required_keys)
-            )
-        required_files = contract.get("required_files", [])
-        if required_files:
-            lines.append(
-                "These files must exist when you finish: "
-                + ", ".join(required_files)
-            )
-        if requires_deliverable:
-            lines.extend(
-                [
-                    "Return the final deliverable inside this exact block:",
-                    "<deliverable>",
-                    "<your deliverable here>",
-                    "</deliverable>",
-                ]
-            )
-        return cls._append_named_block(task, "Expected output contract:", lines)
 
     @staticmethod
     def _extract_deliverable_block(content: str) -> str | None:
-        if not content:
-            return None
-        match = re.search(
-            r"<deliverable>\s*(.*?)\s*</deliverable>",
-            str(content),
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if not match:
-            return None
-        text = match.group(1).strip()
-        return text or None
+        return contracts.extract_deliverable(content)
 
     def _resolve_output_contract_path(self, raw_path: str) -> Path:
         output_dir_str = self.registry.get_context("output_dir")
@@ -906,102 +879,22 @@ class BaseAgent:
         expected_output: str,
         output_contract: dict[str, Any] | None,
     ) -> tuple[bool, str, dict[str, Any] | None, str | None]:
-        contract = self._normalize_output_contract(output_contract)
-        if not expected_output and not contract:
-            return True, content, None, None
-
-        requires_deliverable = self._output_contract_requires_deliverable(
-            expected_output,
-            contract,
+        result = contracts.validate(
+            content,
+            expected_output=expected_output,
+            contract=contracts.OutputContract.parse(output_contract),
+            resolve_path=self._resolve_output_contract_path,
         )
-        deliverable = (
-            self._extract_deliverable_block(content or "")
-            if requires_deliverable
-            else None
+        return (
+            result.ok,
+            result.content,
+            result.structured_content,
+            result.error,
         )
-        if requires_deliverable and deliverable is None:
-            return (
-                False,
-                content,
-                None,
-                "Expected output contract not satisfied: missing <deliverable> block",
-            )
-
-        structured_content: dict[str, Any] | None = None
-        normalized_content = deliverable if deliverable is not None else content
-        requires_json = contract.get("format") == "json" or bool(
-            contract.get("required_keys")
-        )
-        if requires_json:
-            # requires_json ⇒ requires_deliverable (see _output_contract_requires_deliverable),
-            # so we've already returned earlier if deliverable is None.
-            assert deliverable is not None
-            try:
-                parsed = json.loads(deliverable)
-            except Exception:
-                return (
-                    False,
-                    deliverable,
-                    None,
-                    "Expected output contract not satisfied: deliverable is not valid JSON",
-                )
-            if not isinstance(parsed, dict):
-                return (
-                    False,
-                    deliverable,
-                    None,
-                    "Expected output contract not satisfied: deliverable JSON must be an object",
-                )
-            required_keys = contract.get("required_keys", [])
-            missing_keys = [key for key in required_keys if key not in parsed]
-            if missing_keys:
-                return (
-                    False,
-                    deliverable,
-                    parsed,
-                    "Expected output contract not satisfied: missing required deliverable keys: "
-                    + ", ".join(missing_keys),
-                )
-            structured_content = parsed
-            normalized_content = json.dumps(parsed, ensure_ascii=False, sort_keys=True)
-
-        required_files = contract.get("required_files", [])
-        if required_files:
-            missing_files: list[str] = []
-            for raw_path in required_files:
-                try:
-                    resolved_path = self._resolve_output_contract_path(raw_path)
-                except ValueError as exc:
-                    return (
-                        False,
-                        normalized_content,
-                        structured_content,
-                        "Expected output contract not satisfied: invalid required output file path: "
-                        + str(exc),
-                    )
-                if not resolved_path.exists():
-                    missing_files.append(raw_path)
-            if missing_files:
-                return (
-                    False,
-                    normalized_content,
-                    structured_content,
-                    "Expected output contract not satisfied: missing required output file(s): "
-                    + ", ".join(missing_files),
-                )
-
-        return True, normalized_content, structured_content, None
 
     @staticmethod
     def _string_list(value: Any) -> list[str]:
-        if not value:
-            return []
-        if isinstance(value, str):
-            return [value] if value.strip() else []
-        if isinstance(value, (list, tuple, set)):
-            return [str(item) for item in value if str(item).strip()]
-        text = str(value).strip()
-        return [text] if text else []
+        return contracts.string_list(value)
 
     @staticmethod
     def _looks_like_implementation_work(role: str, task: str) -> bool:
@@ -2598,23 +2491,10 @@ class BaseAgent:
         tool_result_history: list[tuple[str, str]] = []
         result_text = ""
         watchdog = self._new_watchdog_state()
-        # Per-turn heartbeat state — updated as we move between LLM calls,
-        # tool batches, and sub-agent dispatch.  A background task reads
-        # this every few seconds and fires sink.on_heartbeat so live UIs
-        # (Feishu cards) can show "agent is alive, elapsed N seconds on X".
-        heartbeat_state: dict[str, Any] = {
-            "op": "starting",
-            "detail": "",
-            "started_at": time.monotonic(),
-            "active": True,
-            "current_tool": None,
-        }
         orchestration_token = None
         if not ctx.metadata.get("_orchestration_child"):
             orchestration_token = _active_orchestration_runs.set([])
-        content_filter_recovered_response: Any | None = None
-        content_filter_submitted_tool_uses: list[dict] | None = None
-        content_filter_submitted_results: list[str] | None = None
+        filter_recovery = _ContentFilterRecovery()
         turn_started_at = time.perf_counter()
         trace_status = "ok"
         trace_error: str | None = None
@@ -2648,11 +2528,9 @@ class BaseAgent:
 
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
-        # Start the per-turn heartbeat task here so it sees the active sink.
+        # Start the per-turn heartbeat here so it sees the active sink.
         from agent.core.output import _active_sink as _hb_sink_var
-        _hb_interval = float(ctx.metadata.get("heartbeat_interval", 5.0) or 5.0)
-        if _hb_interval <= 0:
-            _hb_interval = 5.0
+
         heartbeat_writer: HeartbeatWriter | None = None
         if ctx.metadata.get("heartbeat_enabled", True) is not False:
             heartbeat_writer = HeartbeatWriter(
@@ -2660,53 +2538,14 @@ class BaseAgent:
                 agent_id=ctx.agent_id,
                 path=ctx.metadata.get("heartbeat_path"),
             )
-
-        def _write_runtime_heartbeat(*, status: str = "running", active: bool = True) -> None:
-            if heartbeat_writer is None:
-                return
-            pending = ctx.metadata.get("pending_messages") or []
-            with shared._suppress_with_log("heartbeat writer failed"):
-                heartbeat_writer.write(
-                    state=str(heartbeat_state["op"]),
-                    detail=str(heartbeat_state["detail"]),
-                    current_tool=heartbeat_state.get("current_tool"),
-                    turn_id=str(ctx.metadata.get("turn_id") or ""),
-                    pending_messages=len(pending),
-                    active=active,
-                    status=status,
-                )
-
-        async def _heartbeat_tick() -> None:
-            _write_runtime_heartbeat()
-            while heartbeat_state["active"]:
-                try:
-                    await asyncio.sleep(_hb_interval)
-                except asyncio.CancelledError:
-                    return
-                if not heartbeat_state["active"]:
-                    return
-                _write_runtime_heartbeat()
-                sink = _hb_sink_var.get()
-                if sink is None:
-                    continue
-                fn = getattr(sink, "on_heartbeat", None)
-                if not callable(fn):
-                    continue
-                elapsed = max(0.0, time.monotonic() - float(heartbeat_state["started_at"]))
-                # Don't tick for super-fast ops — most LLM calls finish in <5s
-                # and the first tick would land right as we're handing back.
-                if elapsed < _hb_interval - 0.5:
-                    continue
-                pending = ctx.metadata.get("pending_messages") or []
-                with shared._suppress_with_log("sink.on_heartbeat raised"):
-                    fn(
-                        elapsed_seconds=elapsed,
-                        current_op=str(heartbeat_state["op"]),
-                        op_detail=str(heartbeat_state["detail"]),
-                        pending_messages=len(pending),
-                    )
-
-        _heartbeat_task = asyncio.create_task(_heartbeat_tick())
+        heartbeat = TurnHeartbeat(
+            writer=heartbeat_writer,
+            interval_seconds=float(ctx.metadata.get("heartbeat_interval", 5.0) or 5.0),
+            turn_id=str(ctx.metadata.get("turn_id") or ""),
+            pending_messages=lambda: len(ctx.metadata.get("pending_messages") or []),
+            sink_provider=_hb_sink_var.get,
+        )
+        await heartbeat.__aenter__()
 
         try:
             orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
@@ -2757,16 +2596,10 @@ class BaseAgent:
 
                 try:
                     response_started_at = time.perf_counter()
-                    heartbeat_state["op"] = "LLM"
-                    heartbeat_state["detail"] = self._effective_model(ctx)
-                    heartbeat_state["started_at"] = time.monotonic()
-                    heartbeat_state["current_tool"] = None
-                    if heartbeat_writer is not None:
-                        heartbeat_writer.mark_progress()
-                    _write_runtime_heartbeat()
-                    if content_filter_recovered_response is not None:
-                        response = content_filter_recovered_response
-                        content_filter_recovered_response = None
+                    heartbeat.operation("LLM", self._effective_model(ctx))
+                    recovered = filter_recovery.take_pending_response()
+                    if recovered is not None:
+                        response = recovered
                         streamed_text = ""
                     else:
                         # Wrap the LLM call as a task and register a cleanup
@@ -2838,8 +2671,7 @@ class BaseAgent:
                             tool_calls_made=tool_calls_made,
                             error=structured_output_error,
                         )
-                    content_filter_submitted_tool_uses = None
-                    content_filter_submitted_results = None
+                    filter_recovery.forget_submission()
                     stop_reason, text, tool_uses = self._parse_response(response)
                     _trace_latency(
                         "model_response_received",
@@ -2873,15 +2705,12 @@ class BaseAgent:
                         )
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
                         tool_use_started_at = time.perf_counter()
-                        heartbeat_state["op"] = "tools"
-                        heartbeat_state["detail"] = ", ".join(
+                        tool_names = ", ".join(
                             tu["name"] for tu in tool_uses[:3]
                         ) + (f" +{len(tool_uses) - 3}" if len(tool_uses) > 3 else "")
-                        heartbeat_state["started_at"] = time.monotonic()
-                        heartbeat_state["current_tool"] = heartbeat_state["detail"]
-                        if heartbeat_writer is not None:
-                            heartbeat_writer.mark_progress()
-                        _write_runtime_heartbeat()
+                        heartbeat.operation(
+                            "tools", tool_names, current_tool=tool_names
+                        )
                         try:
                             results = await self._run_tool_uses(
                                 tool_uses,
@@ -2940,8 +2769,7 @@ class BaseAgent:
                             ctx.messages[:] = [
                                 {"role": "user", "content": restart_message}
                             ]
-                            content_filter_submitted_tool_uses = None
-                            content_filter_submitted_results = None
+                            filter_recovery.forget_submission()
                             _iteration += 1
                             continue
 
@@ -2953,8 +2781,7 @@ class BaseAgent:
                         ctx.messages.extend(
                             self._tool_result_messages(tool_uses, filtered_results)
                         )
-                        content_filter_submitted_tool_uses = list(tool_uses)
-                        content_filter_submitted_results = list(results)
+                        filter_recovery.record_submission(tool_uses, results)
 
                         stuck_reason = self._check_tool_loop_stuck(
                             watchdog, tool_uses, results,
@@ -3010,13 +2837,12 @@ class BaseAgent:
                         # summarize the blocked content, and retry.
                         recovered_response = await self._recover_from_content_filter(
                             ctx,
-                            content_filter_submitted_tool_uses,
-                            content_filter_submitted_results,
+                            filter_recovery.submitted_tool_uses,
+                            filter_recovery.submitted_results,
                         )
                         if recovered_response is not None:
-                            content_filter_recovered_response = recovered_response
-                            content_filter_submitted_tool_uses = None
-                            content_filter_submitted_results = None
+                            filter_recovery.pending_response = recovered_response
+                            filter_recovery.forget_submission()
                             trace_status = "content_filter_recovered"
                             _interaction_log(
                                 "content_filter_recovered",
@@ -3056,17 +2882,10 @@ class BaseAgent:
                 _active_orchestration_runs.reset(orchestration_token)
             _active_agent_context.reset(_active_ctx_token)
             shared._active_cancel_token.reset(_cancel_token_token)
-            heartbeat_state["op"] = "finished"
-            heartbeat_state["detail"] = trace_status
-            heartbeat_state["current_tool"] = None
-            _write_runtime_heartbeat(
+            await heartbeat.stop(
                 status=trace_status if trace_status != "ok" else "finished",
-                active=False,
+                detail=trace_status,
             )
-            heartbeat_state["active"] = False
-            _heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await _heartbeat_task
             _interaction_log(
                 "turn_finished",
                 agent_id=ctx.agent_id,

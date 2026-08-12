@@ -562,3 +562,121 @@ def test_writes_do_not_recompute_category_stats(tmp_path, monkeypatch):
     store.add_entry(make_entry(cid="e20", content="fact 20"))
     assert store._meta["total_entries"] == 21
     assert scans == 2
+
+
+# ── Corpus statistics for the re-ranker ────────────────────────────────────
+
+
+def test_corpus_stats_counts_documents_not_candidates(tmp_path):
+    store = make_store(tmp_path)
+    for i in range(10):
+        store.add_entry(make_entry(cid=f"common-{i}", content="deployment notes"))
+    store.add_entry(make_entry(cid="rare", content="kubernetes deployment notes"))
+
+    stats = store.corpus_stats(["kubernetes", "deployment"])
+
+    assert stats.total_documents == 11
+    assert stats.document_frequencies["kubernetes"] == 1
+    assert stats.document_frequencies["deployment"] == 11
+    # The rare term must carry more IDF weight than the ubiquitous one.
+    assert stats.idf("kubernetes", fallback_n=11) > stats.idf(
+        "deployment", fallback_n=11
+    )
+
+
+def test_corpus_stats_handles_cjk_terms(tmp_path):
+    store = make_store(tmp_path)
+    store.add_entry(make_entry(cid="zh-1", content="用户偏好简洁回答"))
+    store.add_entry(make_entry(cid="zh-2", content="用户喜欢中文"))
+    store.add_entry(make_entry(cid="en-1", content="unrelated english note"))
+
+    stats = store.corpus_stats(["用户", "简洁"])
+
+    assert stats.total_documents == 3
+    assert stats.document_frequencies["用户"] == 2
+    assert stats.document_frequencies["简洁"] == 1
+
+
+def test_corpus_stats_respects_scope_filter(tmp_path):
+    from agent import LTMEntry
+
+    store = make_store(tmp_path)
+    store.add_entry(
+        LTMEntry(
+            id="g",
+            content="scoped kubernetes note",
+            importance=0.5,
+            category="code_context",
+            scope="global",
+            created_at="2026-01-01",
+            updated_at="2026-01-01",
+        )
+    )
+    store.add_entry(
+        LTMEntry(
+            id="s",
+            content="scoped kubernetes note",
+            importance=0.5,
+            category="code_context",
+            scope="session:other",
+            created_at="2026-01-01",
+            updated_at="2026-01-01",
+        )
+    )
+
+    scoped = store.corpus_stats(["kubernetes"], scopes=["global"])
+
+    assert scoped.total_documents == 1
+    assert scoped.document_frequencies["kubernetes"] == 1
+
+
+def test_corpus_stats_empty_terms(tmp_path):
+    store = make_store(tmp_path)
+    stats = store.corpus_stats([])
+    assert stats.total_documents == 0
+    assert dict(stats.document_frequencies) == {}
+
+
+def test_corpus_stats_estimates_cjk_df_from_a_bounded_sample(tmp_path, monkeypatch):
+    """CJK df is sampled, so its cost does not grow with the store.
+
+    Exactness is not the goal — IDF is a logarithm, so a df/N ratio good to a
+    few percent is indistinguishable from an exact count in the score.
+    """
+    from agent.memory import store as store_mod
+
+    store = make_store(tmp_path)
+    # 200 entries; "用户" in exactly half.
+    for i in range(200):
+        text = "用户偏好记录" if i % 2 == 0 else "项目部署记录"
+        store.add_entry(make_entry(cid=f"zh-{i:04d}", content=text))
+
+    monkeypatch.setattr(store_mod, "_CJK_DF_SAMPLE_SIZE", 50)
+    stats = store.corpus_stats(["用户"])
+
+    assert stats.total_documents == 200
+    # Scaled back up to the corpus: ~100, not the 50-row sample count.
+    assert 60 <= stats.document_frequencies["用户"] <= 140
+
+
+def test_corpus_stats_marks_a_ubiquitous_cjk_term_as_uninformative(tmp_path):
+    store = make_store(tmp_path)
+    for i in range(50):
+        store.add_entry(make_entry(cid=f"zh-{i:04d}", content="记录用户偏好"))
+
+    stats = store.corpus_stats(["记录"])
+
+    assert stats.document_frequencies["记录"] == stats.total_documents
+    # df == N ⇒ IDF ≈ 0: the term cannot discriminate between these entries.
+    assert stats.idf("记录", fallback_n=50) < 0.05
+
+
+def test_corpus_stats_caps_latin_counts_for_ubiquitous_terms(tmp_path):
+    store = make_store(tmp_path)
+    for i in range(200):
+        store.add_entry(make_entry(cid=f"en-{i:04d}", content="deployment notes here"))
+
+    stats = store.corpus_stats(["deployment"])
+
+    assert stats.document_frequencies["deployment"] == stats.total_documents
+    assert stats.idf("deployment", fallback_n=200) < 0.05
