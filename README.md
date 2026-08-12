@@ -819,12 +819,49 @@ takes the same path. Both enforce the same pipeline:
 2. **Out-of-process import probe** — the module is imported in a subprocess and
    reports the tools it registers, so a module that raises, blocks, or exits
    cannot take the live session with it.
-3. **Human confirmation** — activation runs the module inside the agent
-   process, so it requires an explicit approval. The approval is recorded
+3. **Human confirmation** — activation requires explicit approval, recorded
    against a hash of the file's contents in `~/.agent/tools/.approved.json`: it
    survives restarts, and editing the file revokes it.
 4. **Hot load** — on approval the tool is registered in the running session; no
    restart and no manual file renaming.
+
+#### User tools never run in the agent process
+
+A user tool is Python the *model wrote*. Loading it with `exec_module` — the
+old behaviour — handed it everything the agent has: the provider API keys in
+memory and in `config.json`, the memory database, the tool registry it could
+rewrite, and the event loop it could block. That made the least-trusted code
+in the system the only code with no boundary around it, while the shell tool,
+which merely runs commands, had an OS sandbox.
+
+Loading now probes the module out of process for its schema and registers a
+**proxy**. Each call runs the tool body in a fresh child process:
+
+| | In-process (before) | Child process (now) |
+|---|---|---|
+| Provider API keys | readable | unreachable (`config.json` is sandbox-denied) |
+| Registry / agent state | mutable | unreachable |
+| `sys.exit`, crash, hang | takes the session down | kills the child only |
+| Runaway tool | unbounded | killed on timeout |
+| Cost | ~0 | ~25–35 ms per call |
+
+This holds at every `shell_sandbox` setting — **process isolation is not the
+same thing as a sandbox**, and it is worth something even at `none`. When a
+sandbox mode *is* configured, the same profile the shell tool uses is applied
+on top, so tools inherit the credential-read and autostart-write denials
+rather than needing a policy of their own.
+
+One behavioural change: module-level state no longer persists between calls,
+since each invocation is a fresh interpreter. For model-authored code that is
+closer to a fix than a regression, but a tool that memoized in a module-level
+dict will now recompute.
+
+> **Plugins are deliberately still in-process.** `~/.agent/plugins/` is loaded
+> with `exec_module` and has the same access a user tool used to. The trust
+> story differs — a plugin is something *you* installed, like an editor
+> extension, whereas a user tool is something the *model* wrote — and plugin
+> hooks pass rich objects and mutate prompts mid-turn, so the boundary is not
+> a simple RPC. Treat installing a plugin as running its author's code.
 
 Third-party packages go through `install_tool_dependency`, which runs
 `pip install --target ~/.agent/tools/_deps`. That directory is prepended to

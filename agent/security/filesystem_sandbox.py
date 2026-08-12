@@ -207,6 +207,13 @@ class ShellSandboxRequest:
     #: Home-relative paths denied for read as well as write, on top of
     #: ``_SECRET_HOME_SUBDIRS``.  Comes from ``permissions.shell_secret_paths``.
     extra_secret_paths: tuple[str, ...] = ()
+    #: Absolute paths the child must be able to read regardless of ``mode``.
+    #: A sandbox that launches a *specific* interpreter has to be able to read
+    #: it: in ``restricted`` mode a venv outside the workspace is invisible, so
+    #: the child dies in ``init_import_site`` before running any tool code.
+    #: This is platform runtime, not user data — the same category as
+    #: ``/usr/lib``, which is already allowed unconditionally.
+    extra_read_paths: tuple[str, ...] = ()
     #: The agent's own home (``~/.agent`` or ``~/.agent-<name>``).  Denied for
     #: read and write because ``config.json`` holds provider API keys;
     #: ``output_root`` and ``scratch_dir`` are reopened inside it.
@@ -354,6 +361,11 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
     # output_dir and scratch are always readable for generated artifacts.
     lines.append(f'(allow file-read* (subpath "{_seatbelt_literal(output)}"))')
     lines.append(f'(allow file-read* (subpath "{_seatbelt_literal(scratch)}"))')
+    # Interpreter/runtime roots the child needs merely to start.
+    for candidate in _both_spellings(request.extra_read_paths):
+        lines.append(
+            f'(allow file-read* (subpath "{_seatbelt_literal(candidate)}"))'
+        )
     # Restricted mode still needs to read the user's cache/state dirs so
     # tools can consume their own caches; in read_all mode reads are open
     # anyway and these rules are redundant but harmless.

@@ -7,7 +7,6 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from functools import partial
 import html
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,7 +18,6 @@ import threading
 import time
 import traceback
 import urllib.request
-import uuid
 from typing import Any, Callable, Optional
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -643,32 +641,6 @@ class MCPClient:
             self._server_tasks.clear()
 
 
-class _UserToolRegistryFacade:
-    def __init__(self, registry: ToolRegistry, source: str):
-        self._registry = registry
-        self._source = source
-
-    def register(
-        self,
-        name: str,
-        description: str,
-        parameters: dict,
-        fn: Callable,
-        *,
-        replace: bool = False,
-        capabilities: tuple[str, ...] | list[str] | set[str] | frozenset[str] | None = None,
-    ) -> None:
-        self._registry.register(
-            name,
-            description,
-            parameters,
-            fn,
-            replace=replace,
-            source=self._source,
-            capabilities=capabilities,
-        )
-
-
 class UserToolCatalog:
     """Discover and load user-authored Python tool plugins.
 
@@ -705,12 +677,19 @@ class UserToolCatalog:
         *,
         require_approval: bool = False,
     ) -> list[str]:
-        """Import every admissible tool module and register what it provides.
+        """Register every admissible tool module without importing it here.
 
         With *require_approval* set, only files whose current contents match a
         recorded approval are loaded — the mode used when ``user_tools`` is
         not globally enabled, so a tool the user explicitly approved keeps
         working across restarts without trusting the whole directory.
+
+        Loading used to ``exec_module`` each file into the live session, which
+        put model-authored code in the same process as the provider API keys,
+        the memory database and the registry itself.  Instead the module is
+        probed out of process for its schema, and what gets registered is a
+        proxy that runs the real call in a sandboxed child (see
+        ``user_tool_runner``).  Nothing from the tool is imported here.
         """
         self.root.mkdir(parents=True, exist_ok=True)
         user_tools.ensure_deps_on_path(self.root)
@@ -723,22 +702,54 @@ class UserToolCatalog:
             ):
                 continue
             source = f"user_tool:{plugin_id}"
-            try:
-                module_name = f"agent_user_tool_{uuid.uuid4().hex}"
-                spec = importlib.util.spec_from_file_location(module_name, tool_file)
-                if spec is None or spec.loader is None:
-                    raise ValueError("unable to create import spec")
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                register = getattr(module, "register", None)
-                if not callable(register):
-                    raise ValueError(
-                        "tool plugin must define callable register(registry)"
-                    )
-                register(_UserToolRegistryFacade(registry, source))
-                loaded.append(plugin_id)
-            except Exception as e:
+            probe = user_tools.probe_module_sync(tool_file, root=self.root)
+            if not probe.ok:
                 shared.CONSOLE.print(
-                    f"[yellow]Failed to load user tool plugin {tool_file}: {e}[/yellow]"
+                    f"[yellow]Failed to load user tool plugin {tool_file}: "
+                    f"{probe.error}[/yellow]"
+                )
+                continue
+            registered_any = False
+            for spec in probe.tools:
+                name = str(spec.get("name") or "").strip()
+                if not name:
+                    continue
+                registry.register(
+                    name,
+                    str(spec.get("description") or ""),
+                    spec.get("parameters") or {"type": "object", "properties": {}},
+                    self._proxy_for(tool_file, name, registry),
+                    replace=True,
+                    source=source,
+                )
+                registered_any = True
+            if registered_any:
+                loaded.append(plugin_id)
+            else:
+                shared.CONSOLE.print(
+                    f"[yellow]User tool plugin {tool_file} registered no tools[/yellow]"
                 )
         return loaded
+
+    def _proxy_for(
+        self, tool_file: Path, tool_name: str, registry: ToolRegistry
+    ) -> Callable:
+        """An async callable that forwards one tool call to a child process."""
+
+        async def _invoke(**tool_input: Any) -> Any:
+            from agent.tools.user_tool_runner import run_user_tool
+
+            return await run_user_tool(
+                tool_file,
+                tool_name,
+                tool_input,
+                registry=registry,
+                root=self.root,
+            )
+
+        _invoke.__name__ = f"user_tool_{tool_name}"
+        _invoke.__doc__ = (
+            f"Proxy for user tool {tool_name!r} in {tool_file}; the tool body "
+            "runs in a sandboxed child process."
+        )
+        return _invoke

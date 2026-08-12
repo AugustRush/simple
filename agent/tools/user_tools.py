@@ -239,6 +239,86 @@ print(json.dumps({"ok": True, "tools": collected}))
 """
 
 
+def _probe_argv(path: Path, root: Optional[Path]) -> tuple[list[str], Path]:
+    """Argv for the import probe, plus the cwd it must run in."""
+    dependencies = deps_dir(root)
+    dependencies.mkdir(parents=True, exist_ok=True)
+    return (
+        [
+            sys.executable,
+            # -E only: the probe must see the same importable set the live
+            # session would, so a tool relying on an already-installed package
+            # is not rejected for a difference the real load would not have.
+            "-E",
+            "-c",
+            _PROBE_DRIVER,
+            str(dependencies),
+            str(path),
+        ],
+        # Never the workspace: a probe must not read or write the project.
+        shared.AGENT_HOME,
+    )
+
+
+def _parse_probe_output(
+    stdout: bytes | None, stderr: bytes | None, returncode: int | None
+) -> ProbeResult:
+    text = (stdout or b"").decode("utf-8", "replace").strip()
+    errors = (stderr or b"").decode("utf-8", "replace").strip()
+    last_line = text.splitlines()[-1] if text else ""
+    try:
+        payload = json.loads(last_line)
+    except (json.JSONDecodeError, ValueError):
+        detail = errors or text or f"probe exited with code {returncode}"
+        return ProbeResult(ok=False, error=f"probe failed: {detail[:2000]}")
+    if not payload.get("ok"):
+        return ProbeResult(ok=False, error=str(payload.get("error", "probe failed")))
+    return ProbeResult(
+        ok=True,
+        tools=tuple(
+            item for item in payload.get("tools", []) if isinstance(item, dict)
+        ),
+    )
+
+
+def probe_module_sync(
+    path: Path,
+    *,
+    root: Optional[Path] = None,
+    timeout: float = PROBE_TIMEOUT_SECONDS,
+) -> ProbeResult:
+    """Blocking counterpart of :func:`probe_module`.
+
+    Loading tools happens on startup and after create/remove, which are
+    synchronous paths.  Sharing the driver and the output parsing with the
+    async probe keeps one definition of what "probing a module" means — two
+    copies would drift on the next change to the driver contract.
+    """
+    import subprocess
+
+    argv, cwd = _probe_argv(path, root)
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ProbeResult(
+            ok=False,
+            error=(
+                f"import did not finish within {timeout:g}s; module-level code "
+                "must not block (move slow work inside the tool function)"
+            ),
+        )
+    except Exception as exc:
+        return ProbeResult(ok=False, error=f"unable to start probe: {exc}")
+    return _parse_probe_output(
+        completed.stdout, completed.stderr, completed.returncode
+    )
+
+
 async def probe_module(
     path: Path,
     *,
