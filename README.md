@@ -446,6 +446,27 @@ Permission levels (most → least restrictive):
 | `medium` | auto | auto | confirm |
 | `high` / `full` | auto | auto | auto |
 
+> **You almost certainly do not need `shell_sandbox: none`.** The usual reason
+> people reach for it is GPU access, and that is a different knob:
+> `shell_devices` (default `true`) exposes Metal/IOKit inside the sandbox.
+> Measured on macOS: PyTorch MPS and MLX both run under `read_all` with
+> `shell_devices: true`, identical to unsandboxed, and both fail with
+> `shell_devices: false`. Before disabling the sandbox, match the failure to
+> its knob:
+>
+> | Symptom | Knob |
+> |---|---|
+> | GPU / Metal / MLX unavailable | `shell_devices: true` (already the default) |
+> | Cannot write inside the workspace | an approved `write_scope` |
+> | Cannot read a credential dir you need | remove it from `shell_secret_paths` |
+> | Cannot read outside the workspace | `shell_sandbox: read_all` (the default) |
+> | A tool nests its own sandbox (Chrome/Electron) | `--no-sandbox` / `ELECTRON_DISABLE_SANDBOX=1` |
+>
+> When the sandbox *is* off, the agent says so on every start and in
+> `/permissions`. `none` is a task-scoped decision — prefer
+> `/permissions sandbox session none` over the persistent form, so it expires
+> with the session instead of outliving the reason you needed it.
+
 Shell sandbox modes:
 
 | Mode | Reads | Writes | Notes |

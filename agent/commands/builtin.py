@@ -1109,7 +1109,12 @@ async def _permissions_handler(
         shell_session_sandbox_get,
         shell_session_sandbox_set,
     )
-    from agent.security.filesystem_sandbox import SANDBOX_MODES
+    from agent.security.filesystem_sandbox import (
+        SANDBOX_MODES,
+        effective_sandbox_mode,
+        sandbox_downgrade_note,
+        sandbox_posture_warning,
+    )
 
     registry = context.components.get("registry")
 
@@ -1123,7 +1128,10 @@ async def _permissions_handler(
     session_level = shell_session_permission_get(scope)
     effective_level = session_level or config_level
     session_sandbox = shell_session_sandbox_get(scope)
-    effective_sandbox = session_sandbox or config_sandbox
+    # Apply the same level linkage the shell tool applies, so the status
+    # display cannot report a mode that is not the one being enforced.
+    configured_sandbox = session_sandbox or config_sandbox
+    effective_sandbox = effective_sandbox_mode(configured_sandbox, effective_level)
     args = request.args.strip()
     if not args:
         lines = ["## Shell 权限等级", ""]
@@ -1135,6 +1143,14 @@ async def _permissions_handler(
         for mode in SANDBOX_MODES:
             marker = "●" if mode == effective_sandbox else "○"
             lines.append(f"- {marker} `{mode}`：{_sandbox_mode_label(mode)}")
+        downgrade = sandbox_downgrade_note(configured_sandbox, effective_level)
+        if downgrade:
+            lines.append("")
+            lines.append(f"> ℹ {downgrade}")
+        posture = sandbox_posture_warning(effective_sandbox)
+        if posture:
+            lines.append("")
+            lines.append(f"> ⚠ **{posture}**")
         if session_level:
             lines.append("")
             lines.append(

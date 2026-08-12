@@ -26,6 +26,9 @@ from agent.security.filesystem_sandbox import (
     SandboxUnavailableError,
     ShellSandboxRequest,
     build_sandbox_command,
+    effective_sandbox_mode,
+    looks_like_sandbox_denial,
+    narrow_alternatives_hint,
     new_scratch_dir,
     release_scratch_dir,
 )
@@ -2002,7 +2005,7 @@ class BuiltinTools:
             authorization_scope, permission_level
         )
         if sandbox_mode == SANDBOX_MODE_NONE and effective_level != "full":
-            sandbox_mode = "read_all"
+            sandbox_mode = effective_sandbox_mode(sandbox_mode, effective_level)
         unsandboxed = sandbox_mode == SANDBOX_MODE_NONE
         shell_devices = bool(
             self.registry.get_context("shell_devices", True)
@@ -2219,6 +2222,17 @@ class BuiltinTools:
             if err:
                 result += f"STDERR:\n{err}"
             result += f"\nExit code: {proc.returncode}"
+            # When a command fails *because the sandbox refused it*, say which
+            # narrow knob matches. The reason a user turns the sandbox off
+            # wholesale is almost never that they wanted no boundary — it is
+            # that something broke and `none` was the only option visible at
+            # that moment. (Measured: GPU/Metal works fine under `read_all`
+            # with the default `shell_devices: true`; disabling the sandbox
+            # for it buys nothing.)
+            if proc.returncode != 0 and looks_like_sandbox_denial(err):
+                hint = narrow_alternatives_hint(sandbox_mode)
+                if hint:
+                    result += f"\n\n{hint}"
             moved_artifacts: list[dict[str, str]] = []
             if workspace_before is not None:
                 moved_artifacts = self._move_new_workspace_files_to_output_dir(

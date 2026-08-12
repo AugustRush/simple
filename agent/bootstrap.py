@@ -287,6 +287,18 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
             if str(entry).strip()
         ),
     )
+    if announce:
+        # A posture nobody can see is a posture nobody maintains.  Running
+        # unsandboxed is a deliberate, temporary choice that lives in a
+        # permanent file, so it has to announce itself on every start.
+        from agent.security.filesystem_sandbox import sandbox_posture_warning
+
+        posture = sandbox_posture_warning(
+            str(registry.get_context("shell_sandbox_mode") or "read_all"),
+            devices=bool(registry.get_context("shell_devices", True)),
+        )
+        if posture:
+            console.print(f"[bold yellow]⚠ {posture}[/bold yellow]")
     audio_cfg = cfg.get("audio", {})
     audio_transcription_command = ""
     if isinstance(audio_cfg, dict):

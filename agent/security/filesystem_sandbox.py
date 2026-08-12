@@ -15,8 +15,10 @@ Three sandbox modes link to the permission levels:
   everywhere on the host (``~/.config``, home caches, miniconda, …) so
   local tooling works without granting write access.
 - ``none`` (danger-full-access): no OS sandbox at all; the child sees the
-  whole machine including GPU/IOKit.  Only meaningful with permission level
-  ``full``; the caller enforces that linkage.
+  whole machine including GPU/IOKit.  Honoured only at permission level
+  ``full`` — see :func:`effective_sandbox_mode`, which is the single
+  definition of that linkage so the status display cannot disagree with
+  enforcement.
 
 ``ShellSandboxRequest.devices`` controls device/service access (Metal/IOKit
 mach services) inside a sandboxed run (``restricted`` or ``read_all``): it
@@ -24,6 +26,14 @@ defaults to open, the same posture the profile already takes for network.
 Seatbelt can expose the GPU services (the same mechanism App Store sandboxes
 use), so local MLX/GPU workloads work without opening writes or disabling
 confirmation; set it to ``False`` for the strictest posture.
+
+This matters more than it looks: "I needed GPU" is the most common reason a
+sandbox gets switched off wholesale, and it is not a reason — measured on
+macOS, PyTorch MPS and MLX both run under ``read_all`` with ``devices=True``
+exactly as they do unsandboxed, and both fail with ``devices=False``.  When a
+sandboxed command is denied, :func:`narrow_alternatives_hint` names this and
+the other narrow knobs, because ``none`` becomes the obvious fix only when
+nothing else is visible at the moment something breaks.
 
 Write policy is inverted, not allowlisted: the sandbox protects **user
 data**, not tool behavior.  Writes are open by default, so every local tool
@@ -489,10 +499,100 @@ def _path_is_within(candidate: Path, root: Path) -> bool:
         return False
 
 
-#: A scratch dir left behind by a hard kill is reclaimed once it is older
-#: than this.  Generous compared with the shell tool's own timeout, so a
+#: A scratch dir left behind by a hard kill is reclaimed once it is older#: than this.  Generous compared with the shell tool's own timeout, so a
 #: long-running command can never have its TMPDIR swept out from under it.
 _SCRATCH_MAX_AGE_SECONDS = 6 * 3600
+
+
+# ── Posture reporting ──────────────────────────────────────────────────────
+#
+# A security posture nobody can see is one nobody maintains.  `shell_sandbox:
+# none` is the single most consequential setting in the system and it was
+# surfaced nowhere — not at startup, not in the status row, not in the prompt.
+# So it gets set once for a specific task and stays set for months, which is
+# exactly what happened to the author's own config.
+
+
+def effective_sandbox_mode(mode: str, permission_level: str) -> str:
+    """The mode that will actually be enforced, given the permission level.
+
+    ``none`` is honoured only at permission level ``full``; anything lower
+    falls back to ``read_all``.  This lives here, in one place, because the
+    rule was previously applied only inside the shell tool: ``/permissions``
+    computed the effective mode without it and would report ``none`` while
+    the shell was really running ``read_all``.  A status display that
+    disagrees with enforcement is worse than no display — it is the one the
+    user trusts.
+    """
+    if mode == SANDBOX_MODE_NONE and str(permission_level or "") != "full":
+        return SANDBOX_MODE_READ_ALL
+    return mode
+
+
+def sandbox_downgrade_note(mode: str, permission_level: str) -> str:
+    """Explain a silent downgrade, or "" when none applies."""
+    if effective_sandbox_mode(mode, permission_level) == mode:
+        return ""
+    return (
+        f"configured sandbox `{mode}` is not in effect: it requires "
+        f"permission level `full`, and the current level is "
+        f"`{permission_level}`. Running `read_all` instead."
+    )
+
+
+def sandbox_posture_warning(mode: str, *, devices: bool = True) -> str:
+    """A one-line warning when *mode* leaves the machine unprotected, else "".
+
+    Returned rather than printed so every surface (startup banner, the
+    `/permissions` output, the status row) says the same sentence.  Three
+    copies of this text would drift, and the one that drifts is the one the
+    user happens to read.
+    """
+    if mode != SANDBOX_MODE_NONE:
+        return ""
+    return (
+        "shell sandbox is OFF (danger-full-access): commands can read your "
+        "credentials and write your shell startup files. GPU works without "
+        "this — that is `shell_devices`, which is on by default. "
+        "Re-enable with `/permissions sandbox read_all`."
+    )
+
+
+def narrow_alternatives_hint(mode: str) -> str:
+    """What to reach for when a sandboxed command was denied.
+
+    The reason a user disables the sandbox wholesale is almost never that
+    they wanted no boundary; it is that something broke and ``none`` was the
+    only option they could see at that moment.  Naming the narrow knobs at
+    the point of failure is what keeps the big switch from being the obvious
+    fix.
+    """
+    if mode == SANDBOX_MODE_NONE:
+        return ""
+    return (
+        "This looks like a sandbox denial. Before disabling the sandbox, try "
+        "the narrow option that matches: GPU/Metal -> `shell_devices: true` "
+        "(already the default); writing inside the workspace -> an approved "
+        "`write_scope`; a credential path you actually need -> remove it from "
+        "`permissions.shell_secret_paths`; reads outside the workspace -> "
+        "`/permissions sandbox read_all`. `sandbox none` removes every "
+        "boundary and is rarely what the failure needs."
+    )
+
+
+#: Substrings in a failed command's output that indicate the sandbox, rather
+#: than the command itself, refused the operation.
+_DENIAL_MARKERS: tuple[str, ...] = (
+    "Operation not permitted",
+    "sandbox-exec",
+    "deny file-read",
+    "deny file-write",
+)
+
+
+def looks_like_sandbox_denial(output: str) -> bool:
+    text = str(output or "")
+    return any(marker in text for marker in _DENIAL_MARKERS)
 
 
 def new_scratch_dir(output_root: Path) -> Path:
@@ -554,7 +654,12 @@ __all__ = [
     "ShellSandboxRequest",
     "build_sandbox_command",
     "detect_sandbox_support",
+    "effective_sandbox_mode",
+    "looks_like_sandbox_denial",
+    "narrow_alternatives_hint",
     "new_scratch_dir",
     "reclaim_stale_scratch_dirs",
+    "sandbox_downgrade_note",
+    "sandbox_posture_warning",
     "release_scratch_dir",
 ]
