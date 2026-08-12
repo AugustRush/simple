@@ -1,0 +1,353 @@
+{
+  "_readme": [
+    "Labeled retrieval evaluation set for agent/memory.",
+    "",
+    "Authored, not harvested: a real ~/.agent store holds personal content that",
+    "must not enter version control. The corpus below is written to match the",
+    "shape of a real store instead — same categories, same bilingual mix, same",
+    "ratio of agent-generated episodes to user facts, same length distribution",
+    "(short identity notes vs multi-hundred-character session summaries).",
+    "",
+    "To evaluate against your own real memories instead, see",
+    "`scripts/eval_retrieval.py --harvest`, which writes a gitignored local set.",
+    "",
+    "Each case lists the entry ids that SHOULD be retrieved. Tags group cases by",
+    "the retrieval capability under test, so a regression can be attributed:",
+    "",
+    "  lexical      query shares surface words with the memory (BM25's home turf)",
+    "  paraphrase   query means the same thing in different words",
+    "  cross-lingual query language differs from the stored memory's language",
+    "  distractor   several near-identical memories, one correct answer",
+    "  episode      recalling what happened rather than a stable fact",
+    "  fact         stable knowledge about the user or project",
+    "  multi        more than one memory is correct",
+    "  negative     nothing should be retrieved; measures false-positive rate"
+  ],
+
+  "corpus": [
+    {
+      "id": "id-lang-pref",
+      "category": "identity",
+      "entity": "user",
+      "memory_type": "preference",
+      "importance": 0.9,
+      "content": "User prefers concise answers without emoji. Replies should stay under five sentences unless code is involved."
+    },
+    {
+      "id": "id-name",
+      "category": "identity",
+      "entity": "user",
+      "memory_type": "note",
+      "importance": 0.9,
+      "content": "用户名字是 August，在大疆做 iOS 客户端开发，主要负责 MIMO 相机 App。"
+    },
+    {
+      "id": "id-self",
+      "category": "identity",
+      "entity": "assistant",
+      "memory_type": "self_identity",
+      "importance": 0.8,
+      "content": "The user named this agent 小简."
+    },
+    {
+      "id": "id-tz",
+      "category": "identity",
+      "entity": "user",
+      "memory_type": "preference",
+      "importance": 0.6,
+      "content": "用户在深圳，时区 UTC+8，习惯用中文提问但代码注释用英文。"
+    },
+
+    {
+      "id": "proj-simple",
+      "category": "projects",
+      "entity": "simple",
+      "memory_type": "note",
+      "importance": 0.8,
+      "content": "Simple 是用户自己写的个人 agent 项目，Python 3.11+，用 uv 管理依赖，跑在 ~/.agent 下。"
+    },
+    {
+      "id": "proj-mimo-release",
+      "category": "projects",
+      "entity": "mimo",
+      "memory_type": "note",
+      "importance": 0.7,
+      "content": "MIMO 2.9.0 的开发准出时间是每月第二个周四，CSDK 需要提前三周提测。"
+    },
+    {
+      "id": "proj-db-choice",
+      "category": "projects",
+      "entity": "simple",
+      "memory_type": "feasibility_check",
+      "importance": 0.6,
+      "content": "Decided to keep memory in SQLite with FTS5 rather than adding a vector database, to avoid an external dependency for a single-user workload."
+    },
+
+    {
+      "id": "task-next-review",
+      "category": "tasks",
+      "entity": "simple",
+      "memory_type": "next_step",
+      "importance": 0.7,
+      "content": "下一步：给检索加质量评测集，之前只有延迟 benchmark，改动排序算法时无法验证召回是否变好。"
+    },
+    {
+      "id": "task-sandbox",
+      "category": "tasks",
+      "entity": "simple",
+      "memory_type": "next_step",
+      "importance": 0.6,
+      "content": "Pending: move user-generated tools out of the agent process into the shell sandbox, since exec_module gives them full access to config.json."
+    },
+
+    {
+      "id": "concept-bm25",
+      "category": "concepts",
+      "entity": "retrieval",
+      "memory_type": "note",
+      "importance": 0.5,
+      "content": "BM25 的 IDF 只有相对语料库才有意义；在已经按查询过滤过的候选集上重算，查询词的 df 接近 N，IDF 塌成零。"
+    },
+    {
+      "id": "concept-seatbelt",
+      "category": "concepts",
+      "entity": "sandbox",
+      "memory_type": "note",
+      "importance": 0.5,
+      "content": "macOS seatbelt resolves overlapping rules last-match-wins, so a deny must come after the broad allow it narrows."
+    },
+
+    {
+      "id": "ep-auth-debug",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.5,
+      "content": "上周二排查了 WiFi 连接鉴权失败的问题。日志显示 DJILog 里 FAIL_AUTH 事件集中在 NFC 握手之后，最后定位到证书过期。用户当时说这个 bug 卡了很久。"
+    },
+    {
+      "id": "ep-feishu-setup",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.4,
+      "content": "Set up the Feishu gateway together: installed lark-oapi, configured the app credentials in ~/.agent/config.json, and verified that the bot drains pending messages before closing the WebSocket."
+    },
+    {
+      "id": "ep-perf-tuning",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.4,
+      "content": "花了一个下午优化记忆检索的延迟，把 CJK 的 document frequency 从逐词全表扫描改成一次有界采样，10k 条从 62 毫秒降到 2.7 毫秒。"
+    },
+    {
+      "id": "ep-tui-layout",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.4,
+      "content": "重写了 CLI 的 TUI 布局，加了响应式宽度、状态行和有上限的回滚缓冲区，避免长输出把终端刷爆。"
+    },
+    {
+      "id": "ep-orch-refactor",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "orchestration_summary",
+      "importance": 0.3,
+      "content": "Ran three sub-agents in parallel to audit the security, memory, and orchestration layers; merged their findings into a single ranked review."
+    },
+
+    {
+      "id": "dist-cache-1",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.4,
+      "content": "修了 system prompt 缓存的 key 漂移问题：缓存键少了 supports_vision，切换模型后仍然沿用旧的 prompt。"
+    },
+    {
+      "id": "dist-cache-2",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.4,
+      "content": "修了 sandbox profile 缓存的 key 漂移问题：缓存键少了 mode 和 devices，restricted 模式复用了 read_all 写出来的 profile。"
+    },
+    {
+      "id": "dist-cache-3",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.4,
+      "content": "讨论了缓存键应该按内容 hash 还是按输入字段列举，结论是手写字段列表一定会漂，应该让渲染函数只能读到 key 里的东西。"
+    },
+
+    {
+      "id": "noise-shell-1",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.3,
+      "content": "整理了 shell 命令的风险分级表，确认 medium 风险其实不拦截任何东西，只是给 UI 打标签。"
+    },
+    {
+      "id": "noise-plugin-1",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.3,
+      "content": "调试 evolution 插件时发现它把学到的规则写进了默认实例的目录，--name 起的实例之间没有隔离。"
+    },
+    {
+      "id": "noise-scratch",
+      "category": "episodes",
+      "entity": "session",
+      "memory_type": "session_summary",
+      "importance": 0.3,
+      "content": "Discovered that every shell invocation leaked a scratch directory under output/sandbox; 121 empty ones had accumulated since early August."
+    },
+    {
+      "id": "noise-sub-obs",
+      "category": "episodes",
+      "entity": "reviewer",
+      "memory_type": "sub_agent_observation",
+      "importance": 0.3,
+      "content": "sub-agent [reviewer] task: audit the retrieval layer\n\nresult: The two-stage pipeline recomputes BM25 over candidates that were already selected by the query, which flattens IDF for exactly the terms the user asked about. Recommend supplying corpus-level document frequencies from the store, and note that the second stage's only genuinely new signal is the importance multiplier."
+    }
+  ],
+
+  "cases": [
+    {
+      "query": "用户叫什么名字",
+      "relevant": ["id-name"],
+      "tags": ["fact", "lexical"]
+    },
+    {
+      "query": "我在哪家公司做什么工作",
+      "relevant": ["id-name"],
+      "tags": ["fact", "paraphrase"]
+    },
+    {
+      "query": "回复应该多长",
+      "relevant": ["id-lang-pref"],
+      "tags": ["fact", "cross-lingual", "paraphrase"]
+    },
+    {
+      "query": "should I use emoji in my replies",
+      "relevant": ["id-lang-pref"],
+      "tags": ["fact", "lexical"]
+    },
+    {
+      "query": "你叫什么",
+      "relevant": ["id-self"],
+      "tags": ["fact", "paraphrase"]
+    },
+    {
+      "query": "what timezone is the user in",
+      "relevant": ["id-tz"],
+      "tags": ["fact", "cross-lingual"]
+    },
+
+    {
+      "query": "Simple 项目用什么管理依赖",
+      "relevant": ["proj-simple"],
+      "tags": ["fact", "lexical"]
+    },
+    {
+      "query": "为什么没有用向量数据库",
+      "relevant": ["proj-db-choice"],
+      "tags": ["fact", "cross-lingual", "paraphrase"]
+    },
+    {
+      "query": "MIMO 什么时候提测",
+      "relevant": ["proj-mimo-release"],
+      "tags": ["fact", "paraphrase"]
+    },
+    {
+      "query": "还有什么待办没做",
+      "relevant": ["task-next-review", "task-sandbox"],
+      "tags": ["fact", "multi", "paraphrase"]
+    },
+
+    {
+      "query": "IDF 为什么会塌成零",
+      "relevant": ["concept-bm25"],
+      "tags": ["fact", "lexical"]
+    },
+    {
+      "query": "seatbelt 规则的优先级是怎么算的",
+      "relevant": ["concept-seatbelt"],
+      "tags": ["fact", "cross-lingual"]
+    },
+
+    {
+      "query": "上次那个鉴权失败的问题最后是什么原因",
+      "relevant": ["ep-auth-debug"],
+      "tags": ["episode", "paraphrase"]
+    },
+    {
+      "query": "刚才我们聊过飞书网关怎么配的吗",
+      "relevant": ["ep-feishu-setup"],
+      "tags": ["episode", "cross-lingual", "paraphrase"]
+    },
+    {
+      "query": "之前优化检索性能提升了多少",
+      "relevant": ["ep-perf-tuning"],
+      "tags": ["episode", "paraphrase"]
+    },
+    {
+      "query": "终端输出太长刷屏那次怎么解决的",
+      "relevant": ["ep-tui-layout"],
+      "tags": ["episode", "paraphrase"]
+    },
+
+    {
+      "query": "system prompt 的缓存键少了什么",
+      "relevant": ["dist-cache-1"],
+      "tags": ["distractor", "lexical"]
+    },
+    {
+      "query": "sandbox profile 被复用是因为缓存键少了哪些字段",
+      "relevant": ["dist-cache-2"],
+      "tags": ["distractor", "lexical"]
+    },
+    {
+      "query": "缓存键应该按内容 hash 还是列字段",
+      "relevant": ["dist-cache-3"],
+      "tags": ["distractor", "lexical"]
+    },
+
+    {
+      "query": "shell 的 medium 风险到底拦不拦",
+      "relevant": ["noise-shell-1"],
+      "tags": ["episode", "lexical"]
+    },
+    {
+      "query": "多实例之间为什么没隔离开",
+      "relevant": ["noise-plugin-1"],
+      "tags": ["episode", "paraphrase"]
+    },
+    {
+      "query": "临时目录泄漏了多少个",
+      "relevant": ["noise-scratch"],
+      "tags": ["episode", "cross-lingual", "paraphrase"]
+    },
+    {
+      "query": "子 agent 对检索层的审查结论是什么",
+      "relevant": ["noise-sub-obs"],
+      "tags": ["episode", "cross-lingual", "paraphrase"]
+    },
+
+    {
+      "query": "明天深圳天气怎么样",
+      "relevant": [],
+      "tags": ["negative"]
+    },
+    {
+      "query": "how do I make sourdough bread",
+      "relevant": [],
+      "tags": ["negative"]
+    }
+  ]
+}

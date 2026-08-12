@@ -876,31 +876,19 @@ class ContextManager:
             )
         return "\n".join(lines)
 
-    def retrieve_ltm_context(
+    def ltm_candidates(
         self,
         query: str,
         top_k: int = shared.RETRIEVAL_TOP_K,
-        token_budget: Optional[int] = None,
-    ) -> str:
-        """Return top-K relevant LTM entries as an injectable string.
+    ) -> list[LTMEntry]:
+        """Stage 1: the candidate set the re-ranker is allowed to choose from.
 
-        Two-stage retrieval:
-          1. SQLite FTS5 fetches a broad candidate set via BM25.
-          2. LocalRetriever re-ranks candidates with importance-boosted BM25,
-             using document frequencies measured over the **whole store**.
-          3. Routed categories receive a small score bonus rather than hard filtering.
-
-        Stage 2 used to compute IDF over the stage-1 candidates.  Those
-        candidates are precisely the documents that matched the query, so
-        every query term had df ≈ N among them and scored ~0 IDF: the
-        re-ranker systematically ignored the words the user actually asked
-        about and sorted on incidental vocabulary instead.  Passing real
-        corpus statistics is what makes the second stage informative.
-
-        This keeps keyword routing useful without hiding relevant memories that
-        live outside the routed categories.
+        Named and exposed because it is a hard ceiling on retrieval quality —
+        an entry that stage 1 misses cannot be recovered by any amount of
+        stage-2 ranking. Measuring the two stages separately is what tells you
+        which one to work on; without the split, a recall failure and a
+        ranking failure look identical from the outside.
         """
-        categories = self._route_categories(query)
         scopes = ["global", f"session:{self.staging.session_id}"]
         candidates = self.store.search_entries(
             query,
@@ -910,21 +898,65 @@ class ContextManager:
         )
         if not candidates and self._is_episode_recall_query(query):
             candidates = self.store.read_entries("episodes", scopes=scopes)[: top_k * 3]
+        return candidates
+
+    def rank_ltm_entries(
+        self,
+        query: str,
+        top_k: int = shared.RETRIEVAL_TOP_K,
+    ) -> list[LTMEntry]:
+        """Return the top-K entries for *query*, highest-scoring first.
+
+        The ranking half of :meth:`retrieve_ltm_context`, split out so that
+        retrieval quality can be measured.  Formatting a string is a
+        presentation concern; which entries come back and in what order is
+        the thing that decides whether the agent remembers correctly, and it
+        needs to be observable by an evaluation harness without
+        reimplementing the pipeline (a reimplementation measures itself, not
+        production).
+
+        Two-stage retrieval:
+          1. :meth:`ltm_candidates` fetches a broad candidate set via FTS5.
+          2. LocalRetriever re-ranks candidates with importance-boosted BM25,
+             using document frequencies measured over the **whole store**.
+          3. Routed categories receive a small score bonus rather than hard
+             filtering.
+
+        Stage 2 used to compute IDF over the stage-1 candidates.  Those
+        candidates are precisely the documents that matched the query, so
+        every query term had df ≈ N among them and scored ~0 IDF: the
+        re-ranker systematically ignored the words the user actually asked
+        about and sorted on incidental vocabulary instead.  Passing real
+        corpus statistics is what makes the second stage informative.
+        """
+        scopes = ["global", f"session:{self.staging.session_id}"]
+        candidates = self.ltm_candidates(query, top_k)
         if not candidates:
-            return ""
+            return []
+        categories = self._route_categories(query)
         corpus = self.store.corpus_stats(self.retriever.tokenize(query), scopes=scopes)
         scored = self.retriever.score(query, candidates, corpus)
         if categories:
             routed = set(categories)
             scored = [
-                (
-                    entry,
-                    score * (1.15 if entry.category in routed else 1.0),
-                )
+                (entry, score * (1.15 if entry.category in routed else 1.0))
                 for entry, score in scored
             ]
             scored.sort(key=lambda item: item[1], reverse=True)
-        top = [entry for entry, score in scored[:top_k] if score > 0]
+        return [entry for entry, score in scored[:top_k] if score > 0]
+
+    def retrieve_ltm_context(
+        self,
+        query: str,
+        top_k: int = shared.RETRIEVAL_TOP_K,
+        token_budget: Optional[int] = None,
+    ) -> str:
+        """Format the top-K relevant LTM entries as an injectable string.
+
+        Ranking lives in :meth:`rank_ltm_entries`; this method only decides
+        how much of the result fits in *token_budget*.
+        """
+        top = self.rank_ltm_entries(query, top_k)
         if not top:
             return ""
         header = "## Retrieved Context (from long-term memory)"

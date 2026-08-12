@@ -1,0 +1,85 @@
+{
+  "overall": {
+    "recall@1": 0.5652173913043478,
+    "recall@3": 0.6086956521739131,
+    "recall@5": 0.6086956521739131,
+    "mrr": 0.5869565217391305,
+    "candidate_recall": 0.6956521739130435,
+    "miss_rate": 0.391304347826087
+  },
+  "negative": {
+    "count": 2,
+    "false_positive_rate": 0.5,
+    "avg_spurious_results": 0.5
+  },
+  "by_tag": {
+    "cross-lingual": {
+      "count": 7,
+      "recall@1": 0.14285714285714285,
+      "recall@3": 0.14285714285714285,
+      "recall@5": 0.14285714285714285,
+      "mrr": 0.14285714285714285,
+      "candidate_recall": 0.42857142857142855,
+      "miss_rate": 0.8571428571428571
+    },
+    "distractor": {
+      "count": 3,
+      "recall@1": 1.0,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "mrr": 1.0,
+      "candidate_recall": 1.0,
+      "miss_rate": 0.0
+    },
+    "episode": {
+      "count": 8,
+      "recall@1": 0.5,
+      "recall@3": 0.625,
+      "recall@5": 0.625,
+      "mrr": 0.5625,
+      "candidate_recall": 0.75,
+      "miss_rate": 0.375
+    },
+    "fact": {
+      "count": 12,
+      "recall@1": 0.5,
+      "recall@3": 0.5,
+      "recall@5": 0.5,
+      "mrr": 0.5,
+      "candidate_recall": 0.5833333333333334,
+      "miss_rate": 0.5
+    },
+    "lexical": {
+      "count": 8,
+      "recall@1": 1.0,
+      "recall@3": 1.0,
+      "recall@5": 1.0,
+      "mrr": 1.0,
+      "candidate_recall": 1.0,
+      "miss_rate": 0.0
+    },
+    "multi": {
+      "count": 1,
+      "recall@1": 0.0,
+      "recall@3": 0.0,
+      "recall@5": 0.0,
+      "mrr": 0.0,
+      "candidate_recall": 0.0,
+      "miss_rate": 1.0
+    },
+    "negative": {
+      "count": 2,
+      "false_positive_rate": 0.5,
+      "avg_spurious_results": 0.5
+    },
+    "paraphrase": {
+      "count": 13,
+      "recall@1": 0.3076923076923077,
+      "recall@3": 0.38461538461538464,
+      "recall@5": 0.38461538461538464,
+      "mrr": 0.34615384615384615,
+      "candidate_recall": 0.46153846153846156,
+      "miss_rate": 0.6153846153846154
+    }
+  }
+}

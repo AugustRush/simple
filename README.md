@@ -44,6 +44,30 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **Vision** | Image attachments sent directly to vision-capable models (Anthropic, OpenAI) |
 | **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
 
+### Measuring retrieval quality
+
+Memory recall is the system's core value, so it has an instrument rather than
+only a latency benchmark:
+
+```bash
+uv run python scripts/eval_retrieval.py            # recall@k / MRR by capability
+uv run python scripts/eval_retrieval.py --compare  # diff against the pinned baseline
+uv run python scripts/eval_retrieval.py --harvest  # seed a local set from your own store
+```
+
+It drives the production path (`ContextManager.rank_ltm_entries`) over a
+labeled set in `tests/eval/`, and separates the two failure modes that look
+identical from outside:
+
+- **`candidate_recall`** — did stage 1 (FTS) even fetch the right entry? This
+  is a hard ceiling; ranking cannot recover what was never retrieved.
+- **`recall@k` / `mrr`** — given the candidates, did stage 2 rank it well?
+
+`tests/test_retrieval_quality.py` guards the pinned baseline in CI. Re-pin
+with `--save-baseline` after an intentional change, and read the tag
+breakdown first.
+
+
 ## Examples
 
 ### Multi-instance deployment
