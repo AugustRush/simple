@@ -1981,23 +1981,42 @@ class LTMStore:
     # ── Maintenance ───────────────────────────────────────────────────────────
 
     def apply_decay(self, factor: float = shared.DECAY_FACTOR) -> None:
-        """Decay importance of all entries; prune those below shared.MIN_IMPORTANCE."""
-        affected_categories: set[str] = set()
+        """Decay importance of all entries; prune those below shared.MIN_IMPORTANCE.
+
+        Pushed into SQL so it no longer fetches every entry into Python and
+        writes them back one row at a time (the old per-row _write_entry_row
+        also re-synced each entry's FTS row individually).  Mirrors
+        apply_retention, which already does this for episodes.
+        """
+        now = _now()
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM memory_items WHERE status NOT IN ('archived', 'superseded')"
-            ).fetchall()
-            for row in rows:
-                entry = self._row_to_entry(row)
-                affected_categories.add(self.normalize_category_name(entry.category))
-                entry.decay(factor)
-                entry.updated_at = _now()
-                if entry.importance < shared.MIN_IMPORTANCE:
-                    conn.execute("DELETE FROM memory_items WHERE id = ?", (entry.id,))
-                    self._delete_fts_rows(conn, [entry.id])
-                else:
-                    affected_categories.update(self._write_entry_row(conn, entry))
-        self._sync_after_mutation(affected_categories)
+            conn.execute(
+                """
+                UPDATE memory_items
+                SET importance = importance * ?,
+                    updated_at = ?
+                WHERE status NOT IN ('archived', 'superseded')
+                """,
+                (factor, now),
+            )
+            pruned = [
+                row["id"]
+                for row in conn.execute(
+                    """
+                    SELECT id FROM memory_items
+                    WHERE status NOT IN ('archived', 'superseded')
+                      AND importance < ?
+                    """,
+                    (shared.MIN_IMPORTANCE,),
+                ).fetchall()
+            ]
+            if pruned:
+                self._delete_fts_rows(conn, pruned)
+                conn.execute(
+                    f"DELETE FROM memory_items WHERE id IN ({','.join('?' for _ in pruned)})",
+                    pruned,
+                )
+        self._category_stats_cache = None
 
     def apply_retention(self) -> None:
         """Apply locus-aware retention: decay episodes in-database, leave others untouched.

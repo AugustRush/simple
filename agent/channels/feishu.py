@@ -745,9 +745,14 @@ class FeishuOutputSink(OutputSink):
     async def drain(self) -> None:
         """Await all pending send tasks before the handler returns."""
         while self._pending:
-            pending = list(self._pending)
+            n = len(self._pending)
+            pending = self._pending[:n]
             await asyncio.gather(*pending, return_exceptions=True)
-            self._pending.clear()
+            # Remove only the tasks just awaited, preserving any task _schedule
+            # appended while the gather was awaiting.  A blanket clear() here
+            # dropped those late sends: drain() returned while they were still
+            # in flight and the tasks became untracked.
+            del self._pending[:n]
         if self._send_tail is not None and self._send_tail.done():
             self._send_tail = None
 
@@ -2199,7 +2204,6 @@ class FeishuChannel(Channel):
         assert self._client is not None, "FeishuChannel.start() not called"
         safe_name = self._safe_resource_filename(filename, resource_key)
         output_dir = self._input_dir / message_id
-        output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / safe_name
 
         def _download_types() -> list[str]:
@@ -2247,12 +2251,19 @@ class FeishuChannel(Channel):
                 )
             return None
 
+        def _download_and_write() -> Optional[Path]:
+            # mkdir + write_bytes are disk I/O; run them off the event loop
+            # alongside the (already off-loaded) SDK download.  A 30 MB
+            # attachment write must not stall every other session's stream.
+            output_dir.mkdir(parents=True, exist_ok=True)
+            data = _download_sync()
+            if not data:
+                return None
+            path.write_bytes(data)
+            return path
+
         loop = asyncio.get_running_loop()
-        data = await loop.run_in_executor(None, _download_sync)
-        if not data:
-            return None
-        path.write_bytes(data)
-        return path
+        return await loop.run_in_executor(None, _download_and_write)
 
     # ── WebSocket event handlers ──────────────────────────────────────────────
 
