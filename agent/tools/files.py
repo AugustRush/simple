@@ -298,6 +298,13 @@ def _validate_relative_path(
         raise _invalid("path cannot be empty")
     if "\x00" in rel_path:
         raise _invalid("path cannot contain NUL bytes")
+    if "\\" in rel_path:
+        # Backslash is a path separator on Windows but a literal character on
+        # POSIX.  The whole path model here uses '/' as the separator, so a
+        # backslash is either a Windows-style traversal attempt (``..\\..``)
+        # or a filename we never intend to address; rejecting it keeps the
+        # component checks below from being bypassed cross-platform.
+        raise _invalid("path cannot contain '\\' (use '/' as the separator)")
     if os.path.isabs(rel_path):
         raise _invalid("path must be relative to the selected root")
     parts = rel_path.split("/")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -501,7 +502,11 @@ class EvolutionEngine:
                 description
             )
             if user_tools.validate_tool_id(tool_id) is not None:
-                tool_id = f"generated_tool_{abs(hash(description)) % 10_000}"
+                # Stable across processes/runs: hash() is PYTHONHASHSEED-salted,
+                # so the same description would otherwise yield a different id
+                # on every restart.
+                digest = hashlib.sha256(description.encode("utf-8")).hexdigest()[:8]
+                tool_id = f"generated_tool_{digest}"
 
             # Declared dependencies install into ~/.agent/tools/_deps before the
             # probe runs, so "needs a package" is not reported as "broken tool".

@@ -282,6 +282,11 @@ class ToolRegistry:
             contextvars.ContextVar("tool_registry_context_override", default=None)
         )
         self.console = console
+        # Cache for to_anthropic_format(), invalidated by _prompt_generation.
+        # The tool list is rebuilt once per registration change rather than on
+        # every tool-loop iteration; register()/unregister_*() bump the counter.
+        self._anthropic_tools_cache: Optional[list[dict]] = None
+        self._anthropic_tools_generation: int = -1
 
     def register(
         self,
@@ -339,14 +344,20 @@ class ToolRegistry:
         return decorator
 
     def to_anthropic_format(self) -> list[dict]:
-        return [
-            {
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.parameters,
-            }
-            for t in self._tools.values()
-        ]
+        if (
+            self._anthropic_tools_cache is None
+            or self._anthropic_tools_generation != self._prompt_generation
+        ):
+            self._anthropic_tools_cache = [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                }
+                for t in self._tools.values()
+            ]
+            self._anthropic_tools_generation = self._prompt_generation
+        return self._anthropic_tools_cache
 
     @staticmethod
     def _error_payload(tool_name: str, message: str) -> str:

@@ -469,6 +469,15 @@ def _macos_seatbelt_profile(request: ShellSandboxRequest) -> str:
         lines.append(
             f'(deny file-write* (subpath "{_seatbelt_literal(candidate)}"))'
         )
+    # Reopen the whole workspace when the policy grants it.  This MUST come
+    # after the protected-data denies above: a workspace under ~/Desktop or
+    # ~/Documents would otherwise have its write grant silently shadowed by
+    # the last-match-wins deny for those home subdirectories, so the same
+    # `workspace.write=true` flag worked for some workspaces and not others.
+    if request.workspace_write:
+        lines.append(
+            f'(allow file-write* (subpath "{_seatbelt_literal(workspace)}"))'
+        )
     # Approved write_scope entries reopen paths after their denies.
     for scope in request.write_scope:
         if scope == "*":

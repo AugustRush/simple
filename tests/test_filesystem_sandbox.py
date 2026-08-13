@@ -88,6 +88,36 @@ def test_profile_reopens_scoped_workspace_writes_after_deny(tmp_path):
     )
 
 
+def test_profile_workspace_write_survives_protected_dir_shadowing(tmp_path):
+    """workspace.write=true must reopen the workspace AFTER the protected-data
+    denies, or a workspace under ~/Desktop/~Documents is silently made
+    read-only while the same flag opens writes elsewhere."""
+    home = tmp_path / "home"
+    workspace = home / "Desktop" / "ws"
+    request = ShellSandboxRequest(
+        workspace_root=workspace,
+        output_root=tmp_path / "output",
+        workspace_read=True,
+        workspace_write=True,
+        write_scope=(),
+        scratch_dir=tmp_path / "output" / "sandbox" / "tmp",
+        mode="read_all",
+        home_dir=home,
+    )
+    profile = _macos_seatbelt_profile(request)
+
+    deny_desktop = (
+        f'(deny file-write* (subpath "'
+        f'{home.resolve(strict=False) / "Desktop"}"))'
+    )
+    allow_workspace = (
+        f'(allow file-write* (subpath "{workspace.resolve(strict=False)}"))'
+    )
+    assert deny_desktop in profile
+    assert allow_workspace in profile
+    assert profile.index(allow_workspace) > profile.index(deny_desktop)
+
+
 def test_profile_denies_internal_bookkeeping(tmp_path):
     request = _request(tmp_path)
     profile = _macos_seatbelt_profile(request)

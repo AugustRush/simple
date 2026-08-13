@@ -69,6 +69,59 @@ _SHELL_CONFIRMATION_GUIDANCE = (
     "route around the shell tool."
 )
 
+#: Cap on combined shell stdout+stderr buffered per call.  A runaway command
+#: (``cat /dev/urandom | base64``) must not OOM the agent long before its
+#: timeout; excess bytes are drained and discarded so the child never blocks
+#: on a full pipe, while the timeout still governs truly runaway commands.
+_SHELL_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
+_SHELL_READ_CHUNK = 64 * 1024
+
+
+async def _communicate_bounded(
+    proc: "asyncio.subprocess.Process",
+    *,
+    max_bytes: int,
+) -> tuple[bytes, bytes, bool]:
+    """Read a subprocess' stdout/stderr concurrently, buffering at most
+    *max_bytes* each and discarding the rest.
+
+    Draining (rather than stopping) keeps the child from blocking on a full
+    pipe, so the caller's timeout still governs runaway commands while memory
+    stays bounded.  Returns ``(stdout, stderr, truncated)``.
+    """
+    # Real asyncio subprocesses expose StreamReader streams; test doubles and
+    # exotic wrappers may only implement communicate().  Fall back there — the
+    # bounded path is a hardening, not a protocol requirement, and only real
+    # children can genuinely overflow.
+    if not hasattr(proc, "stdout") or not hasattr(proc, "stderr"):
+        stdout, stderr = await proc.communicate()
+        return stdout, stderr, False
+
+    async def _pump(stream: "asyncio.StreamReader | None") -> tuple[bytes, bool]:
+        if stream is None:
+            return b"", False
+        chunks: list[bytes] = []
+        buffered = 0
+        total = 0
+        while True:
+            chunk = await stream.read(_SHELL_READ_CHUNK)
+            if not chunk:
+                break
+            total += len(chunk)
+            room = max_bytes - buffered
+            if room > 0:
+                keep = chunk[:room]
+                chunks.append(keep)
+                buffered += len(keep)
+        return b"".join(chunks), total > max_bytes
+
+    (stdout, out_truncated), (stderr, err_truncated) = await asyncio.gather(
+        _pump(proc.stdout), _pump(proc.stderr)
+    )
+    await proc.wait()
+    return stdout, stderr, out_truncated or err_truncated
+
+
 
 def _looks_like_plugin(dir_path: Path) -> bool:
     """Return True if *dir_path* contains at least one recognisable plugin marker."""
@@ -2228,8 +2281,9 @@ class BuiltinTools:
 
             heartbeat_task = asyncio.create_task(_heartbeat())
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=timeout
+                stdout, stderr, output_truncated = await asyncio.wait_for(
+                    _communicate_bounded(proc, max_bytes=_SHELL_OUTPUT_MAX_BYTES),
+                    timeout=timeout,
                 )
             finally:
                 _deregister_proc()
@@ -2246,6 +2300,12 @@ class BuiltinTools:
             if err:
                 result += f"STDERR:\n{err}"
             result += f"\nExit code: {proc.returncode}"
+            if output_truncated:
+                result += (
+                    f"\n[output truncated: exceeded {_SHELL_OUTPUT_MAX_BYTES} "
+                    "bytes; redirect to a file or use a more specific command "
+                    "to inspect the rest]"
+                )
             # When a command fails *because the sandbox refused it*, say which
             # narrow knob matches. The reason a user turns the sandbox off
             # wholesale is almost never that they wanted no boundary — it is

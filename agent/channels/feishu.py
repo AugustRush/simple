@@ -2038,8 +2038,10 @@ class FeishuChannel(Channel):
                         "%s Feishu message handler(s) ignored cancellation",
                         len(still_pending),
                     )
-        # Drain all active sinks so in-flight messages are delivered
-        for sink in self._active_sinks:
+        # Drain all active sinks so in-flight messages are delivered.
+        # Snapshot the list: a settling _on_message removes its own sink from
+        # _active_sinks, and iterating a mutating list across an await raises.
+        for sink in list(self._active_sinks):
             try:
                 await asyncio.wait_for(sink.drain(), timeout=5.0)
             except Exception:
@@ -2464,6 +2466,13 @@ class FeishuChannel(Channel):
                     self._release_message(message_id)
                 else:
                     self._settle_message(message_id)
+            # The turn has settled and the handler drained the sink, so drop it
+            # from _active_sinks.  Without this a long-running gateway retains
+            # one sink (with its buffers, task refs, and attachment receipts)
+            # per message ever received — an unbounded leak.
+            if sink is not None:
+                with contextlib.suppress(ValueError):
+                    self._active_sinks.remove(sink)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

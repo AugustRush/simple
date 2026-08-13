@@ -495,16 +495,29 @@ class OpenAITransport(ModelTransport):
 
     @classmethod
     def _sanitize_messages(cls, messages: list[dict]) -> list[dict]:
-        sanitized = copy.deepcopy(messages)
-        for message in sanitized:
+        # Shallow-copy the list and copy only the assistant messages whose
+        # tool_calls need normalising.  deepcopy(messages) copied the entire
+        # history — tool results, image base64, everything — on every OpenAI
+        # create/stream call; _sanitize_tool_call already deep-copies each
+        # individual tool_call, so the surrounding message only needs a
+        # shallow dict copy before its tool_calls field is replaced.
+        sanitized: list[dict] = []
+        for message in messages:
             if not isinstance(message, dict):
+                sanitized.append(message)
                 continue
             if message.get("role") != "assistant":
+                sanitized.append(message)
                 continue
             tool_calls = message.get("tool_calls")
             if not isinstance(tool_calls, list):
+                sanitized.append(message)
                 continue
-            message["tool_calls"] = [cls._sanitize_tool_call(tc) for tc in tool_calls]
+            copied = dict(message)
+            copied["tool_calls"] = [
+                cls._sanitize_tool_call(tc) for tc in tool_calls
+            ]
+            sanitized.append(copied)
         return sanitized
 
     # ── Provider-extras handling (model_extra fields the API echoes back) ──

@@ -89,13 +89,13 @@ async def _execute_regular_tool_calls(
     """
     results: list[str] = [""] * len(regular_calls)
     if any(tu.get("name") == "shell" for _idx, tu in regular_calls):
-        for (idx, tu) in regular_calls:
+        for position, (_idx, tu) in enumerate(regular_calls):
             try:
-                results[idx] = await executor.run(tu)
+                results[position] = await executor.run(tu)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                results[idx] = json.dumps(
+                results[position] = json.dumps(
                     {"ok": False, "error": f"tool '{tu['name']}' raised: {exc}"}
                 )
         return results
@@ -103,17 +103,18 @@ async def _execute_regular_tool_calls(
         *[executor.run(tu) for _idx, tu in regular_calls],
         return_exceptions=True,
     )
-    for (idx, _tu), outcome in zip(regular_calls, raw):
+    for position, (_idx, _tu) in enumerate(regular_calls):
+        outcome = raw[position]
         if isinstance(outcome, asyncio.CancelledError):
             raise outcome
         if isinstance(outcome, Exception):
-            results[idx] = json.dumps(
+            results[position] = json.dumps(
                 {"ok": False, "error": f"tool '{_tu['name']}' raised: {outcome}"}
             )
         elif isinstance(outcome, BaseException):
             raise outcome
         else:
-            results[idx] = outcome
+            results[position] = outcome
     return results
 
 

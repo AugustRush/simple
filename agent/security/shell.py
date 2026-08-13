@@ -619,7 +619,12 @@ def _resolve_effective_command(tokens: list[str]) -> Optional[str]:
 
 def _parse_shell_tokens(command: str) -> list[str]:
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        # Include the backtick in the punctuation set so command substitution
+        # via backticks (``echo `id```) is tokenized as a standalone operator
+        # and caught by _find_shell_operator.  shlex's default punctuation
+        # ("();<>|&") leaves backticks glued to the surrounding word, so a
+        # backtick pair never matched the lone "`" in HIGH_RISK_SHELL_OPERATORS.
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&`")
         lexer.whitespace_split = True
         return list(lexer)
     except ValueError as exc:
@@ -643,6 +648,8 @@ def _find_shell_operator(command: str) -> Optional[str]:
             return token
     if "$(" in command:
         return "$("
+    if "`" in command:
+        return "`"
     return None
 
 
@@ -896,8 +903,10 @@ def _command_is_pre_approved(
 
     An entry containing a space matches the exact normalized command; a bare
     entry (no space) matches any invocation of that command name, e.g.
-    ``osascript`` allows every osascript call.  High-risk commands are never
-    affected — they are blocked before this check runs.
+    ``osascript`` allows every osascript call.  Pre-approval exempts the
+    command from confirmation — including high-risk commands — but never
+    overrides the user blacklist or the structural guards (command
+    substitution, inline ``cd``), which the caller checks first.
     """
     for raw_entry in pre_approved or ():
         entry = _normalize_command(raw_entry)
@@ -990,7 +999,22 @@ def shell_command_check(
             reason=operator_guard[1],
         )
 
-    # ── Check session allowlist first ────────────────────────────────────
+    if not argv0:
+        return ShellCheckResult(
+            allowed=True, risk_level="low", reason="empty command"
+        )
+
+    # ── User-configured blacklist: unconditional at every level ──────────
+    # Checked before the session allowlist so a command the human confirmed
+    # earlier in the session cannot bypass a blacklist entry added since.
+    if argv0 in extra:
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason=f"command '{argv0}' is blocked by configuration",
+        )
+
+    # ── Check session allowlist ──────────────────────────────────────────
     if shell_session_allowlist_contains(
         normalized_command,
         scope=authorization_scope,
@@ -1000,19 +1024,6 @@ def shell_command_check(
             allowed=True,
             risk_level="low",
             reason="command was confirmed for this session",
-        )
-
-    if not argv0:
-        return ShellCheckResult(
-            allowed=True, risk_level="low", reason="empty command"
-        )
-
-    # ── User-configured blacklist: unconditional at every level ──────────
-    if argv0 in extra:
-        return ShellCheckResult(
-            allowed=False,
-            risk_level="high",
-            reason=f"command '{argv0}' is blocked by configuration",
         )
 
     # ── Explicit allowlist entries bypass confirmation ───────────────────
