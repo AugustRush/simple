@@ -393,18 +393,24 @@ class ConsolidationEngine:
                 if normalized_category not in shared.PALACE_LOCI:
                     entity = entity or normalized_category
                     normalized_category = "concepts"
+                # Clamp model-specified scores to the documented [0, 1] range:
+                # a hallucinated 999 would otherwise pin the entry at the top
+                # of retention ordering forever, and a negative value would
+                # never survive a single decay pass.
+                importance = min(1.0, max(0.0, float(data.get("importance", 0.5))))
+                confidence = min(1.0, max(0.0, float(data.get("confidence", 1.0))))
                 entries.append(
                     LTMEntry(
                         id=_new_id(),
                         content=content,
-                        importance=float(data.get("importance", 0.5)),
+                        importance=importance,
                         category=normalized_category,
                         created_at=_now(),
                         updated_at=_now(),
                         entity=entity,
                         memory_type=memory_type,
                         source_session=str(data.get("source_session", "")).strip(),
-                        confidence=float(data.get("confidence", 1.0)),
+                        confidence=confidence,
                     )
                 )
             except Exception:

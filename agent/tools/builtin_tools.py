@@ -1728,13 +1728,17 @@ class BuiltinTools:
             raw_bytes = await asyncio.to_thread(self._make_urllib_request, url)
             # Decode – UTF-8 with replacement (never raises)
             raw_text = raw_bytes.decode("utf-8", errors="replace")
+            # The network layer caps the body at WEB_FETCH_MAX_BYTES and does
+            # not signal the cut, so a page that fills the cap must be reported
+            # as truncated even when the char limit below would not have.
+            truncated_network = len(raw_bytes) >= WEB_FETCH_MAX_BYTES
 
             if raw_html:
                 body = raw_text[:max_chars]
-                truncated = len(raw_text) > max_chars
+                truncated = truncated_network or len(raw_text) > max_chars
             else:
                 body = self._strip_html(raw_text)
-                truncated = len(body) > max_chars
+                truncated = truncated_network or len(body) > max_chars
                 body = body[:max_chars]
 
             return self._ok(

@@ -992,6 +992,17 @@ def shell_command_check(
         argv0 = _resolve_effective_command(tokens)
 
     # ── Structural guards: never confirmable ─────────────────────────────
+    # Inline cwd changes violate the tool contract (the cwd belongs to the
+    # tool's own cwd parameter, not to the command string).  Check argv0 here
+    # so a bare ``cd /tmp`` or a newline-separated ``cd /etc\ncat passwd``
+    # (neither of which contains a shell operator) is still blocked; the
+    # operator guard below only fires when an operator exists.
+    if argv0 in CWD_ESCAPE_COMMANDS:
+        return ShellCheckResult(
+            allowed=False,
+            risk_level="high",
+            reason="inline cwd changes are blocked; use the shell tool cwd parameter",
+        )
     if operator_guard is not None and operator_guard[0] == "blocked":
         return ShellCheckResult(
             allowed=False,

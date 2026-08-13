@@ -119,6 +119,10 @@ class SchedulerService:
 
     async def _renew_lease(self, task, run, lost_ownership: asyncio.Event, now) -> None:
         interval = self.lease_seconds / 3
+        # Three consecutive failures span ~one full lease period (interval is
+        # lease_seconds/3), by which point the lease has genuinely expired even
+        # if the store was only transiently unavailable.
+        consecutive_failures = 0
         while True:
             await asyncio.sleep(interval)
             try:
@@ -129,8 +133,20 @@ class SchedulerService:
                     now=now(),
                     lease_seconds=self.lease_seconds,
                 )
-            except Exception:
-                renewed = False
+            except Exception as exc:
+                # A transient store error is not "lost ownership" — retrying on
+                # the next tick must not interrupt a job whose lease is intact.
+                consecutive_failures += 1
+                logger.warning(
+                    "lease renewal failed (attempt %d): %s",
+                    consecutive_failures,
+                    exc,
+                )
+                if consecutive_failures >= 3:
+                    lost_ownership.set()
+                    return
+                continue
+            consecutive_failures = 0
             if not renewed:
                 lost_ownership.set()
                 return

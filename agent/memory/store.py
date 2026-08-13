@@ -1727,30 +1727,52 @@ class LTMStore:
     ) -> LTMEntry:
         category = self.normalize_category_name(category)
         entity = self._normalize_entity(entity, category)
-        existing = self.read_manual_note(category, entity)
-        if existing:
-            existing.content = (
-                f"{existing.content.rstrip()}\n{content.strip()}" if append else content
-            ).strip()
-            existing.updated_at = _now()
-            entry = existing
-        else:
-            entry = LTMEntry(
-                id=_new_id(),
-                content=content.strip(),
-                importance=0.8,
-                category=category,
-                entity=entity,
-                memory_type="note",
-                scope="global",
-                status="active",
-                source_session="manual_memory_write",
-                confidence=1.0,
-                created_at=_now(),
-                updated_at=_now(),
-            )
+        clean_content = str(content or "").strip()
         with self._connect() as conn:
-            affected_categories = self._write_entry_row(conn, entry)
+            # Read-modify-write under one transaction: a concurrent append
+            # must not read the same base note and overwrite the other
+            # writer's update (lost update).
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    """
+                    SELECT * FROM memory_items
+                    WHERE category = ? AND entity = ? AND memory_type = 'note'
+                      AND status NOT IN ('archived', 'superseded')
+                    ORDER BY updated_at DESC, id ASC
+                    LIMIT 1
+                    """,
+                    (category, entity),
+                ).fetchone()
+                if row:
+                    entry = self._row_to_entry(row)
+                    entry.content = (
+                        f"{entry.content.rstrip()}\n{clean_content}"
+                        if append
+                        else clean_content
+                    ).strip()
+                    entry.updated_at = _now()
+                else:
+                    entry = LTMEntry(
+                        id=_new_id(),
+                        content=clean_content,
+                        importance=0.8,
+                        category=category,
+                        entity=entity,
+                        memory_type="note",
+                        scope="global",
+                        status="active",
+                        source_session="manual_memory_write",
+                        confidence=1.0,
+                        created_at=_now(),
+                        updated_at=_now(),
+                    )
+                affected_categories = self._write_entry_row(conn, entry)
+            except BaseException:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
         self._sync_after_mutation(affected_categories)
         # A hand-written identity note is the most deliberate statement of
         # identity there is.  Skipping fact derivation here left it invisible
