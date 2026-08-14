@@ -1197,4 +1197,11 @@ uv run pytest tests/test_scheduler.py -q
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-Latest verification: `uv run pytest -q` → `1756 passed, 1 skipped`
+`tests/test_sandbox_conformance.py` is the portability judge for the sandbox:
+it spawns real sandboxed children and asks the OS what they are actually
+permitted to do, so its assertions hold for any backend. A new backend earns
+its place by turning that file green on its platform with no assertion edited.
+`tests/test_filesystem_sandbox.py` keeps what is genuinely seatbelt-specific —
+the generated `.sb` text and its cache key.
+
+Latest verification: `uv run pytest -q` → `1757 passed, 1 skipped`
