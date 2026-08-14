@@ -1197,11 +1197,11 @@ uv run pytest tests/test_scheduler.py -q
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-`tests/test_sandbox_conformance.py` is the portability judge for the sandbox:
-it spawns real sandboxed children and asks the OS what they are actually
-permitted to do, so its assertions hold for any backend. A new backend earns
-its place by turning that file green on its platform with no assertion edited.
-`tests/test_filesystem_sandbox.py` keeps what is genuinely seatbelt-specific —
-the generated `.sb` text and its cache key.
+`tests/test_sandbox_conformance.py` spawns real sandboxed children and asks the
+OS what they are actually permitted to do, rather than reading the generated
+profile. It skips only when the host has no enforcing sandbox at all — so if
+macOS detection ever breaks, those tests fail instead of quietly skipping while
+nothing is enforced. `tests/test_filesystem_sandbox.py` keeps what is genuinely
+seatbelt-specific: the generated `.sb` text and its cache key.
 
 Latest verification: `uv run pytest -q` → `1757 passed, 1 skipped`

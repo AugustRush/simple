@@ -5,33 +5,38 @@ The dispatch below is the only place that knows more than one exists, and it
 fails closed — a sandboxed mode on a host with no enforcing backend raises
 rather than silently running the command unsandboxed.
 
-What a second backend is up against
------------------------------------
-``tests/test_sandbox_conformance.py`` is the acceptance test: it spawns real
-sandboxed children and asks the OS what they may do, so a backend earns its
-place by turning that file green with no assertion edited.
+Why there is only one backend
+-----------------------------
+macOS is the only platform this project supports, and Linux support was
+considered and declined rather than left undone.  Recorded here because the
+reasoning is not obvious from the code, and "just add a Landlock backend"
+looks easy until you try it.
 
-The obstacle is not the seam — it is the write policy the assertions encode.
-Both sandboxed modes resolve to ``write_everywhere=True`` followed by several
-dozen nested write denials; ``mode`` selects the *read* posture only
-(``restricted`` differs from ``read_all`` in ``read_everywhere``, nothing
-else).  Linux Landlock is a purely additive allowlist with no deny rule, and a
-nested path may not carry fewer rights than its parent, so "open writes, then
-carve out secrets / later-executed code / user data" is inexpressible there —
-in *both* modes, not just ``read_all``.
+The obstacle is not this seam — it is the write policy.  Both sandboxed modes
+resolve to ``write_everywhere=True`` followed by several dozen nested write
+denials; ``mode`` selects the *read* posture only (``restricted`` differs from
+``read_all`` in ``read_everywhere``, nothing else).  Linux Landlock is a purely
+additive allowlist with no deny rule, and a nested path may not carry fewer
+rights than its parent, so "open writes, then carve out secrets /
+later-executed code / user data" is inexpressible there — in *both* modes.
 
-A Landlock backend therefore cannot be a transcription; it has to choose:
+A Landlock backend could therefore not transcribe the policy.  It would have
+to pick one of:
 
 * Grant only workspace, output and scratch.  Expressible and safe, but it
   breaks the npm/pip/uv/HuggingFace cache writes that the inverted policy
-  exists to permit — and it fails the conformance assertions that check a
+  exists to permit, and it fails the conformance assertions that check a
   sandboxed child *can* write ordinary paths.
 * Enumerate the non-secret entries under home at build time and grant those.
   A point-in-time snapshot: a secret directory created later is missed.  That
   is an open-ended failure, contrary to this module's fail-closed posture.
 
-Neither is a refactor.  Picking one is a security decision about what Linux
-users get, and it belongs to whoever makes that call — not to the seam.
+Worth knowing if that decision is ever revisited: fail-closed is not free on
+an unsupported platform.  ``build_sandbox_command`` raises there, and both
+callers turn that into a refusal — so the shell tool and every user tool stop
+working, and the only configuration that runs at all is ``sandbox none`` at
+permission level ``full``.  Declining to support a platform pushes anyone on
+it toward zero protection, not toward less.
 """
 
 from __future__ import annotations

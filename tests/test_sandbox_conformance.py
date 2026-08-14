@@ -1,20 +1,24 @@
-"""Backend conformance: the same rights assertions, whatever enforces them.
+"""What the OS actually permits a sandboxed child to do.
 
 These tests do not read a profile or inspect a rule table.  They spawn a real
-sandboxed child and ask the operating system what it will actually let that
-child do.  That makes them the only assertions in the suite that survive a
-change of backend — and therefore the real test of whether the backend seam
-holds.  A second backend earns its place by turning this file green on its
-platform, with no assertion edited.
+sandboxed child and ask the operating system what it will let that child do.
+Everything here is therefore an assertion about the *policy* — which paths are
+readable and writable — with no opinion on how that policy is enforced.
 
-The skip below is deliberately phrased against *any* backend rather than
-against seatbelt by name.  On a host with no enforcing sandbox these skip
-rather than fail, because `build_sandbox_command` fails closed there and
-there is no enforcement to conform to.
+The point of keeping them apart from the seatbelt tests is the skip condition.
+These skip on `BACKEND is None`, not on "the backend is not seatbelt", so the
+only way this file goes quiet is a host with no enforcing sandbox at all.  That
+matters because the failure mode it guards is silent: if `detect_sandbox_support`
+ever stops recognising macOS, a by-name skip would turn twenty enforcement tests
+green while nothing was being enforced.  `test_a_backend_is_named_...` below
+fails loudly in exactly that case.
+
+The seam these assertions would also validate — a second backend passing them
+unedited — is currently theoretical: this project runs on macOS only, and
+`backends/__init__.py` records why Linux is deliberately not supported.
 
 Seatbelt-specific tests — profile text, the `.sb` cache key — stay in
-`test_filesystem_sandbox.py`.  They assert *how* macOS is told, which is
-exactly what another backend is free to do differently.
+`test_filesystem_sandbox.py`.  They assert *how* macOS is told.
 """
 
 import os
@@ -452,4 +456,3 @@ def test_sandbox_denies_agent_home_but_reopens_output(tmp_path):
     assert "sk-secret" not in result.stdout
     assert "OUT=0" in result.stdout
     assert (output / "artifact.txt").exists()
-
