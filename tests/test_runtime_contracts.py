@@ -717,7 +717,7 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
     assert sink.drained == 2
     assert state.turn_count == 2
     assert execution.result.text == "reply:follow up"
-    assert execution.iterations == 2
+    assert execution.continuation_rounds == 2
     assert turn_runner.completion_ids == [
         "msg-1:completion:1",
         "msg-1:completion:2",
@@ -915,7 +915,7 @@ def test_agent_core_returns_blocked_execution_with_reason_without_running_turn()
 
     assert execution.blocked
     assert execution.block_reason == "policy"
-    assert execution.iterations == 0
+    assert execution.continuation_rounds == 0
     assert execution.result.text == ""
     assert [event.name for event in execution.events] == ["prompt_blocked"]
     assert execution.events[0].session_id == "session-1"

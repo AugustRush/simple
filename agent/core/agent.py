@@ -19,7 +19,7 @@ import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt
 from agent.core.attachments import MessageAttachment, format_attachment_context
-from agent.core.output import CliOutputSink, _active_sink
+from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
 from agent.memory.system import ContextLimitError, ContextManager, LTMEntry
 from agent.orchestration.runtime import (
     RendezvousDirective,
@@ -73,6 +73,18 @@ def _preview_text(text: object, limit: int = 80) -> str:
 
 def _interaction_log(event: str, **fields: object) -> None:
     shared._interaction_log("agent", event, **fields)
+
+
+def _emit_event(name: str, **fields: object) -> None:
+    """Record a runtime event when a turn collector is listening.
+
+    Observation must never be able to break the turn it observes, so a
+    missing collector is a no-op rather than an error.  Mirrors
+    ``ToolExecutor._emit`` and ``_emit_consolidation``.
+    """
+    collector = _active_event_collector.get()
+    if collector is not None:
+        collector.emit(name, **fields)
 
 
 async def _execute_regular_tool_calls(
@@ -1672,11 +1684,16 @@ class BaseAgent:
         # The last message(s) in ctx.messages are the tool_result entries,
         # preceded by the assistant tool_use message.
         messages_before = len(ctx.messages)
+        dropped_roles: list[str] = []
         if tool_uses:
             # The transport knows how many trailing tool-result messages it
             # appended for this batch; +1 for the preceding assistant turn.
             result_msg_count = self._transport.tool_result_rollback_count(len(tool_uses))
-            del ctx.messages[-(result_msg_count + 1):]
+            cut = result_msg_count + 1
+            dropped_roles = [
+                str(message.get("role", "?")) for message in ctx.messages[-cut:]
+            ]
+            del ctx.messages[-cut:]
 
         # Append a summarized user message instead
         if tool_uses and results:
@@ -1685,7 +1702,23 @@ class BaseAgent:
             logger.info(
                 "Content filter recovery: rolled back %d messages, "
                 "replaced with summarized tool results",
-                messages_before - len(ctx.messages) + 1,
+                len(dropped_roles),
+            )
+
+        if dropped_roles:
+            # This is the one path that rewrites context the model has already
+            # seen.  Without an event here the turn's event stream and
+            # ctx.messages disagree, and "never retrieved" becomes
+            # indistinguishable from "retrieved, then rolled back".
+            _emit_event(
+                "context_rolled_back",
+                reason="content_filter",
+                messages_before=messages_before,
+                messages_after=len(ctx.messages),
+                messages_dropped=len(dropped_roles),
+                dropped_roles=",".join(dropped_roles),
+                tool_names=",".join(tu["name"] for tu in (tool_uses or [])),
+                replaced_with="summary" if (tool_uses and results) else "nothing",
             )
 
         # Retry once with the cleaned messages
@@ -2499,7 +2532,7 @@ class BaseAgent:
         turn_started_at = time.perf_counter()
         trace_status = "ok"
         trace_error: str | None = None
-        trace_iterations = 0
+        steps = 0
         _interaction_log(
             "turn_started",
             agent_id=ctx.agent_id,
@@ -2551,15 +2584,18 @@ class BaseAgent:
         try:
             orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
 
-            # D1: bounded tool-call loop — prevents infinite model loops
-            max_tool_call_iterations = max(1, int(self.max_tool_call_iterations))
-            _iteration = 0
+            # D1: bounded step loop — prevents infinite model loops.
+            # Vocabulary: a *step* is one model request plus the tools that
+            # request calls.  A *turn* is the processing of one user input and
+            # spans one or more steps; continuation rounds are counted
+            # separately by the runtime layer (TurnExecution.continuation_rounds).
+            max_steps = max(1, int(self.max_tool_call_iterations))
+            _step_index = 0
             while True:
-                trace_iterations = _iteration + 1
-                if _iteration == max_tool_call_iterations:
+                if _step_index == max_steps:
                     trace_status = "tool_loop_exceeded"
                     trace_error = (
-                        f"Tool-call loop exceeded {max_tool_call_iterations} "
+                        f"Tool-call loop exceeded {max_steps} "
                         "iterations; possible model loop detected."
                     )
                     return AgentResult(
@@ -2568,22 +2604,24 @@ class BaseAgent:
                         tool_calls_made=tool_calls_made,
                         error=trace_error,
                     )
+                steps = _step_index + 1
                 tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
 
                 # Drain the interjection mailbox: any user messages that
                 # arrived during the previous step get folded in as a
                 # <user_interjection> block so the next LLM call sees them
                 # alongside the original task.  Channel handler appends to
-                # this list; we drain in place so future iterations see
+                # this list; we drain in place so future steps see
                 # only fresh entries.  Sub-agents have no mailbox (key is
                 # absent), so this is a no-op for them.
                 pending = ctx.metadata.get("pending_messages")
                 if pending:
                     self._inject_pending_interjections(ctx, pending)
 
-                # Cooperative cancellation: check at every tool-loop boundary
-                # so the running turn can be interrupted cleanly without
-                # orphaning subprocesses or losing the turn record.
+                # Cooperative cancellation.  This is the step boundary that
+                # `/cancel graceful` promises to stop at: the check sits
+                # before the model request, so a cancelled turn never
+                # orphans a subprocess or loses its turn record.
                 cancel_token = ctx.metadata.get("cancel_token")
                 if cancel_token is not None and cancel_token.is_cancelled:
                     trace_status = "cancelled"
@@ -2595,6 +2633,9 @@ class BaseAgent:
                         error=trace_error,
                     )
 
+                _emit_event("step_started", step=steps)
+                step_tool_calls = 0
+                status_at_step_start = trace_status
                 try:
                     response_started_at = time.perf_counter()
                     heartbeat.operation("LLM", self._effective_model(ctx))
@@ -2677,7 +2718,7 @@ class BaseAgent:
                     _trace_latency(
                         "model_response_received",
                         agent_id=ctx.agent_id,
-                        iteration=_iteration + 1,
+                        step=_step_index + 1,
                         stop_reason=stop_reason,
                         tool_uses=len(tool_uses),
                         duration_ms=f"{(time.perf_counter() - response_started_at) * 1000:.1f}",
@@ -2686,7 +2727,7 @@ class BaseAgent:
                         _interaction_log(
                             "tool_batch_requested",
                             agent_id=ctx.agent_id,
-                            iteration=_iteration + 1,
+                            step=_step_index + 1,
                             stop_reason=stop_reason,
                             tool_uses=len(tool_uses),
                             tool_names=",".join(tu["name"] for tu in tool_uses[:5]),
@@ -2705,6 +2746,7 @@ class BaseAgent:
                             text or streamed_text or ""
                         )
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
+                        step_tool_calls = len(tool_uses)
                         tool_use_started_at = time.perf_counter()
                         tool_names = ", ".join(
                             tu["name"] for tu in tool_uses[:3]
@@ -2722,7 +2764,7 @@ class BaseAgent:
                         _trace_latency(
                             "tool_uses_finished",
                             agent_id=ctx.agent_id,
-                            iteration=_iteration + 1,
+                            step=_step_index + 1,
                             total_tool_uses=len(tool_uses),
                             spawn_calls=sum(
                                 1 for tool_use in tool_uses
@@ -2737,7 +2779,7 @@ class BaseAgent:
                         _interaction_log(
                             "tool_batch_finished",
                             agent_id=ctx.agent_id,
-                            iteration=_iteration + 1,
+                            step=_step_index + 1,
                             tool_uses=len(tool_uses),
                             duration_ms=f"{(time.perf_counter() - tool_use_started_at) * 1000:.1f}",
                         )
@@ -2771,7 +2813,7 @@ class BaseAgent:
                                 {"role": "user", "content": restart_message}
                             ]
                             filter_recovery.forget_submission()
-                            _iteration += 1
+                            _step_index += 1
                             continue
 
                         # Commit the provider protocol unit only after every tool
@@ -2801,7 +2843,7 @@ class BaseAgent:
                             _interaction_log(
                                 "tool_loop_watchdog_stopped",
                                 agent_id=ctx.agent_id,
-                                iteration=_iteration + 1,
+                                step=_step_index + 1,
                                 reason=stuck_reason,
                                 tool_uses=len(tool_uses),
                                 tool_names=",".join(
@@ -2814,7 +2856,7 @@ class BaseAgent:
                                 content=result_text,
                                 tool_calls_made=tool_calls_made,
                             )
-                        _iteration += 1
+                        _step_index += 1
                         continue
                     else:
                         result_text, continuation_error = await self._handle_end_turn(
@@ -2848,7 +2890,7 @@ class BaseAgent:
                             _interaction_log(
                                 "content_filter_recovered",
                                 agent_id=ctx.agent_id,
-                                iteration=_iteration + 1,
+                                step=_step_index + 1,
                             )
                             continue
                         # Recovery failed — let the error propagate
@@ -2873,6 +2915,22 @@ class BaseAgent:
                         tool_calls_made=tool_calls_made,
                         error=trace_error,
                     )
+                finally:
+                    # Every exit from a step passes here — `continue`, `break`,
+                    # `return` and exceptions alike — so `step_started` and
+                    # `step_ended` stay paired for any consumer counting them.
+                    # `trace_status` is turn-scoped and sticky, so report it
+                    # only when *this* step is what changed it.
+                    _emit_event(
+                        "step_ended",
+                        step=steps,
+                        tool_calls=step_tool_calls,
+                        status=(
+                            trace_status
+                            if trace_status != status_at_step_start
+                            else "ok"
+                        ),
+                    )
         finally:
             if orchestration_token is not None:
                 if trace_status in {"ok", "content_filter_recovered"}:
@@ -2892,7 +2950,7 @@ class BaseAgent:
                 agent_id=ctx.agent_id,
                 status=trace_status,
                 error=trace_error,
-                iterations=trace_iterations,
+                steps=steps,
                 tool_calls=len(tool_calls_made),
                 content_len=len(result_text),
                 content_preview=_preview_text(result_text),
@@ -2903,7 +2961,7 @@ class BaseAgent:
                 agent_id=ctx.agent_id,
                 status=trace_status,
                 error=trace_error,
-                iterations=trace_iterations,
+                steps=steps,
                 tool_calls=len(tool_calls_made),
                 duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
             )

@@ -1093,18 +1093,31 @@ AgentCore.handle_turn(TurnInput, RuntimeSessionState)
         ├── on_prompt_submit hooks (block / inject context)
         ├── skill parsing & hot-reload
         ├── TurnRunner.run() → BaseAgent.send_message()
+        │       ├── step loop: one model request + the tools it calls
         │       ├── LLM retry (3x exponential backoff on transient errors)
         │       ├── Tool execution (RegularToolExecutor)
         │       │       ├── Intent-before-action protocol
         │       │       └── Plugin pre/post hooks
         │       └── EventCollector (ContextVar-scoped)
         ├── complete_turn() → plugin hooks, staging, consolidation
-        └── TurnExecution { result, iterations, events: tuple[RuntimeEvent, ...] }
+        └── TurnExecution { result, continuation_rounds, events: tuple[RuntimeEvent, ...] }
 ```
+
+**Turn / step / continuation** name three different counts:
+
+| Term | Scope | Where counted |
+|---|---|---|
+| **step** | one model request plus the tools that request calls | `BaseAgent.send_message`, reported as `step_started` / `step_ended`; bounded by `max_steps` |
+| **continuation round** | one pass of the turn loop (round 1 is the initial completion) | `TurnExecution.continuation_rounds` |
+| **turn** | the whole processing of one user input | `TurnRunner.run()` |
 
 Key properties:
 - **Transport-neutral**: same turn boundary for CLI and Feishu
 - **Replayable event stream**: every tool call, hook, and lifecycle fact is a `RuntimeEvent`
+- **Context rewrites are logged**: the two paths that change what the model already
+  saw — compaction and content-filter rollback — emit `consolidation_compaction`
+  and `context_rolled_back` carrying the dropped roles and token estimate, so
+  "never retrieved" stays distinguishable from "retrieved, then dropped"
 - **Intent-before-action**: write/shell tools require the assistant to declare intent first
 - **LLM retry**: transient API errors (rate limits, 5xx) retried with exponential backoff
 
@@ -1183,4 +1196,4 @@ uv run pytest tests/test_scheduler.py -q
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-Latest verification: `uv run pytest -q` → `569 passed, 1 skipped`
+Latest verification: `uv run pytest -q` → `1716 passed, 1 skipped`

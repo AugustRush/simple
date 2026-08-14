@@ -681,9 +681,12 @@ class ContextManager:
             retained.remove(removable)
             compacted = materialize()
         kept_indexes = {item for unit in retained for item in unit}
-        dropped_now = dropped_before + sum(
-            1 for index in range(len(messages)) if index not in kept_indexes
-        )
+        dropped_messages = [
+            message
+            for index, message in enumerate(messages)
+            if index not in kept_indexes
+        ]
+        dropped_now = dropped_before + len(dropped_messages)
         if dropped_now:
             # Evicted turns remain reachable through staging and the durable
             # store, but the model cannot retrieve what it does not know is
@@ -694,13 +697,28 @@ class ContextManager:
             if self.consolidation.estimate_tokens([notice] + compacted) < budget:
                 compacted = [notice] + compacted
         if len(compacted) != len(messages):
+            # Counts alone say how much was lost but not what: a caller
+            # cannot tell a dropped tool batch from a dropped user request.
+            # The role sequence and token estimate make that judgeable.
             _emit_consolidation(
                 "compaction",
                 messages_before=len(messages),
                 messages_after=len(compacted),
                 messages_dropped=dropped_now,
+                dropped_roles=self._role_sequence(dropped_messages),
+                dropped_tokens=self.consolidation.estimate_tokens(dropped_messages)
+                if dropped_messages
+                else 0,
             )
         return compacted
+
+    @staticmethod
+    def _role_sequence(messages: list[dict], limit: int = 40) -> str:
+        """Comma-joined roles of *messages*, truncated to stay log-sized."""
+        roles = [str(message.get("role", "?")) for message in messages[:limit]]
+        if len(messages) > limit:
+            roles.append(f"+{len(messages) - limit}")
+        return ",".join(roles)
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
 

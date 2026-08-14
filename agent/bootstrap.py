@@ -362,8 +362,15 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         0,
         int(orch_cfg.get("max_agents_per_turn", 0)),
     )
+    # `max_steps` is the preferred spelling; `max_tool_call_iterations` stays
+    # accepted because it is a published config key and dropping it would
+    # break existing configs.  Both name the same bound: the number of steps
+    # (model request + its tools) allowed in one turn.
     agent.max_tool_call_iterations = _bounded_int(
-        cfg.get("max_tool_call_iterations", shared.MAX_TOOL_CALL_ITERATIONS),
+        cfg.get(
+            "max_steps",
+            cfg.get("max_tool_call_iterations", shared.MAX_TOOL_CALL_ITERATIONS),
+        ),
         default=shared.MAX_TOOL_CALL_ITERATIONS,
         min_value=1,
         max_value=shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,

@@ -86,8 +86,10 @@ DEFAULT_CONFIG: dict = {
         "turn_hook_timeout_seconds": shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
     },
     # ── Runtime guardrails ────────────────────────────────────────────────
-    # Maximum model/tool exchange rounds in one turn before treating it as a loop.
-    "max_tool_call_iterations": shared.MAX_TOOL_CALL_ITERATIONS,
+    # Maximum steps (model request + the tools it calls) in one turn before
+    # treating it as a loop.  "max_steps" is the preferred spelling;
+    # "max_tool_call_iterations" remains accepted for existing configs.
+    "max_steps": shared.MAX_TOOL_CALL_ITERATIONS,
     # Bounded follow-up calls used to finish a response stopped by the output cap.
     "max_truncation_continuations": shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
     # ── MCP servers ───────────────────────────────────────────────────────
@@ -277,6 +279,7 @@ def _validate_config(cfg: dict) -> list[str]:
         "shell_allowed_commands",
         "permissions",
         "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
+        "max_steps",
         "max_truncation_continuations", "file_access",
     })
 
@@ -375,6 +378,11 @@ def _validate_config(cfg: dict) -> list[str]:
     _check_int("max_tokens", 1, 2_000_000)
     _check_int(
         "max_tool_call_iterations",
+        1,
+        shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
+    )
+    _check_int(
+        "max_steps",
         1,
         shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
     )

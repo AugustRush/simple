@@ -1119,7 +1119,7 @@ def test_channel_runner_logs_blocked_turn_without_response_delivery(caplog):
         async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
             return TurnExecution(
                 result=TurnResult(text=""),
-                iterations=0,
+                continuation_rounds=0,
                 blocked=True,
                 block_reason="policy",
                 events=(

@@ -317,7 +317,12 @@ class TurnExecution:
     """Result of an application-level turn loop."""
 
     result: TurnResult
-    iterations: int = 1
+    #: Rounds of the continuation loop that ran.  Round 1 is the initial
+    #: completion, so ``n`` rounds means ``n - 1`` continuations; ``0`` means
+    #: the turn was blocked before any completion.  Distinct from a *step*
+    #: (one model request plus the tools it calls), which BaseAgent counts
+    #: internally and reports via ``step_started`` / ``step_ended`` events.
+    continuation_rounds: int = 1
     blocked: bool = False
     block_reason: str = ""
     events: tuple[RuntimeEvent, ...] = ()
@@ -626,7 +631,7 @@ class AgentCore:
             collector.emit("prompt_blocked", reason=prompt)
             return TurnExecution(
                 result=TurnResult(text=""),
-                iterations=0,
+                continuation_rounds=0,
                 blocked=True,
                 block_reason=prompt,
                 events=self._drain_collector(prompted_input),
@@ -660,7 +665,7 @@ class AgentCore:
         try:
             final_result = TurnResult(text="")
             iteration_prompt = prompt
-            iterations = 0
+            continuation_rounds = 0
             cancelled_by_user = False
             completion_attempted = False
             # Publish the session cancel token so send_message() can check it
@@ -675,7 +680,7 @@ class AgentCore:
                 state.ctx.metadata["pending_messages"] = state.pending_messages
             try:
                 for iteration_index in range(max(1, int(max_continuations) + 1)):
-                    iterations = iteration_index + 1
+                    continuation_rounds = iteration_index + 1
                     completion_attempted = False
                     state.ensure_task_context(iteration_prompt)
                     self._refresh_component_prompt_if_needed(state)
@@ -795,7 +800,7 @@ class AgentCore:
                     await self._drain_if_supported(sink)
             return TurnExecution(
                 result=final_result,
-                iterations=iterations,
+                continuation_rounds=continuation_rounds,
                 events=self._drain_collector(
                     prompted_input  # canonical turn identity
                 ),
@@ -818,7 +823,7 @@ class AgentCore:
                     )
             return TurnExecution(
                 result=failed_result,
-                iterations=iterations,
+                continuation_rounds=continuation_rounds,
                 events=self._drain_collector(turn_input),
             )
         finally:

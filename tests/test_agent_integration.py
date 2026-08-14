@@ -9047,3 +9047,219 @@ def test_streaming_retries_when_nothing_was_streamed_yet(monkeypatch):
     assert shown == ["你好"]
     assert result.error is None
     assert result.content == "你好"
+
+
+# ── Step vocabulary and context-rewrite events (Phase A) ────────────────────
+
+
+def _collect_turn_events(run):
+    """Run *run* with a turn-scoped EventCollector bound, returning its events."""
+    from agent.core.output import EventCollector, _active_event_collector
+
+    collector = EventCollector()
+    token = _active_event_collector.set(collector)
+    try:
+        result = run()
+    finally:
+        _active_event_collector.reset(token)
+    return result, collector.drain()
+
+
+def _tool_call_response(agent_module, call_id, tool_name):
+    return agent_module._OAIResponse(
+        [
+            agent_module._OAIChoice(
+                "tool_calls",
+                agent_module._OAIMsg(
+                    "",
+                    [
+                        agent_module._OAITC(
+                            call_id, agent_module._OAIFunc(tool_name, "{}")
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+
+
+def test_send_message_emits_one_paired_step_per_model_request(monkeypatch):
+    """A turn with one tool call then a final answer is exactly two steps."""
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    responses = iter(
+        [
+            _tool_call_response(agent_module, "call-1", "noop"),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("done", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        return next(responses)
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        return [json.dumps({"ok": True}) for _ in tool_uses]
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+
+    result, events = _collect_turn_events(
+        lambda: asyncio.run(
+            agent.send_message(
+                agent_module.AgentContext(system_prompt="system"), "do it"
+            )
+        )
+    )
+
+    assert result.error is None
+    started = [event for event in events if event.name == "step_started"]
+    ended = [event for event in events if event.name == "step_ended"]
+    assert [event.fields["step"] for event in started] == [1, 2]
+    # Every started step ends, so a consumer can count in-flight steps.
+    assert [event.fields["step"] for event in ended] == [1, 2]
+    assert [event.fields["tool_calls"] for event in ended] == [1, 0]
+    assert {event.fields["status"] for event in ended} == {"ok"}
+
+
+def test_send_message_emits_step_ended_when_the_step_loop_is_exceeded(monkeypatch):
+    """The step that trips the bound is still reported, with the reason."""
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent.max_tool_call_iterations = 2
+
+    async def fake_create(ctx, tools):
+        return _tool_call_response(agent_module, "call", "noop")
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        return [json.dumps({"ok": True}) for _ in tool_uses]
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+
+    _, events = _collect_turn_events(
+        lambda: asyncio.run(
+            agent.send_message(
+                agent_module.AgentContext(system_prompt="system"), "do it"
+            )
+        )
+    )
+
+    # The bound is checked before the step begins, so two steps run and both
+    # are reported; the turn-level status carries the overrun.
+    assert [
+        event.fields["step"] for event in events if event.name == "step_started"
+    ] == [1, 2]
+    assert [
+        event.fields["step"] for event in events if event.name == "step_ended"
+    ] == [1, 2]
+
+
+def test_content_filter_rollback_emits_context_rolled_back(monkeypatch):
+    """Rewriting what the model already saw leaves a reconstructable trace."""
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent.llm_max_retries = 0
+    monkeypatch.setattr(agent.content_filter, "save", lambda path: None)
+
+    responses = iter(
+        [
+            _tool_call_response(agent_module, "call-1", "noop"),
+            RuntimeError("Content Exists Risk"),
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("final", None))]
+            ),
+        ]
+    )
+
+    async def fake_create(ctx, tools):
+        response = next(responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        return [f"raw result from {tool_use['name']}" for tool_use in tool_uses]
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+
+    result, events = _collect_turn_events(
+        lambda: asyncio.run(
+            agent.send_message(
+                agent_module.AgentContext(system_prompt="system"), "do it"
+            )
+        )
+    )
+
+    assert result.error is None
+    rollbacks = [event for event in events if event.name == "context_rolled_back"]
+    assert len(rollbacks) == 1
+    fields = rollbacks[0].fields
+    assert fields["reason"] == "content_filter"
+    assert fields["replaced_with"] == "summary"
+    assert fields["tool_names"] == "noop"
+    # The reported count must match the messages actually removed: the
+    # rollback deletes `messages_dropped` and appends one summary.
+    assert fields["messages_dropped"] >= 1
+    assert (
+        fields["messages_before"] - fields["messages_dropped"] + 1
+        == fields["messages_after"]
+    )
+    assert len(fields["dropped_roles"].split(",")) == fields["messages_dropped"]
+
+
+def test_build_components_accepts_max_steps_alias(monkeypatch, tmp_path):
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["max_steps"] = 23
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert components["agent"].max_tool_call_iterations == 23
+
+
+def test_max_steps_takes_precedence_over_the_legacy_key(monkeypatch, tmp_path):
+    """Both keys stay accepted; the preferred spelling wins when both appear."""
+    import agent as agent_module
+
+    cfg = _minimal_cfg()
+    cfg["max_steps"] = 11
+    cfg["max_tool_call_iterations"] = 37
+
+    monkeypatch.setattr(
+        agent_module.ModelClientFactory,
+        "from_config",
+        lambda cfg: (object(), "fake-model", 1024),
+    )
+    monkeypatch.setattr(agent_module, "CONTEXT_DIR", tmp_path / "context")
+    monkeypatch.setattr(agent_module, "MEMORY_DIR", tmp_path / "memory")
+    monkeypatch.setattr(agent_module, "PROMPTS_DIR", tmp_path / "prompts")
+    monkeypatch.setattr(agent_module, "SKILLS_DIR", tmp_path / "skills")
+    monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
+
+    components = agent_module._build_components(cfg)
+
+    assert components["agent"].max_tool_call_iterations == 11

@@ -945,6 +945,39 @@ def test_compact_messages_uses_input_budget_even_below_min_messages(tmp_path):
     assert ctx_mgr.consolidation.estimate_tokens(compacted) < 40
 
 
+def test_compact_messages_event_reports_what_was_dropped(tmp_path):
+    """Counts alone cannot distinguish a dropped tool batch from a dropped ask."""
+    from agent.core.output import EventCollector, _active_event_collector
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "x" * 400},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "new request"},
+    ]
+
+    collector = EventCollector()
+    token = _active_event_collector.set(collector)
+    try:
+        compacted = ctx_mgr.compact_messages(messages, input_token_budget=40)
+    finally:
+        _active_event_collector.reset(token)
+
+    events = [
+        event
+        for event in collector.drain()
+        if event.name == "consolidation_compaction"
+    ]
+    assert len(events) == 1
+    fields = events[0].fields
+    assert fields["messages_before"] == 3
+    assert fields["messages_after"] == len(compacted)
+    assert fields["messages_dropped"] == 2
+    assert fields["dropped_roles"] == "user,assistant"
+    # The dropped bulk is visible as tokens, not just as a message count.
+    assert fields["dropped_tokens"] > 0
+
+
 def test_compact_messages_raises_when_newest_request_cannot_fit(tmp_path):
     from agent import ContextLimitError
 
