@@ -1164,7 +1164,7 @@ server diagnostics cannot overwrite the interactive CLI input line.
 │   ├── orchestration/  # OrchestrationPlanner, parallel/pipeline/rendezvous execution
 │   ├── channels/       # Channel ABC, CliChannel, ChannelRunner, Feishu/Lark channel
 │   ├── scheduler/      # SchedulerService, SchedulerStore, triggers, delivery
-│   ├── security/       # Shell command blocking (chmod/kill/eval/python -c)
+│   ├── security/       # Shell command blocking; sandbox/ = policy + per-OS backends
 │   ├── skills/         # SkillBundle, SkillCatalog, skill parsing, hot-reload
 │   ├── plugins/        # PluginCatalog, AgentPlugin protocol, HookResult, lifecycle
 │   ├── _builtin/       # Built-in plugins (evolution) and skills (daily-summary, etc.)
@@ -1196,4 +1196,4 @@ uv run pytest tests/test_scheduler.py -q
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-Latest verification: `uv run pytest -q` → `1716 passed, 1 skipped`
+Latest verification: `uv run pytest -q` → `1744 passed, 1 skipped`

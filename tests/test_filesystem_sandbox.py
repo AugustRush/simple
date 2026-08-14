@@ -200,8 +200,11 @@ def test_profile_escapes_seatbelt_literals(tmp_path):
 
 
 def test_build_sandbox_command_fails_closed_without_adapter(monkeypatch, tmp_path):
+    # Patched in the backend registry rather than via the re-export shim:
+    # `build_sandbox_command` calls `detect_sandbox_support` through its own
+    # module globals, so that is the name dispatch actually reads.
     monkeypatch.setattr(
-        "agent.security.filesystem_sandbox.detect_sandbox_support",
+        "agent.security.sandbox.backends.detect_sandbox_support",
         lambda: None,
     )
     with pytest.raises(SandboxUnavailableError, match="no enforcing"):
