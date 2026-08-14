@@ -37,6 +37,7 @@ from agent.security.filesystem_sandbox import (
 from agent.security.shell import shell_command_uses_shell_features
 from agent.tools.files import (
     FileAccessPolicy,
+    FileProvider,
     FileService,
     _normalize_write_scope,
     write_scope_allows,
@@ -177,7 +178,7 @@ class BuiltinTools:
         workspace_root: Optional[Path] = None,
         chapter_normalizer: Optional[Callable[[str], str]] = None,
         output_dir: Optional[Path] = None,
-        file_service: Optional[FileService] = None,
+        file_service: Optional[FileProvider] = None,
     ):
         self.memory = memory
         self.registry = registry
@@ -185,23 +186,42 @@ class BuiltinTools:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.chapter_normalizer = chapter_normalizer or (lambda chapter: str(chapter))
         self._output_dir = output_dir
-        if file_service is not None:
-            self._file_service = file_service
-        else:
+        self._injected_file_service = file_service
+        self._fallback_file_service: FileProvider | None = None
+        self._cached_schedule_store: Any = None
+        self._register()
+
+    @property
+    def _file_service(self) -> FileProvider:
+        """The file provider, resolved late so injection always wins.
+
+        Resolved on use rather than in ``__init__`` because the registry
+        context is not necessarily populated by the time the tools are built —
+        bootstrap injects the constructor argument first and sets the context
+        afterwards.  Reading the context eagerly would silently miss a
+        provider that arrives a few lines later, and the fallback below would
+        take its place: a second service, with default policy, that nobody
+        asked for.
+        """
+        if self._injected_file_service is not None:
+            return self._injected_file_service
+        from_context = self.registry.get_context("file_service")
+        if from_context is not None:
+            return from_context
+        if self._fallback_file_service is None:
             # Default policy mirrors the startup defaults: a readable,
             # non-writable workspace plus an always-usable output_dir.
             # The write_scope is resolved per call from the active registry
             # context so sub-agent scopes apply even though the policy is
             # immutable.
-            self._file_service = FileService(
+            self._fallback_file_service = FileService(
                 FileAccessPolicy(
                     workspace_root=self.workspace_root,
                     output_root=self._process_output_dir(),
                 ),
                 write_scope=lambda: self.registry.get_context("write_scope") or (),
             )
-        self._cached_schedule_store: Any = None
-        self._register()
+        return self._fallback_file_service
 
     def _process_output_dir(self) -> Path:
         raw = self.registry.get_context("output_dir")

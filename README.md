@@ -1197,4 +1197,4 @@ uv run pytest tests/test_scheduler.py -q
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-Latest verification: `uv run pytest -q` → `1750 passed, 1 skipped`
+Latest verification: `uv run pytest -q` → `1756 passed, 1 skipped`

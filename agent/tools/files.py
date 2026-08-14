@@ -26,7 +26,7 @@ from pathlib import Path
 import stat
 import threading
 import uuid
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 try:
     import fcntl
@@ -564,6 +564,63 @@ class _LineScanner:
         if self.newline_kinds:
             return next(iter(self.newline_kinds))
         return "none"
+
+
+@runtime_checkable
+class FileProvider(Protocol):
+    """Where the file tools' bytes actually live.
+
+    :class:`FileService` is the only implementation today, and the four
+    built-in file tools are four-line forwards to it.  Writing the interface
+    down makes the direction of that dependency explicit — the tool layer
+    depends on this shape, not on ``FileService`` — so a provider backed by
+    something other than the local filesystem does not require touching the
+    tools.
+
+    Every method returns a plain dict rather than raising: a failure is a
+    result the model can read and act on, not an exception for the tool layer
+    to translate.  An implementation that raises would break that contract
+    silently, since the tool layer has no handler to catch it.
+    """
+
+    def read_file(
+        self,
+        root: str,
+        path: str,
+        *,
+        start_line: int = 1,
+        line_count: int | None = None,
+    ) -> dict[str, Any]: ...
+
+    def write_file(
+        self,
+        root: str,
+        path: str,
+        *,
+        mode: str,
+        content: str,
+        expected_revision: str | None = None,
+    ) -> dict[str, Any]: ...
+
+    def edit_file(
+        self,
+        root: str,
+        path: str,
+        *,
+        expected_revision: str,
+        replacements: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]: ...
+
+    def list_files(
+        self,
+        root: str,
+        path: str = ".",
+        *,
+        recursive: bool = False,
+        pattern: str = "*",
+        cursor: str | None = None,
+        max_results: int | None = None,
+    ) -> dict[str, Any]: ...
 
 
 class FileService:
