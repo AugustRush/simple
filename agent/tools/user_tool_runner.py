@@ -39,13 +39,13 @@ tool that memoized in a module dict will now recompute.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 import sys
 from typing import Any, Optional
 
 from agent import shared
+from agent.exec import ExecRequest, provider_from
 from agent.security.filesystem_sandbox import (
     SANDBOX_MODE_NONE,
     SandboxUnavailableError,
@@ -223,7 +223,6 @@ async def run_user_tool(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     scratch_dir: Path | None = None
-    process = None
     try:
         scratch_dir = new_scratch_dir(output_dir)
         tools_root = Path(root) if root is not None else shared.TOOLS_DIR
@@ -237,44 +236,36 @@ async def run_user_tool(
                 "error": f"user tool '{tool_name}' cannot run: {exc}",
             }
 
-        import os
-
-        env = os.environ.copy()
-        if sandbox is not None:
-            env.update(sandbox.env_updates)
-
-        process = await asyncio.create_subprocess_exec(
-            *(sandbox.argv_prefix if sandbox is not None else ()),
-            sys.executable,
-            "-E",
-            "-c",
-            _RUNNER_DRIVER,
-            str(dependencies),
-            str(module_path),
-            str(tool_name),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            # Arguments go over stdin, not argv: argv is visible to every
-            # other process on the machine via `ps`, and tool inputs routinely
-            # carry content the user would not publish.
-            #
-            # cwd is the per-call scratch dir, never the workspace (a tool must
-            # not default to reading or writing the project) and never
-            # agent_home (which the sandbox denies, so Python could not even
-            # resolve its own sys.path from there).
-            cwd=str(scratch_dir),
-            env=env,
-            start_new_session=True,
-        )
-        payload = json.dumps(tool_input, ensure_ascii=False).encode("utf-8")
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(payload), timeout=timeout
+        result = await provider_from(registry).run(
+            ExecRequest(
+                argv=(
+                    sys.executable,
+                    "-E",
+                    "-c",
+                    _RUNNER_DRIVER,
+                    str(dependencies),
+                    str(module_path),
+                    str(tool_name),
+                ),
+                # Arguments go over stdin, not argv: argv is visible to every
+                # other process on the machine via `ps`, and tool inputs
+                # routinely carry content the user would not publish.
+                stdin=json.dumps(tool_input, ensure_ascii=False).encode("utf-8"),
+                # cwd is the per-call scratch dir, never the workspace (a tool
+                # must not default to reading or writing the project) and never
+                # agent_home (which the sandbox denies, so Python could not
+                # even resolve its own sys.path from there).
+                cwd=str(scratch_dir),
+                sandbox=sandbox,
+                timeout=timeout,
+                # Registering with the cancel token is what the inline spawn
+                # this replaced was missing: a runaway user tool used to
+                # survive `/cancel` until its own timeout expired.
+                cancel_label=f"user-tool:{tool_name}",
+                heartbeat_message=f"user tool '{tool_name}' in progress",
             )
-        except asyncio.TimeoutError:
-            _terminate(process)
-            await process.wait()
+        )
+        if result.timed_out:
             return {
                 "ok": False,
                 "error": (
@@ -283,11 +274,7 @@ async def run_user_tool(
                 ),
             }
 
-        return _decode_result(tool_name, stdout, stderr, process.returncode)
-    except asyncio.CancelledError:
-        if process is not None:
-            _terminate(process)
-        raise
+        return _decode_result(tool_name, result.stdout, result.stderr, result.returncode)
     except Exception as exc:
         return {
             "ok": False,
@@ -295,17 +282,6 @@ async def run_user_tool(
         }
     finally:
         release_scratch_dir(scratch_dir)
-
-
-def _terminate(process: Any) -> None:
-    import os
-    import signal
-
-    with shared._suppress_with_log("terminating a user tool child failed"):
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (AttributeError, ProcessLookupError, PermissionError, OSError):
-            process.kill()
 
 
 def _decode_result(

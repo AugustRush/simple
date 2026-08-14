@@ -1160,6 +1160,7 @@ server diagnostics cannot overwrite the interactive CLI input line.
 │   ├── core/           # BaseAgent, AgentContext, OutputSink, RuntimeEvent, EventCollector
 │   ├── memory/         # LTMStore, MemoryPalace, ConsolidationEngine, StagingBuffer
 │   ├── tools/          # ToolRegistry, BuiltinTools, MCPClient, UserToolCatalog, executor
+│   ├── exec/           # SubprocessProvider seam: one place children are spawned
 │   ├── runtime/        # AgentCore, TurnInput, TurnResult, TurnExecution, TurnRunner
 │   ├── orchestration/  # OrchestrationPlanner, parallel/pipeline/rendezvous execution
 │   ├── channels/       # Channel ABC, CliChannel, ChannelRunner, Feishu/Lark channel
@@ -1196,4 +1197,4 @@ uv run pytest tests/test_scheduler.py -q
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-Latest verification: `uv run pytest -q` → `1744 passed, 1 skipped`
+Latest verification: `uv run pytest -q` → `1750 passed, 1 skipped`

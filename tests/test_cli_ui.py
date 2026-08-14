@@ -112,7 +112,7 @@ def test_shell_confirmation_gate_executes_after_human_approval(
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -353,7 +353,7 @@ def test_parallel_identical_medium_risk_commands_ask_for_consent_once(
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):

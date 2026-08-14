@@ -102,6 +102,10 @@ class RalphVerifier:
         env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
         env["AGENT_OUTPUT_DIR"] = str(self.output_dir)
         try:
+            # Not yet on the `agent.exec` provider seam. It would fit — this
+            # wants the same group teardown — but the verifier deliberately
+            # runs unsandboxed with a curated env allowlist, so moving it is a
+            # separate change with its own security argument to make.
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=self.workspace_root,

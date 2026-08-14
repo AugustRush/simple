@@ -798,6 +798,10 @@ async def _launch_path(path: Path, *, reveal: bool) -> CommandResult:
         args = ["xdg-open", str(path.parent if reveal else path)]
         verb = "在文件管理器中显示" if reveal else "打开"
     try:
+        # Left off the `agent.exec` provider seam on purpose: this hands a path
+        # to the desktop's own opener, which detaches immediately. There is no
+        # output to capture and nothing to cancel, so the provider's
+        # supervision would be pure overhead.
         process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.DEVNULL,

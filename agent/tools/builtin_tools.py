@@ -19,6 +19,8 @@ from zoneinfo import ZoneInfo
 
 from agent import shared
 from agent.core.output import OutputSink, _active_sink
+from agent.exec import ExecRequest, provider_from
+from agent.exec.subprocess import OUTPUT_MAX_BYTES
 from agent.pathing import path_contains, resolve_workspace_path
 from agent.security.network import fetch_public_http_url
 from agent.security.filesystem_sandbox import (
@@ -68,59 +70,6 @@ _SHELL_CONFIRMATION_GUIDANCE = (
     "byte-identical command within 5 minutes — do not modify it and do not "
     "route around the shell tool."
 )
-
-#: Cap on combined shell stdout+stderr buffered per call.  A runaway command
-#: (``cat /dev/urandom | base64``) must not OOM the agent long before its
-#: timeout; excess bytes are drained and discarded so the child never blocks
-#: on a full pipe, while the timeout still governs truly runaway commands.
-_SHELL_OUTPUT_MAX_BYTES = 4 * 1024 * 1024
-_SHELL_READ_CHUNK = 64 * 1024
-
-
-async def _communicate_bounded(
-    proc: "asyncio.subprocess.Process",
-    *,
-    max_bytes: int,
-) -> tuple[bytes, bytes, bool]:
-    """Read a subprocess' stdout/stderr concurrently, buffering at most
-    *max_bytes* each and discarding the rest.
-
-    Draining (rather than stopping) keeps the child from blocking on a full
-    pipe, so the caller's timeout still governs runaway commands while memory
-    stays bounded.  Returns ``(stdout, stderr, truncated)``.
-    """
-    # Real asyncio subprocesses expose StreamReader streams; test doubles and
-    # exotic wrappers may only implement communicate().  Fall back there — the
-    # bounded path is a hardening, not a protocol requirement, and only real
-    # children can genuinely overflow.
-    if not hasattr(proc, "stdout") or not hasattr(proc, "stderr"):
-        stdout, stderr = await proc.communicate()
-        return stdout, stderr, False
-
-    async def _pump(stream: "asyncio.StreamReader | None") -> tuple[bytes, bool]:
-        if stream is None:
-            return b"", False
-        chunks: list[bytes] = []
-        buffered = 0
-        total = 0
-        while True:
-            chunk = await stream.read(_SHELL_READ_CHUNK)
-            if not chunk:
-                break
-            total += len(chunk)
-            room = max_bytes - buffered
-            if room > 0:
-                keep = chunk[:room]
-                chunks.append(keep)
-                buffered += len(keep)
-        return b"".join(chunks), total > max_bytes
-
-    (stdout, out_truncated), (stderr, err_truncated) = await asyncio.gather(
-        _pump(proc.stdout), _pump(proc.stderr)
-    )
-    await proc.wait()
-    return stdout, stderr, out_truncated or err_truncated
-
 
 
 def _looks_like_plugin(dir_path: Path) -> bool:
@@ -2226,87 +2175,44 @@ class BuiltinTools:
                     sandbox_unavailable=True,
                 )
 
-        proc = None
         try:
             env = os.environ.copy()
             env["AGENT_OUTPUT_DIR"] = str(output_dir)
             env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
             env["AGENT_SANDBOX_DIR"] = str(sandbox_dir)
-            if sandbox is not None:
-                env.update(sandbox.env_updates)
-            proc = await asyncio.create_subprocess_exec(
-                *(sandbox.argv_prefix if sandbox is not None else ()),
-                "/bin/sh",
-                "-c",
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-                env=env,
-                cwd=str(resolved_cwd) if resolved_cwd is not None else None,
-            )
-
-            # Register a cleanup so the active CancelToken can kill this
-            # subprocess (and its process group, since we used
-            # start_new_session=True) on /cancel or /now.  Graceful → SIGTERM
-            # to the group; force → SIGKILL.  Without this, /cancel has to
-            # wait for the shell command to complete before taking effect.
-            def _cancel_proc(level: str) -> None:
-                pgid_func = getattr(os, "killpg", None)
-                getpgid = getattr(os, "getpgid", None)
-                sig = signal.SIGKILL if level == "force" else signal.SIGTERM
-                with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                    if pgid_func is not None and getpgid is not None:
-                        pgid_func(getpgid(proc.pid), sig)
-                    else:
-                        proc.send_signal(sig)
-
-            active_token = shared._active_cancel_token.get()
-            _deregister_proc = (
-                active_token.register_cleanup(
-                    f"shell:{command[:60]}", _cancel_proc
-                )
-                if active_token is not None
-                else (lambda: None)
-            )
-
-            # Heartbeat keeps the executor's stale-timeout mechanism alive
-            # during long-running commands that produce no output (downloads, etc.)
-            async def _heartbeat() -> None:
-                while True:
-                    await asyncio.sleep(10)
-                    try:
-                        report_tool_progress(
-                            status="running",
-                            message="shell command in progress",
-                        )
-                    except Exception:
-                        pass
-
-            heartbeat_task = asyncio.create_task(_heartbeat())
-            try:
-                stdout, stderr, output_truncated = await asyncio.wait_for(
-                    _communicate_bounded(proc, max_bytes=_SHELL_OUTPUT_MAX_BYTES),
+            # The provider prepends the sandbox argv and merges its env, kills
+            # the process group on timeout or `/cancel` (so cancellation does
+            # not have to wait for the command, and no child outlives us), and
+            # heartbeats so a long quiet command is not mistaken for a stalled
+            # one.
+            exec_result = await provider_from(self.registry).run(
+                ExecRequest(
+                    argv=("/bin/sh", "-c", command),
+                    cwd=str(resolved_cwd) if resolved_cwd is not None else None,
+                    env=env,
+                    sandbox=sandbox,
                     timeout=timeout,
+                    cancel_label=f"shell:{command[:60]}",
+                    heartbeat_message="shell command in progress",
                 )
-            finally:
-                _deregister_proc()
-                heartbeat_task.cancel()
-                try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    pass
-            out = stdout.decode(errors="replace")
-            err = stderr.decode(errors="replace")
+            )
+            if exec_result.timed_out:
+                return self._error(
+                    f"Command timed out after {timeout}s",
+                    command=command,
+                    timed_out=True,
+                )
+            out = exec_result.stdout_text()
+            err = exec_result.stderr_text()
             result = ""
             if out:
                 result += f"STDOUT:\n{out}"
             if err:
                 result += f"STDERR:\n{err}"
-            result += f"\nExit code: {proc.returncode}"
-            if output_truncated:
+            result += f"\nExit code: {exec_result.returncode}"
+            if exec_result.truncated:
                 result += (
-                    f"\n[output truncated: exceeded {_SHELL_OUTPUT_MAX_BYTES} "
+                    f"\n[output truncated: exceeded {OUTPUT_MAX_BYTES} "
                     "bytes; redirect to a file or use a more specific command "
                     "to inspect the rest]"
                 )
@@ -2317,7 +2223,7 @@ class BuiltinTools:
             # that moment. (Measured: GPU/Metal works fine under `read_all`
             # with the default `shell_devices: true`; disabling the sandbox
             # for it buys nothing.)
-            if proc.returncode != 0 and looks_like_sandbox_denial(err):
+            if exec_result.returncode != 0 and looks_like_sandbox_denial(err):
                 hint = narrow_alternatives_hint(sandbox_mode)
                 if hint:
                     result += f"\n\n{hint}"
@@ -2338,22 +2244,9 @@ class BuiltinTools:
                 root=call_root,
                 cwd=str(resolved_cwd),
                 output=result or "(no output)",
-                exit_code=proc.returncode,
+                exit_code=exec_result.returncode,
                 moved_artifacts=moved_artifacts,
             )
-        except asyncio.TimeoutError:
-            await self._terminate_process(proc)
-            return self._error(
-                f"Command timed out after {timeout}s",
-                command=command,
-                timed_out=True,
-            )
-        except asyncio.CancelledError:
-            # B6: when the outer coroutine is cancelled (e.g. sub-agent timeout via
-            # asyncio.wait_for), ensure the subprocess is killed so it doesn't linger
-            # as a zombie process running under a detached session.
-            await self._terminate_process(proc)
-            raise
         except ValueError as e:
             return self._error(f"Invalid shell input: {e}", command=command)
         except Exception as e:

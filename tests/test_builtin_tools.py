@@ -806,42 +806,30 @@ def test_memory_search_returns_structured_results(tmp_path):
     assert payload["items"][0]["path"] == "identity/user"
 
 
-def test_shell_timeout_terminates_process(tmp_path, monkeypatch):
-    from agent import BuiltinTools
+def test_shell_timeout_is_reported_as_an_error_not_a_hang(tmp_path):
+    """The shell tool's half of a timeout: turn it into a legible failure.
 
-    tools, _, _ = make_builtin_tools(tmp_path)
-    called = {"terminated": False}
+    Killing the process group is the provider's half, covered end to end in
+    ``tests/test_subprocess_provider.py`` — including the negative case where
+    a grandchild would otherwise survive.  Asserting it here too would only
+    re-test the provider through a longer path.
+    """
+    from agent.exec import ExecResult
 
-    class FakeProc:
-        pid = 123
-        returncode = None
+    tools, reg, _ = make_builtin_tools(tmp_path)
 
-        async def communicate(self):
-            return (b"", b"")
+    class TimingOutProvider:
+        async def run(self, request):
+            assert request.timeout == 1
+            return ExecResult(timed_out=True)
 
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        return FakeProc()
-
-    async def fake_terminate(self, proc):
-        called["terminated"] = True
-
-    async def fake_wait_for(awaitable, timeout):
-        awaitable.close()
-        raise asyncio.TimeoutError()
-
-    monkeypatch.setattr(
-        asyncio, "create_subprocess_exec", fake_create_subprocess_exec
-    )
-    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
-    monkeypatch.setattr(
-        BuiltinTools, "_terminate_process", fake_terminate, raising=False
-    )
+    reg.set_context("subprocess_provider", TimingOutProvider())
 
     result = asyncio.run(tools._shell("sleep 10", timeout=1))
 
-    assert called["terminated"] is True
     assert result["ok"] is False
     assert "timed out" in result["error"].lower()
+    assert result["timed_out"] is True
 
 
 def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
@@ -852,7 +840,7 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -882,7 +870,7 @@ def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch)
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -909,7 +897,7 @@ def test_shell_passes_validated_cwd_to_subprocess(tmp_path, monkeypatch):
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -935,7 +923,7 @@ def test_shell_resolves_relative_cwd_inside_declared_root(tmp_path, monkeypatch)
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -1125,7 +1113,7 @@ def test_shell_runs_restricted_command_after_user_scoped_confirmation(
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -1180,7 +1168,7 @@ def test_shell_allowed_commands_context_skips_confirmation(tmp_path, monkeypatch
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -1205,7 +1193,7 @@ def test_shell_permission_level_context_skips_confirmation(tmp_path, monkeypatch
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -1228,7 +1216,7 @@ def _fake_proc_spawn(monkeypatch):
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"ok", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -1776,7 +1764,7 @@ def test_transcribe_audio_runs_in_agent_output_dir(tmp_path, monkeypatch):
     class FakeProc:
         returncode = 0
 
-        async def communicate(self):
+        async def communicate(self, stdin=None):
             return (b"transcript", b"")
 
     async def fake_create_subprocess_exec(*args, **kwargs):
