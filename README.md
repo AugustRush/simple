@@ -155,6 +155,11 @@ The gateway can also serve an HTTP/WebSocket API for a browser frontend.  The
 web channel is just another channel, so it shares the same session machinery
 as Feishu (one conversation id per chat thread).
 
+The React source lives under `frontend/`. Development builds stay in
+`frontend/dist/`; they do not modify the Python package tree. To refresh the
+bundle embedded in a packaged release, run `npm run build:release` from that
+directory.
+
 ```bash
 # Install web dependency
 uv sync --extra web

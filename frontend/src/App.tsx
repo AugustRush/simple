@@ -241,6 +241,8 @@ function App() {
   const [skillFilter, setSkillFilter] = useState<'all' | 'callable' | 'internal'>('all')
   const [currentModel, setCurrentModel] = useState('默认模型')
   const [currentProvider, setCurrentProvider] = useState('')
+  const [permissionLevel, setPermissionLevel] = useState('ask')
+  const [sandboxMode, setSandboxMode] = useState('read_all')
   const [connected, setConnected] = useState(false)
   const [isStreaming, setIsStreaming] = useState(false)
   const [activity, setActivity] = useState('')
@@ -347,6 +349,18 @@ function App() {
       // API errors are surfaced by the shared request helper.
     } finally {
       setLoadingSessions(false)
+    }
+  }, [api])
+
+  const loadSessionPermissions = useCallback(async (sid: string) => {
+    try {
+      const resp = await api(`/api/sessions/${encodeURIComponent(sid)}/permissions`)
+      const data = await resp.json()
+      setPermissionLevel(data.level || 'ask')
+      setSandboxMode(data.sandbox || 'read_all')
+    } catch {
+      setPermissionLevel('ask')
+      setSandboxMode('read_all')
     }
   }, [api])
 
@@ -619,8 +633,9 @@ function App() {
       setMessages([])
       messagesRef.current = []
       loadMessages(sid)
+      loadSessionPermissions(sid)
     },
-    [loadMessages],
+    [loadMessages, loadSessionPermissions],
   )
 
   useEffect(() => {
@@ -838,6 +853,34 @@ function App() {
       },
     })
   }
+
+  const updateSessionPermissions = async (patch: { level?: string; sandbox?: string }) => {
+    if (!activeSession) {
+      messageApi.info('请先选择或新建会话')
+      return
+    }
+    try {
+      const resp = await api(`/api/sessions/${encodeURIComponent(activeSession)}/permissions`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      })
+      const data = await resp.json()
+      setPermissionLevel(data.level || 'ask')
+      setSandboxMode(data.sandbox || 'read_all')
+      messageApi.success('当前会话权限已更新')
+    } catch {
+      // api() surfaces the server error.
+    }
+  }
+
+  const permissionLabel = permissionLevel === 'full'
+    ? '完全访问'
+    : permissionLevel === 'high'
+      ? '高权限'
+      : permissionLevel === 'medium'
+        ? '中权限'
+        : '需确认'
 
   const togglePlugin = async (plugin: PluginInfo, enabled: boolean) => {
     setPlugins(prev =>
@@ -1357,11 +1400,69 @@ function App() {
           />
           <div className="composer-footer">
             <Space size={4}>
-              <Tooltip title="完全访问模式">
-                <Button type="text" icon={<GlobalOutlined />}>
-                  完全访问
+              <Dropdown
+                trigger={['click']}
+                placement="topLeft"
+                menu={{
+                  items: [
+                    {
+                      key: 'permission-title',
+                      label: '当前会话权限',
+                      disabled: true,
+                    },
+                    ...[
+                      ['ask', '需确认', '敏感操作逐项确认'],
+                      ['medium', '中权限', '高风险操作仍需确认'],
+                      ['high', '高权限', '大多数操作自动执行'],
+                      ['full', '完全访问', '最高权限，仍保留安全拦截'],
+                    ].map(([key, label, description]) => ({
+                      key: `level:${key}`,
+                      label: (
+                        <span className="permission-menu-item">
+                          <span>
+                            <strong>{label}</strong>
+                            <small>{description}</small>
+                          </span>
+                          {permissionLevel === key && <CheckCircleFilled />}
+                        </span>
+                      ),
+                      onClick: () => updateSessionPermissions({ level: key }),
+                    })),
+                    { type: 'divider' as const },
+                    {
+                      key: 'sandbox-title',
+                      label: '文件沙箱',
+                      disabled: true,
+                    },
+                    ...[
+                      ['restricted', '工作区', '仅限当前工作区'],
+                      ['read_all', '全盘可读', '读取范围更广，写入仍受限'],
+                      ['none', '无沙箱', '整机访问，仅完全访问可用'],
+                    ].map(([key, label, description]) => ({
+                      key: `sandbox:${key}`,
+                      disabled: key === 'none' && permissionLevel !== 'full',
+                      label: (
+                        <span className="permission-menu-item">
+                          <span>
+                            <strong>{label}</strong>
+                            <small>{description}</small>
+                          </span>
+                          {sandboxMode === key && <CheckCircleFilled />}
+                        </span>
+                      ),
+                      onClick: () => updateSessionPermissions({ sandbox: key }),
+                    })),
+                  ],
+                }}
+              >
+                <Button
+                  type="text"
+                  className="permission-button"
+                  icon={<GlobalOutlined />}
+                >
+                  {permissionLabel}
                 </Button>
-              </Tooltip>
+              </Dropdown>
               <Select
                 value={currentModel}
                 onChange={handleModelChange}

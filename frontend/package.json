@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "build:release": "npm run typecheck && vite build --outDir ../agent/_builtin/web/dist --emptyOutDir",
     "preview": "vite preview"
   },
   "dependencies": {

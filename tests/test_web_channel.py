@@ -118,11 +118,39 @@ def test_web_health_and_sessions_endpoints():
         assert created.status_code == 200
         sid = created.json()["session_id"]
         assert sid
-
         messages = client.get(f"/api/sessions/{sid}/messages")
         assert messages.status_code == 200
         assert messages.json()["messages"] == []
 
+
+def test_web_session_permissions_are_scoped_to_session():
+    from starlette.testclient import TestClient
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_allowlist_clear,
+        shell_session_permission_get,
+    )
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    try:
+        with TestClient(channel.app) as client:
+            changed = client.patch(
+                "/api/sessions/web-a/permissions",
+                json={"level": "high", "sandbox": "read_all"},
+            )
+            assert changed.status_code == 200
+            assert changed.json()["level"] == "high"
+            assert changed.json()["sandbox"] == "read_all"
+
+            other = client.get("/api/sessions/web-b/permissions")
+            assert other.status_code == 200
+            assert other.json()["session_level"] == ""
+            assert shell_session_permission_get(
+                ShellAuthorizationScope("web-a", "web", "")
+            ) == "high"
+    finally:
+        shell_session_allowlist_clear()
 
 def test_web_post_message_runs_handler():
     from starlette.testclient import TestClient

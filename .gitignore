@@ -8,3 +8,17 @@ tests/eval/*.local.json
 # Web frontend
 frontend/node_modules/
 frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Local test and browser artifacts
+.playwright-cli/
+output/
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+.DS_Store
+
+# Generated Python package metadata
+*.egg-info/

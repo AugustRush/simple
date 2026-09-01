@@ -2349,6 +2349,46 @@ html[data-theme='light'] .bubble-user {
   font-size: 12px;
 }
 
+.permission-button {
+  border-radius: 11px !important;
+  color: var(--text-secondary) !important;
+}
+
+.permission-button:hover {
+  color: var(--text) !important;
+  background: var(--surface-hover) !important;
+}
+
+.permission-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+  min-width: 220px;
+}
+
+.permission-menu-item > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.permission-menu-item strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.permission-menu-item small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.permission-menu-item > .anticon {
+  color: var(--text);
+  font-size: 12px;
+}
+
 .send-button {
   min-width: 64px;
   height: 32px !important;
@@ -2974,5 +3014,43 @@ html[data-theme='light'] .global-search-modal .ant-modal-content {
 
   .page-view {
     padding: 24px 16px 34px;
+  }
+}
+
+/* Conversation restraint: content first, chrome second. */
+.app-sider,
+.app-main {
+  border-radius: 22px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.14);
+}
+
+.bubble-user {
+  box-shadow: none;
+}
+
+.bubble-assistant {
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  color: var(--text);
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+.message-row-assistant .message-meta {
+  margin-bottom: 8px;
+}
+
+.message-row-assistant .message-copy {
+  margin-top: 8px;
+}
+
+@media (max-width: 768px) {
+  .app-sider,
+  .app-main {
+    border-radius: 0;
+    box-shadow: none;
   }
 }

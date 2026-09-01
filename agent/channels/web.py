@@ -301,6 +301,20 @@ class WebChannel(Channel):
     def app(self) -> Any:
         return self._app
 
+    @staticmethod
+    def _web_dist_dir() -> Path:
+        """Resolve the frontend bundle for source checkouts and packages.
+
+        Source builds live in ``frontend/dist``; packaged installations use
+        the bundled ``agent/_builtin/web/dist`` copy refreshed by the release
+        build command.
+        """
+        package_dist = Path(__file__).resolve().parent.parent / "_builtin" / "web" / "dist"
+        source_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+        if (source_dist / "index.html").is_file():
+            return source_dist
+        return package_dist
+
     def bind_runtime(
         self,
         sessions: dict[str, Any],
@@ -362,7 +376,7 @@ class WebChannel(Channel):
         from pathlib import Path
         from starlette.responses import HTMLResponse
 
-        dist = Path(__file__).resolve().parent.parent / "_builtin" / "web" / "dist" / "index.html"
+        dist = self._web_dist_dir() / "index.html"
         if dist.is_file():
             return HTMLResponse(dist.read_text(encoding="utf-8"))
         return HTMLResponse(
@@ -672,6 +686,74 @@ class WebChannel(Channel):
             }
         )
 
+    async def _get_session_permissions(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        from agent.security.shell import (
+            PERMISSION_LEVELS,
+            ShellAuthorizationScope,
+            shell_session_permission_get,
+            shell_session_sandbox_get,
+        )
+        from agent.security.filesystem_sandbox import SANDBOX_MODES, effective_sandbox_mode
+        from agent.config import load_config
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = str(request.path_params["session_id"])
+        scope = ShellAuthorizationScope(session_id, "web", "")
+        cfg, _ = load_config()
+        permissions = cfg.get("permissions") if isinstance(cfg, dict) else {}
+        permissions = permissions if isinstance(permissions, dict) else {}
+        configured_level = str(permissions.get("shell_level", "ask") or "ask")
+        configured_sandbox = str(permissions.get("shell_sandbox", "read_all") or "read_all")
+        session_level = shell_session_permission_get(scope)
+        session_sandbox = shell_session_sandbox_get(scope)
+        level = session_level or configured_level
+        sandbox = effective_sandbox_mode(session_sandbox or configured_sandbox, level)
+        return JSONResponse({
+            "session_id": session_id,
+            "level": level,
+            "sandbox": sandbox,
+            "session_level": session_level,
+            "session_sandbox": session_sandbox,
+            "levels": list(PERMISSION_LEVELS),
+            "sandbox_modes": list(SANDBOX_MODES),
+        })
+
+    async def _patch_session_permissions(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        from agent.security.shell import (
+            PERMISSION_LEVELS,
+            ShellAuthorizationScope,
+            shell_session_permission_set,
+            shell_session_sandbox_set,
+        )
+        from agent.security.filesystem_sandbox import SANDBOX_MODES
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        level = str(body.get("level", "") or "").strip().casefold()
+        sandbox = str(body.get("sandbox", "") or "").strip().casefold()
+        if level and level not in PERMISSION_LEVELS:
+            return JSONResponse({"error": "invalid permission level"}, status_code=400)
+        if sandbox and sandbox not in SANDBOX_MODES:
+            return JSONResponse({"error": "invalid sandbox mode"}, status_code=400)
+        if sandbox == "none" and level not in ("", "full"):
+            return JSONResponse({"error": "sandbox none requires full permission"}, status_code=400)
+        session_id = str(request.path_params["session_id"])
+        scope = ShellAuthorizationScope(session_id, "web", "")
+        if level:
+            shell_session_permission_set(scope, level)
+        if sandbox:
+            shell_session_sandbox_set(scope, sandbox)
+        return await self._get_session_permissions(request)
+
     async def _post_message(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -810,9 +892,7 @@ class WebChannel(Channel):
         from starlette.routing import Mount, Route, WebSocketRoute
         from starlette.staticfiles import StaticFiles
 
-        dist_dir = (
-            Path(__file__).resolve().parent.parent / "_builtin" / "web" / "dist"
-        )
+        dist_dir = self._web_dist_dir()
 
         middleware: list[Middleware] = []
         cors_origins = list(self._config.cors_origins or ())
@@ -867,6 +947,16 @@ class WebChannel(Channel):
                 "/api/sessions/{session_id}/messages",
                 self._post_message,
                 methods=["POST"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/permissions",
+                self._get_session_permissions,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/permissions",
+                self._patch_session_permissions,
+                methods=["PATCH"],
             ),
             WebSocketRoute(
                 "/api/sessions/{session_id}/stream",
