@@ -156,14 +156,17 @@ DEFAULT_CONFIG: dict = {
 
 
 def _ensure_config_file() -> bool:
-    """Write default config.json if it doesn't exist yet.
+    """Write the default config file if no config exists yet.
 
-    Returns True if this is the first run (file was just created).
+    Named sessions share the default agent config unless they already have
+    their own ``config.json``.  Returns True when a new file was created.
     """
     shared.AGENT_HOME.mkdir(parents=True, exist_ok=True)
-    if not shared.CONFIG_FILE.exists():
+    config_path = shared.resolve_config_file()
+    if not config_path.exists():
+        config_path.parent.mkdir(parents=True, exist_ok=True)
         shared._atomic_write_text(
-            shared.CONFIG_FILE,
+            config_path,
             json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False),
         )
         return True  # first run
@@ -432,8 +435,9 @@ def load_config() -> tuple[dict, bool]:
       (memory, orchestration, evolution) so the agent always has safe defaults.
     """
     first_run = _ensure_config_file()
+    config_path = shared.resolve_config_file()
     try:
-        raw = json.loads(shared.CONFIG_FILE.read_text())
+        raw = json.loads(config_path.read_text())
         # Only backfill structural sections the user hasn't touched;
         # never overwrite top-level identity keys.
         for section in (
@@ -460,8 +464,9 @@ def load_config() -> tuple[dict, bool]:
 
 
 def save_config(cfg: dict):
-    shared.AGENT_HOME.mkdir(parents=True, exist_ok=True)
-    shared._atomic_write_text(shared.CONFIG_FILE, json.dumps(cfg, indent=2, ensure_ascii=False))
+    config_path = shared.resolve_config_file()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    shared._atomic_write_text(config_path, json.dumps(cfg, indent=2, ensure_ascii=False))
 
 
 def provider_supports_vision(cfg: dict, provider_name: str) -> bool:
@@ -484,7 +489,7 @@ def _first_run_setup() -> bool:
         Panel(
             f"[bold cyan]Welcome to Personal Agent![/bold cyan]\n\n"
             f"Config file created at:\n"
-            f"  [bold]{shared.CONFIG_FILE}[/bold]\n\n"
+            f"  [bold]{shared.resolve_config_file()}[/bold]\n\n"
             f"Let's set up your AI provider. You can change this anytime:\n"
             f"  [dim]python -m agent config use-provider <name>[/dim]\n"
             f"  [dim]python -m agent config edit[/dim]",

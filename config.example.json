@@ -207,7 +207,7 @@
     "_shell_devices_readme": "Device/service access (Metal/IOKit/mach services) inside the sandbox. Open by default, matching the network posture, so local ML workloads (MLX/TTS/LLM) work without disabling the sandbox; set false for the strictest posture (reads/writes are still governed by shell_sandbox)."
   },
   "channels": {
-    "_readme": "External channel configuration. Only one channel may be active at a time. If no channel is enabled the CLI is used by default.",
+    "_readme": "External channel configuration. Multiple channels may be active at once. If no channel is enabled the CLI is used by default.",
     "feishu": {
       "_readme": [
         "Feishu/Lark bot via WebSocket long connection (no public IP required).",
@@ -231,6 +231,21 @@
       "allow_from": [],
       "react_emoji": "THUMBSUP",
       "group_policy": "mention"
+    },
+    "web": {
+      "_readme": [
+        "Local HTTP/WebSocket API for the built-in React web UI and custom integrations.",
+        "Install: uv sync --extra web",
+        "Start:  uv run simple gateway, then open http://127.0.0.1:8787/.",
+        "Keep host=127.0.0.1 for local-only access. Set auth_token when exposing it",
+        "beyond localhost, and call /api/* with 'Authorization: Bearer <token>'.",
+        "cors_origins is only needed when a separate frontend dev server calls the API."
+      ],
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 8787,
+      "auth_token": "",
+      "cors_origins": []
     }
   }
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 import os
 from typing import Any, Optional
@@ -30,6 +31,35 @@ from agent.tools.runtime import MCPClient, ToolRegistry, UserToolCatalog
 
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
+
+_SESSION_BUILD_LOCK = asyncio.Lock()
+
+
+def _web_session_home(session_id: str) -> Path:
+    clean = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
+    if not clean:
+        raise ValueError("invalid session id")
+    return shared.session_home(clean)
+
+
+async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict:
+    """Build a fully home-scoped runtime for one multiplexed web session."""
+    home = _web_session_home(session_id)
+    home.mkdir(parents=True, exist_ok=True)
+    (home / ".web-session").touch(exist_ok=True)
+    previous_home = shared.AGENT_HOME
+    # Most bootstrap helpers intentionally late-bind shared paths. Serialize
+    # the short construction window, then restore the gateway's home; the
+    # resulting components retain explicit paths for their own home.
+    async with _SESSION_BUILD_LOCK:
+        try:
+            agent_module._set_agent_home(home)
+            session_cfg, _ = agent_module.load_config()
+            if not session_cfg:
+                session_cfg = dict(base_cfg)
+            return await _build_components_async(session_cfg, announce=False)
+        finally:
+            agent_module._set_agent_home(previous_home)
 
 
 def _bounded_int(
@@ -507,6 +537,15 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         "mcp_status": mcp_status,
         "mcp_task": None,
     }
+    # WebChannel uses this hook to provision one independent agent home per
+    # browser session (for example ``~/.agent-<session-id>``).
+    components["session_components_factory"] = (
+        lambda session_id: _build_web_session_components(session_id, cfg)
+    )
+    components["session_store_factory"] = lambda session_id: LTMStore(
+        context_dir=_web_session_home(str(session_id)) / "context",
+        memory_dir=_web_session_home(str(session_id)) / "memory",
+    )
 
     async def _execute_ralph_iteration(
         iter_ctx: Any,

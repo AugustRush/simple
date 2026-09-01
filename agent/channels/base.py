@@ -115,8 +115,8 @@ class ChannelRunner:
         self._components = components
         self._cfg = cfg
 
-    def _build_session_context_manager(self, session_id: str):
-        base_ctx_mgr = self._components.get("context_manager")
+    def _build_session_context_manager(self, session_id: str, components: dict):
+        base_ctx_mgr = components.get("context_manager")
         if base_ctx_mgr is None:
             return None
         spawn_session = getattr(base_ctx_mgr, "spawn_session", None)
@@ -124,23 +124,23 @@ class ChannelRunner:
             return spawn_session(session_id)
         return base_ctx_mgr
 
-    def _build_session_memory_worker(self, session_ctx_mgr):
+    def _build_session_memory_worker(self, session_ctx_mgr, components: dict):
         import agent as agent_module
 
         if session_ctx_mgr is None:
             return None
         if (
-            "client" not in self._components
-            or "model" not in self._components
-            or "agent" not in self._components
-            or not hasattr(self._components["agent"], "api_format")
+            "client" not in components
+            or "model" not in components
+            or "agent" not in components
+            or not hasattr(components["agent"], "api_format")
         ):
             return None
         worker = agent_module.BackgroundMemoryWorker(
             session_ctx_mgr,
-            self._components["client"],
-            self._components["model"],
-            self._components["agent"].api_format,
+            components["client"],
+            components["model"],
+            components["agent"].api_format,
             client_factory=lambda: agent_module.ModelClientFactory.from_config(
                 self._cfg, announce=False
             )[0],
@@ -164,8 +164,11 @@ class ChannelRunner:
             payload["message_id"] = message_id
         _interaction_log(event.name, **{k: v for k, v in payload.items() if v is not None})
 
-    def _ensure_session_state(
-        self, sessions: dict[str, RuntimeSessionState], session_id: str
+    async def _ensure_session_state(
+        self,
+        sessions: dict[str, RuntimeSessionState],
+        session_id: str,
+        components: dict,
     ) -> RuntimeSessionState:
         import agent as agent_module
 
@@ -173,13 +176,13 @@ class ChannelRunner:
         if state is not None:
             return state
 
-        session_ctx_mgr = self._build_session_context_manager(session_id)
+        session_ctx_mgr = self._build_session_context_manager(session_id, components)
         state = RuntimeSessionState(
             ctx=agent_module.AgentContext(
-                system_prompt=self._components["system_prompt"]
+                system_prompt=components["system_prompt"]
             ),
             context_manager=session_ctx_mgr,
-            memory_worker=self._build_session_memory_worker(session_ctx_mgr),
+            memory_worker=self._build_session_memory_worker(session_ctx_mgr, components),
             cancel_token=CancelToken(),
         )
         sessions[session_id] = state
@@ -218,6 +221,9 @@ class ChannelRunner:
             set_output_dir(components.get("output_dir"))
 
         sessions: dict[str, RuntimeSessionState] = {}
+        bind_runtime = getattr(channel, "bind_runtime", None)
+        if callable(bind_runtime):
+            bind_runtime(sessions, components)
 
         try:
             await channel.start(self._make_message_handler(sessions))
@@ -297,6 +303,24 @@ class ChannelRunner:
         self, sessions: dict[str, RuntimeSessionState]
     ) -> Callable[["IncomingMessage", OutputSink], Any]:
         components = self._components
+        session_components: dict[str, dict] = {}
+        session_coordinators: dict[str, CommandCoordinator] = {}
+        session_plugins_started: set[str] = set()
+
+        async def _components_for_session(session_id: str) -> dict:
+            existing = session_components.get(session_id)
+            if existing is not None:
+                return existing
+            factory = components.get("session_components_factory")
+            if callable(factory):
+                built = factory(session_id)
+                if hasattr(built, "__await__"):
+                    built = await built
+                if isinstance(built, dict):
+                    session_components[session_id] = built
+                    return built
+            session_components[session_id] = components
+            return components
         agent_core = components.get("agent_core")
         if agent_core is None:
             agent_core = AgentCore(RuntimeComponents(components))
@@ -319,6 +343,22 @@ class ChannelRunner:
             if current is not None:
                 current.append(event)
             self._log_runtime_event(event)
+            # Runtime events are also durable session history.  The web UI
+            # uses these records to restore tool traces after a restart.
+            runtime = session_components.get(event.session_id, components)
+            ctx_mgr = runtime.get("context_manager") if isinstance(runtime, dict) else None
+            record_event = getattr(ctx_mgr, "record_runtime_event", None)
+            if callable(record_event):
+                metadata = dict(event.metadata or {})
+                turn_id = str(
+                    metadata.get("turn_id")
+                    or metadata.get("message_id")
+                    or ""
+                )
+                try:
+                    record_event(event.name, dict(event.fields), turn_id=turn_id)
+                except Exception:
+                    logger.exception("failed to persist runtime event: %s", event.name)
 
         coordinator_factory = components.get("command_coordinator_factory")
         coordinator = (
@@ -337,9 +377,28 @@ class ChannelRunner:
             turn_started_at = time.perf_counter()
             session_id = msg.metadata.get("chat_id") or msg.session_id
             skill_catalog = components["skill_catalog"]
-            state = self._ensure_session_state(sessions, session_id)
+            session_runtime = await _components_for_session(session_id)
+            state = await self._ensure_session_state(sessions, session_id, session_runtime)
             ctx = state.ctx
-            ctx.metadata["skill_catalog"] = skill_catalog
+            session_skill_catalog = session_runtime.get("skill_catalog", skill_catalog)
+            ctx.metadata["skill_catalog"] = session_skill_catalog
+            if session_id not in session_coordinators:
+                session_router = session_runtime.get("command_router")
+                session_agent_core = session_runtime.get("agent_core")
+                if session_router is not None and session_agent_core is not None:
+                    session_coordinators[session_id] = CommandCoordinator(
+                        session_agent_core,
+                        session_router,
+                        components=session_runtime,
+                        config=self._cfg,
+                        event_hook=_record_runtime_event,
+                    )
+                else:
+                    session_coordinators[session_id] = coordinator
+                plugin = session_runtime.get("plugin_catalog")
+                if plugin is not None and session_id not in session_plugins_started:
+                    plugin.fire_session_start(session_runtime)
+                    session_plugins_started.add(session_id)
             _interaction_log(
                 "turn_started",
                 session_id=session_id,
@@ -361,7 +420,7 @@ class ChannelRunner:
             current_events: list[RuntimeEvent] = []
             event_token = runtime_event_buffer.set(current_events)
             try:
-                await coordinator.handle(
+                await session_coordinators[session_id].handle(
                     TurnInput.from_text(
                         msg.text,
                         session_id=session_id,
@@ -394,6 +453,21 @@ def _build_gateway_channels(cfg: dict) -> list[Channel]:
 
     channels: list[Channel] = []
     feishu_cfg = cfg.get("channels", {}).get("feishu", {})
+    web_cfg = cfg.get("channels", {}).get("web", {})
+    if web_cfg.get("enabled"):
+        try:
+            from agent.channels.web import WebChannel, WebConfig  # noqa: PLC0415
+
+            known_fields = WebConfig.__dataclass_fields__
+            filtered = {k: v for k, v in web_cfg.items() if k in known_fields}
+            channels.append(WebChannel(WebConfig(**filtered)))
+            agent_module.CONSOLE.print("[dim]Web channel enabled[/dim]")
+        except ImportError as exc:
+            agent_module.CONSOLE.print(
+                f"[red]Web channel requires starlette/uvicorn: {exc}[/red]"
+            )
+        except Exception as exc:
+            agent_module.CONSOLE.print(f"[red]Web channel init failed: {exc}[/red]")
     if feishu_cfg.get("enabled"):
         try:
             from agent.channels.feishu import FeishuChannel, FeishuConfig  # noqa: PLC0415

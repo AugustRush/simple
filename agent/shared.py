@@ -21,6 +21,66 @@ def _resolve_agent_home() -> Path:
     return Path.home() / ".agent"
 
 
+DEFAULT_AGENT_HOME = _resolve_agent_home()
+DEFAULT_CONFIG_FILE = DEFAULT_AGENT_HOME / "config.json"
+
+
+def session_home(name: str) -> Path:
+    """Return the data home for a named session.
+
+    Named sessions keep the original ``--name`` layout as siblings of the
+    user-level default (``~/.agent-prod`` for ``--name prod``).  An empty name
+    means the default agent home, which honours ``SIMPLE_AGENT_HOME``.
+    """
+    clean = str(name or "").strip()
+    if not clean:
+        return DEFAULT_AGENT_HOME
+    return Path.home() / f".agent-{clean}"
+
+
+def iter_session_homes():
+    """Yield ``(session_name, home)`` for discoverable sessions.
+
+    The default home is always included as ``"default"``; named sessions are
+    discovered by the ``.agent-<name>`` pattern under the user home directory.
+    Missing or non-directory matches are ignored.
+    """
+    yield "default", DEFAULT_AGENT_HOME
+    home_root = Path.home()
+    if not home_root.is_dir():
+        return
+    for path in home_root.glob(".agent-*"):
+        if not path.is_dir():
+            continue
+        yield path.name[len(".agent-"):], path
+
+
+def _is_named_session_home() -> bool:
+    """Return True when the active home is a ``.agent-<name>`` session."""
+    if AGENT_HOME == DEFAULT_AGENT_HOME:
+        return False
+    return (
+        AGENT_HOME.parent == Path.home()
+        and AGENT_HOME.name.startswith(".agent-")
+    )
+
+
+def resolve_config_file() -> Path:
+    """Return the config file to read/write for the active session.
+
+    A session-specific ``config.json`` always wins when present.  For a named
+    session (``~/.agent-<name>``) without its own config, the default shared
+    config is used.  Any other home keeps using its own ``CONFIG_FILE`` even
+    when the file does not exist yet (first run, tests, custom
+    ``SIMPLE_AGENT_HOME``).
+    """
+    if _is_named_session_home():
+        if CONFIG_FILE.exists():
+            return CONFIG_FILE
+        return DEFAULT_CONFIG_FILE
+    return CONFIG_FILE
+
+
 def _set_agent_home(home: Path) -> None:
     """Override AGENT_HOME and all derived paths (for CLI --home support).
 
@@ -432,6 +492,8 @@ class _AnthropicFallbackResponse:
 
 __all__ = [
     "AGENT_HOME",
+    "DEFAULT_AGENT_HOME",
+    "DEFAULT_CONFIG_FILE",
     "MEMORY_DIR",
     "SKILLS_DIR",
     "TOOLS_DIR",
@@ -489,6 +551,9 @@ __all__ = [
     "CONSOLE",
     "_resolve_agent_home",
     "_set_agent_home",
+    "session_home",
+    "iter_session_homes",
+    "resolve_config_file",
     "_new_id",
     "_atomic_write_text",
     "_latency_trace_enabled",

@@ -39,7 +39,7 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **Unified event stream** | Every tool call, hook, and lifecycle fact is a replayable `RuntimeEvent` |
 | **LLM retry** | Transient API errors (rate limit, 5xx) retried 3x with exponential backoff |
 | **Config validation** | Startup warnings for typos and invalid values — never blocks startup |
-| **Multi-instance** | `--name prod` for isolated instances with independent config and data |
+| **Named sessions** | `--name prod` for isolated session data with shared config by default |
 | **Plugin hooks** | 8 lifecycle hooks: prompt submit, tool matchers, command hooks, continue loop |
 | **Vision** | Image attachments sent directly to vision-capable models (Anthropic, OpenAI) |
 | **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
@@ -90,20 +90,36 @@ breakdown first.
 
 ## Examples
 
-### Multi-instance deployment
+### Named sessions
+
+`--name` selects a session for both the gateway and the CLI.  Each session has
+its own data directory but shares the default agent configuration unless it
+explicitly overrides it with its own `config.json`:
 
 ```bash
-# Production instance
-uv run simple gateway --name prod    # -> ~/.agent-prod/{config.json,palace.db,...}
+# Session "prod" — data in ~/.agent-prod/, config shared from ~/.agent/config.json
+uv run simple gateway --name prod
+uv run simple --name prod
 
-# Development instance with its own config
-uv run simple gateway --name dev     # -> ~/.agent-dev/
+# Session "dev" with its own config override
+mkdir -p ~/.agent-dev
+cp ~/.agent/config.json ~/.agent-dev/config.json
+uv run simple gateway --name dev
 
-# Default (no --name)
+# Default session
 uv run simple gateway                # -> ~/.agent/
+uv run simple                        # -> ~/.agent/
 ```
 
-Each named instance has independent config, memory, context database, scheduler, skills, and plugins.
+Each named session has independent memory, context database, scheduler,
+staging, and skills; agent configuration (provider, model, system prompt,
+channels) is shared from `~/.agent/config.json` by default.  A session only
+uses its own config when `~/.agent-<name>/config.json` exists.
+
+`/sessions` lists the discoverable sessions and their config source.  Sessions
+are isolated worlds; cross-session interaction stays at the filesystem level
+(read another session's data when needed) rather than keeping multiple live
+working memories in one process.
 
 ### Feishu Gateway
 
@@ -132,6 +148,75 @@ Configure in `~/.agent/config.json`:
   }
 }
 ```
+
+### Web frontend
+
+The gateway can also serve an HTTP/WebSocket API for a browser frontend.  The
+web channel is just another channel, so it shares the same session machinery
+as Feishu (one conversation id per chat thread).
+
+```bash
+# Install web dependency
+uv sync --extra web
+
+# Start gateway with the web channel enabled
+uv run simple gateway
+
+# In a named session
+uv run simple gateway --name prod
+```
+
+Configure in `~/.agent/config.json`:
+```json
+{
+  "channels": {
+    "web": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8787,
+      "auth_token": "",
+      "cors_origins": ["http://localhost:5173"]
+    }
+  }
+}
+```
+
+The gateway serves a built-in React + Ant Design UI at
+`http://127.0.0.1:8787/`:
+
+```bash
+uv sync --extra web
+uv run simple gateway
+# open http://127.0.0.1:8787/
+```
+
+The React UI provides chat, session management, plugin/skill browsing, settings
+editing, command palette and streamed responses, all through the same
+`/api/...` endpoints.  Or use the API directly:
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | Built-in React UI |
+| GET | `/api/health` | Health check |
+| GET | `/api/commands` | Commands available in the web channel |
+| GET | `/api/config` / POST | Read masked config / save config |
+| GET | `/api/plugins` | List loaded plugins |
+| GET | `/api/skills` | List loaded skills |
+| GET | `/api/context` | Context-manager statistics |
+| GET | `/api/sessions` | List sessions in the current agent home |
+| POST | `/api/sessions` | Create a session id |
+| PATCH | `/api/sessions/{id}` | Rename a session (`{"title": "..."}`) |
+| DELETE | `/api/sessions/{id}` | Delete a session's durable history |
+| POST | `/api/sessions/{id}/reveal` | Reveal the session's isolated agent home in Finder/file manager |
+| POST | `/api/plugins/{name}/toggle` | Enable/disable a plugin (`{"enabled": true/false}`) |
+| GET | `/api/sessions/{id}/messages` | Recent messages for a session |
+| POST | `/api/sessions/{id}/messages` | Send a message (non-streaming) |
+| WS | `/api/sessions/{id}/stream` | Streaming events (`stream_chunk`, `tool_start`, `status`, `confirm_request`, `attachment`, `turn_complete`, …) |
+| GET | `/api/files?path=…` | Download a file from the current agent home |
+
+`auth_token` is empty by default because the server binds to localhost.  Set it
+when exposing the port beyond the local machine, and put the frontend behind
+HTTPS with `Authorization: Bearer <token>` (or `X-Auth-Token`).
 
 ### Scheduling tasks
 
@@ -639,19 +724,23 @@ uv run simple
 uv run simple chat "Summarize this repository"
 ```
 
-### Multi-instance deployment
+### Named sessions
 
-Run multiple isolated instances with `--name`:
+Run a named session with `--name`:
 
 ```bash
-uv run simple gateway --name prod    # -> ~/.agent-prod/
-uv run simple gateway --name dev     # -> ~/.agent-dev/
-uv run simple gateway                # -> ~/.agent/ (default)
+uv run simple gateway --name prod    # data -> ~/.agent-prod/
+uv run simple gateway --name dev     # data -> ~/.agent-dev/
+uv run simple gateway                # data -> ~/.agent/ (default)
 ```
 
-Each instance has completely independent config, memory, context database, scheduler, skills, and plugins. Also works with `--name` on any service command:
+Each session has independent memory, context database, scheduler, staging,
+skills, and plugins.  Agent configuration is shared from `~/.agent/config.json`
+by default; place a `config.json` in the session directory to override it.
+`--name` also works on the CLI and scheduler:
 
 ```bash
+uv run simple --name prod
 uv run simple scheduler --name prod
 ```
 
@@ -673,6 +762,17 @@ Or install globally:
 uv tool install --reinstall --editable . --with lark-oapi
 simple gateway
 ```
+
+### Web channel
+
+Serve the HTTP/WebSocket API for a browser frontend:
+
+```bash
+uv sync --extra web
+uv run simple gateway
+```
+
+See [Web frontend](#web-frontend) for the endpoint table and configuration.
 
 ### Scheduler service
 
@@ -761,7 +861,7 @@ falls back to the classic line-by-line prompt automatically.
 | `/help` | Show commands available in this channel |
 | `/memory` | Memory export summary |
 | `/context` | Long-term context statistics |
-| `/sessions` | List recent session history |
+| `/sessions` | List named sessions and recent scored history |
 | `/session <id>` | View session details by ID prefix |
 | `/tools` | List available tools |
 | `/skills` | List available skills |
@@ -1173,7 +1273,7 @@ server diagnostics cannot overwrite the interactive CLI input line.
 │   ├── config.py       # Config loading, validation, ModelClientFactory, system prompt
 │   ├── bootstrap.py    # Component wiring from config
 │   ├── evolution.py    # Session scoring, prompt rewriting, tool generation
-│   ├── shared.py       # Paths, defaults, tracing, multi-instance support
+│   ├── shared.py       # Paths, defaults, tracing, named-session support
 │   └── pathing.py      # Path resolution and workspace containment
 ├── scripts/
 │   └── benchmark_memory.py

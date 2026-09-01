@@ -20,6 +20,8 @@ dependencies = [
 [project.optional-dependencies]
 # pip install simple[feishu]  /  uv sync --extra feishu
 feishu = ["lark-oapi"]
+# pip install simple[web]  /  uv sync --extra web
+web = ["starlette", "uvicorn"]
 
 [project.scripts]
 simple = "agent.cli:app"
@@ -39,4 +41,6 @@ agent = [
   "_builtin/skills/**/*.py",
   "_builtin/plugins/**/*.json",
   "_builtin/plugins/**/*.py",
+  "_builtin/web/*.html",
+  "_builtin/web/dist/**/*",
 ]

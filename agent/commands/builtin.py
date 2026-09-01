@@ -243,16 +243,30 @@ async def _sessions_handler(
     invalid = _require_no_args(request, "/sessions")
     if invalid is not None:
         return invalid
+    try:
+        from agent.sessions import session_lines
+
+        session_table = session_lines()
+    except Exception:
+        session_table = []
     sessions = _load_sessions(context)
-    if not sessions:
-        return _warning("No session history found.")
-    lines = ["## Recent Sessions", "", "Session ID | Timestamp | Score | Summary"]
-    lines.append("--- | --- | --- | ---")
-    for session in reversed(sessions[-20:]):
-        session_id = _markdown_inline(str(session.get("session_id", "?"))[:12])
-        timestamp = _markdown_inline(str(session.get("timestamp", "?"))[:19])
-        summary = _markdown_inline(str(session.get("task_summary", ""))[:60]) or "-"
-        lines.append(f"{session_id} | {timestamp} | {_score(session)} | {summary}")
+    if not session_table and not sessions:
+        return _warning("No sessions found. Start one with `simple --name <name>`.")
+    lines: list[str] = []
+    if session_table:
+        lines.extend(session_table)
+    if sessions:
+        if lines:
+            lines.append("")
+        lines.extend(
+            ["## Recent Sessions", "", "Session ID | Timestamp | Score | Summary"]
+        )
+        lines.append("--- | --- | --- | ---")
+        for session in reversed(sessions[-20:]):
+            session_id = _markdown_inline(str(session.get("session_id", "?"))[:12])
+            timestamp = _markdown_inline(str(session.get("timestamp", "?"))[:19])
+            summary = _markdown_inline(str(session.get("task_summary", ""))[:60]) or "-"
+            lines.append(f"{session_id} | {timestamp} | {_score(session)} | {summary}")
     return CommandResult(response_text="\n".join(lines))
 
 

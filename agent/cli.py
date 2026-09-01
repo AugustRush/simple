@@ -8,6 +8,7 @@ import logging
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 from typing import Any, Callable, Optional, Sequence
 
@@ -961,6 +962,7 @@ async def _interactive_loop_body(
             logging.lastResort = _previous_last_resort  # type: ignore[assignment]
         if old_sigint is not None:
             signal.signal(signal.SIGINT, old_sigint)
+
         if memory_worker:
             memory_worker.stop()
             await memory_worker.wait()
@@ -1035,8 +1037,15 @@ def _acquire_home_lock_or_exit(mode: str):
 
 
 @app.callback(invoke_without_command=True)
-def main_callback(ctx: typer.Context):
+def main_callback(
+    ctx: typer.Context,
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Session name (default: ~/.agent)"
+    ),
+):
     """Enter interactive chat when no subcommand is given."""
+    if isinstance(name, str):
+        agent_module._set_agent_home(shared.session_home(name))
     if ctx.invoked_subcommand is None:
         home_lock = _acquire_home_lock_or_exit("cli")
         try:
@@ -1066,7 +1075,7 @@ def main_callback(ctx: typer.Context):
 @app.command()
 def gateway(
     name: Optional[str] = typer.Option(
-        None, "--name", help="Instance name for multi-tenant isolation (default: ~/.agent)"
+        None, "--name", help="Session name (default: ~/.agent)"
     ),
 ):
     """Start all configured external channels (Feishu, etc.).
@@ -1074,15 +1083,15 @@ def gateway(
     Reads channel configuration from the agent home directory.
     Runs until interrupted (Ctrl-C) or all channels disconnect.
 
-    Use --name to run multiple isolated instances::
+    Use --name to run a named session::
 
-        simple gateway --name prod    # -> ~/.agent-prod/
-        simple gateway --name dev     # -> ~/.agent-dev/
-        simple gateway                # -> ~/.agent/
+        simple gateway --name prod    # data -> ~/.agent-prod/, config shared from ~/.agent
+        simple gateway --name dev     # data -> ~/.agent-dev/
+        simple gateway                # data -> ~/.agent/
     """
     if isinstance(name, str):
-        agent_module._set_agent_home(Path.home() / f".agent-{name}")
-    # After _set_agent_home so --name instances lock their own home.
+        agent_module._set_agent_home(shared.session_home(name))
+    # After _set_agent_home so each named session locks its own home.
     home_lock = _acquire_home_lock_or_exit("gateway")
     cfg, first_run = agent_module.load_config()
     _configure_runtime_logging()
@@ -1140,6 +1149,7 @@ def gateway(
         asyncio.run(_run())
     finally:
         home_lock.release()
+
 
 
 @app.command()
@@ -1490,12 +1500,12 @@ def scheduler(
     poll_seconds: Optional[float] = typer.Option(None, "--poll-seconds", min=0.1),
     lease_seconds: Optional[int] = typer.Option(None, "--lease-seconds", min=3),
     name: Optional[str] = typer.Option(
-        None, "--name", help="Instance name for multi-tenant isolation (default: ~/.agent)"
+        None, "--name", help="Session name (default: ~/.agent)"
     ),
 ):
     """Run the persistent scheduler service."""
     if isinstance(name, str):
-        agent_module._set_agent_home(Path.home() / f".agent-{name}")
+        agent_module._set_agent_home(shared.session_home(name))
     cfg, first_run = agent_module.load_config()
     if first_run:
         if not agent_module._first_run_setup():

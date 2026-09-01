@@ -123,7 +123,7 @@ TASKS_DIR = AGENT_HOME / "tasks"
 
 
 def _set_agent_home(home: Path) -> None:
-    """Switch to a different agent home (``--name`` multi-instance support).
+    """Switch to a different agent home (``--name`` named-session support).
 
     ``shared._set_agent_home`` rewrites the shared derived paths; this wrapper
     additionally refreshes TASKS_DIR (the Ralph task store), which is captured

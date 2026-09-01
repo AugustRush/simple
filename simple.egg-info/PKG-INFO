@@ -12,6 +12,9 @@ Requires-Dist: mcp
 Requires-Dist: prompt_toolkit
 Provides-Extra: feishu
 Requires-Dist: lark-oapi; extra == "feishu"
+Provides-Extra: web
+Requires-Dist: starlette; extra == "web"
+Requires-Dist: uvicorn; extra == "web"
 
 # Simple — Personal AI Agent
 
@@ -54,27 +57,87 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **Unified event stream** | Every tool call, hook, and lifecycle fact is a replayable `RuntimeEvent` |
 | **LLM retry** | Transient API errors (rate limit, 5xx) retried 3x with exponential backoff |
 | **Config validation** | Startup warnings for typos and invalid values — never blocks startup |
-| **Multi-instance** | `--name prod` for isolated instances with independent config and data |
+| **Named sessions** | `--name prod` for isolated session data with shared config by default |
 | **Plugin hooks** | 8 lifecycle hooks: prompt submit, tool matchers, command hooks, continue loop |
 | **Vision** | Image attachments sent directly to vision-capable models (Anthropic, OpenAI) |
 | **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
 
-## Examples
+### Measuring retrieval quality
 
-### Multi-instance deployment
+Memory recall is the system's core value, so it has an instrument rather than
+only a latency benchmark:
 
 ```bash
-# Production instance
-uv run simple gateway --name prod    # -> ~/.agent-prod/{config.json,palace.db,...}
-
-# Development instance with its own config
-uv run simple gateway --name dev     # -> ~/.agent-dev/
-
-# Default (no --name)
-uv run simple gateway                # -> ~/.agent/
+uv run python scripts/eval_retrieval.py            # recall@k / MRR by capability
+uv run python scripts/eval_retrieval.py --compare  # diff against the pinned baseline
+uv run python scripts/eval_retrieval.py --harvest  # seed a local set from your own store
 ```
 
-Each named instance has independent config, memory, context database, scheduler, skills, and plugins.
+It drives the production path (`ContextManager.rank_ltm_entries`) over a
+labeled set in `tests/eval/`, and separates the two failure modes that look
+identical from outside:
+
+- **`candidate_recall`** — did stage 1 (FTS) even fetch the right entry? This
+  is a hard ceiling; ranking cannot recover what was never retrieved.
+- **`recall@k` / `mrr`** — given the candidates, did stage 2 rank it well?
+
+What it found: the failures are stage 1, not ranking, and the fix is the
+query rather than the algorithm. Memory search is **lexical** — it matches
+words, not meanings — so one unmodified user question misses a memory that
+says the same thing differently, or says it in the other language. Re-asking
+fixes essentially all of it:
+
+| | single query | with reformulation |
+|---|---|---|
+| `candidate_recall` | 0.696 | 1.000 |
+| `mrr` | 0.609 | 1.000 |
+| `cross-lingual` | 0.143 | 1.000 |
+| `paraphrase` | 0.385 | 1.000 |
+
+That is why `context_retrieve` takes **`queries`** (a list), not `query`: the
+parameter shape makes reformulation the default path, which a sentence in a
+tool description does not reliably achieve. `--multi-query` reproduces the
+right-hand column. Treat it as an upper bound — the reformulations are
+authored, so it shows what the approach can reach, not what a given model
+will produce.
+
+`tests/test_retrieval_quality.py` guards the pinned baseline in CI. Re-pin
+with `--save-baseline` after an intentional change, and read the tag
+breakdown first.
+
+
+## Examples
+
+### Named sessions
+
+`--name` selects a session for both the gateway and the CLI.  Each session has
+its own data directory but shares the default agent configuration unless it
+explicitly overrides it with its own `config.json`:
+
+```bash
+# Session "prod" — data in ~/.agent-prod/, config shared from ~/.agent/config.json
+uv run simple gateway --name prod
+uv run simple --name prod
+
+# Session "dev" with its own config override
+mkdir -p ~/.agent-dev
+cp ~/.agent/config.json ~/.agent-dev/config.json
+uv run simple gateway --name dev
+
+# Default session
+uv run simple gateway                # -> ~/.agent/
+uv run simple                        # -> ~/.agent/
+```
+
+Each named session has independent memory, context database, scheduler,
+staging, and skills; agent configuration (provider, model, system prompt,
+channels) is shared from `~/.agent/config.json` by default.  A session only
+uses its own config when `~/.agent-<name>/config.json` exists.
+
+`/sessions` lists the discoverable sessions and their config source.  Sessions
+are isolated worlds; cross-session interaction stays at the filesystem level
+(read another session's data when needed) rather than keeping multiple live
+working memories in one process.
 
 ### Feishu Gateway
 
@@ -103,6 +166,74 @@ Configure in `~/.agent/config.json`:
   }
 }
 ```
+
+### Web frontend
+
+The gateway can also serve an HTTP/WebSocket API for a browser frontend.  The
+web channel is just another channel, so it shares the same session machinery
+as Feishu (one conversation id per chat thread).
+
+```bash
+# Install web dependency
+uv sync --extra web
+
+# Start gateway with the web channel enabled
+uv run simple gateway
+
+# In a named session
+uv run simple gateway --name prod
+```
+
+Configure in `~/.agent/config.json`:
+```json
+{
+  "channels": {
+    "web": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 8787,
+      "auth_token": "",
+      "cors_origins": ["http://localhost:5173"]
+    }
+  }
+}
+```
+
+The gateway serves a built-in React + Ant Design UI at
+`http://127.0.0.1:8787/`:
+
+```bash
+uv sync --extra web
+uv run simple gateway
+# open http://127.0.0.1:8787/
+```
+
+The React UI provides chat, session management, plugin/skill browsing, settings
+editing, command palette and streamed responses, all through the same
+`/api/...` endpoints.  Or use the API directly:
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | Built-in React UI |
+| GET | `/api/health` | Health check |
+| GET | `/api/commands` | Commands available in the web channel |
+| GET | `/api/config` / POST | Read masked config / save config |
+| GET | `/api/plugins` | List loaded plugins |
+| GET | `/api/skills` | List loaded skills |
+| GET | `/api/context` | Context-manager statistics |
+| GET | `/api/sessions` | List sessions in the current agent home |
+| POST | `/api/sessions` | Create a session id |
+| PATCH | `/api/sessions/{id}` | Rename a session (`{"title": "..."}`) |
+| DELETE | `/api/sessions/{id}` | Delete a session's durable history |
+| POST | `/api/plugins/{name}/toggle` | Enable/disable a plugin (`{"enabled": true/false}`) |
+| GET | `/api/sessions/{id}/messages` | Recent messages for a session |
+| POST | `/api/sessions/{id}/messages` | Send a message (non-streaming) |
+| WS | `/api/sessions/{id}/stream` | Streaming events (`stream_chunk`, `tool_start`, `status`, `confirm_request`, `attachment`, `turn_complete`, …) |
+| GET | `/api/files?path=…` | Download a file from the current agent home |
+
+`auth_token` is empty by default because the server binds to localhost.  Set it
+when exposing the port beyond the local machine, and put the frontend behind
+HTTPS with `Authorization: Bearer <token>` (or `X-Auth-Token`).
 
 ### Scheduling tasks
 
@@ -373,6 +504,7 @@ Key config sections:
 | `file_access` | Startup-only workspace read/write policy plus resource limits for file tools (see [File access](#file-access)) |
 | `permissions.shell_level` | Default shell permission level: `ask`, `medium`, `high`, or `full` (see [Shell permissions](#shell-permissions)) |
 | `permissions.shell_sandbox` | OS sandbox mode: `restricted`, `read_all` (default), or `none` (danger-full-access, `full` level only) |
+| `permissions.shell_secret_paths` | Extra home-relative paths the sandboxed shell may neither read nor write (e.g. `[".ssh", ".docker", ".kube"]`); extends the built-in secret set |
 | `permissions.shell_devices` | Device/service access (Metal/IOKit) inside the sandbox; **default `true`** (set `false` for the strictest posture) |
 | `shell_allowed_commands` | Persistent shell allowlist that skips confirmation (see [Shell permissions](#shell-permissions)) |
 | `assistant_identity` | Deterministic assistant name/role for fact recall |
@@ -436,26 +568,77 @@ Permission levels (most → least restrictive):
 | `medium` | auto | auto | confirm |
 | `high` / `full` | auto | auto | auto |
 
+> **You almost certainly do not need `shell_sandbox: none`.** The usual reason
+> people reach for it is GPU access, and that is a different knob:
+> `shell_devices` (default `true`) exposes Metal/IOKit inside the sandbox.
+> Measured on macOS: PyTorch MPS and MLX both run under `read_all` with
+> `shell_devices: true`, identical to unsandboxed, and both fail with
+> `shell_devices: false`. Before disabling the sandbox, match the failure to
+> its knob:
+>
+> | Symptom | Knob |
+> |---|---|
+> | GPU / Metal / MLX unavailable | `shell_devices: true` (already the default) |
+> | Cannot write inside the workspace | an approved `write_scope` |
+> | Cannot read a credential dir you need | remove it from `shell_secret_paths` |
+> | Cannot read outside the workspace | `shell_sandbox: read_all` (the default) |
+> | A tool nests its own sandbox (Chrome/Electron) | `--no-sandbox` / `ELECTRON_DISABLE_SANDBOX=1` |
+>
+> When the sandbox *is* off, the agent says so on every start and in
+> `/permissions`. `none` is a task-scoped decision — prefer
+> `/permissions sandbox session none` over the persistent form, so it expires
+> with the session instead of outliving the reason you needed it.
+
 Shell sandbox modes:
 
 | Mode | Reads | Writes | Notes |
 |---|---|---|---|
-| `restricted` | System dirs + workspace/output only | Open by default; user data + workspace denied | Reads are the locked-down axis |
-| `read_all` (default) | **Whole machine** | Open by default; user data + workspace denied | Local tooling just works; documents/credentials stay write-protected |
+| `restricted` | System dirs + workspace/output only | Open by default; secrets, autostart, user data + workspace denied | Reads are the locked-down axis |
+| `read_all` (default) | **Whole machine except secrets** | Open by default; secrets, autostart, user data + workspace denied | Local tooling just works; credentials stay unreadable |
 | `none` | Everything | Everything | Danger-full-access: no OS sandbox, GPU/Metal reachable. **Only valid with `shell_level: full`** |
 
-Writes are **open by default** — the sandbox protects user data, not tool
-behavior.  There is no per-tool allowlist (npm caches, HuggingFace downloads,
-Chrome/Electron state, MCP servers and temp dirs all just work).  The only
-write denials are protected user-data surfaces: documents/media
-(`~/Documents`, `~/Desktop`, `~/Downloads`, `~/Movies`, `~/Music`,
-`~/Pictures`), keychains and personal library data, credentials
-(`~/.ssh`, `~/.aws`, `~/.azure`, `~/.kube`, `~/.docker`, `~/.git-credentials`,
-`~/.netrc`, `~/.gitconfig`), the workspace unless a `write_scope` explicitly
-reopens it, and the agent's internal bookkeeping.  GUI/rendering workloads
-(headless Chrome, Electron screenshots) receive the generic system
-facilities App Store GUI apps get from `application.sb` (process-local mach
-bootstrap, app-sandbox file extensions, preference reads).
+Writes are **open by default** — there is no per-tool allowlist (npm caches,
+HuggingFace downloads, Chrome/Electron state, MCP servers and temp dirs all
+just work).  The explicit denials name three asset classes, chosen by what an
+attacker gains rather than by where the user files things:
+
+**1. Secrets — denied for read *and* write.**  A write boundary does nothing
+for a credential: the damaging act is reading it and shipping it out, and the
+sandbox allows unrestricted network.  Covers `~/.aws`, `~/.azure`, `~/.gnupg`,
+`~/.netrc`, `~/.git-credentials`, `~/.config/gh`, `~/.config/gcloud`,
+`~/Library/Keychains`, `~/.claude.json`, and the agent's own home (its
+`config.json` holds your provider API keys).
+
+`~/.ssh`, `~/.docker` and `~/.kube` are **not** read-denied by default —
+`git push` over SSH, `docker` and `kubectl` all need them, and a default that
+breaks `git push` just gets switched off wholesale.  Add them when the
+instance does not need those tools:
+
+```json
+{ "permissions": { "shell_secret_paths": [".ssh", ".docker", ".kube"] } }
+```
+
+**2. Later-executed code — write denied.**  Escaping a write sandbox never
+means defeating seatbelt; it means leaving a line for the user's next login
+shell to run.  Covers shell rc files (`~/.zshrc`, `~/.zshenv`, `~/.zprofile`,
+`~/.bashrc`, `~/.profile`, `~/.config/fish`, …), launchd drop points
+(`~/Library/LaunchAgents`, `/Library/LaunchDaemons`, …) and PATH directories
+(`/usr/local/bin`, `/opt/homebrew/bin`, `~/.local/bin`, `~/bin`).
+
+**3. User data — write denied.**  Documents/media (`~/Documents`, `~/Desktop`,
+`~/Downloads`, `~/Movies`, `~/Music`, `~/Pictures`), personal library data,
+the workspace unless a `write_scope` explicitly reopens it, and the agent's
+internal bookkeeping.
+
+GUI/rendering workloads (headless Chrome, Electron screenshots) receive the
+generic system facilities App Store GUI apps get from `application.sb`
+(process-local mach bootstrap, app-sandbox file extensions, preference reads).
+
+> **What this sandbox is for.** It contains accidents and injected
+> instructions, not a determined attacker who already has code execution.
+> Reads outside the secret set stay open in `read_all`, and network egress is
+> unrestricted — so a command that genuinely wants to exfiltrate something no
+> list anticipated can. Use `restricted` when that matters.
 
 The shell tool takes a `root` parameter (`output_dir` by default, or
 `workspace`) and resolves relative `cwd` values inside that root.  Generated
@@ -558,19 +741,23 @@ uv run simple
 uv run simple chat "Summarize this repository"
 ```
 
-### Multi-instance deployment
+### Named sessions
 
-Run multiple isolated instances with `--name`:
+Run a named session with `--name`:
 
 ```bash
-uv run simple gateway --name prod    # -> ~/.agent-prod/
-uv run simple gateway --name dev     # -> ~/.agent-dev/
-uv run simple gateway                # -> ~/.agent/ (default)
+uv run simple gateway --name prod    # data -> ~/.agent-prod/
+uv run simple gateway --name dev     # data -> ~/.agent-dev/
+uv run simple gateway                # data -> ~/.agent/ (default)
 ```
 
-Each instance has completely independent config, memory, context database, scheduler, skills, and plugins. Also works with `--name` on any service command:
+Each session has independent memory, context database, scheduler, staging,
+skills, and plugins.  Agent configuration is shared from `~/.agent/config.json`
+by default; place a `config.json` in the session directory to override it.
+`--name` also works on the CLI and scheduler:
 
 ```bash
+uv run simple --name prod
 uv run simple scheduler --name prod
 ```
 
@@ -592,6 +779,17 @@ Or install globally:
 uv tool install --reinstall --editable . --with lark-oapi
 simple gateway
 ```
+
+### Web channel
+
+Serve the HTTP/WebSocket API for a browser frontend:
+
+```bash
+uv sync --extra web
+uv run simple gateway
+```
+
+See [Web frontend](#web-frontend) for the endpoint table and configuration.
 
 ### Scheduler service
 
@@ -680,7 +878,7 @@ falls back to the classic line-by-line prompt automatically.
 | `/help` | Show commands available in this channel |
 | `/memory` | Memory export summary |
 | `/context` | Long-term context statistics |
-| `/sessions` | List recent session history |
+| `/sessions` | List named sessions and recent scored history |
 | `/session <id>` | View session details by ID prefix |
 | `/tools` | List available tools |
 | `/skills` | List available skills |
@@ -779,12 +977,49 @@ takes the same path. Both enforce the same pipeline:
 2. **Out-of-process import probe** — the module is imported in a subprocess and
    reports the tools it registers, so a module that raises, blocks, or exits
    cannot take the live session with it.
-3. **Human confirmation** — activation runs the module inside the agent
-   process, so it requires an explicit approval. The approval is recorded
+3. **Human confirmation** — activation requires explicit approval, recorded
    against a hash of the file's contents in `~/.agent/tools/.approved.json`: it
    survives restarts, and editing the file revokes it.
 4. **Hot load** — on approval the tool is registered in the running session; no
    restart and no manual file renaming.
+
+#### User tools never run in the agent process
+
+A user tool is Python the *model wrote*. Loading it with `exec_module` — the
+old behaviour — handed it everything the agent has: the provider API keys in
+memory and in `config.json`, the memory database, the tool registry it could
+rewrite, and the event loop it could block. That made the least-trusted code
+in the system the only code with no boundary around it, while the shell tool,
+which merely runs commands, had an OS sandbox.
+
+Loading now probes the module out of process for its schema and registers a
+**proxy**. Each call runs the tool body in a fresh child process:
+
+| | In-process (before) | Child process (now) |
+|---|---|---|
+| Provider API keys | readable | unreachable (`config.json` is sandbox-denied) |
+| Registry / agent state | mutable | unreachable |
+| `sys.exit`, crash, hang | takes the session down | kills the child only |
+| Runaway tool | unbounded | killed on timeout |
+| Cost | ~0 | ~25–35 ms per call |
+
+This holds at every `shell_sandbox` setting — **process isolation is not the
+same thing as a sandbox**, and it is worth something even at `none`. When a
+sandbox mode *is* configured, the same profile the shell tool uses is applied
+on top, so tools inherit the credential-read and autostart-write denials
+rather than needing a policy of their own.
+
+One behavioural change: module-level state no longer persists between calls,
+since each invocation is a fresh interpreter. For model-authored code that is
+closer to a fix than a regression, but a tool that memoized in a module-level
+dict will now recompute.
+
+> **Plugins are deliberately still in-process.** `~/.agent/plugins/` is loaded
+> with `exec_module` and has the same access a user tool used to. The trust
+> story differs — a plugin is something *you* installed, like an editor
+> extension, whereas a user tool is something the *model* wrote — and plugin
+> hooks pass rich objects and mutate prompts mid-turn, so the boundary is not
+> a simple RPC. Treat installing a plugin as running its author's code.
 
 Third-party packages go through `install_tool_dependency`, which runs
 `pip install --target ~/.agent/tools/_deps`. That directory is prepended to
@@ -975,18 +1210,31 @@ AgentCore.handle_turn(TurnInput, RuntimeSessionState)
         ├── on_prompt_submit hooks (block / inject context)
         ├── skill parsing & hot-reload
         ├── TurnRunner.run() → BaseAgent.send_message()
+        │       ├── step loop: one model request + the tools it calls
         │       ├── LLM retry (3x exponential backoff on transient errors)
         │       ├── Tool execution (RegularToolExecutor)
         │       │       ├── Intent-before-action protocol
         │       │       └── Plugin pre/post hooks
         │       └── EventCollector (ContextVar-scoped)
         ├── complete_turn() → plugin hooks, staging, consolidation
-        └── TurnExecution { result, iterations, events: tuple[RuntimeEvent, ...] }
+        └── TurnExecution { result, continuation_rounds, events: tuple[RuntimeEvent, ...] }
 ```
+
+**Turn / step / continuation** name three different counts:
+
+| Term | Scope | Where counted |
+|---|---|---|
+| **step** | one model request plus the tools that request calls | `BaseAgent.send_message`, reported as `step_started` / `step_ended`; bounded by `max_steps` |
+| **continuation round** | one pass of the turn loop (round 1 is the initial completion) | `TurnExecution.continuation_rounds` |
+| **turn** | the whole processing of one user input | `TurnRunner.run()` |
 
 Key properties:
 - **Transport-neutral**: same turn boundary for CLI and Feishu
 - **Replayable event stream**: every tool call, hook, and lifecycle fact is a `RuntimeEvent`
+- **Context rewrites are logged**: the two paths that change what the model already
+  saw — compaction and content-filter rollback — emit `consolidation_compaction`
+  and `context_rolled_back` carrying the dropped roles and token estimate, so
+  "never retrieved" stays distinguishable from "retrieved, then dropped"
 - **Intent-before-action**: write/shell tools require the assistant to declare intent first
 - **LLM retry**: transient API errors (rate limits, 5xx) retried with exponential backoff
 
@@ -1029,11 +1277,12 @@ server diagnostics cannot overwrite the interactive CLI input line.
 │   ├── core/           # BaseAgent, AgentContext, OutputSink, RuntimeEvent, EventCollector
 │   ├── memory/         # LTMStore, MemoryPalace, ConsolidationEngine, StagingBuffer
 │   ├── tools/          # ToolRegistry, BuiltinTools, MCPClient, UserToolCatalog, executor
+│   ├── exec/           # SubprocessProvider seam: one place children are spawned
 │   ├── runtime/        # AgentCore, TurnInput, TurnResult, TurnExecution, TurnRunner
 │   ├── orchestration/  # OrchestrationPlanner, parallel/pipeline/rendezvous execution
 │   ├── channels/       # Channel ABC, CliChannel, ChannelRunner, Feishu/Lark channel
 │   ├── scheduler/      # SchedulerService, SchedulerStore, triggers, delivery
-│   ├── security/       # Shell command blocking (chmod/kill/eval/python -c)
+│   ├── security/       # Shell command blocking; sandbox/ = policy + per-OS backends
 │   ├── skills/         # SkillBundle, SkillCatalog, skill parsing, hot-reload
 │   ├── plugins/        # PluginCatalog, AgentPlugin protocol, HookResult, lifecycle
 │   ├── _builtin/       # Built-in plugins (evolution) and skills (daily-summary, etc.)
@@ -1041,7 +1290,7 @@ server diagnostics cannot overwrite the interactive CLI input line.
 │   ├── config.py       # Config loading, validation, ModelClientFactory, system prompt
 │   ├── bootstrap.py    # Component wiring from config
 │   ├── evolution.py    # Session scoring, prompt rewriting, tool generation
-│   ├── shared.py       # Paths, defaults, tracing, multi-instance support
+│   ├── shared.py       # Paths, defaults, tracing, named-session support
 │   └── pathing.py      # Path resolution and workspace containment
 ├── scripts/
 │   └── benchmark_memory.py
@@ -1065,4 +1314,11 @@ uv run pytest tests/test_scheduler.py -q
 python scripts/benchmark_memory.py --sizes 1000 10000 --search-runs 10
 ```
 
-Latest verification: `uv run pytest -q` → `569 passed, 1 skipped`
+`tests/test_sandbox_conformance.py` spawns real sandboxed children and asks the
+OS what they are actually permitted to do, rather than reading the generated
+profile. It skips only when the host has no enforcing sandbox at all — so if
+macOS detection ever breaks, those tests fail instead of quietly skipping while
+nothing is enforced. `tests/test_filesystem_sandbox.py` keeps what is genuinely
+seatbelt-specific: the generated `.sb` text and its cache key.
+
+Latest verification: `uv run pytest -q` → `1757 passed, 1 skipped`

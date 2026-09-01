@@ -290,6 +290,11 @@ class LTMStore:
                     ON conversation_turns(session_id, id);
                 CREATE INDEX IF NOT EXISTS idx_conversation_turns_created_at
                     ON conversation_turns(created_at);
+                CREATE TABLE IF NOT EXISTS session_meta (
+                    session_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS session_working_state (
                     session_id TEXT PRIMARY KEY,
                     state_json TEXT NOT NULL,
@@ -1176,6 +1181,102 @@ class LTMStore:
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_conversation_turn(row) for row in reversed(rows)]
+
+    def list_session_ids(
+        self,
+        prefix: str = "",
+        limit: int = 50,
+    ) -> list[tuple[str, str, int]]:
+        """Return distinct journaled sessions, most recently active first.
+
+        Each item is ``(session_id, last_activity_iso, turn_count)``.  This
+        enumerates the durable conversations recorded in the
+        ``conversation_turns`` journal for the current agent home (for example
+        the per-chat sessions a gateway multiplexes).
+        """
+        limit = max(1, min(int(limit), 500))
+        clean_prefix = str(prefix or "").strip()
+        with self._connect() as conn:
+            if clean_prefix:
+                rows = conn.execute(
+                    """
+                    SELECT session_id, MAX(created_at) AS last_activity,
+                           COUNT(*) AS turns
+                    FROM conversation_turns
+                    WHERE session_id LIKE ?
+                    GROUP BY session_id
+                    ORDER BY last_activity DESC, session_id ASC
+                    LIMIT ?
+                    """,
+                    (clean_prefix + "%", limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT session_id, MAX(created_at) AS last_activity,
+                           COUNT(*) AS turns
+                    FROM conversation_turns
+                    GROUP BY session_id
+                    ORDER BY last_activity DESC, session_id ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        return [
+            (
+                str(row["session_id"]),
+                str(row["last_activity"] or ""),
+                int(row["turns"] or 0),
+            )
+            for row in rows
+        ]
+
+    def delete_conversation_session(self, session_id: str) -> None:
+        """Delete a conversation session's journaled turns and working state."""
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM conversation_turns WHERE session_id = ?",
+                (clean_session_id,),
+            )
+            conn.execute(
+                "DELETE FROM session_working_state WHERE session_id = ?",
+                (clean_session_id,),
+            )
+            conn.execute(
+                "DELETE FROM agent_events WHERE session_id = ?",
+                (clean_session_id,),
+            )
+            conn.execute(
+                "DELETE FROM session_meta WHERE session_id = ?",
+                (clean_session_id,),
+            )
+
+    def set_session_title(self, session_id: str, title: str) -> None:
+        clean_session_id = str(session_id or "").strip()
+        if not clean_session_id:
+            return
+        clean_title = str(title or "").strip()[:120]
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO session_meta (session_id, title, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    title = excluded.title,
+                    updated_at = excluded.updated_at
+                """,
+                (clean_session_id, clean_title, _now()),
+            )
+
+    def list_session_titles(self) -> dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT session_id, title FROM session_meta WHERE title <> ''"
+            ).fetchall()
+        return {str(row["session_id"]): str(row["title"]) for row in rows}
 
     def search_conversation_turns(
         self,

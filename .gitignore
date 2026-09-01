@@ -4,3 +4,7 @@ outputs
 
 # Eval sets harvested from a real ~/.agent store contain personal memories.
 tests/eval/*.local.json
+
+# Web frontend
+frontend/node_modules/
+frontend/dist/

@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="zh" data-theme="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Simple Agent</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--panel-2:#1c212b;--border:#262b35;--text:#e6e8ee;--muted:#8b93a7;--accent:#4f8cff;--accent-soft:#1a2233;--ok:#34d399;--err:#f87171;--radius:12px;--radius-sm:8px}
+html[data-theme="light"]{--bg:#f5f7fb;--panel:#fff;--panel-2:#eef1f7;--border:#dfe4ee;--text:#1f2430;--muted:#6b7280;--accent:#2563eb;--accent-soft:#e8efff;--ok:#059669;--err:#dc2626}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);height:100vh;display:flex;overflow:hidden}
+button{font:inherit;background:var(--panel-2);color:var(--text);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 12px;cursor:pointer;transition:border-color .15s,background .15s}button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border:none;color:#fff}button.danger{background:transparent;border-color:var(--err);color:var(--err)}
+input,textarea{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:var(--radius-sm);padding:10px 12px;outline:none;transition:border-color .15s,box-shadow .15s}input:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(79,140,255,.15)}
+#sidebar{width:300px;min-width:300px;background:var(--panel);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:16px;gap:14px}
+.brand{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:700}.brand .logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),#7c3aed);display:flex;align-items:center;justify-content:center;color:#fff}
+.side-section{display:flex;flex-direction:column;gap:8px;min-height:0}.side-title{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+#sessions{overflow-y:auto;display:flex;flex-direction:column;gap:6px;flex:1}
+.session{padding:10px;border:1px solid transparent;border-radius:var(--radius-sm);cursor:pointer;transition:background .15s;font-size:13px}.session:hover{background:var(--panel-2)}.session.active{background:var(--accent-soft);border-color:var(--accent)}
+.session .s-title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session .s-meta{font-size:11px;color:var(--muted);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sidebar-footer{display:flex;gap:8px;border-top:1px solid var(--border);padding-top:12px}
+#main{flex:1;display:flex;flex-direction:column;min-width:0}#topbar{height:56px;min-height:56px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 20px;gap:12px}
+#topbar .title{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#topbar .actions{display:flex;gap:6px;align-items:center}#topbar .actions button.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+.view{flex:1;display:flex;flex-direction:column;min-height:0}.view.hidden{display:none}
+#view-chat .messages{flex:1;overflow-y:auto;padding:28px;display:flex;flex-direction:column;gap:14px}
+.empty-state{margin:auto;text-align:center;color:var(--muted)}.empty-state .big{font-size:36px;margin-bottom:8px}
+.msg{max-width:80%;padding:10px 14px;border-radius:14px;line-height:1.55;font-size:14px;white-space:pre-wrap;word-break:break-word}
+.msg.user{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}.msg.assistant{align-self:flex-start;background:var(--panel);border:1px solid var(--border);border-bottom-left-radius:4px}
+.msg.tool{align-self:center;background:var(--panel-2);color:var(--muted);font-size:12px;border-radius:999px;padding:6px 12px;white-space:normal}.msg.error{align-self:center;color:var(--err);font-size:13px}
+.msg.command{align-self:stretch;background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);font-size:13px;white-space:normal;max-width:none}
+.msg.command h1,.msg.command h2,.msg.command h3{margin:6px 0;font-size:14px}.msg.command h1{font-size:16px}.msg.command h2{font-size:15px}.msg.command pre{background:var(--bg);padding:10px;border-radius:8px;overflow-x:auto}.msg.command code{background:var(--bg);padding:1px 5px;border-radius:4px}
+.msg.command table{border-collapse:collapse;font-size:12px;margin:8px 0}.msg.command td,.msg.command th{border:1px solid var(--border);padding:6px 8px;text-align:left}
+.stream-cursor{display:inline-block;width:7px;height:16px;background:var(--accent);vertical-align:text-bottom;animation:blink 1s steps(2,start) infinite}@keyframes blink{50%{opacity:0}}
+.composer{display:flex;align-items:flex-end;gap:10px;padding:16px 20px;border-top:1px solid var(--border);background:var(--panel)}.composer textarea{flex:1;resize:none;min-height:44px;max-height:120px}.composer .hint{font-size:11px;color:var(--muted);margin-top:4px}
+.panel{flex:1;overflow-y:auto;padding:24px 28px}.panel h2{margin:0 0 18px;font-size:18px}.row{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+label input,label select{width:100%}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:10px}.card h3{margin:0 0 6px;font-size:14px;display:flex;align-items:center;justify-content:space-between}.card p{margin:0;color:var(--muted);font-size:12px;white-space:pre-wrap}.card .meta{color:var(--muted);font-size:11px;margin-top:8px}
+.table{width:100%;border-collapse:collapse;font-size:13px;background:var(--panel);border-radius:var(--radius);overflow:hidden}.table th,.table td{border-bottom:1px solid var(--border);padding:10px 12px;text-align:left;vertical-align:top}.table th{background:var(--panel-2);color:var(--muted);font-size:12px}.table tr:last-child td{border-bottom:none}
+#settings-editor{width:100%;min-height:420px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.5}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);display:none;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(2px)}.modal-overlay.show{display:flex}
+.modal{background:var(--panel);border:1px solid var(--border);border-radius:16px;padding:22px;max-width:640px;width:92%;max-height:82vh;display:flex;flex-direction:column;gap:14px;box-shadow:0 20px 60px rgba(0,0,0,.4)}.modal h3{margin:0;font-size:16px}.modal .hint{color:var(--muted);font-size:12px}.modal-actions{display:flex;gap:8px;justify-content:flex-end}
+#command-list{overflow-y:auto;display:flex;flex-direction:column;gap:6px}.command-item{padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);cursor:pointer}.command-item:hover{border-color:var(--accent);background:var(--accent-soft)}.command-item .usage{font-weight:600;font-size:13px}.command-item .desc{color:var(--muted);font-size:11px}
+#confirm-detail{white-space:pre-wrap;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;color:var(--muted);font-size:13px}
+#toasts{position:fixed;top:16px;right:16px;display:flex;flex-direction:column;gap:8px;z-index:200}.toast{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:8px;padding:10px 14px;font-size:13px;box-shadow:0 8px 30px rgba(0,0,0,.25);animation:slide-in .2s ease}.toast.ok{border-left-color:var(--ok)}.toast.err{border-left-color:var(--err)}
+@keyframes slide-in{from{transform:translateX(20px);opacity:0}to{transform:none;opacity:1}}
+@media(max-width:760px){#sidebar{width:230px;min-width:230px;padding:12px}}
+</style>
+</head>
+<body>
+<aside id="sidebar"><div class="brand"><span class="logo">🤖</span><span>Simple Agent</span></div><div class="side-section"><div class="side-title">访问令牌</div><input id="token" placeholder="auth_token（可选）" autocomplete="off" /></div><div class="side-section" style="flex:1"><div class="side-title">会话</div><button id="new-session" style="width:100%;margin-bottom:4px">＋ 新建会话</button><div id="sessions"></div></div><div class="sidebar-footer"><button id="command-btn" style="flex:1">⌘ 命令</button><button id="theme-toggle" title="切换主题">🌓</button></div></aside>
+<main id="main"><header id="topbar"><div class="title" id="active-title">开始新的对话</div><div class="actions"><button class="active" data-view="chat"><span>💬</span> Chat</button><button data-view="sessions"><span>📂</span> 会话</button><button data-view="plugins"><span>🔌</span> 插件</button><button data-view="skills"><span>🧩</span> 技能</button><button data-view="settings"><span>⚙️</span> 设置</button></div></header>
+<section id="view-chat" class="view"><div id="messages" class="messages"></div><div class="composer"><div style="flex:1;display:flex;flex-direction:column"><textarea id="input" placeholder="输入消息，Enter 发送，Shift+Enter 换行"></textarea><div class="hint">支持 /help、/tools、/skills、/export 等命令</div></div><button id="send" class="primary">发送</button></div></section>
+<section id="view-sessions" class="view panel hidden"><h2>会话管理</h2><div class="row"><input id="session-search" placeholder="搜索标题或 ID…" style="flex:1;min-width:180px" /><button id="refresh-sessions">刷新</button></div><table class="table"><thead><tr><th>标题</th><th>会话 ID</th><th>状态</th><th>轮数</th><th>最近活动</th><th>操作</th></tr></thead><tbody id="sessions-table"></tbody></table></section>
+<section id="view-plugins" class="view panel hidden"><h2>插件</h2><div id="plugins-list"></div></section>
+<section id="view-skills" class="view panel hidden"><h2>技能</h2><div id="skills-list"></div></section>
+<section id="view-settings" class="view panel hidden"><h2>设置</h2><div class="row"><button id="settings-reload">重新读取</button><button id="settings-save" class="primary">保存设置</button></div><div class="card"><h3>基础设置</h3><div class="form-grid"><label>Provider<select id="settings-provider"></select></label><label>Model<input id="settings-model" placeholder="default model" /></label><label>Max tokens<input id="settings-max-tokens" type="number" min="1" /></label><label>Web 频道<input type="checkbox" id="settings-web-enabled" /></label><label>飞书频道<input type="checkbox" id="settings-feishu-enabled" /></label></div></div><div class="card"><h3>高级配置（JSON）</h3><textarea id="settings-editor" spellcheck="false"></textarea></div></section>
+</main>
+<div id="command-modal" class="modal-overlay"><div class="modal"><h3>命令面板</h3><input id="command-search" placeholder="搜索命令…" autocomplete="off" /><div id="command-list"></div><div class="hint">Ctrl+K 打开面板</div></div></div>
+<div id="confirm-modal" class="modal-overlay"><div class="modal"><h3>工具审批</h3><pre id="confirm-detail"></pre><div class="modal-actions"><button id="confirm-deny" class="danger">拒绝</button><button id="confirm-approve" class="primary">允许</button></div></div></div>
+<div id="action-modal" class="modal-overlay"><div class="modal"><h3 id="action-title">确认</h3><div id="action-body"></div><div class="modal-actions"><button id="action-cancel">取消</button><button id="action-confirm" class="primary">确认</button></div></div></div>
+<div id="toasts"></div>
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const sessionsEl = $('sessions'), messagesEl = $('messages');
+  const tokenInput = $('token'), input = $('input'), sendBtn = $('send');
+  let activeSessionId = null, ws = null, assistantEl = null, assistantText = '', currentConfirm = null, commandList = [], currentSessions = [], currentConfig = null;
+
+  const token = () => localStorage.getItem('agent_token') || '';
+  const apiHeaders = () => { const t = token(); return t ? {'Authorization':'Bearer '+t,'X-Auth-Token':t} : {}; };
+  const wsUrl = (sid) => { const t = token(); const qs = t ? '?token='+encodeURIComponent(t) : ''; return `${location.protocol==='https:'?'wss':'ws'}://${location.host}/api/sessions/${sid}/stream${qs}`; };
+
+  tokenInput.value = token();
+  tokenInput.addEventListener('change', () => {
+    localStorage.setItem('agent_token', tokenInput.value.trim());
+    refreshSessions();
+    if (activeSessionId) connectWs(activeSessionId);
+    toast(tokenInput.value.trim() ? '令牌已保存' : '已清除令牌', 'ok');
+  });
+
+  function toast(msg, kind='') {
+    const t = document.createElement('div');
+    t.className = 'toast' + (kind ? ' ' + kind : '');
+    t.textContent = msg;
+    $('toasts').appendChild(t);
+    setTimeout(() => t.remove(), 2800);
+  }
+
+  let currentAction = null;
+  function openActionModal(title, body, onConfirm) {
+    currentAction = { onConfirm };
+    $('action-title').textContent = title;
+    $('action-body').innerHTML = body;
+    $('action-modal').classList.add('show');
+    $('action-cancel').onclick = closeActionModal;
+    $('action-confirm').onclick = async () => {
+      const handler = currentAction && currentAction.onConfirm;
+      closeActionModal();
+      if (handler) await handler();
+    };
+  }
+  function closeActionModal() {
+    $('action-modal').classList.remove('show');
+    currentAction = null;
+  }
+
+  async function api(path, options={}) {
+    const resp = await fetch(path, {...options, headers:{...(options.headers||{}),...apiHeaders()}});
+    if (resp.status === 401) { toast('鉴权失败：请检查 auth_token', 'err'); throw new Error('unauthorized'); }
+    if (!resp.ok) {
+      let msg = '请求失败';
+      try { const b = await resp.json(); msg = b.error || msg; } catch(e) {}
+      toast(msg, 'err');
+      throw new Error(msg);
+    }
+    return resp;
+  }
+
+  function escapeHtml(s) { return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+  function markdownToHtml(text) {
+    let t = escapeHtml(text || '');
+    t = t.replace(/```([\s\S]*?)```/g, (m, code) => '<pre>' + code + '</pre>');
+    t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+    t = t.replace(/^### (.*)$/gm, '<h3>$1</h3>');
+    t = t.replace(/^## (.*)$/gm, '<h2>$1</h2>');
+    t = t.replace(/^# (.*)$/gm, '<h1>$1</h1>');
+    t = t.replace(/^\s*[-*] (.*)$/gm, '• $1');
+    t = t.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>');
+    t = t.replace(/\*([^*]+)\*/g, '<i>$1</i>');
+    t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+    return t;
+  }
+
+  function addMessage(role, text, isMarkdown) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    if (isMarkdown || role === 'command' || role === 'assistant') div.innerHTML = markdownToHtml(text);
+    else div.textContent = text;
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return div;
+  }
+
+  function addAttachment(name, path) {
+    const t = token();
+    const url = '/api/files?path=' + encodeURIComponent(path) + (t ? '&token=' + encodeURIComponent(t) : '');
+    const div = document.createElement('div');
+    div.className = 'msg tool';
+    const a = document.createElement('a');
+    a.href = url;
+    a.textContent = '📎 ' + name;
+    div.appendChild(a);
+    messagesEl.appendChild(div);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return div;
+  }
+
+  function renderMessages(messages) {
+    messagesEl.innerHTML = '';
+    assistantEl = null;
+    if (!messages || !messages.length) {
+      messagesEl.innerHTML = '<div class="empty-state"><div class="big">💬</div><div>开始一个新的对话</div><div style="font-size:12px;margin-top:6px;color:var(--muted)">输入消息或使用 /help 查看可用命令</div></div>';
+      return;
+    }
+    (messages || []).forEach(m => addMessage(m.role, m.content, true));
+  }
+
+  async function refreshSessions() {
+    try {
+      const resp = await api('/api/sessions');
+      const data = await resp.json();
+      sessionsEl.innerHTML = '';
+      if (!data.sessions.length) sessionsEl.innerHTML = '<div style="font-size:12px;color:var(--muted);text-align:center;padding:12px">暂无会话</div>';
+      data.sessions.forEach(s => {
+        const div = document.createElement('div');
+        div.className = 'session' + (s.session_id === activeSessionId ? ' active' : '');
+        const title = document.createElement('div');
+        title.className = 's-title';
+        title.textContent = s.title || '未命名会话';
+        const meta = document.createElement('div');
+        meta.className = 's-meta';
+        meta.textContent = s.session_id.slice(0,12) + (s.live ? ' · live' : '') + (s.turn_count ? ' · ' + s.turn_count + ' 轮' : '');
+        div.appendChild(title); div.appendChild(meta);
+        div.onclick = () => selectSession(s.session_id);
+        sessionsEl.appendChild(div);
+      });
+    } catch (e) {}
+  }
+
+  async function selectSession(sid) {
+    activeSessionId = sid;
+    refreshSessions();
+    assistantEl = null;
+    try {
+      const resp = await api(`/api/sessions/${sid}/messages`);
+      const data = await resp.json();
+      renderMessages(data.messages || []);
+      $('active-title').textContent = (data.messages && data.messages.length ? data.messages[0].content.slice(0, 24) : '会话 ' + sid.slice(0,8)) || ('会话 ' + sid.slice(0,8));
+    } catch (e) {}
+    connectWs(sid);
+  }
+
+  function connectWs(sid) {
+    if (!sid) return;
+    if (ws) { try { ws.close(); } catch (e) {} }
+    $('active-title').textContent = '连接中…';
+    ws = new WebSocket(wsUrl(sid));
+    ws.onopen = () => { $('active-title').textContent = '会话 ' + sid.slice(0,8); };
+    ws.onmessage = (event) => {
+      const evt = JSON.parse(event.data);
+      if (evt.type === 'stream_chunk') {
+        if (!assistantEl) { assistantEl = addMessage('assistant','', true); assistantText=''; }
+        assistantText += evt.chunk;
+        assistantEl.innerHTML = markdownToHtml(assistantText) + '<span class="stream-cursor"></span>';
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      } else if (evt.type === 'turn_complete') {
+        if (!assistantEl && evt.text) assistantEl = addMessage('assistant', evt.text, true);
+        if (assistantEl) assistantEl.innerHTML = markdownToHtml(evt.text || assistantText);
+        assistantEl = null; assistantText = '';
+        refreshSessions();
+      } else if (evt.type === 'tool_start') {
+        addMessage('tool', '🔧 ' + evt.name);
+      } else if (evt.type === 'tool_end') {
+        addMessage('tool', '✅ ' + evt.name);
+      } else if (evt.type === 'tool_progress') {
+        addMessage('tool', '⏳ ' + evt.name + ': ' + JSON.stringify(evt.progress));
+      } else if (evt.type === 'tool_blocked') {
+        addMessage('tool', '⛔ ' + evt.name + ': ' + (evt.reason || 'blocked'));
+      } else if (evt.type === 'status') {
+        addMessage('command', evt.text || '', true);
+      } else if (evt.type === 'info') {
+        addMessage('command', typeof evt.content === 'string' ? evt.content : JSON.stringify(evt.content), true);
+      } else if (evt.type === 'notification') {
+        addMessage('command', '**' + (evt.title || '通知') + '**\n' + (evt.body || ''), true);
+      } else if (evt.type === 'subagent_event') {
+        addMessage('tool', '🤖 ' + (evt.agent || '') + ': ' + (evt.event || '') + ' ' + (evt.detail || ''));
+      } else if (evt.type === 'error') {
+        addMessage('error', evt.error || 'error');
+      } else if (evt.type === 'confirm_request') {
+        showConfirm(evt);
+      } else if (evt.type === 'attachment') {
+        addAttachment(evt.name || evt.path, evt.path);
+      }
+    };
+    ws.onclose = () => { if (activeSessionId === sid) $('active-title').textContent = '连接已断开'; };
+    ws.onerror = () => toast('WebSocket 连接错误', 'err');
+  }
+
+  function showConfirm(evt) {
+    currentConfirm = evt;
+    $('confirm-detail').textContent = ['工具：' + (evt.name || 'unknown'), '风险：' + (evt.risk_level || ''), '命令：' + (evt.command || ''), '原因：' + (evt.reason || '')].join('\n');
+    $('confirm-modal').classList.add('show');
+    $('confirm-approve').onclick = () => sendConfirm(true);
+    $('confirm-deny').onclick = () => sendConfirm(false);
+  }
+
+  function sendConfirm(approved) {
+    if (!currentConfirm || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({type:'confirm_response', approved, confirmation_token: currentConfirm.confirmation_token || ''}));
+    currentConfirm = null;
+    $('confirm-modal').classList.remove('show');
+  }
+
+  function sendMessage() {
+    const text = input.value.trim();
+    if (!text || !activeSessionId) return;
+    addMessage('user', text);
+    input.value = '';
+    input.style.height = 'auto';
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      $('active-title').textContent = '正在连接…';
+      connectWs(activeSessionId);
+      setTimeout(() => { try { ws.send(JSON.stringify({type:'message',text})); } catch (e) { toast('发送失败','err'); } }, 400);
+    } else {
+      ws.send(JSON.stringify({type:'message',text}));
+    }
+  }
+
+  sendBtn.onclick = sendMessage;
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } });
+  input.addEventListener('input', () => { input.style.height = 'auto'; input.style.height = Math.min(input.scrollHeight, 120) + 'px'; sendBtn.disabled = !input.value.trim(); });
+
+  async function loadCommands() {
+    try { const resp = await api('/api/commands'); const data = await resp.json(); commandList = data.commands || []; } catch(e) { commandList = []; }
+  }
+  function renderCommandList(filter) {
+    const q = (filter || '').trim().toLowerCase();
+    const list = commandList.filter(c => !q || c.name.includes(q) || (c.description||'').toLowerCase().includes(q) || (c.usage||'').toLowerCase().includes(q));
+    const box = $('command-list'); box.innerHTML = '';
+    if (!list.length) { box.innerHTML = '<div style="color:var(--muted);padding:12px;text-align:center">没有匹配命令</div>'; return; }
+    list.forEach(c => {
+      const div = document.createElement('div');
+      div.className = 'command-item';
+      div.innerHTML = '<div class="usage">' + escapeHtml(c.usage || '/'+c.name) + '</div><div class="desc">' + escapeHtml(c.description || '') + '</div>';
+      div.onclick = () => { input.value = c.name + ' '; $('command-modal').classList.remove('show'); input.focus(); sendBtn.disabled = false; };
+      box.appendChild(div);
+    });
+  }
+  function openCommandPalette() {
+    if (!commandList.length) loadCommands().then(() => renderCommandList(''));
+    else renderCommandList('');
+    $('command-modal').classList.add('show');
+    $('command-search').value = '';
+    $('command-search').focus();
+  }
+
+  function showView(name) {
+    document.querySelectorAll('.view').forEach(v => v.classList.add('hidden'));
+    const target = $('view-'+name); if (target) target.classList.remove('hidden');
+    document.querySelectorAll('#topbar .actions button').forEach(b => b.classList.toggle('active', b.dataset.view === name));
+    if (name === 'sessions') loadSessionsManagement();
+    if (name === 'plugins') loadPlugins();
+    if (name === 'skills') loadSkills();
+    if (name === 'settings') loadSettings();
+  }
+
+  async function loadSessionsManagement() {
+    try {
+      const resp = await api('/api/sessions');
+      const data = await resp.json();
+      currentSessions = data.sessions || [];
+      renderSessionsTable();
+    } catch(e) { currentSessions = []; }
+  }
+
+  function renderSessionsTable() {
+    const q = ($('session-search').value || '').trim().toLowerCase();
+    const list = currentSessions.filter(s => !q || (s.title || '').toLowerCase().includes(q) || s.session_id.toLowerCase().includes(q));
+    const tbody = $('sessions-table'); tbody.innerHTML = '';
+    if (!list.length) { tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:var(--muted);padding:24px">没有匹配的会话</td></tr>'; return; }
+    list.forEach(s => {
+      const tr = document.createElement('tr');
+      const titleTd = document.createElement('td'); titleTd.textContent = s.title || '未命名会话';
+      const idTd = document.createElement('td');
+      const open = document.createElement('button'); open.textContent = s.session_id.slice(0,12);
+      open.onclick = () => { showView('chat'); selectSession(s.session_id); };
+      idTd.appendChild(open);
+      const stateTd = document.createElement('td'); stateTd.textContent = s.live ? 'live' : 'durable';
+      const turnsTd = document.createElement('td'); turnsTd.textContent = s.turn_count || 0;
+      const lastTd = document.createElement('td'); lastTd.textContent = (s.last_activity || '').slice(0,19);
+      const actionsTd = document.createElement('td');
+      const rename = document.createElement('button'); rename.textContent = '重命名';
+      rename.onclick = () => {
+        openActionModal('重命名会话', '<div class="form-grid"><label>标题<input id="rename-input" value="'+escapeHtml(s.title || '')+'" /></label></div>', async () => {
+          const title = $('rename-input').value.trim();
+          if (!title) { toast('标题不能为空', 'err'); return; }
+          try {
+            await api('/api/sessions/'+encodeURIComponent(s.session_id), {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({title})});
+            toast('已重命名', 'ok'); loadSessionsManagement(); refreshSessions();
+          } catch(e) {}
+        });
+        setTimeout(() => { const i=$('rename-input'); if(i){i.focus();i.select();} }, 0);
+      };
+      const del = document.createElement('button'); del.textContent = '删除'; del.className = 'danger';
+      del.onclick = () => {
+        openActionModal('删除会话', '<div style="color:var(--muted);font-size:13px">确定删除 <b>'+escapeHtml(s.session_id.slice(0,12))+'</b> 的历史记录吗？此操作不可撤销。</div>', async () => {
+          try { await api('/api/sessions/'+encodeURIComponent(s.session_id), {method:'DELETE'}); toast('已删除', 'ok'); loadSessionsManagement(); refreshSessions(); } catch(e) {}
+        });
+      };
+      actionsTd.appendChild(rename); actionsTd.appendChild(del);
+      tr.append(titleTd,idTd,stateTd,turnsTd,lastTd,actionsTd);
+      tbody.appendChild(tr);
+    });
+  }
+
+  async function loadPlugins() {
+    try {
+      const resp = await api('/api/plugins');
+      const data = await resp.json();
+      const box = $('plugins-list'); box.innerHTML = '';
+      (data.plugins || []).forEach(p => {
+        const div = document.createElement('div'); div.className = 'card';
+        div.innerHTML = '<h3><span>' + escapeHtml(p.name) + (p.enabled ? '' : ' <span style="color:var(--muted);font-size:11px">(disabled)</span>') + '</span></h3><p>' + escapeHtml(p.description || '') + '</p><div class="meta">source: ' + escapeHtml(p.source || '-') + ' · v' + escapeHtml(p.version || '-') + '</div>';
+        const toggle = document.createElement('button');
+        toggle.textContent = p.enabled ? '停用' : '启用';
+        toggle.style.marginTop = '8px';
+        toggle.onclick = async () => {
+          try {
+            const r = await api('/api/plugins/'+encodeURIComponent(p.name)+'/toggle', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled: !p.enabled})});
+            const b = await r.json();
+            if (!r.ok) throw new Error(b.error || '操作失败');
+            toast(b.enabled ? '插件已启用' : '插件已停用', 'ok');
+            loadPlugins();
+          } catch(e) { toast(e.message || '操作失败', 'err'); }
+        };
+        div.appendChild(toggle); box.appendChild(div);
+      });
+    } catch(e) {}
+  }
+
+  async function loadSkills() {
+    try {
+      const resp = await api('/api/skills');
+      const data = await resp.json();
+      const box = $('skills-list'); box.innerHTML = '';
+      (data.skills || []).forEach(s => {
+        const div = document.createElement('div'); div.className = 'card';
+        div.innerHTML = '<h3><span>' + escapeHtml(s.name) + ' <span style="color:var(--muted);font-size:11px">'+escapeHtml(s.id)+'</span></span></h3><p>' + escapeHtml(s.description || '') + '</p><div class="meta">source: ' + escapeHtml(s.source || '-') + ' · user-invocable: ' + (s.user_invocable ? 'yes' : 'no') + '</div>';
+        box.appendChild(div);
+      });
+    } catch(e) {}
+  }
+
+  async function loadSettings() {
+    try {
+      const resp = await api('/api/config');
+      const data = await resp.json();
+      currentConfig = data.config || {};
+      $('settings-editor').value = JSON.stringify(currentConfig, null, 2);
+      fillSettingsForm(currentConfig);
+    } catch(e) {}
+  }
+
+  function fillSettingsForm(config) {
+    const providers = config.providers || {};
+    const select = $('settings-provider');
+    select.innerHTML = '';
+    Object.keys(providers).forEach(name => {
+      const o = document.createElement('option');
+      o.value = name;
+      o.textContent = name;
+      o.selected = name === config.active_provider;
+      select.appendChild(o);
+    });
+    const active = providers[config.active_provider] || {};
+    $('settings-model').value = active.default_model || '';
+    $('settings-max-tokens').value = active.max_tokens || '';
+    const channels = config.channels || {};
+    $('settings-web-enabled').checked = !!(channels.web && channels.web.enabled);
+    $('settings-feishu-enabled').checked = !!(channels.feishu && channels.feishu.enabled);
+  }
+
+  function applySettingsForm(cfg) {
+    const providers = cfg.providers || {};
+    const active = providers[cfg.active_provider] || {};
+    const model = $('settings-model').value.trim();
+    if (model) active.default_model = model;
+    const maxTokens = parseInt($('settings-max-tokens').value, 10);
+    if (maxTokens > 0) active.max_tokens = maxTokens;
+    providers[cfg.active_provider] = active;
+    cfg.providers = providers;
+    cfg.channels = cfg.channels || {};
+    cfg.channels.web = cfg.channels.web || {};
+    cfg.channels.web.enabled = $('settings-web-enabled').checked;
+    cfg.channels.feishu = cfg.channels.feishu || {};
+    cfg.channels.feishu.enabled = $('settings-feishu-enabled').checked;
+    return cfg;
+  }
+
+  async function saveSettings() {
+    try {
+      const cfg = applySettingsForm(JSON.parse($('settings-editor').value));
+      const resp = await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({config:cfg})});
+      const b = await resp.json();
+      if (!resp.ok) throw new Error(b.error || '保存失败');
+      currentConfig = cfg;
+      toast('设置已保存，重启 gateway 后部分设置生效', 'ok');
+    } catch(e) { toast('保存失败：' + e.message, 'err'); }
+  }
+
+  const savedTheme = localStorage.getItem('agent_theme') || 'dark';
+  document.documentElement.dataset.theme = savedTheme;
+  $('theme-toggle').onclick = () => {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem('agent_theme', next);
+  };
+
+  $('new-session').onclick = async () => {
+    try { const resp = await api('/api/sessions', {method:'POST'}); const data = await resp.json(); await refreshSessions(); await selectSession(data.session_id); showView('chat'); } catch(e) {}
+  };
+  $('command-btn').onclick = openCommandPalette;
+  $('command-search').addEventListener('input', e => renderCommandList(e.target.value));
+  $('refresh-sessions').onclick = loadSessionsManagement;
+  $('session-search').addEventListener('input', renderSessionsTable);
+  $('settings-reload').onclick = loadSettings;
+  $('settings-save').onclick = saveSettings;
+  document.querySelectorAll('#topbar .actions button').forEach(b => b.onclick = () => showView(b.dataset.view));
+  document.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); openCommandPalette(); }
+    if (e.key === 'Escape') { $('command-modal').classList.remove('show'); $('confirm-modal').classList.remove('show'); $('action-modal').classList.remove('show'); }
+  });
+  loadCommands();
+  refreshSessions();
+  renderMessages([]);
+})();
+</script>
+</body>
+</html>

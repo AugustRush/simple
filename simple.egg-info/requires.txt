@@ -7,3 +7,7 @@ prompt_toolkit
 
 [feishu]
 lark-oapi
+
+[web]
+starlette
+uvicorn
