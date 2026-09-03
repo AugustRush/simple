@@ -307,13 +307,21 @@ class ChannelRunner:
 
         components = self._components
         session_components: dict[str, dict] = {}
+        session_revisions: dict[str, int] = {}
         session_coordinators: dict[str, CommandCoordinator] = {}
         session_plugins_started: set[str] = set()
 
         async def _components_for_session(session_id: str) -> dict:
             existing = session_components.get(session_id)
-            if existing is not None:
+            revision = int(components.get("config_revision", 0) or 0)
+            if existing is not None and session_revisions.get(session_id) == revision:
                 return existing
+            if existing is not None:
+                close_components = getattr(agent_module, "_close_components", None)
+                if callable(close_components):
+                    await close_components(existing)
+                session_coordinators.pop(session_id, None)
+                session_plugins_started.discard(session_id)
             factory = components.get("session_components_factory")
             if callable(factory):
                 built = factory(session_id)
@@ -321,12 +329,15 @@ class ChannelRunner:
                     built = await built
                 if isinstance(built, dict):
                     session_components[session_id] = built
+                    session_revisions[session_id] = revision
                     return built
             session_components[session_id] = components
+            session_revisions[session_id] = revision
             return components
 
         async def _cleanup_session_runtime(session_id: str) -> None:
             runtime = session_components.pop(session_id, None)
+            session_revisions.pop(session_id, None)
             session_coordinators.pop(session_id, None)
             session_plugins_started.discard(session_id)
             if runtime is None or runtime is components:
@@ -360,8 +371,20 @@ class ChannelRunner:
             self._log_runtime_event(event)
             # Runtime events are also durable session history.  The web UI
             # uses these records to restore tool traces after a restart.
-            runtime = session_components.get(event.session_id, components)
-            ctx_mgr = runtime.get("context_manager") if isinstance(runtime, dict) else None
+            # RuntimeSessionState owns the session-scoped ContextManager whose
+            # staging buffer is keyed by the Web session id. The component
+            # factory's base manager has its own random staging id; using it
+            # here sends tool events to an unrelated session and makes traces
+            # disappear after a browser refresh.
+            state = sessions.get(event.session_id)
+            ctx_mgr = getattr(state, "context_manager", None)
+            if ctx_mgr is None:
+                runtime = session_components.get(event.session_id, components)
+                ctx_mgr = (
+                    runtime.get("context_manager")
+                    if isinstance(runtime, dict)
+                    else None
+                )
             record_event = getattr(ctx_mgr, "record_runtime_event", None)
             if callable(record_event):
                 metadata = dict(event.metadata or {})
@@ -394,6 +417,22 @@ class ChannelRunner:
             skill_catalog = components["skill_catalog"]
             session_runtime = await _components_for_session(session_id)
             state = await self._ensure_session_state(sessions, session_id, session_runtime)
+            revision = int(components.get("config_revision", 0) or 0)
+            if getattr(state, "runtime_revision", revision) != revision:
+                old_worker = getattr(state, "memory_worker", None)
+                if old_worker is not None:
+                    old_worker.stop()
+                    await old_worker.wait()
+                state.context_manager = self._build_session_context_manager(
+                    session_id, session_runtime
+                )
+                state.memory_worker = self._build_session_memory_worker(
+                    state.context_manager, session_runtime
+                )
+                state.ctx.system_prompt = session_runtime["system_prompt"]
+                state.runtime_revision = revision
+            else:
+                state.runtime_revision = revision
             state.last_activity = time.time()
             ctx = state.ctx
             # Model selection is a per-turn request override.  Keep it on the
@@ -417,7 +456,7 @@ class ChannelRunner:
                         session_agent_core,
                         session_router,
                         components=session_runtime,
-                        config=self._cfg,
+                        config=session_runtime.get("cfg", self._cfg),
                         event_hook=_record_runtime_event,
                     )
                 else:

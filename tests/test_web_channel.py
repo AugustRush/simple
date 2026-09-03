@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from types import SimpleNamespace
 
-import pytest
 
 from agent.channels.web import WebChannel, WebConfig
 from agent.session_service import SessionService
@@ -462,30 +460,13 @@ def test_web_delete_rejects_unsafe_session_id(tmp_path, monkeypatch):
     assert outside.exists()
 
 
-def test_web_model_override_uses_session_config_snapshot(tmp_path, monkeypatch):
+def test_web_model_override_uses_global_config(tmp_path, monkeypatch):
     from pathlib import Path
     from agent import shared
     import agent.config as config_module
 
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
-    home = shared.web_session_home("abc123")
-    home.mkdir(parents=True)
-    (home / ".web-session").touch()
-    (home / "config.json").write_text(
-        json.dumps(
-            {
-                "active_provider": "snapshot-provider",
-                "providers": {
-                    "snapshot-provider": {
-                        "default_model": "snapshot-model",
-                        "models": ["snapshot-model", "snapshot-alt"],
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
     monkeypatch.setattr(
         config_module,
         "load_config",
@@ -493,18 +474,83 @@ def test_web_model_override_uses_session_config_snapshot(tmp_path, monkeypatch):
             {
                 "active_provider": "global-provider",
                 "providers": {
-                    "global-provider": {"default_model": "global-model"}
+                    "global-provider": {
+                        "default_model": "global-model",
+                        "models": ["global-model", "global-alt"],
+                    }
                 },
             },
             False,
         ),
     )
 
-    assert WebChannel._resolve_model_override("snapshot-alt", "abc123") == (
-        "snapshot-alt"
+    assert WebChannel._resolve_model_override("global-alt", "abc123") == "global-alt"
+    assert WebChannel._resolve_model_override("global-model", "abc123") == "global-model"
+
+
+def test_web_session_runtime_uses_global_resources_and_session_output(tmp_path, monkeypatch):
+    from pathlib import Path
+    from agent import shared
+    import agent.bootstrap as bootstrap
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    captured = {}
+
+    async def fake_build(cfg, *, announce=True, resource_home=None):
+        captured.update(cfg=cfg, resource_home=resource_home)
+        return {"ok": True}
+
+    monkeypatch.setattr(bootstrap, "_build_components_async", fake_build)
+    result = __import__("asyncio").run(
+        bootstrap._build_web_session_components("sid123", {"model": "global"})
     )
-    with pytest.raises(ValueError, match="not available"):
-        WebChannel._resolve_model_override("global-model", "abc123")
+
+    home = tmp_path / ".agent" / "web" / "sessions" / "sid123"
+    assert result == {"ok": True}
+    assert captured["resource_home"] == tmp_path / ".agent"
+    assert captured["cfg"]["output_dir"] == str(home / "output")
+    assert not (home / "config.json").exists()
+
+
+def test_session_service_recovers_legacy_events_by_turn_id(tmp_path):
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.append_conversation_turn(
+        session_id="web-session",
+        role="user",
+        content="hello",
+        channel="web",
+        message_id="turn-legacy",
+    )
+    store.append_conversation_turn(
+        session_id="web-session",
+        role="assistant",
+        content="done",
+        channel="web",
+        message_id="turn-legacy:completion:1",
+        reply_to_id="turn-legacy",
+    )
+    store.append_agent_event(
+        session_id="random-factory-session",
+        turn_id="turn-legacy",
+        event_type="tool_started",
+        payload={"operation_id": "tool-1", "tool_name": "search"},
+    )
+    store.append_agent_event(
+        session_id="random-factory-session",
+        turn_id="turn-legacy",
+        event_type="tool_completed",
+        payload={"operation_id": "tool-1", "tool_name": "search", "ok": True},
+    )
+
+    messages = SessionService(store=store).get_messages("web-session")
+
+    assert [item["tool"] for item in messages if item.get("role") == "tool"] == [
+        "search"
+    ]
+    assert messages[1]["role"] == "tool"
 
 
 def test_web_bulk_delete_sessions():
@@ -576,7 +622,7 @@ def test_web_reveal_session_rejects_unknown_session(tmp_path):
     assert resp.status_code == 404
 
 
-def test_web_file_allows_marked_isolated_session_home(tmp_path, monkeypatch):
+def test_web_file_rejects_legacy_session_home(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
     from pathlib import Path
 
@@ -593,8 +639,7 @@ def test_web_file_allows_marked_isolated_session_home(tmp_path, monkeypatch):
     with TestClient(channel.app) as client:
         resp = client.get(f"/api/files?path={artifact}")
 
-    assert resp.status_code == 200
-    assert resp.text == "isolated"
+    assert resp.status_code == 403
 
 
 def test_web_config_get_masks_api_keys():

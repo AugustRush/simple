@@ -22,7 +22,6 @@ import {
   Layout,
   Menu,
   Modal,
-  Popconfirm,
   Row,
   Select,
   Skeleton,
@@ -258,6 +257,7 @@ function App() {
   const [view, setView] = useState<string>('chat')
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([])
+  const [pendingDeleteSessionId, setPendingDeleteSessionId] = useState<string | null>(null)
   const [activeSession, setActiveSession] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [commands, setCommands] = useState<CommandInfo[]>([])
@@ -351,10 +351,30 @@ function App() {
   const streamIdRef = useRef<string | null>(null)
   const messagesRef = useRef<Message[]>([])
   const loadMessagesRequestRef = useRef(0)
-  const chatEndRef = useRef<HTMLDivElement | null>(null)
+  const chatScrollRef = useRef<HTMLDivElement | null>(null)
+  const followChatRef = useRef(true)
   const commandItemRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const idRef = useRef(0)
   const token = localStorage.getItem('agent_token') || ''
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
+
+  const scrollChatToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
+    const container = chatScrollRef.current
+    if (!container) return
+    followChatRef.current = true
+    container.scrollTo({ top: container.scrollHeight, behavior })
+  }, [])
+
+  const handleChatScroll = useCallback(() => {
+    const container = chatScrollRef.current
+    if (!container) return
+    // Keep following only while the reader is already close to the bottom.
+    // A generous threshold accounts for the composer and touchpad inertia.
+    const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    const nearBottom = distanceToBottom <= 96
+    followChatRef.current = nearBottom
+    setShowScrollToBottom(!nearBottom)
+  }, [])
 
   useEffect(() => {
     currentModelRef.current = currentModel
@@ -391,12 +411,17 @@ function App() {
   }, [])
 
   useEffect(() => {
-    if (!chatEndRef.current) return
-    const frame = requestAnimationFrame(() => {
-      chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-    })
+    // Streaming updates can arrive many times per second. Never enqueue a
+    // smooth animation for each chunk; follow instantly only when the user is
+    // already at the bottom. Once they scroll up, preserve their reading
+    // position until they explicitly return to the bottom.
+    if (!followChatRef.current) {
+      setShowScrollToBottom(true)
+      return
+    }
+    const frame = requestAnimationFrame(() => scrollChatToBottom('auto'))
     return () => cancelAnimationFrame(frame)
-  }, [messages])
+  }, [messages, scrollChatToBottom])
 
   const apiHeaders = useCallback((): Record<string, string> => {
     const t = token
@@ -732,6 +757,9 @@ function App() {
 
   const selectSession = useCallback(
     (sid: string) => {
+      setPendingDeleteSessionId(null)
+      followChatRef.current = true
+      setShowScrollToBottom(false)
       activeSessionRef.current = sid
       setActiveSession(sid)
       setView('chat')
@@ -785,6 +813,11 @@ function App() {
     const text = (overrideText ?? input).trim()
     if (!text || creatingSession) return
 
+    // A newly submitted turn is an explicit request to see the response.
+    // Re-enable bottom following even if the reader had previously scrolled
+    // up to inspect older messages.
+    followChatRef.current = true
+    setShowScrollToBottom(false)
     appendMessage({ id: makeId(), role: 'user', content: text })
     setInput('')
     setActivity('等待模型响应')
@@ -994,10 +1027,29 @@ function App() {
         messagesRef.current = []
         streamIdRef.current = null
       }
+      setPendingDeleteSessionId(current => current === item.session_id ? null : current)
       await loadSessions()
     } catch {
       // Errors are surfaced by the shared request helper.
     }
+  }
+
+  // Dropdown menus are rendered through a React portal. Guard the session
+  // container click as well as the menu itself so selecting an action cannot
+  // bubble into selectSession() and immediately reset the pending state.
+  const handleSessionContainerClick = (
+    event: React.MouseEvent<HTMLElement>,
+    sid: string,
+  ) => {
+    const target = event.target as HTMLElement | null
+    if (
+      target?.closest('.ant-dropdown') ||
+      target?.closest('.ant-dropdown-trigger') ||
+      target?.closest('.session-item-delete-actions')
+    ) {
+      return
+    }
+    selectSession(sid)
   }
 
   const deleteSelectedSessions = () => {
@@ -1642,7 +1694,11 @@ function App() {
 
   const renderChat = () => (
     <div className="chat-view">
-      <div className="chat-scroll">
+      <div
+        className="chat-scroll"
+        ref={chatScrollRef}
+        onScroll={handleChatScroll}
+      >
         <div className="chat-inner">
           {messages.length === 0 ? (
             <div className="chat-empty">
@@ -1697,9 +1753,20 @@ function App() {
               )}
             </>
           )}
-          <div ref={chatEndRef} />
         </div>
       </div>
+
+      {showScrollToBottom && (
+        <button
+          type="button"
+          className="chat-scroll-bottom"
+          onClick={() => scrollChatToBottom('smooth')}
+          aria-label="回到底部"
+        >
+          <DownOutlined />
+          <span>回到底部</span>
+        </button>
+      )}
 
       <div className="composer-wrap">
         {input.startsWith('/') && (
@@ -1889,7 +1956,7 @@ function App() {
               <Card
                 className={`session-card ${item.session_id === activeSession ? 'session-card-active' : ''}`}
                 hoverable
-                onClick={() => selectSession(item.session_id)}
+                onClick={event => handleSessionContainerClick(event, item.session_id)}
               >
                 <div className="session-card-head">
                   <div className="session-card-title">
@@ -1905,50 +1972,63 @@ function App() {
                     <span>{item.title || '未命名会话'}</span>
                     {item.live && <Badge status="processing" />}
                   </div>
-                  <Dropdown
-                    trigger={['click']}
-                    menu={{
-                      items: [
-                        {
-                          key: 'reveal',
-                          label: '在 Finder 中显示',
-                          icon: <FolderOpenOutlined />,
-                          onClick: () => revealSession(item),
-                        },
-                        {
-                          key: 'rename',
-                          label: '重命名',
-                          icon: <EditOutlined />,
-                          onClick: () => renameSession(item),
-                        },
-                        {
-                          key: 'delete',
-                          label: (
-                            <Popconfirm
-                              title="删除这个会话？"
-                              description="历史记录将被永久删除"
-                              okText="删除"
-                              cancelText="取消"
-                              okButtonProps={{ danger: true }}
-                              placement="left"
-                              onConfirm={() => deleteSession(item)}
-                            >
-                              <span onClick={event => event.stopPropagation()}>删除</span>
-                            </Popconfirm>
-                          ),
-                          icon: <DeleteOutlined />,
-                          danger: true,
-                        },
-                      ],
-                    }}
-                  >
-                    <Button
-                      type="text"
-                      size="small"
-                      icon={<MoreOutlined />}
+                  {pendingDeleteSessionId === item.session_id ? (
+                    <div
+                      className="session-item-delete-actions session-card-delete-actions"
                       onClick={event => event.stopPropagation()}
-                    />
-                  </Dropdown>
+                    >
+                      <Button
+                        type="text"
+                        danger
+                        size="small"
+                        onClick={() => deleteSession(item)}
+                      >
+                        删除
+                      </Button>
+                      <Button
+                        type="text"
+                        size="small"
+                        onClick={() => setPendingDeleteSessionId(null)}
+                      >
+                        取消
+                      </Button>
+                    </div>
+                  ) : (
+                    <Dropdown
+                      trigger={['click']}
+                      menu={{
+                        onClick: ({ domEvent }) => domEvent.stopPropagation(),
+                        items: [
+                          {
+                            key: 'reveal',
+                            label: '在 Finder 中显示',
+                            icon: <FolderOpenOutlined />,
+                            onClick: () => revealSession(item),
+                          },
+                          {
+                            key: 'rename',
+                            label: '重命名',
+                            icon: <EditOutlined />,
+                            onClick: () => renameSession(item),
+                          },
+                          {
+                            key: 'delete',
+                            label: '删除',
+                            icon: <DeleteOutlined />,
+                            danger: true,
+                            onClick: () => setPendingDeleteSessionId(item.session_id),
+                          },
+                        ],
+                      }}
+                    >
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<MoreOutlined />}
+                        onClick={event => event.stopPropagation()}
+                      />
+                    </Dropdown>
+                  )}
                 </div>
                 <div className="session-card-id">
                   <Typography.Text code>{item.session_id.slice(0, 18)}</Typography.Text>
@@ -2377,7 +2457,7 @@ function App() {
                       className={`session-item ${
                         item.session_id === activeSession ? 'active' : ''
                       }`}
-                      onClick={() => selectSession(item.session_id)}
+                      onClick={event => handleSessionContainerClick(event, item.session_id)}
                     >
                       <div className="session-item-status">
                         <span className={item.live ? 'live' : 'durable'} />
@@ -2390,50 +2470,63 @@ function App() {
                           {item.turn_count || 0} 轮 · {relativeTime(item.last_activity)}
                         </div>
                       </div>
-                      <Dropdown
-                        trigger={['click']}
-                        menu={{
-                          items: [
-                            {
-                              key: 'reveal',
-                              label: '在 Finder 中显示',
-                              icon: <FolderOpenOutlined />,
-                              onClick: () => revealSession(item),
-                            },
-                            {
-                              key: 'rename',
-                              label: '重命名',
-                              icon: <EditOutlined />,
-                              onClick: () => renameSession(item),
-                            },
-                            {
-                              key: 'delete',
-                              label: (
-                                <Popconfirm
-                                  title="删除这个会话？"
-                                  description="历史记录将被永久删除"
-                                  okText="删除"
-                                  cancelText="取消"
-                                  okButtonProps={{ danger: true }}
-                                  placement="left"
-                                  onConfirm={() => deleteSession(item)}
-                                >
-                                  <span onClick={event => event.stopPropagation()}>删除</span>
-                                </Popconfirm>
-                              ),
-                              icon: <DeleteOutlined />,
-                              danger: true,
-                            },
-                          ],
-                        }}
-                      >
-                        <Button
-                          type="text"
-                          size="small"
-                          icon={<MoreOutlined />}
+                      {pendingDeleteSessionId === item.session_id ? (
+                        <div
+                          className="session-item-delete-actions"
                           onClick={event => event.stopPropagation()}
-                        />
-                      </Dropdown>
+                        >
+                          <Button
+                            type="text"
+                            danger
+                            size="small"
+                            onClick={() => deleteSession(item)}
+                          >
+                            删除
+                          </Button>
+                          <Button
+                            type="text"
+                            size="small"
+                            onClick={() => setPendingDeleteSessionId(null)}
+                          >
+                            取消
+                          </Button>
+                        </div>
+                      ) : (
+                        <Dropdown
+                          trigger={['click']}
+                          menu={{
+                            onClick: ({ domEvent }) => domEvent.stopPropagation(),
+                            items: [
+                              {
+                                key: 'reveal',
+                                label: '在 Finder 中显示',
+                                icon: <FolderOpenOutlined />,
+                                onClick: () => revealSession(item),
+                              },
+                              {
+                                key: 'rename',
+                                label: '重命名',
+                                icon: <EditOutlined />,
+                                onClick: () => renameSession(item),
+                              },
+                              {
+                                key: 'delete',
+                                label: '删除',
+                                icon: <DeleteOutlined />,
+                                danger: true,
+                                onClick: () => setPendingDeleteSessionId(item.session_id),
+                              },
+                            ],
+                          }}
+                        >
+                          <Button
+                            type="text"
+                            size="small"
+                            icon={<MoreOutlined />}
+                            onClick={event => event.stopPropagation()}
+                          />
+                        </Dropdown>
+                      )}
                     </div>
                   </React.Fragment>
                 )

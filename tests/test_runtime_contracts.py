@@ -60,6 +60,12 @@ def test_runtime_event_copies_fields_and_metadata():
     assert event.metadata == {"message_id": "msg-1"}
 
 
+def test_runtime_session_state_accepts_runtime_revision():
+    state = RuntimeSessionState(ctx=object(), runtime_revision=7)
+
+    assert state.runtime_revision == 7
+
+
 def test_runtime_components_require_returns_dependency():
     components = RuntimeComponents({"agent": object()})
 

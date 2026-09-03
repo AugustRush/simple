@@ -59,6 +59,51 @@ def test_memory_clear_suppresses_current_turn_re_persistence(tmp_path):
     assert manager.consume_memory_clear_suppression() is False
 
 
+def test_spawn_session_partitions_staging_without_mixing_memory_store(tmp_path):
+    """Session managers share durable primitives but isolate raw turns.
+
+    This is the invariant used by both the CLI (the stable ``cli`` partition)
+    and Web (one partition per browser session).  A regression here can cause
+    consolidation for one session to consume another session's turns.
+    """
+    base = make_ctx_manager(tmp_path)
+    first = base.spawn_session("web-a")
+    second = base.spawn_session("web-b")
+
+    first.staging.append("user", "private first")
+    second.staging.append("user", "private second")
+
+    first_rows = first.staging.read_all()
+    assert len(first_rows) == 1
+    assert first_rows[0]["role"] == "user"
+    assert first_rows[0]["content"] == "private first"
+    assert [item["content"] for item in second.staging.read_all()] == ["private second"]
+    assert first.staging.session_id == "web-a"
+    assert second.staging.session_id == "web-b"
+    assert first.store is second.store is base.store
+    assert first.staging.context_dir == second.staging.context_dir == tmp_path / "context"
+
+
+def test_spawn_session_uses_explicit_staging_context_dir(tmp_path):
+    """A JSONL staging file in a nested directory must not move the DB root."""
+    from agent import ContextManager, ConsolidationEngine, LTMStore, LocalRetriever, StagingBuffer
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    staging = StagingBuffer(path=tmp_path / "custom" / "raw.jsonl", context_dir=context_dir, session_id="cli")
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=staging,
+    )
+
+    spawned = manager.spawn_session("cli-2")
+
+    assert spawned.staging.context_dir == context_dir
+    assert spawned.staging._db_path == context_dir / "palace.db"
+
+
 # ── Durable conversation history tests ───────────────────────────────────────
 
 

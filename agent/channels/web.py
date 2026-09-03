@@ -486,22 +486,12 @@ class WebChannel(Channel):
             return None
 
         cfg: dict[str, Any] = {}
-        clean_session_id = str(session_id or "").strip()
-        if clean_session_id:
-            try:
-                session_config = shared.web_session_home(clean_session_id) / "config.json"
-                loaded = json.loads(session_config.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    cfg = loaded
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                pass
-        if not cfg:
-            try:
-                from agent.config import load_config
+        try:
+            from agent.config import load_config
 
-                cfg, _ = load_config()
-            except Exception:
-                cfg = {}
+            cfg, _ = load_config()
+        except Exception:
+            cfg = {}
         configured: set[str] = set()
         top_level = cfg.get("model")
         if isinstance(top_level, str) and top_level.strip():
@@ -639,6 +629,9 @@ class WebChannel(Channel):
             save_config(new_cfg)
         except Exception as exc:
             return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
+        # Existing turns continue with their captured components; the next
+        # turn will rebuild each session runtime against the new global config.
+        self._components["config_revision"] = int(self._components.get("config_revision", 0)) + 1
         return JSONResponse({"ok": True})
 
     async def _plugins(self, request: Any) -> Any:
@@ -780,6 +773,7 @@ class WebChannel(Channel):
                         {"error": f"reload failed: {exc}", "saved": True},
                         status_code=500,
                     )
+        self._components["config_revision"] = int(self._components.get("config_revision", 0)) + 1
         return JSONResponse({"ok": True, "name": plugin_name, "enabled": desired})
 
     async def _delete_session(self, request: Any) -> Any:
@@ -851,11 +845,6 @@ class WebChannel(Channel):
                 web_root = shared.web_session_root().resolve()
                 if web_root.is_dir():
                     allowed_roots.append(web_root)
-                allowed_roots.extend(
-                    home.resolve()
-                    for home in Path.home().glob(".agent-*")
-                    if (home / ".web-session").is_file()
-                )
             except OSError:
                 pass
             if not any(

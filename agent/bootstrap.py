@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import os
@@ -23,14 +22,11 @@ from agent.commands import (
     CommandRouter,
     register_builtin_commands,
 )
-from agent.memory.system import BackgroundMemoryWorker, ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
+from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime import AgentCore, TurnRunner
 from agent.ralph import RalphIterationResult, RalphService, RalphTaskStore, RalphVerifier
-from agent.skills.catalog import SkillCatalog
-from agent.tools.builtin_tools import BuiltinTools
 from agent.tools.files import FileService, resolve_file_access_config
-from agent.tools.runtime import MCPClient, ToolRegistry, UserToolCatalog
 
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
@@ -50,15 +46,9 @@ async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict
     home = _web_session_home(session_id)
     home.mkdir(parents=True, exist_ok=True)
     (home / ".web-session").touch(exist_ok=True)
-    # Freeze the gateway configuration for this session. Existing sessions
-    # should not silently change provider, skill or tool behavior when the
-    # global config is edited later; a new session picks up the new template.
-    session_config = home / "config.json"
-    if not session_config.is_file():
-        shared._atomic_write_text(
-            session_config,
-            json.dumps(base_cfg, ensure_ascii=False, indent=2),
-        )
+    # Configuration and executable resources are global. Only conversational
+    # state lives below the session home; this avoids stale per-session copies
+    # of provider, skill, plugin, and tool settings.
     manifest = home / ".session.json"
     if not manifest.is_file():
         active_provider = str(base_cfg.get("active_provider") or "")
@@ -77,9 +67,6 @@ async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "provider": active_provider,
                     "model": model,
-                    "config_sha256": hashlib.sha256(
-                        session_config.read_bytes()
-                    ).hexdigest(),
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -92,10 +79,14 @@ async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict
     async with _SESSION_BUILD_LOCK:
         try:
             agent_module._set_agent_home(home)
-            session_cfg, _ = agent_module.load_config()
-            if not session_cfg:
-                session_cfg = dict(base_cfg)
-            return await _build_components_async(session_cfg, announce=False)
+            session_cfg = dict(base_cfg)
+            # Generated files and attachments are always session-owned. A
+            # global output_dir setting is intentionally ignored for Web
+            # runtimes to prevent cross-session leakage.
+            session_cfg["output_dir"] = str(home / "output")
+            return await _build_components_async(
+                session_cfg, announce=False, resource_home=previous_home
+            )
         finally:
             agent_module._set_agent_home(previous_home)
 
@@ -172,13 +163,30 @@ async def _connect_mcp_in_background(
             )
 
 
-async def _build_components_async(cfg: dict, *, announce: bool = True):
+async def _build_components_async(
+    cfg: dict,
+    *,
+    announce: bool = True,
+    resource_home: Path | None = None,
+):
     """Build all components from config using ModelClientFactory."""
     console = shared.CONSOLE
     context_dir = shared.CONTEXT_DIR
     memory_dir = shared.MEMORY_DIR
     plugins_dir = shared.PLUGINS_DIR
-    user_plugins_dir = shared.USER_PLUGINS_DIR
+    resource_root = (resource_home or shared.AGENT_HOME).resolve()
+    if resource_home is None:
+        # Preserve the normal CLI/test path mirrors; Web explicitly passes the
+        # gateway home so its resource directories are global to all sessions.
+        user_plugins_dir = shared.USER_PLUGINS_DIR
+        user_skills_dir = shared.SKILLS_DIR
+        user_tools_dir = shared.TOOLS_DIR
+        prompts_dir = shared.PROMPTS_DIR
+    else:
+        user_plugins_dir = resource_root / "plugins"
+        user_skills_dir = resource_root / "skills"
+        user_tools_dir = resource_root / "tools"
+        prompts_dir = resource_root / "prompts"
     legacy_memory_aliases = shared.LEGACY_MEMORY_ALIASES
     max_categories = shared.MAX_CATEGORIES
     decay_factor = shared.DECAY_FACTOR
@@ -229,7 +237,7 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
                 )
             max_tokens = adjusted
 
-    system_prompt = _load_system_prompt(cfg)
+    system_prompt = _load_system_prompt(cfg, prompts_dir=prompts_dir)
 
     # Sub-config sections
     mem_cfg = cfg.get("memory", {})
@@ -255,6 +263,13 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
     supports_vision = provider_supports_vision(cfg, active_provider)
 
     registry = registry_cls(console=console)
+    # Resource definitions (skills, tools, plugins, prompts) are global for
+    # Web sessions, while state directories below the session home remain
+    # isolated.  Keep this explicit for tools that resolve paths at call time.
+    registry.set_context("resource_home", str(resource_root))
+    registry.set_context("user_skills_dir", str(user_skills_dir))
+    registry.set_context("user_tools_dir", str(user_tools_dir))
+    registry.set_context("user_plugins_dir", str(user_plugins_dir))
 
     # Context Manager — build first so BuiltinTools can reference it
     # Config is split into two sub-sections:
@@ -404,10 +419,10 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
     if tavily_api_key:
         registry.set_context("tavily_api_key", tavily_api_key)
 
-    skill_catalog = skill_catalog_cls()
+    skill_catalog = skill_catalog_cls(user_root=user_skills_dir)
     skill_catalog.load_all()
     skill_catalog.register_tools(registry)
-    user_tool_catalog = user_tool_catalog_cls()
+    user_tool_catalog = user_tool_catalog_cls(root=user_tools_dir)
 
     mcp_client = None
     mcp_server_configs = list(cfg.get("mcp_servers", []) or [])
@@ -592,12 +607,17 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         "mcp_client": mcp_client,
         "mcp_status": mcp_status,
         "mcp_task": None,
+        "config_revision": 0,
     }
     # WebChannel uses this hook to provision one independent agent home per
     # browser session under ``~/.agent/web/sessions/<session-id>``.
-    components["session_components_factory"] = (
-        lambda session_id: _build_web_session_components(session_id, cfg)
-    )
+    async def _session_components_factory(session_id: str) -> dict:
+        # Resolve the global config at session-runtime creation time so config
+        # changes apply to subsequent turns without interrupting active ones.
+        global_cfg, _ = agent_module.load_config()
+        return await _build_web_session_components(session_id, global_cfg or cfg)
+
+    components["session_components_factory"] = _session_components_factory
     components["session_store_factory"] = lambda session_id: LTMStore(
         context_dir=_web_session_home(str(session_id)) / "context",
         memory_dir=_web_session_home(str(session_id)) / "memory",

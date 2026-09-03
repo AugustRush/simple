@@ -627,8 +627,8 @@ def _resolve_output_dir(cfg: dict) -> Path:
     return p
 
 
-def _load_system_prompt(cfg: dict) -> str:
-    best = shared.PROMPTS_DIR / "best.md"
+def _load_system_prompt(cfg: dict, *, prompts_dir: Optional[Path] = None) -> str:
+    best = (prompts_dir or shared.PROMPTS_DIR) / "best.md"
     if best.exists():
         content = best.read_text()
         content = re.sub(r"^<!--.*?-->\n", "", content, flags=re.DOTALL)
@@ -699,9 +699,9 @@ def _static_prompt_inputs(
         workspace_root=workspace_root,
         output_dir=output_dir,
         supports_vision=bool(registry.get_context("supports_vision")),
-        tools_dir=str(shared.TOOLS_DIR),
-        skills_dir=str(shared.SKILLS_DIR),
-        default_output_dir=str(shared.DEFAULT_OUTPUT_DIR),
+        tools_dir=str(registry.get_context("user_tools_dir") or shared.TOOLS_DIR),
+        skills_dir=str(registry.get_context("user_skills_dir") or shared.SKILLS_DIR),
+        default_output_dir=str(output_dir or shared.DEFAULT_OUTPUT_DIR),
     )
 
 

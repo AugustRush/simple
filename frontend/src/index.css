@@ -392,13 +392,54 @@ textarea {
   height: 100%;
   display: flex;
   flex-direction: column;
+  position: relative;
 }
 
 .chat-scroll {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  scroll-behavior: smooth;
+  /* Programmatic scrolling chooses its own behavior. Keeping this off avoids
+     queuing a smooth animation for every streaming token. */
+  scroll-behavior: auto;
+}
+
+.chat-scroll-bottom {
+  position: absolute;
+  right: max(20px, calc((100% - 820px) / 2));
+  bottom: 104px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text);
+  background: var(--surface-raised);
+  background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
+  cursor: pointer;
+  font-size: 12px;
+  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.chat-scroll-bottom:hover {
+  border-color: var(--primary);
+  background: var(--surface-raised);
+  transform: translateY(-1px);
+}
+
+.chat-scroll-bottom .anticon {
+  font-size: 11px;
+}
+
+@media (max-width: 768px) {
+  .chat-scroll-bottom {
+    right: 16px;
+    bottom: 96px;
+  }
 }
 
 .chat-inner {
@@ -3585,4 +3626,65 @@ html[data-theme='light'] .app-main {
     min-width: 34px;
     height: 34px !important;
   }
+}
+
+/* Inline session deletion confirmation in the sidebar. Keeping the actions
+ * inside the item makes the destructive step explicit without covering the
+ * conversation with a popover. */
+.session-item-delete-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+
+.session-item-delete-actions .ant-btn {
+  height: 25px;
+  margin: 0;
+  padding-inline: 7px;
+  border-radius: 6px;
+  opacity: 1;
+  transform: none;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.session-item-delete-actions .ant-btn:hover {
+  transform: none;
+}
+
+.session-item-delete-actions .ant-btn-dangerous {
+  color: var(--red);
+  background: var(--red-soft);
+}
+
+.session-item-delete-actions .ant-btn:not(.ant-btn-dangerous):hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
+.session-card-delete-actions {
+  margin-left: auto;
+}
+
+/* Ant Design's theme-level `.ant-btn-primary` rule has higher specificity
+ * than the generic disabled selector above. Override it explicitly so the
+ * disabled "保存设置" button keeps readable text in both themes. */
+html[data-theme='light'] .settings-save-button:disabled {
+  color: #5b6472 !important;
+  background: #e8eaee !important;
+  border-color: #d5d9e0 !important;
+  opacity: 1;
+}
+
+html[data-theme='dark'] .settings-save-button:disabled {
+  color: #b7bac3 !important;
+  background: #303036 !important;
+  border-color: #484850 !important;
+  opacity: 1;
 }

@@ -1062,6 +1062,73 @@ def test_channel_runner_same_chat_cancel_and_interjections_reach_active_turn():
     assert calls.count(("chat-a", "first")) == 1
 
 
+def test_channel_runner_persists_runtime_events_to_session_context_manager():
+    from agent.commands import CommandRouter
+    from agent.core.output import RuntimeEvent
+    from agent.runtime import TurnExecution, TurnResult
+
+    sessions = {}
+    recorded = []
+
+    class SessionContext:
+        def record_runtime_event(self, event_type, payload=None, *, turn_id=""):
+            recorded.append((event_type, payload or {}, turn_id))
+
+    class BaseContext:
+        def spawn_session(self, session_id):
+            assert session_id == "web-session"
+            return SessionContext()
+
+    class Core:
+        async def handle_turn(self, turn_input, state, *, sink=None, **kwargs):
+            return TurnExecution(
+                result=TurnResult(text="ok"),
+                events=(
+                    RuntimeEvent(
+                        name="tool_started",
+                        session_id="web-session",
+                        channel_name="web",
+                        fields={
+                            "operation_id": "tool-1",
+                            "tool_name": "search",
+                        },
+                        metadata={"message_id": "turn-1"},
+                    ),
+                ),
+            )
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": object(),
+            "agent_core": Core(),
+            "command_router": CommandRouter(),
+            "skill_catalog": object(),
+            "plugin_catalog": None,
+            "context_manager": BaseContext(),
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+    handler = runner._make_message_handler(sessions)
+
+    asyncio.run(
+        handler(
+            IncomingMessage(
+                text="run",
+                metadata={"chat_id": "web-session", "message_id": "turn-1"},
+            ),
+            OutputSink(),
+        )
+    )
+
+    assert (
+        "tool_started",
+        {"operation_id": "tool-1", "tool_name": "search"},
+        "turn-1",
+    ) in recorded
+
+
 def test_channel_runner_rapid_messages_are_not_lost_or_duplicated():
     from agent.runtime import TurnExecution, TurnResult
 

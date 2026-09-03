@@ -52,15 +52,7 @@ def web_session_home(session_id: str) -> Path:
     clean = str(session_id or "").strip()
     if not clean or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", clean) is None:
         raise ValueError("invalid web session id")
-    target = web_session_root() / clean
-    # Backward compatibility for installations created before the Web session
-    # root was introduced. Keep using the old home until it is explicitly
-    # migrated, so reopening a historical session never starts from empty
-    # context by accident.
-    legacy = Path.home() / f".agent-{clean}"
-    if not (target / ".web-session").is_file() and (legacy / ".web-session").is_file():
-        return legacy
-    return target
+    return web_session_root() / clean
 
 
 def iter_session_homes():

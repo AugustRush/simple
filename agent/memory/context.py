@@ -117,10 +117,20 @@ class ContextManager:
         consolidation rules, but they must not share staging buffers, idle
         timers, or dirty flags.
         """
-        if self.staging.path.parent.name == "_staging":
-            context_dir = self.staging.path.parent.parent
-        else:
-            context_dir = self.staging.path.parent
+        # ``StagingBuffer`` keeps the owning context directory explicitly for
+        # both its SQLite and legacy JSONL backends.  Prefer that value over
+        # inferring it from ``path``: callers may place a JSONL staging file in
+        # an arbitrary subdirectory, and inferring from that path would make a
+        # spawned session silently write a new ``palace.db`` in the wrong
+        # directory.  The path fallback is retained for old test doubles.
+        context_dir = getattr(self.staging, "context_dir", None)
+        if context_dir is None:
+            path = Path(self.staging.path)
+            context_dir = (
+                path.parent.parent
+                if path.parent.name == "_staging"
+                else path.parent
+            )
         staging = StagingBuffer(context_dir=context_dir, session_id=session_id)
         return ContextManager(
             store=self.store,

@@ -136,6 +136,7 @@ class RuntimeSessionState:
     system_prompt_override: str | None = None
     turn_lock: Any = None
     last_activity: float = 0.0
+    runtime_revision: int = 0
 
     def __init__(
         self,
@@ -158,6 +159,7 @@ class RuntimeSessionState:
         system_prompt_override: str | None = None,
         turn_lock: Any = None,
         last_activity: float = 0.0,
+        runtime_revision: int = 0,
     ) -> None:
         if (
             pending_messages is not None
@@ -199,6 +201,7 @@ class RuntimeSessionState:
         self.system_prompt_override = system_prompt_override
         self.turn_lock = turn_lock if turn_lock is not None else asyncio.Lock()
         self.last_activity = float(last_activity or 0.0)
+        self.runtime_revision = int(runtime_revision or 0)
 
     @property
     def pending_messages(self) -> list[dict[str, Any]]:

@@ -151,11 +151,6 @@ class SessionService:
             from agent import shared
 
             home = shared.web_session_home(str(session_id).strip())
-            # Keep reading the pre-migration layout until it is explicitly
-            # migrated. This allows users to upgrade without losing history.
-            legacy_home = Path.home() / f".agent-{str(session_id).strip()}"
-            if not (home / ".web-session").is_file() and (legacy_home / ".web-session").is_file():
-                home = legacy_home
             if not (home / ".web-session").is_file():
                 return self._store
         except (OSError, ValueError):
@@ -290,16 +285,11 @@ class SessionService:
 
             web_root = shared.web_session_root()
             homes = list(web_root.iterdir()) if web_root.is_dir() else []
-            # Legacy sibling homes remain discoverable during migration.
-            homes.extend(Path.home().glob(".agent-*"))
             for home in homes:
                 marker = home / ".web-session"
                 if not marker.is_file():
                     continue
-                if home.parent == web_root:
-                    sid = home.name
-                else:
-                    sid = home.name[len(".agent-"):]
+                sid = home.name
                 if sid and sid not in durable:
                     isolated_store = self._store_for_session(sid)
                     isolated_ids = getattr(isolated_store, "list_session_ids", None)
@@ -487,7 +477,6 @@ class SessionService:
             candidates = {
                 current_home,
                 shared.web_session_root() / clean,
-                Path.home() / f".agent-{clean}",
             }
             for home in candidates:
                 if (home / ".web-session").is_file() and home.is_dir():
@@ -562,6 +551,11 @@ class SessionService:
             turns = get_turns(session_id=session_id, limit=limit)
         except Exception:
             return []
+        turn_ids = {
+            str(getattr(turn, "message_id", "") or "").strip()
+            for turn in turns or ()
+            if str(getattr(turn, "message_id", "") or "").strip()
+        }
         messages: list[dict[str, Any]] = []
         for turn in turns or ():
             role = str(getattr(turn, "role", "") or "")
@@ -585,6 +579,29 @@ class SessionService:
                 events = get_events(session_id=session_id, limit=max(100, limit * 8))
             except Exception:
                 events = []
+            # Recover events written by pre-fix Web runtimes under a factory
+            # staging session id. Turn ids are globally unique and still tie
+            # those events to the correct conversation.
+            get_events_for_turns = getattr(
+                target_store, "recent_agent_events_for_turns", None
+            )
+            if callable(get_events_for_turns) and turn_ids:
+                try:
+                    legacy_events = get_events_for_turns(
+                        turn_ids=turn_ids,
+                        limit=max(100, limit * 8),
+                    )
+                    seen_event_ids = {
+                        int(getattr(event, "id", 0) or 0) for event in events
+                    }
+                    events.extend(
+                        event
+                        for event in legacy_events
+                        if int(getattr(event, "id", 0) or 0) not in seen_event_ids
+                    )
+                    events.sort(key=lambda event: int(getattr(event, "id", 0) or 0))
+                except Exception:
+                    pass
             tools: dict[str, dict[str, Any]] = {}
             order: list[str] = []
             terminal_turns: set[str] = set()

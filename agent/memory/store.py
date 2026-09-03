@@ -1466,6 +1466,37 @@ class LTMStore:
             ).fetchall()
         return [self._row_to_agent_runtime_event(row) for row in reversed(rows)]
 
+    def recent_agent_events_for_turns(
+        self,
+        *,
+        turn_ids: list[str] | tuple[str, ...] | set[str],
+        limit: int = 2000,
+    ) -> list[AgentRuntimeEvent]:
+        """Read events for known turns, including legacy mis-scoped rows.
+
+        Older Web runtimes persisted events through a factory-level staging
+        buffer, so their ``session_id`` can differ from the conversation row
+        while the globally unique ``turn_id`` remains correct. This narrow
+        lookup lets history replay recover those rows without broadening the
+        session query to unrelated events.
+        """
+        ids = [str(value or "").strip() for value in turn_ids]
+        ids = list(dict.fromkeys(value for value in ids if value))
+        if not ids:
+            return []
+        limit = max(1, min(int(limit), 2000))
+        placeholders = ", ".join("?" for _ in ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM agent_events
+                WHERE turn_id IN ({placeholders})
+                ORDER BY id DESC LIMIT ?
+                """,
+                (*ids, limit),
+            ).fetchall()
+        return [self._row_to_agent_runtime_event(row) for row in reversed(rows)]
+
     @staticmethod
     def _fact_assertion_core_score(
         assertion: FactAssertion,

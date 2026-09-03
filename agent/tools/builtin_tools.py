@@ -151,13 +151,13 @@ class _PluginInstallError(Exception):
         super().__init__(str(payload.get("error") or "plugin install failed"))
 
 
-def _resolve_user_plugin_target(name: str) -> Path:
+def _resolve_user_plugin_target(name: str, root: Path | None = None) -> Path:
     if name != name.strip() or re.fullmatch(
         r"[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?\Z", name
     ) is None:
         raise ValueError("plugin name must be a canonical slug")
 
-    root = shared.USER_PLUGINS_DIR.expanduser().resolve(strict=False)
+    root = (root or shared.USER_PLUGINS_DIR).expanduser().resolve(strict=False)
     target = (root / name).resolve(strict=False)
     if target.parent != root:
         raise ValueError(
@@ -233,6 +233,10 @@ class BuiltinTools:
             output_dir = shared.DEFAULT_OUTPUT_DIR.expanduser().resolve(strict=False)
         output_dir.mkdir(parents=True, exist_ok=True)
         return output_dir
+
+    def _resource_home(self) -> Path:
+        raw = self.registry.get_context("resource_home")
+        return Path(str(raw)).expanduser().resolve(strict=False) if raw else shared.AGENT_HOME
 
     def _sandbox_dir(self) -> Path:
         """Dedicated scratch directory for shell commands.
@@ -1245,7 +1249,7 @@ class BuiltinTools:
             name = re.sub(r"[^a-zA-Z0-9_-]", "-", slug).strip("-") or "plugin"
 
         try:
-            target = _resolve_user_plugin_target(name)
+            target = _resolve_user_plugin_target(name, self.registry.get_context("user_plugins_dir") and Path(str(self.registry.get_context("user_plugins_dir"))))
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -1500,7 +1504,7 @@ class BuiltinTools:
         import shutil
 
         try:
-            target = _resolve_user_plugin_target(name)
+            target = _resolve_user_plugin_target(name, self.registry.get_context("user_plugins_dir") and Path(str(self.registry.get_context("user_plugins_dir"))))
         except ValueError as exc:
             return {"ok": False, "error": str(exc)}
         if not target.is_dir():
@@ -1536,8 +1540,9 @@ class BuiltinTools:
 
         on_disk: list[dict] = []
         user_dir_loaded_count = 0
-        if shared.USER_PLUGINS_DIR.is_dir():
-            for entry in sorted(shared.USER_PLUGINS_DIR.iterdir()):
+        user_plugins_dir = Path(str(self.registry.get_context("user_plugins_dir") or shared.USER_PLUGINS_DIR))
+        if user_plugins_dir.is_dir():
+            for entry in sorted(user_plugins_dir.iterdir()):
                 if not entry.is_dir():
                     continue
                 # Check if the directory name matches a loaded plugin, OR
@@ -1555,7 +1560,7 @@ class BuiltinTools:
                 })
         return {
             "ok": True,
-            "user_plugins_dir": str(shared.USER_PLUGINS_DIR),
+            "user_plugins_dir": str(user_plugins_dir),
             "plugins": on_disk,
             # Count of loaded plugins present in the user plugin directory listing.
             "loaded_count": user_dir_loaded_count,
@@ -2185,7 +2190,7 @@ class BuiltinTools:
                         extra_secret_paths=tuple(
                             self.registry.get_context("shell_secret_paths") or ()
                         ),
-                        agent_home=shared.AGENT_HOME,
+                        agent_home=self._resource_home(),
                     )
                 )
             except SandboxUnavailableError as exc:
