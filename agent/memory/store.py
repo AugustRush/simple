@@ -1451,7 +1451,10 @@ class LTMStore:
         clean_session_id = str(session_id or "").strip()
         if not clean_session_id:
             return []
-        limit = max(1, min(int(limit), 100))
+        # Tool progress is much more verbose than conversation turns. Allow
+        # the web history reader to fetch enough events to rebuild older traces
+        # after a restart while retaining a hard upper bound.
+        limit = max(1, min(int(limit), 2000))
         with self._connect() as conn:
             rows = conn.execute(
                 """

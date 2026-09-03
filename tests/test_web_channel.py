@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -277,7 +279,6 @@ def test_web_files_endpoint_serves_agent_home_files(tmp_path):
 
     channel = _channel()
     channel.bind_runtime({}, {})
-    monkeypatch_holder = None
 
     with TestClient(channel.app) as client:
         # Use the active agent home as the allowed root.
@@ -339,6 +340,193 @@ def test_web_delete_session_removes_durable_turns():
         assert resp.status_code == 200
         sessions = client.get("/api/sessions").json()["sessions"]
         assert all(s["session_id"] != "abc123" for s in sessions)
+
+
+def test_web_session_home_uses_new_root_and_delete_cleans_it(tmp_path, monkeypatch):
+    from pathlib import Path
+    from agent import shared
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    home = shared.web_session_home("abc123")
+    assert home == tmp_path / ".agent" / "web" / "sessions" / "abc123"
+    home.mkdir(parents=True)
+    (home / ".web-session").touch()
+    (home / "output").mkdir()
+    (home / "output" / "artifact.txt").write_text("x")
+
+    service = SessionService(store=_FakeStore(), live_states={})
+    assert service.delete_session("abc123") is True
+    assert not home.exists()
+
+
+def test_web_session_registry_keeps_empty_sessions(tmp_path, monkeypatch):
+    from pathlib import Path
+    from agent import shared
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    channel = _channel()
+    channel.bind_runtime(
+        {},
+        {
+            "context_manager": SimpleNamespace(store=_FakeStore()),
+            "session_store_factory": lambda sid: _FakeStore(),
+        },
+    )
+    with TestClient(channel.app) as client:
+        sid = client.post("/api/sessions").json()["session_id"]
+        sessions = client.get("/api/sessions").json()["sessions"]
+        assert any(item["session_id"] == sid for item in sessions)
+
+
+def test_web_session_registry_keeps_registry_title(tmp_path, monkeypatch):
+    from pathlib import Path
+    from agent import shared
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    channel = _channel()
+    channel.bind_runtime(
+        {},
+        {
+            "context_manager": SimpleNamespace(store=_FakeStore()),
+            "session_store_factory": lambda sid: _FakeStore(),
+        },
+    )
+    with TestClient(channel.app) as client:
+        sid = client.post("/api/sessions").json()["session_id"]
+        renamed = client.patch(
+            f"/api/sessions/{sid}",
+            json={"title": "保留的空会话标题"},
+        )
+        assert renamed.status_code == 200
+        sessions = client.get("/api/sessions").json()["sessions"]
+
+    assert next(item for item in sessions if item["session_id"] == sid)["title"] == (
+        "保留的空会话标题"
+    )
+
+
+def test_web_delete_awaits_runtime_cleanup_before_removing_home(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+    from agent import shared
+    from starlette.testclient import TestClient
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    session_id = "abc123"
+    home = shared.web_session_home(session_id)
+    home.mkdir(parents=True)
+    (home / ".web-session").touch()
+    cleanup_observations = []
+
+    async def cleanup(sid):
+        cleanup_observations.append((sid, home.exists()))
+        await asyncio.sleep(0)
+        cleanup_observations.append((sid, home.exists()))
+
+    channel = _channel()
+    channel.bind_runtime(
+        {session_id: SimpleNamespace(turn_count=0)},
+        {
+            "context_manager": SimpleNamespace(store=_FakeStore()),
+            "session_store_factory": lambda sid: _FakeStore(),
+            "session_runtime_cleanup": cleanup,
+        },
+    )
+    with TestClient(channel.app) as client:
+        response = client.delete(f"/api/sessions/{session_id}")
+
+    assert response.status_code == 200
+    assert cleanup_observations == [(session_id, True), (session_id, True)]
+    assert not home.exists()
+
+
+def test_web_delete_rejects_unsafe_session_id(tmp_path, monkeypatch):
+    from pathlib import Path
+    from agent import shared
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    outside = tmp_path / ".agent" / "web" / "victim"
+    outside.mkdir(parents=True)
+    (outside / ".web-session").touch()
+
+    service = SessionService(store=_FakeStore(), live_states={})
+    assert service.delete_session("../victim") is False
+    assert outside.exists()
+
+
+def test_web_model_override_uses_session_config_snapshot(tmp_path, monkeypatch):
+    from pathlib import Path
+    from agent import shared
+    import agent.config as config_module
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    home = shared.web_session_home("abc123")
+    home.mkdir(parents=True)
+    (home / ".web-session").touch()
+    (home / "config.json").write_text(
+        json.dumps(
+            {
+                "active_provider": "snapshot-provider",
+                "providers": {
+                    "snapshot-provider": {
+                        "default_model": "snapshot-model",
+                        "models": ["snapshot-model", "snapshot-alt"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: (
+            {
+                "active_provider": "global-provider",
+                "providers": {
+                    "global-provider": {"default_model": "global-model"}
+                },
+            },
+            False,
+        ),
+    )
+
+    assert WebChannel._resolve_model_override("snapshot-alt", "abc123") == (
+        "snapshot-alt"
+    )
+    with pytest.raises(ValueError, match="not available"):
+        WebChannel._resolve_model_override("global-model", "abc123")
+
+
+def test_web_bulk_delete_sessions():
+    from starlette.testclient import TestClient
+
+    store = _FakeStore({
+        "abc123": [_turn("user", "hi")],
+        "def456": [_turn("user", "hello")],
+    })
+    channel = _channel()
+    channel.bind_runtime({}, {"context_manager": SimpleNamespace(store=store)})
+
+    with TestClient(channel.app) as client:
+        resp = client.request(
+            "DELETE",
+            "/api/sessions",
+            json={"session_ids": ["abc123", "def456", "abc123"]},
+        )
+        assert resp.status_code == 200
+        assert set(resp.json()["deleted"]) == {"abc123", "def456"}
+        assert resp.json()["failed"] == []
+        assert client.get("/api/sessions").json()["sessions"] == []
 
 
 def test_web_reveal_session_opens_session_snapshot(monkeypatch, tmp_path):
@@ -447,7 +635,6 @@ def test_web_rename_session_updates_title():
 
 
 def test_web_plugin_toggle_saves_config_and_reloads():
-    import asyncio
     from starlette.testclient import TestClient
     import agent.config as config_module
 

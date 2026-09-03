@@ -8,7 +8,6 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -28,7 +27,7 @@ DEFAULT_CONFIG_FILE = DEFAULT_AGENT_HOME / "config.json"
 def session_home(name: str) -> Path:
     """Return the data home for a named session.
 
-    Named sessions keep the original ``--name`` layout as siblings of the
+    Named CLI sessions keep the original ``--name`` layout as siblings of the
     user-level default (``~/.agent-prod`` for ``--name prod``).  An empty name
     means the default agent home, which honours ``SIMPLE_AGENT_HOME``.
     """
@@ -36,6 +35,32 @@ def session_home(name: str) -> Path:
     if not clean:
         return DEFAULT_AGENT_HOME
     return Path.home() / f".agent-{clean}"
+
+
+def web_session_root() -> Path:
+    """Return the root directory for isolated Web session runtimes.
+
+    Web sessions intentionally keep independent context, memory, skills and
+    tools. Keeping them below the active agent home makes that isolation
+    explicit without scattering ``.agent-<id>`` siblings across the home.
+    """
+    return AGENT_HOME / "web" / "sessions"
+
+
+def web_session_home(session_id: str) -> Path:
+    """Return the filesystem home for one Web session."""
+    clean = str(session_id or "").strip()
+    if not clean or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", clean) is None:
+        raise ValueError("invalid web session id")
+    target = web_session_root() / clean
+    # Backward compatibility for installations created before the Web session
+    # root was introduced. Keep using the old home until it is explicitly
+    # migrated, so reopening a historical session never starts from empty
+    # context by accident.
+    legacy = Path.home() / f".agent-{clean}"
+    if not (target / ".web-session").is_file() and (legacy / ".web-session").is_file():
+        return legacy
+    return target
 
 
 def iter_session_homes():
@@ -552,6 +577,8 @@ __all__ = [
     "_resolve_agent_home",
     "_set_agent_home",
     "session_home",
+    "web_session_root",
+    "web_session_home",
     "iter_session_homes",
     "resolve_config_file",
     "_new_id",

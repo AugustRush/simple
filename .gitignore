@@ -15,6 +15,7 @@ frontend/vite.config.d.ts
 # Local test and browser artifacts
 .playwright-cli/
 output/
+.test-gateway.log
 .pytest_cache/
 **/__pycache__/
 *.py[cod]

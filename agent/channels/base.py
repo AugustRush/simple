@@ -142,7 +142,7 @@ class ChannelRunner:
             components["model"],
             components["agent"].api_format,
             client_factory=lambda: agent_module.ModelClientFactory.from_config(
-                self._cfg, announce=False
+                components.get("cfg", self._cfg), announce=False
             )[0],
         )
         worker.start()
@@ -221,12 +221,13 @@ class ChannelRunner:
             set_output_dir(components.get("output_dir"))
 
         sessions: dict[str, RuntimeSessionState] = {}
+        handler = self._make_message_handler(sessions)
         bind_runtime = getattr(channel, "bind_runtime", None)
         if callable(bind_runtime):
             bind_runtime(sessions, components)
 
         try:
-            await channel.start(self._make_message_handler(sessions))
+            await channel.start(handler)
         finally:
             for session in sessions.values():
                 worker = session.memory_worker
@@ -302,6 +303,8 @@ class ChannelRunner:
     def _make_message_handler(
         self, sessions: dict[str, RuntimeSessionState]
     ) -> Callable[["IncomingMessage", OutputSink], Any]:
+        import agent as agent_module
+
         components = self._components
         session_components: dict[str, dict] = {}
         session_coordinators: dict[str, CommandCoordinator] = {}
@@ -321,6 +324,18 @@ class ChannelRunner:
                     return built
             session_components[session_id] = components
             return components
+
+        async def _cleanup_session_runtime(session_id: str) -> None:
+            runtime = session_components.pop(session_id, None)
+            session_coordinators.pop(session_id, None)
+            session_plugins_started.discard(session_id)
+            if runtime is None or runtime is components:
+                return
+            close_components = getattr(agent_module, "_close_components", None)
+            if callable(close_components):
+                await close_components(runtime)
+
+        components.setdefault("session_runtime_cleanup", _cleanup_session_runtime)
         agent_core = components.get("agent_core")
         if agent_core is None:
             agent_core = AgentCore(RuntimeComponents(components))
@@ -379,7 +394,19 @@ class ChannelRunner:
             skill_catalog = components["skill_catalog"]
             session_runtime = await _components_for_session(session_id)
             state = await self._ensure_session_state(sessions, session_id, session_runtime)
+            state.last_activity = time.time()
             ctx = state.ctx
+            # Model selection is a per-turn request override.  Keep it on the
+            # mutable session state so AgentCore publishes it into the request
+            # context without mutating the shared BaseAgent/model used by
+            # other web sessions.
+            if "model_override" in msg.metadata:
+                override = msg.metadata.get("model_override")
+                state.model_override = (
+                    override
+                    if isinstance(override, str) and override.strip()
+                    else None
+                )
             session_skill_catalog = session_runtime.get("skill_catalog", skill_catalog)
             ctx.metadata["skill_catalog"] = session_skill_catalog
             if session_id not in session_coordinators:

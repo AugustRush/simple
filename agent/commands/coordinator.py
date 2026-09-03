@@ -253,10 +253,25 @@ class CommandCoordinator:
         first = True
 
         while True:
-            token = self._cancel_token_factory()
-            state.cancel_token = token
-            state.accepts_interjections = current_accepts
-            state.operation_state = "active"
+            # Claim the idle -> active transition atomically. The lock is held
+            # only for state publication, so queued interjections and turns in
+            # other sessions are not blocked while the model is running.
+            turn_lock = getattr(state, "turn_lock", None)
+            if turn_lock is not None:
+                await turn_lock.acquire()
+            try:
+                if state.operation_state != "idle":
+                    state.restart_queue.append(
+                        self._queue_entry(current_input, current_sink)
+                    )
+                    return first_action
+                token = self._cancel_token_factory()
+                state.cancel_token = token
+                state.accepts_interjections = current_accepts
+                state.operation_state = "active"
+            finally:
+                if turn_lock is not None:
+                    turn_lock.release()
             try:
                 if current_ready is not None:
                     await current_ready.wait()

@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +22,41 @@ from agent import shared
 from agent.channels.base import Channel, IncomingMessage
 from agent.core.output import OutputSink
 from agent.session_service import SessionService
+
+logger = logging.getLogger(__name__)
+
+
+def _web_session_output_dir(session_id: str) -> Path:
+    """Return the isolated output directory for a Web session."""
+    try:
+        return shared.web_session_home(str(session_id)) / "output"
+    except ValueError:
+        return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "output"
+
+# File extensions treated as attachable media (image/audio/video).
+_MEDIA_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".tif", ".tiff",
+    ".mp3", ".wav", ".m4a", ".ogg", ".aac", ".flac",
+    ".mp4", ".mov", ".webm", ".mkv", ".avi",
+}
+
+_RASTER_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"}
+
+
+def _svg_has_raster_sibling(path: Path) -> bool:
+    """True when ``path`` is an SVG source with a raster image sibling (X.svg.png)."""
+    if path.suffix.lower() != ".svg":
+        return False
+    try:
+        # The skill writes both ``X.svg`` and a raster sibling named after the
+        # full source file (``X.svg.png``), not after the bare stem (``X.png``),
+        # so build the candidate from ``path.name``.
+        for rs in _RASTER_EXTS:
+            if (path.parent / (path.name + rs)).is_file():
+                return True
+    except OSError:
+        return False
+    return False
 
 
 @dataclass
@@ -45,12 +83,25 @@ class WebOutputSink(OutputSink):
     for the non-streaming HTTP path.
     """
 
-    def __init__(self, websocket: Any = None, *, collect: bool = False) -> None:
+    def __init__(
+        self,
+        websocket: Any = None,
+        *,
+        collect: bool = False,
+        on_attachment: Any = None,
+        output_dir: Any = None,
+    ) -> None:
         self._websocket = websocket
         self._collect = collect or websocket is None
         self._events: list[dict[str, Any]] = []
         self._attachments: list[str] = []
         self._turn_complete_emitted = False
+        self.on_attachment = on_attachment
+        # Session output directory scanned for media produced during a turn so
+        # images/audio/video show inline even if the agent never called send_file.
+        self._output_dir = output_dir
+        self._turn_started_at = 0.0
+        self._attached_paths: set[str] = set()
         self.full_text = ""
         self._queue: Optional[asyncio.Queue[dict[str, Any] | None]] = None
         self._sender_task: Optional[asyncio.Task[Any]] = None
@@ -79,6 +130,14 @@ class WebOutputSink(OutputSink):
     def mark_turn_start(self) -> None:
         """Reset the per-message completion marker used by WebSocket delivery."""
         self._turn_complete_emitted = False
+        self._turn_started_at = time.time()
+        # ``_attachments`` / ``_attached_paths`` are per-turn transient state.  A
+        # sink is reused across turns on a WebSocket connection; without clearing
+        # them here a media path attached in an earlier turn would suppress the
+        # auto-scan when the file is regenerated later, so a fresh image/audio/
+        # video would never show inline.
+        self._attachments.clear()
+        self._attached_paths.clear()
 
     @property
     def turn_complete_emitted(self) -> bool:
@@ -148,16 +207,80 @@ class WebOutputSink(OutputSink):
         return str(path)
 
     async def flush_attachments(self) -> None:
-        """Emit queued attachment events and clear the queue."""
-        if not self._attachments:
-            return
+        """Emit queued attachment events, auto-attach session media, and clear."""
         for path in self._attachments:
             name = Path(path).name
             self._emit(
                 {"type": "attachment", "path": path, "name": name}
             )
+            # Mark as already attached so the auto-scan below won't re-emit it.
+            self._attached_paths.add(str(path))
+            cb = getattr(self, "on_attachment", None)
+            if callable(cb):
+                try:
+                    cb(path, name)
+                except Exception:
+                    logger.exception("failed to journal attachment: %s", path)
         self._attachments.clear()
+        self._auto_attach_media()
         await self.flush()
+
+    def _auto_attach_media(self) -> None:
+        """Attach media files the agent created in this session's output dir.
+
+        The agent often writes an image/audio/video into the session home and
+        narrates that it was sent without ever calling ``send_file``.  To keep
+        the web UI consistent (media shows inline, live and in history), scan the
+        session output dir for media created during this turn and emit+journal a
+        normal ``attachment`` event for each one not already queued.
+        """
+        out = getattr(self, "_output_dir", None)
+        if out is None:
+            return
+        try:
+            out = Path(out)
+        except Exception:
+            return
+        if not out.is_dir():
+            return
+        turn_started = float(getattr(self, "_turn_started_at", 0.0) or 0.0)
+        if turn_started <= 0:
+            return
+        cb = getattr(self, "on_attachment", None)
+        attached = getattr(self, "_attached_paths", set())
+        now = time.time()
+        try:
+            for p in out.iterdir():
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in _MEDIA_EXTS:
+                    continue
+                # Skip an SVG source when a raster sibling (e.g. X.svg -> X.svg.png)
+                # exists: the skill writes both, and rendering both is a duplicate.
+                if p.suffix.lower() == ".svg":
+                    if _svg_has_raster_sibling(p):
+                        continue
+                s = str(p)
+                if s in attached:
+                    continue
+                try:
+                    mtime = p.stat().st_mtime
+                except OSError:
+                    continue
+                # Created during this turn (allow small clock skew); ignore
+                # future-dated files to avoid weird clock errors.
+                if mtime < turn_started - 1 or mtime > now + 60:
+                    continue
+                attached.add(s)
+                name = p.name
+                self._emit({"type": "attachment", "path": s, "name": name})
+                if callable(cb):
+                    try:
+                        cb(s, name)
+                    except Exception:
+                        logger.exception("failed to journal attachment: %s", s)
+        except Exception:
+            logger.exception("auto-attach media scan failed")
 
     def defer_temporary_attachment_cleanup(self, receipt: object) -> bool:
         return True
@@ -311,7 +434,12 @@ class WebChannel(Channel):
         """
         package_dist = Path(__file__).resolve().parent.parent / "_builtin" / "web" / "dist"
         source_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-        if (source_dist / "index.html").is_file():
+        # Vite can leave ``index.html`` behind when a build is interrupted or
+        # when only the source tree has been copied.  Treat that as an
+        # incomplete bundle; StaticFiles raises during app construction if the
+        # referenced assets directory is missing.  Falling back to the bundled
+        # release keeps the gateway usable until the next frontend build.
+        if (source_dist / "index.html").is_file() and (source_dist / "assets").is_dir():
             return source_dist
         return package_dist
 
@@ -329,12 +457,78 @@ class WebChannel(Channel):
             store=store,
             live_states=sessions,
             store_factory=components.get("session_store_factory"),
+            runtime_cleanup=lambda sid: (
+                self._components.get("session_runtime_cleanup")(sid)
+                if callable(self._components.get("session_runtime_cleanup"))
+                else None
+            ),
         )
 
     def _service(self) -> SessionService:
         if self._session_service is None:
             self._session_service = SessionService(live_states=self._sessions)
         return self._session_service
+
+    @staticmethod
+    def _resolve_model_override(raw_model: Any, session_id: str = "") -> str | None:
+        """Validate a model selected by the browser.
+
+        The input control sends a model id, not a provider configuration.  Keep
+        this value scoped to the current turn and only accept ids advertised by
+        the local configuration (plus the configured top-level model).
+        """
+        if raw_model is None:
+            return None
+        if not isinstance(raw_model, str):
+            raise ValueError("model must be a string")
+        model = raw_model.strip()
+        if not model or model == "默认模型":
+            return None
+
+        cfg: dict[str, Any] = {}
+        clean_session_id = str(session_id or "").strip()
+        if clean_session_id:
+            try:
+                session_config = shared.web_session_home(clean_session_id) / "config.json"
+                loaded = json.loads(session_config.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg = loaded
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        if not cfg:
+            try:
+                from agent.config import load_config
+
+                cfg, _ = load_config()
+            except Exception:
+                cfg = {}
+        configured: set[str] = set()
+        top_level = cfg.get("model")
+        if isinstance(top_level, str) and top_level.strip():
+            configured.add(top_level.strip())
+        providers = cfg.get("providers")
+        if isinstance(providers, dict):
+            # A session's client is initialized for the active provider.  Keep
+            # the input selector honest by accepting only models that client
+            # can serve; changing provider remains an explicit settings action.
+            active_name = cfg.get("active_provider")
+            provider = providers.get(active_name, {})
+            if isinstance(provider, dict):
+                default = provider.get("default_model")
+                if isinstance(default, str) and default.strip():
+                    configured.add(default.strip())
+                models = provider.get("models")
+                if isinstance(models, (list, tuple)):
+                    configured.update(
+                        item.strip()
+                        for item in models
+                        if isinstance(item, str) and item.strip()
+                    )
+        if configured and model not in configured:
+            raise ValueError("model is not available in the current configuration")
+        if not configured:
+            raise ValueError("no configured models are available")
+        return model
 
     def _authorized(self, request: Any) -> bool:
         token = self._config.auth_token.strip()
@@ -373,7 +567,6 @@ class WebChannel(Channel):
     # -- HTTP endpoints -------------------------------------------------------
 
     async def _index(self, request: Any) -> Any:
-        from pathlib import Path
         from starlette.responses import HTMLResponse
 
         dist = self._web_dist_dir() / "index.html"
@@ -595,10 +788,29 @@ class WebChannel(Channel):
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         session_id = request.path_params["session_id"]
-        ok = self._service().delete_session(session_id)
+        ok = await self._service().delete_session_async(session_id)
         if not ok:
             return JSONResponse({"error": "delete failed"}, status_code=500)
         return JSONResponse({"ok": True})
+
+    async def _delete_sessions(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        if not isinstance(body, dict) or not isinstance(body.get("session_ids"), list):
+            return JSONResponse({"error": "session_ids must be an array"}, status_code=400)
+        session_ids = body["session_ids"]
+        if len(session_ids) > 200:
+            return JSONResponse({"error": "too many sessions"}, status_code=400)
+        if not all(isinstance(item, str) and item.strip() for item in session_ids):
+            return JSONResponse({"error": "session_ids must contain non-empty strings"}, status_code=400)
+        result = await self._service().delete_sessions_async(session_ids)
+        return JSONResponse({"ok": not result["failed"], **result})
 
     async def _reveal_session(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -636,6 +848,9 @@ class WebChannel(Channel):
             resolved = candidate.resolve()
             allowed_roots = [shared.AGENT_HOME.resolve()]
             try:
+                web_root = shared.web_session_root().resolve()
+                if web_root.is_dir():
+                    allowed_roots.append(web_root)
                 allowed_roots.extend(
                     home.resolve()
                     for home in Path.home().glob(".agent-*")
@@ -775,8 +990,27 @@ class WebChannel(Channel):
 
         session_id = request.path_params["session_id"]
         message_id = str(body.get("message_id") or uuid.uuid4().hex)
-        sink = WebOutputSink(collect=True)
-        await self._handle_text(session_id, text, sink, message_id=message_id)
+        clean_sid = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
+        sink = WebOutputSink(
+            collect=True,
+            on_attachment=lambda path, name: self._record_attachment(
+                session_id, path, name, turn_id=message_id
+            ),
+            output_dir=_web_session_output_dir(clean_sid),
+        )
+        sink.mark_turn_start()
+        try:
+            model = self._resolve_model_override(body.get("model"), session_id)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        await self._handle_text(
+            session_id,
+            text,
+            sink,
+            message_id=message_id,
+            model_override=model,
+        )
+        await sink.flush_attachments()
         return JSONResponse(
             {
                 "session_id": session_id,
@@ -785,6 +1019,27 @@ class WebChannel(Channel):
                 "events": sink.events,
             }
         )
+
+    async def _cancel_session(self, request: Any) -> Any:
+        """Cancel the actively running turn for a session.
+
+        Used by the frontend "stop" button.  Cancelling the session's
+        ``cancel_token`` cooperatively stops the running agent turn (the
+        registered cleanup aborts an in-flight model request) and the
+        existing stream flow emits ``turn_complete`` so the client resets its
+        streaming state.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = request.path_params["session_id"]
+        state = self._sessions.get(session_id)
+        token = getattr(state, "cancel_token", None) if state is not None else None
+        if token is None:
+            return JSONResponse({"ok": True, "cancelled": False})
+        token.cancel("force")
+        return JSONResponse({"ok": True, "cancelled": True})
 
     async def _stream(self, websocket: Any) -> None:
         await websocket.accept()
@@ -797,7 +1052,11 @@ class WebChannel(Channel):
             return
 
         session_id = websocket.path_params["session_id"]
-        sink = WebOutputSink(websocket=websocket)
+        clean_sid = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
+        sink = WebOutputSink(
+            websocket=websocket,
+            output_dir=_web_session_output_dir(clean_sid),
+        )
         try:
             while True:
                 data = await websocket.receive_json()
@@ -812,11 +1071,23 @@ class WebChannel(Channel):
                     )
                     continue
                 message_id = str(data.get("message_id") or uuid.uuid4().hex)
+                try:
+                    model = self._resolve_model_override(data.get("model"), session_id)
+                except ValueError as exc:
+                    await websocket.send_json({"type": "error", "error": str(exc)})
+                    continue
+                sink.on_attachment = lambda path, name: self._record_attachment(
+                    session_id, path, name, turn_id=message_id
+                )
                 sink.mark_turn_start()
                 await self._handle_text(
-                    session_id, text, sink, message_id=message_id
+                    session_id,
+                    text,
+                    sink,
+                    message_id=message_id,
+                    model_override=model,
                 )
-                await sink.flush()
+                await sink.flush_attachments()
                 if not sink.turn_complete_emitted:
                     sink.on_turn_complete("", [])
                     await sink.flush()
@@ -832,15 +1103,37 @@ class WebChannel(Channel):
         sink: OutputSink,
         *,
         message_id: str,
+        model_override: str | None = None,
     ) -> None:
         assert self._handler is not None
+        service = self._service()
+        service.touch_session(session_id, status="active")
         msg = IncomingMessage(
             text=text,
             session_id=session_id,
             channel_name="web",
-            metadata={"message_id": message_id},
+            metadata={
+                "message_id": message_id,
+                "model_override": model_override,
+            },
         )
-        await self._handler(msg, sink)
+        try:
+            await self._handler(msg, sink)
+        finally:
+            service.touch_session(session_id, status="idle")
+
+    def _record_attachment(
+        self,
+        session_id: str,
+        path: str,
+        name: str,
+        *,
+        turn_id: str = "",
+    ) -> None:
+        try:
+            self._service().record_attachment(session_id, path, name, turn_id=turn_id)
+        except Exception:
+            logger.exception("failed to journal attachment: %s", path)
 
     # -- Channel contract -------------------------------------------------------
 
@@ -938,6 +1231,7 @@ class WebChannel(Channel):
             Route("/api/files", self._file, methods=["GET"]),
             Route("/api/sessions", self._list_sessions, methods=["GET"]),
             Route("/api/sessions", self._create_session, methods=["POST"]),
+            Route("/api/sessions", self._delete_sessions, methods=["DELETE"]),
             Route(
                 "/api/sessions/{session_id}/messages",
                 self._get_messages,
@@ -946,6 +1240,11 @@ class WebChannel(Channel):
             Route(
                 "/api/sessions/{session_id}/messages",
                 self._post_message,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/cancel",
+                self._cancel_session,
                 methods=["POST"],
             ),
             Route(
@@ -963,6 +1262,6 @@ class WebChannel(Channel):
                 self._stream,
             ),
         ]
-        if dist_dir.is_dir():
+        if (dist_dir / "assets").is_dir():
             routes.append(Mount("/assets", StaticFiles(directory=dist_dir / "assets")))
         return Starlette(routes=routes, middleware=middleware)

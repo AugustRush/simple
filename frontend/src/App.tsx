@@ -5,11 +5,13 @@ import React, {
   useRef,
   useState,
 } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Avatar,
   Badge,
   Button,
   Card,
+  Checkbox,
   Col,
   ConfigProvider,
   Dropdown,
@@ -20,6 +22,7 @@ import {
   Layout,
   Menu,
   Modal,
+  Popconfirm,
   Row,
   Select,
   Skeleton,
@@ -59,6 +62,7 @@ import {
   SearchOutlined,
   SendOutlined,
   SettingOutlined,
+  StopOutlined,
   SunOutlined,
   TagsOutlined,
   ThunderboltOutlined,
@@ -71,7 +75,7 @@ const { TextArea } = Input
 const { Paragraph, Text } = Typography
 
 type MessageRole = 'user' | 'assistant' | 'tool' | 'command' | 'error'
-type ToolState = 'running' | 'done' | 'blocked'
+type ToolState = 'running' | 'done' | 'blocked' | 'interrupted'
 
 interface SessionInfo {
   session_id: string
@@ -124,6 +128,31 @@ function escapeHtml(s: string): string {
   }[c]!))
 }
 
+const IMAGE_EXT = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico'])
+const AUDIO_EXT = new Set(['mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'opus'])
+const VIDEO_EXT = new Set(['mp4', 'webm', 'mov', 'm4v', 'avi', 'mkv', 'ogv'])
+
+type MediaKind = 'image' | 'audio' | 'video' | 'file'
+
+function mediaKindForUrl(url: string): MediaKind {
+  if (!url) return 'file'
+  let s = String(url)
+  try {
+    // /api/files?path=... — read the underlying path so the extension is true.
+    const u = new URL(s, location.origin)
+    const p = u.searchParams.get('path')
+    if (p && !/^https?:/i.test(p)) return mediaKindForUrl(p)
+  } catch {
+    // not a parseable URL — fall through to extension sniffing
+  }
+  const clean = s.split('?')[0].split('#')[0].toLowerCase()
+  const ext = (clean.split('.').pop() || '').trim()
+  if (IMAGE_EXT.has(ext)) return 'image'
+  if (AUDIO_EXT.has(ext)) return 'audio'
+  if (VIDEO_EXT.has(ext)) return 'video'
+  return 'file'
+}
+
 function markdownToHtml(text: string): string {
   let t = escapeHtml(text || '')
   const codeBlocks: string[] = []
@@ -146,6 +175,7 @@ function markdownToHtml(text: string): string {
   t = t.replace(/`([^`]+)`/g, '<code>$1</code>')
   t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
   t = t.replace(/\*([^*]+)\*/g, '<em>$1</em>')
+  t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img class="md-img" src="$2" alt="$1" loading="lazy" />')
   t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
 
   const lines = t.split('\n')
@@ -204,6 +234,7 @@ function relativeTime(value?: string): string {
 function toolStateLabel(state?: ToolState): string {
   if (state === 'running') return '执行中'
   if (state === 'blocked') return '已阻止'
+  if (state === 'interrupted') return '已中断'
   return '已完成'
 }
 
@@ -226,6 +257,7 @@ function App() {
   )
   const [view, setView] = useState<string>('chat')
   const [sessions, setSessions] = useState<SessionInfo[]>([])
+  const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([])
   const [activeSession, setActiveSession] = useState<string | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [commands, setCommands] = useState<CommandInfo[]>([])
@@ -234,7 +266,54 @@ function App() {
   const [config, setConfig] = useState<any>(null)
   const [configText, setConfigText] = useState<string>('')
   const [confirmReq, setConfirmReq] = useState<any>(null)
-  const [input, setInput] = useState('')
+  const [drafts, setDrafts] = useState<Record<string, string>>(() => {
+    try {
+      const raw = localStorage.getItem('chat_drafts')
+      return raw ? (JSON.parse(raw) as Record<string, string>) : {}
+    } catch {
+      return {}
+    }
+  })
+  const draftKey = activeSession ?? '__new__'
+  const input = drafts[draftKey] ?? ''
+  const setInput = useCallback((value: string) => {
+    setDrafts(prev => ({ ...prev, [draftKey]: value }))
+  }, [draftKey])
+  useEffect(() => {
+    try {
+      localStorage.setItem('chat_drafts', JSON.stringify(drafts))
+    } catch {
+      // ignore storage errors
+    }
+  }, [drafts])
+
+  // Cache a bounded set of the most recent sessions locally. In-progress turns
+  // are rare and completed history lives server-side, so only a few recent
+  // sessions need to be cached (LRU, capped) to restore instantly on switch and
+  // to avoid blowing the localStorage quota. Writes are debounced so streaming
+  // chunks don't hit localStorage on every frame.
+  const MAX_CACHED_SESSIONS = 6
+  useEffect(() => {
+    if (!activeSession) return
+    const t = setTimeout(() => {
+      try {
+        localStorage.setItem(`chat_messages:${activeSession}`, JSON.stringify(messages))
+        const raw = localStorage.getItem('chat_messages:index')
+        const index = (raw ? (JSON.parse(raw) as string[]) : []).filter(
+          id => id !== activeSession,
+        )
+        index.unshift(activeSession)
+        while (index.length > MAX_CACHED_SESSIONS) {
+          const evicted = index.pop()
+          if (evicted) localStorage.removeItem(`chat_messages:${evicted}`)
+        }
+        localStorage.setItem('chat_messages:index', JSON.stringify(index))
+      } catch {
+        // ignore storage errors
+      }
+    }, 300)
+    return () => clearTimeout(t)
+  }, [messages, activeSession])
   const [sessionSearch, setSessionSearch] = useState('')
   const [pluginSearch, setPluginSearch] = useState('')
   const [skillSearch, setSkillSearch] = useState('')
@@ -256,16 +335,30 @@ function App() {
   const [commandIndex, setCommandIndex] = useState(0)
   const [expandedTraces, setExpandedTraces] = useState<Record<string, boolean>>({})
   const [settingsDirty, setSettingsDirty] = useState(false)
+  const [sendShortcut, setSendShortcut] = useState<'enter' | 'ctrl-enter'>(
+    () => (localStorage.getItem('send_shortcut') === 'ctrl-enter' ? 'ctrl-enter' : 'enter'),
+  )
+  const sendShortcutLabel = sendShortcut === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'
   const [form] = Form.useForm()
+  const activeProviderName = Form.useWatch('active_provider', form)
   const wsRef = useRef<WebSocket | null>(null)
+  // Keep the selected model available to WebSocket callbacks without making
+  // the socket reconnect every time the dropdown changes.
+  const currentModelRef = useRef(currentModel)
   const activeSessionRef = useRef<string | null>(null)
   const pendingSendRef = useRef<string | null>(null)
+  const pendingModelRef = useRef<string | null>(null)
   const streamIdRef = useRef<string | null>(null)
   const messagesRef = useRef<Message[]>([])
   const loadMessagesRequestRef = useRef(0)
   const chatEndRef = useRef<HTMLDivElement | null>(null)
+  const commandItemRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const idRef = useRef(0)
   const token = localStorage.getItem('agent_token') || ''
+
+  useEffect(() => {
+    currentModelRef.current = currentModel
+  }, [currentModel])
 
   const makeId = useCallback(() => {
     idRef.current += 1
@@ -344,7 +437,11 @@ function App() {
       setLoadingSessions(true)
       const resp = await api('/api/sessions')
       const data = await resp.json()
-      setSessions(data.sessions || [])
+      const nextSessions = data.sessions || []
+      setSessions(nextSessions)
+      setSelectedSessionIds(current =>
+        current.filter(id => nextSessions.some((item: SessionInfo) => item.session_id === id)),
+      )
     } catch {
       // API errors are surfaced by the shared request helper.
     } finally {
@@ -377,14 +474,20 @@ function App() {
           return
         }
         const loaded = (data.messages || []).map(
-          (item: any): Message => ({
-            id: makeId(),
-            role: (item.role as MessageRole) || 'assistant',
-            content: item.content || '',
-            link: item.link,
-            tool: item.tool,
-            toolState: item.toolState as ToolState | undefined,
-          }),
+          (item: any): Message => {
+            let link = item.link || ''
+            if (link && token) {
+              link += (link.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token)
+            }
+            return {
+              id: makeId(),
+              role: (item.role as MessageRole) || 'assistant',
+              content: item.content || '',
+              link,
+              tool: item.tool,
+              toolState: item.toolState as ToolState | undefined,
+            }
+          },
         )
         messagesRef.current = loaded
         setMessages(loaded)
@@ -399,7 +502,7 @@ function App() {
         setMessages([])
       }
     },
-    [api, makeId],
+    [api, makeId, token],
   )
 
   const appendMessage = useCallback((next: Message) => {
@@ -443,7 +546,12 @@ function App() {
         if (pending) {
           pendingSendRef.current = null
           setIsStreaming(true)
-          ws.send(JSON.stringify({ type: 'message', text: pending }))
+          ws.send(JSON.stringify({
+            type: 'message',
+            text: pending,
+            model: pendingModelRef.current,
+          }))
+          pendingModelRef.current = null
         }
       }
 
@@ -630,8 +738,27 @@ function App() {
       streamIdRef.current = null
       setIsStreaming(false)
       setActivity('')
-      setMessages([])
-      messagesRef.current = []
+      // Restore the previous conversation instantly from the local cache, then
+      // let the server reconcile in the background so the view never blanks out.
+      const cached = localStorage.getItem(`chat_messages:${sid}`)
+      if (cached) {
+        try {
+          const arr = JSON.parse(cached) as Message[]
+          if (Array.isArray(arr)) {
+            messagesRef.current = arr
+            setMessages(arr)
+          } else {
+            messagesRef.current = []
+            setMessages([])
+          }
+        } catch {
+          messagesRef.current = []
+          setMessages([])
+        }
+      } else {
+        messagesRef.current = []
+        setMessages([])
+      }
       loadMessages(sid)
       loadSessionPermissions(sid)
     },
@@ -666,6 +793,7 @@ function App() {
       try {
         setCreatingSession(true)
         pendingSendRef.current = text
+        pendingModelRef.current = currentModelRef.current
         const resp = await api('/api/sessions', { method: 'POST' })
         const data = await resp.json()
         const sid = data.session_id as string
@@ -675,6 +803,7 @@ function App() {
         setActiveSession(sid)
       } catch {
         pendingSendRef.current = null
+        pendingModelRef.current = null
         setActivity('')
       } finally {
         setCreatingSession(false)
@@ -685,12 +814,24 @@ function App() {
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) {
       setIsStreaming(true)
-      ws.send(JSON.stringify({ type: 'message', text }))
+      ws.send(JSON.stringify({
+        type: 'message',
+        text,
+        model: currentModelRef.current,
+      }))
       return
     }
 
     messageApi.warning('连接已断开，正在重新连接…')
     connectWs(activeSession)
+  }
+
+  const stopStreaming = () => {
+    // Ask the backend to cancel the running turn. The stream flow emits
+    // `turn_complete` (with whatever partial text was generated), which resets
+    // `isStreaming` and flips the send button back to "发送".
+    if (!activeSession) return
+    api(`/api/sessions/${activeSession}/cancel`, { method: 'POST' }).catch(() => {})
   }
 
   const sendConfirm = (approved: boolean) => {
@@ -830,26 +971,76 @@ function App() {
     }
   }
 
-  const deleteSession = (item: SessionInfo) => {
+  const deleteSession = async (item: SessionInfo) => {
+    try {
+      await api(`/api/sessions/${encodeURIComponent(item.session_id)}`, {
+        method: 'DELETE',
+      })
+      messageApi.success('会话已删除')
+      try {
+        localStorage.removeItem(`chat_messages:${item.session_id}`)
+        const raw = localStorage.getItem('chat_messages:index')
+        const index = raw
+          ? (JSON.parse(raw) as string[]).filter(id => id !== item.session_id)
+          : []
+        localStorage.setItem('chat_messages:index', JSON.stringify(index))
+      } catch {
+        // ignore storage errors
+      }
+      if (activeSession === item.session_id) {
+        activeSessionRef.current = null
+        setActiveSession(null)
+        setMessages([])
+        messagesRef.current = []
+        streamIdRef.current = null
+      }
+      await loadSessions()
+    } catch {
+      // Errors are surfaced by the shared request helper.
+    }
+  }
+
+  const deleteSelectedSessions = () => {
+    const ids = selectedSessionIds.filter(id => sessions.some(item => item.session_id === id))
+    if (!ids.length) return
     Modal.confirm({
-      title: '删除会话',
-      content: `确定删除「${item.title || '未命名会话'}」的历史记录吗？`,
-      okText: '删除',
+      title: `删除选中的 ${ids.length} 个会话？`,
+      content: '历史记录将被永久删除，此操作无法撤销。',
+      okText: '批量删除',
       okButtonProps: { danger: true },
       cancelText: '取消',
       onOk: async () => {
-        await api(`/api/sessions/${encodeURIComponent(item.session_id)}`, {
-          method: 'DELETE',
-        })
-        messageApi.success('会话已删除')
-        if (activeSession === item.session_id) {
-          activeSessionRef.current = null
-          setActiveSession(null)
-          setMessages([])
-          messagesRef.current = []
-          streamIdRef.current = null
+        try {
+          const resp = await api('/api/sessions', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_ids: ids }),
+          })
+          const data = await resp.json()
+          for (const id of data.deleted || []) {
+            try { localStorage.removeItem(`chat_messages:${id}`) } catch { /* ignore */ }
+          }
+          try {
+            const raw = localStorage.getItem('chat_messages:index')
+            const index = raw ? (JSON.parse(raw) as string[]).filter(id => !(data.deleted || []).includes(id)) : []
+            localStorage.setItem('chat_messages:index', JSON.stringify(index))
+          } catch { /* ignore */ }
+          if (activeSession && (data.deleted || []).includes(activeSession)) {
+            activeSessionRef.current = null
+            setActiveSession(null)
+            setMessages([])
+            messagesRef.current = []
+            streamIdRef.current = null
+          }
+          setSelectedSessionIds([])
+          await loadSessions()
+          const failed = (data.failed || []).length
+          messageApi[failed ? 'warning' : 'success'](
+            failed ? `已删除 ${data.deleted?.length || 0} 个，${failed} 个失败` : `已删除 ${data.deleted?.length || 0} 个会话`,
+          )
+        } catch {
+          // api() surfaces the server error.
         }
-        loadSessions()
       },
     })
   }
@@ -977,6 +1168,9 @@ function App() {
     ]
   }, [sessions, sessionSearch])
 
+  const allFilteredSessionsSelected = filteredSessions.length > 0 &&
+    filteredSessions.every(item => selectedSessionIds.includes(item.session_id))
+
   const filteredPlugins = useMemo(() => {
     const query = pluginSearch.trim().toLowerCase()
     if (!query) return plugins
@@ -998,31 +1192,47 @@ function App() {
   }, [skills, skillSearch, skillFilter])
 
   const modelOptions = useMemo(() => {
-    return Object.keys(config?.providers || {}).map(providerName => {
-      const provider = config.providers[providerName]
-      const models = provider?.models?.length
-        ? provider.models
-        : [provider?.default_model].filter(Boolean)
-      return {
-        label: providerName,
-        options: (models || []).map((model: string) => ({
-          value: model,
-          label: model,
-        })),
-      }
-    })
+    // A running session is built from the configured active provider. Showing
+    // models from other providers in this control is misleading because a
+    // model id alone cannot switch the underlying API client/base URL.
+    const providerName = config?.active_provider
+    const provider = providerName ? config?.providers?.[providerName] : undefined
+    const models = provider?.models?.length
+      ? provider.models
+      : [provider?.default_model].filter(Boolean)
+    return providerName
+      ? [{
+          label: providerName,
+          options: (models || []).map((model: string) => ({
+            value: model,
+            label: model,
+          })),
+        }]
+      : []
   }, [config])
 
+  // Settings page: models of the currently selected provider. The default
+  // model is chosen from a dropdown instead of free-text input, so the value
+  // always matches a real model id of the active provider.
+  const settingsModelOptions = useMemo(() => {
+    const provider = config?.providers?.[activeProviderName]
+    const models = provider?.models?.length
+      ? provider.models
+      : [provider?.default_model].filter(Boolean)
+    const seen = new Set<string>()
+    const list: string[] = []
+    for (const model of models || []) {
+      if (model && !seen.has(model)) {
+        seen.add(model)
+        list.push(model)
+      }
+    }
+    return list.map(model => ({ value: model, label: model }))
+  }, [config, activeProviderName])
+
   const handleModelChange = (model: string) => {
+    currentModelRef.current = model
     setCurrentModel(model)
-    const providerName = Object.keys(config?.providers || {}).find(name => {
-      const provider = config.providers[name]
-      const models = provider?.models?.length
-        ? provider.models
-        : [provider?.default_model].filter(Boolean)
-      return (models || []).includes(model)
-    })
-    if (providerName) setCurrentProvider(providerName)
   }
 
   const filteredCommands = useMemo(() => {
@@ -1039,6 +1249,17 @@ function App() {
   useEffect(() => {
     setCommandIndex(0)
   }, [filteredCommands])
+
+  // Keep the highlighted command visible while navigating with ↑/↓. The
+  // popover is its own scroll container, so relying on browser focus would
+  // not scroll the active item (and would also move focus away from the
+  // composer). ``nearest`` avoids jumping the surrounding page while only
+  // adjusting the command list when necessary.
+  useEffect(() => {
+    if (!input.startsWith('/') || filteredCommands.length === 0) return
+    const command = filteredCommands[commandIndex] || filteredCommands[0]
+    commandItemRefs.current[command.name]?.scrollIntoView({ block: 'nearest' })
+  }, [commandIndex, filteredCommands, input])
 
   const paletteCommands = useMemo(() => {
     const query = paletteQuery.trim().toLowerCase()
@@ -1104,9 +1325,14 @@ function App() {
   }
 
   const handleComposerKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === 'Enter') {
-      if (event.shiftKey) return
-      event.preventDefault()
+    // 输入法（IME）组合输入时，Enter 用于选中候选字/上屏，不应触发送出。
+    if (event.nativeEvent?.isComposing || event.keyCode === 229) {
+      return
+    }
+
+    const ctrlOrCmd = event.ctrlKey || event.metaKey
+
+    const send = () => {
       if (input.startsWith('/') && filteredCommands.length > 0) {
         const command = filteredCommands[commandIndex] || filteredCommands[0]
         const parts = input.trim().slice(1).split(/\s+/)
@@ -1117,7 +1343,29 @@ function App() {
         return
       }
       if (input.trim()) sendMessage()
-      return
+    }
+
+    if (sendShortcut === 'ctrl-enter') {
+      // 单独 Enter = 换行；Ctrl/Cmd + Enter = 发送
+      if (event.key === 'Enter') {
+        if (ctrlOrCmd) {
+          event.preventDefault()
+          if (isStreaming) return
+          send()
+        }
+        return
+      }
+    } else {
+      if (event.key === 'Enter' && !event.shiftKey && isStreaming) {
+        event.preventDefault()
+        return
+      }
+      if (event.key === 'Enter') {
+        if (event.shiftKey) return
+        event.preventDefault()
+        send()
+        return
+      }
     }
 
     if (!input.startsWith('/')) return
@@ -1136,28 +1384,79 @@ function App() {
     }
   }
 
-  const renderToolEvent = (item: Message) => (
-    <div className="tool-event" key={item.id}>
-      <span className={`tool-event-dot ${item.toolState || 'done'}`} />
-      <span className="tool-event-name">{item.tool || 'tool'}</span>
-      <span className="tool-event-state">{toolStateLabel(item.toolState)}</span>
-      {(item.content || item.link) && (
-        <div className="tool-event-details">
-          {item.content && <div className="tool-event-detail">{item.content}</div>}
-          {item.link && (
-            <a
-              className="tool-event-link"
-              href={item.link}
-              target="_blank"
-              rel="noreferrer"
-            >
-              <FileTextOutlined /> 打开文件
-            </a>
+  const renderAttachment = (item: Message) => {
+    const media = item.link ? mediaKindForUrl(item.link) : 'file'
+    const label = (item.content || '附件').split(/[\\/]/).pop() || '附件'
+
+    if (media === 'image') {
+      return (
+        <div className="attachment-card attachment-image-card" key={item.id}>
+          <a href={item.link} target="_blank" rel="noreferrer" className="attachment-preview">
+            <img src={item.link} alt={label} loading="lazy" />
+          </a>
+          <div className="attachment-caption">
+            <FileTextOutlined />
+            <span title={label}>{label}</span>
+            <a href={item.link} target="_blank" rel="noreferrer">打开</a>
+          </div>
+        </div>
+      )
+    }
+
+    if (media === 'audio' || media === 'video') {
+      return (
+        <div className="attachment-card attachment-player-card" key={item.id}>
+          <div className="attachment-caption">
+            <FileTextOutlined />
+            <span title={label}>{label}</span>
+            <a href={item.link} target="_blank" rel="noreferrer">打开</a>
+          </div>
+          {media === 'audio' ? (
+            <audio className="attachment-player" controls preload="metadata" src={item.link} />
+          ) : (
+            <video className="attachment-player attachment-video" controls preload="metadata" src={item.link} />
           )}
         </div>
-      )}
-    </div>
-  )
+      )
+    }
+
+    return (
+      <a className="attachment-file-card" href={item.link} target="_blank" rel="noreferrer" key={item.id}>
+        <span className="attachment-file-icon"><FileTextOutlined /></span>
+        <span className="attachment-file-main">
+          <strong title={label}>{label}</strong>
+          <small>附件 · 点击打开</small>
+        </span>
+        <DownOutlined className="attachment-file-arrow" rotate={-90} />
+      </a>
+    )
+  }
+
+  const renderToolEvent = (item: Message) => {
+    if (item.tool === 'attachment' || item.link) return renderAttachment(item)
+    return (
+      <div className="tool-event" key={item.id}>
+        <span className={`tool-event-dot ${item.toolState || 'done'}`} />
+        <span className="tool-event-name">{item.tool || '文件'}</span>
+        <span className="tool-event-state">{toolStateLabel(item.toolState)}</span>
+        {(item.content || item.link) && (
+          <div className="tool-event-details">
+            {item.content && <div className="tool-event-detail">{item.content}</div>}
+            {item.link && (
+              <a
+                className="tool-event-link"
+                href={item.link}
+                target="_blank"
+                rel="noreferrer"
+              >
+                <FileTextOutlined /> 打开文件
+              </a>
+            )}
+          </div>
+        )}
+      </div>
+    )
+  }
 
   const renderMessage = (item: Message, traceSummary?: React.ReactNode) => {
     if (item.role === 'tool') return renderToolEvent(item)
@@ -1245,9 +1544,35 @@ function App() {
           <span className="tool-trace-label">工具轨迹 · {tools.length} 步</span>
           <DownOutlined className="tool-trace-chevron" />
         </button>
-        {expanded && (
-          <div className="tool-trace-items">{tools.map(renderToolEvent)}</div>
-        )}
+        {expanded &&
+          createPortal(
+            <div
+              className="tool-trace-mask"
+              onClick={() => toggleTraceExpanded(traceId)}
+            >
+              <div
+                className="tool-trace-modal"
+                onClick={event => event.stopPropagation()}
+              >
+                <div className="tool-trace-modal-head">
+                  <span className="tool-trace-modal-title">
+                    工具轨迹 · {tools.length} 步
+                  </span>
+                  <button
+                    type="button"
+                    className="tool-trace-modal-close"
+                    onClick={() => toggleTraceExpanded(traceId)}
+                  >
+                    <CloseOutlined />
+                  </button>
+                </div>
+                <div className="tool-trace-modal-body">
+                  {tools.map(renderToolEvent)}
+                </div>
+              </div>
+            </div>,
+            document.body,
+          )}
       </div>
     )
   }
@@ -1291,7 +1616,20 @@ function App() {
         currentTail = []
         hasTurn = true
       } else if (item.role === 'tool') {
-        currentTools.push(item)
+        // Attachments (image/audio/video/file) are real inline content and must
+        // appear in the chat stream, not hidden inside the collapsible tool
+        // trace overlay.  Regular tool-trace rows carry no ``link``.  Feed them
+        // through ``currentTail`` so they render right after the user message
+        // (in order) rather than being collected into the trace.
+        if (item.tool === 'attachment' || item.link) {
+          if (hasTurn) {
+            currentTail.push(item)
+          } else {
+            nodes.push(renderMessage(item))
+          }
+        } else {
+          currentTools.push(item)
+        }
       } else if (hasTurn) {
         currentTail.push(item)
       } else {
@@ -1340,13 +1678,20 @@ function App() {
             <>
               {renderMessageList()}
               {isStreaming && !messages.some(item => item.streaming) && (
-                <div className="thinking-indicator">
-                  <span className="thinking-indicator-icon">
-                    <LoadingOutlined spin />
-                  </span>
-                  <div>
-                    <strong>{activity || '正在思考…'}</strong>
-                    <small>正在处理，请稍候</small>
+                <div className="message-row message-row-assistant">
+                  <Avatar className="message-avatar assistant" icon={<RobotOutlined />} />
+                  <div className="message-stack">
+                    <div className="message-meta">
+                      <span className="message-author">Simple Agent</span>
+                      <span className="message-streaming">
+                        正在生成…
+                      </span>
+                    </div>
+                    <div className="bubble bubble-assistant">
+                      <span className="typing-dots" aria-label="正在输入">
+                        <i /><i /><i />
+                      </span>
+                    </div>
                   </div>
                 </div>
               )}
@@ -1368,6 +1713,9 @@ function App() {
                 <button
                   type="button"
                   key={command.name}
+                  ref={element => {
+                    commandItemRefs.current[command.name] = element
+                  }}
                   className={`command-item ${index === commandIndex ? 'active' : ''}`}
                   onMouseDown={event => {
                     event.preventDefault()
@@ -1393,7 +1741,9 @@ function App() {
             value={input}
             onChange={event => setInput(event.target.value)}
             onKeyDown={handleComposerKeyDown}
-            placeholder="输入消息，/ 查看命令，Enter 发送，Shift + Enter 换行"
+            placeholder={sendShortcut === 'ctrl-enter'
+              ? '输入消息，/ 查看命令，Ctrl/Cmd + Enter 发送，Enter 换行'
+              : '输入消息，/ 查看命令，Enter 发送，Shift + Enter 换行'}
             autoSize={{ minRows: 1, maxRows: 6 }}
             variant="borderless"
             disabled={false}
@@ -1473,21 +1823,16 @@ function App() {
               />
             </Space>
             <Space size={4}>
-              {isStreaming && (
-                <span className="composer-busy">
-                  <LoadingOutlined spin /> {activity || '正在生成'}
-                </span>
-              )}
-              <Tooltip title="发送 (Enter)">
+              <Tooltip title={isStreaming ? '终止生成' : `发送 (${sendShortcutLabel})`}>
                 <Button
-                  type="primary"
-                  className="send-button"
-                  icon={<SendOutlined />}
-                  disabled={!input.trim() || creatingSession}
-                  onClick={() => sendMessage()}
-                >
-                  发送
-                </Button>
+                  type={isStreaming ? 'default' : 'primary'}
+                  danger={isStreaming}
+                  className={isStreaming ? 'send-button stop-button' : 'send-button'}
+                  aria-label={isStreaming ? '终止生成' : '发送'}
+                  icon={isStreaming ? <StopOutlined /> : <SendOutlined />}
+                  disabled={!isStreaming && (!input.trim() || creatingSession)}
+                  onClick={() => (isStreaming ? stopStreaming() : sendMessage())}
+                />
               </Tooltip>
             </Space>
           </div>
@@ -1503,14 +1848,34 @@ function App() {
           <h2>{pageMeta.sessions.title}</h2>
           <p>{pageMeta.sessions.subtitle}</p>
         </div>
-        <Input
-          prefix={<SearchOutlined />}
-          placeholder="搜索会话"
-          value={sessionSearch}
-          onChange={event => setSessionSearch(event.target.value)}
-          allowClear
-          style={{ width: 240 }}
-        />
+        <Space>
+          {filteredSessions.length > 0 && (
+            <Checkbox
+              checked={allFilteredSessionsSelected}
+              indeterminate={selectedSessionIds.length > 0 && !allFilteredSessionsSelected}
+              onChange={event => {
+                setSelectedSessionIds(event.target.checked
+                  ? Array.from(new Set([...selectedSessionIds, ...filteredSessions.map(item => item.session_id)]))
+                  : selectedSessionIds.filter(id => !filteredSessions.some(item => item.session_id === id)))
+              }}
+            >
+              全选
+            </Checkbox>
+          )}
+          {selectedSessionIds.length > 0 && (
+            <Button danger icon={<DeleteOutlined />} onClick={deleteSelectedSessions}>
+              删除选中 ({selectedSessionIds.length})
+            </Button>
+          )}
+          <Input
+            prefix={<SearchOutlined />}
+            placeholder="搜索会话"
+            value={sessionSearch}
+            onChange={event => setSessionSearch(event.target.value)}
+            allowClear
+            style={{ width: 240 }}
+          />
+        </Space>
       </div>
 
       {loadingSessions ? (
@@ -1528,6 +1893,15 @@ function App() {
               >
                 <div className="session-card-head">
                   <div className="session-card-title">
+                    <Checkbox
+                      checked={selectedSessionIds.includes(item.session_id)}
+                      onClick={event => event.stopPropagation()}
+                      onChange={event => {
+                        setSelectedSessionIds(current => event.target.checked
+                          ? [...current, item.session_id]
+                          : current.filter(id => id !== item.session_id))
+                      }}
+                    />
                     <span>{item.title || '未命名会话'}</span>
                     {item.live && <Badge status="processing" />}
                   </div>
@@ -1549,10 +1923,21 @@ function App() {
                         },
                         {
                           key: 'delete',
-                          label: '删除',
+                          label: (
+                            <Popconfirm
+                              title="删除这个会话？"
+                              description="历史记录将被永久删除"
+                              okText="删除"
+                              cancelText="取消"
+                              okButtonProps={{ danger: true }}
+                              placement="left"
+                              onConfirm={() => deleteSession(item)}
+                            >
+                              <span onClick={event => event.stopPropagation()}>删除</span>
+                            </Popconfirm>
+                          ),
                           icon: <DeleteOutlined />,
                           danger: true,
-                          onClick: () => deleteSession(item),
                         },
                       ],
                     }}
@@ -1588,7 +1973,7 @@ function App() {
   )
 
   const renderPlugins = () => (
-    <div className="page-view">
+    <div className="page-view plugins-view">
       <div className="page-head">
         <div>
           <h2>{pageMeta.plugins.title}</h2>
@@ -1600,7 +1985,7 @@ function App() {
           value={pluginSearch}
           onChange={event => setPluginSearch(event.target.value)}
           allowClear
-          style={{ width: 240 }}
+          className="workspace-search"
         />
       </div>
 
@@ -1682,7 +2067,7 @@ function App() {
           value={skillSearch}
           onChange={event => setSkillSearch(event.target.value)}
           allowClear
-          className="skills-search"
+          className="workspace-search skills-search"
         />
       </div>
 
@@ -1721,7 +2106,7 @@ function App() {
 
   const renderSettings = () => (
     <div className="page-view settings-view">
-      <div className="page-head">
+      <div className="page-head settings-page-head">
         <div>
           <div className="eyebrow">WORKSPACE</div>
           <h2>{pageMeta.settings.title}</h2>
@@ -1732,7 +2117,7 @@ function App() {
             <span className="save-state-dot" />
             {settingsDirty ? '有未保存更改' : '已同步'}
           </span>
-          <Button type="primary" icon={<CheckCircleFilled />} onClick={saveSettings} disabled={!settingsDirty}>
+          <Button className="settings-save-button" type="primary" icon={<CheckCircleFilled />} onClick={saveSettings} disabled={!settingsDirty}>
             保存设置
           </Button>
         </Space>
@@ -1754,6 +2139,7 @@ function App() {
               />
               <Button
                 type="primary"
+                className="settings-inline-save"
                 onClick={() => {
                   const element = document.getElementById(
                     'token-input',
@@ -1769,6 +2155,26 @@ function App() {
                 保存令牌
               </Button>
             </Space.Compact>
+          </Card>
+
+          <Card className="settings-card" title="发送偏好" extra={<span className="card-kicker">UX</span>}>
+            <p className="settings-hint">
+              修改发送快捷键。中文输入法用 Enter 上屏，切换成 Ctrl/Cmd + Enter 可避免误发送。
+            </p>
+            <label style={{ display: 'block', marginBottom: 6, fontWeight: 500 }}>发送快捷键</label>
+            <Select
+              value={sendShortcut}
+              onChange={value => {
+                setSendShortcut(value)
+                localStorage.setItem('send_shortcut', value)
+                messageApi.success(`发送快捷键已改为：${value === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'}`)
+              }}
+              options={[
+                { value: 'enter', label: 'Enter' },
+                { value: 'ctrl-enter', label: 'Ctrl/Cmd + Enter' },
+              ]}
+              style={{ width: '100%' }}
+            />
           </Card>
 
           <Card className="settings-card" title="模型与频道" extra={<span className="card-kicker">RUNTIME</span>}>
@@ -1790,7 +2196,12 @@ function App() {
                 </Col>
                 <Col xs={24} md={12}>
                   <Form.Item name="model" label="默认模型">
-                    <Input placeholder="default model" />
+                    <Select
+                      options={settingsModelOptions}
+                      placeholder="选择模型"
+                      showSearch
+                      optionFilterProp="label"
+                    />
                   </Form.Item>
                 </Col>
                 <Col xs={24} md={8}>
@@ -1997,10 +2408,21 @@ function App() {
                             },
                             {
                               key: 'delete',
-                              label: '删除',
+                              label: (
+                                <Popconfirm
+                                  title="删除这个会话？"
+                                  description="历史记录将被永久删除"
+                                  okText="删除"
+                                  cancelText="取消"
+                                  okButtonProps={{ danger: true }}
+                                  placement="left"
+                                  onConfirm={() => deleteSession(item)}
+                                >
+                                  <span onClick={event => event.stopPropagation()}>删除</span>
+                                </Popconfirm>
+                              ),
                               icon: <DeleteOutlined />,
                               danger: true,
-                              onClick: () => deleteSession(item),
                             },
                           ],
                         }}
@@ -2049,6 +2471,7 @@ function App() {
                 type="text"
                 className="header-menu"
                 icon={<MenuOutlined />}
+                aria-label={collapsed ? '展开侧栏' : '收起侧栏'}
                 onClick={() => setCollapsed(value => !value)}
               />
               <div>

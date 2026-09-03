@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
-from pathlib import Path
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import agent as agent_module
@@ -39,7 +42,7 @@ def _web_session_home(session_id: str) -> Path:
     clean = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
     if not clean:
         raise ValueError("invalid session id")
-    return shared.session_home(clean)
+    return shared.web_session_home(clean)
 
 
 async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict:
@@ -47,6 +50,41 @@ async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict
     home = _web_session_home(session_id)
     home.mkdir(parents=True, exist_ok=True)
     (home / ".web-session").touch(exist_ok=True)
+    # Freeze the gateway configuration for this session. Existing sessions
+    # should not silently change provider, skill or tool behavior when the
+    # global config is edited later; a new session picks up the new template.
+    session_config = home / "config.json"
+    if not session_config.is_file():
+        shared._atomic_write_text(
+            session_config,
+            json.dumps(base_cfg, ensure_ascii=False, indent=2),
+        )
+    manifest = home / ".session.json"
+    if not manifest.is_file():
+        active_provider = str(base_cfg.get("active_provider") or "")
+        provider_cfg = (base_cfg.get("providers") or {}).get(active_provider, {})
+        model = str(
+            (provider_cfg or {}).get("default_model")
+            or base_cfg.get("model")
+            or ""
+        )
+        shared._atomic_write_text(
+            manifest,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "session_id": str(session_id),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "provider": active_provider,
+                    "model": model,
+                    "config_sha256": hashlib.sha256(
+                        session_config.read_bytes()
+                    ).hexdigest(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
     previous_home = shared.AGENT_HOME
     # Most bootstrap helpers intentionally late-bind shared paths. Serialize
     # the short construction window, then restore the gateway's home; the
@@ -172,6 +210,24 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
     )
     if context_window is not None:
         context_window = int(context_window)
+
+    # ``max_tokens`` is an output budget, so it cannot consume the entire
+    # provider context window: system instructions, tool schemas, and the
+    # user's conversation also need room.  A provider config that sets both
+    # values to the same number otherwise makes every turn fail before the
+    # request is sent (especially visible when a historical web session is
+    # lazily re-created after a restart). Keep the configured value when it is
+    # safe, otherwise reserve a bounded input slice automatically.
+    if context_window is not None and max_tokens >= context_window:
+        reserve = max(4096, min(16384, context_window // 10))
+        adjusted = max(1, context_window - reserve)
+        if adjusted < max_tokens:
+            if announce:
+                console.print(
+                    f"[yellow]max_tokens={max_tokens} equals context_window={context_window}; "
+                    f"using {adjusted} to reserve input context[/yellow]"
+                )
+            max_tokens = adjusted
 
     system_prompt = _load_system_prompt(cfg)
 
@@ -538,7 +594,7 @@ async def _build_components_async(cfg: dict, *, announce: bool = True):
         "mcp_task": None,
     }
     # WebChannel uses this hook to provision one independent agent home per
-    # browser session (for example ``~/.agent-<session-id>``).
+    # browser session under ``~/.agent/web/sessions/<session-id>``.
     components["session_components_factory"] = (
         lambda session_id: _build_web_session_components(session_id, cfg)
     )

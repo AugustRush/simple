@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -133,6 +134,8 @@ class RuntimeSessionState:
     model_override: str | None = None
     base_system_prompt_override: str | None = None
     system_prompt_override: str | None = None
+    turn_lock: Any = None
+    last_activity: float = 0.0
 
     def __init__(
         self,
@@ -153,6 +156,8 @@ class RuntimeSessionState:
         model_override: str | None = None,
         base_system_prompt_override: str | None = None,
         system_prompt_override: str | None = None,
+        turn_lock: Any = None,
+        last_activity: float = 0.0,
     ) -> None:
         if (
             pending_messages is not None
@@ -192,6 +197,8 @@ class RuntimeSessionState:
         self.model_override = model_override
         self.base_system_prompt_override = base_system_prompt_override
         self.system_prompt_override = system_prompt_override
+        self.turn_lock = turn_lock if turn_lock is not None else asyncio.Lock()
+        self.last_activity = float(last_activity or 0.0)
 
     @property
     def pending_messages(self) -> list[dict[str, Any]]:
@@ -748,6 +755,11 @@ class AgentCore:
                     collector.emit("turn_response_delivered")
                     if final_result.error:
                         collector.emit("turn_error_reported", error=final_result.error)
+                        if final_result.error == "cancelled_by_user":
+                            collector.emit(
+                                "turn_interrupted",
+                                reason="cancelled_by_user",
+                            )
                     continued = False
                     for hook_result in hook_results or []:
                         if (
@@ -779,6 +791,10 @@ class AgentCore:
                     error=True,
                     content_len=len(final_result.text),
                     content_preview=final_result.text,
+                )
+                collector.emit(
+                    "turn_interrupted",
+                    reason="cancelled_by_user",
                 )
                 # Run post-turn maintenance so the interrupted turn is
                 # recorded in staging and not lost.

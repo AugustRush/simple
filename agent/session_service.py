@@ -9,10 +9,105 @@ session id, and read messages without touching SQL directly.
 from __future__ import annotations
 
 import hashlib
+import inspect
+import json
 import os
+import re
+import shutil
+import sqlite3
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
+
+
+class _WebSessionRegistry:
+    """Small metadata index for isolated Web session homes."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.path, timeout=2.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS web_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'idle',
+                    model TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL DEFAULT '',
+                    deleted_at TEXT
+                )
+                """
+            )
+            conn.execute(
+                """CREATE INDEX IF NOT EXISTS idx_web_sessions_updated
+                ON web_sessions(updated_at DESC)"""
+            )
+
+    def upsert(
+        self,
+        session_id: str,
+        *,
+        title: str = "",
+        model: str = "",
+        provider: str = "",
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.path, timeout=2.0) as conn:
+            conn.execute(
+                """
+                INSERT INTO web_sessions
+                    (session_id, title, created_at, updated_at, status, model, provider, deleted_at)
+                VALUES (?, ?, ?, ?, 'idle', ?, ?, NULL)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    title = CASE WHEN excluded.title <> '' THEN excluded.title ELSE web_sessions.title END,
+                    model = CASE WHEN excluded.model <> '' THEN excluded.model ELSE web_sessions.model END,
+                    provider = CASE WHEN excluded.provider <> '' THEN excluded.provider ELSE web_sessions.provider END,
+                    deleted_at = NULL
+                """,
+                (session_id, title, now, now, model, provider),
+            )
+
+    def touch(self, session_id: str, *, status: str = "active") -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.path, timeout=2.0) as conn:
+            conn.execute(
+                "UPDATE web_sessions SET updated_at = ?, status = ?, deleted_at = NULL WHERE session_id = ?",
+                (now, status, session_id),
+            )
+
+    def delete(self, session_id: str) -> None:
+        with sqlite3.connect(self.path, timeout=2.0) as conn:
+            conn.execute("DELETE FROM web_sessions WHERE session_id = ?", (session_id,))
+
+    def list(self, limit: int = 500) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.path, timeout=2.0) as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, title, created_at, updated_at, status, model, provider
+                FROM web_sessions WHERE deleted_at IS NULL
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [
+            {
+                "session_id": row[0],
+                "title": row[1],
+                "created_at": row[2],
+                "last_activity": row[3],
+                "status": row[4],
+                "model": row[5],
+                "provider": row[6],
+            }
+            for row in rows
+        ]
 
 
 class SessionService:
@@ -30,35 +125,137 @@ class SessionService:
         store: Any = None,
         live_states: Optional[dict[str, Any]] = None,
         store_factory: Any = None,
+        runtime_cleanup: Any = None,
     ) -> None:
         self._store = store
         # Preserve an intentionally empty mapping: ChannelRunner populates the
         # shared dict after WebChannel.bind_runtime() returns.
         self._live_states = live_states if live_states is not None else {}
         self._store_factory = store_factory
+        self._session_runtime_cleanup = runtime_cleanup
+        self._registry: _WebSessionRegistry | None = None
+        if store_factory is not None:
+            try:
+                from agent import shared
+
+                self._registry = _WebSessionRegistry(
+                    shared.AGENT_HOME / "web" / "sessions" / "index.db"
+                )
+            except (OSError, sqlite3.Error):
+                self._registry = None
 
     def _store_for_session(self, session_id: str) -> Any:
         if self._store_factory is None:
             return self._store
         try:
-            home = Path.home() / f".agent-{str(session_id).strip()}"
+            from agent import shared
+
+            home = shared.web_session_home(str(session_id).strip())
+            # Keep reading the pre-migration layout until it is explicitly
+            # migrated. This allows users to upgrade without losing history.
+            legacy_home = Path.home() / f".agent-{str(session_id).strip()}"
+            if not (home / ".web-session").is_file() and (legacy_home / ".web-session").is_file():
+                home = legacy_home
             if not (home / ".web-session").is_file():
                 return self._store
-        except OSError:
+        except (OSError, ValueError):
             return self._store
         try:
             return self._store_factory(session_id)
         except Exception:
             return self._store
 
+    def record_attachment(
+        self,
+        session_id: str,
+        path: str,
+        name: str = "",
+        *,
+        turn_id: str = "",
+    ) -> None:
+        """Journal an attachment (image/audio/video/file) for a session.
+
+        Attachments are emitted as live events; persisting them keeps history
+        reloads able to re-render the media inline instead of showing a path.
+        """
+        clean = str(session_id or "").strip()
+        if not clean or not path:
+            return
+        store = self._store_for_session(clean)
+        append_event = getattr(store, "append_agent_event", None)
+        if not callable(append_event):
+            return
+        try:
+            append_event(
+                session_id=clean,
+                event_type="attachment",
+                payload={"name": str(name or Path(path).name), "path": str(path)},
+                turn_id=str(turn_id or ""),
+            )
+        except Exception:
+            pass
+
     def create_session(self) -> str:
         """Return a fresh session id (the live state is created on first use)."""
-        return uuid.uuid4().hex
+        session_id = uuid.uuid4().hex
+        if self._registry is not None:
+            try:
+                self._registry.upsert(session_id)
+            except (OSError, sqlite3.Error):
+                pass
+        return session_id
+
+    def touch_session(self, session_id: str, *, status: str = "active") -> None:
+        clean = str(session_id or "").strip()
+        if not clean or self._registry is None:
+            return
+        try:
+            metadata = self._session_manifest_metadata(clean)
+            self._registry.upsert(
+                clean,
+                model=metadata.get("model", ""),
+                provider=metadata.get("provider", ""),
+            )
+            self._registry.touch(clean, status=status)
+        except (OSError, sqlite3.Error):
+            pass
+
+    @staticmethod
+    def _session_manifest_metadata(session_id: str) -> dict[str, str]:
+        """Read the non-secret provider/model summary for an isolated session."""
+        try:
+            from agent import shared
+
+            raw = json.loads(
+                (shared.web_session_home(session_id) / ".session.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            key: str(raw.get(key) or "").strip()
+            for key in ("model", "provider")
+        }
 
     def list_sessions(self, limit: int = 200) -> list[dict[str, Any]]:
         """Return sessions ordered as durable history followed by live-only."""
         durable: dict[str, dict[str, Any]] = {}
         titles: dict[str, str] = {}
+        if self._registry is not None:
+            try:
+                for item in self._registry.list(limit=limit):
+                    durable[item["session_id"]] = {
+                        "last_activity": item.get("last_activity", ""),
+                        "turn_count": 0,
+                        "created_at": item.get("created_at", ""),
+                        "status": item.get("status", "idle"),
+                    }
+                    titles[item["session_id"]] = item.get("title", "")
+            except (OSError, sqlite3.Error):
+                pass
         if self._store is not None:
             list_ids = getattr(self._store, "list_session_ids", None)
             if callable(list_ids):
@@ -67,30 +264,42 @@ class SessionService:
                         sid = str(item[0])
                         last_activity = str(item[1] or "") if len(item) > 1 else ""
                         turn_count = int(item[2] or 0) if len(item) > 2 else 0
+                        current = durable.get(sid, {})
                         durable[sid] = {
                             "last_activity": last_activity,
                             "turn_count": turn_count,
+                            "created_at": current.get("created_at", ""),
+                            "status": current.get("status", "idle"),
                         }
                 except Exception:
                     durable = {}
             list_titles = getattr(self._store, "list_session_titles", None)
             if callable(list_titles):
                 try:
-                    titles = {
-                        str(k): str(v) for k, v in list_titles().items()
-                    }
+                    titles.update(
+                        {str(k): str(v) for k, v in list_titles().items()}
+                    )
                 except Exception:
-                    titles = {}
+                    pass
 
         # Web sessions are backed by named agent homes. Discover only homes
         # carrying the marker created by the web session factory, so regular
         # CLI ``--name`` instances are not mixed into this list.
         try:
-            for home in Path.home().glob(".agent-*"):
+            from agent import shared
+
+            web_root = shared.web_session_root()
+            homes = list(web_root.iterdir()) if web_root.is_dir() else []
+            # Legacy sibling homes remain discoverable during migration.
+            homes.extend(Path.home().glob(".agent-*"))
+            for home in homes:
                 marker = home / ".web-session"
                 if not marker.is_file():
                     continue
-                sid = home.name[len(".agent-"):]
+                if home.parent == web_root:
+                    sid = home.name
+                else:
+                    sid = home.name[len(".agent-"):]
                 if sid and sid not in durable:
                     isolated_store = self._store_for_session(sid)
                     isolated_ids = getattr(isolated_store, "list_session_ids", None)
@@ -116,13 +325,20 @@ class SessionService:
         for session_id, state in self._live_states.items():
             live_seen.add(session_id)
             turn_count = int(getattr(state, "turn_count", 0) or 0)
+            activity = float(getattr(state, "last_activity", 0.0) or 0.0)
+            last_activity = (
+                datetime.fromtimestamp(activity, timezone.utc).isoformat()
+                if activity > 0
+                else ""
+            )
             sessions.append(
                 {
                     "session_id": session_id,
-                    "last_activity": "",
+                    "last_activity": last_activity,
                     "turn_count": turn_count,
                     "live": True,
                     "title": titles.get(session_id, ""),
+                    "status": getattr(state, "operation_state", "idle"),
                 }
             )
 
@@ -136,6 +352,8 @@ class SessionService:
                     "turn_count": info["turn_count"],
                     "live": False,
                     "title": titles.get(session_id, ""),
+                    "created_at": info.get("created_at", ""),
+                    "status": info.get("status", "idle"),
                 }
             )
 
@@ -160,32 +378,97 @@ class SessionService:
                 live.title = str(title or "").strip()[:120]
             except Exception:
                 pass
+        if self._registry is not None:
+            try:
+                self._registry.upsert(clean, title=str(title or "").strip()[:120])
+            except (OSError, sqlite3.Error):
+                pass
         return True
 
-    def delete_session(self, session_id: str) -> bool:
-        """Delete a durable session and, if live, stop and remove it."""
+    @staticmethod
+    def _close_live_state(live: Any) -> None:
+        """Stop per-session helpers not owned by the component close hook."""
+        if live is None:
+            return
+        worker = getattr(live, "memory_worker", None)
+        if worker is not None:
+            stop = getattr(worker, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    pass
+        manager = getattr(live, "context_manager", None)
+        if manager is not None:
+            staging = getattr(manager, "staging", None)
+            close = getattr(staging, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    @classmethod
+    async def _close_live_state_async(cls, live: Any) -> None:
+        """Stop a live state's worker and wait until it releases its files."""
+        if live is None:
+            return
+        token = getattr(live, "cancel_token", None)
+        cancel = getattr(token, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel("force")
+            except Exception:
+                pass
+        worker = getattr(live, "memory_worker", None)
+        stop = getattr(worker, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+        wait = getattr(worker, "wait", None)
+        if callable(wait):
+            try:
+                result = wait()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                pass
+        cls._close_live_state(live)
+
+    async def delete_session_async(self, session_id: str) -> bool:
+        """Close a live runtime, then remove all durable session data."""
         clean = str(session_id or "").strip()
-        if not clean:
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", clean) is None:
+            return False
+
+        live = self._live_states.pop(clean, None)
+        await self._close_live_state_async(live)
+        # Component shutdown may flush/close files inside the isolated home.
+        # Await it before deleting that directory so cleanup cannot race with
+        # shutil.rmtree (or recreate files after the delete response).
+        cleanup = self._registry_cleanup_callback()
+        if cleanup is not None:
+            try:
+                result = cleanup(clean)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                pass
+        return self._delete_session_data(clean)
+
+    def delete_session(self, session_id: str) -> bool:
+        """Synchronously remove durable data after runtime cleanup, if any."""
+        clean = str(session_id or "").strip()
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", clean) is None:
             return False
         live = self._live_states.pop(clean, None)
-        if live is not None:
-            worker = getattr(live, "memory_worker", None)
-            if worker is not None:
-                stop = getattr(worker, "stop", None)
-                if callable(stop):
-                    try:
-                        stop()
-                    except Exception:
-                        pass
-            manager = getattr(live, "context_manager", None)
-            if manager is not None:
-                staging = getattr(manager, "staging", None)
-                close = getattr(staging, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        pass
+        self._close_live_state(live)
+        return self._delete_session_data(clean)
+
+    def _delete_session_data(self, clean: str) -> bool:
+        """Remove store records and the exact validated isolated home."""
         target_store = self._store_for_session(clean)
         if target_store is not None:
             delete = getattr(target_store, "delete_conversation_session", None)
@@ -194,7 +477,74 @@ class SessionService:
                     delete(clean)
                 except Exception:
                     return False
+        # Remove only the exact isolated Web session home. The store may be a
+        # shared fake or a custom backend, so directory cleanup is best-effort
+        # and never masks a successful database deletion.
+        try:
+            from agent import shared
+
+            current_home = shared.web_session_home(clean)
+            candidates = {
+                current_home,
+                shared.web_session_root() / clean,
+                Path.home() / f".agent-{clean}",
+            }
+            for home in candidates:
+                if (home / ".web-session").is_file() and home.is_dir():
+                    shutil.rmtree(home)
+        except (OSError, ValueError):
+            pass
+        if self._registry is not None:
+            try:
+                self._registry.delete(clean)
+            except (OSError, sqlite3.Error):
+                pass
         return True
+
+    def _registry_cleanup_callback(self) -> Any:
+        """Resolve the optional ChannelRunner cleanup hook lazily."""
+        callback = getattr(self, "_session_runtime_cleanup", None)
+        return callback if callable(callback) else None
+
+    def delete_sessions(self, session_ids: Any) -> dict[str, Any]:
+        """Delete multiple sessions and report individual failures.
+
+        Each id is processed independently so one stale/broken session does not
+        prevent the remaining selected sessions from being removed.
+        """
+        if not isinstance(session_ids, (list, tuple, set)):
+            return {"deleted": [], "failed": []}
+        deleted: list[str] = []
+        failed: list[str] = []
+        seen: set[str] = set()
+        for raw in session_ids:
+            clean = str(raw or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            if self.delete_session(clean):
+                deleted.append(clean)
+            else:
+                failed.append(clean)
+        return {"deleted": deleted, "failed": failed}
+
+    async def delete_sessions_async(self, session_ids: Any) -> dict[str, Any]:
+        """Asynchronously clean and delete multiple isolated sessions."""
+        if not isinstance(session_ids, (list, tuple, set)):
+            return {"deleted": [], "failed": []}
+        deleted: list[str] = []
+        failed: list[str] = []
+        seen: set[str] = set()
+        for raw in session_ids:
+            clean = str(raw or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            if await self.delete_session_async(clean):
+                deleted.append(clean)
+            else:
+                failed.append(clean)
+        return {"deleted": deleted, "failed": failed}
 
     def get_messages(
         self,
@@ -208,7 +558,6 @@ class SessionService:
         get_turns = getattr(target_store, "recent_conversation_turns", None)
         if not callable(get_turns):
             return []
-        temp: Optional[Path] = None
         try:
             turns = get_turns(session_id=session_id, limit=limit)
         except Exception:
@@ -238,11 +587,34 @@ class SessionService:
                 events = []
             tools: dict[str, dict[str, Any]] = {}
             order: list[str] = []
+            terminal_turns: set[str] = set()
             for event in events or ():
                 event_type = str(getattr(event, "event_type", "") or "")
+                event_turn_id = str(getattr(event, "turn_id", "") or "")
+                if event_type in {
+                    "turn_response_delivered",
+                    "turn_failed",
+                    "turn_error_reported",
+                    "turn_interrupted",
+                } and event_turn_id:
+                    terminal_turns.add(event_turn_id)
                 payload = getattr(event, "payload", {})
                 if not isinstance(payload, dict):
                     payload = {}
+                if event_type == "attachment":
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "content": str(payload.get("name") or payload.get("path") or ""),
+                            "tool": "attachment",
+                            "toolState": "done",
+                            "created_at": str(getattr(event, "created_at", "") or ""),
+                            "turn_id": str(getattr(event, "turn_id", "") or ""),
+                            "link": "/api/files?path="
+                            + quote(str(payload.get("path") or ""), safe=""),
+                        }
+                    )
+                    continue
                 if event_type not in {"tool_started", "tool_progress", "tool_completed", "tool_failed"}:
                     continue
                 operation_id = str(payload.get("operation_id") or "")
@@ -270,10 +642,53 @@ class SessionService:
                 elif event_type == "tool_failed":
                     item["toolState"] = "blocked"
                     item["content"] = str(payload.get("result_preview") or item.get("content") or "执行失败")[:220]
+            # A process restart can leave the last tool_started event without
+            # a terminal event. It is unsafe to present that operation as
+            # completed (or to replay it automatically), so expose an
+            # explicit recoverable state to the UI. Live sessions keep the
+            # running state because their worker may still be active.
+            if session_id not in self._live_states:
+                for item in tools.values():
+                    if item.get("toolState") == "running":
+                        item["toolState"] = "interrupted"
+            else:
+                for item in tools.values():
+                    if (
+                        item.get("toolState") == "running"
+                        and str(item.get("turn_id") or "") in terminal_turns
+                    ):
+                        item["toolState"] = "interrupted"
             messages.extend(tools[key] for key in order)
 
         turns_only = [item for item in messages if item.get("role") in ("user", "assistant")]
         tools_only = [item for item in messages if item.get("role") == "tool"]
+
+        # Older runtime/attachment events may not have recorded a ``turn_id``.
+        # They are still durable, but previously all of them were appended at
+        # the very end of the transcript after a restart.  Recover a sensible
+        # placement from the event timestamp by attaching each orphan to the
+        # most recent user turn that had already started.
+        user_turns = [
+            item
+            for item in turns_only
+            if item.get("role") == "user" and item.get("message_id")
+        ]
+        for tool in tools_only:
+            if str(tool.get("turn_id") or ""):
+                continue
+            tool_created = str(tool.get("created_at") or "")
+            candidate = ""
+            for user in user_turns:
+                user_created = str(user.get("created_at") or "")
+                if not tool_created or not user_created or user_created <= tool_created:
+                    candidate = str(user.get("message_id") or "")
+                else:
+                    break
+            if not candidate and user_turns:
+                candidate = str(user_turns[-1].get("message_id") or "")
+            if candidate:
+                tool["turn_id"] = candidate
+
         tools_by_turn: dict[str, list[dict[str, Any]]] = {}
         for item in tools_only:
             tools_by_turn.setdefault(str(item.get("turn_id") or ""), []).append(item)
@@ -314,6 +729,7 @@ class SessionService:
         directory = getattr(self._store_for_session(clean), "dir", None)
         if not directory:
             return None
+        temp: Path | None = None
         try:
             context_dir = Path(directory).expanduser().resolve(strict=False)
             if not context_dir.is_dir():
