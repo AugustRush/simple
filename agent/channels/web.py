@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -24,6 +25,40 @@ from agent.core.output import OutputSink
 from agent.session_service import SessionService
 
 logger = logging.getLogger(__name__)
+
+
+async def _pick_workspace_directory() -> str | None:
+    """Open the host OS folder picker and return the selected directory."""
+    import sys
+
+    if sys.platform == "darwin":
+        script = (
+            'set pickedFolder to choose folder with prompt "选择 Agent 项目文件夹"\n'
+            'POSIX path of pickedFolder'
+        )
+        args = ["osascript", "-e", script]
+    elif sys.platform.startswith("win"):
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d=New-Object System.Windows.Forms.FolderBrowserDialog; "
+            "if($d.ShowDialog() -eq 'OK'){[Console]::Write($d.SelectedPath)}"
+        )
+        args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+    else:
+        args = ["zenity", "--file-selection", "--directory", "--title=选择 Agent 项目文件夹"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+    except (FileNotFoundError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    selected = stdout.decode("utf-8", errors="replace").strip()
+    return selected or None
 
 
 def _web_session_output_dir(session_id: str) -> Path:
@@ -90,19 +125,23 @@ class WebOutputSink(OutputSink):
         collect: bool = False,
         on_attachment: Any = None,
         output_dir: Any = None,
+        confirmation_handler: Any = None,
     ) -> None:
         self._websocket = websocket
         self._collect = collect or websocket is None
         self._events: list[dict[str, Any]] = []
         self._attachments: list[str] = []
         self._turn_complete_emitted = False
+        self._completion_event = asyncio.Event()
         self.on_attachment = on_attachment
+        self._confirmation_handler = confirmation_handler
         # Session output directory scanned for media produced during a turn so
         # images/audio/video show inline even if the agent never called send_file.
         self._output_dir = output_dir
         self._turn_started_at = 0.0
         self._attached_paths: set[str] = set()
         self.full_text = ""
+        self._turn_started = False
         self._queue: Optional[asyncio.Queue[dict[str, Any] | None]] = None
         self._sender_task: Optional[asyncio.Task[Any]] = None
         if not self._collect:
@@ -119,6 +158,7 @@ class WebOutputSink(OutputSink):
         if full_text:
             self.full_text = full_text
         self._turn_complete_emitted = True
+        self._completion_event.set()
         self._emit(
             {
                 "type": "turn_complete",
@@ -130,6 +170,7 @@ class WebOutputSink(OutputSink):
     def mark_turn_start(self) -> None:
         """Reset the per-message completion marker used by WebSocket delivery."""
         self._turn_complete_emitted = False
+        self._turn_started = True
         self._turn_started_at = time.time()
         # ``_attachments`` / ``_attached_paths`` are per-turn transient state.  A
         # sink is reused across turns on a WebSocket connection; without clearing
@@ -142,6 +183,26 @@ class WebOutputSink(OutputSink):
     @property
     def turn_complete_emitted(self) -> bool:
         return self._turn_complete_emitted
+
+    @property
+    def streaming_snapshot(self) -> dict[str, Any] | None:
+        """Return a lightweight snapshot used when a browser reconnects.
+
+        A session can keep running while its browser tab is switched away.
+        Rebinding the sink and sending this snapshot lets the new tab render
+        the already-generated text immediately instead of waiting for the
+        final turn event.
+        """
+        # Empty sinks are usually queued messages waiting behind the active
+        # operation. Do not replay them as additional blank assistant bubbles
+        # when a browser switches back to this session.
+        if not self._turn_started or self._turn_complete_emitted or not self.full_text:
+            return None
+        return {"type": "stream_snapshot", "text": self.full_text}
+
+    def set_websocket(self, websocket: Any) -> None:
+        """Route subsequent events to the currently selected browser tab."""
+        self._websocket = websocket
 
     def on_tool_start(self, name: str, inputs: dict) -> None:
         self._emit({"type": "tool_start", "name": name, "inputs": dict(inputs)})
@@ -224,6 +285,16 @@ class WebOutputSink(OutputSink):
         self._attachments.clear()
         self._auto_attach_media()
         await self.flush()
+
+    async def wait_for_completion(self, timeout: float = 3600.0) -> bool:
+        """Wait until the coordinator finishes this sink's queued turn."""
+        if self._turn_complete_emitted:
+            return True
+        try:
+            await asyncio.wait_for(self._completion_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        return self._turn_complete_emitted
 
     def _auto_attach_media(self) -> None:
         """Attach media files the agent created in this session's output dir.
@@ -309,6 +380,13 @@ class WebOutputSink(OutputSink):
             }
         )
         await self.flush()
+        handler = self._confirmation_handler
+        if callable(handler):
+            try:
+                return bool(await handler(confirmation_token))
+            except Exception:
+                return False
+        # Collection/testing sinks have no shared WebSocket reader.
         try:
             data = await asyncio.wait_for(self._websocket.receive_json(), timeout=120)
         except Exception:
@@ -414,6 +492,7 @@ class WebChannel(Channel):
             Callable[[IncomingMessage, OutputSink], Any]
         ] = None
         self._sessions: dict[str, Any] = {}
+        self._live_sinks: dict[str, set[WebOutputSink]] = {}
         self._components: dict[str, Any] = {}
         self._session_service: Optional[SessionService] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -426,11 +505,13 @@ class WebChannel(Channel):
 
     @staticmethod
     def _web_dist_dir() -> Path:
-        """Resolve the frontend bundle for source checkouts and packages.
+        """Resolve the frontend bundle used by the gateway.
 
-        Source builds live in ``frontend/dist``; packaged installations use
-        the bundled ``agent/_builtin/web/dist`` copy refreshed by the release
-        build command.
+        The bundled copy is the canonical runtime asset and is checked into
+        the package.  ``frontend/dist`` is intentionally ignored by git and
+        may contain an older local build, so it must never silently override
+        the bundled assets after a restart.  Set ``SIMPLE_WEB_USE_SOURCE_DIST``
+        to opt into source-dist serving during local frontend development.
         """
         package_dist = Path(__file__).resolve().parent.parent / "_builtin" / "web" / "dist"
         source_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
@@ -439,7 +520,13 @@ class WebChannel(Channel):
         # incomplete bundle; StaticFiles raises during app construction if the
         # referenced assets directory is missing.  Falling back to the bundled
         # release keeps the gateway usable until the next frontend build.
-        if (source_dist / "index.html").is_file() and (source_dist / "assets").is_dir():
+        use_source = os.getenv("SIMPLE_WEB_USE_SOURCE_DIST", "").strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if use_source and (source_dist / "index.html").is_file() and (source_dist / "assets").is_dir():
             return source_dist
         return package_dist
 
@@ -890,6 +977,40 @@ class WebChannel(Channel):
             }
         )
 
+    async def _get_session_state(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = str(request.path_params["session_id"])
+        return JSONResponse(self._service().get_session_state(session_id))
+
+    async def _pick_workspace(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        if self._handler is None:
+            return JSONResponse({"error": "channel not started"}, status_code=503)
+        selected = await _pick_workspace_directory()
+        if not selected:
+            return JSONResponse({"cancelled": True, "workspace_root": ""})
+        session_id = str(request.path_params["session_id"])
+        # Reuse the transport-neutral command so filesystem policy, prompt,
+        # and the session manifest are updated exactly as in CLI/Web commands.
+        sink = WebOutputSink(collect=True)
+        await self._handle_text(
+            session_id,
+            f"/workspace {selected}",
+            sink,
+            message_id=uuid.uuid4().hex,
+        )
+        return JSONResponse({
+            "cancelled": False,
+            "workspace_root": selected,
+            "text": sink.full_text,
+            "events": sink.events,
+        })
+
     async def _get_session_permissions(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
         from agent.security.shell import (
@@ -1042,14 +1163,96 @@ class WebChannel(Channel):
 
         session_id = websocket.path_params["session_id"]
         clean_sid = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
-        sink = WebOutputSink(
-            websocket=websocket,
-            output_dir=_web_session_output_dir(clean_sid),
-        )
+        # A previous tab may have been switched away while this session was
+        # still generating. Rebind its sinks to the new socket and publish the
+        # text generated so far before receiving new input.
+        live_sinks = self._live_sinks.get(session_id, set())
+        for live_sink in tuple(live_sinks):
+            live_sink.set_websocket(websocket)
+            snapshot = live_sink.streaming_snapshot
+            if snapshot is not None:
+                try:
+                    await websocket.send_json(snapshot)
+                except Exception:
+                    pass
+        active_tasks: set[asyncio.Task[Any]] = set()
+        confirmation_waiters: dict[str, asyncio.Future[bool]] = {}
+
+        def wait_for_confirmation(token: str) -> asyncio.Future[bool]:
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[bool] = loop.create_future()
+            confirmation_waiters[token] = future
+            async def guarded() -> bool:
+                try:
+                    return bool(await asyncio.wait_for(future, timeout=120))
+                except asyncio.TimeoutError:
+                    return False
+                finally:
+                    confirmation_waiters.pop(token, None)
+            return asyncio.ensure_future(guarded())
+
+        async def process_message(
+            text: str,
+            message_id: str,
+            model: str | None,
+        ) -> None:
+            # Each incoming message gets its own sink.  The coordinator owns
+            # per-session serialization and can therefore queue a message
+            # while an earlier turn is running; sharing one sink here would
+            # reset its turn markers and make queued messages look completed.
+            sink = WebOutputSink(
+                websocket=websocket,
+                output_dir=_web_session_output_dir(clean_sid),
+                confirmation_handler=wait_for_confirmation,
+            )
+            sink.on_attachment = lambda path, name: self._record_attachment(
+                session_id, path, name, turn_id=message_id
+            )
+            sink.mark_turn_start()
+            self._live_sinks.setdefault(session_id, set()).add(sink)
+            try:
+                await self._handle_text(
+                    session_id,
+                    text,
+                    sink,
+                    message_id=message_id,
+                    model_override=model,
+                )
+                await sink.flush_attachments()
+                # A queued message intentionally has no turn_complete event;
+                # its eventual execution gets its own sink and completion.
+                # Commands that produce no output still receive a completion
+                # marker so the client can clear its transient state.
+                if not sink.turn_complete_emitted:
+                    state = self._sessions.get(session_id)
+                    operation_state = str(getattr(state, "operation_state", "idle"))
+                    if operation_state != "idle":
+                        # The coordinator accepted this request into its
+                        # restart queue. Keep this sink alive until that
+                        # queued operation is actually executed; closing it
+                        # here would silently drop all later stream events.
+                        await sink.wait_for_completion()
+                    final_state = self._sessions.get(session_id)
+                    final_operation_state = str(
+                        getattr(final_state, "operation_state", "idle")
+                    )
+                    if not sink.turn_complete_emitted and final_operation_state == "idle":
+                        sink.on_turn_complete("", [])
+                        await sink.flush()
+            finally:
+                self._live_sinks.get(session_id, set()).discard(sink)
+                await sink.close()
+
         try:
             while True:
                 data = await websocket.receive_json()
                 if not isinstance(data, dict):
+                    continue
+                if data.get("type") == "confirm_response":
+                    token = str(data.get("confirmation_token") or "")
+                    waiter = confirmation_waiters.get(token)
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(bool(data.get("approved", False)))
                     continue
                 if data.get("type") != "message":
                     continue
@@ -1065,25 +1268,20 @@ class WebChannel(Channel):
                 except ValueError as exc:
                     await websocket.send_json({"type": "error", "error": str(exc)})
                     continue
-                sink.on_attachment = lambda path, name: self._record_attachment(
-                    session_id, path, name, turn_id=message_id
+                task = asyncio.create_task(
+                    process_message(text, message_id, model),
+                    name=f"web-message-{message_id}",
                 )
-                sink.mark_turn_start()
-                await self._handle_text(
-                    session_id,
-                    text,
-                    sink,
-                    message_id=message_id,
-                    model_override=model,
-                )
-                await sink.flush_attachments()
-                if not sink.turn_complete_emitted:
-                    sink.on_turn_complete("", [])
-                    await sink.flush()
+                active_tasks.add(task)
+                task.add_done_callback(active_tasks.discard)
         except Exception:
             pass
         finally:
-            await sink.close()
+            # A tab switch closes the old socket, but must not cancel the
+            # session operation. Its sinks remain registered and are rebound
+            # by the next WebSocket connection, allowing the reply to
+            # continue and the partial snapshot to be restored.
+            active_tasks.clear()
 
     async def _handle_text(
         self,
@@ -1225,6 +1423,16 @@ class WebChannel(Channel):
                 "/api/sessions/{session_id}/messages",
                 self._get_messages,
                 methods=["GET"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/state",
+                self._get_session_state,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/workspace/pick",
+                self._pick_workspace,
+                methods=["POST"],
             ),
             Route(
                 "/api/sessions/{session_id}/messages",

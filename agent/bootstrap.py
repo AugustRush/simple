@@ -80,6 +80,13 @@ async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict
         try:
             agent_module._set_agent_home(home)
             session_cfg = dict(base_cfg)
+            try:
+                persisted = json.loads(manifest.read_text(encoding="utf-8"))
+                persisted_workspace = persisted.get("workspace_root")
+                if isinstance(persisted_workspace, str) and persisted_workspace.strip():
+                    session_cfg["workspace_root"] = persisted_workspace
+            except (OSError, ValueError, TypeError):
+                pass
             # Generated files and attachments are always session-owned. A
             # global output_dir setting is intentionally ignored for Web
             # runtimes to prevent cross-session leakage.
@@ -243,7 +250,8 @@ async def _build_components_async(
     mem_cfg = cfg.get("memory", {})
     orch_cfg = cfg.get("orchestration", {})
 
-    workspace_root = Path.cwd().resolve()
+    configured_workspace = cfg.get("workspace_root")
+    workspace_root = Path(str(configured_workspace)).expanduser().resolve() if configured_workspace else Path.cwd().resolve()
     output_dir = _resolve_output_dir(cfg)
     # Construct the immutable file access policy before any file or shell
     # tool is registered.  Invalid configuration or overlapping roots abort

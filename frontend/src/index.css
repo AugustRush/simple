@@ -404,44 +404,6 @@ textarea {
   scroll-behavior: auto;
 }
 
-.chat-scroll-bottom {
-  position: absolute;
-  right: max(20px, calc((100% - 820px) / 2));
-  bottom: 104px;
-  z-index: 3;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 32px;
-  padding: 0 12px;
-  border: 1px solid var(--border-strong);
-  border-radius: 999px;
-  color: var(--text);
-  background: var(--surface-raised);
-  background: color-mix(in srgb, var(--surface-raised) 92%, transparent);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
-  cursor: pointer;
-  font-size: 12px;
-  transition: border-color 160ms ease, background 160ms ease, transform 160ms ease;
-}
-
-.chat-scroll-bottom:hover {
-  border-color: var(--primary);
-  background: var(--surface-raised);
-  transform: translateY(-1px);
-}
-
-.chat-scroll-bottom .anticon {
-  font-size: 11px;
-}
-
-@media (max-width: 768px) {
-  .chat-scroll-bottom {
-    right: 16px;
-    bottom: 96px;
-  }
-}
-
 .chat-inner {
   width: min(820px, calc(100% - 32px));
   margin: 0 auto;
@@ -979,6 +941,102 @@ html[data-theme='light'] .tool-trace-items {
 .composer-wrap {
   position: relative;
   padding: 0 24px 20px;
+}
+
+.message-queue-banner,
+.task-guidance-card {
+  width: min(820px, 100%);
+  margin: 0 auto 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.message-queue-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 0 10px;
+}
+
+.message-queue-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--primary);
+}
+
+.message-queue-banner button {
+  margin-left: auto;
+  padding: 2px 4px;
+  border: 0;
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.message-queue-banner button:hover {
+  color: var(--text);
+}
+
+.task-guidance-card {
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+}
+
+.task-guidance-head,
+.task-guidance-next {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.task-guidance-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.task-guidance-status {
+  padding: 1px 6px;
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: var(--primary-soft);
+  font-size: 10px;
+}
+
+.task-guidance-card strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.task-guidance-card > span,
+.task-guidance-next > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-guidance-next {
+  justify-content: space-between;
+  color: var(--text-muted);
+}
+
+.task-guidance-next .ant-btn {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  color: var(--primary);
+}
+
+.message-queued {
+  color: var(--amber);
+  font-size: 11px;
 }
 
 .composer {

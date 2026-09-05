@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from datetime import datetime, timezone
 import json
 import os
@@ -140,6 +141,110 @@ def _require_no_args(request: CommandRequest, usage: str) -> CommandResult | Non
 def _context_manager(context: CommandContext) -> Any:
     manager = getattr(context.session_state, "context_manager", None)
     return manager if manager is not None else _component(context, "context_manager")
+
+
+def _session_agent(context: CommandContext) -> Any:
+    agent = context.components.get("agent")
+    if agent is not None:
+        return agent
+    core = context.components.get("agent_core")
+    return getattr(getattr(core, "_components", None), "values", {}).get("agent")
+
+
+async def _compact_handler(request: CommandRequest, context: CommandContext) -> CommandResult:
+    if request.args:
+        return _error("用法：/compact")
+    manager = _context_manager(context)
+    agent = _session_agent(context)
+    messages = getattr(getattr(context.session_state, "ctx", None), "messages", None)
+    if manager is None or agent is None or not isinstance(messages, list):
+        return _error("当前会话的上下文管理器不可用。")
+    budget = max(1, int(getattr(agent, "context_window", 0) or 0) - int(getattr(agent, "max_tokens", 0) or 0))
+    before = len(messages)
+    try:
+        compacted = manager.compact_messages(messages, input_token_budget=budget)
+    except Exception as exc:
+        return _error(f"上下文压缩失败：{exc}")
+    messages[:] = compacted
+    return CommandResult(response_text=f"上下文压缩完成：{before} 条消息 → {len(compacted)} 条。长期记忆与记忆宫殿未被清除。")
+
+
+async def _clear_handler(request: CommandRequest, context: CommandContext) -> CommandResult:
+    if request.args:
+        return _error("用法：/clear")
+    ctx = getattr(context.session_state, "ctx", None)
+    if ctx is None or not isinstance(getattr(ctx, "messages", None), list):
+        return _error("当前会话上下文不可用。")
+    removed = len(ctx.messages)
+    ctx.messages.clear()
+    context.session_state.task_context = ""
+    if hasattr(ctx, "metadata"):
+        for key in ("pending_messages", "required_skills", "_predicted_input_tokens"):
+            ctx.metadata.pop(key, None)
+    return CommandResult(response_text=f"已清除当前会话上下文（{removed} 条消息）。长期记忆与记忆宫殿仍保留。")
+
+
+async def _workspace_handler(request: CommandRequest, context: CommandContext) -> CommandResult:
+    raw = request.args.strip().strip("'\"")
+    agent = _session_agent(context)
+    if agent is None:
+        return _error("当前会话运行时不可用。")
+    current = Path(getattr(agent, "workspace_root", None) or Path.cwd()).resolve()
+    if not raw:
+        return CommandResult(response_text=f"当前工作文件夹：`{current}`")
+    target = Path(raw).expanduser()
+    if not target.is_absolute():
+        target = current / target
+    try:
+        target = target.resolve(strict=True)
+    except OSError:
+        return _error(f"工作文件夹不存在：{target}")
+    if not target.is_dir():
+        return _error(f"工作路径不是文件夹：{target}")
+    from agent.tools.files import FileService, resolve_file_access_config
+    output_dir = Path(str(context.components.get("output_dir") or shared.DEFAULT_OUTPUT_DIR)).resolve()
+    policy = resolve_file_access_config(dict(context.config), workspace_root=target, output_dir=output_dir)
+    service = FileService(policy)
+    registry = context.components.get("registry")
+    if registry is not None:
+        registry.set_context("workspace_root", str(target))
+        registry.set_context("file_access_policy", policy)
+        registry.set_context("file_service", service)
+        for tool in getattr(registry, "_tools", {}).values():
+            owner = getattr(tool.fn, "__self__", None)
+            if owner is not None and hasattr(owner, "workspace_root"):
+                owner.workspace_root = target
+                if hasattr(owner, "_injected_file_service"):
+                    owner._injected_file_service = service
+    agent.workspace_root = target
+    core_components = getattr(getattr(context.components.get("agent_core"), "_components", None), "values", None)
+    if isinstance(core_components, dict):
+        core_components["workspace_root"] = target
+        core_components["file_access_policy"] = policy
+        core_components["file_service"] = service
+    # Make the new root visible to the model immediately. The runtime keeps
+    # the agent and registry objects session-scoped, while the command context
+    # itself is an immutable request snapshot.
+    current_prompt = str(getattr(context.session_state.ctx, "system_prompt", "") or "")
+    marker = "\n\nCurrent session workspace: "
+    if marker in current_prompt:
+        current_prompt = current_prompt.split(marker, 1)[0]
+    context.session_state.ctx.system_prompt = f"{current_prompt}{marker}{target}"
+    if hasattr(context.session_state.ctx, "metadata"):
+        context.session_state.ctx.metadata["workspace_root"] = str(target)
+    # Web sessions have a durable manifest, so a gateway restart restores the
+    # selected folder. CLI sessions intentionally remain process-scoped.
+    if context.channel_name == "web":
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            manifest = shared.web_session_home(context.session_id) / ".session.json"
+            payload = {}
+            if manifest.is_file():
+                loaded = json.loads(manifest.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload.update(loaded)
+            payload["workspace_root"] = str(target)
+            shared._atomic_write_text(manifest, json.dumps(payload, ensure_ascii=False, indent=2))
+    return CommandResult(response_text=f"已切换当前会话工作文件夹：`{target}`")
 
 
 def _sessions_file(context: CommandContext) -> Path:
@@ -1455,6 +1560,29 @@ def _builtin_descriptors(router: CommandRouter) -> tuple[CommandDescriptor, ...]
             usage="/context",
             description="Show long-term context statistics",
             concurrency="anytime",
+        ),
+        CommandDescriptor(
+            "compact",
+            _compact_handler,
+            usage="/compact",
+            description="压缩当前会话上下文，保留长期记忆",
+            concurrency="idle_only",
+        ),
+        CommandDescriptor(
+            "clear",
+            _clear_handler,
+            aliases=("reset-context",),
+            usage="/clear",
+            description="清除当前会话上下文，不删除长期记忆",
+            concurrency="idle_only",
+        ),
+        CommandDescriptor(
+            "workspace",
+            _workspace_handler,
+            aliases=("cwd",),
+            usage="/workspace [路径]",
+            description="查看或切换当前会话的工作文件夹",
+            concurrency="idle_only",
         ),
         CommandDescriptor(
             "sessions",

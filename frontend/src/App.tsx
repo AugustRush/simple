@@ -89,6 +89,7 @@ interface Message {
   role: MessageRole
   content: string
   streaming?: boolean
+  queued?: boolean
   link?: string
   tool?: string
   toolState?: ToolState
@@ -115,6 +116,35 @@ interface CommandInfo {
   aliases?: string[]
   usage?: string
   description?: string
+}
+
+interface SessionTaskGuidance {
+  task_id?: string
+  active_goal?: string
+  status?: string
+  progress?: string
+  next_action?: string
+  last_error?: string
+  artifacts?: string[]
+}
+
+interface SessionState {
+  session_id: string
+  live?: boolean
+  operation_state?: string
+  queue?: {
+    pending?: number
+    interjections?: number
+    restarts?: number
+  }
+  task?: SessionTaskGuidance | null
+  workspace_root?: string
+}
+
+interface QueuedMessage {
+  id: string
+  text: string
+  model: string
 }
 
 function escapeHtml(s: string): string {
@@ -339,6 +369,8 @@ function App() {
     () => (localStorage.getItem('send_shortcut') === 'ctrl-enter' ? 'ctrl-enter' : 'enter'),
   )
   const sendShortcutLabel = sendShortcut === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'
+  const [sessionState, setSessionState] = useState<SessionState | null>(null)
+  const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([])
   const [form] = Form.useForm()
   const activeProviderName = Form.useWatch('active_provider', form)
   const wsRef = useRef<WebSocket | null>(null)
@@ -348,6 +380,7 @@ function App() {
   const activeSessionRef = useRef<string | null>(null)
   const pendingSendRef = useRef<string | null>(null)
   const pendingModelRef = useRef<string | null>(null)
+  const queuedMessagesRef = useRef<QueuedMessage[]>([])
   const streamIdRef = useRef<string | null>(null)
   const messagesRef = useRef<Message[]>([])
   const loadMessagesRequestRef = useRef(0)
@@ -356,7 +389,6 @@ function App() {
   const commandItemRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const idRef = useRef(0)
   const token = localStorage.getItem('agent_token') || ''
-  const [showScrollToBottom, setShowScrollToBottom] = useState(false)
 
   const scrollChatToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
     const container = chatScrollRef.current
@@ -373,7 +405,6 @@ function App() {
     const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight
     const nearBottom = distanceToBottom <= 96
     followChatRef.current = nearBottom
-    setShowScrollToBottom(!nearBottom)
   }, [])
 
   useEffect(() => {
@@ -416,7 +447,6 @@ function App() {
     // already at the bottom. Once they scroll up, preserve their reading
     // position until they explicitly return to the bottom.
     if (!followChatRef.current) {
-      setShowScrollToBottom(true)
       return
     }
     const frame = requestAnimationFrame(() => scrollChatToBottom('auto'))
@@ -514,8 +544,17 @@ function App() {
             }
           },
         )
-        messagesRef.current = loaded
-        setMessages(loaded)
+        // Keep transient events that arrived through the newly connected
+        // socket while this HTTP history request was in flight. This is what
+        // makes switching back to a running session show its partial reply
+        // immediately instead of replacing it with only the persisted user
+        // messages.
+        const transient = messagesRef.current.filter(item =>
+          item.streaming || (item.role === 'tool' && item.toolState === 'running'),
+        )
+        const merged = [...loaded, ...transient]
+        messagesRef.current = merged
+        setMessages(merged)
       } catch {
         if (
           requestId !== loadMessagesRequestRef.current ||
@@ -529,6 +568,25 @@ function App() {
     },
     [api, makeId, token],
   )
+
+  const loadSessionState = useCallback(async (sid: string) => {
+    try {
+      const resp = await api(`/api/sessions/${encodeURIComponent(sid)}/state`)
+      const data = (await resp.json()) as SessionState
+      if (activeSessionRef.current === sid) {
+        setSessionState(data)
+        // Restoring a session while its agent is still working should bring
+        // back the generating state (and stop button) even before the first
+        // snapshot/chunk arrives on the newly opened socket.
+        setIsStreaming(String(data.operation_state || 'idle') !== 'idle')
+      }
+    } catch {
+      if (activeSessionRef.current === sid) {
+        setSessionState(null)
+        setIsStreaming(false)
+      }
+    }
+  }, [api])
 
   const appendMessage = useCallback((next: Message) => {
     messagesRef.current = [...messagesRef.current, next]
@@ -623,6 +681,21 @@ function App() {
           return
         }
 
+        if (evt.type === 'stream_snapshot') {
+          const text = String(evt.text || '')
+          const existingId = streamIdRef.current
+          if (existingId) {
+            updateMessage(existingId, { content: text, streaming: true })
+          } else {
+            const id = makeId()
+            streamIdRef.current = id
+            appendMessage({ id, role: 'assistant', content: text, streaming: true })
+          }
+          setIsStreaming(true)
+          setActivity('正在生成…')
+          return
+        }
+
         if (evt.type === 'turn_complete') {
           if (streamIdRef.current) {
             updateMessage(streamIdRef.current, {
@@ -634,6 +707,12 @@ function App() {
           setIsStreaming(false)
           setActivity('')
           loadSessions()
+          loadSessionState(sid)
+          const nextQueued = queuedMessagesRef.current.shift()
+          if (nextQueued) {
+            setQueuedMessages([...queuedMessagesRef.current])
+            updateMessage(nextQueued.id, { queued: false })
+          }
           return
         }
 
@@ -696,6 +775,16 @@ function App() {
             (typeof evt.content === 'string'
               ? evt.content
               : JSON.stringify(evt.content))
+          // The coordinator acknowledges messages submitted while a turn is
+          // active with a queue status.  Remove the optimistic local queue
+          // marker as soon as that acknowledgement arrives; otherwise an
+          // interjection (which is consumed by the current turn) can remain
+          // stuck as "排队中" forever after a single turn_complete event.
+          if (/queued|排队/i.test(text) && queuedMessagesRef.current.length > 0) {
+            const queued = queuedMessagesRef.current.shift()
+            setQueuedMessages([...queuedMessagesRef.current])
+            if (queued) updateMessage(queued.id, { queued: false })
+          }
           setActivity(truncate(text, 90))
           appendMessage({ id: makeId(), role: 'command', content: text })
           return
@@ -752,14 +841,16 @@ function App() {
         }
       }
     },
-    [appendMessage, loadSessions, makeId, token, updateMessage],
+    [appendMessage, loadSessionState, loadSessions, makeId, token, updateMessage],
   )
 
   const selectSession = useCallback(
     (sid: string) => {
       setPendingDeleteSessionId(null)
       followChatRef.current = true
-      setShowScrollToBottom(false)
+      queuedMessagesRef.current = []
+      setQueuedMessages([])
+      setSessionState(null)
       activeSessionRef.current = sid
       setActiveSession(sid)
       setView('chat')
@@ -789,8 +880,9 @@ function App() {
       }
       loadMessages(sid)
       loadSessionPermissions(sid)
+      loadSessionState(sid)
     },
-    [loadMessages, loadSessionPermissions],
+    [loadMessages, loadSessionPermissions, loadSessionState],
   )
 
   useEffect(() => {
@@ -809,6 +901,19 @@ function App() {
     // for the lifecycle we need here.
   }, [activeSession, connectWs])
 
+  // Working-state projections and coordinator mailboxes are updated while a
+  // turn is running. Polling this lightweight endpoint keeps task guidance and
+  // queue counts useful during long tool runs, including messages submitted
+  // from another browser tab.
+  useEffect(() => {
+    if (!activeSession) return
+    const refresh = () => loadSessionState(activeSession)
+    refresh()
+    if (!isStreaming) return
+    const timer = window.setInterval(refresh, 1200)
+    return () => window.clearInterval(timer)
+  }, [activeSession, isStreaming, loadSessionState])
+
   const sendMessage = async (overrideText?: string) => {
     const text = (overrideText ?? input).trim()
     if (!text || creatingSession) return
@@ -817,10 +922,23 @@ function App() {
     // Re-enable bottom following even if the reader had previously scrolled
     // up to inspect older messages.
     followChatRef.current = true
-    setShowScrollToBottom(false)
-    appendMessage({ id: makeId(), role: 'user', content: text })
+    const queueWhileBusy =
+      isStreaming && !/^\/(?:cancel|now)(?:\s|$)/i.test(text)
+    const messageId = makeId()
+    appendMessage({ id: messageId, role: 'user', content: text, queued: queueWhileBusy })
     setInput('')
     setActivity('等待模型响应')
+
+    if (queueWhileBusy) {
+      const queued = {
+        id: messageId,
+        text,
+        model: currentModelRef.current,
+      }
+      queuedMessagesRef.current = [...queuedMessagesRef.current, queued]
+      setQueuedMessages([...queuedMessagesRef.current])
+      setActivity(`已排队 ${queuedMessagesRef.current.length} 条消息`)
+    }
 
     if (!activeSession) {
       try {
@@ -834,6 +952,7 @@ function App() {
         await loadSessions()
         setView('chat')
         setActiveSession(sid)
+        loadSessionState(sid)
       } catch {
         pendingSendRef.current = null
         pendingModelRef.current = null
@@ -865,6 +984,22 @@ function App() {
     // `isStreaming` and flips the send button back to "发送".
     if (!activeSession) return
     api(`/api/sessions/${activeSession}/cancel`, { method: 'POST' }).catch(() => {})
+  }
+
+  const pickWorkspace = async () => {
+    if (!activeSession) {
+      messageApi.info('请先选择或新建会话')
+      return
+    }
+    try {
+      const resp = await api(`/api/sessions/${encodeURIComponent(activeSession)}/workspace/pick`, { method: 'POST' })
+      const data = await resp.json()
+      if (data.cancelled) return
+      await loadSessionState(activeSession)
+      messageApi.success(`项目文件夹已切换：${data.workspace_root}`)
+    } catch {
+      // api helper already reports the error
+    }
   }
 
   const sendConfirm = (approved: boolean) => {
@@ -1026,6 +1161,9 @@ function App() {
         setMessages([])
         messagesRef.current = []
         streamIdRef.current = null
+        queuedMessagesRef.current = []
+        setQueuedMessages([])
+        setSessionState(null)
       }
       setPendingDeleteSessionId(current => current === item.session_id ? null : current)
       await loadSessions()
@@ -1083,6 +1221,9 @@ function App() {
             setMessages([])
             messagesRef.current = []
             streamIdRef.current = null
+            queuedMessagesRef.current = []
+            setQueuedMessages([])
+            setSessionState(null)
           }
           setSelectedSessionIds([])
           await loadSessions()
@@ -1336,7 +1477,7 @@ function App() {
     chat: {
       title: activeSession ? '当前对话' : '开始新的对话',
       subtitle: activeSession
-        ? `${activeSession.slice(0, 12)} · ${connected ? '实时连接中' : '连接已断开'}`
+        ? `${activeSession.slice(0, 12)} · ${connected ? '实时连接中' : '连接已断开'}${sessionState?.workspace_root ? ` · ${sessionState.workspace_root}` : ''}`
         : '与你的 AI Agent 开始一段对话',
     },
     sessions: {
@@ -1402,16 +1543,11 @@ function App() {
       if (event.key === 'Enter') {
         if (ctrlOrCmd) {
           event.preventDefault()
-          if (isStreaming) return
           send()
         }
         return
       }
     } else {
-      if (event.key === 'Enter' && !event.shiftKey && isStreaming) {
-        event.preventDefault()
-        return
-      }
       if (event.key === 'Enter') {
         if (event.shiftKey) return
         event.preventDefault()
@@ -1539,6 +1675,7 @@ function App() {
         <div className="message-stack">
           <div className={`message-meta ${traceSummary ? 'message-meta-trace' : ''}`}>
             <span className="message-author">{isUser ? '你' : 'Simple Agent'}</span>
+            {item.queued && <span className="message-queued">排队中</span>}
             {item.streaming && <span className="message-streaming">正在生成</span>}
             {traceSummary}
           </div>
@@ -1756,19 +1893,54 @@ function App() {
         </div>
       </div>
 
-      {showScrollToBottom && (
-        <button
-          type="button"
-          className="chat-scroll-bottom"
-          onClick={() => scrollChatToBottom('smooth')}
-          aria-label="回到底部"
-        >
-          <DownOutlined />
-          <span>回到底部</span>
-        </button>
-      )}
-
       <div className="composer-wrap">
+        {Math.max(
+          queuedMessages.length,
+          Number(sessionState?.queue?.pending || 0),
+        ) > 0 && (
+          <div className="message-queue-banner">
+            <span className="message-queue-dot" />
+            <span>
+              已排队 {Math.max(queuedMessages.length, Number(sessionState?.queue?.pending || 0))} 条消息，将按顺序处理
+            </span>
+            {queuedMessages.length > 0 && <button type="button" onClick={() => {
+              const ids = new Set(queuedMessages.map(item => item.id))
+              messagesRef.current = messagesRef.current.filter(item => !ids.has(item.id))
+              setMessages([...messagesRef.current])
+              queuedMessagesRef.current = []
+              setQueuedMessages([])
+            }}>清空</button>}
+          </div>
+        )}
+        {sessionState?.task?.active_goal &&
+          !['completed', 'success', 'done', 'updated'].includes(
+            String(sessionState.task.status || '').toLowerCase(),
+          ) && (
+            <div className="task-guidance-card">
+              <div className="task-guidance-head">
+                <span className="task-guidance-label">当前任务</span>
+                {sessionState.task.status && (
+                  <span className="task-guidance-status">{sessionState.task.status}</span>
+                )}
+              </div>
+              <strong>{truncate(sessionState.task.active_goal, 140)}</strong>
+              {sessionState.task.progress && (
+                <span>{truncate(sessionState.task.progress, 180)}</span>
+              )}
+              {sessionState.task.next_action && (
+                <div className="task-guidance-next">
+                  <span>下一步：{truncate(sessionState.task.next_action, 180)}</span>
+                  <Button
+                    type="text"
+                    size="small"
+                    onClick={() => sendMessage('继续当前任务')}
+                  >
+                    继续任务
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
         {input.startsWith('/') && (
           <div className="command-popover">
             <div className="command-popover-head">
@@ -1817,6 +1989,15 @@ function App() {
           />
           <div className="composer-footer">
             <Space size={4}>
+              <Tooltip title="选择项目文件夹">
+                <Button
+                  type="text"
+                  className="workspace-button"
+                  aria-label="选择项目文件夹"
+                  icon={<FolderOpenOutlined />}
+                  onClick={pickWorkspace}
+                />
+              </Tooltip>
               <Dropdown
                 trigger={['click']}
                 placement="topLeft"
@@ -1890,15 +2071,26 @@ function App() {
               />
             </Space>
             <Space size={4}>
-              <Tooltip title={isStreaming ? '终止生成' : `发送 (${sendShortcutLabel})`}>
+              {isStreaming && (
+                <Tooltip title="终止生成">
+                  <Button
+                    type="default"
+                    danger
+                    className="send-button stop-button"
+                    aria-label="终止生成"
+                    icon={<StopOutlined />}
+                    onClick={stopStreaming}
+                  />
+                </Tooltip>
+              )}
+              <Tooltip title={isStreaming ? '排队发送' : `发送 (${sendShortcutLabel})`}>
                 <Button
-                  type={isStreaming ? 'default' : 'primary'}
-                  danger={isStreaming}
-                  className={isStreaming ? 'send-button stop-button' : 'send-button'}
-                  aria-label={isStreaming ? '终止生成' : '发送'}
-                  icon={isStreaming ? <StopOutlined /> : <SendOutlined />}
+                  type="primary"
+                  className="send-button"
+                  aria-label={isStreaming ? '排队发送' : '发送'}
+                  icon={<SendOutlined />}
                   disabled={!isStreaming && (!input.trim() || creatingSession)}
-                  onClick={() => (isStreaming ? stopStreaming() : sendMessage())}
+                  onClick={() => sendMessage()}
                 />
               </Tooltip>
             </Space>

@@ -83,6 +83,35 @@ def test_session_service_tracks_live_mapping_after_empty_bind():
     assert [item["session_id"] for item in sessions] == ["later"]
 
 
+def test_session_service_exposes_task_guidance_and_queue_state():
+    class Snapshot:
+        state = {
+            "task_id": "task-1",
+            "active_goal": "finish the migration",
+            "status": "in_progress",
+            "progress": "database schema updated",
+            "next_action": "run the verification suite",
+            "last_error": "",
+            "artifacts": ["schema.sql"],
+        }
+
+    class Store(_FakeStore):
+        def load_session_working_state(self, session_id):
+            assert session_id == "s-1"
+            return Snapshot()
+
+    live = SimpleNamespace(
+        operation_state="active",
+        pending_interjections=[{"text": "urgent"}],
+        restart_queue=[{"text": "follow-up"}, {"text": "another"}],
+    )
+    state = SessionService(store=Store(), live_states={"s-1": live}).get_session_state("s-1")
+
+    assert state["operation_state"] == "active"
+    assert state["queue"] == {"pending": 3, "interjections": 1, "restarts": 2}
+    assert state["task"]["active_goal"] == "finish the migration"
+
+
 def test_web_index_serves_ui():
     from starlette.testclient import TestClient
 

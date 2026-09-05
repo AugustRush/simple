@@ -350,6 +350,87 @@ class SessionService:
         sessions.sort(key=lambda item: item["last_activity"], reverse=True)
         return sessions
 
+    def get_session_state(self, session_id: str) -> dict[str, Any]:
+        """Return durable task guidance and live queue information.
+
+        The runtime already owns the authoritative mailboxes and the memory
+        layer owns the durable ``session_working_state`` projection.  Expose a
+        small, read-only view for Web clients instead of duplicating either
+        queue in the browser or reconstructing task state from transcript
+        text.  Missing/invalid sessions intentionally return an empty state so
+        the endpoint is safe to poll while a session is being created.
+        """
+        clean = str(session_id or "").strip()
+        if not clean:
+            return {
+                "session_id": "",
+                "live": False,
+                "operation_state": "idle",
+                "queue": {"pending": 0, "interjections": 0, "restarts": 0},
+                "task": None,
+                "workspace_root": "",
+            }
+
+        live = self._live_states.get(clean)
+        live_ctx = getattr(live, "ctx", None) if live is not None else None
+        live_metadata = getattr(live_ctx, "metadata", {}) if live_ctx is not None else {}
+        workspace_root = (
+            str(live_metadata.get("workspace_root") or "")
+            if isinstance(live_metadata, dict)
+            else ""
+        )
+        if not workspace_root:
+            try:
+                from agent import shared
+                manifest = shared.web_session_home(clean) / ".session.json"
+                if manifest.is_file():
+                    payload = json.loads(manifest.read_text(encoding="utf-8"))
+                    if isinstance(payload, dict):
+                        workspace_root = str(payload.get("workspace_root") or "")
+            except (OSError, ValueError, TypeError):
+                workspace_root = ""
+        interjections = getattr(live, "pending_interjections", []) if live else []
+        restarts = getattr(live, "restart_queue", []) if live else []
+        task: dict[str, Any] | None = None
+        store = self._store_for_session(clean)
+        load_state = getattr(store, "load_session_working_state", None)
+        if callable(load_state):
+            try:
+                snapshot = load_state(clean)
+                raw = getattr(snapshot, "state", None) if snapshot is not None else None
+                if isinstance(raw, dict) and raw:
+                    # Keep the payload intentionally bounded; recent turns and
+                    # artifacts are enough to guide a continuation without
+                    # shipping the whole memory database to the browser.
+                    task = {
+                        "task_id": str(raw.get("task_id") or ""),
+                        "active_goal": str(raw.get("active_goal") or ""),
+                        "status": str(raw.get("status") or ""),
+                        "progress": str(raw.get("progress") or ""),
+                        "next_action": str(raw.get("next_action") or ""),
+                        "last_error": str(raw.get("last_error") or ""),
+                        "artifacts": [
+                            str(item)
+                            for item in (raw.get("artifacts") or [])[:8]
+                            if str(item).strip()
+                        ],
+                    }
+            except Exception:
+                task = None
+
+        return {
+            "session_id": clean,
+            "live": live is not None,
+            "operation_state": str(getattr(live, "operation_state", "idle")),
+            "queue": {
+                "pending": len(interjections) + len(restarts),
+                "interjections": len(interjections),
+                "restarts": len(restarts),
+            },
+            "task": task,
+            "workspace_root": workspace_root,
+        }
+
     def rename_session(self, session_id: str, title: str) -> bool:
         clean = str(session_id or "").strip()
         if not clean:
