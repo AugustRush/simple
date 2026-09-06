@@ -8,6 +8,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 from rich.console import Console
@@ -177,10 +178,29 @@ class ChannelRunner:
             return state
 
         session_ctx_mgr = self._build_session_context_manager(session_id, components)
+        initial_ctx = agent_module.AgentContext(
+            system_prompt=components["system_prompt"]
+        )
+        workspace_root = components.get("workspace_root")
+        if workspace_root is not None:
+            try:
+                workspace_path = Path(workspace_root).expanduser().resolve(strict=False)
+                initial_ctx.metadata["workspace_root"] = str(workspace_path)
+                initial_ctx.metadata["workspace_status"] = (
+                    "ready" if workspace_path.is_dir() else "missing"
+                )
+                policy = components.get("file_access_policy")
+                if policy is not None:
+                    initial_ctx.metadata["workspace_read"] = bool(
+                        getattr(policy, "workspace_read", True)
+                    )
+                    initial_ctx.metadata["workspace_write"] = bool(
+                        getattr(policy, "workspace_write", False)
+                    )
+            except (OSError, TypeError, ValueError):
+                pass
         state = RuntimeSessionState(
-            ctx=agent_module.AgentContext(
-                system_prompt=components["system_prompt"]
-            ),
+            ctx=initial_ctx,
             context_manager=session_ctx_mgr,
             memory_worker=self._build_session_memory_worker(session_ctx_mgr, components),
             cancel_token=CancelToken(),

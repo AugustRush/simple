@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 
 from agent import shared
 from agent.channels.base import Channel, IncomingMessage
+from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
 from agent.session_service import SessionService
 
@@ -67,6 +68,13 @@ def _web_session_output_dir(session_id: str) -> Path:
         return shared.web_session_home(str(session_id)) / "output"
     except ValueError:
         return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "output"
+
+
+def _web_session_upload_dir(session_id: str) -> Path:
+    try:
+        return shared.web_session_home(str(session_id)) / "uploads"
+    except ValueError:
+        return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "uploads"
 
 # File extensions treated as attachable media (image/audio/video).
 _MEDIA_EXTS = {
@@ -233,6 +241,24 @@ class WebOutputSink(OutputSink):
 
     def on_notification(self, title: str, body: str, *, level: str = "info") -> None:
         self._emit({"type": "notification", "title": title, "body": body, "level": level})
+
+    def on_workspace_changed(
+        self,
+        workspace_root: str,
+        *,
+        workspace_read: bool = True,
+        workspace_write: bool = False,
+        status: str = "ready",
+    ) -> None:
+        self._emit(
+            {
+                "type": "workspace_changed",
+                "workspace_root": workspace_root,
+                "workspace_read": bool(workspace_read),
+                "workspace_write": bool(workspace_write),
+                "status": status,
+            }
+        )
 
     def on_subagent_event(self, event: Any) -> None:
         self._emit(
@@ -679,6 +705,16 @@ class WebChannel(Channel):
                 }
                 for d in descriptors
             ]
+            catalog = self._components.get("skill_catalog")
+            if catalog is not None:
+                commands.extend({
+                    "name": bundle.id,
+                    "aliases": [],
+                    "usage": f"/{bundle.id}",
+                    "description": bundle.description or "技能",
+                    "concurrency": "queue",
+                    "kind": "skill",
+                } for bundle in catalog.list_skills() if getattr(bundle, "user_invocable", True))
         except Exception:
             commands = []
         return JSONResponse({"commands": commands})
@@ -776,6 +812,170 @@ class WebChannel(Channel):
                 except Exception:
                     skills = []
         return JSONResponse({"skills": skills})
+
+    async def _upload_attachment(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = str(request.path_params["session_id"])
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", session_id):
+            return JSONResponse({"error": "invalid session id"}, status_code=400)
+        try:
+            form = await request.form()
+            uploads = form.getlist("files") if hasattr(form, "getlist") else []
+        except Exception as exc:
+            return JSONResponse({"error": f"invalid multipart body: {exc}"}, status_code=400)
+        if not uploads:
+            return JSONResponse({"error": "files are required"}, status_code=400)
+        if len(uploads) > 12:
+            return JSONResponse({"error": "最多上传 12 个文件"}, status_code=400)
+        root = _web_session_upload_dir(session_id).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        result: list[dict[str, Any]] = []
+        max_size = 25 * 1024 * 1024
+        for upload in uploads:
+            filename = Path(str(getattr(upload, "filename", "") or "附件")).name
+            if not filename or filename in {".", ".."}:
+                return JSONResponse({"error": "invalid filename"}, status_code=400)
+            content_type = str(getattr(upload, "content_type", "") or "application/octet-stream")
+            target = (root / f"{uuid.uuid4().hex[:12]}-{filename}").resolve()
+            if root not in target.parents:
+                return JSONResponse({"error": "invalid upload path"}, status_code=400)
+            size = 0
+            try:
+                with target.open("wb") as out:
+                    while True:
+                        chunk = await upload.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > max_size:
+                            target.unlink(missing_ok=True)
+                            return JSONResponse({"error": "单个文件不能超过 25 MB"}, status_code=413)
+                        out.write(chunk)
+            except Exception as exc:
+                target.unlink(missing_ok=True)
+                return JSONResponse({"error": f"upload failed: {exc}"}, status_code=500)
+            result.append({
+                "id": target.name,
+                "filename": filename,
+                "mime_type": content_type,
+                "kind": attachment_kind_for_mime(content_type),
+                "path": str(target),
+                "size_bytes": size,
+            })
+        return JSONResponse({"attachments": result})
+
+    async def _schedules(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            tasks = []
+            for task in store.list_tasks():
+                tasks.append({
+                    "id": task.id, "name": task.name, "kind": task.kind,
+                    "enabled": task.enabled, "trigger_type": task.trigger.trigger_type,
+                    "trigger": task.trigger.payload, "payload": task.payload,
+                    "delivery_mode": task.delivery_mode,
+                    "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
+                    "last_run_at": task.last_run_at.isoformat() if task.last_run_at else None,
+                })
+            return JSONResponse({"tasks": tasks})
+        finally:
+            store.close()
+
+    async def _create_schedule(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict): raise ValueError("body must be an object")
+            from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec, SchedulerStore
+            kind = str(body.get("trigger_type", "once")).lower()
+            tz = str(body.get("timezone_name", "UTC"))
+            if kind == "once": trigger = TriggerSpec.once(body["at"], tz)
+            elif kind == "interval": trigger = TriggerSpec.interval(int(body["every"]), str(body["unit"]), body["anchor_at"], tz)
+            elif kind == "daily": trigger = TriggerSpec.daily(str(body["time_of_day"]), tz)
+            elif kind == "weekly": trigger = TriggerSpec.weekly(str(body["day_of_week"]), str(body["time_of_day"]), tz)
+            else: raise ValueError("unsupported trigger_type")
+            action = str(body.get("action_type", "message"))
+            if action == "agent_task": task_kind, payload = "agent_prompt", {"prompt": str(body.get("prompt", "")).strip()}
+            elif action == "system_job": task_kind, payload = "system_job", {"job_name": str(body.get("job_name", "")).strip()}
+            else: task_kind, payload = "message", {"message_text": str(body.get("message_text", "")).strip()}
+            if not next(iter(payload.values()), ""): raise ValueError("任务内容不能为空")
+            task = NewScheduledTask(name=str(body.get("name", "未命名任务")).strip() or "未命名任务", kind=task_kind, trigger=trigger, payload=payload, delivery_mode="standalone", delivery_target=DeliveryTarget.standalone(), model_override=body.get("model_override"))
+            store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            try: created = store.create_task(task)
+            finally: store.close()
+            return JSONResponse({"task": {"id": created.id, "name": created.name, "next_run_at": created.next_run_at.isoformat() if created.next_run_at else None}})
+        except (KeyError, ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def _delete_schedule(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        if not self._authorized(request): return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            task_id = str(request.path_params["task_id"])
+            ok = store.get_task(task_id) is not None
+            store.delete_task(task_id)
+        finally: store.close()
+        return JSONResponse({"ok": bool(ok)})
+
+    async def _patch_schedule(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        if not self._authorized(request): return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try: body = await request.json()
+        except Exception: return JSONResponse({"error": "invalid json body"}, status_code=400)
+        if not isinstance(body, dict) or "enabled" not in body: return JSONResponse({"error": "enabled is required"}, status_code=400)
+        from agent.scheduler import SchedulerStore
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try: store.set_enabled(str(request.path_params["task_id"]), bool(body["enabled"]))
+        finally: store.close()
+        return JSONResponse({"ok": True, "enabled": bool(body["enabled"])})
+
+    async def _delete_skill(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        if not self._authorized(request): return JSONResponse({"error": "unauthorized"}, status_code=401)
+        catalog = self._components.get("skill_catalog")
+        bundle = catalog.get(str(request.path_params["skill_id"])) if catalog is not None else None
+        if bundle is None: return JSONResponse({"error": "skill not found"}, status_code=404)
+        if getattr(bundle, "source", "") != "user": return JSONResponse({"error": "内置技能不能删除"}, status_code=403)
+        try:
+            import shutil
+            path = Path(bundle.path).resolve()
+            root = Path(getattr(catalog, "user_root", shared.SKILLS_DIR)).resolve()
+            if root not in path.parents: return JSONResponse({"error": "invalid skill path"}, status_code=400)
+            shutil.rmtree(path)
+            catalog.reload()
+            self._components["config_revision"] = int(self._components.get("config_revision", 0)) + 1
+            return JSONResponse({"ok": True, "id": bundle.id})
+        except Exception as exc: return JSONResponse({"error": str(exc)}, status_code=500)
+
+    async def _delete_plugin(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+        if not self._authorized(request): return JSONResponse({"error": "unauthorized"}, status_code=401)
+        name = str(request.path_params["plugin_name"])
+        catalog = self._components.get("plugin_catalog")
+        meta = next((item for item in (catalog.list_plugins() if catalog else []) if getattr(item, "name", "") == name), None)
+        if meta is None: return JSONResponse({"error": "plugin not found"}, status_code=404)
+        if getattr(meta, "source", "") != "user": return JSONResponse({"error": "内置插件不能删除"}, status_code=403)
+        try:
+            import shutil
+            root = Path(shared.USER_PLUGINS_DIR).resolve(); path = Path(meta.path).resolve()
+            if root not in path.parents: return JSONResponse({"error": "invalid plugin path"}, status_code=400)
+            shutil.rmtree(path)
+            reload_fn = getattr(catalog, "reload", None)
+            if callable(reload_fn): await reload_fn(self._components)
+            self._components["config_revision"] = int(self._components.get("config_revision", 0)) + 1
+            return JSONResponse({"ok": True, "name": name})
+        except Exception as exc: return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def _context_stats(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -991,10 +1191,21 @@ class WebChannel(Channel):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         if self._handler is None:
             return JSONResponse({"error": "channel not started"}, status_code=503)
+        session_id = str(request.path_params["session_id"])
+        live_state = self._sessions.get(session_id)
+        if live_state is not None and str(getattr(live_state, "operation_state", "idle")) != "idle":
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "cancelled": False,
+                    "error": "当前会话仍在执行任务，请等待任务结束或先停止任务后再切换项目文件夹",
+                    "busy": True,
+                },
+                status_code=409,
+            )
         selected = await _pick_workspace_directory()
         if not selected:
             return JSONResponse({"cancelled": True, "workspace_root": ""})
-        session_id = str(request.path_params["session_id"])
         # Reuse the transport-neutral command so filesystem policy, prompt,
         # and the session manifest are updated exactly as in CLI/Web commands.
         sink = WebOutputSink(collect=True)
@@ -1004,9 +1215,56 @@ class WebChannel(Channel):
             sink,
             message_id=uuid.uuid4().hex,
         )
+        errors = [
+            str(event.get("error") or "项目文件夹切换失败")
+            for event in sink.events
+            if isinstance(event, dict) and event.get("type") == "error"
+        ]
+        errors.extend(
+            str(event.get("text") or "项目文件夹切换失败")
+            for event in sink.events
+            if isinstance(event, dict)
+            and event.get("type") == "status"
+            and str(event.get("level") or "").casefold() == "error"
+        )
+        if errors:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "cancelled": False,
+                    "error": errors[-1],
+                    "events": sink.events,
+                },
+                status_code=409,
+            )
+        state = self._service().get_session_state(session_id)
+        actual_root = str(state.get("workspace_root") or "")
+        if actual_root != str(Path(selected).expanduser().resolve()):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "cancelled": False,
+                    "error": "项目文件夹切换未生效",
+                    "workspace_root": actual_root,
+                    "events": sink.events,
+                },
+                status_code=409,
+            )
+        workspace_state = self._service().get_session_state(session_id)
+        for live_sink in tuple(self._live_sinks.get(session_id, set())):
+            try:
+                live_sink.on_workspace_changed(
+                    actual_root,
+                    workspace_read=bool(workspace_state.get("workspace_read", True)),
+                    workspace_write=bool(workspace_state.get("workspace_write", False)),
+                    status=str(workspace_state.get("workspace_status") or "ready"),
+                )
+            except Exception:
+                logger.debug("failed to broadcast workspace change", exc_info=True)
         return JSONResponse({
+            "ok": True,
             "cancelled": False,
-            "workspace_root": selected,
+            "workspace_root": actual_root,
             "text": sink.full_text,
             "events": sink.events,
         })
@@ -1095,7 +1353,7 @@ class WebChannel(Channel):
             return JSONResponse({"error": "invalid json body"}, status_code=400)
 
         text = str(body.get("text", "") or "").strip()
-        if not text:
+        if not text and not body.get("attachments"):
             return JSONResponse({"error": "text is required"}, status_code=400)
 
         session_id = request.path_params["session_id"]
@@ -1119,6 +1377,7 @@ class WebChannel(Channel):
             sink,
             message_id=message_id,
             model_override=model,
+            attachments=self._parse_uploaded_attachments(session_id, body.get("attachments")),
         )
         await sink.flush_attachments()
         return JSONResponse(
@@ -1195,6 +1454,7 @@ class WebChannel(Channel):
             text: str,
             message_id: str,
             model: str | None,
+            attachment_payload: Any = None,
         ) -> None:
             # Each incoming message gets its own sink.  The coordinator owns
             # per-session serialization and can therefore queue a message
@@ -1217,6 +1477,7 @@ class WebChannel(Channel):
                     sink,
                     message_id=message_id,
                     model_override=model,
+                    attachments=self._parse_uploaded_attachments(session_id, attachment_payload),
                 )
                 await sink.flush_attachments()
                 # A queued message intentionally has no turn_complete event;
@@ -1257,7 +1518,7 @@ class WebChannel(Channel):
                 if data.get("type") != "message":
                     continue
                 text = str(data.get("text", "") or "").strip()
-                if not text:
+                if not text and not data.get("attachments"):
                     await websocket.send_json(
                         {"type": "error", "error": "text is required"}
                     )
@@ -1269,7 +1530,7 @@ class WebChannel(Channel):
                     await websocket.send_json({"type": "error", "error": str(exc)})
                     continue
                 task = asyncio.create_task(
-                    process_message(text, message_id, model),
+                    process_message(text, message_id, model, data.get("attachments")),
                     name=f"web-message-{message_id}",
                 )
                 active_tasks.add(task)
@@ -1291,6 +1552,7 @@ class WebChannel(Channel):
         *,
         message_id: str,
         model_override: str | None = None,
+        attachments: tuple[MessageAttachment, ...] = (),
     ) -> None:
         assert self._handler is not None
         service = self._service()
@@ -1303,11 +1565,40 @@ class WebChannel(Channel):
                 "message_id": message_id,
                 "model_override": model_override,
             },
+            attachments=attachments,
         )
+        for attachment in attachments:
+            self._record_attachment(session_id, str(attachment.local_path), attachment.filename, turn_id=message_id)
         try:
             await self._handler(msg, sink)
         finally:
             service.touch_session(session_id, status="idle")
+
+    def _parse_uploaded_attachments(self, session_id: str, payload: Any) -> tuple[MessageAttachment, ...]:
+        if not isinstance(payload, list):
+            return ()
+        root = _web_session_upload_dir(session_id).resolve()
+        out: list[MessageAttachment] = []
+        for raw in payload[:12]:
+            if not isinstance(raw, dict):
+                continue
+            try:
+                path = Path(str(raw.get("path", ""))).resolve()
+                if root not in path.parents or not path.is_file():
+                    continue
+                mime = str(raw.get("mime_type", "application/octet-stream"))
+                out.append(MessageAttachment(
+                    kind=str(raw.get("kind") or attachment_kind_for_mime(mime)),
+                    mime_type=mime,
+                    local_path=path,
+                    filename=Path(str(raw.get("filename") or path.name)).name,
+                    source="web",
+                    source_ref=str(raw.get("id") or path.name),
+                    size_bytes=path.stat().st_size,
+                ))
+            except (OSError, ValueError):
+                continue
+        return tuple(out)
 
     def _record_attachment(
         self,
@@ -1415,6 +1706,13 @@ class WebChannel(Channel):
                 self._toggle_plugin,
                 methods=["POST"],
             ),
+            Route("/api/plugins/{plugin_name}", self._delete_plugin, methods=["DELETE"]),
+            Route("/api/skills/{skill_id:path}", self._delete_skill, methods=["DELETE"]),
+            Route("/api/schedules", self._schedules, methods=["GET"]),
+            Route("/api/schedules", self._create_schedule, methods=["POST"]),
+            Route("/api/schedules/{task_id}", self._delete_schedule, methods=["DELETE"]),
+            Route("/api/schedules/{task_id}", self._patch_schedule, methods=["PATCH"]),
+            Route("/api/sessions/{session_id}/attachments", self._upload_attachment, methods=["POST"]),
             Route("/api/files", self._file, methods=["GET"]),
             Route("/api/sessions", self._list_sessions, methods=["GET"]),
             Route("/api/sessions", self._create_session, methods=["POST"]),

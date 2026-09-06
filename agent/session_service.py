@@ -369,11 +369,14 @@ class SessionService:
                 "queue": {"pending": 0, "interjections": 0, "restarts": 0},
                 "task": None,
                 "workspace_root": "",
+                "workspace_status": "unset",
+                "workspace_exists": False,
             }
 
         live = self._live_states.get(clean)
         live_ctx = getattr(live, "ctx", None) if live is not None else None
         live_metadata = getattr(live_ctx, "metadata", {}) if live_ctx is not None else {}
+        persisted_workspace_meta: dict[str, Any] = {}
         workspace_root = (
             str(live_metadata.get("workspace_root") or "")
             if isinstance(live_metadata, dict)
@@ -386,9 +389,17 @@ class SessionService:
                 if manifest.is_file():
                     payload = json.loads(manifest.read_text(encoding="utf-8"))
                     if isinstance(payload, dict):
+                        persisted_workspace_meta = payload
                         workspace_root = str(payload.get("workspace_root") or "")
             except (OSError, ValueError, TypeError):
                 workspace_root = ""
+        workspace_path = Path(workspace_root).expanduser() if workspace_root else None
+        workspace_exists = bool(workspace_path and workspace_path.is_dir())
+        workspace_status = "ready" if workspace_exists else ("missing" if workspace_root else "unset")
+        if isinstance(live_metadata, dict):
+            recorded_status = str(live_metadata.get("workspace_status") or "").strip()
+            if recorded_status:
+                workspace_status = recorded_status
         interjections = getattr(live, "pending_interjections", []) if live else []
         restarts = getattr(live, "restart_queue", []) if live else []
         task: dict[str, Any] | None = None
@@ -429,6 +440,18 @@ class SessionService:
             },
             "task": task,
             "workspace_root": workspace_root,
+            "workspace_status": workspace_status,
+            "workspace_exists": workspace_exists,
+            "workspace_read": bool(
+                live_metadata.get(
+                    "workspace_read", persisted_workspace_meta.get("workspace_read", True)
+                )
+            ) if isinstance(live_metadata, dict) else bool(persisted_workspace_meta.get("workspace_read", True)),
+            "workspace_write": bool(
+                live_metadata.get(
+                    "workspace_write", persisted_workspace_meta.get("workspace_write", False)
+                )
+            ) if isinstance(live_metadata, dict) else bool(persisted_workspace_meta.get("workspace_write", False)),
         }
 
     def rename_session(self, session_id: str, title: str) -> bool:

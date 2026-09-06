@@ -65,6 +65,7 @@ import {
   SunOutlined,
   TagsOutlined,
   ThunderboltOutlined,
+  UploadOutlined,
   UserOutlined,
 } from '@ant-design/icons'
 import './index.css'
@@ -93,6 +94,16 @@ interface Message {
   link?: string
   tool?: string
   toolState?: ToolState
+  attachments?: AttachmentInfo[]
+}
+
+interface AttachmentInfo {
+  id: string
+  filename: string
+  mime_type: string
+  kind: string
+  path: string
+  size_bytes?: number
 }
 
 interface PluginInfo {
@@ -116,6 +127,18 @@ interface CommandInfo {
   aliases?: string[]
   usage?: string
   description?: string
+  kind?: 'command' | 'skill'
+}
+
+interface ScheduleInfo {
+  id: string
+  name: string
+  kind: string
+  enabled?: boolean
+  trigger_type?: string
+  trigger?: Record<string, any>
+  payload?: Record<string, any>
+  next_run_at?: string
 }
 
 interface SessionTaskGuidance {
@@ -139,6 +162,10 @@ interface SessionState {
   }
   task?: SessionTaskGuidance | null
   workspace_root?: string
+  workspace_status?: 'ready' | 'missing' | 'unset' | string
+  workspace_exists?: boolean
+  workspace_read?: boolean
+  workspace_write?: boolean
 }
 
 interface QueuedMessage {
@@ -293,6 +320,10 @@ function App() {
   const [commands, setCommands] = useState<CommandInfo[]>([])
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [skills, setSkills] = useState<SkillInfo[]>([])
+  const [schedules, setSchedules] = useState<ScheduleInfo[]>([])
+  const [scheduleModalOpen, setScheduleModalOpen] = useState(false)
+  const [scheduleDraft, setScheduleDraft] = useState<any>({ name: '', trigger_type: 'once', at: '', message_text: '' })
+  const [pendingAttachments, setPendingAttachments] = useState<AttachmentInfo[]>([])
   const [config, setConfig] = useState<any>(null)
   const [configText, setConfigText] = useState<string>('')
   const [confirmReq, setConfirmReq] = useState<any>(null)
@@ -364,6 +395,8 @@ function App() {
   const [paletteQuery, setPaletteQuery] = useState('')
   const [commandIndex, setCommandIndex] = useState(0)
   const [expandedTraces, setExpandedTraces] = useState<Record<string, boolean>>({})
+  const [hoveredTurn, setHoveredTurn] = useState<{ id: string; top: number } | null>(null)
+  const [hoveredTurnIndex, setHoveredTurnIndex] = useState<number | null>(null)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [sendShortcut, setSendShortcut] = useState<'enter' | 'ctrl-enter'>(
     () => (localStorage.getItem('send_shortcut') === 'ctrl-enter' ? 'ctrl-enter' : 'enter'),
@@ -372,6 +405,7 @@ function App() {
   const [sessionState, setSessionState] = useState<SessionState | null>(null)
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([])
   const [form] = Form.useForm()
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
   const activeProviderName = Form.useWatch('active_provider', form)
   const wsRef = useRef<WebSocket | null>(null)
   // Keep the selected model available to WebSocket callbacks without making
@@ -387,6 +421,10 @@ function App() {
   const chatScrollRef = useRef<HTMLDivElement | null>(null)
   const followChatRef = useRef(true)
   const commandItemRefs = useRef<Record<string, HTMLButtonElement | null>>({})
+  const turnRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const conversationRailRef = useRef<HTMLDivElement | null>(null)
+  const conversationMarkerRefs = useRef<Record<string, HTMLButtonElement | null>>({})
+  const hoverClearTimerRef = useRef<number | null>(null)
   const idRef = useRef(0)
   const token = localStorage.getItem('agent_token') || ''
 
@@ -541,6 +579,7 @@ function App() {
               link,
               tool: item.tool,
               toolState: item.toolState as ToolState | undefined,
+              attachments: Array.isArray(item.attachments) ? item.attachments : undefined,
             }
           },
         )
@@ -826,6 +865,19 @@ function App() {
           return
         }
 
+        if (evt.type === 'workspace_changed') {
+          setSessionState(prev => prev ? {
+            ...prev,
+            workspace_root: evt.workspace_root || prev.workspace_root,
+            workspace_status: evt.status || 'ready',
+            workspace_exists: true,
+            workspace_read: !!evt.workspace_read,
+            workspace_write: !!evt.workspace_write,
+          } : prev)
+          setActivity('项目文件夹已更新')
+          return
+        }
+
         if (evt.type === 'error') {
           appendMessage({
             id: makeId(),
@@ -914,9 +966,14 @@ function App() {
     return () => window.clearInterval(timer)
   }, [activeSession, isStreaming, loadSessionState])
 
+  const uploadPendingAttachments = async (): Promise<AttachmentInfo[]> => {
+    if (!activeSession || !pendingAttachments.length) return pendingAttachments
+    return pendingAttachments
+  }
+
   const sendMessage = async (overrideText?: string) => {
     const text = (overrideText ?? input).trim()
-    if (!text || creatingSession) return
+    if ((!text && pendingAttachments.length === 0) || creatingSession) return
 
     // A newly submitted turn is an explicit request to see the response.
     // Re-enable bottom following even if the reader had previously scrolled
@@ -925,8 +982,10 @@ function App() {
     const queueWhileBusy =
       isStreaming && !/^\/(?:cancel|now)(?:\s|$)/i.test(text)
     const messageId = makeId()
-    appendMessage({ id: messageId, role: 'user', content: text, queued: queueWhileBusy })
+    const attachments = await uploadPendingAttachments()
+    appendMessage({ id: messageId, role: 'user', content: text, queued: queueWhileBusy, attachments })
     setInput('')
+    setPendingAttachments([])
     setActivity('等待模型响应')
 
     if (queueWhileBusy) {
@@ -970,6 +1029,7 @@ function App() {
         type: 'message',
         text,
         model: currentModelRef.current,
+        attachments,
       }))
       return
     }
@@ -986,6 +1046,36 @@ function App() {
     api(`/api/sessions/${activeSession}/cancel`, { method: 'POST' }).catch(() => {})
   }
 
+  const handleFilesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    event.target.value = ''
+    if (!files.length) return
+    let sessionId = activeSession
+    if (!sessionId) {
+      try {
+        const created = await api('/api/sessions', { method: 'POST' })
+        const data = await created.json()
+        sessionId = data.session_id as string
+        activeSessionRef.current = sessionId
+        setActiveSession(sessionId)
+        await loadSessions()
+      } catch { return }
+    }
+    if (files.length + pendingAttachments.length > 12) {
+      messageApi.warning('最多同时发送 12 个文件')
+      return
+    }
+    const body = new FormData()
+    files.forEach(file => body.append('files', file, file.name))
+    try {
+      const resp = await api(`/api/sessions/${encodeURIComponent(sessionId)}/attachments`, { method: 'POST', body })
+      const data = await resp.json()
+      setPendingAttachments(prev => [...prev, ...(data.attachments || [])])
+    } catch {
+      // api helper surfaces the error
+    }
+  }
+
   const pickWorkspace = async () => {
     if (!activeSession) {
       messageApi.info('请先选择或新建会话')
@@ -996,7 +1086,11 @@ function App() {
       const data = await resp.json()
       if (data.cancelled) return
       await loadSessionState(activeSession)
-      messageApi.success(`项目文件夹已切换：${data.workspace_root}`)
+      if (data.ok === false) {
+        messageApi.warning(data.error || '项目文件夹切换失败')
+      } else {
+        messageApi.success(`项目文件夹已切换：${data.workspace_root}`)
+      }
     } catch {
       // api helper already reports the error
     }
@@ -1043,6 +1137,17 @@ function App() {
     }
   }, [api])
 
+  const loadSchedules = useCallback(async () => {
+    try {
+      setLoadingView(true)
+      const resp = await api('/api/schedules')
+      const data = await resp.json()
+      setSchedules(data.tasks || [])
+    } finally {
+      setLoadingView(false)
+    }
+  }, [api])
+
   const loadSettings = useCallback(async () => {
     try {
       setLoadingView(true)
@@ -1078,8 +1183,9 @@ function App() {
   useEffect(() => {
     if (view === 'plugins') loadPlugins()
     if (view === 'skills') loadSkills()
+    if (view === 'schedules') loadSchedules()
     if (view === 'settings') loadSettings()
-  }, [view, loadPlugins, loadSkills, loadSettings])
+  }, [view, loadPlugins, loadSkills, loadSchedules, loadSettings])
 
   const createSession = async () => {
     try {
@@ -1288,6 +1394,33 @@ function App() {
     }
   }
 
+  const deletePlugin = async (plugin: PluginInfo) => {
+    if (plugin.source !== 'user') return messageApi.info('内置插件不能删除')
+    try { await api(`/api/plugins/${encodeURIComponent(plugin.name)}`, { method: 'DELETE' }); setPlugins(prev => prev.filter(item => item.name !== plugin.name)); messageApi.success('插件已删除') } catch { /* surfaced */ }
+  }
+
+  const deleteSkill = async (skill: SkillInfo) => {
+    if (skill.source !== 'user') return messageApi.info('内置技能不能删除')
+    try { await api(`/api/skills/${encodeURIComponent(skill.id)}`, { method: 'DELETE' }); setSkills(prev => prev.filter(item => item.id !== skill.id)); messageApi.success('技能已删除') } catch { /* surfaced */ }
+  }
+
+  const deleteSchedule = async (task: ScheduleInfo) => {
+    try { await api(`/api/schedules/${encodeURIComponent(task.id)}`, { method: 'DELETE' }); setSchedules(prev => prev.filter(item => item.id !== task.id)); messageApi.success('任务已删除') } catch { /* surfaced */ }
+  }
+
+  const toggleSchedule = async (task: ScheduleInfo, enabled: boolean) => {
+    try { await api(`/api/schedules/${encodeURIComponent(task.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }); setSchedules(prev => prev.map(item => item.id === task.id ? { ...item, enabled } : item)) } catch { /* surfaced */ }
+  }
+
+  const createSchedule = async () => {
+    try {
+      const resp = await api('/api/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...scheduleDraft, timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone }) })
+      const data = await resp.json()
+      setSchedules(prev => [...prev, { id: data.task.id, name: data.task.name, kind: 'message', trigger_type: scheduleDraft.trigger_type, next_run_at: data.task.next_run_at }])
+      setScheduleModalOpen(false); setScheduleDraft({ name: '', trigger_type: 'once', at: '', message_text: '' }); messageApi.success('定时任务已创建')
+    } catch { /* surfaced */ }
+  }
+
   const saveSettings = async () => {
     try {
       const values = await form.validateFields()
@@ -1470,6 +1603,7 @@ function App() {
     { key: 'sessions', icon: <FolderOpenOutlined />, label: '会话管理' },
     { key: 'plugins', icon: <AppstoreOutlined />, label: '插件' },
     { key: 'skills', icon: <ApiOutlined />, label: '技能' },
+    { key: 'schedules', icon: <ClockCircleOutlined />, label: '定时任务' },
     { key: 'settings', icon: <SettingOutlined />, label: '设置' },
   ]
 
@@ -1477,7 +1611,7 @@ function App() {
     chat: {
       title: activeSession ? '当前对话' : '开始新的对话',
       subtitle: activeSession
-        ? `${activeSession.slice(0, 12)} · ${connected ? '实时连接中' : '连接已断开'}${sessionState?.workspace_root ? ` · ${sessionState.workspace_root}` : ''}`
+        ? `${activeSession.slice(0, 12)} · ${connected ? '实时连接中' : '连接已断开'}${sessionState?.workspace_root ? ` · ${sessionState.workspace_root}${sessionState.workspace_status === 'missing' ? '（目录不可用）' : ''}` : ''}`
         : '与你的 AI Agent 开始一段对话',
     },
     sessions: {
@@ -1492,6 +1626,7 @@ function App() {
       title: '技能',
       subtitle: `${skills.length} 个可用技能`,
     },
+    schedules: { title: '定时任务', subtitle: '管理一次性与周期性任务。' },
     settings: {
       title: '设置',
       subtitle: '管理访问令牌、模型与频道',
@@ -1667,6 +1802,7 @@ function App() {
     return (
       <div
         key={item.id}
+        ref={isUser ? element => { turnRefs.current[item.id] = element } : undefined}
         className={`message-row ${isUser ? 'message-row-user' : 'message-row-assistant'}`}
       >
         {!isUser && (
@@ -1680,6 +1816,16 @@ function App() {
             {traceSummary}
           </div>
           <div className={`bubble ${isUser ? 'bubble-user' : 'bubble-assistant'}`}>
+            {item.attachments && item.attachments.length > 0 && (
+              <div className="message-attachments">
+                {item.attachments.map(attachment => (
+                  <a className="message-attachment" key={attachment.id || attachment.path} href={`/api/files?path=${encodeURIComponent(attachment.path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`} target="_blank" rel="noreferrer">
+                    {attachment.kind === 'image' ? <img src={`/api/files?path=${encodeURIComponent(attachment.path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`} alt={attachment.filename} /> : <FileTextOutlined />}
+                    <span>{attachment.filename}</span>
+                  </a>
+                ))}
+              </div>
+            )}
             <div
               className="markdown"
               dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content) }}
@@ -1829,8 +1975,109 @@ function App() {
     return nodes
   }
 
+  const conversationTurns = messages.filter(item => item.role === 'user')
+  // Keep a calm rhythm for short conversations, then compress the rail as
+  // history grows so the indicator remains a compact page-edge affordance.
+  const conversationGap = Math.max(
+    3,
+    Math.min(10, 11 - Math.max(0, conversationTurns.length - 2) * 0.45),
+  )
+  const activateTurnIndex = (index: number) => {
+    const item = conversationTurns[index]
+    if (!item) return
+    if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
+    setHoveredTurnIndex(index)
+    const marker = conversationMarkerRefs.current[item.id]
+    const rail = conversationRailRef.current
+    const target = marker?.getBoundingClientRect()
+    const parent = rail?.parentElement?.getBoundingClientRect()
+    if (!target || !parent) return
+    // The summary card is centered on the active marker via CSS. Keep a
+    // small safe margin so the compact card never crosses the chat bounds.
+    const rawTop = target.top + target.height / 2 - parent.top
+    const cardHalfHeight = 62
+    const maxTop = Math.max(cardHalfHeight, parent.height - cardHalfHeight)
+    setHoveredTurn({ id: item.id, top: Math.max(cardHalfHeight, Math.min(rawTop, maxTop)) })
+  }
+
+  const handleRailMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
+    const rail = event.currentTarget.getBoundingClientRect()
+    if (conversationTurns.length < 2) return
+    const markerHeight = 18
+    const gap = conversationGap
+    const step = markerHeight + gap
+    const totalHeight = markerHeight * conversationTurns.length + gap * (conversationTurns.length - 1)
+    const firstCenter = (rail.height - totalHeight) / 2 + markerHeight / 2
+    const relativeY = event.clientY - rail.top
+    const index = Math.max(0, Math.min(conversationTurns.length - 1, Math.round((relativeY - firstCenter) / step)))
+    activateTurnIndex(index)
+  }
+
+  const scheduleHideTurnSummary = () => {
+    if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
+    hoverClearTimerRef.current = window.setTimeout(() => {
+      setHoveredTurn(null)
+      setHoveredTurnIndex(null)
+    }, 140)
+  }
+
+  const keepTurnSummary = () => {
+    if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
+  }
+
   const renderChat = () => (
     <div className="chat-view">
+      {conversationTurns.length > 1 && (
+        <div
+          className="conversation-indicator"
+          ref={conversationRailRef}
+          aria-label="对话历史"
+          onMouseEnter={keepTurnSummary}
+          onMouseLeave={scheduleHideTurnSummary}
+        >
+          <div
+            className="conversation-rail"
+            role="list"
+            style={{ '--conversation-gap': `${conversationGap}px` } as React.CSSProperties}
+          >
+            <div className="conversation-rail-hitbox" onMouseMove={handleRailMouseMove} onMouseLeave={scheduleHideTurnSummary} />
+            {conversationTurns.map((item, index) => (
+              <button
+                type="button"
+                key={item.id}
+                ref={element => { conversationMarkerRefs.current[item.id] = element }}
+                className={`conversation-marker ${hoveredTurn?.id === item.id ? 'active' : ''}`}
+                style={{
+                  '--marker-width': `${hoveredTurnIndex === null || Math.abs(index - hoveredTurnIndex) > 5 ? 11 : Math.max(11, 27 - Math.abs(index - hoveredTurnIndex) * 3)}px`,
+                } as React.CSSProperties}
+                aria-label={`第 ${index + 1} 轮：${truncate(item.content || '附件', 40)}`}
+                onMouseEnter={() => activateTurnIndex(index)}
+                onFocus={() => activateTurnIndex(index)}
+                onClick={() => turnRefs.current[item.id]?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+              >
+                <span className="conversation-marker-line" />
+              </button>
+            ))}
+          </div>
+          {hoveredTurn && (() => {
+            const item = conversationTurns.find(turn => turn.id === hoveredTurn.id)
+            if (!item) return null
+            const lines = (item.content || '附件').split(/\n+/).map(line => line.trim()).filter(Boolean)
+            return (
+              <div
+                className="conversation-summary"
+                style={{ top: hoveredTurn.top }}
+                onMouseEnter={keepTurnSummary}
+                onMouseLeave={scheduleHideTurnSummary}
+              >
+                <strong>{truncate(lines[0] || '附件', 52)}</strong>
+                {lines.slice(1, 3).map((line, lineIndex) => <span key={`${item.id}-${lineIndex}`}>{truncate(line, 68)}</span>)}
+                <small>第 {conversationTurns.findIndex(turn => turn.id === item.id) + 1} 轮 · 点击定位</small>
+              </div>
+            )
+          })()}
+        </div>
+      )}
       <div
         className="chat-scroll"
         ref={chatScrollRef}
@@ -1894,6 +2141,15 @@ function App() {
       </div>
 
       <div className="composer-wrap">
+        {pendingAttachments.length > 0 && (
+          <div className="pending-attachments">
+            {pendingAttachments.map(item => (
+              <Tag key={item.id} closable onClose={() => setPendingAttachments(prev => prev.filter(x => x.id !== item.id))}>
+                {item.filename}
+              </Tag>
+            ))}
+          </div>
+        )}
         {Math.max(
           queuedMessages.length,
           Number(sessionState?.queue?.pending || 0),
@@ -1961,10 +2217,10 @@ function App() {
                     setInput(`/${command.name} `)
                   }}
                 >
-                  <CodeOutlined />
+                  {command.kind === 'skill' ? <ApiOutlined /> : <CodeOutlined />}
                   <span className="command-item-main">
                     <strong>{command.usage || `/${command.name}`}</strong>
-                    <small>{command.description || '无描述'}</small>
+                    <small>{command.kind === 'skill' ? '技能 · ' : ''}{command.description || '无描述'}</small>
                   </span>
                   <kbd>/</kbd>
                 </button>
@@ -1989,7 +2245,11 @@ function App() {
           />
           <div className="composer-footer">
             <Space size={4}>
-              <Tooltip title="选择项目文件夹">
+              <Tooltip title="添加图片或文件">
+                <Button type="text" className="workspace-button" aria-label="添加附件" icon={<UploadOutlined />} onClick={() => fileInputRef.current?.click()} />
+              </Tooltip>
+              <input ref={fileInputRef} type="file" multiple hidden onChange={handleFilesSelected} accept="image/*,.pdf,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" />
+              <Tooltip title="选择 Agent 所在机器上的项目文件夹">
                 <Button
                   type="text"
                   className="workspace-button"
@@ -1998,6 +2258,14 @@ function App() {
                   onClick={pickWorkspace}
                 />
               </Tooltip>
+              {sessionState?.workspace_root && (
+                <Tag
+                  className={`workspace-status-tag ${sessionState.workspace_status === 'missing' ? 'workspace-status-missing' : ''}`}
+                  title={sessionState.workspace_root}
+                >
+                  {sessionState.workspace_status === 'missing' ? '项目目录不可用' : (sessionState.workspace_write ? '项目可写' : '项目只读')}
+                </Tag>
+              )}
               <Dropdown
                 trigger={['click']}
                 placement="topLeft"
@@ -2089,7 +2357,7 @@ function App() {
                   className="send-button"
                   aria-label={isStreaming ? '排队发送' : '发送'}
                   icon={<SendOutlined />}
-                  disabled={!isStreaming && (!input.trim() || creatingSession)}
+                  disabled={!isStreaming && (!input.trim() && pendingAttachments.length === 0 || creatingSession)}
                   onClick={() => sendMessage()}
                 />
               </Tooltip>
@@ -2283,6 +2551,7 @@ function App() {
                     checked={item.enabled}
                     onChange={checked => togglePlugin(item, checked)}
                   />
+                  {item.source === 'user' && <Button type="text" danger size="small" icon={<DeleteOutlined />} onClick={() => deletePlugin(item)} />}
                 </div>
                 <p className="entity-description">
                   {item.description || '暂无描述'}
@@ -2368,11 +2637,30 @@ function App() {
                   icon={<CopyOutlined />}
                   onClick={() => copyMessage(item.id)}
                 >复制 ID</Button>
+                {item.source === 'user' && <Button type="text" danger size="small" icon={<DeleteOutlined />} onClick={() => deleteSkill(item)} />}
               </div>
             </div>
           ))}
         </div>
       )}
+    </div>
+  )
+
+  const renderSchedules = () => (
+    <div className="page-view schedules-view">
+      <div className="page-head"><div><h2>定时任务</h2><p>一次性、间隔、每日和每周任务统一管理。</p></div><Button type="primary" icon={<PlusOutlined />} onClick={() => setScheduleModalOpen(true)}>新建任务</Button></div>
+      <Modal open={scheduleModalOpen} title="新建定时任务" okText="创建" cancelText="取消" onCancel={() => setScheduleModalOpen(false)} onOk={createSchedule}>
+        <Space direction="vertical" style={{ width: '100%' }}>
+          <Input placeholder="任务名称" value={scheduleDraft.name} onChange={e => setScheduleDraft({ ...scheduleDraft, name: e.target.value })} />
+          <Select style={{ width: '100%' }} value={scheduleDraft.trigger_type} onChange={value => setScheduleDraft({ ...scheduleDraft, trigger_type: value })} options={[{ value: 'once', label: '一次性' }, { value: 'interval', label: '间隔周期' }, { value: 'daily', label: '每天' }, { value: 'weekly', label: '每周' }]} />
+          {scheduleDraft.trigger_type === 'once' && <Input placeholder="执行时间（ISO，例如 2026-09-05T18:00:00+08:00）" value={scheduleDraft.at} onChange={e => setScheduleDraft({ ...scheduleDraft, at: e.target.value })} />}
+          {scheduleDraft.trigger_type === 'interval' && <Space.Compact block><InputNumber min={1} placeholder="每隔" value={scheduleDraft.every} onChange={value => setScheduleDraft({ ...scheduleDraft, every: value })} /><Select value={scheduleDraft.unit || 'hours'} onChange={value => setScheduleDraft({ ...scheduleDraft, unit: value })} options={[{ value: 'minutes', label: '分钟' }, { value: 'hours', label: '小时' }, { value: 'days', label: '天' }]} /><Input placeholder="锚点时间 ISO" value={scheduleDraft.anchor_at} onChange={e => setScheduleDraft({ ...scheduleDraft, anchor_at: e.target.value })} /></Space.Compact>}
+          {scheduleDraft.trigger_type === 'daily' && <Input placeholder="每天时间，例如 09:00" value={scheduleDraft.time_of_day} onChange={e => setScheduleDraft({ ...scheduleDraft, time_of_day: e.target.value })} />}
+          {scheduleDraft.trigger_type === 'weekly' && <Space.Compact block><Input placeholder="星期，例如 monday" value={scheduleDraft.day_of_week} onChange={e => setScheduleDraft({ ...scheduleDraft, day_of_week: e.target.value })} /><Input placeholder="时间，例如 09:00" value={scheduleDraft.time_of_day} onChange={e => setScheduleDraft({ ...scheduleDraft, time_of_day: e.target.value })} /></Space.Compact>}
+          <TextArea rows={3} placeholder="执行时发送的消息" value={scheduleDraft.message_text} onChange={e => setScheduleDraft({ ...scheduleDraft, message_text: e.target.value, action_type: 'message' })} />
+        </Space>
+      </Modal>
+      {loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : schedules.length === 0 ? <Empty description="暂无定时任务" className="page-empty" /> : <div className="schedule-list">{schedules.map(task => <Card key={task.id} className="schedule-card"><div className="schedule-card-head"><div><strong>{task.name}</strong><Tag>{task.trigger_type || 'once'}</Tag></div><Space><Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} /><Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button></Space></div><p>{task.kind === 'agent_prompt' ? task.payload?.prompt : task.kind === 'system_job' ? task.payload?.job_name : task.payload?.message_text}</p><small>下次执行：{task.next_run_at ? new Date(task.next_run_at).toLocaleString() : '—'}</small></Card>)}</div>}
     </div>
   )
 
@@ -2532,6 +2820,7 @@ function App() {
     if (view === 'sessions') return renderSessions()
     if (view === 'plugins') return renderPlugins()
     if (view === 'skills') return renderSkills()
+    if (view === 'schedules') return renderSchedules()
     if (view === 'settings') return renderSettings()
     return renderChat()
   }

@@ -203,47 +203,154 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
         return _error(f"工作路径不是文件夹：{target}")
     from agent.tools.files import FileService, resolve_file_access_config
     output_dir = Path(str(context.components.get("output_dir") or shared.DEFAULT_OUTPUT_DIR)).resolve()
-    policy = resolve_file_access_config(dict(context.config), workspace_root=target, output_dir=output_dir)
+    try:
+        policy = resolve_file_access_config(
+            dict(context.config), workspace_root=target, output_dir=output_dir
+        )
+    except Exception as exc:
+        return _error(f"项目文件夹不可用：{exc}")
     service = FileService(policy)
-    registry = context.components.get("registry")
-    if registry is not None:
-        registry.set_context("workspace_root", str(target))
-        registry.set_context("file_access_policy", policy)
-        registry.set_context("file_service", service)
-        for tool in getattr(registry, "_tools", {}).values():
-            owner = getattr(tool.fn, "__self__", None)
-            if owner is not None and hasattr(owner, "workspace_root"):
-                owner.workspace_root = target
-                if hasattr(owner, "_injected_file_service"):
-                    owner._injected_file_service = service
-    agent.workspace_root = target
-    core_components = getattr(getattr(context.components.get("agent_core"), "_components", None), "values", None)
-    if isinstance(core_components, dict):
-        core_components["workspace_root"] = target
-        core_components["file_access_policy"] = policy
-        core_components["file_service"] = service
-    # Make the new root visible to the model immediately. The runtime keeps
-    # the agent and registry objects session-scoped, while the command context
-    # itself is an immutable request snapshot.
-    current_prompt = str(getattr(context.session_state.ctx, "system_prompt", "") or "")
-    marker = "\n\nCurrent session workspace: "
-    if marker in current_prompt:
-        current_prompt = current_prompt.split(marker, 1)[0]
-    context.session_state.ctx.system_prompt = f"{current_prompt}{marker}{target}"
-    if hasattr(context.session_state.ctx, "metadata"):
-        context.session_state.ctx.metadata["workspace_root"] = str(target)
-    # Web sessions have a durable manifest, so a gateway restart restores the
-    # selected folder. CLI sessions intentionally remain process-scoped.
+
+    # Web workspaces are durable session state.  Persist the new value before
+    # mutating the live runtime so a failed write can never leave the current
+    # process and the next restart disagreeing about the selected directory.
+    manifest: Path | None = None
+    previous_manifest: str | None = None
     if context.channel_name == "web":
-        with contextlib.suppress(OSError, TypeError, ValueError):
+        try:
             manifest = shared.web_session_home(context.session_id) / ".session.json"
-            payload = {}
             if manifest.is_file():
-                loaded = json.loads(manifest.read_text(encoding="utf-8"))
+                previous_manifest = manifest.read_text(encoding="utf-8")
+            payload: dict[str, Any] = {}
+            if previous_manifest:
+                loaded = json.loads(previous_manifest)
                 if isinstance(loaded, dict):
                     payload.update(loaded)
             payload["workspace_root"] = str(target)
-            shared._atomic_write_text(manifest, json.dumps(payload, ensure_ascii=False, indent=2))
+            payload["workspace_status"] = "ready"
+            payload["workspace_read"] = bool(policy.workspace_read)
+            payload["workspace_write"] = bool(policy.workspace_write)
+            shared._atomic_write_text(
+                manifest,
+                json.dumps(payload, ensure_ascii=False, indent=2),
+            )
+        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            return _error(f"无法保存项目文件夹设置：{exc}")
+
+    previous_agent_workspace = getattr(agent, "workspace_root", None)
+    previous_registry_context = None
+    previous_core_components: dict[str, Any] | None = None
+    previous_prompt = str(getattr(context.session_state.ctx, "system_prompt", "") or "")
+    previous_metadata = dict(getattr(context.session_state.ctx, "metadata", {}) or {})
+    registry = None
+    core_components = None
+    previous_owner_state: list[tuple[Any, Any, Any]] = []
+    try:
+        registry = context.components.get("registry")
+        if registry is not None:
+            raw_context = getattr(registry, "_context", None)
+            if isinstance(raw_context, dict):
+                previous_registry_context = dict(raw_context)
+            registry.set_context("workspace_root", str(target))
+            registry.set_context("file_access_policy", policy)
+            registry.set_context("file_service", service)
+            for tool in getattr(registry, "_tools", {}).values():
+                owner = getattr(tool.fn, "__self__", None)
+                if owner is not None and hasattr(owner, "workspace_root"):
+                    previous_owner_state.append(
+                        (
+                            owner,
+                            getattr(owner, "workspace_root", None),
+                            getattr(owner, "_injected_file_service", None),
+                        )
+                    )
+                    owner.workspace_root = target
+                    if hasattr(owner, "_injected_file_service"):
+                        owner._injected_file_service = service
+        agent.workspace_root = target
+        core_components = getattr(getattr(context.components.get("agent_core"), "_components", None), "values", None)
+        if isinstance(core_components, dict):
+            previous_core_components = {
+                key: core_components.get(key)
+                for key in ("workspace_root", "file_access_policy", "file_service")
+            }
+            core_components["workspace_root"] = target
+            core_components["file_access_policy"] = policy
+            core_components["file_service"] = service
+        # Rebuild the prompt from structured runtime inputs instead of
+        # appending a string marker. This keeps workspace state intact when
+        # skills/plugins/context compression refresh the prompt later.
+        import agent as agent_module
+        skill_catalog = context.components.get("skill_catalog")
+        plugin_catalog = context.components.get("plugin_catalog")
+        base_prompt = str(
+            context.components.get("base_system_prompt")
+            or getattr(context.session_state.ctx, "system_prompt", "")
+            or ""
+        )
+        try:
+            refreshed_prompt = agent_module._compose_system_prompt(
+                base_prompt,
+                registry,
+                target,
+                output_dir,
+                skill_catalog=skill_catalog,
+                plugin_catalog=plugin_catalog,
+            )
+            with_task_context = getattr(agent_module, "_with_task_context", None)
+            if callable(with_task_context):
+                refreshed_prompt = with_task_context(
+                    refreshed_prompt,
+                    getattr(context.session_state, "task_context", ""),
+                )
+        except Exception:
+            # A custom/test registry should not make a valid folder switch
+            # fail. Runtime file access has already been updated; preserve the
+            # previous prompt and add a current-root hint.
+            marker = "\n\nCurrent session workspace: "
+            previous_prompt = str(getattr(context.session_state.ctx, "system_prompt", "") or "")
+            refreshed_prompt = f"{previous_prompt.split(marker, 1)[0]}{marker}{target}"
+        context.session_state.ctx.system_prompt = refreshed_prompt
+        if hasattr(context.session_state.ctx, "metadata"):
+            context.session_state.ctx.metadata["workspace_root"] = str(target)
+            context.session_state.ctx.metadata["workspace_status"] = "ready"
+            context.session_state.ctx.metadata["workspace_read"] = bool(policy.workspace_read)
+            context.session_state.ctx.metadata["workspace_write"] = bool(policy.workspace_write)
+        workspace_event = getattr(context.sink, "on_workspace_changed", None)
+        if callable(workspace_event):
+            workspace_event(
+                str(target),
+                workspace_read=bool(policy.workspace_read),
+                workspace_write=bool(policy.workspace_write),
+                status="ready",
+            )
+    except Exception as exc:
+        # Restore the previous durable value if a live component could not be
+        # updated.  The old runtime remains the source of truth for this turn.
+        if manifest is not None:
+            with contextlib.suppress(OSError):
+                if previous_manifest is None:
+                    manifest.unlink(missing_ok=True)
+                else:
+                    shared._atomic_write_text(manifest, previous_manifest)
+        with contextlib.suppress(Exception):
+            agent.workspace_root = previous_agent_workspace
+        with contextlib.suppress(Exception):
+            if registry is not None and previous_registry_context is not None:
+                registry._context = previous_registry_context  # noqa: SLF001
+        with contextlib.suppress(Exception):
+            if isinstance(previous_core_components, dict) and isinstance(core_components, dict):
+                core_components.update(previous_core_components)
+        with contextlib.suppress(Exception):
+            for owner, old_root, old_service in previous_owner_state:
+                owner.workspace_root = old_root
+                if hasattr(owner, "_injected_file_service"):
+                    owner._injected_file_service = old_service
+        with contextlib.suppress(Exception):
+            context.session_state.ctx.system_prompt = previous_prompt
+            context.session_state.ctx.metadata.clear()
+            context.session_state.ctx.metadata.update(previous_metadata)
+        return _error(f"无法切换项目文件夹：{exc}")
     return CommandResult(response_text=f"已切换当前会话工作文件夹：`{target}`")
 
 
