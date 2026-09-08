@@ -454,6 +454,25 @@ def test_continue_recovers_most_recent_completed_working_state(tmp_path):
     assert ctx_mgr.last_working_state_recovery_trace["selected"] is True
 
 
+def test_dismissed_working_state_is_not_recovered(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.store.save_session_working_state(
+        ctx_mgr.staging.session_id,
+        {
+            "task_id": "dismissed-task",
+            "active_goal": "实现 3D 花园",
+            "status": "dismissed",
+            "progress": "用户放弃继续",
+            "next_action": "",
+        },
+    )
+
+    result = ctx_mgr.working_state_context("继续")
+
+    assert result == ""
+    assert ctx_mgr.last_working_state_recovery_trace["selected"] is False
+
+
 def test_successful_working_state_not_injected_for_unrelated_query(tmp_path):
     from agent import (
         LTMStore,

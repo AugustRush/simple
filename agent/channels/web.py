@@ -11,13 +11,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import quote
 
 from agent import shared
 from agent.channels.base import Channel, IncomingMessage
@@ -75,6 +78,99 @@ def _web_session_upload_dir(session_id: str) -> Path:
         return shared.web_session_home(str(session_id)) / "uploads"
     except ValueError:
         return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "uploads"
+
+
+def _scheduler_run_payload(run: Any) -> dict[str, Any]:
+    output_path = str(getattr(run, "output_path", "") or "").strip()
+    output_available = False
+    if output_path:
+        try:
+            output_available = Path(output_path).expanduser().is_file()
+        except OSError:
+            pass
+    started_at = getattr(run, "started_at", None)
+    finished_at = getattr(run, "finished_at", None)
+    duration_ms = None
+    if started_at is not None and finished_at is not None:
+        duration_ms = max(0, round((finished_at - started_at).total_seconds() * 1000))
+    return {
+        "id": str(getattr(run, "id", "") or ""),
+        "task_id": str(getattr(run, "task_id", "") or ""),
+        "status": str(getattr(run, "status", "") or ""),
+        "scheduled_for": (
+            run.scheduled_for.isoformat() if getattr(run, "scheduled_for", None) else None
+        ),
+        "started_at": started_at.isoformat() if started_at else None,
+        "finished_at": finished_at.isoformat() if finished_at else None,
+        "duration_ms": duration_ms,
+        "summary": str(getattr(run, "summary", "") or ""),
+        "error": str(getattr(run, "error", "") or ""),
+        "delivery_status": str(getattr(run, "delivery_status", "") or ""),
+        "trigger_source": str(getattr(run, "trigger_source", "schedule") or "schedule"),
+        "attempt": int(getattr(run, "attempt", 1) or 1),
+        "cancel_requested_at": (
+            run.cancel_requested_at.isoformat()
+            if getattr(run, "cancel_requested_at", None)
+            else None
+        ),
+        "retry_of_run_id": str(getattr(run, "retry_of_run_id", "") or ""),
+        "config_snapshot": dict(getattr(run, "config_snapshot", {}) or {}),
+        "output_available": output_available,
+        "output_url": (
+            "/api/files?path=" + quote(output_path, safe="")
+            if output_available
+            else ""
+        ),
+    }
+
+
+def _scheduler_task_payload(task: Any, latest_run: Any = None) -> dict[str, Any]:
+    return {
+        "id": task.id,
+        "name": task.name,
+        "kind": task.kind,
+        "enabled": task.enabled,
+        "trigger_type": task.trigger.trigger_type,
+        "trigger": task.trigger.payload,
+        "payload": task.payload,
+        "delivery_mode": task.delivery_mode,
+        "delivery_target": {
+            "target_type": task.delivery_target.target_type,
+            "payload": task.delivery_target.payload,
+        },
+        "model_override": task.model_override,
+        "workspace_root": task.workspace_root,
+        "context_policy": task.context_policy,
+        "timeout_seconds": task.timeout_seconds,
+        "retry_policy": task.retry_policy,
+        "selected_skills": task.selected_skills,
+        "permission_profile": task.permission_profile,
+        "overlap_policy": task.overlap_policy,
+        "missed_run_policy": task.missed_run_policy,
+        "active_run_id": task.active_run_id,
+        "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
+        "last_run_at": task.last_run_at.isoformat() if task.last_run_at else None,
+        "last_success_at": (
+            task.last_success_at.isoformat() if task.last_success_at else None
+        ),
+        "latest_run": _scheduler_run_payload(latest_run) if latest_run else None,
+    }
+
+
+def _scheduler_output_path(task_id: str, run: Any) -> Path | None:
+    raw = str(getattr(run, "output_path", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except OSError:
+        return None
+    # Standalone scheduler output is always <output-root>/<task-id>/<run-id>.md.
+    # Validate that shape so an unexpected database value cannot expose an
+    # unrelated local file through the result endpoint.
+    if resolved.parent.name != task_id or resolved.name != f"{run.id}.md":
+        return None
+    return resolved
 
 # File extensions treated as attachable media (image/audio/video).
 _MEDIA_EXTS = {
@@ -139,6 +235,7 @@ class WebOutputSink(OutputSink):
         self._collect = collect or websocket is None
         self._events: list[dict[str, Any]] = []
         self._attachments: list[str] = []
+        self._queued_attachment_paths: set[str] = set()
         self._turn_complete_emitted = False
         self._completion_event = asyncio.Event()
         self.on_attachment = on_attachment
@@ -186,6 +283,7 @@ class WebOutputSink(OutputSink):
         # auto-scan when the file is regenerated later, so a fresh image/audio/
         # video would never show inline.
         self._attachments.clear()
+        self._queued_attachment_paths.clear()
         self._attached_paths.clear()
 
     @property
@@ -290,18 +388,36 @@ class WebOutputSink(OutputSink):
 
     def queue_attachment(self, path: Any) -> object | None:
         """Queue an attachment path for the next attachment flush."""
-        self._attachments.append(str(path))
-        return str(path)
+        value = str(path)
+        key = self._attachment_key(value)
+        if key not in self._queued_attachment_paths and key not in self._attached_paths:
+            self._attachments.append(value)
+            self._queued_attachment_paths.add(key)
+        return value
+
+    @staticmethod
+    def _attachment_key(path: Any) -> str:
+        """Return a stable key for equivalent local attachment paths."""
+        value = str(path or "").strip()
+        if not value:
+            return ""
+        try:
+            return str(Path(value).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            return value
 
     async def flush_attachments(self) -> None:
         """Emit queued attachment events, auto-attach session media, and clear."""
         for path in self._attachments:
+            key = self._attachment_key(path)
+            if key in self._attached_paths:
+                continue
             name = Path(path).name
             self._emit(
                 {"type": "attachment", "path": path, "name": name}
             )
             # Mark as already attached so the auto-scan below won't re-emit it.
-            self._attached_paths.add(str(path))
+            self._attached_paths.add(key)
             cb = getattr(self, "on_attachment", None)
             if callable(cb):
                 try:
@@ -309,6 +425,7 @@ class WebOutputSink(OutputSink):
                 except Exception:
                     logger.exception("failed to journal attachment: %s", path)
         self._attachments.clear()
+        self._queued_attachment_paths.clear()
         self._auto_attach_media()
         await self.flush()
 
@@ -358,7 +475,8 @@ class WebOutputSink(OutputSink):
                     if _svg_has_raster_sibling(p):
                         continue
                 s = str(p)
-                if s in attached:
+                key = self._attachment_key(s)
+                if key in attached:
                     continue
                 try:
                     mtime = p.stat().st_mtime
@@ -368,7 +486,7 @@ class WebOutputSink(OutputSink):
                 # future-dated files to avoid weird clock errors.
                 if mtime < turn_started - 1 or mtime > now + 60:
                     continue
-                attached.add(s)
+                attached.add(key)
                 name = p.name
                 self._emit({"type": "attachment", "path": s, "name": name})
                 if callable(cb):
@@ -867,6 +985,159 @@ class WebChannel(Channel):
             })
         return JSONResponse({"attachments": result})
 
+    def _schedule_from_body(self, body: dict[str, Any], existing: Any = None):
+        from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec
+
+        name = str(body.get("name", getattr(existing, "name", ""))).strip()
+        if not name:
+            raise ValueError("任务名称不能为空")
+        if len(name) > 80:
+            raise ValueError("任务名称不能超过 80 个字符")
+
+        trigger_type = str(
+            body.get(
+                "trigger_type",
+                getattr(getattr(existing, "trigger", None), "trigger_type", "once"),
+            )
+        ).lower()
+        timezone_name = str(body.get("timezone_name", "UTC")).strip() or "UTC"
+        if trigger_type == "once":
+            trigger = TriggerSpec.once(body["at"], timezone_name)
+            if trigger.initial_run_at() <= datetime.now(timezone.utc):
+                raise ValueError("执行时间必须晚于当前时间")
+        elif trigger_type == "interval":
+            every = int(body["every"])
+            if every < 1:
+                raise ValueError("重复间隔必须大于 0")
+            trigger = TriggerSpec.interval(
+                every, str(body["unit"]), body["anchor_at"], timezone_name
+            )
+        elif trigger_type == "daily":
+            trigger = TriggerSpec.daily(str(body["time_of_day"]), timezone_name)
+        elif trigger_type == "weekly":
+            trigger = TriggerSpec.weekly(
+                str(body["day_of_week"]), str(body["time_of_day"]), timezone_name
+            )
+        elif trigger_type == "weekdays":
+            trigger = TriggerSpec.weekdays(str(body["time_of_day"]), timezone_name)
+        elif trigger_type == "monthly":
+            trigger = TriggerSpec.monthly(
+                int(body["day_of_month"]), str(body["time_of_day"]), timezone_name
+            )
+        else:
+            raise ValueError("不支持的执行计划")
+        trigger.instantiate().next_after(datetime.now(timezone.utc))
+
+        existing_kind = str(getattr(existing, "kind", "agent_prompt"))
+        default_action = "message" if existing_kind == "message" else "agent_task"
+        action = str(body.get("action_type", default_action))
+        if action == "agent_task":
+            task_kind = "agent_prompt"
+            payload = {"prompt": str(body.get("prompt", "")).strip()}
+            max_content_length = 6000
+        elif action == "message":
+            task_kind = "message"
+            payload = {"message_text": str(body.get("message_text", "")).strip()}
+            max_content_length = 2000
+        else:
+            raise ValueError("不支持的任务类型")
+        content = str(next(iter(payload.values()), ""))
+        if not content:
+            raise ValueError("任务内容不能为空")
+        if len(content) > max_content_length:
+            raise ValueError(f"任务内容不能超过 {max_content_length} 个字符")
+
+        workspace_value = str(
+            body.get("workspace_root")
+            or getattr(existing, "workspace_root", "")
+            or self._components.get("workspace_root")
+            or Path.cwd()
+        )
+        workspace = Path(workspace_value).expanduser().resolve(strict=False)
+        if task_kind == "agent_prompt" and not workspace.is_dir():
+            raise ValueError(f"项目文件夹不存在：{workspace}")
+
+        context_policy = str(
+            body.get("context_policy", getattr(existing, "context_policy", "stateless"))
+        )
+        if context_policy not in {"stateless", "task_history", "shared_memory"}:
+            raise ValueError("不支持的上下文策略")
+        timeout_seconds = int(
+            body.get("timeout_seconds", getattr(existing, "timeout_seconds", 1800))
+        )
+        if timeout_seconds < 10 or timeout_seconds > 604800:
+            raise ValueError("超时时间必须在 10 秒到 7 天之间")
+        raw_retry = body.get("retry_policy", getattr(existing, "retry_policy", {}))
+        retry = dict(raw_retry) if isinstance(raw_retry, dict) else {}
+        max_attempts = int(retry.get("max_attempts", 1))
+        backoff_seconds = int(retry.get("backoff_seconds", 30))
+        if max_attempts < 1 or max_attempts > 5:
+            raise ValueError("最大尝试次数必须在 1 到 5 之间")
+        if backoff_seconds < 0 or backoff_seconds > 86400:
+            raise ValueError("重试间隔必须在 0 到 86400 秒之间")
+
+        delivery_mode = str(
+            body.get("delivery_mode", getattr(existing, "delivery_mode", "standalone"))
+        )
+        delivery_target = getattr(existing, "delivery_target", None)
+        if delivery_mode == "standalone" or delivery_target is None:
+            delivery_target = DeliveryTarget.standalone()
+
+        raw_model = (
+            body.get("model_override")
+            if "model_override" in body
+            else getattr(existing, "model_override", None)
+        )
+        model_override = self._resolve_model_override(raw_model)
+        raw_skills = body.get(
+            "selected_skills", getattr(existing, "selected_skills", [])
+        )
+        if not isinstance(raw_skills, list):
+            raise ValueError("selected_skills must be a list")
+        selected_skills = list(dict.fromkeys(
+            str(item).strip() for item in raw_skills if str(item).strip()
+        ))
+        catalog = self._components.get("skill_catalog")
+        if catalog is not None:
+            for skill_id in selected_skills:
+                bundle = catalog.get(skill_id)
+                if bundle is None or not getattr(bundle, "user_invocable", False):
+                    raise ValueError(f"技能不可用：{skill_id}")
+        permission_profile = str(
+            body.get(
+                "permission_profile",
+                getattr(existing, "permission_profile", "inherit"),
+            )
+        )
+        if permission_profile not in {"inherit", "read_only"}:
+            raise ValueError("不支持的权限策略")
+
+        return NewScheduledTask(
+            name=name,
+            kind=task_kind,
+            trigger=trigger,
+            payload=payload,
+            delivery_mode=delivery_mode,
+            delivery_target=delivery_target,
+            model_override=model_override,
+            enabled=bool(body.get("enabled", getattr(existing, "enabled", True))),
+            overlap_policy=str(
+                body.get("overlap_policy", getattr(existing, "overlap_policy", "forbid_overlap"))
+            ),
+            missed_run_policy=str(
+                body.get("missed_run_policy", getattr(existing, "missed_run_policy", "coalesce"))
+            ),
+            workspace_root=str(workspace),
+            context_policy=context_policy,
+            timeout_seconds=timeout_seconds,
+            retry_policy={
+                "max_attempts": max_attempts,
+                "backoff_seconds": backoff_seconds,
+            },
+            selected_skills=selected_skills,
+            permission_profile=permission_profile,
+        )
+
     async def _schedules(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
         if not self._authorized(request):
@@ -876,17 +1147,161 @@ class WebChannel(Channel):
         try:
             tasks = []
             for task in store.list_tasks():
-                tasks.append({
-                    "id": task.id, "name": task.name, "kind": task.kind,
-                    "enabled": task.enabled, "trigger_type": task.trigger.trigger_type,
-                    "trigger": task.trigger.payload, "payload": task.payload,
-                    "delivery_mode": task.delivery_mode,
-                    "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
-                    "last_run_at": task.last_run_at.isoformat() if task.last_run_at else None,
-                })
+                latest_run = store.latest_run(task.id)
+                tasks.append(_scheduler_task_payload(task, latest_run))
             return JSONResponse({"tasks": tasks})
         finally:
             store.close()
+
+    async def _schedule_runs(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+
+        task_id = str(request.path_params["task_id"])
+        try:
+            limit = max(1, min(int(request.query_params.get("limit", "50")), 100))
+        except ValueError:
+            limit = 50
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            task = store.get_task(task_id)
+            if task is None:
+                return JSONResponse({"error": "task not found"}, status_code=404)
+            runs = list(reversed(store.list_runs(task_id)))[:limit]
+            return JSONResponse(
+                {
+                    "task": _scheduler_task_payload(task, store.latest_run(task.id)),
+                    "runs": [_scheduler_run_payload(run) for run in runs],
+                }
+            )
+        finally:
+            store.close()
+
+    async def _schedule_run_output(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+
+        task_id = str(request.path_params["task_id"])
+        run_id = str(request.path_params["run_id"])
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            if store.get_task(task_id) is None:
+                return JSONResponse({"error": "task not found"}, status_code=404)
+            run = store.get_run(task_id, run_id)
+            if run is None:
+                return JSONResponse({"error": "run not found"}, status_code=404)
+        finally:
+            store.close()
+        if not run.output_path:
+            return JSONResponse(
+                {"run_id": run.id, "available": False, "content": "", "truncated": False}
+            )
+        output_path = _scheduler_output_path(task_id, run)
+        if output_path is None:
+            return JSONResponse({"error": "invalid run output path"}, status_code=403)
+        if not output_path.is_file():
+            return JSONResponse(
+                {"run_id": run.id, "available": False, "content": "", "truncated": False}
+            )
+        try:
+            max_bytes = 2 * 1024 * 1024
+            with output_path.open("rb") as handle:
+                raw = handle.read(max_bytes + 1)
+            truncated = len(raw) > max_bytes
+            content = raw[:max_bytes].decode("utf-8", errors="replace")
+        except OSError as exc:
+            return JSONResponse({"error": f"unable to read run output: {exc}"}, status_code=500)
+        return JSONResponse(
+            {
+                "run_id": run.id,
+                "available": True,
+                "content": content,
+                "truncated": truncated,
+                "output_url": "/api/files?path=" + quote(str(output_path), safe=""),
+            }
+        )
+
+    def _schedule_artifact_root(self, task_id: str, run: Any) -> Path:
+        output_path = str(getattr(run, "output_path", "") or "").strip()
+        if output_path:
+            return Path(output_path).expanduser().resolve().parent / run.id / "artifacts"
+        output_root = Path(
+            self._components.get("output_dir") or shared.DEFAULT_OUTPUT_DIR
+        ).expanduser().resolve()
+        return output_root / "scheduler" / task_id / run.id / "artifacts"
+
+    async def _schedule_run_artifacts(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+
+        task_id = str(request.path_params["task_id"])
+        run_id = str(request.path_params["run_id"])
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            run = store.get_run(task_id, run_id)
+        finally:
+            store.close()
+        if run is None:
+            return JSONResponse({"error": "run not found"}, status_code=404)
+        root = self._schedule_artifact_root(task_id, run)
+        artifacts = []
+        if root.is_dir():
+            for path in sorted(root.rglob("*")):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(root).as_posix()
+                mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+                artifacts.append(
+                    {
+                        "path": relative,
+                        "name": path.name,
+                        "mime_type": mime_type,
+                        "size_bytes": path.stat().st_size,
+                        "url": (
+                            f"/api/schedules/{quote(task_id, safe='')}/runs/"
+                            f"{quote(run_id, safe='')}/artifacts/{quote(relative, safe='/')}"
+                        ),
+                    }
+                )
+                if len(artifacts) >= 500:
+                    break
+        return JSONResponse({"artifacts": artifacts})
+
+    async def _schedule_run_artifact(self, request: Any) -> Any:
+        from starlette.responses import FileResponse, JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+
+        task_id = str(request.path_params["task_id"])
+        run_id = str(request.path_params["run_id"])
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            run = store.get_run(task_id, run_id)
+        finally:
+            store.close()
+        if run is None:
+            return JSONResponse({"error": "run not found"}, status_code=404)
+        root = self._schedule_artifact_root(task_id, run)
+        try:
+            target = (root / str(request.path_params["artifact_path"])).resolve()
+            if root != target and root not in target.parents:
+                return JSONResponse({"error": "invalid artifact path"}, status_code=403)
+            if not target.is_file():
+                return JSONResponse({"error": "artifact not found"}, status_code=404)
+        except OSError:
+            return JSONResponse({"error": "invalid artifact path"}, status_code=400)
+        return FileResponse(target, filename=target.name)
 
     async def _create_schedule(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -894,25 +1309,17 @@ class WebChannel(Channel):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         try:
             body = await request.json()
-            if not isinstance(body, dict): raise ValueError("body must be an object")
-            from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec, SchedulerStore
-            kind = str(body.get("trigger_type", "once")).lower()
-            tz = str(body.get("timezone_name", "UTC"))
-            if kind == "once": trigger = TriggerSpec.once(body["at"], tz)
-            elif kind == "interval": trigger = TriggerSpec.interval(int(body["every"]), str(body["unit"]), body["anchor_at"], tz)
-            elif kind == "daily": trigger = TriggerSpec.daily(str(body["time_of_day"]), tz)
-            elif kind == "weekly": trigger = TriggerSpec.weekly(str(body["day_of_week"]), str(body["time_of_day"]), tz)
-            else: raise ValueError("unsupported trigger_type")
-            action = str(body.get("action_type", "message"))
-            if action == "agent_task": task_kind, payload = "agent_prompt", {"prompt": str(body.get("prompt", "")).strip()}
-            elif action == "system_job": task_kind, payload = "system_job", {"job_name": str(body.get("job_name", "")).strip()}
-            else: task_kind, payload = "message", {"message_text": str(body.get("message_text", "")).strip()}
-            if not next(iter(payload.values()), ""): raise ValueError("任务内容不能为空")
-            task = NewScheduledTask(name=str(body.get("name", "未命名任务")).strip() or "未命名任务", kind=task_kind, trigger=trigger, payload=payload, delivery_mode="standalone", delivery_target=DeliveryTarget.standalone(), model_override=body.get("model_override"))
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            from agent.scheduler import SchedulerStore
+
+            task = self._schedule_from_body(body)
             store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
-            try: created = store.create_task(task)
-            finally: store.close()
-            return JSONResponse({"task": {"id": created.id, "name": created.name, "next_run_at": created.next_run_at.isoformat() if created.next_run_at else None}})
+            try:
+                created = store.create_task(task)
+            finally:
+                store.close()
+            return JSONResponse({"task": _scheduler_task_payload(created)})
         except (KeyError, ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -923,7 +1330,12 @@ class WebChannel(Channel):
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
             task_id = str(request.path_params["task_id"])
-            ok = store.get_task(task_id) is not None
+            task = store.get_task(task_id)
+            if task is not None and task.active_run_id:
+                return JSONResponse(
+                    {"error": "任务正在运行，请先取消运行"}, status_code=409
+                )
+            ok = task is not None
             store.delete_task(task_id)
         finally: store.close()
         return JSONResponse({"ok": bool(ok)})
@@ -939,6 +1351,161 @@ class WebChannel(Channel):
         try: store.set_enabled(str(request.path_params["task_id"]), bool(body["enabled"]))
         finally: store.close()
         return JSONResponse({"ok": True, "enabled": bool(body["enabled"])})
+
+    async def _update_schedule(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            from agent.scheduler import SchedulerStore
+
+            store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            try:
+                task_id = str(request.path_params["task_id"])
+                existing = store.get_task(task_id)
+                if existing is None:
+                    return JSONResponse({"error": "task not found"}, status_code=404)
+                spec = self._schedule_from_body(body, existing)
+                updated = store.update_task(task_id, spec)
+            finally:
+                store.close()
+            if updated is None:
+                return JSONResponse({"error": "task not found"}, status_code=404)
+            return JSONResponse({"task": _scheduler_task_payload(updated)})
+        except (KeyError, ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def _bulk_schedules(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        ids = list(dict.fromkeys(
+            str(item).strip() for item in body.get("task_ids", []) if str(item).strip()
+        ))
+        if not ids or len(ids) > 200:
+            return JSONResponse({"error": "task_ids must contain 1 to 200 ids"}, status_code=400)
+        action = str(body.get("action", "")).strip().lower()
+        if action not in {"enable", "disable", "delete"}:
+            return JSONResponse({"error": "unsupported bulk action"}, status_code=400)
+        from agent.scheduler import SchedulerStore
+
+        completed: list[str] = []
+        skipped: list[dict[str, str]] = []
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            for task_id in ids:
+                task = store.get_task(task_id)
+                if task is None:
+                    skipped.append({"id": task_id, "reason": "not_found"})
+                    continue
+                if action == "delete":
+                    if task.active_run_id:
+                        skipped.append({"id": task_id, "reason": "running"})
+                        continue
+                    store.delete_task(task_id)
+                else:
+                    store.set_enabled(task_id, action == "enable")
+                completed.append(task_id)
+        finally:
+            store.close()
+        return JSONResponse({"completed": completed, "skipped": skipped})
+
+    async def _schedule_preview(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            spec = self._schedule_from_body(body)
+            trigger = spec.trigger
+            current = trigger.initial_run_at(datetime.now(timezone.utc))
+            occurrences: list[str] = []
+            while current is not None and len(occurrences) < 5:
+                occurrences.append(current.isoformat())
+                current = trigger.advance_after_claim(current, current)
+            return JSONResponse({"occurrences": occurrences})
+        except (KeyError, ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def _run_schedule_now(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        service = self._components.get("scheduler_service")
+        if service is None:
+            return JSONResponse({"error": "scheduler is offline"}, status_code=503)
+        claimed = await service.run_task_now(str(request.path_params["task_id"]))
+        if claimed is None:
+            return JSONResponse(
+                {"error": "任务不存在或已有运行中的实例"}, status_code=409
+            )
+        return JSONResponse({"run": _scheduler_run_payload(claimed.run)}, status_code=202)
+
+    async def _retry_schedule_run(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        service = self._components.get("scheduler_service")
+        if service is None:
+            return JSONResponse({"error": "scheduler is offline"}, status_code=503)
+        claimed = await service.retry_run(
+            str(request.path_params["task_id"]),
+            str(request.path_params["run_id"]),
+            use_latest=bool(body.get("use_latest", False)),
+        )
+        if claimed is None:
+            return JSONResponse(
+                {"error": "运行记录不存在、仍在运行，或任务正忙"}, status_code=409
+            )
+        return JSONResponse({"run": _scheduler_run_payload(claimed.run)}, status_code=202)
+
+    async def _cancel_schedule_run(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        service = self._components.get("scheduler_service")
+        if service is None:
+            return JSONResponse({"error": "scheduler is offline"}, status_code=503)
+        cancelled = await service.cancel_run(
+            str(request.path_params["task_id"]),
+            str(request.path_params["run_id"]),
+        )
+        if not cancelled:
+            return JSONResponse({"error": "运行不存在或已经结束"}, status_code=409)
+        return JSONResponse({"ok": True}, status_code=202)
+
+    async def _scheduler_health(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        service = self._components.get("scheduler_service")
+        if service is None:
+            return JSONResponse({"status": "offline", "active_runs": 0})
+        return JSONResponse(service.health())
 
     async def _delete_skill(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -1184,6 +1751,26 @@ class WebChannel(Channel):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         session_id = str(request.path_params["session_id"])
         return JSONResponse(self._service().get_session_state(session_id))
+
+    async def _dismiss_task_guidance(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        session_id = str(request.path_params["session_id"])
+        task_id = str(body.get("task_id") or "").strip()
+        ok = self._service().dismiss_task_guidance(session_id, task_id)
+        if not ok:
+            return JSONResponse({"ok": False, "dismissed": False, "error": "task not found"}, status_code=404)
+        return JSONResponse({"ok": True, "dismissed": True, "task_id": task_id})
 
     async def _pick_workspace(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -1557,6 +2144,17 @@ class WebChannel(Channel):
         assert self._handler is not None
         service = self._service()
         service.touch_session(session_id, status="active")
+        attachment_metadata = [
+            {
+                "id": attachment.source_ref or attachment.local_path.name,
+                "filename": attachment.filename or attachment.local_path.name,
+                "mime_type": attachment.mime_type,
+                "kind": attachment.kind,
+                "path": str(attachment.local_path),
+                "size_bytes": attachment.size_bytes,
+            }
+            for attachment in attachments
+        ]
         msg = IncomingMessage(
             text=text,
             session_id=session_id,
@@ -1564,11 +2162,10 @@ class WebChannel(Channel):
             metadata={
                 "message_id": message_id,
                 "model_override": model_override,
+                "attachments": attachment_metadata,
             },
             attachments=attachments,
         )
-        for attachment in attachments:
-            self._record_attachment(session_id, str(attachment.local_path), attachment.filename, turn_id=message_id)
         try:
             await self._handler(msg, sink)
         finally:
@@ -1710,8 +2307,47 @@ class WebChannel(Channel):
             Route("/api/skills/{skill_id:path}", self._delete_skill, methods=["DELETE"]),
             Route("/api/schedules", self._schedules, methods=["GET"]),
             Route("/api/schedules", self._create_schedule, methods=["POST"]),
+            Route("/api/schedules", self._bulk_schedules, methods=["PATCH"]),
+            Route("/api/schedules/preview", self._schedule_preview, methods=["POST"]),
+            Route("/api/scheduler/health", self._scheduler_health, methods=["GET"]),
+            Route(
+                "/api/schedules/{task_id}/run",
+                self._run_schedule_now,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/schedules/{task_id}/runs",
+                self._schedule_runs,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/schedules/{task_id}/runs/{run_id}/retry",
+                self._retry_schedule_run,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/schedules/{task_id}/runs/{run_id}/cancel",
+                self._cancel_schedule_run,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/schedules/{task_id}/runs/{run_id}/output",
+                self._schedule_run_output,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/schedules/{task_id}/runs/{run_id}/artifacts",
+                self._schedule_run_artifacts,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/schedules/{task_id}/runs/{run_id}/artifacts/{artifact_path:path}",
+                self._schedule_run_artifact,
+                methods=["GET"],
+            ),
             Route("/api/schedules/{task_id}", self._delete_schedule, methods=["DELETE"]),
             Route("/api/schedules/{task_id}", self._patch_schedule, methods=["PATCH"]),
+            Route("/api/schedules/{task_id}", self._update_schedule, methods=["PUT"]),
             Route("/api/sessions/{session_id}/attachments", self._upload_attachment, methods=["POST"]),
             Route("/api/files", self._file, methods=["GET"]),
             Route("/api/sessions", self._list_sessions, methods=["GET"]),
@@ -1726,6 +2362,11 @@ class WebChannel(Channel):
                 "/api/sessions/{session_id}/state",
                 self._get_session_state,
                 methods=["GET"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/task-guidance/dismiss",
+                self._dismiss_task_guidance,
+                methods=["POST"],
             ),
             Route(
                 "/api/sessions/{session_id}/workspace/pick",

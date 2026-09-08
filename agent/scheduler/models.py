@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import calendar
 from datetime import datetime, time as dt_time, timedelta, timezone
 import json
+from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -150,6 +152,73 @@ class WeeklyTrigger:
 
 
 @dataclass
+class WeekdaysTrigger:
+    time_of_day: str
+    timezone_name: str = "UTC"
+
+    def next_after(self, now: datetime) -> Optional[datetime]:
+        tz = ZoneInfo(self.timezone_name)
+        local_now = now.astimezone(tz)
+        target_time = _parse_time_of_day(self.time_of_day)
+        candidate = local_now.replace(
+            hour=target_time.hour,
+            minute=target_time.minute,
+            second=0,
+            microsecond=0,
+        )
+        if candidate <= local_now:
+            candidate += timedelta(days=1)
+        while candidate.weekday() >= 5:
+            candidate += timedelta(days=1)
+        return candidate.astimezone(UTC)
+
+    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+        candidate = self.next_after(scheduled_for)
+        while candidate is not None and candidate <= now.astimezone(UTC):
+            candidate = self.next_after(candidate)
+        return candidate
+
+
+@dataclass
+class MonthlyTrigger:
+    day_of_month: int
+    time_of_day: str
+    timezone_name: str = "UTC"
+
+    def _candidate(self, year: int, month: int, tz: ZoneInfo) -> Optional[datetime]:
+        day = int(self.day_of_month)
+        if day < 1 or day > 31:
+            raise ValueError("day_of_month must be between 1 and 31")
+        if day > calendar.monthrange(year, month)[1]:
+            return None
+        target_time = _parse_time_of_day(self.time_of_day)
+        return datetime(
+            year, month, day, target_time.hour, target_time.minute, tzinfo=tz
+        )
+
+    @staticmethod
+    def _next_month(year: int, month: int) -> tuple[int, int]:
+        return (year + 1, 1) if month == 12 else (year, month + 1)
+
+    def next_after(self, now: datetime) -> Optional[datetime]:
+        tz = ZoneInfo(self.timezone_name)
+        local_now = now.astimezone(tz)
+        year, month = local_now.year, local_now.month
+        for _ in range(24):
+            candidate = self._candidate(year, month, tz)
+            if candidate is not None and candidate > local_now:
+                return candidate.astimezone(UTC)
+            year, month = self._next_month(year, month)
+        raise ValueError("unable to calculate monthly occurrence")
+
+    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+        candidate = self.next_after(scheduled_for)
+        while candidate is not None and candidate <= now.astimezone(UTC):
+            candidate = self.next_after(candidate)
+        return candidate
+
+
+@dataclass
 class TriggerSpec:
     trigger_type: str
     payload: dict[str, Any]
@@ -199,6 +268,26 @@ class TriggerSpec:
             },
         )
 
+    @classmethod
+    def weekdays(cls, time_of_day: str, timezone_name: str) -> "TriggerSpec":
+        return cls(
+            "weekdays",
+            {"time_of_day": time_of_day, "timezone_name": timezone_name},
+        )
+
+    @classmethod
+    def monthly(
+        cls, day_of_month: int, time_of_day: str, timezone_name: str
+    ) -> "TriggerSpec":
+        return cls(
+            "monthly",
+            {
+                "day_of_month": int(day_of_month),
+                "time_of_day": time_of_day,
+                "timezone_name": timezone_name,
+            },
+        )
+
     def instantiate(self):
         if self.trigger_type == "once":
             return OnceTrigger(
@@ -220,6 +309,17 @@ class TriggerSpec:
         if self.trigger_type == "weekly":
             return WeeklyTrigger(
                 day_of_week=str(self.payload["day_of_week"]),
+                time_of_day=str(self.payload["time_of_day"]),
+                timezone_name=self.payload.get("timezone_name", "UTC"),
+            )
+        if self.trigger_type == "weekdays":
+            return WeekdaysTrigger(
+                time_of_day=str(self.payload["time_of_day"]),
+                timezone_name=self.payload.get("timezone_name", "UTC"),
+            )
+        if self.trigger_type == "monthly":
+            return MonthlyTrigger(
+                day_of_month=int(self.payload["day_of_month"]),
                 time_of_day=str(self.payload["time_of_day"]),
                 timezone_name=self.payload.get("timezone_name", "UTC"),
             )
@@ -288,6 +388,14 @@ class NewScheduledTask:
     enabled: bool = True
     overlap_policy: str = "forbid_overlap"
     missed_run_policy: str = "coalesce"
+    workspace_root: str = field(default_factory=lambda: str(Path.cwd().resolve()))
+    context_policy: str = "stateless"
+    timeout_seconds: int = 1800
+    retry_policy: dict[str, Any] = field(
+        default_factory=lambda: {"max_attempts": 1, "backoff_seconds": 30}
+    )
+    selected_skills: list[str] = field(default_factory=list)
+    permission_profile: str = "inherit"
 
 
 @dataclass
@@ -303,6 +411,12 @@ class ScheduledTask:
     model_override: Optional[str]
     overlap_policy: str
     missed_run_policy: str
+    workspace_root: str
+    context_policy: str
+    timeout_seconds: int
+    retry_policy: dict[str, Any]
+    selected_skills: list[str]
+    permission_profile: str
     next_run_at: Optional[datetime]
     lease_until: Optional[datetime]
     active_run_id: Optional[str]
@@ -324,8 +438,35 @@ class TaskRun:
     error: str = ""
     output_path: str = ""
     delivery_status: str = ""
+    config_snapshot: dict[str, Any] = field(default_factory=dict)
+    trigger_source: str = "schedule"
+    attempt: int = 1
+    cancel_requested_at: Optional[datetime] = None
+    retry_of_run_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+
+def execution_snapshot(task: ScheduledTask) -> dict[str, Any]:
+    """Return the immutable, non-secret configuration used by one run."""
+    return {
+        "task_id": task.id,
+        "task_updated_at": task.updated_at.isoformat(),
+        "kind": task.kind,
+        "payload": task.payload,
+        "workspace_root": task.workspace_root,
+        "context_policy": task.context_policy,
+        "model_override": task.model_override,
+        "timeout_seconds": task.timeout_seconds,
+        "retry_policy": task.retry_policy,
+        "selected_skills": task.selected_skills,
+        "permission_profile": task.permission_profile,
+        "delivery_mode": task.delivery_mode,
+        "delivery_target": {
+            "target_type": task.delivery_target.target_type,
+            "payload": task.delivery_target.payload,
+        },
+    }
 
 
 @dataclass

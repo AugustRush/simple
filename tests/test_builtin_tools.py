@@ -832,8 +832,8 @@ def test_shell_timeout_is_reported_as_an_error_not_a_hang(tmp_path):
     assert result["timed_out"] is True
 
 
-def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
-    tools, reg, _ = make_builtin_tools(tmp_path)
+def test_shell_passes_roots_to_subprocess_environment(tmp_path, monkeypatch):
+    tools, reg, workspace = make_builtin_tools(tmp_path)
     reg.set_context("output_dir", str(tmp_path / "output"))
     captured = {}
 
@@ -857,11 +857,11 @@ def test_shell_passes_output_dir_env_to_subprocess(tmp_path, monkeypatch):
     assert result["ok"] is True
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(tmp_path / "output")
     assert captured["env"]["AGENT_WORKSPACE_ROOT"]
-    assert captured["cwd"] == str((tmp_path / "output").resolve())
+    assert captured["cwd"] == str(workspace.resolve())
     assert captured["env"]["AGENT_SANDBOX_DIR"] == str((tmp_path / "output" / "sandbox").resolve())
 
 
-def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch):
+def test_shell_defaults_to_selected_workspace(tmp_path, monkeypatch):
     import agent.shared as shared_module
 
     tools, _reg, workspace = make_builtin_tools(tmp_path)
@@ -885,8 +885,7 @@ def test_shell_defaults_to_agent_output_dir_not_workspace(tmp_path, monkeypatch)
     result = asyncio.run(tools._shell("echo ok", timeout=1))
 
     assert result["ok"] is True
-    assert captured["cwd"] == str(shared_module.DEFAULT_OUTPUT_DIR.resolve())
-    assert captured["cwd"] != str(workspace.resolve())
+    assert captured["cwd"] == str(workspace.resolve())
     assert captured["env"]["AGENT_OUTPUT_DIR"] == str(shared_module.DEFAULT_OUTPUT_DIR.resolve())
 
 
@@ -1086,7 +1085,7 @@ def test_shell_tool_schema_does_not_expose_confirmation_token(tmp_path):
     assert "confirmation_token" not in shell["input_schema"]["properties"]
     root_schema = shell["input_schema"]["properties"]["root"]
     assert root_schema["enum"] == ["output_dir", "workspace"]
-    assert root_schema["default"] == "output_dir"
+    assert root_schema["default"] == "workspace"
 
 
 def test_shell_runs_restricted_command_after_user_scoped_confirmation(

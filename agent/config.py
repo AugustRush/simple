@@ -790,23 +790,32 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
             )
             lines.append(
                 "The shell tool takes a `root` parameter (`output_dir` or "
-                "`workspace`); the default root is the configured output "
-                f"directory ({output_dir or inputs.default_output_dir}), NOT "
-                f"the workspace root ({workspace_root}). Relative `cwd` values "
-                "resolve inside that root, so downloads, clones, and generated "
-                "artifacts stay in the output directory."
+                "`workspace`); the default root is the selected project "
+                f"workspace ({workspace_root}). Relative `cwd` values resolve "
+                "inside that root, so downloads and generated artifacts must "
+                "explicitly use `root=output_dir`."
             )
             lines.append(
-                "For current project files use `root=workspace` with relative "
-                "paths; for downloads and build artifacts keep `root=output_dir` "
-                "and use relative targets such as `git clone <url> repo-name`; "
-                "run follow-up commands with `cwd` set to the directory you "
-                "created."
+                "Project source changes, dependency commands, tests, and normal "
+                "build commands belong in `root=workspace`; for downloads and "
+                "user-facing generated artifacts use `root=output_dir` with "
+                "relative targets such as `git clone <url> repo-name`. Keep "
+                "follow-up commands in the same root and set `cwd` to the "
+                "directory you created."
+            )
+            lines.append(
+                "In the Web channel, a folder selected with the project-folder "
+                "picker is an explicit read/write grant for this session."
             )
         if "send_file" in builtin_names:
             lines.append(
                 "If the user asks to receive a file in the current channel, use `send_file` with the resolved file path "
                 "instead of claiming file delivery is unsupported."
+            )
+            lines.append(
+                "For generated images, send each final user-facing image exactly once. "
+                "Do not send source grids, contact sheets, previews, or other intermediate images "
+                "unless the user explicitly asks to inspect them or requests multiple variants."
             )
         if "set_identity" in builtin_names:
             lines.append(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import threading
@@ -20,6 +20,30 @@ def test_daily_trigger_next_after_returns_next_local_wall_clock_time():
 
     assert trigger.next_after(now) == datetime(
         2026, 4, 19, 1, 0, tzinfo=timezone.utc
+    )
+
+
+def test_weekdays_trigger_skips_weekend_in_local_timezone():
+    from agent.scheduler import WeekdaysTrigger
+
+    trigger = WeekdaysTrigger(time_of_day="09:00", timezone_name="Asia/Shanghai")
+    friday_after_work = datetime(2026, 4, 17, 10, 0, tzinfo=timezone.utc)
+
+    assert trigger.next_after(friday_after_work) == datetime(
+        2026, 4, 20, 1, 0, tzinfo=timezone.utc
+    )
+
+
+def test_monthly_trigger_skips_month_without_requested_date():
+    from agent.scheduler import MonthlyTrigger
+
+    trigger = MonthlyTrigger(
+        day_of_month=31, time_of_day="09:00", timezone_name="Asia/Shanghai"
+    )
+    april = datetime(2026, 4, 1, tzinfo=timezone.utc)
+
+    assert trigger.next_after(april) == datetime(
+        2026, 5, 31, 1, 0, tzinfo=timezone.utc
     )
 
 
@@ -99,6 +123,54 @@ def test_scheduler_store_sets_schema_version(tmp_path):
     store.close()
 
     assert version >= 1
+
+
+def test_scheduler_store_migrates_v4_permission_profile(tmp_path):
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+
+    db_path = tmp_path / "scheduler.db"
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        """
+        CREATE TABLE scheduled_tasks (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
+            enabled INTEGER NOT NULL, trigger_json TEXT NOT NULL,
+            payload_json TEXT NOT NULL, delivery_mode TEXT NOT NULL,
+            delivery_target_json TEXT NOT NULL, model_override TEXT,
+            overlap_policy TEXT NOT NULL, missed_run_policy TEXT NOT NULL,
+            workspace_root TEXT NOT NULL DEFAULT '',
+            context_policy TEXT NOT NULL DEFAULT 'stateless',
+            timeout_seconds INTEGER NOT NULL DEFAULT 1800,
+            retry_policy_json TEXT NOT NULL DEFAULT '{}',
+            selected_skills_json TEXT NOT NULL DEFAULT '[]',
+            next_run_at TEXT, lease_until TEXT, active_run_id TEXT,
+            last_run_at TEXT, last_success_at TEXT,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute("PRAGMA user_version = 4")
+    connection.commit()
+    connection.close()
+
+    store = SchedulerStore(db_path=db_path)
+    columns = {
+        row[1] for row in sqlite3.connect(db_path).execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    created = store.create_task(NewScheduledTask(
+        name="migrated",
+        kind="agent_prompt",
+        trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+        payload={"prompt": "check migration"},
+        delivery_mode="standalone",
+        delivery_target=DeliveryTarget.standalone(),
+    ))
+    store.close()
+
+    assert "permission_profile" in columns
+    assert created.permission_profile == "inherit"
 
 
 def test_scheduler_store_claims_due_task_and_creates_run(tmp_path):
@@ -378,6 +450,149 @@ def test_scheduler_service_executes_due_agent_prompt_task_and_persists_run(tmp_p
     assert refreshed is not None
     assert refreshed.next_run_at is None
     assert refreshed.active_run_id is None
+
+
+def test_scheduler_run_captures_immutable_execution_snapshot(tmp_path):
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="snapshot",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "original"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            model_override="model-a",
+            workspace_root=str(tmp_path),
+            context_policy="task_history",
+            timeout_seconds=90,
+            retry_policy={"max_attempts": 3, "backoff_seconds": 5},
+            selected_skills=["quality/review"],
+            permission_profile="read_only",
+        )
+    )
+    claimed = store.claim_due_tasks(
+        datetime(2026, 4, 19, tzinfo=timezone.utc), lease_seconds=30
+    )[0]
+
+    assert claimed.run.config_snapshot["payload"] == {"prompt": "original"}
+    assert claimed.run.config_snapshot["model_override"] == "model-a"
+    assert claimed.run.config_snapshot["workspace_root"] == str(tmp_path)
+    assert claimed.run.config_snapshot["context_policy"] == "task_history"
+    assert claimed.run.config_snapshot["timeout_seconds"] == 90
+    assert claimed.run.config_snapshot["selected_skills"] == ["quality/review"]
+    assert claimed.run.config_snapshot["permission_profile"] == "read_only"
+    assert store.get_run(task.id, claimed.run.id).config_snapshot == claimed.run.config_snapshot
+
+
+def test_scheduler_manual_run_does_not_consume_next_occurrence(tmp_path):
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="manual",
+            kind="message",
+            trigger=TriggerSpec.daily("09:00", "Asia/Shanghai"),
+            payload={"message_text": "hello"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        ),
+        now=datetime(2026, 4, 18, tzinfo=timezone.utc),
+    )
+    original_next = task.next_run_at
+    claimed = store.claim_task_now(
+        task.id,
+        now=datetime(2026, 4, 18, 1, tzinfo=timezone.utc),
+        lease_seconds=30,
+    )
+
+    assert claimed is not None
+    assert claimed.run.trigger_source == "manual"
+    assert store.get_task(task.id).next_run_at == original_next
+
+
+def test_scheduler_automatic_retry_is_durable_and_claimed_after_backoff(tmp_path):
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="retry",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "run"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            retry_policy={"max_attempts": 3, "backoff_seconds": 10},
+        )
+    )
+    started = datetime(2026, 4, 19, tzinfo=timezone.utc)
+    first = store.claim_due_tasks(started, lease_seconds=30)[0]
+    assert store.complete_run(
+        task.id, first.run.id, finished_at=started, status="failed", error="boom"
+    )
+    queued = store.enqueue_retry(
+        task.id, first.run.id, retry_at=started + timedelta(seconds=10)
+    )
+    assert queued is not None
+    assert queued.status == "queued"
+
+    store.close()
+    reopened = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    assert reopened.claim_due_tasks(started + timedelta(seconds=9), lease_seconds=30) == []
+    retry = reopened.claim_due_tasks(started + timedelta(seconds=10), lease_seconds=30)[0]
+    assert retry.run.id == queued.id
+    assert retry.run.attempt == 2
+    assert retry.run.trigger_source == "automatic_retry"
+    assert retry.run.config_snapshot == first.run.config_snapshot
+
+
+def test_scheduler_service_queues_configured_retry_after_failure(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="retry-service",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "run"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            retry_policy={"max_attempts": 2, "backoff_seconds": 30},
+        )
+    )
+
+    async def failing_executor(task, run):
+        raise RuntimeError("temporary failure")
+
+    async def unused(*args):
+        raise AssertionError("unused")
+
+    service = SchedulerService(
+        store=store,
+        agent_executor=failing_executor,
+        system_executor=unused,
+        delivery=unused,
+        lease_seconds=300,
+    )
+    asyncio.run(
+        service.run_once(now=datetime(2026, 4, 19, tzinfo=timezone.utc))
+    )
+
+    runs = store.list_runs(task.id)
+    assert [run.status for run in runs] == ["failed", "queued"]
+    assert runs[1].attempt == 2
+    assert runs[1].retry_of_run_id == runs[0].id
 
 
 def test_scheduler_run_forever_recovers_after_iteration_error(tmp_path):

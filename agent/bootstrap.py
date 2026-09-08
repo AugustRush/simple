@@ -85,6 +85,15 @@ async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict
                 persisted_workspace = persisted.get("workspace_root")
                 if isinstance(persisted_workspace, str) and persisted_workspace.strip():
                     session_cfg["workspace_root"] = persisted_workspace
+                    # Picking a directory in the Web UI is an explicit,
+                    # session-scoped grant: project work happens there while
+                    # generated deliverables remain in output_dir.
+                    if persisted.get("workspace_write") is True:
+                        file_access = dict(session_cfg.get("file_access") or {})
+                        workspace_access = dict(file_access.get("workspace") or {})
+                        workspace_access.update({"read": True, "write": True})
+                        file_access["workspace"] = workspace_access
+                        session_cfg["file_access"] = file_access
             except (OSError, ValueError, TypeError):
                 pass
             # Generated files and attachments are always session-owned. A
@@ -261,7 +270,12 @@ async def _build_components_async(
         workspace_root=workspace_root,
         output_dir=output_dir,
     )
-    file_service = FileService(file_policy)
+    # The primary agent owns the selected project root. Child agents still
+    # receive their own narrowed write_scope when they are spawned.
+    file_service = FileService(
+        file_policy,
+        write_scope=("*",) if file_policy.workspace_write else (),
+    )
 
     # Resolve active provider format for format-aware classes
     active_provider = cfg.get("active_provider", "anthropic")
@@ -275,6 +289,7 @@ async def _build_components_async(
     # Web sessions, while state directories below the session home remain
     # isolated.  Keep this explicit for tools that resolve paths at call time.
     registry.set_context("resource_home", str(resource_root))
+    registry.set_context("workspace_root", str(workspace_root))
     registry.set_context("user_skills_dir", str(user_skills_dir))
     registry.set_context("user_tools_dir", str(user_tools_dir))
     registry.set_context("user_plugins_dir", str(user_plugins_dir))

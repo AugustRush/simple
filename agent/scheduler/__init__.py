@@ -6,12 +6,14 @@ from .models import (
     DeliveryTarget,
     ExecutionResult,
     IntervalTrigger,
+    MonthlyTrigger,
     NewScheduledTask,
     OnceTrigger,
     ScheduledTask,
     TaskRun,
     TriggerSpec,
     WeeklyTrigger,
+    WeekdaysTrigger,
 )
 from .runtime import SchedulerService
 from .store import SchedulerStore
@@ -23,6 +25,7 @@ __all__ = [
     "DeliveryTarget",
     "ExecutionResult",
     "IntervalTrigger",
+    "MonthlyTrigger",
     "NewScheduledTask",
     "OnceTrigger",
     "ScheduledTask",
@@ -32,4 +35,5 @@ __all__ = [
     "TaskRun",
     "TriggerSpec",
     "WeeklyTrigger",
+    "WeekdaysTrigger",
 ]

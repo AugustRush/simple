@@ -298,8 +298,8 @@ class BuiltinTools:
                     "root": {
                         "type": "string",
                         "enum": ["output_dir", "workspace"],
-                        "default": "output_dir",
-                        "description": "Security domain for this shell call. output_dir (default) is for generated, downloaded, and temporary files and resolves inside the configured output directory; workspace is for project-file operations and resolves inside the workspace root.",
+                        "default": "workspace",
+                        "description": "Security domain for this shell call. workspace (default) is the selected project directory; output_dir is for generated deliverables, downloads, and temporary files.",
                     },
                     "cwd": {
                         "type": "string",
@@ -379,7 +379,7 @@ class BuiltinTools:
 
         r.register(
             "send_file",
-            "Queue an existing file to be sent back to the current user/channel when the turn completes. Use after generating or locating a file the user asked to receive.",
+            "Queue an existing file to be sent back to the current user/channel when the turn completes. Use after generating or locating a file the user asked to receive. For generated images, queue each final deliverable once and omit source grids, previews, contact sheets, and other intermediate files unless the user explicitly requests them.",
             {
                 "type": "object",
                 "properties": {
@@ -687,7 +687,8 @@ class BuiltinTools:
                 "`action_type=agent_task` for future agent work, or "
                 "`action_type=system_job` for internal maintenance. "
                 "For once: provide `at`. For interval: provide `every`, `unit`, and `at` (anchor). "
-                "For daily: provide `time_of_day`. For weekly: provide `day_of_week` and `time_of_day`."
+                "For daily or weekdays: provide `time_of_day`. For weekly: provide `day_of_week` and `time_of_day`. "
+                "For monthly: provide `day_of_month` and `time_of_day`."
             ),
             {
                 "type": "object",
@@ -695,7 +696,7 @@ class BuiltinTools:
                     "name": {"type": "string", "description": "Short task name"},
                     "trigger_type": {
                         "type": "string",
-                        "description": "one of: once, interval, daily, weekly",
+                        "description": "one of: once, interval, daily, weekly, weekdays, monthly",
                     },
                     "prompt": {
                         "type": "string",
@@ -742,6 +743,10 @@ class BuiltinTools:
                     "day_of_week": {
                         "type": "string",
                         "description": "mon|tue|wed|thu|fri|sat|sun for weekly triggers",
+                    },
+                    "day_of_month": {
+                        "type": "integer",
+                        "description": "1-31 for monthly triggers; months without that date are skipped",
                     },
                     "delivery_mode": {
                         "type": "string",
@@ -2018,7 +2023,7 @@ class BuiltinTools:
         command: str,
         intent: str = "",
         timeout: int = 300,
-        root: str = "output_dir",
+        root: str = "workspace",
         cwd: Optional[str] = None,
     ) -> dict[str, Any]:
         # Security: block dangerous commands before spawning any subprocess.
@@ -2124,7 +2129,7 @@ class BuiltinTools:
         write_scope = _normalize_write_scope(
             self.registry.get_context("write_scope") or ()
         )
-        root = str(root or "output_dir").strip().casefold()
+        root = str(root or "workspace").strip().casefold()
         if root not in ("workspace", "output_dir"):
             return self._error(
                 "Shell root must be 'workspace' or 'output_dir'",
@@ -2728,6 +2733,7 @@ class BuiltinTools:
         unit: Optional[str] = None,
         time_of_day: Optional[str] = None,
         day_of_week: Optional[str] = None,
+        day_of_month: Optional[int] = None,
     ):
         from agent.scheduler import TriggerSpec
 
@@ -2748,6 +2754,14 @@ class BuiltinTools:
             if not day_of_week or not time_of_day:
                 raise ValueError("`day_of_week` and `time_of_day` are required for weekly triggers")
             return TriggerSpec.weekly(day_of_week, time_of_day, timezone_name)
+        if kind == "weekdays":
+            if not time_of_day:
+                raise ValueError("`time_of_day` is required for weekdays triggers")
+            return TriggerSpec.weekdays(time_of_day, timezone_name)
+        if kind == "monthly":
+            if day_of_month is None or not time_of_day:
+                raise ValueError("`day_of_month` and `time_of_day` are required for monthly triggers")
+            return TriggerSpec.monthly(day_of_month, time_of_day, timezone_name)
         raise ValueError(f"Unsupported trigger_type '{trigger_type}'")
 
     def _schedule_create(
@@ -2765,6 +2779,7 @@ class BuiltinTools:
         unit: Optional[str] = None,
         time_of_day: Optional[str] = None,
         day_of_week: Optional[str] = None,
+        day_of_month: Optional[int] = None,
         delivery_mode: Optional[str] = None,
     ) -> dict[str, Any]:
         trigger = self._schedule_trigger(
@@ -2775,6 +2790,7 @@ class BuiltinTools:
             unit=unit,
             time_of_day=time_of_day,
             day_of_week=day_of_week,
+            day_of_month=day_of_month,
         )
         resolved_mode, target = self._schedule_target(delivery_mode)
         from agent.scheduler import NewScheduledTask

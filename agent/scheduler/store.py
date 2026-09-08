@@ -17,6 +17,7 @@ from .models import (
     ScheduledTask,
     TaskRun,
     TriggerSpec,
+    execution_snapshot,
 )
 
 
@@ -66,7 +67,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 5
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -110,6 +111,12 @@ class SchedulerStore:
                     model_override TEXT,
                     overlap_policy TEXT NOT NULL,
                     missed_run_policy TEXT NOT NULL,
+                    workspace_root TEXT NOT NULL DEFAULT '',
+                    context_policy TEXT NOT NULL DEFAULT 'stateless',
+                    timeout_seconds INTEGER NOT NULL DEFAULT 1800,
+                    retry_policy_json TEXT NOT NULL DEFAULT '{"max_attempts": 1, "backoff_seconds": 30}',
+                    selected_skills_json TEXT NOT NULL DEFAULT '[]',
+                    permission_profile TEXT NOT NULL DEFAULT 'inherit',
                     next_run_at TEXT,
                     lease_until TEXT,
                     active_run_id TEXT,
@@ -131,6 +138,11 @@ class SchedulerStore:
                     error TEXT NOT NULL DEFAULT '',
                     output_path TEXT NOT NULL DEFAULT '',
                     delivery_status TEXT NOT NULL DEFAULT '',
+                    config_snapshot_json TEXT NOT NULL DEFAULT '{}',
+                    trigger_source TEXT NOT NULL DEFAULT 'schedule',
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    cancel_requested_at TEXT,
+                    retry_of_run_id TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(task_id) REFERENCES scheduled_tasks(id)
@@ -151,6 +163,83 @@ class SchedulerStore:
             version += 1
             if version == 1:
                 self._conn.execute("PRAGMA user_version = 1")
+            elif version == 2:
+                task_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_tasks)"
+                    ).fetchall()
+                }
+                run_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_task_runs)"
+                    ).fetchall()
+                }
+                additions = {
+                    "workspace_root": "TEXT NOT NULL DEFAULT ''",
+                    "context_policy": "TEXT NOT NULL DEFAULT 'stateless'",
+                    "timeout_seconds": "INTEGER NOT NULL DEFAULT 1800",
+                    "retry_policy_json": (
+                        "TEXT NOT NULL DEFAULT "
+                        "'{\"max_attempts\": 1, \"backoff_seconds\": 30}'"
+                    ),
+                }
+                for name, declaration in additions.items():
+                    if name not in task_columns:
+                        self._conn.execute(
+                            f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}"
+                        )
+                run_additions = {
+                    "config_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
+                    "trigger_source": "TEXT NOT NULL DEFAULT 'schedule'",
+                    "attempt": "INTEGER NOT NULL DEFAULT 1",
+                    "cancel_requested_at": "TEXT",
+                }
+                for name, declaration in run_additions.items():
+                    if name not in run_columns:
+                        self._conn.execute(
+                            f"ALTER TABLE scheduled_task_runs ADD COLUMN {name} {declaration}"
+                        )
+                self._conn.execute("PRAGMA user_version = 2")
+            elif version == 3:
+                run_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_task_runs)"
+                    ).fetchall()
+                }
+                if "retry_of_run_id" not in run_columns:
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_task_runs ADD COLUMN "
+                        "retry_of_run_id TEXT NOT NULL DEFAULT ''"
+                    )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_queued "
+                    "ON scheduled_task_runs(status, started_at)"
+                )
+                self._conn.execute("PRAGMA user_version = 3")
+            elif version == 4:
+                task_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_tasks)"
+                    ).fetchall()
+                }
+                if "selected_skills_json" not in task_columns:
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_tasks ADD COLUMN "
+                        "selected_skills_json TEXT NOT NULL DEFAULT '[]'"
+                    )
+                self._conn.execute("PRAGMA user_version = 4")
+            elif version == 5:
+                task_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_tasks)"
+                    ).fetchall()
+                }
+                if "permission_profile" not in task_columns:
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_tasks ADD COLUMN "
+                        "permission_profile TEXT NOT NULL DEFAULT 'inherit'"
+                    )
+                self._conn.execute("PRAGMA user_version = 5")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -165,6 +254,12 @@ class SchedulerStore:
             model_override=row["model_override"],
             overlap_policy=row["overlap_policy"],
             missed_run_policy=row["missed_run_policy"],
+            workspace_root=row["workspace_root"],
+            context_policy=row["context_policy"],
+            timeout_seconds=int(row["timeout_seconds"]),
+            retry_policy=json.loads(row["retry_policy_json"]),
+            selected_skills=json.loads(row["selected_skills_json"]),
+            permission_profile=row["permission_profile"],
             next_run_at=_dt(row["next_run_at"]),
             lease_until=_dt(row["lease_until"]),
             active_run_id=row["active_run_id"],
@@ -186,6 +281,11 @@ class SchedulerStore:
             error=row["error"],
             output_path=row["output_path"],
             delivery_status=row["delivery_status"],
+            config_snapshot=json.loads(row["config_snapshot_json"]),
+            trigger_source=row["trigger_source"],
+            attempt=int(row["attempt"]),
+            cancel_requested_at=_dt(row["cancel_requested_at"]),
+            retry_of_run_id=row["retry_of_run_id"],
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),
         )
@@ -203,9 +303,13 @@ class SchedulerStore:
                 INSERT INTO scheduled_tasks (
                     id, name, kind, enabled, trigger_json, payload_json,
                     delivery_mode, delivery_target_json, model_override,
-                    overlap_policy, missed_run_policy, next_run_at, lease_until,
+                    overlap_policy, missed_run_policy, workspace_root,
+                    context_policy, timeout_seconds, retry_policy_json,
+                    selected_skills_json,
+                    permission_profile,
+                    next_run_at, lease_until,
                     active_run_id, last_run_at, last_success_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
                 """,
                 (
                     task_id,
@@ -219,6 +323,12 @@ class SchedulerStore:
                     task.model_override,
                     task.overlap_policy,
                     task.missed_run_policy,
+                    task.workspace_root,
+                    task.context_policy,
+                    int(task.timeout_seconds),
+                    json.dumps(task.retry_policy, ensure_ascii=False),
+                    json.dumps(task.selected_skills, ensure_ascii=False),
+                    task.permission_profile,
                     _iso(next_run_at),
                     _iso(created_at),
                     _iso(created_at),
@@ -246,6 +356,12 @@ class SchedulerStore:
                   )
               AND overlap_policy = ?
               AND missed_run_policy = ?
+              AND workspace_root = ?
+              AND context_policy = ?
+              AND timeout_seconds = ?
+              AND retry_policy_json = ?
+              AND selected_skills_json = ?
+              AND permission_profile = ?
             ORDER BY created_at ASC
             LIMIT 1
             """,
@@ -261,6 +377,12 @@ class SchedulerStore:
                 task.model_override,
                 task.overlap_policy,
                 task.missed_run_policy,
+                task.workspace_root,
+                task.context_policy,
+                int(task.timeout_seconds),
+                json.dumps(task.retry_policy, ensure_ascii=False),
+                json.dumps(task.selected_skills, ensure_ascii=False),
+                task.permission_profile,
             ),
         ).fetchone()
         return self._task_from_row(row) if row else None
@@ -289,6 +411,12 @@ class SchedulerStore:
                 row["model_override"],
                 row["overlap_policy"],
                 row["missed_run_policy"],
+                row["workspace_root"],
+                row["context_policy"],
+                row["timeout_seconds"],
+                row["retry_policy_json"],
+                row["selected_skills_json"],
+                row["permission_profile"],
             )
             if signature in seen:
                 duplicate_ids.append(row["id"])
@@ -336,6 +464,291 @@ class SchedulerStore:
         return [self._run_from_row(row) for row in rows]
 
     @_synchronized
+    def get_run(self, task_id: str, run_id: str) -> Optional[TaskRun]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM scheduled_task_runs
+            WHERE task_id = ? AND id = ?
+            LIMIT 1
+            """,
+            (task_id, run_id),
+        ).fetchone()
+        return self._run_from_row(row) if row else None
+
+    @_synchronized
+    def latest_run(self, task_id: str) -> Optional[TaskRun]:
+        row = self._conn.execute(
+            """
+            SELECT * FROM scheduled_task_runs
+            WHERE task_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        return self._run_from_row(row) if row else None
+
+    @_synchronized
+    def update_task(
+        self,
+        task_id: str,
+        task: NewScheduledTask,
+        *,
+        now: Optional[datetime] = None,
+    ) -> Optional[ScheduledTask]:
+        updated_at = (now or datetime.now(UTC)).astimezone(UTC)
+        next_run_at = task.trigger.initial_run_at(updated_at)
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET name = ?, kind = ?, enabled = ?, trigger_json = ?,
+                    payload_json = ?, delivery_mode = ?, delivery_target_json = ?,
+                    model_override = ?, overlap_policy = ?, missed_run_policy = ?,
+                    workspace_root = ?, context_policy = ?, timeout_seconds = ?,
+                    retry_policy_json = ?, next_run_at = ?, updated_at = ?
+                    , selected_skills_json = ?, permission_profile = ?
+                WHERE id = ?
+                """,
+                (
+                    task.name,
+                    task.kind,
+                    1 if task.enabled else 0,
+                    task.trigger.to_json(),
+                    json.dumps(task.payload, ensure_ascii=False),
+                    task.delivery_mode,
+                    task.delivery_target.to_json(),
+                    task.model_override,
+                    task.overlap_policy,
+                    task.missed_run_policy,
+                    task.workspace_root,
+                    task.context_policy,
+                    int(task.timeout_seconds),
+                    json.dumps(task.retry_policy, ensure_ascii=False),
+                    _iso(next_run_at),
+                    _iso(updated_at),
+                    json.dumps(task.selected_skills, ensure_ascii=False),
+                    task.permission_profile,
+                    task_id,
+                ),
+            )
+        return self.get_task(task_id) if cursor.rowcount else None
+
+    def _claim_task_in_transaction(
+        self,
+        task: ScheduledTask,
+        *,
+        now: datetime,
+        lease_seconds: int,
+        scheduled_for: datetime,
+        trigger_source: str,
+        snapshot: dict,
+        attempt: int = 1,
+    ) -> Optional[ClaimedTask]:
+        run_id = _new_id()
+        lease_until = now + timedelta(seconds=lease_seconds)
+        self._conn.execute(
+            """
+            INSERT INTO scheduled_task_runs (
+                id, task_id, scheduled_for, started_at, finished_at, status,
+                summary, error, output_path, delivery_status,
+                config_snapshot_json, trigger_source, attempt,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                task.id,
+                _iso(scheduled_for),
+                _iso(now),
+                json.dumps(snapshot, ensure_ascii=False),
+                trigger_source,
+                max(1, int(attempt)),
+                _iso(now),
+                _iso(now),
+            ),
+        )
+        cursor = self._conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET lease_until = ?, active_run_id = ?, updated_at = ?
+            WHERE id = ? AND active_run_id IS NULL
+            """,
+            (_iso(lease_until), run_id, _iso(now), task.id),
+        )
+        if cursor.rowcount != 1:
+            self._conn.execute(
+                "DELETE FROM scheduled_task_runs WHERE id = ?", (run_id,)
+            )
+            return None
+        refreshed = self._conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE id = ?", (task.id,)
+        ).fetchone()
+        claimed_task = self._task_from_row(refreshed) if refreshed else task
+        return ClaimedTask(
+            task=claimed_task,
+            run=TaskRun(
+                id=run_id,
+                task_id=task.id,
+                scheduled_for=scheduled_for,
+                started_at=now,
+                finished_at=None,
+                status="running",
+                config_snapshot=snapshot,
+                trigger_source=trigger_source,
+                attempt=max(1, int(attempt)),
+                created_at=now,
+                updated_at=now,
+            ),
+        )
+
+    @_synchronized
+    def claim_task_now(
+        self,
+        task_id: str,
+        *,
+        now: Optional[datetime] = None,
+        lease_seconds: int = 300,
+    ) -> Optional[ClaimedTask]:
+        if lease_seconds < 3:
+            raise ValueError("lease_seconds must be at least 3")
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        with self._immediate_transaction():
+            self._recover_stale_runs_in_transaction(current)
+            row = self._conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE id = ? AND active_run_id IS NULL",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            task = self._task_from_row(row)
+            return self._claim_task_in_transaction(
+                task,
+                now=current,
+                lease_seconds=lease_seconds,
+                scheduled_for=current,
+                trigger_source="manual",
+                snapshot=execution_snapshot(task),
+            )
+
+    @_synchronized
+    def claim_retry(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        use_latest: bool = False,
+        now: Optional[datetime] = None,
+        lease_seconds: int = 300,
+    ) -> Optional[ClaimedTask]:
+        if lease_seconds < 3:
+            raise ValueError("lease_seconds must be at least 3")
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        with self._immediate_transaction():
+            self._recover_stale_runs_in_transaction(current)
+            task_row = self._conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE id = ? AND active_run_id IS NULL",
+                (task_id,),
+            ).fetchone()
+            source_row = self._conn.execute(
+                """
+                SELECT * FROM scheduled_task_runs
+                WHERE id = ? AND task_id = ? AND status <> 'running'
+                """,
+                (run_id, task_id),
+            ).fetchone()
+            if task_row is None or source_row is None:
+                return None
+            task = self._task_from_row(task_row)
+            source = self._run_from_row(source_row)
+            snapshot = execution_snapshot(task) if use_latest else source.config_snapshot
+            if not snapshot:
+                snapshot = execution_snapshot(task)
+            return self._claim_task_in_transaction(
+                task,
+                now=current,
+                lease_seconds=lease_seconds,
+                scheduled_for=source.scheduled_for,
+                trigger_source="retry_latest" if use_latest else "retry_snapshot",
+                snapshot=snapshot,
+                attempt=source.attempt + 1,
+            )
+
+    @_synchronized
+    def request_cancel(
+        self, task_id: str, run_id: str, *, now: Optional[datetime] = None
+    ) -> bool:
+        requested_at = (now or datetime.now(UTC)).astimezone(UTC)
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE scheduled_task_runs
+                SET cancel_requested_at = ?, updated_at = ?
+                WHERE id = ? AND task_id = ? AND status = 'running'
+                """,
+                (_iso(requested_at), _iso(requested_at), run_id, task_id),
+            )
+        return cursor.rowcount == 1
+
+    @_synchronized
+    def enqueue_retry(
+        self,
+        task_id: str,
+        source_run_id: str,
+        *,
+        retry_at: datetime,
+    ) -> Optional[TaskRun]:
+        retry_at = retry_at.astimezone(UTC)
+        with self._immediate_transaction():
+            source_row = self._conn.execute(
+                """
+                SELECT * FROM scheduled_task_runs
+                WHERE id = ? AND task_id = ? AND status = 'failed'
+                """,
+                (source_run_id, task_id),
+            ).fetchone()
+            if source_row is None:
+                return None
+            existing = self._conn.execute(
+                """
+                SELECT * FROM scheduled_task_runs
+                WHERE task_id = ? AND retry_of_run_id = ? AND status IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (task_id, source_run_id),
+            ).fetchone()
+            if existing is not None:
+                return self._run_from_row(existing)
+            source = self._run_from_row(source_row)
+            run_id = _new_id()
+            self._conn.execute(
+                """
+                INSERT INTO scheduled_task_runs (
+                    id, task_id, scheduled_for, started_at, finished_at, status,
+                    summary, error, output_path, delivery_status,
+                    config_snapshot_json, trigger_source, attempt,
+                    cancel_requested_at, retry_of_run_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, 'queued', '', '', '', '', ?,
+                          'automatic_retry', ?, NULL, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    task_id,
+                    _iso(source.scheduled_for),
+                    _iso(retry_at),
+                    json.dumps(source.config_snapshot, ensure_ascii=False),
+                    source.attempt + 1,
+                    source_run_id,
+                    _iso(datetime.now(UTC)),
+                    _iso(datetime.now(UTC)),
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT * FROM scheduled_task_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        return self._run_from_row(row) if row else None
+
+    @_synchronized
     def claim_due_tasks(
         self, now: datetime, limit: int = 10, lease_seconds: int = 300
     ) -> list[ClaimedTask]:
@@ -345,6 +758,53 @@ class SchedulerStore:
         claimed: list[ClaimedTask] = []
         with self._immediate_transaction():
             self._recover_stale_runs_in_transaction(now)
+            queued_rows = self._conn.execute(
+                """
+                SELECT r.* FROM scheduled_task_runs r
+                JOIN scheduled_tasks t ON t.id = r.task_id
+                WHERE r.status = 'queued'
+                  AND r.started_at <= ?
+                  AND t.enabled = 1
+                  AND t.active_run_id IS NULL
+                ORDER BY r.started_at ASC, r.created_at ASC
+                LIMIT ?
+                """,
+                (_iso(now), int(limit)),
+            ).fetchall()
+            for queued_row in queued_rows:
+                run = self._run_from_row(queued_row)
+                task_row = self._conn.execute(
+                    "SELECT * FROM scheduled_tasks WHERE id = ?", (run.task_id,)
+                ).fetchone()
+                if task_row is None:
+                    continue
+                task = self._task_from_row(task_row)
+                lease_until = now + timedelta(seconds=lease_seconds)
+                task_cursor = self._conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET lease_until = ?, active_run_id = ?, updated_at = ?
+                    WHERE id = ? AND enabled = 1 AND active_run_id IS NULL
+                    """,
+                    (_iso(lease_until), run.id, _iso(now), task.id),
+                )
+                if task_cursor.rowcount != 1:
+                    continue
+                self._conn.execute(
+                    """
+                    UPDATE scheduled_task_runs
+                    SET status = 'running', started_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (_iso(now), _iso(now), run.id),
+                )
+                run.status = "running"
+                run.started_at = now
+                run.updated_at = now
+                claimed.append(ClaimedTask(task=task, run=run))
+            remaining = max(0, int(limit) - len(claimed))
+            if remaining == 0:
+                return claimed
             rows = self._conn.execute(
                 """
                 SELECT * FROM scheduled_tasks
@@ -355,7 +815,7 @@ class SchedulerStore:
                 ORDER BY next_run_at ASC, created_at ASC
                 LIMIT ?
                 """,
-                (_iso(now), int(limit)),
+                (_iso(now), remaining),
             ).fetchall()
             for row in rows:
                 task = self._task_from_row(row)
@@ -369,14 +829,17 @@ class SchedulerStore:
                     """
                     INSERT INTO scheduled_task_runs (
                         id, task_id, scheduled_for, started_at, finished_at, status,
-                        summary, error, output_path, delivery_status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, ?)
+                        summary, error, output_path, delivery_status,
+                        config_snapshot_json, trigger_source, attempt,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, 'schedule', 1, ?, ?)
                     """,
                     (
                         run_id,
                         task.id,
                         _iso(task.next_run_at),
                         _iso(started_at),
+                        json.dumps(execution_snapshot(task), ensure_ascii=False),
                         _iso(started_at),
                         _iso(started_at),
                     ),
@@ -419,6 +882,8 @@ class SchedulerStore:
                             started_at=started_at,
                             finished_at=None,
                             status="running",
+                            config_snapshot=execution_snapshot(task),
+                            trigger_source="schedule",
                             created_at=started_at,
                             updated_at=started_at,
                         ),

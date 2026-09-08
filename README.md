@@ -628,13 +628,21 @@ generic system facilities App Store GUI apps get from `application.sb`
 > unrestricted — so a command that genuinely wants to exfiltrate something no
 > list anticipated can. Use `restricted` when that matters.
 
-The shell tool takes a `root` parameter (`output_dir` by default, or
-`workspace`) and resolves relative `cwd` values inside that root.  Generated
-and downloaded files therefore land in the configured output directory, not
-the repository.  When a call is scoped to `output_dir` and still creates new
-files inside the workspace (for example via absolute paths), the tool moves
-them to `output_dir/workspace-artifacts/` — this invariant holds even when
-the OS sandbox is disabled.
+The shell tool takes a `root` parameter (`workspace` by default, or
+`output_dir`) and resolves relative `cwd` values inside that root. Project
+commands therefore run in the selected workspace, like a coding agent opened
+on that folder. Generated deliverables, downloads, attachments, and temporary
+files should explicitly use `output_dir`; Web keeps that directory isolated per
+session. When a call is scoped to `output_dir` and still creates new files
+inside the workspace (for example via absolute paths), the tool moves them to
+`output_dir/workspace-artifacts/` — this invariant holds even when the OS
+sandbox is disabled.
+
+Selecting a project folder in Web is an explicit, session-scoped read/write
+grant for that folder. The selection and access mode are stored in the session
+manifest and restored after a gateway restart. Global skills, plugins, tools,
+and configuration still come from `~/.agent`; conversation state, attachments,
+runtime logs, and generated output remain in the session home.
 
 One limitation is architectural: seatbelt cannot nest — a tool that installs
 its own OS sandbox (headless Chrome, Electron) must disable it

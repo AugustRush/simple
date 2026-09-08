@@ -290,6 +290,7 @@ user-invocable: true
     assert "use the schedule tools instead of saying you cannot act in the future" in prompt
     assert "Do not pretend the scheduled action has already run" in prompt
     assert "use `send_file` with the resolved file path" in prompt
+    assert "send each final user-facing image exactly once" in prompt
 
 
 def test_activate_skill_returns_candidates_for_namespaced_match(monkeypatch, tmp_path):
@@ -8362,6 +8363,119 @@ def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_
     assert state.turn_count == 1
     assert sink is None
     assert kwargs == {}
+
+
+def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
+    monkeypatch, tmp_path
+):
+    import types
+
+    import agent as agent_module
+    import agent.cli as cli_module
+    from agent.runtime import TurnExecution, TurnResult
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            self.agent_executor = kwargs["agent_executor"]
+
+    class _FakeStore:
+        pass
+
+    class _FakeAgent:
+        context_manager = object()
+
+    class _FakeAgentCore:
+        def __init__(self):
+            self.states = []
+
+        async def handle_turn(self, turn_input, state, **kwargs):
+            self.states.append(state)
+            return TurnExecution(result=TurnResult(text="done"))
+
+    captured = {"configs": [], "closed": []}
+    isolated_core = _FakeAgentCore()
+
+    async def fake_build(cfg, *, announce=True, resource_home=None):
+        captured["configs"].append((cfg, announce, resource_home))
+        return {
+            "agent": _FakeAgent(),
+            "agent_core": isolated_core,
+            "system_prompt": "system",
+            "skill_catalog": object(),
+        }
+
+    async def fake_close(components):
+        captured["closed"].append(components)
+
+    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
+    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
+    monkeypatch.setattr(agent_module, "_close_components", fake_close)
+
+    cfg = _minimal_cfg()
+    cfg["file_access"] = {"workspace": {"read": True, "write": True}}
+    cfg["permissions"] = {"shell_sandbox": "danger-full-access"}
+    primary = {"output_dir": tmp_path, "workspace_root": tmp_path}
+    service, _store, _components = asyncio.run(
+        cli_module._build_scheduler_service(
+            cfg,
+            poll_seconds=1,
+            lease_seconds=30,
+            max_concurrent_runs=1,
+            components=primary,
+        )
+    )
+    task = types.SimpleNamespace(
+        id="task-1",
+        name="review",
+        payload={"prompt": "review it"},
+        workspace_root=str(tmp_path),
+        context_policy="stateless",
+        permission_profile="inherit",
+        model_override=None,
+    )
+    run = types.SimpleNamespace(
+        id="run-1",
+        config_snapshot={
+            "payload": {"prompt": "review it"},
+            "workspace_root": str(tmp_path),
+            "context_policy": "stateless",
+            "selected_skills": ["quality/review"],
+            "permission_profile": "read_only",
+        },
+    )
+
+    result = asyncio.run(service.agent_executor(task, run))
+
+    run_cfg, announce, _resource_home = captured["configs"][0]
+    assert result.text_output == "done"
+    assert announce is False
+    assert run_cfg["file_access"]["workspace"] == {"read": True, "write": False}
+    assert run_cfg["permissions"]["shell_sandbox"] == "read_all"
+    assert cfg["file_access"]["workspace"]["write"] is True
+    assert cfg["permissions"]["shell_sandbox"] == "danger-full-access"
+    assert isolated_core.states[0].ctx.metadata["required_skills_preset"] == [
+        "quality/review"
+    ]
+    assert len(captured["closed"]) == 1
+
+
+def test_agent_core_rejects_deleted_required_skill():
+    from agent.runtime import AgentCore, RuntimeSessionState
+
+    class _MissingSkillCatalog:
+        def get(self, skill_id):
+            return None
+
+    state = RuntimeSessionState(
+        ctx=SimpleNamespace(
+            metadata={"required_skills_preset": ["deleted-skill"]}
+        )
+    )
+    core = AgentCore({"skill_catalog": _MissingSkillCatalog()})
+
+    with pytest.raises(ValueError, match="required skill is unavailable: deleted-skill"):
+        core._prepare_skill_request("run scheduled task", state)
 
 
 def test_interactive_loop_context_command_uses_dynamic_category_stats(

@@ -14,6 +14,8 @@ import {
   Checkbox,
   Col,
   ConfigProvider,
+  DatePicker,
+  Drawer,
   Dropdown,
   Empty,
   Form,
@@ -30,10 +32,12 @@ import {
   Switch,
   Tag,
   theme,
+  TimePicker,
   Tooltip,
   Typography,
   message,
 } from 'antd'
+import zhCN from 'antd/locale/zh_CN'
 import {
   ApiOutlined,
   AppstoreOutlined,
@@ -68,7 +72,11 @@ import {
   UploadOutlined,
   UserOutlined,
 } from '@ant-design/icons'
+import dayjs from 'dayjs'
+import 'dayjs/locale/zh-cn'
 import './index.css'
+
+dayjs.locale('zh-cn')
 
 const { Sider, Header, Content } = Layout
 const { TextArea } = Input
@@ -139,6 +147,86 @@ interface ScheduleInfo {
   trigger?: Record<string, any>
   payload?: Record<string, any>
   next_run_at?: string
+  last_run_at?: string
+  last_success_at?: string
+  delivery_mode?: string
+  active_run_id?: string | null
+  latest_run?: ScheduleRun | null
+  model_override?: string | null
+  workspace_root?: string
+  context_policy?: 'stateless' | 'task_history' | 'shared_memory'
+  timeout_seconds?: number
+  retry_policy?: { max_attempts?: number; backoff_seconds?: number }
+  selected_skills?: string[]
+  permission_profile?: 'inherit' | 'read_only'
+  overlap_policy?: string
+  missed_run_policy?: string
+}
+
+interface ScheduleRun {
+  id: string
+  task_id: string
+  status: string
+  scheduled_for?: string
+  started_at?: string
+  finished_at?: string
+  duration_ms?: number | null
+  summary?: string
+  error?: string
+  delivery_status?: string
+  output_available?: boolean
+  output_url?: string
+  trigger_source?: string
+  attempt?: number
+  cancel_requested_at?: string | null
+  retry_of_run_id?: string
+  config_snapshot?: Record<string, any>
+}
+
+interface SchedulerHealth {
+  status: 'online' | 'offline' | string
+  last_heartbeat?: string
+  active_runs?: number
+  max_concurrent_runs?: number
+}
+
+interface ScheduleRunOutput {
+  run_id: string
+  available: boolean
+  content: string
+  truncated?: boolean
+  output_url?: string
+}
+
+interface ScheduleArtifact {
+  path: string
+  name: string
+  mime_type: string
+  size_bytes: number
+  url: string
+}
+
+interface ScheduleDraft {
+  name: string
+  action_type: 'agent_task' | 'message'
+  trigger_type: 'once' | 'interval' | 'daily' | 'weekly' | 'weekdays' | 'monthly'
+  at: string
+  every: number
+  unit: 'minutes' | 'hours' | 'days' | 'weeks'
+  anchor_at: string
+  time_of_day: string
+  day_of_week: string
+  day_of_month: number
+  prompt: string
+  message_text: string
+  workspace_root: string
+  context_policy: 'stateless' | 'task_history' | 'shared_memory'
+  model_override: string
+  timeout_seconds: number
+  max_attempts: number
+  backoff_seconds: number
+  selected_skills: string[]
+  permission_profile: 'inherit' | 'read_only'
 }
 
 interface SessionTaskGuidance {
@@ -276,6 +364,17 @@ function truncate(value: string, length = 64): string {
   return value.length > length ? `${value.slice(0, length)}…` : value
 }
 
+function compactWorkspacePath(value: string, maxLength = 36): string {
+  const path = String(value || '').trim()
+  if (!path || path.length <= maxLength) return path
+  const parts = path.split(/[\\/]+/).filter(Boolean)
+  if (parts.length < 2) return truncate(path, maxLength)
+  const tail = parts.slice(-2).join('/')
+  const prefix = path.startsWith('/') ? '/' : ''
+  const compact = `${prefix}…/${tail}`
+  return compact.length <= maxLength ? compact : truncate(compact, maxLength)
+}
+
 function relativeTime(value?: string): string {
   if (!value) return '—'
   const date = new Date(value)
@@ -306,6 +405,149 @@ function toolStateIcon(state?: ToolState) {
   return <CheckCircleFilled />
 }
 
+const WEEKDAY_OPTIONS = [
+  { value: 'monday', label: '周一' },
+  { value: 'tuesday', label: '周二' },
+  { value: 'wednesday', label: '周三' },
+  { value: 'thursday', label: '周四' },
+  { value: 'friday', label: '周五' },
+  { value: 'saturday', label: '周六' },
+  { value: 'sunday', label: '周日' },
+]
+
+function defaultScheduleDraft(workspaceRoot = ''): ScheduleDraft {
+  const start = dayjs().add(1, 'hour').startOf('minute')
+  const weekday = WEEKDAY_OPTIONS[(start.day() + 6) % 7].value
+  return {
+    name: '',
+    action_type: 'agent_task',
+    trigger_type: 'once',
+    at: start.toISOString(),
+    every: 1,
+    unit: 'hours',
+    anchor_at: start.toISOString(),
+    time_of_day: start.format('HH:mm'),
+    day_of_week: weekday,
+    day_of_month: start.date(),
+    prompt: '',
+    message_text: '',
+    workspace_root: workspaceRoot,
+    context_policy: 'stateless',
+    model_override: '',
+    timeout_seconds: 1800,
+    max_attempts: 1,
+    backoff_seconds: 30,
+    selected_skills: [],
+    permission_profile: 'inherit',
+  }
+}
+
+function scheduleDraftFromTask(task: ScheduleInfo): ScheduleDraft {
+  const fallback = defaultScheduleDraft(task.workspace_root || '')
+  const trigger = task.trigger || {}
+  return {
+    ...fallback,
+    name: task.name,
+    action_type: task.kind === 'message' ? 'message' : 'agent_task',
+    trigger_type: (task.trigger_type || 'once') as ScheduleDraft['trigger_type'],
+    at: String(trigger.at || fallback.at),
+    every: Number(trigger.every || 1),
+    unit: (trigger.unit || 'hours') as ScheduleDraft['unit'],
+    anchor_at: String(trigger.anchor_at || fallback.anchor_at),
+    time_of_day: String(trigger.time_of_day || fallback.time_of_day),
+    day_of_week: String(trigger.day_of_week || fallback.day_of_week),
+    day_of_month: Number(trigger.day_of_month || fallback.day_of_month),
+    prompt: String(task.payload?.prompt || ''),
+    message_text: String(task.payload?.message_text || ''),
+    workspace_root: task.workspace_root || '',
+    context_policy: task.context_policy || 'stateless',
+    model_override: task.model_override || '',
+    timeout_seconds: Number(task.timeout_seconds || 1800),
+    max_attempts: Number(task.retry_policy?.max_attempts || 1),
+    backoff_seconds: Number(task.retry_policy?.backoff_seconds ?? 30),
+    selected_skills: task.selected_skills || [],
+    permission_profile: task.permission_profile || 'inherit',
+  }
+}
+
+function scheduleRequestBody(draft: ScheduleDraft) {
+  const { max_attempts, backoff_seconds, ...rest } = draft
+  return {
+    ...rest,
+    retry_policy: { max_attempts, backoff_seconds },
+    timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone,
+  }
+}
+
+function scheduleTimeValue(value: string) {
+  const [hour, minute] = String(value || '').split(':').map(Number)
+  if (!Number.isInteger(hour) || !Number.isInteger(minute)) return null
+  return dayjs().hour(hour).minute(minute).second(0).millisecond(0)
+}
+
+function scheduleTriggerLabel(task: ScheduleInfo): string {
+  const trigger = task.trigger || {}
+  if (task.trigger_type === 'once') {
+    return trigger.at ? `一次 · ${new Date(trigger.at).toLocaleString()}` : '一次性执行'
+  }
+  if (task.trigger_type === 'interval') {
+    const units: Record<string, string> = { minutes: '分钟', hours: '小时', days: '天', weeks: '周' }
+    return `每 ${trigger.every || 1} ${units[trigger.unit] || trigger.unit || ''}`
+  }
+  if (task.trigger_type === 'daily') return `每天 ${trigger.time_of_day || ''}`
+  if (task.trigger_type === 'weekdays') return `工作日 ${trigger.time_of_day || ''}`
+  if (task.trigger_type === 'monthly') return `每月 ${trigger.day_of_month || 1} 日 ${trigger.time_of_day || ''}`
+  if (task.trigger_type === 'weekly') {
+    const weekday = WEEKDAY_OPTIONS.find(item => item.value === trigger.day_of_week)?.label || trigger.day_of_week || ''
+    return `每${weekday} ${trigger.time_of_day || ''}`
+  }
+  return '未设置计划'
+}
+
+function scheduleRunStatusLabel(status?: string): string {
+  if (status === 'running') return '执行中'
+  if (status === 'queued') return '等待重试'
+  if (status === 'succeeded') return '执行成功'
+  if (status === 'failed') return '执行失败'
+  if (status === 'interrupted') return '已中断'
+  if (status === 'cancelled') return '已取消'
+  return '等待首次执行'
+}
+
+function scheduleRunStatusIcon(status?: string) {
+  if (status === 'running') return <LoadingOutlined spin />
+  if (status === 'queued') return <ClockCircleOutlined />
+  if (status === 'succeeded') return <CheckCircleFilled />
+  if (status === 'failed' || status === 'interrupted' || status === 'cancelled') {
+    return <ExclamationCircleFilled />
+  }
+  return <ClockCircleOutlined />
+}
+
+function formatScheduleDuration(durationMs?: number | null): string {
+  if (durationMs === null || durationMs === undefined) return '—'
+  if (durationMs < 1000) return `${durationMs} 毫秒`
+  const seconds = Math.round(durationMs / 1000)
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  const rest = seconds % 60
+  return rest ? `${minutes} 分 ${rest} 秒` : `${minutes} 分钟`
+}
+
+function formatFileSize(sizeBytes: number): string {
+  if (sizeBytes < 1024) return `${sizeBytes} B`
+  if (sizeBytes < 1024 * 1024) return `${Math.max(1, Math.round(sizeBytes / 1024))} KB`
+  return `${(sizeBytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function scheduleDeliveryStatusLabel(status?: string): string {
+  if (status === 'stored') return '结果已保存'
+  if (status === 'delivered') return '结果已发送'
+  if (status === 'skipped') return '无文本输出'
+  if (status === 'failed') return '结果交付失败'
+  return status || '—'
+}
+
 function App() {
   const [messageApi, contextHolder] = message.useMessage()
   const [themeMode, setThemeMode] = useState<string>(
@@ -321,8 +563,24 @@ function App() {
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [skills, setSkills] = useState<SkillInfo[]>([])
   const [schedules, setSchedules] = useState<ScheduleInfo[]>([])
+  const [scheduleQuery, setScheduleQuery] = useState('')
+  const [scheduleStatusFilter, setScheduleStatusFilter] = useState('all')
+  const [selectedScheduleIds, setSelectedScheduleIds] = useState<string[]>([])
   const [scheduleModalOpen, setScheduleModalOpen] = useState(false)
-  const [scheduleDraft, setScheduleDraft] = useState<any>({ name: '', trigger_type: 'once', at: '', message_text: '' })
+  const [scheduleSaving, setScheduleSaving] = useState(false)
+  const [scheduleDraft, setScheduleDraft] = useState<ScheduleDraft>(defaultScheduleDraft)
+  const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null)
+  const [schedulePreview, setSchedulePreview] = useState<string[]>([])
+  const [schedulePreviewError, setSchedulePreviewError] = useState('')
+  const [schedulerHealth, setSchedulerHealth] = useState<SchedulerHealth>({ status: 'offline' })
+  const [scheduleDetailOpen, setScheduleDetailOpen] = useState(false)
+  const [selectedSchedule, setSelectedSchedule] = useState<ScheduleInfo | null>(null)
+  const [scheduleRuns, setScheduleRuns] = useState<ScheduleRun[]>([])
+  const [selectedScheduleRunId, setSelectedScheduleRunId] = useState<string | null>(null)
+  const [scheduleRunsLoading, setScheduleRunsLoading] = useState(false)
+  const [scheduleRunOutput, setScheduleRunOutput] = useState<ScheduleRunOutput | null>(null)
+  const [scheduleArtifacts, setScheduleArtifacts] = useState<ScheduleArtifact[]>([])
+  const [scheduleOutputLoading, setScheduleOutputLoading] = useState(false)
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentInfo[]>([])
   const [config, setConfig] = useState<any>(null)
   const [configText, setConfigText] = useState<string>('')
@@ -397,6 +655,7 @@ function App() {
   const [expandedTraces, setExpandedTraces] = useState<Record<string, boolean>>({})
   const [hoveredTurn, setHoveredTurn] = useState<{ id: string; top: number } | null>(null)
   const [hoveredTurnIndex, setHoveredTurnIndex] = useState<number | null>(null)
+  const [composerHeight, setComposerHeight] = useState(0)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [sendShortcut, setSendShortcut] = useState<'enter' | 'ctrl-enter'>(
     () => (localStorage.getItem('send_shortcut') === 'ctrl-enter' ? 'ctrl-enter' : 'enter'),
@@ -424,6 +683,7 @@ function App() {
   const turnRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const conversationRailRef = useRef<HTMLDivElement | null>(null)
   const conversationMarkerRefs = useRef<Record<string, HTMLButtonElement | null>>({})
+  const composerWrapRef = useRef<HTMLDivElement | null>(null)
   const hoverClearTimerRef = useRef<number | null>(null)
   const idRef = useRef(0)
   const token = localStorage.getItem('agent_token') || ''
@@ -448,6 +708,19 @@ function App() {
   useEffect(() => {
     currentModelRef.current = currentModel
   }, [currentModel])
+
+  useEffect(() => {
+    if (view !== 'chat') return
+    const composer = composerWrapRef.current
+    if (!composer) return
+    const updateHeight = () => {
+      setComposerHeight(Math.ceil(composer.getBoundingClientRect().height))
+    }
+    updateHeight()
+    const observer = new ResizeObserver(updateHeight)
+    observer.observe(composer)
+    return () => observer.disconnect()
+  }, [view])
 
   const makeId = useCallback(() => {
     idRef.current += 1
@@ -558,7 +831,13 @@ function App() {
     async (sid: string) => {
       const requestId = ++loadMessagesRequestRef.current
       try {
-        const resp = await api(`/api/sessions/${sid}/messages`)
+        const stateRequest = api(`/api/sessions/${encodeURIComponent(sid)}/state`)
+          .then(resp => resp.json() as Promise<SessionState>)
+          .catch(() => null)
+        const [resp, state] = await Promise.all([
+          api(`/api/sessions/${encodeURIComponent(sid)}/messages`),
+          stateRequest,
+        ])
         const data = await resp.json()
         if (
           requestId !== loadMessagesRequestRef.current ||
@@ -583,17 +862,41 @@ function App() {
             }
           },
         )
-        // Keep transient events that arrived through the newly connected
-        // socket while this HTTP history request was in flight. This is what
-        // makes switching back to a running session show its partial reply
-        // immediately instead of replacing it with only the persisted user
-        // messages.
-        const transient = messagesRef.current.filter(item =>
+        const current = messagesRef.current
+        const hasLiveTransient = current.some(item =>
           item.streaming || (item.role === 'tool' && item.toolState === 'running'),
         )
-        const merged = [...loaded, ...transient]
+        // A socket event may be newer than the state snapshot when a message
+        // is submitted immediately after selecting the session.
+        const operationActive =
+          String(state?.operation_state || 'idle') !== 'idle' || hasLiveTransient
+        let merged = [...loaded]
+        if (operationActive) {
+          // Only socket events received after cache sanitisation are eligible
+          // here. Keep the latest reply snapshot and reconcile running tools
+          // with their durable event projection.
+          const latestStream = [...current]
+            .reverse()
+            .find(item => item.role === 'assistant' && item.streaming)
+          const runningTools = current.filter(
+            item => item.role === 'tool' && item.toolState === 'running',
+          )
+          for (const tool of runningTools) {
+            const durableIndex = merged.findIndex(item =>
+              item.role === 'tool' &&
+              item.toolState === 'running' &&
+              item.tool === tool.tool,
+            )
+            if (durableIndex >= 0) merged[durableIndex] = tool
+            else merged.push(tool)
+          }
+          if (latestStream) merged.push(latestStream)
+        }
         messagesRef.current = merged
         setMessages(merged)
+        if (state) setSessionState(state)
+        else setSessionState(null)
+        setIsStreaming(operationActive)
       } catch {
         if (
           requestId !== loadMessagesRequestRef.current ||
@@ -840,11 +1143,24 @@ function App() {
 
         if (evt.type === 'attachment') {
           const t = token
+          const link = `/api/files?path=${encodeURIComponent(evt.path)}${t ? `&token=${encodeURIComponent(t)}` : ''}`
+          let currentTurnStart = -1
+          for (let index = messagesRef.current.length - 1; index >= 0; index -= 1) {
+            if (messagesRef.current[index].role === 'user') {
+              currentTurnStart = index
+              break
+            }
+          }
+          const alreadyShown = messagesRef.current
+            .slice(currentTurnStart + 1)
+            .some(item => item.role === 'tool' && item.link === link)
+          if (alreadyShown) return
           appendMessage({
             id: makeId(),
             role: 'tool',
             content: `${evt.name || evt.path}`,
-            link: `/api/files?path=${encodeURIComponent(evt.path)}${t ? `&token=${encodeURIComponent(t)}` : ''}`,
+            tool: 'attachment',
+            link,
           })
           return
         }
@@ -916,8 +1232,15 @@ function App() {
         try {
           const arr = JSON.parse(cached) as Message[]
           if (Array.isArray(arr)) {
-            messagesRef.current = arr
-            setMessages(arr)
+            // Streaming and running-tool rows are snapshots, not history.
+            // A reconnecting socket will restore them if this session is
+            // genuinely still active.
+            const durableCache = arr.filter(item =>
+              !item.streaming &&
+              !(item.role === 'tool' && item.toolState === 'running'),
+            )
+            messagesRef.current = durableCache
+            setMessages(durableCache)
           } else {
             messagesRef.current = []
             setMessages([])
@@ -932,9 +1255,8 @@ function App() {
       }
       loadMessages(sid)
       loadSessionPermissions(sid)
-      loadSessionState(sid)
     },
-    [loadMessages, loadSessionPermissions, loadSessionState],
+    [loadMessages, loadSessionPermissions],
   )
 
   useEffect(() => {
@@ -1046,6 +1368,23 @@ function App() {
     api(`/api/sessions/${activeSession}/cancel`, { method: 'POST' }).catch(() => {})
   }
 
+  const dismissTaskGuidance = async () => {
+    if (!activeSession || !sessionState?.task) return
+    const taskId = sessionState.task.task_id || ''
+    try {
+      await api(`/api/sessions/${encodeURIComponent(activeSession)}/task-guidance/dismiss`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(taskId ? { task_id: taskId } : {}),
+      })
+      setSessionState(previous => previous
+        ? { ...previous, task: previous.task ? { ...previous.task, status: 'dismissed', next_action: '' } : previous.task }
+        : previous)
+    } catch {
+      // The shared request helper reports the server error to the user.
+    }
+  }
+
   const handleFilesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
@@ -1124,29 +1463,241 @@ function App() {
     }
   }, [api])
 
-  const loadSkills = useCallback(async () => {
+  const loadSkills = useCallback(async (silent = false) => {
     try {
-      setLoadingView(true)
+      if (!silent) setLoadingView(true)
       const resp = await api('/api/skills')
       const data = await resp.json()
       setSkills(data.skills || [])
     } catch {
       // Handled by api helper.
     } finally {
-      setLoadingView(false)
+      if (!silent) setLoadingView(false)
     }
   }, [api])
 
-  const loadSchedules = useCallback(async () => {
+  const loadSchedules = useCallback(async (silent = false) => {
     try {
-      setLoadingView(true)
+      if (!silent) setLoadingView(true)
       const resp = await api('/api/schedules')
       const data = await resp.json()
       setSchedules(data.tasks || [])
+      setSelectedSchedule(current => {
+        if (!current) return current
+        const refreshed = (data.tasks || []).find(
+          (item: ScheduleInfo) => item.id === current.id,
+        )
+        return refreshed || current
+      })
     } finally {
-      setLoadingView(false)
+      if (!silent) setLoadingView(false)
     }
   }, [api])
+
+  const loadSchedulerHealth = useCallback(async () => {
+    try {
+      const resp = await api('/api/scheduler/health')
+      setSchedulerHealth(await resp.json())
+    } catch {
+      setSchedulerHealth({ status: 'offline' })
+    }
+  }, [api])
+
+  useEffect(() => {
+    if (!scheduleModalOpen) {
+      setSchedulePreview([])
+      setSchedulePreviewError('')
+      return
+    }
+    const taskContent = scheduleDraft.action_type === 'agent_task'
+      ? scheduleDraft.prompt.trim()
+      : scheduleDraft.message_text.trim()
+    if (!scheduleDraft.name.trim() || !taskContent || (
+      scheduleDraft.action_type === 'agent_task' && !scheduleDraft.workspace_root.trim()
+    )) {
+      setSchedulePreview([])
+      return
+    }
+    let cancelled = false
+    const timer = window.setTimeout(async () => {
+      try {
+        const resp = await fetch('/api/schedules/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...apiHeaders() },
+          body: JSON.stringify(scheduleRequestBody(scheduleDraft)),
+        })
+        const data = await resp.json()
+        if (cancelled) return
+        if (!resp.ok) {
+          setSchedulePreview([])
+          setSchedulePreviewError(data.error || '无法预览执行时间')
+          return
+        }
+        setSchedulePreview(Array.isArray(data.occurrences) ? data.occurrences : [])
+        setSchedulePreviewError('')
+      } catch {
+        if (!cancelled) setSchedulePreviewError('无法连接调度服务')
+      }
+    }, 350)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [apiHeaders, scheduleDraft, scheduleModalOpen])
+
+  const loadScheduleRuns = useCallback(
+    async (taskId: string, selectLatest = false, silent = false) => {
+      try {
+        if (!silent) setScheduleRunsLoading(true)
+        const resp = await api(
+          `/api/schedules/${encodeURIComponent(taskId)}/runs?limit=50`,
+        )
+        const data = await resp.json()
+        const runs = Array.isArray(data.runs) ? data.runs as ScheduleRun[] : []
+        setScheduleRuns(runs)
+        setSelectedSchedule(current => current && current.id === taskId
+          ? { ...current, ...(data.task || {}) }
+          : current)
+        setSelectedScheduleRunId(current => {
+          if (selectLatest) return runs[0]?.id || null
+          return current && runs.some(run => run.id === current)
+            ? current
+            : runs[0]?.id || null
+        })
+      } finally {
+        if (!silent) setScheduleRunsLoading(false)
+      }
+    },
+    [api],
+  )
+
+  const openScheduleDetails = useCallback((task: ScheduleInfo) => {
+    setSelectedSchedule(task)
+    setScheduleDetailOpen(true)
+    setScheduleRuns([])
+    setSelectedScheduleRunId(null)
+    setScheduleRunOutput(null)
+    void loadScheduleRuns(task.id, true)
+  }, [loadScheduleRuns])
+
+  const selectedScheduleRun = useMemo(
+    () => scheduleRuns.find(run => run.id === selectedScheduleRunId) || null,
+    [scheduleRuns, selectedScheduleRunId],
+  )
+
+  const filteredSchedules = useMemo(() => {
+    const query = scheduleQuery.trim().toLowerCase()
+    return schedules.filter(task => {
+      const latestStatus = task.latest_run?.status || ''
+      const statusMatches = scheduleStatusFilter === 'all'
+        || (scheduleStatusFilter === 'running' && (!!task.active_run_id || latestStatus === 'running'))
+        || (scheduleStatusFilter === 'failed' && latestStatus === 'failed')
+        || (scheduleStatusFilter === 'paused' && task.enabled === false)
+      if (!statusMatches) return false
+      if (!query) return true
+      const content = `${task.name} ${task.workspace_root || ''} ${task.payload?.prompt || task.payload?.message_text || ''}`.toLowerCase()
+      return content.includes(query)
+    })
+  }, [scheduleQuery, scheduleStatusFilter, schedules])
+
+  useEffect(() => {
+    if (!scheduleDetailOpen || !selectedSchedule || !selectedScheduleRun) {
+      setScheduleRunOutput(null)
+      setScheduleOutputLoading(false)
+      return
+    }
+    if (selectedScheduleRun.status === 'running') {
+      setScheduleRunOutput(null)
+      setScheduleOutputLoading(false)
+      return
+    }
+    if (!selectedScheduleRun.output_available) {
+      setScheduleRunOutput({
+        run_id: selectedScheduleRun.id,
+        available: false,
+        content: '',
+      })
+      setScheduleOutputLoading(false)
+      return
+    }
+    let cancelled = false
+    setScheduleOutputLoading(true)
+    api(
+      `/api/schedules/${encodeURIComponent(selectedSchedule.id)}` +
+      `/runs/${encodeURIComponent(selectedScheduleRun.id)}/output`,
+    )
+      .then(resp => resp.json())
+      .then(data => {
+        if (!cancelled) setScheduleRunOutput(data as ScheduleRunOutput)
+      })
+      .catch(() => {
+        if (!cancelled) setScheduleRunOutput(null)
+      })
+      .finally(() => {
+        if (!cancelled) setScheduleOutputLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    api,
+    scheduleDetailOpen,
+    selectedSchedule,
+    selectedScheduleRun?.id,
+    selectedScheduleRun?.output_available,
+    selectedScheduleRun?.status,
+  ])
+
+  useEffect(() => {
+    if (!scheduleDetailOpen || !selectedSchedule || !selectedScheduleRun) {
+      setScheduleArtifacts([])
+      return
+    }
+    let cancelled = false
+    api(
+      `/api/schedules/${encodeURIComponent(selectedSchedule.id)}` +
+      `/runs/${encodeURIComponent(selectedScheduleRun.id)}/artifacts`,
+    )
+      .then(resp => resp.json())
+      .then(data => {
+        if (!cancelled) setScheduleArtifacts(Array.isArray(data.artifacts) ? data.artifacts : [])
+      })
+      .catch(() => {
+        if (!cancelled) setScheduleArtifacts([])
+      })
+    return () => { cancelled = true }
+  }, [api, scheduleDetailOpen, selectedSchedule?.id, selectedScheduleRun?.id, selectedScheduleRun?.status])
+
+  useEffect(() => {
+    if (view !== 'schedules') return
+    const hasRunningTask = schedules.some(task =>
+      !!task.active_run_id || task.latest_run?.status === 'running',
+    ) || scheduleRuns.some(run => run.status === 'running')
+    if (!hasRunningTask) return
+    const refresh = () => {
+      void loadSchedules(true)
+      if (scheduleDetailOpen && selectedSchedule) {
+        void loadScheduleRuns(selectedSchedule.id, false, true)
+      }
+    }
+    const timer = window.setInterval(refresh, 2000)
+    return () => window.clearInterval(timer)
+  }, [
+    loadScheduleRuns,
+    loadSchedules,
+    scheduleDetailOpen,
+    scheduleRuns,
+    schedules,
+    selectedSchedule,
+    view,
+  ])
+
+  useEffect(() => {
+    if (view !== 'schedules') return
+    void loadSchedulerHealth()
+    const timer = window.setInterval(loadSchedulerHealth, 10000)
+    return () => window.clearInterval(timer)
+  }, [loadSchedulerHealth, view])
 
   const loadSettings = useCallback(async () => {
     try {
@@ -1183,9 +1734,13 @@ function App() {
   useEffect(() => {
     if (view === 'plugins') loadPlugins()
     if (view === 'skills') loadSkills()
-    if (view === 'schedules') loadSchedules()
+    if (view === 'schedules') {
+      loadSchedules()
+      loadSkills(true)
+      loadSchedulerHealth()
+    }
     if (view === 'settings') loadSettings()
-  }, [view, loadPlugins, loadSkills, loadSchedules, loadSettings])
+  }, [view, loadPlugins, loadSkills, loadSchedules, loadSchedulerHealth, loadSettings])
 
   const createSession = async () => {
     try {
@@ -1394,30 +1949,218 @@ function App() {
     }
   }
 
-  const deletePlugin = async (plugin: PluginInfo) => {
+  const confirmResourceDeletion = (
+    resourceLabel: string,
+    resourceName: string,
+    onConfirm: () => Promise<void>,
+  ) => {
+    Modal.confirm({
+      title: `删除${resourceLabel}“${resourceName}”？`,
+      content: `此操作会永久删除该${resourceLabel}，且无法恢复。`,
+      okText: '确认删除',
+      cancelText: '取消',
+      okButtonProps: { danger: true },
+      centered: true,
+      className: 'resource-delete-confirm',
+      onOk: onConfirm,
+    })
+  }
+
+  const deletePlugin = (plugin: PluginInfo) => {
     if (plugin.source !== 'user') return messageApi.info('内置插件不能删除')
-    try { await api(`/api/plugins/${encodeURIComponent(plugin.name)}`, { method: 'DELETE' }); setPlugins(prev => prev.filter(item => item.name !== plugin.name)); messageApi.success('插件已删除') } catch { /* surfaced */ }
+    confirmResourceDeletion('插件', plugin.name, async () => {
+      await api(`/api/plugins/${encodeURIComponent(plugin.name)}`, { method: 'DELETE' })
+      setPlugins(prev => prev.filter(item => item.name !== plugin.name))
+      messageApi.success('插件已删除')
+    })
   }
 
-  const deleteSkill = async (skill: SkillInfo) => {
+  const deleteSkill = (skill: SkillInfo) => {
     if (skill.source !== 'user') return messageApi.info('内置技能不能删除')
-    try { await api(`/api/skills/${encodeURIComponent(skill.id)}`, { method: 'DELETE' }); setSkills(prev => prev.filter(item => item.id !== skill.id)); messageApi.success('技能已删除') } catch { /* surfaced */ }
+    confirmResourceDeletion('技能', skill.name || skill.id, async () => {
+      await api(`/api/skills/${encodeURIComponent(skill.id)}`, { method: 'DELETE' })
+      setSkills(prev => prev.filter(item => item.id !== skill.id))
+      messageApi.success('技能已删除')
+    })
   }
 
-  const deleteSchedule = async (task: ScheduleInfo) => {
-    try { await api(`/api/schedules/${encodeURIComponent(task.id)}`, { method: 'DELETE' }); setSchedules(prev => prev.filter(item => item.id !== task.id)); messageApi.success('任务已删除') } catch { /* surfaced */ }
+  const deleteSchedule = (task: ScheduleInfo) => {
+    confirmResourceDeletion('定时任务', task.name, async () => {
+      await api(`/api/schedules/${encodeURIComponent(task.id)}`, { method: 'DELETE' })
+      setSchedules(prev => prev.filter(item => item.id !== task.id))
+      if (selectedSchedule?.id === task.id) {
+        setScheduleDetailOpen(false)
+        setSelectedSchedule(null)
+        setScheduleRuns([])
+        setSelectedScheduleRunId(null)
+      }
+      messageApi.success('任务已删除')
+    })
   }
 
   const toggleSchedule = async (task: ScheduleInfo, enabled: boolean) => {
-    try { await api(`/api/schedules/${encodeURIComponent(task.id)}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) }); setSchedules(prev => prev.map(item => item.id === task.id ? { ...item, enabled } : item)) } catch { /* surfaced */ }
+    try {
+      await api(`/api/schedules/${encodeURIComponent(task.id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      setSchedules(prev => prev.map(item => item.id === task.id ? { ...item, enabled } : item))
+      setSelectedSchedule(current => current?.id === task.id
+        ? { ...current, enabled }
+        : current)
+    } catch { /* surfaced */ }
   }
 
-  const createSchedule = async () => {
-    try {
-      const resp = await api('/api/schedules', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...scheduleDraft, timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone }) })
+  const bulkScheduleAction = async (action: 'enable' | 'disable' | 'delete') => {
+    if (!selectedScheduleIds.length) return
+    const execute = async () => {
+      const resp = await api('/api/schedules', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, task_ids: selectedScheduleIds }),
+      })
       const data = await resp.json()
-      setSchedules(prev => [...prev, { id: data.task.id, name: data.task.name, kind: 'message', trigger_type: scheduleDraft.trigger_type, next_run_at: data.task.next_run_at }])
-      setScheduleModalOpen(false); setScheduleDraft({ name: '', trigger_type: 'once', at: '', message_text: '' }); messageApi.success('定时任务已创建')
+      const completed = Array.isArray(data.completed) ? data.completed as string[] : []
+      setSelectedScheduleIds(prev => prev.filter(id => !completed.includes(id)))
+      await loadSchedules(true)
+      if (data.skipped?.length) {
+        messageApi.warning(`${completed.length} 个任务已处理，${data.skipped.length} 个运行中或不存在的任务已跳过`)
+      } else {
+        messageApi.success(`${completed.length} 个任务已${action === 'delete' ? '删除' : action === 'enable' ? '启用' : '暂停'}`)
+      }
+    }
+    if (action === 'delete') {
+      confirmResourceDeletion('定时任务', `${selectedScheduleIds.length} 个所选任务`, execute)
+    } else {
+      await execute()
+    }
+  }
+
+  const openCreateSchedule = () => {
+    setEditingScheduleId(null)
+    setScheduleDraft(defaultScheduleDraft(sessionState?.workspace_root || config?.workspace_root || ''))
+    setScheduleModalOpen(true)
+  }
+
+  const openEditSchedule = (task: ScheduleInfo) => {
+    setEditingScheduleId(task.id)
+    const draft = scheduleDraftFromTask(task)
+    setScheduleDraft({
+      ...draft,
+      workspace_root: draft.workspace_root || sessionState?.workspace_root || config?.workspace_root || '',
+    })
+    setScheduleModalOpen(true)
+  }
+
+  const duplicateSchedule = (task: ScheduleInfo) => {
+    setEditingScheduleId(null)
+    const draft = scheduleDraftFromTask(task)
+    setScheduleDraft({
+      ...draft,
+      name: `${task.name} 副本`,
+      workspace_root: draft.workspace_root || sessionState?.workspace_root || config?.workspace_root || '',
+    })
+    setScheduleModalOpen(true)
+  }
+
+  const saveSchedule = async () => {
+    const taskContent = scheduleDraft.action_type === 'agent_task'
+      ? scheduleDraft.prompt.trim()
+      : scheduleDraft.message_text.trim()
+    if (!scheduleDraft.name.trim()) {
+      messageApi.warning('请填写任务名称')
+      return
+    }
+    if (!taskContent) {
+      messageApi.warning(scheduleDraft.action_type === 'agent_task' ? '请填写任务执行要求' : '请填写提醒内容')
+      return
+    }
+    if (scheduleDraft.trigger_type === 'once') {
+      if (!scheduleDraft.at || !dayjs(scheduleDraft.at).isValid()) {
+        messageApi.warning('请选择执行时间')
+        return
+      }
+      if (dayjs(scheduleDraft.at).valueOf() <= Date.now()) {
+        messageApi.warning('执行时间必须晚于当前时间')
+        return
+      }
+    }
+    if (scheduleDraft.trigger_type === 'interval' && !scheduleDraft.anchor_at) {
+      messageApi.warning('请选择首次执行时间')
+      return
+    }
+    if (['daily', 'weekly', 'weekdays', 'monthly'].includes(scheduleDraft.trigger_type) && !scheduleDraft.time_of_day) {
+      messageApi.warning('请选择每天的执行时间')
+      return
+    }
+    try {
+      setScheduleSaving(true)
+      const target = editingScheduleId
+        ? `/api/schedules/${encodeURIComponent(editingScheduleId)}`
+        : '/api/schedules'
+      const resp = await api(target, {
+        method: editingScheduleId ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(scheduleRequestBody(scheduleDraft)),
+      })
+      const data = await resp.json()
+      setScheduleModalOpen(false)
+      setEditingScheduleId(null)
+      setScheduleDraft(defaultScheduleDraft(sessionState?.workspace_root || config?.workspace_root || ''))
+      await loadSchedules()
+      if (selectedSchedule?.id === data.task.id) {
+        setSelectedSchedule(data.task)
+      }
+      messageApi.success(`定时任务“${data.task.name}”已${editingScheduleId ? '更新' : '创建'}`)
+    } catch { /* surfaced */ } finally {
+      setScheduleSaving(false)
+    }
+  }
+
+  const runScheduleNow = async (task: ScheduleInfo) => {
+    try {
+      const resp = await api(`/api/schedules/${encodeURIComponent(task.id)}/run`, {
+        method: 'POST',
+      })
+      const data = await resp.json()
+      messageApi.success('任务已开始运行')
+      setSelectedScheduleRunId(data.run?.id || null)
+      await loadSchedules(true)
+      if (scheduleDetailOpen && selectedSchedule?.id === task.id) {
+        await loadScheduleRuns(task.id, true, true)
+      } else {
+        openScheduleDetails(task)
+      }
+    } catch { /* surfaced */ }
+  }
+
+  const cancelScheduleRun = async (task: ScheduleInfo, run: ScheduleRun) => {
+    try {
+      await api(
+        `/api/schedules/${encodeURIComponent(task.id)}/runs/${encodeURIComponent(run.id)}/cancel`,
+        { method: 'POST' },
+      )
+      setScheduleRuns(prev => prev.map(item => item.id === run.id
+        ? { ...item, cancel_requested_at: new Date().toISOString() }
+        : item))
+      messageApi.info('正在取消任务')
+    } catch { /* surfaced */ }
+  }
+
+  const retryScheduleRun = async (task: ScheduleInfo, run: ScheduleRun, useLatest: boolean) => {
+    try {
+      await api(
+        `/api/schedules/${encodeURIComponent(task.id)}/runs/${encodeURIComponent(run.id)}/retry`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ use_latest: useLatest }),
+        },
+      )
+      messageApi.success(useLatest ? '已使用当前配置重试' : '已使用原运行配置重试')
+      await loadSchedules(true)
+      await loadScheduleRuns(task.id, true, true)
     } catch { /* surfaced */ }
   }
 
@@ -1611,7 +2354,7 @@ function App() {
     chat: {
       title: activeSession ? '当前对话' : '开始新的对话',
       subtitle: activeSession
-        ? `${activeSession.slice(0, 12)} · ${connected ? '实时连接中' : '连接已断开'}${sessionState?.workspace_root ? ` · ${sessionState.workspace_root}${sessionState.workspace_status === 'missing' ? '（目录不可用）' : ''}` : ''}`
+        ? `${activeSession.slice(0, 12)} · ${connected ? '实时连接中' : '连接已断开'}`
         : '与你的 AI Agent 开始一段对话',
     },
     sessions: {
@@ -1815,7 +2558,7 @@ function App() {
             {item.streaming && <span className="message-streaming">正在生成</span>}
             {traceSummary}
           </div>
-          <div className={`bubble ${isUser ? 'bubble-user' : 'bubble-assistant'}`}>
+          <div className={`bubble ${isUser ? 'bubble-user' : 'bubble-assistant'} ${item.attachments?.length ? 'bubble-with-attachments' : ''}`}>
             {item.attachments && item.attachments.length > 0 && (
               <div className="message-attachments">
                 {item.attachments.map(attachment => (
@@ -1988,29 +2731,33 @@ function App() {
     if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
     setHoveredTurnIndex(index)
     const marker = conversationMarkerRefs.current[item.id]
-    const rail = conversationRailRef.current
+    const indicator = conversationRailRef.current
     const target = marker?.getBoundingClientRect()
-    const parent = rail?.parentElement?.getBoundingClientRect()
-    if (!target || !parent) return
+    const bounds = indicator?.getBoundingClientRect()
+    if (!target || !bounds) return
     // The summary card is centered on the active marker via CSS. Keep a
     // small safe margin so the compact card never crosses the chat bounds.
-    const rawTop = target.top + target.height / 2 - parent.top
+    const rawTop = target.top + target.height / 2 - bounds.top
     const cardHalfHeight = 62
-    const maxTop = Math.max(cardHalfHeight, parent.height - cardHalfHeight)
+    const maxTop = Math.max(cardHalfHeight, bounds.height - cardHalfHeight)
     setHoveredTurn({ id: item.id, top: Math.max(cardHalfHeight, Math.min(rawTop, maxTop)) })
   }
 
   const handleRailMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
-    const rail = event.currentTarget.getBoundingClientRect()
     if (conversationTurns.length < 2) return
-    const markerHeight = 18
-    const gap = conversationGap
-    const step = markerHeight + gap
-    const totalHeight = markerHeight * conversationTurns.length + gap * (conversationTurns.length - 1)
-    const firstCenter = (rail.height - totalHeight) / 2 + markerHeight / 2
-    const relativeY = event.clientY - rail.top
-    const index = Math.max(0, Math.min(conversationTurns.length - 1, Math.round((relativeY - firstCenter) / step)))
-    activateTurnIndex(index)
+    let nearestIndex = 0
+    let nearestDistance = Number.POSITIVE_INFINITY
+    conversationTurns.forEach((item, index) => {
+      const marker = conversationMarkerRefs.current[item.id]
+      if (!marker) return
+      const bounds = marker.getBoundingClientRect()
+      const distance = Math.abs(event.clientY - (bounds.top + bounds.height / 2))
+      if (distance < nearestDistance) {
+        nearestDistance = distance
+        nearestIndex = index
+      }
+    })
+    activateTurnIndex(nearestIndex)
   }
 
   const scheduleHideTurnSummary = () => {
@@ -2031,6 +2778,7 @@ function App() {
         <div
           className="conversation-indicator"
           ref={conversationRailRef}
+          style={{ bottom: composerHeight + 28 }}
           aria-label="对话历史"
           onMouseEnter={keepTurnSummary}
           onMouseLeave={scheduleHideTurnSummary}
@@ -2140,16 +2888,7 @@ function App() {
         </div>
       </div>
 
-      <div className="composer-wrap">
-        {pendingAttachments.length > 0 && (
-          <div className="pending-attachments">
-            {pendingAttachments.map(item => (
-              <Tag key={item.id} closable onClose={() => setPendingAttachments(prev => prev.filter(x => x.id !== item.id))}>
-                {item.filename}
-              </Tag>
-            ))}
-          </div>
-        )}
+      <div className="composer-wrap" ref={composerWrapRef}>
         {Math.max(
           queuedMessages.length,
           Number(sessionState?.queue?.pending || 0),
@@ -2169,7 +2908,7 @@ function App() {
           </div>
         )}
         {sessionState?.task?.active_goal &&
-          !['completed', 'success', 'done', 'updated'].includes(
+          !['completed', 'success', 'done', 'updated', 'dismissed'].includes(
             String(sessionState.task.status || '').toLowerCase(),
           ) && (
             <div className="task-guidance-card">
@@ -2183,9 +2922,9 @@ function App() {
               {sessionState.task.progress && (
                 <span>{truncate(sessionState.task.progress, 180)}</span>
               )}
-              {sessionState.task.next_action && (
-                <div className="task-guidance-next">
-                  <span>下一步：{truncate(sessionState.task.next_action, 180)}</span>
+              <div className="task-guidance-next">
+                <span>{sessionState.task.next_action ? `下一步：${truncate(sessionState.task.next_action, 180)}` : '任务已中断，可选择继续或放弃'}</span>
+                <div className="task-guidance-actions">
                   <Button
                     type="text"
                     size="small"
@@ -2193,8 +2932,16 @@ function App() {
                   >
                     继续任务
                   </Button>
+                  <Button
+                    type="text"
+                    size="small"
+                    danger
+                    onClick={dismissTaskGuidance}
+                  >
+                    放弃任务
+                  </Button>
                 </div>
-              )}
+              </div>
             </div>
           )}
         {input.startsWith('/') && (
@@ -2232,6 +2979,43 @@ function App() {
         )}
 
         <div className="composer">
+          {pendingAttachments.length > 0 && (
+            <div className="composer-attachments" aria-label="待发送附件">
+              {pendingAttachments.map(item => {
+                const fileUrl = `/api/files?path=${encodeURIComponent(item.path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`
+                const kindLabel = item.kind === 'image'
+                  ? '图片'
+                  : item.kind === 'document'
+                    ? '文档'
+                    : item.kind === 'archive'
+                      ? '压缩包'
+                      : '文件'
+                return (
+                  <div className="composer-attachment" key={item.id}>
+                    {item.kind === 'image' ? (
+                      <img src={fileUrl} alt="" />
+                    ) : (
+                      <span className="composer-attachment-icon"><FileTextOutlined /></span>
+                    )}
+                    <span className="composer-attachment-main">
+                      <strong title={item.filename}>{item.filename}</strong>
+                      <small>{kindLabel}{item.size_bytes ? ` · ${Math.max(1, Math.round(item.size_bytes / 1024))} KB` : ''}</small>
+                    </span>
+                    <Tooltip title="移除附件">
+                      <button
+                        type="button"
+                        className="composer-attachment-remove"
+                        aria-label={`移除 ${item.filename}`}
+                        onClick={() => setPendingAttachments(prev => prev.filter(attachment => attachment.id !== item.id))}
+                      >
+                        <CloseOutlined />
+                      </button>
+                    </Tooltip>
+                  </div>
+                )
+              })}
+            </div>
+          )}
           <TextArea
             value={input}
             onChange={event => setInput(event.target.value)}
@@ -2244,28 +3028,33 @@ function App() {
             disabled={false}
           />
           <div className="composer-footer">
-            <Space size={4}>
+            <div className="composer-tools">
               <Tooltip title="添加图片或文件">
                 <Button type="text" className="workspace-button" aria-label="添加附件" icon={<UploadOutlined />} onClick={() => fileInputRef.current?.click()} />
               </Tooltip>
               <input ref={fileInputRef} type="file" multiple hidden onChange={handleFilesSelected} accept="image/*,.pdf,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" />
-              <Tooltip title="选择 Agent 所在机器上的项目文件夹">
-                <Button
-                  type="text"
-                  className="workspace-button"
-                  aria-label="选择项目文件夹"
-                  icon={<FolderOpenOutlined />}
+              <Tooltip title={sessionState?.workspace_root ? `切换工作区：${sessionState.workspace_root}` : '选择 Agent 接下来工作的项目文件夹'}>
+                <button
+                  type="button"
+                  className={`workspace-picker ${sessionState?.workspace_status === 'missing' ? 'workspace-picker-missing' : ''}`}
+                  aria-label={sessionState?.workspace_root
+                    ? `当前工作区：${sessionState.workspace_root}，${sessionState.workspace_write ? '可写' : '只读'}，点击切换`
+                    : '选择工作区'}
                   onClick={pickWorkspace}
-                />
-              </Tooltip>
-              {sessionState?.workspace_root && (
-                <Tag
-                  className={`workspace-status-tag ${sessionState.workspace_status === 'missing' ? 'workspace-status-missing' : ''}`}
-                  title={sessionState.workspace_root}
                 >
-                  {sessionState.workspace_status === 'missing' ? '项目目录不可用' : (sessionState.workspace_write ? '项目可写' : '项目只读')}
-                </Tag>
-              )}
+                  <FolderOpenOutlined aria-hidden="true" />
+                  {sessionState?.workspace_root ? (
+                    <>
+                      <span className="workspace-picker-label">工作区</span>
+                      <strong title={sessionState.workspace_root}>{compactWorkspacePath(sessionState.workspace_root)}</strong>
+                      <span className="workspace-status-dot" aria-hidden="true" />
+                      <span className="workspace-status-text">{sessionState.workspace_status === 'missing' ? '不可用' : (sessionState.workspace_write ? '可写' : '只读')}</span>
+                    </>
+                  ) : (
+                    <strong>选择工作区</strong>
+                  )}
+                </button>
+              </Tooltip>
               <Dropdown
                 trigger={['click']}
                 placement="topLeft"
@@ -2325,8 +3114,9 @@ function App() {
                   type="text"
                   className="permission-button"
                   icon={<GlobalOutlined />}
+                  aria-label={`当前权限：${permissionLabel}`}
                 >
-                  {permissionLabel}
+                  <span className="permission-button-label">{permissionLabel}</span>
                 </Button>
               </Dropdown>
               <Select
@@ -2337,7 +3127,7 @@ function App() {
                 popupMatchSelectWidth={false}
                 variant="borderless"
               />
-            </Space>
+            </div>
             <Space size={4}>
               {isStreaming && (
                 <Tooltip title="终止生成">
@@ -2648,19 +3438,624 @@ function App() {
 
   const renderSchedules = () => (
     <div className="page-view schedules-view">
-      <div className="page-head"><div><h2>定时任务</h2><p>一次性、间隔、每日和每周任务统一管理。</p></div><Button type="primary" icon={<PlusOutlined />} onClick={() => setScheduleModalOpen(true)}>新建任务</Button></div>
-      <Modal open={scheduleModalOpen} title="新建定时任务" okText="创建" cancelText="取消" onCancel={() => setScheduleModalOpen(false)} onOk={createSchedule}>
-        <Space direction="vertical" style={{ width: '100%' }}>
-          <Input placeholder="任务名称" value={scheduleDraft.name} onChange={e => setScheduleDraft({ ...scheduleDraft, name: e.target.value })} />
-          <Select style={{ width: '100%' }} value={scheduleDraft.trigger_type} onChange={value => setScheduleDraft({ ...scheduleDraft, trigger_type: value })} options={[{ value: 'once', label: '一次性' }, { value: 'interval', label: '间隔周期' }, { value: 'daily', label: '每天' }, { value: 'weekly', label: '每周' }]} />
-          {scheduleDraft.trigger_type === 'once' && <Input placeholder="执行时间（ISO，例如 2026-09-05T18:00:00+08:00）" value={scheduleDraft.at} onChange={e => setScheduleDraft({ ...scheduleDraft, at: e.target.value })} />}
-          {scheduleDraft.trigger_type === 'interval' && <Space.Compact block><InputNumber min={1} placeholder="每隔" value={scheduleDraft.every} onChange={value => setScheduleDraft({ ...scheduleDraft, every: value })} /><Select value={scheduleDraft.unit || 'hours'} onChange={value => setScheduleDraft({ ...scheduleDraft, unit: value })} options={[{ value: 'minutes', label: '分钟' }, { value: 'hours', label: '小时' }, { value: 'days', label: '天' }]} /><Input placeholder="锚点时间 ISO" value={scheduleDraft.anchor_at} onChange={e => setScheduleDraft({ ...scheduleDraft, anchor_at: e.target.value })} /></Space.Compact>}
-          {scheduleDraft.trigger_type === 'daily' && <Input placeholder="每天时间，例如 09:00" value={scheduleDraft.time_of_day} onChange={e => setScheduleDraft({ ...scheduleDraft, time_of_day: e.target.value })} />}
-          {scheduleDraft.trigger_type === 'weekly' && <Space.Compact block><Input placeholder="星期，例如 monday" value={scheduleDraft.day_of_week} onChange={e => setScheduleDraft({ ...scheduleDraft, day_of_week: e.target.value })} /><Input placeholder="时间，例如 09:00" value={scheduleDraft.time_of_day} onChange={e => setScheduleDraft({ ...scheduleDraft, time_of_day: e.target.value })} /></Space.Compact>}
-          <TextArea rows={3} placeholder="执行时发送的消息" value={scheduleDraft.message_text} onChange={e => setScheduleDraft({ ...scheduleDraft, message_text: e.target.value, action_type: 'message' })} />
+      <div className="page-head schedule-page-head">
+        <div>
+          <div className="schedule-title-row">
+            <h2>定时任务</h2>
+            <span className={`scheduler-health ${schedulerHealth.status === 'online' ? 'online' : 'offline'}`}>
+              <i />{schedulerHealth.status === 'online' ? '调度器在线' : '调度器离线'}
+            </span>
+          </div>
+          <p>安排 Agent 自动执行工作，或在指定时间发送提醒。</p>
+        </div>
+        <Space>
+          <Tooltip title="刷新运行状态">
+            <Button
+              aria-label="刷新运行状态"
+              icon={<ReloadOutlined />}
+              onClick={() => loadSchedules()}
+            />
+          </Tooltip>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreateSchedule}>新建任务</Button>
         </Space>
+      </div>
+      <div className="schedule-toolbar">
+        <Input
+          allowClear
+          prefix={<SearchOutlined />}
+          placeholder="搜索任务、项目目录或执行内容"
+          value={scheduleQuery}
+          onChange={event => setScheduleQuery(event.target.value)}
+        />
+        <div className="schedule-filter" role="group" aria-label="任务状态筛选">
+          {[
+            ['all', '全部'],
+            ['running', '运行中'],
+            ['failed', '失败'],
+            ['paused', '已暂停'],
+          ].map(([value, label]) => (
+            <button key={value} type="button" className={scheduleStatusFilter === value ? 'active' : ''} onClick={() => setScheduleStatusFilter(value)}>{label}</button>
+          ))}
+        </div>
+        {selectedScheduleIds.length > 0 && (
+          <Space className="schedule-bulk-actions">
+            <span>已选 {selectedScheduleIds.length} 个</span>
+            <Button size="small" onClick={() => bulkScheduleAction('enable')}>启用</Button>
+            <Button size="small" onClick={() => bulkScheduleAction('disable')}>暂停</Button>
+            <Button size="small" danger icon={<DeleteOutlined />} onClick={() => bulkScheduleAction('delete')}>删除</Button>
+          </Space>
+        )}
+      </div>
+      <Modal
+        open={scheduleModalOpen}
+        title={editingScheduleId ? '编辑定时任务' : '新建定时任务'}
+        width={700}
+        okText={editingScheduleId ? '保存修改' : '创建任务'}
+        cancelText="取消"
+        confirmLoading={scheduleSaving}
+        onCancel={() => {
+          setScheduleModalOpen(false)
+          setEditingScheduleId(null)
+        }}
+        onOk={saveSchedule}
+        className="schedule-modal"
+      >
+        <div className="schedule-form">
+          <div className="schedule-field">
+            <label>任务名称</label>
+            <Input
+              maxLength={80}
+              placeholder="例如：生成每日项目进展摘要"
+              value={scheduleDraft.name}
+              onChange={event => setScheduleDraft({ ...scheduleDraft, name: event.target.value })}
+            />
+          </div>
+
+          <div className="schedule-field">
+            <label>任务类型</label>
+            <div className="schedule-action-picker" role="radiogroup" aria-label="任务类型">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={scheduleDraft.action_type === 'agent_task'}
+                className={scheduleDraft.action_type === 'agent_task' ? 'active' : ''}
+                onClick={() => setScheduleDraft({ ...scheduleDraft, action_type: 'agent_task' })}
+              >
+                <RobotOutlined />
+                <span><strong>Agent 执行任务</strong><small>让 Agent 按要求完成具体工作</small></span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={scheduleDraft.action_type === 'message'}
+                className={scheduleDraft.action_type === 'message' ? 'active' : ''}
+                onClick={() => setScheduleDraft({ ...scheduleDraft, action_type: 'message' })}
+              >
+                <MessageOutlined />
+                <span><strong>定时提醒</strong><small>到时间后发送一条固定内容</small></span>
+              </button>
+            </div>
+          </div>
+
+          {scheduleDraft.action_type === 'agent_task' && (
+            <>
+              <div className="schedule-form-section-title">运行环境</div>
+              <div className="schedule-field">
+                <label>项目文件夹</label>
+                <Input
+                  prefix={<FolderOpenOutlined />}
+                  placeholder="Agent 执行任务时使用的项目目录"
+                  value={scheduleDraft.workspace_root}
+                  onChange={event => setScheduleDraft({ ...scheduleDraft, workspace_root: event.target.value })}
+                />
+                <small className="schedule-field-hint">任务会固定使用此目录，不受当前会话切换影响。</small>
+              </div>
+              <div className="schedule-field-grid schedule-field-grid-three">
+                <div className="schedule-field">
+                  <label>模型</label>
+                  <Select
+                    allowClear
+                    showSearch
+                    placeholder={`默认模型 · ${currentModel}`}
+                    value={scheduleDraft.model_override || undefined}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, model_override: value || '' })}
+                    options={modelOptions}
+                  />
+                </div>
+                <div className="schedule-field">
+                  <label>上下文</label>
+                  <Select
+                    value={scheduleDraft.context_policy}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, context_policy: value })}
+                    options={[
+                      { value: 'stateless', label: '每次独立（推荐）' },
+                      { value: 'task_history', label: '参考历史成功摘要' },
+                      { value: 'shared_memory', label: '共享任务长期上下文' },
+                    ]}
+                  />
+                </div>
+                <div className="schedule-field">
+                  <label>权限</label>
+                  <Select
+                    value={scheduleDraft.permission_profile}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, permission_profile: value })}
+                    options={[
+                      { value: 'inherit', label: '继承全局权限' },
+                      { value: 'read_only', label: '强制只读' },
+                    ]}
+                  />
+                </div>
+              </div>
+              <div className="schedule-field">
+                <label>指定技能</label>
+                <Select
+                  mode="multiple"
+                  allowClear
+                  showSearch
+                  optionFilterProp="label"
+                  placeholder="不指定时由 Agent 自主选择"
+                  value={scheduleDraft.selected_skills}
+                  onChange={value => setScheduleDraft({ ...scheduleDraft, selected_skills: value })}
+                  options={skills.filter(item => item.user_invocable).map(item => ({
+                    value: item.id,
+                    label: item.name || item.id,
+                  }))}
+                />
+                <small className="schedule-field-hint">任务启动前会验证技能；被删除或停用的技能会让运行明确失败。</small>
+              </div>
+            </>
+          )}
+
+          <div className="schedule-form-section-title">执行时间</div>
+
+          <div className="schedule-field">
+            <label>执行计划</label>
+            <Select
+              value={scheduleDraft.trigger_type}
+              onChange={value => setScheduleDraft({ ...scheduleDraft, trigger_type: value })}
+              options={[
+                { value: 'once', label: '指定日期和时间' },
+                { value: 'interval', label: '固定间隔' },
+                { value: 'daily', label: '每天' },
+                { value: 'weekly', label: '每周' },
+                { value: 'weekdays', label: '工作日（周一至周五）' },
+                { value: 'monthly', label: '每月指定日期' },
+              ]}
+            />
+          </div>
+
+          {scheduleDraft.trigger_type === 'once' && (
+            <div className="schedule-field">
+              <label>执行时间</label>
+              <DatePicker
+                showTime={{ format: 'HH:mm' }}
+                format="YYYY年M月D日 HH:mm"
+                value={scheduleDraft.at ? dayjs(scheduleDraft.at) : null}
+                onChange={value => setScheduleDraft({ ...scheduleDraft, at: value?.toISOString() || '' })}
+                disabledDate={current => !!current && current.endOf('day').valueOf() < Date.now()}
+                style={{ width: '100%' }}
+              />
+            </div>
+          )}
+
+          {scheduleDraft.trigger_type === 'interval' && (
+            <div className="schedule-field-grid">
+              <div className="schedule-field">
+                <label>重复间隔</label>
+                <Space.Compact block>
+                  <InputNumber
+                    min={1}
+                    max={999}
+                    value={scheduleDraft.every}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, every: Number(value || 1) })}
+                    style={{ width: '45%' }}
+                  />
+                  <Select
+                    value={scheduleDraft.unit}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, unit: value })}
+                    options={[
+                      { value: 'minutes', label: '分钟' },
+                      { value: 'hours', label: '小时' },
+                      { value: 'days', label: '天' },
+                      { value: 'weeks', label: '周' },
+                    ]}
+                    style={{ width: '55%' }}
+                  />
+                </Space.Compact>
+              </div>
+              <div className="schedule-field">
+                <label>首次执行</label>
+                <DatePicker
+                  showTime={{ format: 'HH:mm' }}
+                  format="YYYY-MM-DD HH:mm"
+                  value={scheduleDraft.anchor_at ? dayjs(scheduleDraft.anchor_at) : null}
+                  onChange={value => setScheduleDraft({ ...scheduleDraft, anchor_at: value?.toISOString() || '' })}
+                  disabledDate={current => !!current && current.endOf('day').valueOf() < Date.now()}
+                  style={{ width: '100%' }}
+                />
+              </div>
+            </div>
+          )}
+
+          {(['daily', 'weekly', 'weekdays', 'monthly'].includes(scheduleDraft.trigger_type)) && (
+            <div className={`schedule-field-grid ${['daily', 'weekdays'].includes(scheduleDraft.trigger_type) ? 'single' : ''}`}>
+              {scheduleDraft.trigger_type === 'weekly' && (
+                <div className="schedule-field">
+                  <label>星期</label>
+                  <Select
+                    value={scheduleDraft.day_of_week}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, day_of_week: value })}
+                    options={WEEKDAY_OPTIONS}
+                  />
+                </div>
+              )}
+              {scheduleDraft.trigger_type === 'monthly' && (
+                <div className="schedule-field">
+                  <label>日期</label>
+                  <InputNumber
+                    min={1}
+                    max={31}
+                    value={scheduleDraft.day_of_month}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, day_of_month: Number(value || 1) })}
+                    style={{ width: '100%' }}
+                  />
+                  <small className="schedule-field-hint">没有该日期的月份将自动跳过。</small>
+                </div>
+              )}
+              <div className="schedule-field">
+                <label>执行时间</label>
+                <TimePicker
+                  format="HH:mm"
+                  minuteStep={5}
+                  value={scheduleTimeValue(scheduleDraft.time_of_day)}
+                  onChange={value => setScheduleDraft({ ...scheduleDraft, time_of_day: value?.format('HH:mm') || '' })}
+                  style={{ width: '100%' }}
+                />
+              </div>
+            </div>
+          )}
+
+          <div className="schedule-field">
+            <label>{scheduleDraft.action_type === 'agent_task' ? '任务执行要求' : '提醒内容'}</label>
+            {scheduleDraft.action_type === 'agent_task' ? (
+              <TextArea
+                rows={5}
+                maxLength={6000}
+                placeholder="说明要完成的工作、涉及的范围和期望输出。任务会在独立运行环境中交给 Agent 执行。"
+                value={scheduleDraft.prompt}
+                onChange={event => setScheduleDraft({ ...scheduleDraft, prompt: event.target.value })}
+              />
+            ) : (
+              <TextArea
+                rows={4}
+                maxLength={2000}
+                placeholder="输入到时间后需要发送的提醒内容"
+                value={scheduleDraft.message_text}
+                onChange={event => setScheduleDraft({ ...scheduleDraft, message_text: event.target.value })}
+              />
+            )}
+            <div className="schedule-field-meta">
+              <small>时区：{Intl.DateTimeFormat().resolvedOptions().timeZone}</small>
+              <small>{scheduleDraft.action_type === 'agent_task'
+                ? `${scheduleDraft.prompt.length} / 6000`
+                : `${scheduleDraft.message_text.length} / 2000`}</small>
+            </div>
+          </div>
+
+          {scheduleDraft.action_type === 'agent_task' && (
+            <>
+              <div className="schedule-form-section-title">失败与超时</div>
+              <div className="schedule-field-grid schedule-field-grid-three">
+                <div className="schedule-field">
+                  <label>超时（分钟）</label>
+                  <InputNumber
+                    min={1}
+                    max={10080}
+                    value={Math.ceil(scheduleDraft.timeout_seconds / 60)}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, timeout_seconds: Number(value || 1) * 60 })}
+                    style={{ width: '100%' }}
+                  />
+                </div>
+                <div className="schedule-field">
+                  <label>最大尝试次数</label>
+                  <InputNumber
+                    min={1}
+                    max={5}
+                    value={scheduleDraft.max_attempts}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, max_attempts: Number(value || 1) })}
+                    style={{ width: '100%' }}
+                  />
+                </div>
+                <div className="schedule-field">
+                  <label>重试间隔（秒）</label>
+                  <InputNumber
+                    min={0}
+                    max={86400}
+                    disabled={scheduleDraft.max_attempts <= 1}
+                    value={scheduleDraft.backoff_seconds}
+                    onChange={value => setScheduleDraft({ ...scheduleDraft, backoff_seconds: Number(value || 0) })}
+                    style={{ width: '100%' }}
+                  />
+                </div>
+              </div>
+            </>
+          )}
+
+          <div className="schedule-preview">
+            <div><ClockCircleOutlined /><strong>未来执行时间</strong></div>
+            {schedulePreview.length > 0 ? (
+              <ol>{schedulePreview.map(item => <li key={item}>{new Date(item).toLocaleString()}</li>)}</ol>
+            ) : (
+              <span>{schedulePreviewError || '填写完整任务信息后显示未来 5 次执行时间'}</span>
+            )}
+          </div>
+        </div>
       </Modal>
-      {loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : schedules.length === 0 ? <Empty description="暂无定时任务" className="page-empty" /> : <div className="schedule-list">{schedules.map(task => <Card key={task.id} className="schedule-card"><div className="schedule-card-head"><div><strong>{task.name}</strong><Tag>{task.trigger_type || 'once'}</Tag></div><Space><Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} /><Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button></Space></div><p>{task.kind === 'agent_prompt' ? task.payload?.prompt : task.kind === 'system_job' ? task.payload?.job_name : task.payload?.message_text}</p><small>下次执行：{task.next_run_at ? new Date(task.next_run_at).toLocaleString() : '—'}</small></Card>)}</div>}
+      <Drawer
+        open={scheduleDetailOpen}
+        width="min(880px, calc(100vw - 20px))"
+        title={selectedSchedule?.name || '任务运行详情'}
+        onClose={() => setScheduleDetailOpen(false)}
+        className="schedule-detail-drawer"
+        extra={selectedSchedule && (
+          <Space>
+            <Button icon={<ThunderboltOutlined />} onClick={() => runScheduleNow(selectedSchedule)} disabled={schedulerHealth.status !== 'online' || !!selectedSchedule.active_run_id}>立即运行</Button>
+            <Button icon={<EditOutlined />} onClick={() => openEditSchedule(selectedSchedule)}>编辑</Button>
+            <Dropdown
+              menu={{ items: [
+                { key: 'duplicate', icon: <CopyOutlined />, label: '创建副本', onClick: () => duplicateSchedule(selectedSchedule) },
+                { key: 'delete', icon: <DeleteOutlined />, label: '删除任务', danger: true, disabled: !!selectedSchedule.active_run_id, onClick: () => deleteSchedule(selectedSchedule) },
+              ] }}
+            >
+              <Button aria-label="更多任务操作" icon={<MoreOutlined />} />
+            </Dropdown>
+            <Tooltip title="刷新运行记录">
+              <Button
+                aria-label="刷新运行记录"
+                icon={<ReloadOutlined />}
+                loading={scheduleRunsLoading}
+                onClick={() => loadScheduleRuns(selectedSchedule.id)}
+              />
+            </Tooltip>
+          </Space>
+        )}
+      >
+        {selectedSchedule && (
+          <div className="schedule-detail">
+            <div className="schedule-detail-overview">
+              <div className="schedule-detail-overview-main">
+                <span className="schedule-card-icon">
+                  {selectedSchedule.kind === 'agent_prompt' ? <RobotOutlined /> : <MessageOutlined />}
+                </span>
+                <div>
+                  <div className="schedule-detail-tags">
+                    <Tag>{selectedSchedule.kind === 'agent_prompt' ? 'Agent 任务' : selectedSchedule.kind === 'message' ? '定时提醒' : '系统任务'}</Tag>
+                    <Tag>{scheduleTriggerLabel(selectedSchedule)}</Tag>
+                    <Tag>{selectedSchedule.enabled === false ? '已暂停' : '已启用'}</Tag>
+                    {selectedSchedule.context_policy && <Tag>{selectedSchedule.context_policy === 'stateless' ? '独立上下文' : selectedSchedule.context_policy === 'task_history' ? '任务历史' : '共享记忆'}</Tag>}
+                    {selectedSchedule.kind === 'agent_prompt' && (
+                      <Tag>{selectedSchedule.permission_profile === 'read_only' ? '强制只读' : '继承全局权限'}</Tag>
+                    )}
+                  </div>
+                  <p>{selectedSchedule.kind === 'agent_prompt'
+                    ? selectedSchedule.payload?.prompt
+                    : selectedSchedule.kind === 'system_job'
+                      ? selectedSchedule.payload?.job_name
+                      : selectedSchedule.payload?.message_text}</p>
+                  {selectedSchedule.workspace_root && (
+                    <div className="schedule-workspace"><FolderOpenOutlined />{selectedSchedule.workspace_root}</div>
+                  )}
+                </div>
+              </div>
+              <div className="schedule-detail-next">
+                <small>下次执行</small>
+                <strong>{selectedSchedule.next_run_at
+                  ? new Date(selectedSchedule.next_run_at).toLocaleString()
+                  : '暂无后续执行'}</strong>
+              </div>
+            </div>
+
+            {scheduleRunsLoading && scheduleRuns.length === 0 ? (
+              <div className="schedule-detail-loading"><Spin /><span>正在读取运行记录</span></div>
+            ) : scheduleRuns.length === 0 ? (
+              <Empty description="该任务尚未执行" className="schedule-runs-empty" />
+            ) : (
+              <div className="schedule-detail-grid">
+                <aside className="schedule-run-list" aria-label="运行历史">
+                  <div className="schedule-detail-section-title">
+                    <strong>运行历史</strong>
+                    <span>{scheduleRuns.length} 次</span>
+                  </div>
+                  <div className="schedule-run-items">
+                    {scheduleRuns.map(run => (
+                      <button
+                        key={run.id}
+                        type="button"
+                        className={`schedule-run-item ${selectedScheduleRunId === run.id ? 'active' : ''}`}
+                        onClick={() => setSelectedScheduleRunId(run.id)}
+                      >
+                        <span className={`schedule-run-status-icon status-${run.status}`}>
+                          {scheduleRunStatusIcon(run.status)}
+                        </span>
+                        <span className="schedule-run-item-main">
+                          <strong>{scheduleRunStatusLabel(run.status)}</strong>
+                          <small>{run.started_at ? new Date(run.started_at).toLocaleString() : '等待开始'}</small>
+                        </span>
+                        <span className="schedule-run-duration">{formatScheduleDuration(run.duration_ms)}</span>
+                      </button>
+                    ))}
+                  </div>
+                </aside>
+
+                <section className="schedule-run-detail" aria-label="运行结果">
+                  {selectedScheduleRun && (
+                    <>
+                      <div className="schedule-run-detail-head">
+                        <div>
+                          <span className={`schedule-run-status status-${selectedScheduleRun.status}`}>
+                            {scheduleRunStatusIcon(selectedScheduleRun.status)}
+                            {scheduleRunStatusLabel(selectedScheduleRun.status)}
+                          </span>
+                          <div
+                            className="schedule-run-summary markdown"
+                            dangerouslySetInnerHTML={{ __html: markdownToHtml(selectedScheduleRun.summary || '暂无运行摘要') }}
+                          />
+                        </div>
+                        <Space>
+                        {selectedScheduleRun.status === 'running' && (
+                          <Button danger size="small" icon={<StopOutlined />} loading={!!selectedScheduleRun.cancel_requested_at} onClick={() => cancelScheduleRun(selectedSchedule, selectedScheduleRun)}>
+                            {selectedScheduleRun.cancel_requested_at ? '正在取消' : '取消运行'}
+                          </Button>
+                        )}
+                        {selectedScheduleRun.status !== 'running' && (
+                          <Dropdown menu={{ items: [
+                            { key: 'snapshot', label: '使用本次运行配置', onClick: () => retryScheduleRun(selectedSchedule, selectedScheduleRun, false) },
+                            { key: 'latest', label: '使用任务当前配置', onClick: () => retryScheduleRun(selectedSchedule, selectedScheduleRun, true) },
+                          ] }}>
+                            <Button size="small" icon={<ReloadOutlined />} disabled={!!selectedSchedule.active_run_id}>重试</Button>
+                          </Dropdown>
+                        )}
+                        {scheduleRunOutput?.available && scheduleRunOutput.output_url && (
+                          <Button
+                            size="small"
+                            icon={<FileTextOutlined />}
+                            href={`${scheduleRunOutput.output_url}${token ? `${scheduleRunOutput.output_url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}` : ''}`}
+                            target="_blank"
+                          >打开原始文件</Button>
+                        )}
+                        </Space>
+                      </div>
+
+                      <div className="schedule-run-meta">
+                        <div><small>计划时间</small><span>{selectedScheduleRun.scheduled_for ? new Date(selectedScheduleRun.scheduled_for).toLocaleString() : '—'}</span></div>
+                        <div><small>开始时间</small><span>{selectedScheduleRun.started_at ? new Date(selectedScheduleRun.started_at).toLocaleString() : '—'}</span></div>
+                        <div><small>完成时间</small><span>{selectedScheduleRun.finished_at ? new Date(selectedScheduleRun.finished_at).toLocaleString() : '—'}</span></div>
+                        <div><small>执行耗时</small><span>{formatScheduleDuration(selectedScheduleRun.duration_ms)}</span></div>
+                        <div><small>触发方式</small><span>{selectedScheduleRun.trigger_source === 'manual' ? '手动运行' : selectedScheduleRun.trigger_source?.startsWith('retry') ? `重试 · 第 ${selectedScheduleRun.attempt || 1} 次` : '按计划运行'}</span></div>
+                        <div><small>运行模型</small><span>{selectedScheduleRun.config_snapshot?.model_override || '默认模型'}</span></div>
+                      </div>
+
+                      {selectedScheduleRun.error && (
+                        <div className="schedule-run-error">
+                          <strong>执行错误</strong>
+                          <pre>{selectedScheduleRun.error}</pre>
+                        </div>
+                      )}
+
+                      <div className="schedule-output-head">
+                        <strong>完整输出</strong>
+                        {selectedScheduleRun.delivery_status && <span>{scheduleDeliveryStatusLabel(selectedScheduleRun.delivery_status)}</span>}
+                      </div>
+                      {selectedScheduleRun.status === 'running' ? (
+                        <div className="schedule-output-state"><Spin size="small" /><span>任务正在执行，结果会自动刷新</span></div>
+                      ) : scheduleOutputLoading ? (
+                        <div className="schedule-output-state"><Spin size="small" /><span>正在加载输出</span></div>
+                      ) : scheduleRunOutput?.available ? (
+                        <>
+                          {scheduleRunOutput.truncated && <div className="schedule-output-notice">输出较长，页面仅展示前 2 MB，可打开原始文件查看全部内容。</div>}
+                          <div
+                            className="schedule-output markdown"
+                            dangerouslySetInnerHTML={{ __html: markdownToHtml(scheduleRunOutput.content) }}
+                          />
+                        </>
+                      ) : (
+                        <div className="schedule-output-state muted">本次运行没有可展示的文本输出</div>
+                      )}
+                      {scheduleArtifacts.length > 0 && (
+                        <div className="schedule-artifacts">
+                          <div className="schedule-output-head">
+                            <strong>输出文件</strong>
+                            <span>{scheduleArtifacts.length} 个</span>
+                          </div>
+                          <div className="schedule-artifact-list">
+                            {scheduleArtifacts.map(artifact => {
+                              const url = `${artifact.url}${token ? `?token=${encodeURIComponent(token)}` : ''}`
+                              return (
+                                <a key={artifact.path} href={url} target="_blank" rel="noreferrer" className="schedule-artifact-item">
+                                  {artifact.mime_type.startsWith('image/')
+                                    ? <img src={url} alt="" />
+                                    : <span><FileTextOutlined /></span>}
+                                  <div><strong>{artifact.name}</strong><small>{formatFileSize(artifact.size_bytes)}</small></div>
+                                </a>
+                              )
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </section>
+              </div>
+            )}
+          </div>
+        )}
+      </Drawer>
+      {loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={schedules.length ? '没有符合条件的任务' : '暂无定时任务'} className="page-empty" /> : (
+        <div className="schedule-list">
+          {filteredSchedules.map(task => {
+            const description = task.kind === 'agent_prompt'
+              ? task.payload?.prompt
+              : task.kind === 'system_job'
+                ? task.payload?.job_name
+                : task.payload?.message_text
+            const latestRun = task.latest_run
+            return (
+              <Card
+                key={task.id}
+                hoverable
+                role="button"
+                tabIndex={0}
+                aria-label={`查看 ${task.name} 的运行记录`}
+                className={`schedule-card ${task.enabled === false ? 'schedule-card-disabled' : ''}`}
+                onClick={() => openScheduleDetails(task)}
+                onKeyDown={event => {
+                  if (event.target !== event.currentTarget) return
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    openScheduleDetails(task)
+                  }
+                }}
+              >
+                <div className="schedule-card-head">
+                  <div className="schedule-card-title">
+                    <span className="schedule-card-icon">{task.kind === 'agent_prompt' ? <RobotOutlined /> : <MessageOutlined />}</span>
+                    <div>
+                      <strong>{task.name}</strong>
+                      <span>{task.kind === 'agent_prompt' ? 'Agent 任务' : task.kind === 'message' ? '定时提醒' : '系统任务'}</span>
+                    </div>
+                  </div>
+                  <Space onClick={event => event.stopPropagation()}>
+                    <Checkbox
+                      aria-label={`选择 ${task.name}`}
+                      checked={selectedScheduleIds.includes(task.id)}
+                      onChange={event => setSelectedScheduleIds(prev => event.target.checked
+                        ? [...prev, task.id]
+                        : prev.filter(id => id !== task.id))}
+                    />
+                    <Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} />
+                    <Tooltip title={schedulerHealth.status === 'online' ? '立即运行' : '调度器离线'}><Button type="text" icon={<ThunderboltOutlined />} disabled={schedulerHealth.status !== 'online' || !!task.active_run_id} onClick={() => runScheduleNow(task)} /></Tooltip>
+                    <Tooltip title="编辑"><Button type="text" icon={<EditOutlined />} onClick={() => openEditSchedule(task)} /></Tooltip>
+                    <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button>
+                  </Space>
+                </div>
+                <p className="schedule-card-description">{description || '暂无任务描述'}</p>
+                <div className="schedule-card-footer">
+                  <span className={`schedule-run-status status-${latestRun?.status || 'pending'}`}>
+                    {scheduleRunStatusIcon(latestRun?.status)}
+                    {scheduleRunStatusLabel(latestRun?.status)}
+                  </span>
+                  {latestRun?.duration_ms !== null && latestRun?.duration_ms !== undefined && (
+                    <span>耗时 {formatScheduleDuration(latestRun.duration_ms)}</span>
+                  )}
+                  <span>下次执行：{task.next_run_at ? new Date(task.next_run_at).toLocaleString() : '暂无'}</span>
+                  {task.last_run_at && <span>上次执行：{new Date(task.last_run_at).toLocaleString()}</span>}
+                  <Button type="text" size="small" icon={<FileTextOutlined />} className="schedule-card-detail-button">运行记录</Button>
+                </div>
+              </Card>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 
@@ -2830,6 +4225,7 @@ function App() {
 
   return (
     <ConfigProvider
+      locale={zhCN}
       theme={{
         algorithm: themeMode === 'dark' ? theme.darkAlgorithm : theme.defaultAlgorithm,
         token: {

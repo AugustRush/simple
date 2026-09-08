@@ -31,9 +31,10 @@ async def _echo_handler(msg, sink):
 
 
 class _FakeStore:
-    def __init__(self, turns=None):
+    def __init__(self, turns=None, working_state=None):
         self._turns = turns or {}
         self._titles = {}
+        self._working_state = working_state
 
     def list_session_ids(self, prefix="", limit=50):
         return [
@@ -54,6 +55,15 @@ class _FakeStore:
     def recent_conversation_turns(self, session_id, limit=100):
         turns = self._turns.get(session_id, [])
         return turns[-limit:]
+
+    def load_session_working_state(self, session_id):
+        if self._working_state is None:
+            return None
+        return SimpleNamespace(state=self._working_state)
+
+    def save_session_working_state(self, session_id, state, updated_at=None):
+        self._working_state = state
+        return SimpleNamespace(state=state)
 
 
 def _turn(role, content):
@@ -110,6 +120,73 @@ def test_session_service_exposes_task_guidance_and_queue_state():
     assert state["operation_state"] == "active"
     assert state["queue"] == {"pending": 3, "interjections": 1, "restarts": 2}
     assert state["task"]["active_goal"] == "finish the migration"
+
+
+def test_session_service_dismisses_task_guidance_and_persists_state():
+    store = _FakeStore(
+        working_state={
+            "task_id": "task-1",
+            "active_goal": "finish the migration",
+            "status": "cancelled",
+            "next_action": "run verification",
+            "tasks": [
+                {
+                    "task_id": "task-1",
+                    "active_goal": "finish the migration",
+                    "status": "cancelled",
+                    "next_action": "run verification",
+                }
+            ],
+        }
+    )
+    service = SessionService(store=store)
+
+    assert service.dismiss_task_guidance("s-1", "task-1") is True
+    assert store._working_state["status"] == "dismissed"
+    assert store._working_state["next_action"] == ""
+    assert store._working_state["tasks"][0]["status"] == "dismissed"
+
+
+def test_session_service_dismisses_only_selected_legacy_task():
+    store = _FakeStore(
+        working_state={
+            "active_goal": "second task",
+            "status": "cancelled",
+            "tasks": [
+                {"active_goal": "first task", "status": "cancelled"},
+                {"active_goal": "second task", "status": "cancelled"},
+            ],
+        }
+    )
+
+    assert SessionService(store=store).dismiss_task_guidance("s-1") is True
+    assert store._working_state["tasks"][0]["status"] == "cancelled"
+    assert store._working_state["tasks"][1]["status"] == "dismissed"
+
+
+def test_web_task_guidance_dismiss_endpoint():
+    from starlette.testclient import TestClient
+
+    store = _FakeStore(
+        working_state={
+            "task_id": "task-1",
+            "active_goal": "finish the migration",
+            "status": "cancelled",
+            "next_action": "run verification",
+        }
+    )
+    channel = _channel()
+    channel.bind_runtime({}, {"context_manager": SimpleNamespace(store=store)})
+
+    with TestClient(channel.app) as client:
+        response = client.post(
+            "/api/sessions/s-1/task-guidance/dismiss",
+            json={"task_id": "task-1"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["dismissed"] is True
+    assert store._working_state["status"] == "dismissed"
 
 
 def test_web_index_serves_ui():
@@ -335,6 +412,28 @@ def test_web_output_sink_emits_attachment_events():
     assert sink.events[-1]["name"] == "example.txt"
 
 
+def test_web_output_sink_deduplicates_equivalent_attachment_paths(tmp_path):
+    import asyncio
+
+    from agent.channels.web import WebOutputSink
+
+    recorded = []
+    target = tmp_path / "images" / "result.png"
+    sink = WebOutputSink(
+        collect=True,
+        on_attachment=lambda path, name: recorded.append((path, name)),
+    )
+    sink.mark_turn_start()
+    sink.queue_attachment(target)
+    sink.queue_attachment(target.parent / "." / target.name)
+
+    asyncio.run(sink.flush_attachments())
+
+    attachments = [event for event in sink.events if event["type"] == "attachment"]
+    assert len(attachments) == 1
+    assert recorded == [(str(target), "result.png")]
+
+
 def test_web_management_endpoints_plugins_skills_context():
     from starlette.testclient import TestClient
 
@@ -542,6 +641,46 @@ def test_web_session_runtime_uses_global_resources_and_session_output(tmp_path, 
     assert not (home / "config.json").exists()
 
 
+def test_web_session_runtime_restores_selected_workspace_write_grant(tmp_path, monkeypatch):
+    from pathlib import Path
+    from agent import shared
+    import agent.bootstrap as bootstrap
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    home = tmp_path / ".agent" / "web" / "sessions" / "sid123"
+    home.mkdir(parents=True)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (home / ".session.json").write_text(
+        __import__("json").dumps({
+            "workspace_root": str(workspace),
+            "workspace_read": True,
+            "workspace_write": True,
+        }),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    async def fake_build(cfg, *, announce=True, resource_home=None):
+        captured.update(cfg=cfg, resource_home=resource_home)
+        return {"ok": True}
+
+    monkeypatch.setattr(bootstrap, "_build_components_async", fake_build)
+    __import__("asyncio").run(
+        bootstrap._build_web_session_components(
+            "sid123",
+            {"file_access": {"workspace": {"read": True, "write": False}}},
+        )
+    )
+
+    assert captured["cfg"]["workspace_root"] == str(workspace)
+    assert captured["cfg"]["file_access"]["workspace"] == {
+        "read": True,
+        "write": True,
+    }
+
+
 def test_session_service_recovers_legacy_events_by_turn_id(tmp_path):
     from agent.memory.store import LTMStore
 
@@ -580,6 +719,428 @@ def test_session_service_recovers_legacy_events_by_turn_id(tmp_path):
         "search"
     ]
     assert messages[1]["role"] == "tool"
+
+
+def test_session_service_restores_attachments_on_the_user_message(tmp_path):
+    from agent.memory.store import LTMStore
+
+    attachment = tmp_path / "uploads" / "brief.pdf"
+    attachment.parent.mkdir()
+    attachment.write_bytes(b"%PDF-test")
+    metadata = {
+        "attachments": [
+            {
+                "id": "upload-1",
+                "filename": "brief.pdf",
+                "mime_type": "application/pdf",
+                "kind": "document",
+                "path": str(attachment),
+                "size_bytes": attachment.stat().st_size,
+            }
+        ]
+    }
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    result = store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="",
+        channel="web",
+        message_id="attachment-turn",
+        metadata=metadata,
+    )
+    assert result.user_created is True
+    # Simulate the event written by the previous implementation. It must not
+    # create a second standalone attachment after a refresh.
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="attachment-turn",
+        event_type="attachment",
+        payload={"name": "brief.pdf", "path": str(attachment)},
+    )
+
+    messages = SessionService(store=store).get_messages("web-session")
+
+    assert messages == [
+        {
+            "role": "user",
+            "content": "",
+            "attachments": metadata["attachments"],
+        }
+    ]
+
+
+def test_session_service_deduplicates_output_attachment_events_per_turn(tmp_path):
+    from agent.memory.store import LTMStore
+
+    attachment = tmp_path / "output" / "result.png"
+    attachment.parent.mkdir()
+    attachment.write_bytes(b"image")
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="生成一张图片",
+        assistant_content="图片已生成。",
+        channel="web",
+        message_id="image-turn",
+    )
+    for _ in range(2):
+        store.append_agent_event(
+            session_id="web-session",
+            turn_id="image-turn",
+            event_type="attachment",
+            payload={"name": "result.png", "path": str(attachment)},
+        )
+
+    messages = SessionService(store=store).get_messages("web-session")
+
+    attachments = [item for item in messages if item.get("tool") == "attachment"]
+    assert len(attachments) == 1
+
+
+def test_session_service_merges_continuations_without_moving_trace_or_attachment(
+    tmp_path,
+):
+    from agent.memory.store import LTMStore
+
+    attachment = tmp_path / "uploads" / "reference.png"
+    attachment.parent.mkdir()
+    attachment.write_bytes(b"image")
+    metadata = {
+        "attachments": [
+            {
+                "id": "upload-1",
+                "filename": "reference.png",
+                "mime_type": "image/png",
+                "kind": "image",
+                "path": str(attachment),
+                "size_bytes": attachment.stat().st_size,
+            }
+        ]
+    }
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="分析这个附件",
+        channel="web",
+        message_id="attachment-turn",
+        metadata=metadata,
+    )
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="分析这个附件",
+        assistant_content="我先检查文件。",
+        channel="web",
+        message_id="attachment-turn",
+        assistant_message_id="attachment-turn:completion:1",
+    )
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="attachment-turn",
+        event_type="tool_started",
+        payload={"operation_id": "tool-1", "tool_name": "inspect_image"},
+    )
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="attachment-turn",
+        event_type="tool_completed",
+        payload={
+            "operation_id": "tool-1",
+            "tool_name": "inspect_image",
+            "ok": True,
+        },
+    )
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="继续分析",
+        assistant_content="检查完成，这是最终结论。",
+        channel="web",
+        message_id="attachment-turn",
+        assistant_message_id="attachment-turn:completion:2",
+    )
+
+    messages = SessionService(store=store).get_messages("web-session")
+
+    assert [item["role"] for item in messages] == ["user", "tool", "assistant"]
+    assert messages[0]["attachments"] == metadata["attachments"]
+    assert messages[1]["tool"] == "inspect_image"
+    assert messages[1]["toolState"] == "done"
+    assert messages[2]["content"] == "我先检查文件。\n\n检查完成，这是最终结论。"
+
+
+def test_web_create_agent_schedule_with_structured_time(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+
+    with TestClient(channel.app) as client:
+        created = client.post(
+            "/api/schedules",
+            json={
+                "name": "daily review",
+                "action_type": "agent_task",
+                "prompt": "Review the repository and summarize open risks.",
+                "trigger_type": "once",
+                "at": future,
+                "timezone_name": "Asia/Shanghai",
+            },
+        )
+        assert created.status_code == 200
+        assert created.json()["task"]["kind"] == "agent_prompt"
+        tasks = client.get("/api/schedules").json()["tasks"]
+        assert tasks[0]["payload"]["prompt"].startswith("Review the repository")
+
+        invalid = client.post(
+            "/api/schedules",
+            json={
+                "name": "past task",
+                "action_type": "agent_task",
+                "prompt": "Do something",
+                "trigger_type": "once",
+                "at": "2020-01-01T00:00:00+00:00",
+                "timezone_name": "UTC",
+            },
+        )
+        assert invalid.status_code == 400
+        assert "晚于当前时间" in invalid.json()["error"]
+
+
+def test_web_schedule_validates_selected_skills_and_permission(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    class SkillCatalog:
+        def get(self, skill_id):
+            if skill_id == "review":
+                return SimpleNamespace(id="review", user_invocable=True)
+            return None
+
+    channel = _channel()
+    channel.bind_runtime({}, {"skill_catalog": SkillCatalog()})
+    body = {
+        "name": "review",
+        "action_type": "agent_task",
+        "prompt": "Review the repository.",
+        "trigger_type": "once",
+        "at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+        "timezone_name": "UTC",
+        "selected_skills": ["review"],
+        "permission_profile": "read_only",
+    }
+
+    with TestClient(channel.app) as client:
+        created = client.post("/api/schedules", json=body)
+        assert created.status_code == 200
+        assert created.json()["task"]["selected_skills"] == ["review"]
+        assert created.json()["task"]["permission_profile"] == "read_only"
+
+        unavailable = client.post(
+            "/api/schedules",
+            json={**body, "name": "missing", "selected_skills": ["missing"]},
+        )
+        assert unavailable.status_code == 400
+        assert "技能不可用" in unavailable.json()["error"]
+
+        unsafe = client.post(
+            "/api/schedules",
+            json={**body, "name": "unsafe", "permission_profile": "full"},
+        )
+        assert unsafe.status_code == 400
+        assert "权限策略" in unsafe.json()["error"]
+
+
+def test_web_schedule_run_history_and_output(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+
+    agent_home = tmp_path / ".agent"
+    db_path = agent_home / "tasks" / "scheduler.db"
+    monkeypatch.setattr(shared, "AGENT_HOME", agent_home)
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", db_path)
+    store = SchedulerStore(db_path=db_path)
+    scheduled_for = datetime(2026, 9, 7, 2, 0, tzinfo=timezone.utc)
+    task = store.create_task(
+        NewScheduledTask(
+            name="daily report",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once(scheduled_for, "Asia/Shanghai"),
+            payload={"prompt": "Summarize today's work"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        ),
+        now=scheduled_for - timedelta(hours=1),
+    )
+    claimed = store.claim_due_tasks(
+        now=scheduled_for + timedelta(seconds=2),
+        lease_seconds=300,
+    )[0]
+    output_path = agent_home / "output" / "scheduler" / task.id / f"{claimed.run.id}.md"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("# Daily report\n\nEverything completed.", encoding="utf-8")
+    artifact_path = output_path.parent / claimed.run.id / "artifacts" / "report.txt"
+    artifact_path.parent.mkdir(parents=True)
+    artifact_path.write_text("artifact contents", encoding="utf-8")
+    store.complete_run(
+        task.id,
+        claimed.run.id,
+        finished_at=scheduled_for + timedelta(seconds=7),
+        status="succeeded",
+        summary="Daily report completed",
+        output_path=str(output_path),
+        delivery_status="stored",
+    )
+    store.close()
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        listed = client.get("/api/schedules")
+        assert listed.status_code == 200
+        listed_task = listed.json()["tasks"][0]
+        assert listed_task["latest_run"]["status"] == "succeeded"
+        assert listed_task["latest_run"]["duration_ms"] == 5000
+        assert listed_task["latest_run"]["output_available"] is True
+
+        history = client.get(f"/api/schedules/{task.id}/runs")
+        assert history.status_code == 200
+        run = history.json()["runs"][0]
+        assert run["id"] == claimed.run.id
+        assert run["summary"] == "Daily report completed"
+        assert run["delivery_status"] == "stored"
+
+        output = client.get(
+            f"/api/schedules/{task.id}/runs/{claimed.run.id}/output"
+        )
+        assert output.status_code == 200
+        assert output.json()["available"] is True
+        assert output.json()["content"].startswith("# Daily report")
+        assert output.json()["truncated"] is False
+
+        artifacts = client.get(
+            f"/api/schedules/{task.id}/runs/{claimed.run.id}/artifacts"
+        )
+        assert artifacts.status_code == 200
+        assert artifacts.json()["artifacts"][0]["name"] == "report.txt"
+        artifact = client.get(artifacts.json()["artifacts"][0]["url"])
+        assert artifact.status_code == 200
+        assert artifact.text == "artifact contents"
+
+        missing = client.get(f"/api/schedules/{task.id}/runs/missing/output")
+        assert missing.status_code == 404
+
+
+def test_web_schedule_controls_delegate_to_live_scheduler(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import TaskRun
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    class Scheduler:
+        def __init__(self):
+            self.calls = []
+
+        def health(self):
+            return {"status": "online", "active_runs": 0}
+
+        async def run_task_now(self, task_id):
+            self.calls.append(("run", task_id))
+            return SimpleNamespace(
+                run=TaskRun(
+                    id="run-now",
+                    task_id=task_id,
+                    scheduled_for=datetime.now(timezone.utc),
+                    started_at=datetime.now(timezone.utc),
+                    finished_at=None,
+                    status="running",
+                )
+            )
+
+        async def retry_run(self, task_id, run_id, *, use_latest=False):
+            self.calls.append(("retry", task_id, run_id, use_latest))
+            return SimpleNamespace(
+                run=TaskRun(
+                    id="retry-now",
+                    task_id=task_id,
+                    scheduled_for=datetime.now(timezone.utc),
+                    started_at=datetime.now(timezone.utc),
+                    finished_at=None,
+                    status="running",
+                    trigger_source="retry_latest" if use_latest else "retry_snapshot",
+                )
+            )
+
+        async def cancel_run(self, task_id, run_id):
+            self.calls.append(("cancel", task_id, run_id))
+            return True
+
+    scheduler = Scheduler()
+    channel = _channel()
+    channel.bind_runtime({}, {"scheduler_service": scheduler})
+    with TestClient(channel.app) as client:
+        assert client.get("/api/scheduler/health").json()["status"] == "online"
+        assert client.post("/api/schedules/task-1/run").status_code == 202
+        retried = client.post(
+            "/api/schedules/task-1/runs/run-1/retry", json={"use_latest": True}
+        )
+        assert retried.status_code == 202
+        assert retried.json()["run"]["trigger_source"] == "retry_latest"
+        assert client.post("/api/schedules/task-1/runs/run-1/cancel").status_code == 202
+
+    assert scheduler.calls == [
+        ("run", "task-1"),
+        ("retry", "task-1", "run-1", True),
+        ("cancel", "task-1", "run-1"),
+    ]
+
+
+def test_web_bulk_schedule_management_skips_running_tasks(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+    future = datetime.now(timezone.utc) + timedelta(hours=1)
+    ids = []
+    for name in ("first", "second"):
+        ids.append(store.create_task(NewScheduledTask(
+            name=name,
+            kind="message",
+            trigger=TriggerSpec.once(future, "UTC"),
+            payload={"message_text": name},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )).id)
+    running = store.claim_task_now(ids[1], lease_seconds=300)
+    assert running is not None
+    store.close()
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        paused = client.patch(
+            "/api/schedules", json={"action": "disable", "task_ids": ids}
+        )
+        assert paused.status_code == 200
+        assert set(paused.json()["completed"]) == set(ids)
+
+        deleted = client.patch(
+            "/api/schedules", json={"action": "delete", "task_ids": ids}
+        )
+        assert deleted.status_code == 200
+        assert deleted.json()["completed"] == [ids[0]]
+        assert deleted.json()["skipped"] == [{"id": ids[1], "reason": "running"}]
 
 
 def test_web_bulk_delete_sessions():

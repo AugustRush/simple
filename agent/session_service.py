@@ -454,6 +454,94 @@ class SessionService:
             ) if isinstance(live_metadata, dict) else bool(persisted_workspace_meta.get("workspace_write", False)),
         }
 
+    def dismiss_task_guidance(self, session_id: str, task_id: str = "") -> bool:
+        """Persist that a task guidance card was explicitly dismissed.
+
+        Working state can be stored as either the current task object or a
+        newer ``tasks`` collection.  Update both representations so clients
+        using either shape observe the same terminal state after a refresh.
+        """
+        clean = str(session_id or "").strip()
+        if not clean:
+            return False
+        store = self._store_for_session(clean)
+        load_state = getattr(store, "load_session_working_state", None)
+        save_state = getattr(store, "save_session_working_state", None)
+        if not callable(load_state) or not callable(save_state):
+            return False
+        try:
+            snapshot = load_state(clean)
+            raw = getattr(snapshot, "state", None) if snapshot is not None else None
+            if not isinstance(raw, dict) or not raw:
+                return False
+            state = dict(raw)
+            requested_id = str(task_id or "").strip()
+            candidates = self._working_state_candidates_for_dismiss(state)
+            target_index: int | None = None
+            if requested_id:
+                target_index = next(
+                    (
+                        index
+                        for index, item in enumerate(candidates)
+                        if str(item.get("task_id") or "") == requested_id
+                    ),
+                    None,
+                )
+            if target_index is None:
+                terminal_statuses = {
+                    "completed",
+                    "success",
+                    "done",
+                    "updated",
+                    "dismissed",
+                }
+                target_index = next(
+                    (
+                        index
+                        for index in range(len(candidates) - 1, -1, -1)
+                        if str(candidates[index].get("status") or "").lower()
+                        not in terminal_statuses
+                    ),
+                    None,
+                )
+            if target_index is None:
+                return False
+            target = dict(candidates[target_index])
+            target_id = str(target.get("task_id") or "")
+            target["status"] = "dismissed"
+            target["next_action"] = ""
+            target["updated_at"] = datetime.now(timezone.utc).isoformat()
+            if isinstance(state.get("tasks"), list):
+                tasks = [item for item in state["tasks"] if isinstance(item, dict)]
+                tasks[target_index] = target
+                state["tasks"] = tasks
+            # Keep the legacy/top-level projection in sync when it identifies
+            # the dismissed task, or when no task list is present.
+            if (
+                not isinstance(state.get("tasks"), list)
+                or str(state.get("task_id") or "") == target_id
+            ):
+                state.update(target)
+            save_state(
+                clean,
+                state,
+                updated_at=str(target.get("updated_at") or ""),
+            )
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _working_state_candidates_for_dismiss(
+        state: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        tasks = state.get("tasks")
+        if isinstance(tasks, list):
+            candidates = [item for item in tasks if isinstance(item, dict)]
+            if candidates:
+                return candidates
+        return [state]
+
     def rename_session(self, session_id: str, title: str) -> bool:
         clean = str(session_id or "").strip()
         if not clean:
@@ -644,7 +732,7 @@ class SessionService:
         session_id: str,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        """Return recent plain-text turns for ``session_id``."""
+        """Return recent display messages and durable traces for ``session_id``."""
         target_store = self._store_for_session(str(session_id or "").strip())
         if target_store is None:
             return []
@@ -661,18 +749,56 @@ class SessionService:
             if str(getattr(turn, "message_id", "") or "").strip()
         }
         messages: list[dict[str, Any]] = []
+        assistants_by_reply: dict[str, dict[str, Any]] = {}
+        persisted_attachment_paths: set[str] = set()
         for turn in turns or ():
             role = str(getattr(turn, "role", "") or "")
             content = str(getattr(turn, "content", "") or "").strip()
-            if role in ("user", "assistant") and content:
-                messages.append(
-                    {
-                        "role": role,
-                        "content": content,
-                        "created_at": str(getattr(turn, "created_at", "") or ""),
-                        "message_id": str(getattr(turn, "message_id", "") or ""),
-                    }
-                )
+            reply_to_id = str(getattr(turn, "reply_to_id", "") or "").strip()
+            metadata = getattr(turn, "metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            attachments: list[dict[str, Any]] = []
+            if role == "user" and isinstance(metadata.get("attachments"), list):
+                for raw in metadata["attachments"][:12]:
+                    if not isinstance(raw, dict):
+                        continue
+                    path = str(raw.get("path") or "").strip()
+                    if not path:
+                        continue
+                    persisted_attachment_paths.add(path)
+                    attachments.append(
+                        {
+                            "id": str(raw.get("id") or Path(path).name),
+                            "filename": str(raw.get("filename") or Path(path).name),
+                            "mime_type": str(raw.get("mime_type") or "application/octet-stream"),
+                            "kind": str(raw.get("kind") or "unknown"),
+                            "path": path,
+                            "size_bytes": raw.get("size_bytes"),
+                        }
+                    )
+            if role in ("user", "assistant") and (content or attachments):
+                if role == "assistant" and reply_to_id in assistants_by_reply:
+                    previous = assistants_by_reply[reply_to_id]
+                    previous_content = str(previous.get("content") or "").strip()
+                    if content and content != previous_content:
+                        if content.startswith(previous_content):
+                            previous["content"] = content
+                        elif not previous_content.startswith(content):
+                            previous["content"] = f"{previous_content}\n\n{content}"
+                    continue
+                item = {
+                    "role": role,
+                    "content": content,
+                    "created_at": str(getattr(turn, "created_at", "") or ""),
+                    "message_id": str(getattr(turn, "message_id", "") or ""),
+                    "reply_to_id": reply_to_id,
+                }
+                if attachments:
+                    item["attachments"] = attachments
+                messages.append(item)
+                if role == "assistant" and reply_to_id:
+                    assistants_by_reply[reply_to_id] = item
 
         # Tool output is emitted as a live event, not as a conversation turn.
         # Rehydrate one compact tool row per operation so the UI can rebuild
@@ -709,6 +835,7 @@ class SessionService:
             tools: dict[str, dict[str, Any]] = {}
             order: list[str] = []
             terminal_turns: set[str] = set()
+            seen_output_attachments: set[tuple[str, str]] = set()
             for event in events or ():
                 event_type = str(getattr(event, "event_type", "") or "")
                 event_turn_id = str(getattr(event, "turn_id", "") or "")
@@ -723,6 +850,16 @@ class SessionService:
                 if not isinstance(payload, dict):
                     payload = {}
                 if event_type == "attachment":
+                    attachment_path = str(payload.get("path") or "")
+                    # Input attachments now live on the durable user turn.
+                    # Suppress equivalent legacy events so a refresh does not
+                    # render the same file again as an output attachment.
+                    if attachment_path in persisted_attachment_paths:
+                        continue
+                    attachment_key = (event_turn_id, attachment_path)
+                    if attachment_key in seen_output_attachments:
+                        continue
+                    seen_output_attachments.add(attachment_key)
                     messages.append(
                         {
                             "role": "tool",
@@ -732,7 +869,7 @@ class SessionService:
                             "created_at": str(getattr(event, "created_at", "") or ""),
                             "turn_id": str(getattr(event, "turn_id", "") or ""),
                             "link": "/api/files?path="
-                            + quote(str(payload.get("path") or ""), safe=""),
+                            + quote(attachment_path, safe=""),
                         }
                     )
                     continue
@@ -827,6 +964,7 @@ class SessionService:
         for item in ordered:
             item.pop("created_at", None)
             item.pop("message_id", None)
+            item.pop("reply_to_id", None)
             item.pop("turn_id", None)
         return ordered
 

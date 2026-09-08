@@ -1284,7 +1284,7 @@ class ContextManager:
     @staticmethod
     def _working_state_is_complete(state: dict[str, Any]) -> bool:
         status = str(state.get("status", "") or "").strip().lower()
-        return status in {"completed", "updated", "done", "success"}
+        return status in {"completed", "updated", "done", "success", "dismissed"}
 
     def _working_state_candidates(self, state: dict[str, Any]) -> list[dict[str, Any]]:
         tasks = state.get("tasks")
@@ -1332,8 +1332,16 @@ class ContextManager:
         scored: list[tuple[float, dict[str, Any]]] = []
         for candidate in self._working_state_candidates(state):
             complete = self._working_state_is_complete(candidate)
+            dismissed = (
+                str(candidate.get("status", "") or "").strip().lower()
+                == "dismissed"
+            )
             score = self._working_state_relevance_score(candidate, query)
-            eligible = include_completed or continuation_request or not complete
+            # An explicit dismissal is durable user intent.  Even a generic
+            # "continue" request must not resurrect that task automatically.
+            eligible = False if dismissed else (
+                include_completed or continuation_request or not complete
+            )
             candidate_trace = {
                 "task_id": str(candidate.get("task_id", "") or ""),
                 "status": str(candidate.get("status", "") or ""),

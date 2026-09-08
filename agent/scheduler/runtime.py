@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from .models import DeliveryResult, ExecutionResult
+from .models import DeliveryResult, DeliveryTarget, ExecutionResult
 from .store import SchedulerStore
 
 
@@ -35,6 +35,12 @@ class SchedulerService:
         if self.lease_seconds < 3:
             raise ValueError("lease_seconds must be at least 3")
         self.max_concurrent_runs = max(1, int(max_concurrent_runs))
+        self._active_tasks: dict[str, asyncio.Task] = {}
+        self._background_tasks: set[asyncio.Task] = set()
+        self._cancel_requested: set[str] = set()
+        self._started_at = datetime.now(UTC)
+        self._last_heartbeat = self._started_at
+        self._running = False
 
     async def _store_call(self, method_name: str, *args, **kwargs):
         """Run SQLite work off-loop using a connection owned by that thread."""
@@ -108,14 +114,80 @@ class SchedulerService:
                 continue
 
     async def run_forever(self) -> None:
-        while True:
-            try:
-                await self.run_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Scheduler iteration failed; retrying after poll interval")
-            await asyncio.sleep(self.poll_seconds)
+        self._running = True
+        try:
+            while True:
+                self._last_heartbeat = datetime.now(UTC)
+                try:
+                    await self.run_once()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Scheduler iteration failed; retrying after poll interval")
+                self._last_heartbeat = datetime.now(UTC)
+                await asyncio.sleep(self.poll_seconds)
+        finally:
+            self._running = False
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "status": "online" if self._running else "offline",
+            "started_at": self._started_at.isoformat(),
+            "last_heartbeat": self._last_heartbeat.isoformat(),
+            "active_runs": len(self._active_tasks),
+            "poll_seconds": self.poll_seconds,
+            "max_concurrent_runs": self.max_concurrent_runs,
+        }
+
+    async def shutdown(self) -> None:
+        pending = [task for task in self._background_tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    def _start_background_claim(self, claimed) -> None:
+        operation = asyncio.create_task(self._execute_claimed(claimed.task, claimed.run))
+        self._active_tasks[claimed.run.id] = operation
+        self._background_tasks.add(operation)
+        operation.add_done_callback(self._background_tasks.discard)
+
+    async def run_task_now(self, task_id: str):
+        claimed = await self._store_call(
+            "claim_task_now",
+            task_id,
+            now=datetime.now(UTC),
+            lease_seconds=self.lease_seconds,
+        )
+        if claimed is not None:
+            self._start_background_claim(claimed)
+        return claimed
+
+    async def retry_run(self, task_id: str, run_id: str, *, use_latest: bool = False):
+        claimed = await self._store_call(
+            "claim_retry",
+            task_id,
+            run_id,
+            use_latest=use_latest,
+            now=datetime.now(UTC),
+            lease_seconds=self.lease_seconds,
+        )
+        if claimed is not None:
+            self._start_background_claim(claimed)
+        return claimed
+
+    async def cancel_run(self, task_id: str, run_id: str) -> bool:
+        operation = self._active_tasks.get(run_id)
+        if operation is None or operation.done():
+            return False
+        requested = await self._store_call(
+            "request_cancel", task_id, run_id, now=datetime.now(UTC)
+        )
+        if not requested:
+            return False
+        self._cancel_requested.add(run_id)
+        operation.cancel()
+        return True
 
     async def _renew_lease(self, task, run, lost_ownership: asyncio.Event, now) -> None:
         interval = self.lease_seconds / 3
@@ -180,6 +252,26 @@ class SchedulerService:
             error=reason,
         )
 
+    async def _enqueue_automatic_retry(self, task, run, finished_at: datetime) -> None:
+        snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+        retry_policy = snapshot.get("retry_policy")
+        if not isinstance(retry_policy, dict):
+            retry_policy = getattr(task, "retry_policy", {}) or {}
+        max_attempts = max(1, int(retry_policy.get("max_attempts", 1) or 1))
+        attempt = max(1, int(getattr(run, "attempt", 1) or 1))
+        if attempt >= max_attempts:
+            return
+        base_delay = max(0, int(retry_policy.get("backoff_seconds", 30) or 0))
+        retry_at = finished_at + timedelta(
+            seconds=base_delay * (2 ** max(0, attempt - 1))
+        )
+        await self._store_call(
+            "enqueue_retry",
+            task.id,
+            run.id,
+            retry_at=retry_at,
+        )
+
     async def _owns_unexpired_lease(self, task, run, now) -> bool:
         try:
             return await self._store_call(
@@ -200,24 +292,45 @@ class SchedulerService:
         renewal = asyncio.create_task(
             self._renew_lease(task, run, lost_ownership, run_now)
         )
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._active_tasks[run.id] = current_task
         result: Optional[ExecutionResult] = None
         try:
-            if task.kind == "agent_prompt":
+            snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+            kind = str(snapshot.get("kind") or task.kind)
+            payload = snapshot.get("payload")
+            if not isinstance(payload, dict):
+                payload = getattr(task, "payload", {})
+            if kind == "agent_prompt":
                 execution = self.agent_executor(task, run)
-            elif task.kind == "message":
-                text = str(task.payload.get("message_text", "")).strip()
+            elif kind == "message":
+                text = str(payload.get("message_text", "")).strip()
                 if not text:
                     raise ValueError("Message task has no message_text")
                 async def message_result():
                     return ExecutionResult(summary=text, text_output=text)
 
                 execution = message_result()
-            elif task.kind == "system_job":
+            elif kind == "system_job":
                 execution = self.system_executor(task, run)
             else:
-                raise ValueError(f"Unsupported task kind: {task.kind}")
+                raise ValueError(f"Unsupported task kind: {kind}")
 
-            result = await self._await_while_owned(execution, lost_ownership)
+            timeout_seconds = int(
+                snapshot.get("timeout_seconds")
+                or getattr(task, "timeout_seconds", 1800)
+                or 1800
+            )
+            try:
+                result = await asyncio.wait_for(
+                    self._await_while_owned(execution, lost_ownership),
+                    timeout=max(1, timeout_seconds),
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"scheduled task timed out after {timeout_seconds} seconds"
+                ) from exc
             if lost_ownership.is_set() or not await self._owns_unexpired_lease(
                 task, run, run_now
             ):
@@ -254,17 +367,40 @@ class SchedulerService:
             status = "succeeded" if successful_delivery else "failed"
             if not successful_delivery and not delivery_error:
                 delivery_error = f"unexpected delivery status: {delivery_status or 'empty'}"
+            finished_at = run_now()
             await self._store_call(
                 "complete_run",
                 task.id,
                 run.id,
-                finished_at=run_now(),
+                finished_at=finished_at,
                 status=status,
                 summary=result.summary,
                 error=delivery_error,
                 output_path=output_path,
                 delivery_status=delivery_status,
             )
+            if status == "failed":
+                await self._enqueue_automatic_retry(task, run, finished_at)
+        except asyncio.CancelledError:
+            if run.id in self._cancel_requested:
+                await self._store_call(
+                    "complete_run",
+                    task.id,
+                    run.id,
+                    finished_at=run_now(),
+                    status="cancelled",
+                    error="cancelled by user",
+                    output_path=result.output_path if result is not None else "",
+                )
+            else:
+                await self._store_call(
+                    "release_claim",
+                    task.id,
+                    run.id,
+                    now=run_now(),
+                    reason="scheduler stopped",
+                )
+            raise
         except Exception as exc:
             status = (
                 "interrupted"
@@ -272,16 +408,21 @@ class SchedulerService:
                 or "scheduler lease ownership lost" in str(exc)
                 else "failed"
             )
+            finished_at = run_now()
             await self._store_call(
                 "complete_run",
                 task.id,
                 run.id,
-                finished_at=run_now(),
+                finished_at=finished_at,
                 status=status,
                 error=str(exc),
                 output_path=result.output_path if result is not None else "",
             )
+            if status == "failed":
+                await self._enqueue_automatic_retry(task, run, finished_at)
         finally:
+            self._active_tasks.pop(run.id, None)
+            self._cancel_requested.discard(run.id)
             renewal.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await renewal
@@ -289,10 +430,19 @@ class SchedulerService:
     async def _deliver(self, task, run, result: ExecutionResult):
         if callable(self.delivery):
             return await self.delivery(task, run, result)
+        snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+        delivery_mode = str(snapshot.get("delivery_mode") or task.delivery_mode)
+        target = task.delivery_target
+        raw_target = snapshot.get("delivery_target")
+        if isinstance(raw_target, dict) and raw_target.get("target_type"):
+            target = DeliveryTarget(
+                target_type=str(raw_target["target_type"]),
+                payload=dict(raw_target.get("payload") or {}),
+            )
         return await self.delivery.deliver(
             task_id=task.id,
             run_id=run.id,
-            delivery_mode=task.delivery_mode,
-            target=task.delivery_target,
+            delivery_mode=delivery_mode,
+            target=target,
             text=result.text_output,
         )

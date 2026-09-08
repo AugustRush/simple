@@ -1016,16 +1016,17 @@ class LTMStore:
         user row is committed before an LLM request can begin; a later call can
         attach the assistant row without duplicating the user event.
         """
+        payload = metadata or {}
+        if not isinstance(payload, dict):
+            payload = {"value": payload}
         clean_user_content = str(user_content or "").strip()
-        if not clean_user_content:
+        has_attachments = bool(payload.get("attachments"))
+        if not clean_user_content and not has_attachments:
             return ConversationWriteResult()
         clean_assistant_content = str(assistant_content or "").strip()
         clean_session_id = str(session_id or "").strip() or "default"
         clean_message_id = str(message_id or "").strip()
         clean_assistant_message_id = str(assistant_message_id or "").strip()
-        payload = metadata or {}
-        if not isinstance(payload, dict):
-            payload = {"value": payload}
         metadata_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         timestamp = created_at or _now()
 

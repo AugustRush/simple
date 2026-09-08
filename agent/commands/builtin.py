@@ -204,12 +204,24 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
     from agent.tools.files import FileService, resolve_file_access_config
     output_dir = Path(str(context.components.get("output_dir") or shared.DEFAULT_OUTPUT_DIR)).resolve()
     try:
+        runtime_config = dict(context.config)
+        # In Web, choosing a folder is the explicit user grant that makes it
+        # the writable project workspace for this session.
+        if context.channel_name == "web":
+            file_access = dict(runtime_config.get("file_access") or {})
+            workspace_access = dict(file_access.get("workspace") or {})
+            workspace_access.update({"read": True, "write": True})
+            file_access["workspace"] = workspace_access
+            runtime_config["file_access"] = file_access
         policy = resolve_file_access_config(
-            dict(context.config), workspace_root=target, output_dir=output_dir
+            runtime_config, workspace_root=target, output_dir=output_dir
         )
     except Exception as exc:
         return _error(f"项目文件夹不可用：{exc}")
-    service = FileService(policy)
+    service = FileService(
+        policy,
+        write_scope=("*",) if policy.workspace_write else (),
+    )
 
     # Web workspaces are durable session state.  Persist the new value before
     # mutating the live runtime so a failed write can never leave the current

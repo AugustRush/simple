@@ -381,9 +381,24 @@ class AgentCore:
     def _prepare_skill_request(self, text: str, state: RuntimeSessionState) -> str:
         skill_catalog = self._skill_catalog()
         ctx_metadata = self._context_metadata(state)
+        preset = (
+            list(ctx_metadata.get("required_skills_preset") or [])
+            if ctx_metadata is not None
+            else []
+        )
         if skill_catalog is None:
             if ctx_metadata is not None:
                 ctx_metadata.pop("required_skills", None)
+            return text
+        if preset:
+            resolved = []
+            for skill_id in preset:
+                bundle = skill_catalog.get(str(skill_id))
+                if bundle is None or not bundle.user_invocable:
+                    raise ValueError(f"required skill is unavailable: {skill_id}")
+                resolved.append(bundle.id)
+            if ctx_metadata is not None:
+                ctx_metadata["required_skills"] = resolved
             return text
         normalized, required_skills = prepare_user_message_for_skills(
             text,
