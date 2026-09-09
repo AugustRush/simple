@@ -64,6 +64,7 @@ class ContextManager:
         staging_turn_threshold: int = shared.STAGING_TURN_THRESHOLD,
         staging_token_threshold: int = shared.STAGING_TOKEN_THRESHOLD,
         route_keywords: Optional[dict[str, list[str] | tuple[str, ...]]] = None,
+        project_scope: str = "",
     ):
         self.store = store
         self.retriever = retriever
@@ -73,6 +74,7 @@ class ContextManager:
         self.staging_turn_threshold = staging_turn_threshold
         self.staging_token_threshold = staging_token_threshold
         self.staging: StagingBuffer = staging or StagingBuffer()
+        self.project_scope = str(project_scope or "").strip()
         source_keywords = route_keywords or shared.DEFAULT_ROUTE_KEYWORDS
         self.route_keywords = {
             category: tuple(str(keyword).lower() for keyword in keywords)
@@ -109,7 +111,12 @@ class ContextManager:
             return ConsolidationResult(success=True, compressed_messages=result)
         return ConsolidationResult(success=bool(result), compressed_messages=[])
 
-    def spawn_session(self, session_id: Optional[str] = None) -> "ContextManager":
+    def spawn_session(
+        self,
+        session_id: Optional[str] = None,
+        *,
+        project_scope: str = "",
+    ) -> "ContextManager":
         """Create a session-scoped manager that shares durable memory primitives.
 
         Channel transports may multiplex many independent chats through one
@@ -142,6 +149,7 @@ class ContextManager:
             staging_turn_threshold=self.staging_turn_threshold,
             staging_token_threshold=self.staging_token_threshold,
             route_keywords=dict(self.route_keywords),
+            project_scope=project_scope or self.project_scope,
         )
 
     # ── Activity tracking ─────────────────────────────────────────────────────
@@ -918,6 +926,8 @@ class ContextManager:
         ranking failure look identical from the outside.
         """
         scopes = ["global", f"session:{self.staging.session_id}"]
+        if self.project_scope:
+            scopes.insert(1, self.project_scope)
         candidates = self.store.search_entries(
             query,
             categories=None,
@@ -962,6 +972,8 @@ class ContextManager:
             return []
 
         scopes = ["global", f"session:{self.staging.session_id}"]
+        if self.project_scope:
+            scopes.insert(1, self.project_scope)
         best: dict[str, float] = {}
         entries: dict[str, LTMEntry] = {}
         routed: set[str] = set()
@@ -1433,6 +1445,110 @@ class ContextManager:
             )
         return text
 
+    def has_active_working_state(self) -> bool:
+        """Whether durable state still describes an unfinished task."""
+        snapshot = self.store.load_session_working_state(self.staging.session_id)
+        if snapshot is None or not isinstance(snapshot.state, dict):
+            return False
+        tasks = snapshot.state.get("tasks")
+        if isinstance(tasks, list):
+            return any(
+                isinstance(task, dict) and not self._working_state_is_complete(task)
+                for task in tasks
+            )
+        return not self._working_state_is_complete(snapshot.state)
+
+    @staticmethod
+    def _checkpoint_summary(messages: list[dict], limit: int = 4000) -> str:
+        lines: list[str] = []
+        length = 0
+        for message in messages:
+            role = str(message.get("role", "unknown") or "unknown").upper()
+            content = message.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text = block.get("text") or block.get("content")
+                    if text:
+                        parts.append(str(text))
+                content = " ".join(parts)
+            clean = re.sub(r"\s+", " ", str(content or "")).strip()
+            if not clean:
+                continue
+            line = f"- {role}: {clean}"
+            remaining = limit - length
+            if remaining <= 0:
+                break
+            lines.append(line[:remaining])
+            length += min(len(line), remaining)
+        return "\n".join(lines)
+
+    def save_provider_checkpoint(
+        self,
+        messages: list[dict],
+        *,
+        token_budget: int = 24000,
+    ) -> dict[str, Any]:
+        """Persist a bounded, structurally complete provider replay tail."""
+
+        repaired = self._repair_tool_history(list(messages))
+        compacted = repaired
+        if repaired and self.consolidation.estimate_tokens(repaired) >= token_budget:
+            compacted = self.compact_messages(
+                repaired,
+                input_token_budget=max(512, int(token_budget)),
+            )
+        # compact_messages() may replace a dropped message with an eviction
+        # notice, so comparing list lengths cannot reliably detect loss.  Match
+        # canonical message values as a multiset instead; this also handles
+        # repeated, identical messages without relying on object identity.
+        retained_counts: dict[str, int] = {}
+        for item in compacted:
+            content = item.get("content")
+            if (
+                item.get("role") == "user"
+                and isinstance(content, str)
+                and content.startswith(self._EVICTION_SENTINEL)
+            ):
+                continue
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            retained_counts[key] = retained_counts.get(key, 0) + 1
+        dropped: list[dict] = []
+        for item in repaired:
+            content = item.get("content")
+            if (
+                item.get("role") == "user"
+                and isinstance(content, str)
+                and content.startswith(self._EVICTION_SENTINEL)
+            ):
+                continue
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            if retained_counts.get(key, 0) > 0:
+                retained_counts[key] -= 1
+            else:
+                dropped.append(item)
+
+        existing = self.load_provider_checkpoint() or {}
+        previous_summary = str(existing.get("summary") or "").strip()
+        dropped_summary = self._checkpoint_summary(dropped).strip()
+        summary = "\n".join(
+            part for part in (previous_summary, dropped_summary) if part
+        )
+        if len(summary) > 4000:
+            summary = summary[:2000].rstrip() + "\n...\n" + summary[-1995:].lstrip()
+        save = getattr(self.store, "save_provider_checkpoint", None)
+        if callable(save):
+            save(self.staging.session_id, compacted, summary=summary)
+        return {"messages": compacted, "summary": summary}
+
+    def load_provider_checkpoint(self) -> dict[str, Any] | None:
+        load = getattr(self.store, "load_provider_checkpoint", None)
+        if not callable(load):
+            return None
+        return load(self.staging.session_id)
+
     @staticmethod
     def _clip_working_state_text(text: str, limit: int = 800) -> str:
         clean = re.sub(r"\s+", " ", str(text or "").strip())
@@ -1672,6 +1788,8 @@ class ContextManager:
         current_messages: Optional[list[dict]] = None,
         current_turn_id: str = "",
         token_budget: Optional[int] = None,
+        include_recent_session: bool = True,
+        include_working_state: bool = True,
     ) -> str:
         """Return context for automatic prompt injection.
 
@@ -1691,16 +1809,17 @@ class ContextManager:
         assistant_identity = self._assistant_identity_context()
         if assistant_identity:
             sections.append(assistant_identity)
-        working_state = self.working_state_context(query)
-        if working_state:
-            sections.append(working_state)
-        if "episodes" in self._route_categories(query):
+        if include_working_state:
+            working_state = self.working_state_context(query)
+            if working_state:
+                sections.append(working_state)
+        if include_recent_session and "episodes" in self._route_categories(query):
             recent = self._recent_session_context(
                 exclude_message_id=current_turn_id,
             )
             if recent:
                 sections.append(recent)
-        else:
+        elif include_recent_session:
             recent = self._recent_unconsolidated_context(
                 current_messages=current_messages
             )
@@ -1780,9 +1899,21 @@ class ContextManager:
     ) -> list[dict]:
         """Run one sleep cycle (uses staging as source), then clear dirty flag."""
         try:
-            result = await self.consolidation.consolidate(
-                messages, client, model, api_format, staging=self.staging
-            )
+            try:
+                result = await self.consolidation.consolidate(
+                    messages,
+                    client,
+                    model,
+                    api_format,
+                    staging=self.staging,
+                    project_scope=self.project_scope,
+                )
+            except TypeError as exc:
+                if "project_scope" not in str(exc):
+                    raise
+                result = await self.consolidation.consolidate(
+                    messages, client, model, api_format, staging=self.staging
+                )
             return self._coerce_consolidation_result(result).compressed_messages
         finally:
             with self._lock:
@@ -1836,10 +1967,25 @@ class ContextManager:
                 extracted = extractor(staged, job)
                 for item in extracted or []:
                     if isinstance(item, LTMEntry):
+                        if not item.scope or item.scope == "global":
+                            item.scope = self.consolidation._scope_for_entry(
+                                item.category,
+                                session_id=staging_buffer.session_id,
+                                project_scope=self.project_scope,
+                            )
+                            item.source_session = staging_buffer.session_id
                         entries.append(item)
                     elif isinstance(item, dict):
                         lines = json.dumps(item, ensure_ascii=False)
-                        entries.extend(self.consolidation._parse_entries(lines))
+                        parsed = self.consolidation._parse_entries(lines)
+                        for entry in parsed:
+                            entry.scope = self.consolidation._scope_for_entry(
+                                entry.category,
+                                session_id=staging_buffer.session_id,
+                                project_scope=self.project_scope,
+                            )
+                            entry.source_session = staging_buffer.session_id
+                        entries.extend(parsed)
                 self.store.add_entries(entries)
                 self.store.apply_retention()
                 staging_buffer.drop_prefix(len(staged))
@@ -1850,13 +1996,21 @@ class ContextManager:
                 return True
 
             try:
-                result = await self.consolidation.consolidate(
-                    [],
-                    client,
-                    model,
-                    api_format,
-                    staging=staging_buffer,
-                )
+                try:
+                    result = await self.consolidation.consolidate(
+                        [],
+                        client,
+                        model,
+                        api_format,
+                        staging=staging_buffer,
+                        project_scope=self.project_scope,
+                    )
+                except TypeError as exc:
+                    if "project_scope" not in str(exc):
+                        raise
+                    result = await self.consolidation.consolidate(
+                        [], client, model, api_format, staging=staging_buffer
+                    )
             except Exception as exc:
                 _emit_consolidation("failed", reason="llm_extraction_error", error=str(exc))
                 shared.CONSOLE.print(f"[dim]Sleep extraction error: {exc}[/dim]")

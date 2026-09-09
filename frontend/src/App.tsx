@@ -662,6 +662,7 @@ function App() {
   )
   const sendShortcutLabel = sendShortcut === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'
   const [sessionState, setSessionState] = useState<SessionState | null>(null)
+  const [resumingTaskId, setResumingTaskId] = useState<string | null>(null)
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([])
   const [form] = Form.useForm()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -917,6 +918,14 @@ function App() {
       const data = (await resp.json()) as SessionState
       if (activeSessionRef.current === sid) {
         setSessionState(data)
+        setResumingTaskId(previous => {
+          if (!previous) return null
+          const task = data.task
+          const taskKey = task?.task_id || task?.active_goal || ''
+          const status = String(task?.status || '').toLowerCase()
+          const stillInterrupted = ['cancelled', 'interrupted', 'failed'].includes(status)
+          return taskKey === previous && stillInterrupted ? previous : null
+        })
         // Restoring a session while its agent is still working should bring
         // back the generating state (and stop button) even before the first
         // snapshot/chunk arrives on the newly opened socket.
@@ -925,6 +934,7 @@ function App() {
     } catch {
       if (activeSessionRef.current === sid) {
         setSessionState(null)
+        setResumingTaskId(null)
         setIsStreaming(false)
       }
     }
@@ -983,6 +993,7 @@ function App() {
       ws.onclose = () => {
         if (wsRef.current !== ws || activeSessionRef.current !== sid) return
         setConnected(false)
+        setResumingTaskId(null)
         setIsStreaming(false)
         setActivity('连接已断开')
       }
@@ -990,6 +1001,7 @@ function App() {
       ws.onerror = () => {
         if (wsRef.current !== ws || activeSessionRef.current !== sid) return
         setConnected(false)
+        setResumingTaskId(null)
         setIsStreaming(false)
         setActivity('连接异常')
       }
@@ -1200,6 +1212,7 @@ function App() {
             role: 'error',
             content: evt.error || '发生错误',
           })
+          setResumingTaskId(null)
           setIsStreaming(false)
           return
         }
@@ -1383,6 +1396,13 @@ function App() {
     } catch {
       // The shared request helper reports the server error to the user.
     }
+  }
+
+  const continueTask = async () => {
+    if (!sessionState?.task) return
+    const taskKey = sessionState.task.task_id || sessionState.task.active_goal || ''
+    setResumingTaskId(taskKey)
+    await sendMessage('继续当前任务')
   }
 
   const handleFilesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -2315,6 +2335,10 @@ function App() {
     )
   }, [commands, input])
 
+  const inlineCommandOpen = input.startsWith('/') &&
+    !/\s/.test(input) &&
+    filteredCommands.length > 0
+
   useEffect(() => {
     setCommandIndex(0)
   }, [filteredCommands])
@@ -2908,6 +2932,7 @@ function App() {
           </div>
         )}
         {sessionState?.task?.active_goal &&
+          resumingTaskId !== (sessionState.task.task_id || sessionState.task.active_goal) &&
           !['completed', 'success', 'done', 'updated', 'dismissed'].includes(
             String(sessionState.task.status || '').toLowerCase(),
           ) && (
@@ -2928,7 +2953,7 @@ function App() {
                   <Button
                     type="text"
                     size="small"
-                    onClick={() => sendMessage('继续当前任务')}
+                    onClick={continueTask}
                   >
                     继续任务
                   </Button>
@@ -2944,14 +2969,13 @@ function App() {
               </div>
             </div>
           )}
-        {input.startsWith('/') && (
+        {inlineCommandOpen && (
           <div className="command-popover">
             <div className="command-popover-head">
               <span>可用命令</span>
               <span>↑ ↓ 选择 · Enter 发送 · Esc 关闭</span>
             </div>
-            {filteredCommands.length > 0 ? (
-              filteredCommands.map((command, index) => (
+            {filteredCommands.map((command, index) => (
                 <button
                   type="button"
                   key={command.name}
@@ -2962,6 +2986,7 @@ function App() {
                   onMouseDown={event => {
                     event.preventDefault()
                     setInput(`/${command.name} `)
+                    setCommandIndex(0)
                   }}
                 >
                   {command.kind === 'skill' ? <ApiOutlined /> : <CodeOutlined />}
@@ -2971,10 +2996,7 @@ function App() {
                   </span>
                   <kbd>/</kbd>
                 </button>
-              ))
-            ) : (
-              <div className="command-empty">没有匹配命令</div>
-            )}
+              ))}
           </div>
         )}
 

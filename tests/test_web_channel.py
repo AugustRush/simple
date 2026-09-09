@@ -623,21 +623,50 @@ def test_web_session_runtime_uses_global_resources_and_session_output(tmp_path, 
 
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
-    captured = {}
+    class _Registry:
+        def __init__(self): self.context = {}
+        def fork(self, context, **_kwargs):
+            child = _Registry(); child.context.update(context); return child
+        def set_context(self, key, value): self.context[key] = value
 
-    async def fake_build(cfg, *, announce=True, resource_home=None):
-        captured.update(cfg=cfg, resource_home=resource_home)
-        return {"ok": True}
+    class _Agent:
+        api_format = "openai"
+        supports_vision = False
+        context_window = 10000
+        max_parallel_agents = 2
+        sub_agent_timeout_seconds = 30
+        sub_agent_retries = 0
+        max_agents_per_turn = 2
+        max_tool_call_iterations = 8
+        max_truncation_continuations = 1
+        max_rendezvous_rounds = 2
+        result_content_max_chars = 1000
+        llm_max_retries = 1
+        llm_retry_base_delay = 0.1
+        content_filter = object()
+        def __init__(self, *_args, **_kwargs): pass
+        def register_spawn_capability(self, *_args, **_kwargs): pass
 
-    monkeypatch.setattr(bootstrap, "_build_components_async", fake_build)
+    monkeypatch.setattr(bootstrap, "BaseAgent", _Agent)
+    monkeypatch.setattr(bootstrap, "_compose_system_prompt", lambda *_a, **_k: "session prompt")
+    global_components = {
+        "registry": _Registry(), "agent": _Agent(), "client": object(),
+        "model": "global-model", "max_tokens": 1024, "base_system_prompt": "base",
+        "context_manager": object(), "workspace_root": tmp_path / "workspace",
+        "skill_catalog": object(), "plugin_catalog": object(),
+    }
     result = __import__("asyncio").run(
-        bootstrap._build_web_session_components("sid123", {"model": "global"})
+        bootstrap._build_web_session_components(
+            "sid123", {"model": "global"}, global_components
+        )
     )
 
     home = tmp_path / ".agent" / "web" / "sessions" / "sid123"
-    assert result == {"ok": True}
-    assert captured["resource_home"] == tmp_path / ".agent"
-    assert captured["cfg"]["output_dir"] == str(home / "output")
+    assert result["client"] is global_components["client"]
+    assert result["skill_catalog"] is global_components["skill_catalog"]
+    assert result["plugin_catalog"] is global_components["plugin_catalog"]
+    assert result["output_dir"] == (home / "output").resolve()
+    assert result["_shares_global_runtime"] is True
     assert not (home / "config.json").exists()
 
 
@@ -660,25 +689,41 @@ def test_web_session_runtime_restores_selected_workspace_write_grant(tmp_path, m
         }),
         encoding="utf-8",
     )
-    captured = {}
+    class _Registry:
+        def __init__(self): self.context = {}
+        def fork(self, context, **_kwargs):
+            child = _Registry(); child.context.update(context); return child
+        def set_context(self, key, value): self.context[key] = value
 
-    async def fake_build(cfg, *, announce=True, resource_home=None):
-        captured.update(cfg=cfg, resource_home=resource_home)
-        return {"ok": True}
+    class _Agent:
+        api_format = "openai"; supports_vision = False; context_window = 10000
+        max_parallel_agents = 2; sub_agent_timeout_seconds = 30; sub_agent_retries = 0
+        max_agents_per_turn = 2; max_tool_call_iterations = 8
+        max_truncation_continuations = 1; max_rendezvous_rounds = 2
+        result_content_max_chars = 1000; llm_max_retries = 1; llm_retry_base_delay = 0.1
+        content_filter = object()
+        def __init__(self, *_args, **_kwargs): pass
+        def register_spawn_capability(self, *_args, **_kwargs): pass
 
-    monkeypatch.setattr(bootstrap, "_build_components_async", fake_build)
-    __import__("asyncio").run(
+    monkeypatch.setattr(bootstrap, "BaseAgent", _Agent)
+    monkeypatch.setattr(bootstrap, "_compose_system_prompt", lambda *_a, **_k: "session prompt")
+    global_components = {
+        "registry": _Registry(), "agent": _Agent(), "client": object(),
+        "model": "global-model", "max_tokens": 1024, "base_system_prompt": "base",
+        "context_manager": object(), "workspace_root": tmp_path / "default",
+        "skill_catalog": object(), "plugin_catalog": object(),
+    }
+    result = __import__("asyncio").run(
         bootstrap._build_web_session_components(
             "sid123",
             {"file_access": {"workspace": {"read": True, "write": False}}},
+            global_components,
         )
     )
 
-    assert captured["cfg"]["workspace_root"] == str(workspace)
-    assert captured["cfg"]["file_access"]["workspace"] == {
-        "read": True,
-        "write": True,
-    }
+    assert result["workspace_root"] == workspace.resolve()
+    assert result["file_access_policy"].workspace_read is True
+    assert result["file_access_policy"].workspace_write is True
 
 
 def test_session_service_recovers_legacy_events_by_turn_id(tmp_path):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import os
@@ -31,8 +32,11 @@ from agent.tools.files import FileService, resolve_file_access_config
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
 
-_SESSION_BUILD_LOCK = asyncio.Lock()
 
+def _project_memory_scope(workspace_root: Path) -> str:
+    canonical = str(workspace_root.expanduser().resolve(strict=False))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return f"project:{digest}"
 
 def _web_session_home(session_id: str) -> Path:
     clean = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
@@ -41,8 +45,17 @@ def _web_session_home(session_id: str) -> Path:
     return shared.web_session_home(clean)
 
 
-async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict:
-    """Build a fully home-scoped runtime for one multiplexed web session."""
+async def _build_web_session_components(
+    session_id: str,
+    base_cfg: dict,
+    global_components: dict,
+) -> dict:
+    """Build a lightweight execution view for one multiplexed Web session.
+
+    Provider clients, discovered tools, skills, plugins, MCP connections and
+    the durable memory store belong to the process runtime. A Web session only
+    owns mutable conversation state, workspace policy and output paths.
+    """
     home = _web_session_home(session_id)
     home.mkdir(parents=True, exist_ok=True)
     (home / ".web-session").touch(exist_ok=True)
@@ -72,39 +85,109 @@ async def _build_web_session_components(session_id: str, base_cfg: dict) -> dict
                 indent=2,
             ),
         )
-    previous_home = shared.AGENT_HOME
-    # Most bootstrap helpers intentionally late-bind shared paths. Serialize
-    # the short construction window, then restore the gateway's home; the
-    # resulting components retain explicit paths for their own home.
-    async with _SESSION_BUILD_LOCK:
-        try:
-            agent_module._set_agent_home(home)
-            session_cfg = dict(base_cfg)
-            try:
-                persisted = json.loads(manifest.read_text(encoding="utf-8"))
-                persisted_workspace = persisted.get("workspace_root")
-                if isinstance(persisted_workspace, str) and persisted_workspace.strip():
-                    session_cfg["workspace_root"] = persisted_workspace
-                    # Picking a directory in the Web UI is an explicit,
-                    # session-scoped grant: project work happens there while
-                    # generated deliverables remain in output_dir.
-                    if persisted.get("workspace_write") is True:
-                        file_access = dict(session_cfg.get("file_access") or {})
-                        workspace_access = dict(file_access.get("workspace") or {})
-                        workspace_access.update({"read": True, "write": True})
-                        file_access["workspace"] = workspace_access
-                        session_cfg["file_access"] = file_access
-            except (OSError, ValueError, TypeError):
-                pass
-            # Generated files and attachments are always session-owned. A
-            # global output_dir setting is intentionally ignored for Web
-            # runtimes to prevent cross-session leakage.
-            session_cfg["output_dir"] = str(home / "output")
-            return await _build_components_async(
-                session_cfg, announce=False, resource_home=previous_home
-            )
-        finally:
-            agent_module._set_agent_home(previous_home)
+    session_cfg = dict(base_cfg)
+    try:
+        persisted = json.loads(manifest.read_text(encoding="utf-8"))
+        persisted_workspace = persisted.get("workspace_root")
+        if isinstance(persisted_workspace, str) and persisted_workspace.strip():
+            session_cfg["workspace_root"] = persisted_workspace
+            if persisted.get("workspace_write") is True:
+                file_access = dict(session_cfg.get("file_access") or {})
+                workspace_access = dict(file_access.get("workspace") or {})
+                workspace_access.update({"read": True, "write": True})
+                file_access["workspace"] = workspace_access
+                session_cfg["file_access"] = file_access
+    except (OSError, ValueError, TypeError):
+        pass
+
+    output_dir = (home / "output").resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    configured_workspace = session_cfg.get("workspace_root")
+    workspace_root = (
+        Path(str(configured_workspace)).expanduser().resolve(strict=False)
+        if configured_workspace
+        else Path(global_components.get("workspace_root") or Path.cwd()).resolve()
+    )
+    session_cfg["output_dir"] = str(output_dir)
+    session_cfg["workspace_root"] = str(workspace_root)
+    file_policy = resolve_file_access_config(
+        session_cfg,
+        workspace_root=workspace_root,
+        output_dir=output_dir,
+    )
+    file_service = FileService(
+        file_policy,
+        write_scope=("*",) if file_policy.workspace_write else (),
+    )
+    project_scope = _project_memory_scope(workspace_root)
+
+    global_registry = global_components["registry"]
+    registry = global_registry.fork(
+        {
+            "workspace_root": str(workspace_root),
+            "output_dir": str(output_dir),
+            "file_access_policy": file_policy,
+            "file_service": file_service,
+            "project_memory_scope": project_scope,
+        },
+        exclude_source_prefixes=("runtime:spawn",),
+    )
+    global_agent = global_components["agent"]
+    agent = BaseAgent(
+        global_components["client"],
+        registry,
+        model=global_components["model"],
+        max_tokens=global_components["max_tokens"],
+        api_format=global_agent.api_format,
+        supports_vision=global_agent.supports_vision,
+        context_window=global_agent.context_window,
+    )
+    for name in (
+        "max_parallel_agents",
+        "sub_agent_timeout_seconds",
+        "sub_agent_retries",
+        "max_agents_per_turn",
+        "max_tool_call_iterations",
+        "max_truncation_continuations",
+        "max_rendezvous_rounds",
+        "result_content_max_chars",
+        "llm_max_retries",
+        "llm_retry_base_delay",
+    ):
+        setattr(agent, name, getattr(global_agent, name))
+    agent.content_filter = global_agent.content_filter
+    agent.plugin_catalog = global_components.get("plugin_catalog")
+    agent.context_manager = global_components.get("context_manager")
+    base_system_prompt = str(global_components.get("base_system_prompt") or "")
+    agent.register_spawn_capability(base_system_prompt, workspace_root=workspace_root)
+    system_prompt = _compose_system_prompt(
+        base_system_prompt,
+        registry,
+        workspace_root,
+        output_dir,
+        skill_catalog=global_components.get("skill_catalog"),
+        plugin_catalog=global_components.get("plugin_catalog"),
+    )
+
+    session_components = dict(global_components)
+    session_components.update(
+        {
+            "cfg": session_cfg,
+            "registry": registry,
+            "agent": agent,
+            "system_prompt": system_prompt,
+            "workspace_root": workspace_root,
+            "output_dir": output_dir,
+            "file_access_policy": file_policy,
+            "file_service": file_service,
+            "mcp_task": None,
+            "_shares_global_runtime": True,
+        }
+    )
+    session_components["turn_runner"] = TurnRunner(session_components)
+    session_components["agent_core"] = AgentCore(session_components)
+    registry.set_context("components", session_components)
+    return session_components
 
 
 def _bounded_int(
@@ -348,6 +431,11 @@ async def _build_components_async(
             decay_factor=storage_cfg.get("decay_factor", decay_factor),
             sleep_token_ratio=cons_cfg.get("token_ratio", sleep_token_ratio),
             keep_last_messages=cons_cfg.get("keep_last_messages", 6),
+            max_source_tokens=cons_cfg.get(
+                "max_source_tokens", shared.CONSOLIDATION_MAX_SOURCE_TOKENS
+            ),
+            max_chunks_per_run=cons_cfg.get("max_chunks_per_run", 2),
+            output_tokens=cons_cfg.get("output_tokens", 512),
             chars_per_token=cons_cfg.get("token_estimation", {}).get(
                 "chars_per_token", float(chars_per_token)
             ),
@@ -357,7 +445,14 @@ async def _build_components_async(
         ),
         idle_seconds=cons_cfg.get("idle_seconds", 300),
         min_messages=cons_cfg.get("min_messages", 4),
+        staging_turn_threshold=cons_cfg.get(
+            "staging_turn_threshold", shared.STAGING_TURN_THRESHOLD
+        ),
+        staging_token_threshold=cons_cfg.get(
+            "staging_token_threshold", shared.STAGING_TOKEN_THRESHOLD
+        ),
         route_keywords=ctx_cfg.get("route_keywords"),
+        project_scope=_project_memory_scope(workspace_root),
     )
 
     builtin_tools_cls(
@@ -638,13 +733,15 @@ async def _build_components_async(
         # Resolve the global config at session-runtime creation time so config
         # changes apply to subsequent turns without interrupting active ones.
         global_cfg, _ = agent_module.load_config()
-        return await _build_web_session_components(session_id, global_cfg or cfg)
+        return await _build_web_session_components(
+            session_id,
+            global_cfg or cfg,
+            components,
+        )
 
     components["session_components_factory"] = _session_components_factory
-    components["session_store_factory"] = lambda session_id: LTMStore(
-        context_dir=_web_session_home(str(session_id)) / "context",
-        memory_dir=_web_session_home(str(session_id)) / "memory",
-    )
+    components["session_store_factory"] = lambda _session_id: ctx_store
+    components["use_memory_worker_pool"] = True
 
     async def _execute_ralph_iteration(
         iter_ctx: Any,

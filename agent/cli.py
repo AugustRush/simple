@@ -922,15 +922,19 @@ async def _interactive_loop_body(
     skill_catalog: SkillCatalog = components["skill_catalog"]
 
     ctx = AgentContext(system_prompt=system_prompt)
-    # Track the user's first non-command message so it can be re-injected into
-    # the system prompt after compaction (compact_messages drops early messages
-    # to keep working memory bounded; this preserves the original task intent
-    # without coupling task context to API message-list formatting rules).
+    # Incomplete-task guidance is persisted by the context manager. Completed
+    # requests are not duplicated into the system prompt.
+    consolidation_cfg = cfg.get("context", {}).get("consolidation", {})
+    memory_model = str(
+        consolidation_cfg.get("model")
+        or components.get("model")
+        or getattr(agent, "model", "")
+    )
     memory_worker = (
         agent_module.BackgroundMemoryWorker(
             ctx_mgr,
             components["client"],
-            components["model"],
+            memory_model,
             agent.api_format,
             client_factory=lambda: agent_module.ModelClientFactory.from_config(
                 cfg, announce=False
@@ -1094,7 +1098,8 @@ async def _interactive_loop_body(
         # ^C is caught by the inner except and causes a normal break; the
         # finally block then runs this code before the process exits.
         # (A ^C^C that arrives *here* can still abort — that is user intent.)
-        if ctx_mgr and ctx_mgr.should_session_end_sleep():
+        flush_on_end = bool(consolidation_cfg.get("flush_on_session_end", False))
+        if flush_on_end and ctx_mgr and ctx_mgr.should_session_end_sleep():
             shared.CONSOLE.print("[dim]Saving session context…[/dim]")
             try:
                 flush_timeout = max(
@@ -1111,7 +1116,7 @@ async def _interactive_loop_body(
                     while ctx_mgr.pending_jobs():
                         processed = await ctx_mgr.process_one_job(
                             components["client"],
-                            components["model"],
+                            memory_model,
                             api_format=agent.api_format,
                         )
                         if not processed:

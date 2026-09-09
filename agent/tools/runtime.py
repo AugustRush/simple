@@ -343,7 +343,7 @@ class ToolRegistry:
 
         return decorator
 
-    def to_anthropic_format(self) -> list[dict]:
+    def to_anthropic_format(self, names: Optional[set[str]] = None) -> list[dict]:
         if (
             self._anthropic_tools_cache is None
             or self._anthropic_tools_generation != self._prompt_generation
@@ -357,7 +357,9 @@ class ToolRegistry:
                 for t in self._tools.values()
             ]
             self._anthropic_tools_generation = self._prompt_generation
-        return self._anthropic_tools_cache
+        if names is None:
+            return self._anthropic_tools_cache
+        return [tool for tool in self._anthropic_tools_cache if tool["name"] in names]
 
     @staticmethod
     def _error_payload(tool_name: str, message: str) -> str:
@@ -453,6 +455,35 @@ class ToolRegistry:
         if override is not None and key in override:
             return override[key]
         return self._context.get(key, default)
+
+    def fork(
+        self,
+        context: Optional[dict[str, Any]] = None,
+        *,
+        exclude_source_prefixes: tuple[str, ...] = (),
+    ) -> "ToolRegistry":
+        """Create a cheap session view over the registered tool functions.
+
+        Tool definitions are immutable after registration for the lifetime of
+        a config revision, so a shallow copy is sufficient. Bound tool methods
+        continue to use their owner registry; ``call`` already installs this
+        view's context as a ContextVar override while invoking them.
+        """
+
+        forked = type(self)(console=self.console)
+        forked._tools = {
+            name: tool
+            for name, tool in self._tools.items()
+            if not any(
+                tool.source.startswith(prefix)
+                for prefix in exclude_source_prefixes
+            )
+        }
+        forked._context = dict(self._context)
+        if context:
+            forked._context.update(context)
+        forked._prompt_generation = self._prompt_generation
+        return forked
 
     def unregister_by_source_prefix(self, prefix: str) -> None:
         for name in [

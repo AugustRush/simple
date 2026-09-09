@@ -300,6 +300,12 @@ class LTMStore:
                     state_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS provider_checkpoints (
+                    session_id TEXT PRIMARY KEY,
+                    messages_json TEXT NOT NULL DEFAULT '[]',
+                    summary TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS agent_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT NOT NULL,
@@ -310,6 +316,20 @@ class LTMStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_agent_events_session_id
                     ON agent_events(session_id, id);
+                CREATE TABLE IF NOT EXISTS usage_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL DEFAULT '',
+                    phase TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_usage_events_session_id
+                    ON usage_events(session_id, id);
                 CREATE TABLE IF NOT EXISTS fact_assertions (
                     id TEXT PRIMARY KEY,
                     subject TEXT NOT NULL,
@@ -1247,7 +1267,15 @@ class LTMStore:
                 (clean_session_id,),
             )
             conn.execute(
+                "DELETE FROM provider_checkpoints WHERE session_id = ?",
+                (clean_session_id,),
+            )
+            conn.execute(
                 "DELETE FROM agent_events WHERE session_id = ?",
+                (clean_session_id,),
+            )
+            conn.execute(
+                "DELETE FROM usage_events WHERE session_id = ?",
                 (clean_session_id,),
             )
             conn.execute(
@@ -1408,6 +1436,127 @@ class LTMStore:
                 (clean_session_id,),
             ).fetchone()
         return self._row_to_session_working_state(row)
+
+    def save_provider_checkpoint(
+        self,
+        session_id: str,
+        messages: list[dict[str, Any]],
+        *,
+        summary: str = "",
+        updated_at: Optional[str] = None,
+    ) -> None:
+        clean = str(session_id or "").strip() or "default"
+        payload = json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_checkpoints (
+                    session_id, messages_json, summary, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    messages_json = excluded.messages_json,
+                    summary = excluded.summary,
+                    updated_at = excluded.updated_at
+                """,
+                (clean, payload, str(summary or ""), updated_at or _now()),
+            )
+
+    def load_provider_checkpoint(self, session_id: str) -> dict[str, Any] | None:
+        clean = str(session_id or "").strip()
+        if not clean:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM provider_checkpoints WHERE session_id = ?",
+                (clean,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            messages = json.loads(str(row["messages_json"] or "[]"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            messages = []
+        if not isinstance(messages, list):
+            messages = []
+        return {
+            "session_id": clean,
+            "messages": [item for item in messages if isinstance(item, dict)],
+            "summary": str(row["summary"] or ""),
+            "updated_at": str(row["updated_at"] or ""),
+        }
+
+    def append_usage_event(
+        self,
+        *,
+        session_id: str,
+        phase: str,
+        model: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cached_input_tokens: int = 0,
+        turn_id: str = "",
+        metadata: Optional[dict[str, Any]] = None,
+        created_at: Optional[str] = None,
+    ) -> None:
+        """Persist one provider call so foreground and background cost is visible."""
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO usage_events (
+                    session_id, turn_id, phase, model, input_tokens,
+                    output_tokens, cached_input_tokens, metadata_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(session_id or "").strip() or "default",
+                    str(turn_id or ""),
+                    str(phase or "foreground").strip() or "foreground",
+                    str(model or ""),
+                    max(0, int(input_tokens or 0)),
+                    max(0, int(output_tokens or 0)),
+                    max(0, int(cached_input_tokens or 0)),
+                    json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True),
+                    created_at or _now(),
+                ),
+            )
+
+    def usage_summary(self, session_id: str) -> dict[str, Any]:
+        """Return bounded aggregate usage for one session, grouped by phase."""
+
+        clean = str(session_id or "").strip()
+        if not clean:
+            return {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                    "cached_input_tokens": 0, "by_phase": {}}
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT phase, COUNT(*) AS calls,
+                       SUM(input_tokens) AS input_tokens,
+                       SUM(output_tokens) AS output_tokens,
+                       SUM(cached_input_tokens) AS cached_input_tokens
+                FROM usage_events WHERE session_id = ? GROUP BY phase
+                """,
+                (clean,),
+            ).fetchall()
+        by_phase = {
+            str(row["phase"]): {
+                "calls": int(row["calls"] or 0),
+                "input_tokens": int(row["input_tokens"] or 0),
+                "output_tokens": int(row["output_tokens"] or 0),
+                "cached_input_tokens": int(row["cached_input_tokens"] or 0),
+            }
+            for row in rows
+        }
+        return {
+            "calls": sum(item["calls"] for item in by_phase.values()),
+            "input_tokens": sum(item["input_tokens"] for item in by_phase.values()),
+            "output_tokens": sum(item["output_tokens"] for item in by_phase.values()),
+            "cached_input_tokens": sum(
+                item["cached_input_tokens"] for item in by_phase.values()
+            ),
+            "by_phase": by_phase,
+        }
 
     def append_agent_event(
         self,

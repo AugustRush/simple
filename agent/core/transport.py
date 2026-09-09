@@ -21,6 +21,7 @@ from typing import Any, Callable, Optional
 import anthropic
 
 from agent import shared
+from agent.usage import ProviderUsage, extract_provider_usage
 
 
 # ── OpenAI-specific constants kept with the OpenAI transport ────────────────
@@ -128,14 +129,12 @@ class ModelTransport(abc.ABC):
         cost.  Both supported providers report it on every response, under
         different names, so the base implementation reads either.
         """
-        usage = getattr(response, "usage", None)
-        if usage is None:
-            return None
-        for attribute in ("input_tokens", "prompt_tokens"):
-            value = getattr(usage, attribute, None)
-            if isinstance(value, int) and value > 0:
-                return value
-        return None
+        value = extract_provider_usage(response).input_tokens
+        return value or None
+
+    @staticmethod
+    def observed_usage(response: Any) -> ProviderUsage:
+        return extract_provider_usage(response)
 
     # ── Message-history shaping ────────────────────────────────────────
 

@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable, Optional
 import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt
+from agent.core.context_assembler import ContextAssembler
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
 from agent.memory.system import ContextLimitError, ContextManager, LTMEntry
@@ -39,6 +40,7 @@ from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry
+from agent.usage import extract_provider_usage
 from agent.security.content_filter import (
     ContentFilter,
     default_model_path,
@@ -303,6 +305,7 @@ class BaseAgent:
         )
         from agent.core.transport import build_transport
         self._transport = build_transport(api_format, client)
+        self.context_assembler = ContextAssembler()
         self.context_manager: Optional[ContextManager] = None
         self.plugin_catalog: Optional["PluginCatalog"] = None
         self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
@@ -1323,7 +1326,12 @@ class BaseAgent:
         self._observe_provider_usage(ctx, response)
         return response
 
-    def _retrieval_token_budget(self) -> int:
+    def _retrieval_token_budget(
+        self,
+        ctx: Optional["AgentContext"] = None,
+        tools: Optional[list[dict]] = None,
+        current_user_content: Any = "",
+    ) -> int:
         """How much of the window automatic retrieval may claim.
 
         Retrieval is injected into the system prompt, which compaction never
@@ -1334,6 +1342,25 @@ class BaseAgent:
         than relying on stored memories staying short.
         """
         configured = int(getattr(self, "max_retrieval_tokens", 0) or 0)
+        if ctx is not None and tools is not None:
+            budget = self.context_assembler.allocate(
+                context_window=self.context_window,
+                output_tokens=self.max_tokens,
+                system_prompt=ctx.system_prompt,
+                tools=tools,
+                current_messages=ctx.messages,
+                current_user_content=current_user_content,
+                estimate=lambda messages: self._estimate_input_tokens(messages, ctx=ctx),
+                configured_retrieval_tokens=configured,
+            )
+            ctx.metadata["context_budget"] = {
+                "static_tokens": budget.static_tokens,
+                "message_tokens": budget.message_tokens,
+                "retrieval_tokens": budget.retrieval_tokens,
+                "input_tokens": budget.input_tokens,
+                "selected_tools": len(tools),
+            }
+            return budget.retrieval_tokens
         if configured > 0:
             return configured
         usable = max(0, int(self.context_window) - int(self.max_tokens))
@@ -1364,8 +1391,10 @@ class BaseAgent:
         ctx: Optional["AgentContext"] = None,
     ) -> int:
         context_manager = self._context_manager_for(ctx)
-        if context_manager is not None:
-            return context_manager.consolidation.estimate_tokens(messages)
+        consolidation = getattr(context_manager, "consolidation", None)
+        estimate = getattr(consolidation, "estimate_tokens", None)
+        if callable(estimate):
+            return estimate(messages)
         serialized = json.dumps(messages, ensure_ascii=False, sort_keys=True)
         return max(0, int(len(serialized) / max(1.0, float(shared.CHARS_PER_TOKEN))))
 
@@ -1381,6 +1410,7 @@ class BaseAgent:
             tools,
             output_max_tokens=output_max_tokens,
         )
+        ctx.metadata["_last_input_token_budget"] = budget
         if budget <= 0:
             raise ContextLimitError("provider input token budget is not positive")
         context_manager = self._context_manager_for(ctx)
@@ -1411,16 +1441,53 @@ class BaseAgent:
         was wrong is a provider-side failure.
         """
         predicted = int(ctx.metadata.pop("_predicted_input_tokens", 0) or 0)
-        if predicted <= 0:
-            return
+        observed_usage = getattr(self._transport, "observed_usage", None)
+        usage = (
+            observed_usage(response)
+            if callable(observed_usage)
+            else extract_provider_usage(response)
+        )
         context_manager = self._context_manager_for(ctx)
         if context_manager is None:
             return
-        with shared._suppress_with_log("token calibration skipped"):
-            actual = self._transport.observed_input_tokens(response)
-            if not actual:
-                return
-            context_manager.consolidation.observe_actual_usage(predicted, actual)
+        if predicted > 0 and usage.input_tokens > 0:
+            with shared._suppress_with_log("token calibration skipped"):
+                context_manager.consolidation.observe_actual_usage(
+                    predicted, usage.input_tokens
+                )
+        if usage.total_tokens <= 0:
+            return
+        session_id = str(
+            ctx.metadata.get("session_id")
+            or getattr(getattr(context_manager, "staging", None), "session_id", "")
+            or ctx.agent_id
+        )
+        step = max(1, int(ctx.metadata.get("_provider_step", 1) or 1))
+        phase = "subagent" if ctx.metadata.get("_orchestration_child") else (
+            "foreground" if step == 1 else "tool_step"
+        )
+        store = getattr(context_manager, "store", None)
+        record = getattr(store, "append_usage_event", None)
+        if callable(record):
+            with shared._suppress_with_log("provider usage persistence skipped"):
+                record(
+                    session_id=session_id,
+                    turn_id=str(ctx.metadata.get("turn_id") or ""),
+                    phase=phase,
+                    model=self._effective_model(ctx),
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cached_input_tokens=usage.cached_input_tokens,
+                    metadata={"step": step, "predicted_input_tokens": predicted},
+                )
+        _emit_event(
+            "provider_usage",
+            phase=phase,
+            step=step,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cached_input_tokens=usage.cached_input_tokens,
+        )
 
     def _next_structured_output_budget(
         self,
@@ -1723,7 +1790,7 @@ class BaseAgent:
 
         # Retry once with the cleaned messages
         try:
-            tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
+            tools = list(ctx.metadata.get("_selected_tools") or [])
             return await self._create(ctx, tools)
         except Exception as retry_exc:
             if self._is_content_filter_block(retry_exc):
@@ -2414,16 +2481,59 @@ class BaseAgent:
         Caller is responsible for restoring ``ctx.system_prompt`` afterwards
         (send_message captures ``original_system`` before calling this).
         """
+        checkpoint_summary = str(
+            ctx.metadata.get("_checkpoint_summary") or ""
+        ).strip()
+        if checkpoint_summary:
+            ctx.system_prompt = (
+                ctx.system_prompt
+                + "\n\n<session_checkpoint trust=\"untrusted_evidence\">\n"
+                + html.escape(checkpoint_summary, quote=False)
+                + "\n</session_checkpoint>"
+            )
         # retrieve_implicit_context() covers both recent staging-buffer turns
         # (not yet consolidated) and historical LTM hits.  Skipping the
         # staging side would let recently-compacted turns drop from view.
+        decision = self._plan_orchestration(ctx, user_message)
+        all_tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
+        selected_tools = self.context_assembler.select_tools(
+            all_tools,
+            user_message,
+            required_skills=ctx.metadata.get("required_skills", ()),
+            attachment_kinds=(attachment.kind for attachment in attachments),
+        )
+        if decision.mode == "explicit":
+            selected_names = {str(tool.get("name") or "") for tool in selected_tools}
+            selected_tools.extend(
+                tool
+                for tool in all_tools
+                if tool.get("name") == "spawn_agent"
+                and tool.get("name") not in selected_names
+            )
+        ctx.metadata["_selected_tools"] = selected_tools
         context_manager = self._context_manager_for(ctx)
-        if context_manager:
+        retrieval_budget = self._retrieval_token_budget(
+            ctx,
+            selected_tools,
+            current_user_content=user_message,
+        )
+        if context_manager and retrieval_budget > 0:
+            has_active_state = True
+            if ctx.metadata.get("_has_provider_checkpoint"):
+                active_state = getattr(
+                    context_manager, "has_active_working_state", None
+                )
+                if callable(active_state):
+                    has_active_state = bool(active_state())
             retrieved = context_manager.retrieve_implicit_context(
                 user_message,
                 current_messages=ctx.messages,
                 current_turn_id=str(ctx.metadata.get("turn_id") or ""),
-                token_budget=self._retrieval_token_budget(),
+                token_budget=retrieval_budget,
+                include_recent_session=not bool(
+                    ctx.metadata.get("_has_provider_checkpoint")
+                ),
+                include_working_state=has_active_state,
             )
             if retrieved:
                 ctx.system_prompt = (
@@ -2446,7 +2556,6 @@ class BaseAgent:
                     + "\n\n## Active Skills\n"
                     + "\n\n".join(active_blocks)
                 )
-        decision = self._plan_orchestration(ctx, user_message)
         if decision.mode == "explicit":
             policy = (
                 "When using orchestration tools, encode ordering and coordination "
@@ -2605,7 +2714,8 @@ class BaseAgent:
                         error=trace_error,
                     )
                 steps = _step_index + 1
-                tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
+                ctx.metadata["_provider_step"] = steps
+                tools = list(ctx.metadata.get("_selected_tools") or [])
 
                 # Drain the interjection mailbox: any user messages that
                 # arrived during the previous step get folded in as a
@@ -2825,6 +2935,33 @@ class BaseAgent:
                             self._tool_result_messages(tool_uses, filtered_results)
                         )
                         filter_recovery.record_submission(tool_uses, results)
+                        # A long tool chain can be interrupted or the process
+                        # can be restarted before turn maintenance runs. Save
+                        # only after the assistant call and every matching tool
+                        # result form a complete provider protocol unit.
+                        checkpoint_manager = self._context_manager_for(ctx)
+                        save_checkpoint = getattr(
+                            checkpoint_manager, "save_provider_checkpoint", None
+                        )
+                        if callable(save_checkpoint):
+                            with shared._suppress_with_log(
+                                "provider checkpoint save skipped"
+                            ):
+                                save_checkpoint(
+                                    ctx.messages,
+                                    token_budget=max(
+                                        2048,
+                                        min(
+                                            24000,
+                                            int(
+                                                ctx.metadata.get(
+                                                    "_last_input_token_budget", 24000
+                                                )
+                                                or 24000
+                                            ),
+                                        ),
+                                    ),
+                                )
 
                         stuck_reason = self._check_tool_loop_stuck(
                             watchdog, tool_uses, results,
@@ -2969,6 +3106,8 @@ class BaseAgent:
             # is published via the _active_agent_context ContextVar; that
             # token is reset above, so no extra stack bookkeeping is needed.
             ctx.system_prompt = original_system
+            ctx.metadata.pop("_provider_step", None)
+            ctx.metadata.pop("_selected_tools", None)
 
         return AgentResult(
             agent_id=ctx.agent_id,
@@ -2998,11 +3137,33 @@ class BaseAgent:
         message handler after every agent turn.  Keeping this in one place
         prevents the two call sites from diverging.
         """
+        metadata = getattr(ctx, "metadata", {})
+        agent_max_tokens = int(getattr(agent, "max_tokens", 0) or 0)
+        default_input_budget = max(
+            2048,
+            int(getattr(agent, "context_window", 0) or 0) - agent_max_tokens,
+        )
+        input_token_budget = int(
+            metadata.get("_last_input_token_budget")
+            or default_input_budget
+        )
         if ctx_mgr:
             consume_suppression = getattr(
                 ctx_mgr, "consume_memory_clear_suppression", None
             )
             if callable(consume_suppression) and consume_suppression():
+                save_checkpoint = getattr(ctx_mgr, "save_provider_checkpoint", None)
+                if callable(save_checkpoint):
+                    with shared._suppress_with_log("provider checkpoint save skipped"):
+                        checkpoint = save_checkpoint(
+                            getattr(ctx, "messages", []),
+                            token_budget=max(2048, min(24000, input_token_budget)),
+                        )
+                        if isinstance(checkpoint, dict) and isinstance(metadata, dict):
+                            ctx.metadata["_checkpoint_summary"] = str(
+                                checkpoint.get("summary") or ""
+                            )
+                            ctx.metadata["_has_provider_checkpoint"] = True
                 return
             if record_kwargs is None:
                 record_kwargs = {}
@@ -3073,9 +3234,6 @@ class BaseAgent:
         # 2. Wake the background memory worker so staged content gets
         #    consolidated without delaying the interactive loop.
         # The pre-loop check in send_message handles the common case.
-        input_token_budget = (
-            getattr(agent, "context_window", agent.max_tokens) - agent.max_tokens
-        )
         if ctx_mgr and ctx_mgr.should_compact_messages(
             ctx.messages, input_token_budget=input_token_budget
         ):
@@ -3083,15 +3241,26 @@ class BaseAgent:
                 ctx.messages, input_token_budget=input_token_budget
             )
             if system_prompt:
-                ctx.system_prompt = agent_module._with_task_context(
-                    system_prompt, task_context
-                )
+                ctx.system_prompt = system_prompt
             if (
                 memory_worker is not None
                 and ctx_mgr.staging.count() >= ctx_mgr.min_messages
             ):
                 ctx_mgr.enqueue_consolidation("compact_triggered")
                 memory_worker.wake()
+        if ctx_mgr:
+            save_checkpoint = getattr(ctx_mgr, "save_provider_checkpoint", None)
+            if callable(save_checkpoint):
+                with shared._suppress_with_log("provider checkpoint save skipped"):
+                    checkpoint = save_checkpoint(
+                        ctx.messages,
+                        token_budget=max(2048, min(24000, input_token_budget)),
+                    )
+                    if isinstance(checkpoint, dict) and isinstance(metadata, dict):
+                        ctx.metadata["_checkpoint_summary"] = str(
+                            checkpoint.get("summary") or ""
+                        )
+                        ctx.metadata["_has_provider_checkpoint"] = True
 
     async def _stream_response(
         self,

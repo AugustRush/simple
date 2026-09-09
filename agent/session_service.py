@@ -428,6 +428,13 @@ class SessionService:
                     }
             except Exception:
                 task = None
+        usage: dict[str, Any] = {}
+        usage_summary = getattr(store, "usage_summary", None)
+        if callable(usage_summary):
+            try:
+                usage = usage_summary(clean)
+            except Exception:
+                usage = {}
 
         return {
             "session_id": clean,
@@ -439,6 +446,7 @@ class SessionService:
                 "restarts": len(restarts),
             },
             "task": task,
+            "usage": usage,
             "workspace_root": workspace_root,
             "workspace_status": workspace_status,
             "workspace_exists": workspace_exists,

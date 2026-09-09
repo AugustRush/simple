@@ -146,3 +146,129 @@ class BackgroundMemoryWorker:
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.close()
+
+
+class BackgroundMemoryWorkerPool:
+    """One bounded worker loop shared by many session context managers."""
+
+    def __init__(
+        self,
+        client: Any,
+        *,
+        client_factory: Optional[Callable[[], Any]] = None,
+        poll_seconds: float = 1.0,
+    ) -> None:
+        self.client = client
+        self.client_factory = client_factory
+        self.poll_seconds = max(0.05, float(poll_seconds))
+        self._sessions: dict[str, tuple[ContextManager, str, str]] = {}
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="background-memory-worker-pool",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def register(
+        self,
+        session_id: str,
+        ctx_mgr: ContextManager,
+        model: str,
+        api_format: str,
+    ) -> None:
+        with self._lock:
+            self._sessions[str(session_id)] = (ctx_mgr, str(model), str(api_format))
+        self._wake_event.set()
+
+    def unregister(self, session_id: str) -> None:
+        with self._lock:
+            self._sessions.pop(str(session_id), None)
+
+    def wake(self, session_id: str | None = None) -> None:
+        self._wake_event.set()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._wake_event.set()
+
+    async def wait(self) -> None:
+        if self._thread:
+            await asyncio.to_thread(self._thread.join)
+
+    async def _process(self, loop: asyncio.AbstractEventLoop, item: tuple[ContextManager, str, str], client: Any) -> bool:
+        manager, model, api_format = item
+        return bool(
+            await manager.process_one_job(client, model, api_format=api_format)
+        )
+
+    def _run(self) -> None:
+        client = self.client_factory() if self.client_factory else self.client
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            while not self._stop_event.is_set():
+                on_demand = self._wake_event.is_set()
+                self._wake_event.clear()
+                with self._lock:
+                    items = list(self._sessions.values())
+                made_progress = False
+                for manager, _model, _api_format in items:
+                    if self._stop_event.is_set():
+                        break
+                    if not on_demand and not manager.should_process_jobs():
+                        continue
+                    try:
+                        processed = loop.run_until_complete(
+                            self._process(loop, (manager, _model, _api_format), client)
+                        )
+                        made_progress = made_progress or processed
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as exc:
+                        shared.CONSOLE.print(
+                            f"[dim]Background consolidation error: {exc}[/dim]"
+                        )
+                if made_progress and on_demand:
+                    self._wake_event.set()
+                    continue
+                self._wake_event.wait(timeout=self.poll_seconds)
+        finally:
+            aclose = getattr(client, "aclose", None)
+            if self.client_factory and callable(aclose):
+                with contextlib.suppress(Exception):
+                    loop.run_until_complete(aclose())
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.close()
+
+
+class PooledMemoryWorkerHandle:
+    """Per-session compatibility handle backed by a worker pool."""
+
+    def __init__(self, pool: BackgroundMemoryWorkerPool, session_id: str) -> None:
+        self.pool = pool
+        self.session_id = str(session_id)
+
+    def start(self) -> None:
+        self.pool.start()
+
+    def stop(self) -> None:
+        self.pool.unregister(self.session_id)
+
+    async def wait(self) -> None:
+        return None
+
+    def wake(self) -> None:
+        self.pool.wake(self.session_id)

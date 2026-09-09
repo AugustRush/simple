@@ -266,19 +266,23 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
             registry.set_context("workspace_root", str(target))
             registry.set_context("file_access_policy", policy)
             registry.set_context("file_service", service)
-            for tool in getattr(registry, "_tools", {}).values():
-                owner = getattr(tool.fn, "__self__", None)
-                if owner is not None and hasattr(owner, "workspace_root"):
-                    previous_owner_state.append(
-                        (
-                            owner,
-                            getattr(owner, "workspace_root", None),
-                            getattr(owner, "_injected_file_service", None),
+            # A Web session registry is a ContextVar-backed view over global
+            # tool definitions. Bound tool owners are process-global and must
+            # never be mutated by one session's workspace switch.
+            if not context.components.get("_shares_global_runtime"):
+                for tool in getattr(registry, "_tools", {}).values():
+                    owner = getattr(tool.fn, "__self__", None)
+                    if owner is not None and hasattr(owner, "workspace_root"):
+                        previous_owner_state.append(
+                            (
+                                owner,
+                                getattr(owner, "workspace_root", None),
+                                getattr(owner, "_injected_file_service", None),
+                            )
                         )
-                    )
-                    owner.workspace_root = target
-                    if hasattr(owner, "_injected_file_service"):
-                        owner._injected_file_service = service
+                        owner.workspace_root = target
+                        if hasattr(owner, "_injected_file_service"):
+                            owner._injected_file_service = service
         agent.workspace_root = target
         core_components = getattr(getattr(context.components.get("agent_core"), "_components", None), "values", None)
         if isinstance(core_components, dict):
@@ -309,12 +313,6 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
                 skill_catalog=skill_catalog,
                 plugin_catalog=plugin_catalog,
             )
-            with_task_context = getattr(agent_module, "_with_task_context", None)
-            if callable(with_task_context):
-                refreshed_prompt = with_task_context(
-                    refreshed_prompt,
-                    getattr(context.session_state, "task_context", ""),
-                )
         except Exception:
             # A custom/test registry should not make a valid folder switch
             # fail. Runtime file access has already been updated; preserve the

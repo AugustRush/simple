@@ -56,12 +56,14 @@ from .store import LTMStore
 from .retrieval import LocalRetriever
 from .consolidation import ConsolidationEngine
 from .context import ContextManager
-from .worker import BackgroundMemoryWorker
+from .worker import BackgroundMemoryWorker, BackgroundMemoryWorkerPool, PooledMemoryWorkerHandle
 from .palace import MemoryPalace
 
 __all__ = [
     "AgentRuntimeEvent",
     "BackgroundMemoryWorker",
+    "BackgroundMemoryWorkerPool",
+    "PooledMemoryWorkerHandle",
     "ConsolidationEngine",
     "ConsolidationResult",
     "ContextLimitError",

@@ -9087,6 +9087,28 @@ def test_observed_input_tokens_reads_either_provider_field():
     assert read(object()) is None
 
 
+def test_observed_usage_reads_output_and_cache_fields():
+    from agent.core.transport import ModelTransport
+
+    response = type(
+        "Response",
+        (),
+        {
+            "usage": {
+                "prompt_tokens": 500,
+                "completion_tokens": 80,
+                "prompt_tokens_details": {"cached_tokens": 320},
+            }
+        },
+    )()
+
+    usage = ModelTransport.observed_usage(response)
+
+    assert usage.input_tokens == 500
+    assert usage.output_tokens == 80
+    assert usage.cached_input_tokens == 320
+
+
 def _streaming_agent():
     import agent as agent_module
 

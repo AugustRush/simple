@@ -203,6 +203,12 @@ class BuiltinTools:
         take its place: a second service, with default policy, that nobody
         asked for.
         """
+        # Constructor injection remains the default for ordinary CLI calls;
+        # a forked session may override it through ToolRegistry's ContextVar.
+        override = getattr(self.registry, "_context_override", None)
+        active_override = override.get() if override is not None else None
+        if isinstance(active_override, dict) and "file_service" in active_override:
+            return active_override["file_service"]
         if self._injected_file_service is not None:
             return self._injected_file_service
         from_context = self.registry.get_context("file_service")
@@ -222,6 +228,12 @@ class BuiltinTools:
                 write_scope=lambda: self.registry.get_context("write_scope") or (),
             )
         return self._fallback_file_service
+
+    def _active_workspace_root(self) -> Path:
+        raw = self.registry.get_context("workspace_root")
+        if raw:
+            return Path(str(raw)).expanduser().resolve(strict=False)
+        return self.workspace_root.expanduser().resolve(strict=False)
 
     def _process_output_dir(self) -> Path:
         raw = self.registry.get_context("output_dir")
@@ -1929,8 +1941,8 @@ class BuiltinTools:
     def _resolve_tool_path(self, path: str) -> tuple[Path, str]:
         return resolve_workspace_path(
             path,
-            workspace_root=self.workspace_root,
-            output_dir=self._output_dir,
+            workspace_root=self._active_workspace_root(),
+            output_dir=self._process_output_dir(),
         )
 
     def _resolve_output_path(self, path: str) -> tuple[Path, str]:
@@ -1946,13 +1958,13 @@ class BuiltinTools:
             path = str(output_dir / candidate)
         return resolve_workspace_path(
             path,
-            workspace_root=self.workspace_root,
+            workspace_root=self._active_workspace_root(),
             output_dir=self._process_output_dir(),
         )
 
     def _path_is_inside_workspace(self, path: Path) -> bool:
         return path_contains(
-            self.workspace_root.expanduser().resolve(strict=False),
+            self._active_workspace_root(),
             path.expanduser().resolve(strict=False),
         )
 
@@ -1965,7 +1977,7 @@ class BuiltinTools:
     def _workspace_file_snapshot(self) -> set[Path]:
         """Return files currently in the workspace, ignoring agent outputs."""
         files: set[Path] = set()
-        workspace_root = self.workspace_root.expanduser().resolve(strict=False)
+        workspace_root = self._active_workspace_root()
         output_dir = self._process_output_dir()
         if not workspace_root.exists():
             return files
@@ -1989,7 +2001,7 @@ class BuiltinTools:
         cwd: Path,
     ) -> list[dict[str, str]]:
         output_dir = self._process_output_dir()
-        workspace_root = self.workspace_root.expanduser().resolve(strict=False)
+        workspace_root = self._active_workspace_root()
         moved: list[dict[str, str]] = []
         for path in sorted(self._workspace_file_snapshot() - before):
             if not path.is_file() or path_contains(output_dir, path):
@@ -2072,12 +2084,13 @@ class BuiltinTools:
         )
 
         output_dir = self._process_output_dir()
+        workspace_root = self._active_workspace_root()
         sandbox_dir = self._sandbox_dir()
         _shell_command_check = agent_module._shell_command_check
         safety = _shell_command_check(
             command,
             extra_blocked,
-            allowed_roots=frozenset({self.workspace_root, output_dir}),
+            allowed_roots=frozenset({workspace_root, output_dir}),
             scope=authorization_scope,
             pre_approved=pre_approved,
             permission_level=permission_level,
@@ -2094,7 +2107,7 @@ class BuiltinTools:
             safety = _shell_command_check(
                 command,
                 extra_blocked,
-                allowed_roots=frozenset({self.workspace_root, output_dir}),
+                allowed_roots=frozenset({workspace_root, output_dir}),
                 scope=authorization_scope,
                 pre_approved=pre_approved,
                 permission_level=permission_level,
@@ -2140,14 +2153,14 @@ class BuiltinTools:
             if candidate.is_absolute():
                 resolved_cwd, call_root = resolve_workspace_path(
                     candidate,
-                    workspace_root=self.workspace_root,
+                    workspace_root=workspace_root,
                     output_dir=output_dir,
                 )
             else:
-                base = self.workspace_root if root == "workspace" else output_dir
+                base = workspace_root if root == "workspace" else output_dir
                 resolved_cwd, _ = resolve_workspace_path(
                     base / candidate,
-                    workspace_root=self.workspace_root,
+                    workspace_root=workspace_root,
                     output_dir=output_dir,
                 )
                 if not path_contains(base, resolved_cwd):
@@ -2158,7 +2171,7 @@ class BuiltinTools:
                 call_root = root
         else:
             if root == "workspace":
-                resolved_cwd, call_root = self.workspace_root, "workspace"
+                resolved_cwd, call_root = workspace_root, "workspace"
             else:
                 resolved_cwd, call_root = output_dir, "output_dir"
 
@@ -2184,7 +2197,7 @@ class BuiltinTools:
                 scratch_dir = new_scratch_dir(output_dir)
                 sandbox = build_sandbox_command(
                     ShellSandboxRequest(
-                        workspace_root=self.workspace_root,
+                        workspace_root=workspace_root,
                         output_root=output_dir,
                         workspace_read=workspace_read,
                         workspace_write=workspace_write,
@@ -2208,7 +2221,7 @@ class BuiltinTools:
         try:
             env = os.environ.copy()
             env["AGENT_OUTPUT_DIR"] = str(output_dir)
-            env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
+            env["AGENT_WORKSPACE_ROOT"] = str(workspace_root)
             env["AGENT_SANDBOX_DIR"] = str(sandbox_dir)
             # The provider prepends the sandbox argv and merges its env, kills
             # the process group on timeout or `/cancel` (so cancellation does
@@ -2392,7 +2405,7 @@ class BuiltinTools:
                 env={
                     **os.environ.copy(),
                     "AGENT_OUTPUT_DIR": str(output_dir),
-                    "AGENT_WORKSPACE_ROOT": str(self.workspace_root),
+                    "AGENT_WORKSPACE_ROOT": str(self._active_workspace_root()),
                 },
                 cwd=str(output_dir),
                 start_new_session=True,

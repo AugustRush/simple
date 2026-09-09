@@ -120,9 +120,18 @@ class ChannelRunner:
         base_ctx_mgr = components.get("context_manager")
         if base_ctx_mgr is None:
             return None
+        staging = getattr(base_ctx_mgr, "staging", None)
+        if str(getattr(staging, "session_id", "") or "") == str(session_id):
+            return base_ctx_mgr
         spawn_session = getattr(base_ctx_mgr, "spawn_session", None)
         if callable(spawn_session):
-            return spawn_session(session_id)
+            try:
+                return spawn_session(
+                    session_id,
+                    project_scope=str(components.get("project_memory_scope") or ""),
+                )
+            except TypeError:
+                return spawn_session(session_id)
         return base_ctx_mgr
 
     def _build_session_memory_worker(self, session_ctx_mgr, components: dict):
@@ -130,6 +139,23 @@ class ChannelRunner:
 
         if session_ctx_mgr is None:
             return None
+        pool = components.get("memory_worker_pool")
+        if pool is not None:
+            consolidation_cfg = (
+                components.get("cfg", {}).get("context", {}).get("consolidation", {})
+            )
+            memory_model = str(consolidation_cfg.get("model") or components["model"])
+            pool.register(
+                getattr(session_ctx_mgr.staging, "session_id", ""),
+                session_ctx_mgr,
+                memory_model,
+                components["agent"].api_format,
+            )
+            handle = agent_module.PooledMemoryWorkerHandle(
+                pool, getattr(session_ctx_mgr.staging, "session_id", "")
+            )
+            handle.start()
+            return handle
         if (
             "client" not in components
             or "model" not in components
@@ -137,10 +163,14 @@ class ChannelRunner:
             or not hasattr(components["agent"], "api_format")
         ):
             return None
+        consolidation_cfg = (
+            components.get("cfg", {}).get("context", {}).get("consolidation", {})
+        )
+        memory_model = str(consolidation_cfg.get("model") or components["model"])
         worker = agent_module.BackgroundMemoryWorker(
             session_ctx_mgr,
             components["client"],
-            components["model"],
+            memory_model,
             components["agent"].api_format,
             client_factory=lambda: agent_module.ModelClientFactory.from_config(
                 components.get("cfg", self._cfg), announce=False
@@ -181,6 +211,29 @@ class ChannelRunner:
         initial_ctx = agent_module.AgentContext(
             system_prompt=components["system_prompt"]
         )
+        if session_ctx_mgr is not None:
+            load_checkpoint = getattr(
+                session_ctx_mgr, "load_provider_checkpoint", None
+            )
+            if callable(load_checkpoint):
+                try:
+                    checkpoint = load_checkpoint()
+                except Exception:
+                    logger.exception(
+                        "failed to restore provider checkpoint for session %s",
+                        session_id,
+                    )
+                else:
+                    if isinstance(checkpoint, dict):
+                        messages = checkpoint.get("messages")
+                        if isinstance(messages, list):
+                            initial_ctx.messages = [
+                                item for item in messages if isinstance(item, dict)
+                            ]
+                        initial_ctx.metadata["_checkpoint_summary"] = str(
+                            checkpoint.get("summary") or ""
+                        )
+                        initial_ctx.metadata["_has_provider_checkpoint"] = True
         workspace_root = components.get("workspace_root")
         if workspace_root is not None:
             try:
@@ -232,6 +285,22 @@ class ChannelRunner:
             return
 
         components = self._components
+        memory_pool = None
+        if components.get("use_memory_worker_pool"):
+            pool_cls = getattr(agent_module, "BackgroundMemoryWorkerPool", None)
+            if pool_cls is not None and components.get("client") is not None:
+                consolidation_cfg = (
+                    components.get("cfg", {}).get("context", {}).get("consolidation", {})
+                )
+                memory_pool = pool_cls(
+                    components["client"],
+                    client_factory=lambda: agent_module.ModelClientFactory.from_config(
+                        components.get("cfg", self._cfg), announce=False
+                    )[0],
+                    poll_seconds=float(consolidation_cfg.get("poll_seconds", 1.0) or 1.0),
+                )
+                components["memory_worker_pool"] = memory_pool
+                memory_pool.start()
         plugin_catalog = components.get("plugin_catalog")
         if plugin_catalog:
             plugin_catalog.fire_session_start(components)
@@ -255,7 +324,14 @@ class ChannelRunner:
                     continue
                 worker.stop()
                 await worker.wait()
+            flush_on_end = bool(
+                self._cfg.get("context", {})
+                .get("consolidation", {})
+                .get("flush_on_session_end", False)
+            )
             for session in sessions.values():
+                if not flush_on_end:
+                    continue
                 manager = session.context_manager
                 should_flush = getattr(manager, "should_session_end_sleep", None)
                 if manager is None or not callable(should_flush) or not should_flush():
@@ -319,6 +395,9 @@ class ChannelRunner:
                 close = getattr(staging, "close", None)
                 if callable(close):
                     close()
+            if memory_pool is not None:
+                memory_pool.stop()
+                await memory_pool.wait()
 
     def _make_message_handler(
         self, sessions: dict[str, RuntimeSessionState]
@@ -338,7 +417,10 @@ class ChannelRunner:
                 return existing
             if existing is not None:
                 close_components = getattr(agent_module, "_close_components", None)
-                if callable(close_components):
+                if (
+                    callable(close_components)
+                    and not existing.get("_shares_global_runtime")
+                ):
                     await close_components(existing)
                 session_coordinators.pop(session_id, None)
                 session_plugins_started.discard(session_id)
@@ -360,11 +442,65 @@ class ChannelRunner:
             session_revisions.pop(session_id, None)
             session_coordinators.pop(session_id, None)
             session_plugins_started.discard(session_id)
-            if runtime is None or runtime is components:
+            if (
+                runtime is None
+                or runtime is components
+                or runtime.get("_shares_global_runtime")
+            ):
                 return
             close_components = getattr(agent_module, "_close_components", None)
             if callable(close_components):
                 await close_components(runtime)
+
+        async def _evict_session(session_id: str) -> None:
+            state = sessions.get(session_id)
+            if state is None or getattr(state, "operation_state", "idle") != "idle":
+                return
+            worker = getattr(state, "memory_worker", None)
+            if worker is not None:
+                with shared._suppress_with_log("session worker stop failed"):
+                    worker.stop()
+                wait = getattr(worker, "wait", None)
+                if callable(wait):
+                    with shared._suppress_with_log("session worker wait failed"):
+                        await wait()
+            staging = getattr(getattr(state, "context_manager", None), "staging", None)
+            close = getattr(staging, "close", None)
+            if callable(close):
+                with shared._suppress_with_log("session staging close failed"):
+                    close()
+            sessions.pop(session_id, None)
+            await _cleanup_session_runtime(session_id)
+
+        async def _evict_idle_sessions(protected_session_id: str) -> None:
+            web_cfg = self._cfg.get("channels", {}).get("web", {})
+            max_active = max(1, int(web_cfg.get("max_active_sessions", 16) or 16))
+            idle_ttl = max(
+                1.0,
+                float(web_cfg.get("session_idle_ttl_seconds", 900) or 900),
+            )
+            now = time.time()
+            idle = sorted(
+                (
+                    (session_id, state)
+                    for session_id, state in sessions.items()
+                    if session_id != protected_session_id
+                    and getattr(state, "operation_state", "idle") == "idle"
+                ),
+                key=lambda item: float(getattr(item[1], "last_activity", 0.0) or 0.0),
+            )
+            expired = [
+                session_id
+                for session_id, state in idle
+                if now - float(getattr(state, "last_activity", 0.0) or 0.0) >= idle_ttl
+            ]
+            for session_id in expired:
+                await _evict_session(session_id)
+            remaining_idle = [
+                session_id for session_id, _state in idle if session_id in sessions
+            ]
+            while len(sessions) >= max_active and remaining_idle:
+                await _evict_session(remaining_idle.pop(0))
 
         components.setdefault("session_runtime_cleanup", _cleanup_session_runtime)
         agent_core = components.get("agent_core")
@@ -436,6 +572,7 @@ class ChannelRunner:
             session_id = msg.metadata.get("chat_id") or msg.session_id
             skill_catalog = components["skill_catalog"]
             session_runtime = await _components_for_session(session_id)
+            await _evict_idle_sessions(session_id)
             state = await self._ensure_session_state(sessions, session_id, session_runtime)
             revision = int(components.get("config_revision", 0) or 0)
             if getattr(state, "runtime_revision", revision) != revision:

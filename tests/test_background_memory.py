@@ -47,7 +47,7 @@ def test_mark_activity_enqueues_memory_work(tmp_path):
 def test_should_enqueue_uses_staging_volume(tmp_path):
     ctx_mgr, staging = _build_context_manager(tmp_path)
 
-    for i in range(6):
+    for i in range(ctx_mgr.staging_turn_threshold):
         staging.append("user", f"turn {i}")
 
     ctx_mgr.mark_activity()
@@ -312,6 +312,43 @@ def test_background_worker_wake_drains_all_pending_jobs():
     asyncio.run(run())
 
     assert ctx_mgr.processed == 3
+
+
+def test_background_worker_pool_uses_one_thread_for_multiple_sessions():
+    from agent import BackgroundMemoryWorkerPool
+
+    class _FakeContextManager:
+        def __init__(self):
+            self.pending = 1
+            self.processed = 0
+
+        def should_process_jobs(self):
+            return self.pending > 0
+
+        async def process_one_job(self, *_args, **_kwargs):
+            if self.pending <= 0:
+                return False
+            self.pending -= 1
+            self.processed += 1
+            return True
+
+    first = _FakeContextManager()
+    second = _FakeContextManager()
+    pool = BackgroundMemoryWorkerPool(client=None, poll_seconds=0.01)
+    pool.register("a", first, "model-a", "openai")
+    pool.register("b", second, "model-b", "openai")
+
+    async def run():
+        pool.start()
+        await asyncio.sleep(0.05)
+        pool.stop()
+        await pool.wait()
+
+    asyncio.run(run())
+
+    assert first.processed == 1
+    assert second.processed == 1
+    assert pool._thread is not None
 
 
 def test_process_one_job_logs_reason_and_session_context(tmp_path, capsys):

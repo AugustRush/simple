@@ -629,6 +629,44 @@ def test_channel_runner_sets_output_dir_on_channels_with_setter(tmp_path):
     assert channel.output_dir == tmp_path / "output"
 
 
+def test_channel_runner_restores_provider_checkpoint_for_historical_session():
+    checkpoint_messages = [
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "result"},
+    ]
+
+    class _SessionManager:
+        def load_provider_checkpoint(self):
+            return {"messages": checkpoint_messages, "summary": "older context"}
+
+    class _RootManager:
+        def spawn_session(self, session_id):
+            assert session_id == "history-1"
+            return _SessionManager()
+
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "context_manager": _RootManager(),
+            "system_prompt": "system",
+        },
+        cfg={},
+    )
+
+    state = asyncio.run(
+        runner._ensure_session_state({}, "history-1", runner._components)
+    )
+
+    assert state.ctx.messages == checkpoint_messages
+    assert state.ctx.metadata["_checkpoint_summary"] == "older context"
+    assert state.ctx.metadata["_has_provider_checkpoint"] is True
+
+
 def test_channel_runner_scopes_context_manager_per_chat():
     class _RecordingStaging:
         def __init__(self, session_id: str):
@@ -745,6 +783,59 @@ def test_channel_runner_scopes_context_manager_per_chat():
     assert root_ctx_mgr.spawned["chat-b"].recorded_turns == [
         ("world", "reply:world", "cli")
     ]
+
+
+def test_channel_runner_evicts_oldest_idle_session_at_capacity():
+    class _Staging:
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self.closed = False
+            self.entries = []
+        def append(self, role, content): self.entries.append((role, content))
+        def count(self): return len(self.entries)
+        def close(self): self.closed = True
+
+    class _Manager:
+        min_messages = 2
+        def __init__(self, session_id): self.staging = _Staging(session_id)
+        def mark_activity(self): pass
+        def record_turn(self, **_kwargs): return True
+        def should_enqueue_consolidation(self): return False
+        def should_compact_messages(self, _messages, input_token_budget): return False
+
+    class _RootManager:
+        def __init__(self): self.created = {}
+        def spawn_session(self, session_id):
+            manager = _Manager(session_id)
+            self.created[session_id] = manager
+            return manager
+
+    class _Agent:
+        max_tokens = 1024
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            ctx.messages.append({"role": "assistant", "content": user_message})
+            return agent_module.AgentResult(agent_id="agent", content=user_message)
+
+    sessions = {}
+    root = _RootManager()
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": _Agent(), "skill_catalog": object(), "plugin_catalog": None,
+            "context_manager": root, "system_prompt": "system",
+        },
+        cfg={"channels": {"web": {"max_active_sessions": 1, "session_idle_ttl_seconds": 9999}}},
+    )
+    handler = runner._make_message_handler(sessions)
+
+    async def _run():
+        await handler(IncomingMessage(text="a", metadata={"chat_id": "chat-a"}), OutputSink())
+        await handler(IncomingMessage(text="b", metadata={"chat_id": "chat-b"}), OutputSink())
+
+    asyncio.run(_run())
+
+    assert set(sessions) == {"chat-b"}
+    assert root.created["chat-a"].staging.closed is True
 
 
 def test_channel_runner_emits_latency_trace(monkeypatch, caplog):
@@ -1458,7 +1549,7 @@ def test_channel_runner_flushes_session_staging_on_exit():
             "model": "fake-model",
             "plugin_catalog": None,
         },
-        cfg={},
+        cfg={"context": {"consolidation": {"flush_on_session_end": True}}},
     )
 
     def _make_handler(sessions):
@@ -1516,7 +1607,7 @@ def test_channel_runner_exit_timeout_retains_session_staging(caplog):
             "model": "fake-model",
             "plugin_catalog": None,
         },
-        cfg={},
+        cfg={"context": {"consolidation": {"flush_on_session_end": True}}},
     )
 
     def _make_handler(sessions):

@@ -319,6 +319,8 @@ class TurnRunner:
             task_context=state.task_context,
             error=result.error or "",
         )
+        if not result.error:
+            state.task_context = ""
         return hook_results
 
 
@@ -473,10 +475,7 @@ class AgentCore:
             state.system_prompt_override = refreshed
         else:
             refreshed = shared_refreshed
-        state.ctx.system_prompt = agent_module._with_task_context(
-            refreshed,
-            state.task_context,
-        )
+        state.ctx.system_prompt = refreshed
 
     def _refresh_component_prompt_if_needed(
         self,
@@ -489,12 +488,9 @@ class AgentCore:
         )
         if not isinstance(prompt, str) or not prompt:
             return
-        import agent as agent_module
-
-        refreshed = agent_module._with_task_context(prompt, state.task_context)
-        if getattr(state.ctx, "system_prompt", None) != refreshed:
+        if getattr(state.ctx, "system_prompt", None) != prompt:
             try:
-                state.ctx.system_prompt = refreshed
+                state.ctx.system_prompt = prompt
             except AttributeError:
                 return
 

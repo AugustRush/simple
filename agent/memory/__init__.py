@@ -34,10 +34,16 @@ from .palace import MemoryPalace
 from .retrieval import LocalRetriever
 from .staging import StagingBuffer
 from .store import LTMStore
-from .worker import BackgroundMemoryWorker
+from .worker import (
+    BackgroundMemoryWorker,
+    BackgroundMemoryWorkerPool,
+    PooledMemoryWorkerHandle,
+)
 
 __all__ = [
     "BackgroundMemoryWorker",
+    "BackgroundMemoryWorkerPool",
+    "PooledMemoryWorkerHandle",
     "AgentRuntimeEvent",
     "ConsolidationEngine",
     "ContextLimitError",

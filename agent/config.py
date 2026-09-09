@@ -117,6 +117,13 @@ DEFAULT_CONFIG: dict = {
             "keep_last_messages": 6,
             "idle_seconds": 300,
             "min_messages": 4,
+            "staging_turn_threshold": shared.STAGING_TURN_THRESHOLD,
+            "staging_token_threshold": shared.STAGING_TOKEN_THRESHOLD,
+            "max_source_tokens": shared.CONSOLIDATION_MAX_SOURCE_TOKENS,
+            "max_chunks_per_run": 2,
+            "output_tokens": 512,
+            "model": None,
+            "flush_on_session_end": False,
             "token_estimation": {
                 "chars_per_token": 4,
                 "cjk_chars_per_token": 1,

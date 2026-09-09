@@ -589,8 +589,8 @@ def test_agent_core_uses_live_component_prompt_for_existing_session():
 
     asyncio.run(core.handle_turn(TurnInput.from_text("hello"), state))
 
-    assert observed["system_prompt"].startswith("new")
-    assert "Current Task Context" in observed["system_prompt"]
+    assert observed["system_prompt"] == "new"
+    assert "hello" not in observed["system_prompt"]
 
 
 def test_agent_core_replaces_request_model_metadata_for_each_session_state():

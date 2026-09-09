@@ -209,6 +209,8 @@ TOOL_DEFAULT_MAX_LIST_RESULTS = 100
 from .memory.system import (
     AgentRuntimeEvent,
     BackgroundMemoryWorker,
+    BackgroundMemoryWorkerPool,
+    PooledMemoryWorkerHandle,
     ConsolidationEngine,
     ContextLimitError,
     ContextManager,

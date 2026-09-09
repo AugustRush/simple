@@ -7,6 +7,7 @@ from typing import Any, Callable, Optional
 
 from agent import shared
 from agent.lexical import count_cjk_chars
+from agent.usage import extract_provider_usage
 
 from ._helpers import _new_id, _now
 from .models import ConsolidationResult, LTMEntry
@@ -28,6 +29,8 @@ class ConsolidationEngine:
         sleep_token_ratio: float = shared.SLEEP_TOKEN_RATIO,
         keep_last_messages: int = 6,
         max_source_tokens: int = shared.CONSOLIDATION_MAX_SOURCE_TOKENS,
+        max_chunks_per_run: int = 0,
+        output_tokens: int = 512,
         chars_per_token: float = float(shared.CHARS_PER_TOKEN),
         cjk_chars_per_token: float = 1.0,
     ):
@@ -37,6 +40,8 @@ class ConsolidationEngine:
         self.sleep_token_ratio = sleep_token_ratio
         self.keep_last_messages = keep_last_messages
         self.max_source_tokens = max(1, int(max_source_tokens))
+        self.max_chunks_per_run = max(0, int(max_chunks_per_run))
+        self.output_tokens = max(64, min(2048, int(output_tokens)))
         # Token estimation ratios — configurable for different script systems.
         # chars_per_token:     non-CJK chars per token (Latin/ASCII, default 4)
         # cjk_chars_per_token: CJK chars per token (Hanzi/Kana/Hangul, default 1)
@@ -245,6 +250,7 @@ class ConsolidationEngine:
         api_format: str = "anthropic",
         keep_last: Optional[int] = None,
         staging: Optional["StagingBuffer"] = None,
+        project_scope: str = "",
     ) -> ConsolidationResult:
         """One sleep cycle: extract → classify → store → decay → compress.
 
@@ -275,6 +281,20 @@ class ConsolidationEngine:
             else f"messages ({len(messages)})"
         )
         conversation_chunks = self._chunk_messages_for_llm(source)
+        omitted_chunks = 0
+        if self.max_chunks_per_run and len(conversation_chunks) > self.max_chunks_per_run:
+            omitted_chunks = len(conversation_chunks) - self.max_chunks_per_run
+            # Preserve the initial request and the newest outcome. The journal
+            # remains authoritative for middle detail omitted from this index.
+            if self.max_chunks_per_run == 1:
+                conversation_chunks = [conversation_chunks[-1]]
+            else:
+                head_count = self.max_chunks_per_run // 2
+                tail_count = self.max_chunks_per_run - head_count
+                conversation_chunks = (
+                    conversation_chunks[:head_count]
+                    + conversation_chunks[-tail_count:]
+                )
 
         try:
             raw_responses: list[str] = []
@@ -285,23 +305,49 @@ class ConsolidationEngine:
                 if api_format == "anthropic":
                     resp = await client.messages.create(
                         model=model,
-                        max_tokens=1024,
+                        max_tokens=self.output_tokens,
                         messages=[{"role": "user", "content": prompt}],
                     )
                     raw_responses.append(resp.content[0].text)
                 else:
                     resp = await client.chat.completions.create(
                         model=model,
-                        max_tokens=1024,
+                        max_tokens=self.output_tokens,
                         messages=[{"role": "user", "content": prompt}],
                     )
                     raw_responses.append(resp.choices[0].message.content or "")
+                usage = extract_provider_usage(resp)
+                record_usage = getattr(self.store, "append_usage_event", None)
+                if callable(record_usage) and usage.total_tokens > 0:
+                    record_usage(
+                        session_id=staging.session_id if staging else "default",
+                        phase="consolidation",
+                        model=model,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cached_input_tokens=usage.cached_input_tokens,
+                        metadata={
+                            "chunk_index": idx,
+                            "chunk_count": len(conversation_chunks),
+                            "omitted_chunks": omitted_chunks,
+                        },
+                    )
 
             entries = [
                 self._build_episode_entry(source, staging.session_id if staging else "")
             ]
             for raw in raw_responses:
-                entries.extend(self._parse_entries(raw))
+                parsed = self._parse_entries(raw)
+                for entry in parsed:
+                    entry.scope = self._scope_for_entry(
+                        entry.category,
+                        session_id=staging.session_id if staging else "",
+                        project_scope=project_scope,
+                    )
+                    entry.source_session = (
+                        staging.session_id if staging else entry.source_session
+                    )
+                entries.extend(parsed)
             self.store.add_entries(entries)
 
             self.store.apply_retention()
@@ -417,6 +463,20 @@ class ConsolidationEngine:
                 continue
         return entries
 
+    @staticmethod
+    def _scope_for_entry(
+        category: str,
+        *,
+        session_id: str = "",
+        project_scope: str = "",
+    ) -> str:
+        normalized = str(category or "").strip().lower()
+        if normalized in {"tasks", "episodes", "archive"} and session_id:
+            return f"session:{session_id}"
+        if normalized == "projects" and project_scope:
+            return project_scope
+        return "global"
+
     def _build_episode_entry(
         self, messages: list[dict], session_id: str = ""
     ) -> LTMEntry:
@@ -442,6 +502,7 @@ class ConsolidationEngine:
             entity=session_id or "session",
             memory_type="session_summary",
             source_session=session_id,
+            scope=f"session:{session_id}" if session_id else "global",
             confidence=1.0,
             created_at=_now(),
             updated_at=_now(),

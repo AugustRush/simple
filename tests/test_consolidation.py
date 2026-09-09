@@ -37,6 +37,56 @@ def make_ctx_manager(tmp_path, idle_seconds=300, min_messages=4):
     )
 
 
+def test_usage_ledger_aggregates_by_session_and_phase(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    store = ctx_mgr.store
+    store.append_usage_event(
+        session_id="web-a",
+        turn_id="turn-1",
+        phase="foreground",
+        model="test-model",
+        input_tokens=100,
+        output_tokens=20,
+        cached_input_tokens=60,
+    )
+    store.append_usage_event(
+        session_id="web-a",
+        turn_id="turn-1",
+        phase="tool_step",
+        model="test-model",
+        input_tokens=140,
+        output_tokens=10,
+    )
+    store.append_usage_event(
+        session_id="web-b",
+        phase="foreground",
+        input_tokens=999,
+    )
+
+    summary = store.usage_summary("web-a")
+
+    assert summary == {
+        "calls": 2,
+        "input_tokens": 240,
+        "output_tokens": 30,
+        "cached_input_tokens": 60,
+        "by_phase": {
+            "foreground": {
+                "calls": 1,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cached_input_tokens": 60,
+            },
+            "tool_step": {
+                "calls": 1,
+                "input_tokens": 140,
+                "output_tokens": 10,
+                "cached_input_tokens": 0,
+            },
+        },
+    }
+
+
 def test_memory_clear_suppresses_current_turn_re_persistence(tmp_path):
     from agent import BaseAgent
 
@@ -102,6 +152,33 @@ def test_spawn_session_uses_explicit_staging_context_dir(tmp_path):
 
     assert spawned.staging.context_dir == context_dir
     assert spawned.staging._db_path == context_dir / "palace.db"
+
+
+def test_spawn_session_project_scope_isolated_from_other_projects(tmp_path):
+    base = make_ctx_manager(tmp_path)
+    first = base.spawn_session("web-a", project_scope="project:one")
+    second = base.spawn_session("web-b", project_scope="project:two")
+    from agent import LTMEntry
+
+    first.store.add_entry(
+        LTMEntry(
+            id="project-one",
+            content="project one deployment decision",
+            importance=0.9,
+            category="projects",
+            entity="repo",
+            scope="project:one",
+            created_at="2026-01-01",
+            updated_at="2026-01-01",
+        )
+    )
+
+    assert "project one deployment decision" in first.retrieve_ltm_context(
+        "deployment decision"
+    )
+    assert "project one deployment decision" not in second.retrieve_ltm_context(
+        "deployment decision"
+    )
 
 
 # ── Durable conversation history tests ───────────────────────────────────────
@@ -1251,6 +1328,42 @@ def test_consolidate_includes_full_staging_text_before_clearing(tmp_path):
     assert staging.count() == 0
 
 
+def test_consolidation_can_bound_hidden_model_calls(tmp_path):
+    import asyncio
+    from agent import ConsolidationEngine, LTMStore, StagingBuffer
+
+    class _Completions:
+        def __init__(self):
+            self.calls = []
+            self.completions = self
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            message = type("Message", (), {"content": ""})()
+            choice = type("Choice", (), {"message": message})()
+            return type("Response", (), {"choices": [choice], "usage": None})()
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    engine = ConsolidationEngine(
+        store=store,
+        max_source_tokens=500,
+        max_chunks_per_run=2,
+        output_tokens=256,
+    )
+    staging = StagingBuffer(path=tmp_path / "staging.jsonl", session_id="bounded")
+    staging.append("user", "first request " + "a" * 3000)
+    staging.append("assistant", "z" * 3000 + " latest result")
+    client = type("Client", (), {"chat": _Completions()})()
+
+    asyncio.run(engine.consolidate([], client, "memory-model", "openai", staging=staging))
+
+    assert len(client.chat.calls) == 2
+    assert all(call["max_tokens"] == 256 for call in client.chat.calls)
+    prompts = "\n".join(call["messages"][0]["content"] for call in client.chat.calls)
+    assert "first request" in prompts
+    assert "latest result" in prompts
+
+
 # ── ContextManager dirty flag tests ──────────────────────────────────────────
 
 
@@ -2070,7 +2183,7 @@ def test_should_process_jobs_fires_when_threshold_reached(tmp_path):
     ctx_mgr = make_ctx_manager(tmp_path, idle_seconds=0)
     ctx_mgr.mark_activity()
 
-    for i in range(6):  # staging_turn_threshold = 6
+    for i in range(ctx_mgr.staging_turn_threshold):
         ctx_mgr.staging.append("user", f"msg {i}")
 
     assert ctx_mgr.should_process_jobs()
@@ -2155,8 +2268,8 @@ def test_should_enqueue_fast_path_unchanged(tmp_path):
     ctx_mgr = make_ctx_manager(tmp_path)
     ctx_mgr.mark_activity()
 
-    # 6 short entries (3 complete turns) = fast-path threshold, tiny responses.
-    for i in range(6):
+    # Short entries at the configured fast-path threshold must still enqueue.
+    for i in range(ctx_mgr.staging_turn_threshold):
         ctx_mgr.staging.append("user", f"m{i}")
 
     assert ctx_mgr.should_enqueue_consolidation()
@@ -2465,6 +2578,84 @@ def test_compaction_with_notice_preserves_pairing_and_is_stable(tmp_path):
     # Re-compacting an already-compacted list must be a no-op.
     again = ctx_mgr.compact_messages(compacted, input_token_budget=700)
     assert len(again) == len(compacted)
+
+
+def test_provider_checkpoint_preserves_openai_tool_protocol_and_summary(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "old requirement " + "x" * 2400},
+        {"role": "assistant", "content": "old response " + "y" * 2400},
+        {"role": "user", "content": "inspect the repository"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": '{"command":"ls"}'},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "file.py"},
+        {"role": "assistant", "content": "The repository contains file.py."},
+        {"role": "user", "content": "continue"},
+    ]
+
+    saved = ctx_mgr.save_provider_checkpoint(messages, token_budget=700)
+    restored = ctx_mgr.load_provider_checkpoint()
+
+    assert restored is not None
+    assert restored["messages"] == saved["messages"]
+    calls = {
+        call["id"]
+        for message in restored["messages"]
+        for call in message.get("tool_calls", [])
+    }
+    results = {
+        message["tool_call_id"]
+        for message in restored["messages"]
+        if message.get("role") == "tool"
+    }
+    assert calls == results
+    assert "old requirement" in restored["summary"]
+
+    # Saving an already-bounded tail must retain the bridge to older history.
+    ctx_mgr.save_provider_checkpoint(restored["messages"], token_budget=700)
+    assert "old requirement" in ctx_mgr.load_provider_checkpoint()["summary"]
+
+
+def test_provider_checkpoint_repairs_incomplete_anthropic_protocol(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = [
+        {"role": "user", "content": "run lookup"},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": "missing", "name": "lookup", "input": {}}
+            ],
+        },
+        {"role": "user", "content": "new independent request"},
+    ]
+
+    ctx_mgr.save_provider_checkpoint(messages)
+    restored = ctx_mgr.load_provider_checkpoint()
+
+    assert restored is not None
+    assert restored["messages"] == [
+        {"role": "user", "content": "run lookup"},
+        {"role": "user", "content": "new independent request"},
+    ]
+
+
+def test_delete_session_removes_provider_checkpoint(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    ctx_mgr.save_provider_checkpoint([{"role": "user", "content": "hello"}])
+    assert ctx_mgr.load_provider_checkpoint() is not None
+
+    ctx_mgr.store.delete_conversation_session("test-session")
+
+    assert ctx_mgr.load_provider_checkpoint() is None
 
 
 def _store_verbose_memories(ctx_mgr, count, repeat):
