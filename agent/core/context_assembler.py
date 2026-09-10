@@ -21,6 +21,9 @@ _DEEP_MEMORY_TOOLS = {"memory_index", "memory_clear"}
 _SKILL_RUNTIME_TOOLS = {"activate_skill", "list_skill_files", "read_skill_file"}
 _ORCHESTRATION_TOOLS = {"spawn_agent"}
 _SEARCH_EXTRAS = {"tavily_search"}
+# Only useful when the turn actually carries audio; gated so the schema
+# does not ride along in every prompt.
+_ATTACHMENT_GATED_TOOLS = {"transcribe_audio"}
 
 
 def _matches(text: str, terms: Iterable[str]) -> bool:
@@ -54,6 +57,7 @@ class ContextAssembler:
             | _DEEP_MEMORY_TOOLS
             | _ORCHESTRATION_TOOLS
             | _SEARCH_EXTRAS
+            | _ATTACHMENT_GATED_TOOLS
         )
 
         if _matches(query, ("schedule", "remind", "recurring", "cron", "定时", "提醒", "周期")):

@@ -31,6 +31,11 @@ _FACT_SOURCE_PRECEDENCE = {
 }
 _RUN_SCRATCH_RETENTION_DAYS = 7
 _RUN_SCRATCH_MAX_ACTIVE = 500
+# Provider usage is a cost-visibility ledger, not an archive: a gateway
+# process appends one row per provider call and would otherwise grow the
+# table without bound. 90 days keeps quarter-over-quarter comparisons
+# while staying bounded.
+_USAGE_EVENT_RETENTION_DAYS = 90
 _FACT_QUERY_SUBJECT_ALIASES: dict[str, tuple[str, ...]] = {
     "assistant": (
         "assistant",

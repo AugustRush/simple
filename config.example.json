@@ -101,6 +101,18 @@
         "idle_seconds: seconds of inactivity before the background idle-consolidation task fires (default 300).",
         "  The idle task polls every 30 s and only triggers when the dirty flag is set (i.e. new messages exist).",
         "min_messages: minimum messages in working memory before any consolidation is attempted (default 4).",
+        "model: model used for consolidation LLM calls (default: the active provider's model).",
+        "  Set a cheaper/faster model here; consolidation runs in the background and never blocks a turn.",
+        "max_source_tokens: cap on how much staged text one consolidation run may read (default 8000).",
+        "max_chunks_per_run: staged chunks processed per run (default 2); higher drains backlog faster.",
+        "output_tokens: max tokens for one consolidation response (default 512).",
+        "staging_turn_threshold / staging_token_threshold: enqueue consolidation once the staging",
+        "  buffer reaches this many turns (default 12) or estimated tokens (default 16000),",
+        "  whichever comes first. Lower = memories persist sooner, more background LLM calls.",
+        "flush_on_session_end: on gateway shutdown, wait for pending consolidation to finish",
+        "  instead of dropping it (default false). The trade-off: false keeps shutdown fast and",
+        "  leaves staged turns to be consolidated on the next session use; true bounds shutdown",
+        "  time by the slowest in-flight consolidation call.",
         "token_estimation: ratios used to estimate token counts from character counts.",
         "  chars_per_token: non-CJK characters per token (Latin/ASCII, default 4).",
         "  cjk_chars_per_token: CJK characters per token (Hanzi/Kana/Hangul, default 1).",
@@ -116,6 +128,13 @@
       "keep_last_messages": 6,
       "idle_seconds": 300,
       "min_messages": 4,
+      "model": null,
+      "max_source_tokens": 8000,
+      "max_chunks_per_run": 2,
+      "output_tokens": 512,
+      "staging_turn_threshold": 12,
+      "staging_token_threshold": 16000,
+      "flush_on_session_end": false,
       "token_estimation": {
         "chars_per_token": 4,
         "cjk_chars_per_token": 1
@@ -239,13 +258,20 @@
         "Start:  uv run simple gateway, then open http://127.0.0.1:8787/.",
         "Keep host=127.0.0.1 for local-only access. Set auth_token when exposing it",
         "beyond localhost, and call /api/* with 'Authorization: Bearer <token>'.",
-        "cors_origins is only needed when a separate frontend dev server calls the API."
+        "cors_origins is only needed when a separate frontend dev server calls the API.",
+        "max_active_sessions: resident web sessions kept in memory (default 16). At capacity,",
+        "  the least-recently-active idle session is evicted; its state is rebuilt from the",
+        "  provider checkpoint on the next message, so eviction costs a replay, not the chat.",
+        "session_idle_ttl_seconds: idle sessions older than this are evicted eagerly (default 900).",
+        "  A session mid-turn is never evicted, regardless of either limit."
       ],
       "enabled": false,
       "host": "127.0.0.1",
       "port": 8787,
       "auth_token": "",
-      "cors_origins": []
+      "cors_origins": [],
+      "max_active_sessions": 16,
+      "session_idle_ttl_seconds": 900
     }
   }
 }

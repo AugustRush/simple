@@ -454,3 +454,54 @@ def test_process_one_job_keeps_retry_signal_when_consolidation_fails(tmp_path):
     assert result is False
     assert ctx_mgr._needs_consolidation is True
     assert staging.count() == 2
+
+
+def test_background_worker_pool_slow_session_does_not_starve_others():
+    """Consolidation jobs run concurrently across sessions.
+
+    A slow session's LLM call (tens of seconds in production) must not
+    block another session's already-queued job from completing in the
+    same poll cycle.
+    """
+    from agent import BackgroundMemoryWorkerPool
+
+    class _FakeContextManager:
+        def __init__(self, delay: float):
+            self.delay = delay
+            self.pending = 1
+            self.processed = 0
+            self.started_at: list[float] = []
+
+        def should_process_jobs(self):
+            return self.pending > 0
+
+        async def process_one_job(self, *_args, **_kwargs):
+            if self.pending <= 0:
+                return False
+            self.pending -= 1
+            self.started_at.append(time.monotonic())
+            await asyncio.sleep(self.delay)
+            self.processed += 1
+            return True
+
+    slow = _FakeContextManager(delay=0.3)
+    fast = _FakeContextManager(delay=0.0)
+    pool = BackgroundMemoryWorkerPool(client=None, poll_seconds=0.01)
+    pool.register("slow", slow, "model-a", "openai")
+    pool.register("fast", fast, "model-b", "openai")
+
+    async def run():
+        pool.start()
+        # Both jobs start in the first cycle; fast finishes long before
+        # slow does, proving they were not serialized.
+        await asyncio.sleep(0.1)
+        fast_done_early = fast.processed == 1
+        pool.stop()
+        await pool.wait()
+        return fast_done_early
+
+    fast_done_early = asyncio.run(run())
+
+    assert slow.processed == 1
+    assert fast.processed == 1
+    assert fast_done_early, "fast session was serialized behind the slow one"

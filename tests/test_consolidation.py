@@ -2741,3 +2741,29 @@ def test_retrieval_budget_default_leaves_room_for_the_conversation(tmp_path):
 
     agent.max_retrieval_tokens = 4096
     assert agent._retrieval_token_budget() == 4096
+
+
+def test_retention_prunes_stale_usage_events(tmp_path):
+    """The usage ledger is bounded: records older than the window drop,
+    recent ones survive so per-session cost stays queryable."""
+    from datetime import datetime, timedelta, timezone
+    from agent import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context")
+    now = datetime.now(timezone.utc)
+    stale = (now - timedelta(days=120)).strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+    recent = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+    store.append_usage_event(
+        session_id="old", phase="foreground", input_tokens=10,
+        output_tokens=1, created_at=stale,
+    )
+    store.append_usage_event(
+        session_id="new", phase="foreground", input_tokens=20,
+        output_tokens=2, created_at=recent,
+    )
+
+    store.apply_retention()
+
+    assert store.usage_summary("old")["calls"] == 0
+    assert store.usage_summary("new")["calls"] == 1
+    assert store.usage_summary("new")["input_tokens"] == 20

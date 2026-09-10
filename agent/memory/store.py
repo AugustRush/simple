@@ -34,6 +34,7 @@ from ._helpers import (
     _new_id,
     _normalize_fact_part,
     _now,
+    _USAGE_EVENT_RETENTION_DAYS,
 )
 from .models import (
     AgentRuntimeEvent,
@@ -2336,6 +2337,9 @@ class LTMStore:
         run_cutoff = (
             datetime.now(timezone.utc) - timedelta(days=_RUN_SCRATCH_RETENTION_DAYS)
         ).strftime("%Y-%m-%d %H:%M UTC")
+        usage_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=_USAGE_EVENT_RETENTION_DAYS)
+        ).strftime("%Y-%m-%d %H:%M:%S.%f UTC")
         with self._connect() as conn:
             # Step 1: decay importance for all active episodes in a single UPDATE.
             conn.execute(
@@ -2400,6 +2404,14 @@ class LTMStore:
                     (now, *archived_id_list),
                 )
                 self._delete_fts_rows(conn, archived_id_list)
+            # The usage ledger is append-only by design (one row per provider
+            # call); bound it here so a long-running gateway cannot grow the
+            # table without limit. created_at is fixed-width UTC, so the
+            # lexicographic comparison tracks time order.
+            conn.execute(
+                "DELETE FROM usage_events WHERE created_at < ?",
+                (usage_cutoff,),
+            )
         self._sync_after_mutation({"episodes"})
 
     def maintenance_snapshot(self, limit: int = 20) -> str:

@@ -204,11 +204,45 @@ class BackgroundMemoryWorkerPool:
         if self._thread:
             await asyncio.to_thread(self._thread.join)
 
-    async def _process(self, loop: asyncio.AbstractEventLoop, item: tuple[ContextManager, str, str], client: Any) -> bool:
+    async def _process(self, item: tuple[ContextManager, str, str], client: Any) -> bool:
         manager, model, api_format = item
         return bool(
             await manager.process_one_job(client, model, api_format=api_format)
         )
+
+    async def _drain_once(self, client: Any, on_demand: bool) -> bool:
+        """Run one job per registered session concurrently.
+
+        Each ContextManager serializes its own jobs via _processing_job, and
+        managers share no mutable state with each other (the durable store
+        is SQLite with its own locking), so cross-session concurrency is
+        safe. This matters for latency: consolidation jobs make LLM calls
+        that can take tens of seconds, and a slow session must not starve
+        the others.
+        """
+        with self._lock:
+            items = [
+                item for item in self._sessions.values()
+                if on_demand or item[0].should_process_jobs()
+            ]
+        if not items:
+            return False
+        tasks = [
+            asyncio.ensure_future(self._process(item, client))
+            for item in items
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        made_progress = False
+        for result in results:
+            if isinstance(result, BaseException):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                shared.CONSOLE.print(
+                    f"[dim]Background consolidation error: {result}[/dim]"
+                )
+            elif result:
+                made_progress = True
+        return made_progress
 
     def _run(self) -> None:
         client = self.client_factory() if self.client_factory else self.client
@@ -218,25 +252,13 @@ class BackgroundMemoryWorkerPool:
             while not self._stop_event.is_set():
                 on_demand = self._wake_event.is_set()
                 self._wake_event.clear()
-                with self._lock:
-                    items = list(self._sessions.values())
                 made_progress = False
-                for manager, _model, _api_format in items:
-                    if self._stop_event.is_set():
-                        break
-                    if not on_demand and not manager.should_process_jobs():
-                        continue
-                    try:
-                        processed = loop.run_until_complete(
-                            self._process(loop, (manager, _model, _api_format), client)
-                        )
-                        made_progress = made_progress or processed
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as exc:
-                        shared.CONSOLE.print(
-                            f"[dim]Background consolidation error: {exc}[/dim]"
-                        )
+                try:
+                    made_progress = loop.run_until_complete(
+                        self._drain_once(client, on_demand)
+                    )
+                except asyncio.CancelledError:
+                    break
                 if made_progress and on_demand:
                     self._wake_event.set()
                     continue
