@@ -26,6 +26,15 @@ from agent import (
 )
 
 
+class CleanSkillCatalog:
+    """Minimal SkillCatalog stand-in: never dirty, so the runtime's
+    per-turn prompt refresh is a no-op. The real contract requires
+    consume_dirty(); bare object() breaks it."""
+
+    def consume_dirty(self) -> bool:
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _fmt_tool_inputs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -504,14 +513,11 @@ def test_channel_runner_passes_attachments_to_turn_input(tmp_path):
         async def complete_turn(self, turn_input, state, result):
             pass
 
-    class _FakeSkillCatalog:
-        pass
-
     runner = ChannelRunner(
         channels=[],
         components={
             "turn_runner": _FakeTurnRunner(),
-            "skill_catalog": _FakeSkillCatalog(),
+            "skill_catalog": CleanSkillCatalog(),
             "system_prompt": "system",
             "agent": object(),
         },
@@ -645,7 +651,7 @@ def test_channel_runner_restores_provider_checkpoint_for_historical_session():
             return {"messages": checkpoint_messages, "summary": "older context"}
 
     class _RootManager:
-        def spawn_session(self, session_id):
+        def spawn_session(self, session_id, *, project_scope=""):
             assert session_id == "history-1"
             return _SessionManager()
 
@@ -707,7 +713,7 @@ def test_channel_runner_scopes_context_manager_per_chat():
             self.spawned: dict[str, _SessionContextManager] = {}
             self.mark_calls = 0
 
-        def spawn_session(self, session_id: str):
+        def spawn_session(self, session_id: str, *, project_scope: str = ""):
             mgr = _SessionContextManager(session_id)
             self.spawned[session_id] = mgr
             return mgr
@@ -740,7 +746,7 @@ def test_channel_runner_scopes_context_manager_per_chat():
         channels=[],
         components={
             "agent": _FakeAgent(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": root_ctx_mgr,
             "system_prompt": "system",
@@ -805,7 +811,7 @@ def test_channel_runner_evicts_oldest_idle_session_at_capacity():
 
     class _RootManager:
         def __init__(self): self.created = {}
-        def spawn_session(self, session_id):
+        def spawn_session(self, session_id, *, project_scope=""):
             manager = _Manager(session_id)
             self.created[session_id] = manager
             return manager
@@ -821,7 +827,7 @@ def test_channel_runner_evicts_oldest_idle_session_at_capacity():
     runner = ChannelRunner(
         channels=[],
         components={
-            "agent": _Agent(), "skill_catalog": object(), "plugin_catalog": None,
+            "agent": _Agent(), "skill_catalog": CleanSkillCatalog(), "plugin_catalog": None,
             "context_manager": root, "system_prompt": "system",
         },
         cfg={"channels": {"web": {"max_active_sessions": 1, "session_idle_ttl_seconds": 9999}}},
@@ -866,7 +872,7 @@ def test_channel_runner_emits_latency_trace(monkeypatch, caplog):
         channels=[],
         components={
             "agent": _FakeAgent(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -924,7 +930,7 @@ def test_channel_runner_uses_turn_runner_when_provided():
         channels=[],
         components={
             "agent": _ExplodingAgent(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -984,7 +990,7 @@ def test_channel_runner_delegates_message_turn_to_agent_core():
         components={
             "agent": object(),
             "agent_core": core,
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -1052,7 +1058,7 @@ def test_channel_runner_queues_message_after_noninterjection_command():
             "agent": object(),
             "agent_core": Core(),
             "command_router": router,
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -1114,7 +1120,7 @@ def test_channel_runner_same_chat_cancel_and_interjections_reach_active_turn():
         components={
             "agent": object(),
             "agent_core": Core(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -1166,7 +1172,7 @@ def test_channel_runner_persists_runtime_events_to_session_context_manager():
             recorded.append((event_type, payload or {}, turn_id))
 
     class BaseContext:
-        def spawn_session(self, session_id):
+        def spawn_session(self, session_id, *, project_scope=""):
             assert session_id == "web-session"
             return SessionContext()
 
@@ -1194,7 +1200,7 @@ def test_channel_runner_persists_runtime_events_to_session_context_manager():
             "agent": object(),
             "agent_core": Core(),
             "command_router": CommandRouter(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": BaseContext(),
             "system_prompt": "system",
@@ -1241,7 +1247,7 @@ def test_channel_runner_rapid_messages_are_not_lost_or_duplicated():
         components={
             "agent": object(),
             "agent_core": Core(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -1296,7 +1302,7 @@ def test_channel_runner_logs_blocked_turn_without_response_delivery(caplog):
         components={
             "agent": object(),
             "agent_core": _FakeAgentCore(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -1349,7 +1355,7 @@ def test_channel_runner_emits_interaction_logs(caplog):
         channels=[],
         components={
             "agent": _FakeAgent(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -1449,7 +1455,7 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
             self.staging = _RecordingStaging("root")
             self.spawned: dict[str, _SessionContextManager] = {}
 
-        def spawn_session(self, session_id: str):
+        def spawn_session(self, session_id: str, *, project_scope: str = ""):
             mgr = _SessionContextManager(session_id)
             self.spawned[session_id] = mgr
             return mgr
@@ -1479,7 +1485,7 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
         channels=[],
         components={
             "agent": _FakeAgent(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": root_ctx_mgr,
             "system_prompt": "system",
@@ -1682,7 +1688,7 @@ def test_channel_runner_fires_session_end_per_chat_session():
         channels=[channel],
         components={
             "agent": _FakeAgent(),
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": plugin_catalog,
             "context_manager": None,
             "system_prompt": "system",
@@ -1750,7 +1756,7 @@ def test_channel_runner_exposes_feishu_delivery_target_to_scheduler_tools(
         components={
             "agent": _FakeAgent(),
             "registry": registry,
-            "skill_catalog": object(),
+            "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
@@ -1807,7 +1813,7 @@ def test_channel_runner_eviction_loses_race_against_turn_claim():
         def should_compact_messages(self, _messages, input_token_budget): return False
 
     class _RootManager:
-        def spawn_session(self, session_id): return _Manager(session_id)
+        def spawn_session(self, session_id, *, project_scope=""): return _Manager(session_id)
 
     worker_wait_started = asyncio.Event()
     allow_eviction_finish = asyncio.Event()
@@ -1836,7 +1842,7 @@ def test_channel_runner_eviction_loses_race_against_turn_claim():
     runner = ChannelRunner(
         channels=[],
         components={
-            "agent": _Agent(), "skill_catalog": object(), "plugin_catalog": None,
+            "agent": _Agent(), "skill_catalog": CleanSkillCatalog(), "plugin_catalog": None,
             "context_manager": _RootManager(), "system_prompt": "system",
         },
         cfg={"channels": {"web": {"max_active_sessions": 16, "session_idle_ttl_seconds": 60}}},

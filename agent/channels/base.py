@@ -125,13 +125,10 @@ class ChannelRunner:
             return base_ctx_mgr
         spawn_session = getattr(base_ctx_mgr, "spawn_session", None)
         if callable(spawn_session):
-            try:
-                return spawn_session(
-                    session_id,
-                    project_scope=str(components.get("project_memory_scope") or ""),
-                )
-            except TypeError:
-                return spawn_session(session_id)
+            return spawn_session(
+                session_id,
+                project_scope=str(components.get("project_memory_scope") or ""),
+            )
         return base_ctx_mgr
 
     def _build_session_memory_worker(self, session_ctx_mgr, components: dict):
@@ -454,39 +451,27 @@ class ChannelRunner:
 
         async def _evict_session(session_id: str) -> None:
             state = sessions.get(session_id)
-            if state is None or getattr(state, "operation_state", "idle") != "idle":
+            if state is None or state.operation_state != "idle":
                 return
-            # Re-check idleness under the session's turn lock: the web
-            # channel processes messages concurrently, and between the check
-            # above and this eviction a message could claim the idle->active
-            # transition and start using the very state we are about to
-            # tear down. Popping from ``sessions`` inside the critical
-            # section makes the claim-vs-evict race decided atomically.
-            turn_lock = getattr(state, "turn_lock", None)
-            if turn_lock is not None:
-                try:
-                    await asyncio.wait_for(turn_lock.acquire(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    return
-            try:
+            # The web channel processes messages concurrently, so eviction
+            # must be decided atomically with the coordinator's idle->active
+            # claim, which happens under the same session turn lock. The
+            # lock is only ever held across synchronous state publication,
+            # so acquiring it here cannot wedge eviction.
+            async with state.turn_lock:
                 if (
                     sessions.get(session_id) is not state
-                    or getattr(state, "operation_state", "idle") != "idle"
+                    or state.operation_state != "idle"
                 ):
                     return
                 sessions.pop(session_id, None)
-            finally:
-                if turn_lock is not None:
-                    turn_lock.release()
-            worker = getattr(state, "memory_worker", None)
+            worker = state.memory_worker
             if worker is not None:
                 with shared._suppress_with_log("session worker stop failed"):
                     worker.stop()
-                wait = getattr(worker, "wait", None)
-                if callable(wait):
-                    with shared._suppress_with_log("session worker wait failed"):
-                        await wait()
-            staging = getattr(getattr(state, "context_manager", None), "staging", None)
+                with shared._suppress_with_log("session worker wait failed"):
+                    await worker.wait()
+            staging = getattr(state.context_manager, "staging", None)
             close = getattr(staging, "close", None)
             if callable(close):
                 with shared._suppress_with_log("session staging close failed"):
@@ -593,8 +578,12 @@ class ChannelRunner:
             session_id = msg.metadata.get("chat_id") or msg.session_id
             skill_catalog = components["skill_catalog"]
             session_runtime = await _components_for_session(session_id)
-            await _evict_idle_sessions(session_id)
             state = await self._ensure_session_state(sessions, session_id, session_runtime)
+            # Touch activity before evicting: a freshly created session has
+            # last_activity == 0.0, and evaluating idle expiry before the
+            # touch would evict the session this very message just created.
+            state.last_activity = time.time()
+            await _evict_idle_sessions(session_id)
             revision = int(components.get("config_revision", 0) or 0)
             if getattr(state, "runtime_revision", revision) != revision:
                 old_worker = getattr(state, "memory_worker", None)
@@ -611,7 +600,6 @@ class ChannelRunner:
                 state.runtime_revision = revision
             else:
                 state.runtime_revision = revision
-            state.last_activity = time.time()
             ctx = state.ctx
             # Model selection is a per-turn request override.  Keep it on the
             # mutable session state so AgentCore publishes it into the request
