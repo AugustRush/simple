@@ -3241,7 +3241,11 @@ class BaseAgent:
                 ctx.messages, input_token_budget=input_token_budget
             )
             if system_prompt:
-                ctx.system_prompt = system_prompt
+                # Compaction may summarize away the message that carried the
+                # original request; keep it reachable via the task context.
+                ctx.system_prompt = agent_module._with_task_context(
+                    system_prompt, task_context
+                )
             if (
                 memory_worker is not None
                 and ctx_mgr.staging.count() >= ctx_mgr.min_messages

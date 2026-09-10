@@ -475,7 +475,13 @@ class AgentCore:
             state.system_prompt_override = refreshed
         else:
             refreshed = shared_refreshed
-        state.ctx.system_prompt = refreshed
+        # send_message restores ctx.system_prompt to its pre-turn value only
+        # at turn end; a mid-turn refresh would otherwise drop the original
+        # request from the prompt for all remaining tool steps.
+        state.ctx.system_prompt = agent_module._with_task_context(
+            refreshed,
+            state.task_context,
+        )
 
     def _refresh_component_prompt_if_needed(
         self,
@@ -488,9 +494,15 @@ class AgentCore:
         )
         if not isinstance(prompt, str) or not prompt:
             return
-        if getattr(state.ctx, "system_prompt", None) != prompt:
+        import agent as agent_module
+
+        # Same task-context preservation as the skill refresh above: this
+        # runs before every continuation step while ctx.messages may already
+        # have been compacted past the original request.
+        refreshed = agent_module._with_task_context(prompt, state.task_context)
+        if getattr(state.ctx, "system_prompt", None) != refreshed:
             try:
-                state.ctx.system_prompt = prompt
+                state.ctx.system_prompt = refreshed
             except AttributeError:
                 return
 
