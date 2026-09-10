@@ -1127,7 +1127,11 @@ def test_agent_core_handles_minimal_context_without_metadata_when_no_skill_catal
             "turn_runner": _FakeTurnRunner(),
         }
     )
-    state = RuntimeSessionState(ctx=object())
+    # AgentContext contract: handle_turn refreshes ctx.system_prompt every
+    # iteration, so even a minimal context must expose a writable prompt.
+    from types import SimpleNamespace
+
+    state = RuntimeSessionState(ctx=SimpleNamespace(system_prompt="system"))
 
     execution = asyncio.run(
         core.handle_turn(
@@ -1207,3 +1211,27 @@ def test_agent_core_normalizes_explicit_skill_requests_before_prompt_hooks():
     turn_input, metadata = turn_runner.run_calls[0]
     assert turn_input.text == "tighten this"
     assert metadata["required_skills"] == ["quality/review"]
+
+
+def test_set_session_prompt_attaches_task_context_regardless_of_caller():
+    """The single prompt write-in point carries the task context by design.
+
+    Any mid-session refresh path (dirty skills, config reload, workspace
+    switch, post-compaction rebuild) funnels through set_session_prompt,
+    so no caller can forget the original request.
+    """
+    from types import SimpleNamespace
+
+    state = RuntimeSessionState(
+        ctx=SimpleNamespace(system_prompt="", metadata={}),
+    )
+    state.ensure_task_context("refactor the auth module")
+
+    state.set_session_prompt("fresh base prompt")
+    assert "fresh base prompt" in state.ctx.system_prompt
+    assert "refactor the auth module" in state.ctx.system_prompt
+
+    # A cleared task context (turn finished) leaves the bare prompt.
+    state.task_context = ""
+    state.set_session_prompt("next turn prompt")
+    assert state.ctx.system_prompt == "next turn prompt"

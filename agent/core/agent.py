@@ -3243,6 +3243,9 @@ class BaseAgent:
             if system_prompt:
                 # Compaction may summarize away the message that carried the
                 # original request; keep it reachable via the task context.
+                # Same rule as RuntimeSessionState.set_session_prompt — the
+                # runtime layer owns the prompt during a turn; maintenance
+                # only rebuilds it after compaction, outside any turn.
                 ctx.system_prompt = agent_module._with_task_context(
                     system_prompt, task_context
                 )

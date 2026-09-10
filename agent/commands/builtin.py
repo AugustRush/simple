@@ -320,15 +320,9 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
             marker = "\n\nCurrent session workspace: "
             previous_prompt = str(getattr(context.session_state.ctx, "system_prompt", "") or "")
             refreshed_prompt = f"{previous_prompt.split(marker, 1)[0]}{marker}{target}"
-        # The switch can happen mid-turn; keep the original request visible to
-        # the remaining tool steps, matching the runtime's prompt refreshes.
-        with_task_context = getattr(agent_module, "_with_task_context", None)
-        if callable(with_task_context):
-            refreshed_prompt = with_task_context(
-                refreshed_prompt,
-                getattr(context.session_state, "task_context", ""),
-            )
-        context.session_state.ctx.system_prompt = refreshed_prompt
+        # The switch can happen mid-turn; set_session_prompt is the single
+        # authority that keeps the original request attached to the prompt.
+        context.session_state.set_session_prompt(refreshed_prompt)
         if hasattr(context.session_state.ctx, "metadata"):
             context.session_state.ctx.metadata["workspace_root"] = str(target)
             context.session_state.ctx.metadata["workspace_status"] = "ready"

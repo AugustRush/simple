@@ -229,6 +229,22 @@ class RuntimeSessionState:
         if not self.task_context:
             self.task_context = text[:300]
 
+    def set_session_prompt(self, prompt: str) -> None:
+        """Single authority for writing ctx.system_prompt during a session.
+
+        Any runtime path that refreshes the prompt mid-session (dirty skills,
+        config reload, workspace switch, post-compaction rebuild) must go
+        through here so the current task context stays attached. send_message
+        restores ctx.system_prompt to its pre-turn value at turn end, so a
+        refresh that forgot the task context would leave every remaining
+        tool step of a multi-step turn without the original request.
+        """
+        import agent as agent_module
+
+        self.ctx.system_prompt = agent_module._with_task_context(
+            prompt, self.task_context
+        )
+
     def record_turn(self, tool_calls: list[str]) -> None:
         self.tools_used.extend(tool_calls)
         self.turn_count += 1
@@ -445,43 +461,33 @@ class AgentCore:
         state: RuntimeSessionState,
     ) -> None:
         skill_catalog = self._skill_catalog()
-        if skill_catalog is None:
-            return
-        consume_dirty = getattr(skill_catalog, "consume_dirty", None)
-        if not callable(consume_dirty) or not consume_dirty():
+        if skill_catalog is None or not skill_catalog.consume_dirty():
             return
         import agent as agent_module
 
         shared_refreshed = agent_module._compose_system_prompt(
-            self._components.values.get("base_system_prompt", ""),
-            self._components.values.get("registry"),
-            self._components.values.get("workspace_root"),
-            self._components.values.get("output_dir"),
+            self._components.values["base_system_prompt"],
+            self._components.values["registry"],
+            self._components.values["workspace_root"],
+            self._components.values["output_dir"],
             skill_catalog=skill_catalog,
             plugin_catalog=self._plugin_catalog(),
         )
-        if isinstance(self._components.values, dict):
-            self._components.values["system_prompt"] = shared_refreshed
+        self._components.values["system_prompt"] = shared_refreshed
 
         if state.base_system_prompt_override is not None:
             refreshed = agent_module._compose_system_prompt(
                 state.base_system_prompt_override,
-                self._components.values.get("registry"),
-                self._components.values.get("workspace_root"),
-                self._components.values.get("output_dir"),
+                self._components.values["registry"],
+                self._components.values["workspace_root"],
+                self._components.values["output_dir"],
                 skill_catalog=skill_catalog,
                 plugin_catalog=self._plugin_catalog(),
             )
             state.system_prompt_override = refreshed
         else:
             refreshed = shared_refreshed
-        # send_message restores ctx.system_prompt to its pre-turn value only
-        # at turn end; a mid-turn refresh would otherwise drop the original
-        # request from the prompt for all remaining tool steps.
-        state.ctx.system_prompt = agent_module._with_task_context(
-            refreshed,
-            state.task_context,
-        )
+        state.set_session_prompt(refreshed)
 
     def _refresh_component_prompt_if_needed(
         self,
@@ -490,21 +496,13 @@ class AgentCore:
         prompt = (
             state.system_prompt_override
             if state.system_prompt_override is not None
-            else self._components.values.get("system_prompt")
+            else self._components.values["system_prompt"]
         )
         if not isinstance(prompt, str) or not prompt:
             return
-        import agent as agent_module
-
-        # Same task-context preservation as the skill refresh above: this
-        # runs before every continuation step while ctx.messages may already
+        # Runs before every continuation step while ctx.messages may already
         # have been compacted past the original request.
-        refreshed = agent_module._with_task_context(prompt, state.task_context)
-        if getattr(state.ctx, "system_prompt", None) != refreshed:
-            try:
-                state.ctx.system_prompt = refreshed
-            except AttributeError:
-                return
+        state.set_session_prompt(prompt)
 
     @staticmethod
     async def _drain_if_supported(sink: Any) -> None:
