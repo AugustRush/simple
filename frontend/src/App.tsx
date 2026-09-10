@@ -3149,7 +3149,7 @@ function App() {
           <div className="composer-footer">
             <div className="composer-tools">
               <Tooltip title="添加图片或文件">
-                <Button type="text" className="workspace-button" aria-label="添加附件" icon={<UploadOutlined />} onClick={() => fileInputRef.current?.click()} />
+                <Button type="text" className="composer-icon-button" aria-label="添加附件" icon={<UploadOutlined />} onClick={() => fileInputRef.current?.click()} />
               </Tooltip>
               <input ref={fileInputRef} type="file" multiple hidden onChange={handleFilesSelected} accept="image/*,.pdf,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" />
               <Tooltip title={sessionState?.workspace_root ? `切换工作区：${sessionState.workspace_root}` : '选择 Agent 接下来工作的项目文件夹'}>
