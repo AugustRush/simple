@@ -364,6 +364,11 @@ function truncate(value: string, length = 64): string {
   return value.length > length ? `${value.slice(0, length)}…` : value
 }
 
+// Half of .conversation-summary's max-height (124px, index.css). The hover
+// summary clamps its top position so the card never crosses the chat bounds;
+// keep this in sync when the card's max-height changes.
+const CONVERSATION_SUMMARY_HALF_HEIGHT = 62
+
 function compactWorkspacePath(value: string, maxLength = 36): string {
   const path = String(value || '').trim()
   if (!path || path.length <= maxLength) return path
@@ -652,10 +657,13 @@ function App() {
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false)
   const [paletteQuery, setPaletteQuery] = useState('')
   const [commandIndex, setCommandIndex] = useState(0)
+  // Esc only hides the inline command popover for the current input; typing
+  // again re-opens it. Without this state, closing the popover would require
+  // destroying the user's draft.
+  const [commandDismissed, setCommandDismissed] = useState(false)
   const [expandedTraces, setExpandedTraces] = useState<Record<string, boolean>>({})
   const [hoveredTurn, setHoveredTurn] = useState<{ id: string; top: number } | null>(null)
   const [hoveredTurnIndex, setHoveredTurnIndex] = useState<number | null>(null)
-  const [composerHeight, setComposerHeight] = useState(0)
   const [settingsDirty, setSettingsDirty] = useState(false)
   const [sendShortcut, setSendShortcut] = useState<'enter' | 'ctrl-enter'>(
     () => (localStorage.getItem('send_shortcut') === 'ctrl-enter' ? 'ctrl-enter' : 'enter'),
@@ -684,7 +692,6 @@ function App() {
   const turnRefs = useRef<Record<string, HTMLDivElement | null>>({})
   const conversationRailRef = useRef<HTMLDivElement | null>(null)
   const conversationMarkerRefs = useRef<Record<string, HTMLButtonElement | null>>({})
-  const composerWrapRef = useRef<HTMLDivElement | null>(null)
   const hoverClearTimerRef = useRef<number | null>(null)
   const idRef = useRef(0)
   const token = localStorage.getItem('agent_token') || ''
@@ -709,19 +716,6 @@ function App() {
   useEffect(() => {
     currentModelRef.current = currentModel
   }, [currentModel])
-
-  useEffect(() => {
-    if (view !== 'chat') return
-    const composer = composerWrapRef.current
-    if (!composer) return
-    const updateHeight = () => {
-      setComposerHeight(Math.ceil(composer.getBoundingClientRect().height))
-    }
-    updateHeight()
-    const observer = new ResizeObserver(updateHeight)
-    observer.observe(composer)
-    return () => observer.disconnect()
-  }, [view])
 
   const makeId = useCallback(() => {
     idRef.current += 1
@@ -2335,9 +2329,16 @@ function App() {
     )
   }, [commands, input])
 
-  const inlineCommandOpen = input.startsWith('/') &&
+  // The popover shows while the input is a bare command prefix (`/pref` with
+  // no arguments) and has not been dismissed with Esc. Once arguments start,
+  // the command is decided and completion no longer applies.
+  const commandPrefixActive = input.startsWith('/') &&
     !/\s/.test(input) &&
-    filteredCommands.length > 0
+    !commandDismissed
+  const inlineCommandOpen = commandPrefixActive && filteredCommands.length > 0
+  const inlineCommandEmpty = commandPrefixActive &&
+    commands.length > 0 &&
+    filteredCommands.length === 0
 
   useEffect(() => {
     setCommandIndex(0)
@@ -2349,10 +2350,10 @@ function App() {
   // composer). ``nearest`` avoids jumping the surrounding page while only
   // adjusting the command list when necessary.
   useEffect(() => {
-    if (!input.startsWith('/') || filteredCommands.length === 0) return
+    if (!inlineCommandOpen) return
     const command = filteredCommands[commandIndex] || filteredCommands[0]
     commandItemRefs.current[command.name]?.scrollIntoView({ block: 'nearest' })
-  }, [commandIndex, filteredCommands, input])
+  }, [commandIndex, filteredCommands, inlineCommandOpen])
 
   const paletteCommands = useMemo(() => {
     const query = paletteQuery.trim().toLowerCase()
@@ -2419,6 +2420,25 @@ function App() {
     setExpandedTraces(prev => ({ ...prev, [id]: !prev[id] }))
   }
 
+  // Sending must resolve a `/command` identically no matter which affordance
+  // triggered it (Enter, the send button). An exact command name — or a
+  // command that already carries arguments — goes through as typed; only a
+  // bare partial prefix completes to the highlighted suggestion.
+  const resolveComposerText = (raw: string) => {
+    const trimmed = raw.trim()
+    if (!trimmed.startsWith('/')) return trimmed
+    const parts = trimmed.slice(1).split(/\s+/)
+    if (parts.length > 1) return trimmed
+    const name = (parts[0] || '').toLowerCase()
+    const isExact = commands.some(command =>
+      (command.name || '').toLowerCase() === name ||
+      (command.aliases || []).some(alias => alias.toLowerCase() === name),
+    )
+    if (isExact || !inlineCommandOpen) return trimmed
+    const command = filteredCommands[commandIndex] || filteredCommands[0]
+    return `/${command.name}`
+  }
+
   const handleComposerKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // 输入法（IME）组合输入时，Enter 用于选中候选字/上屏，不应触发送出。
     if (event.nativeEvent?.isComposing || event.keyCode === 229) {
@@ -2428,16 +2448,7 @@ function App() {
     const ctrlOrCmd = event.ctrlKey || event.metaKey
 
     const send = () => {
-      if (input.startsWith('/') && filteredCommands.length > 0) {
-        const command = filteredCommands[commandIndex] || filteredCommands[0]
-        const parts = input.trim().slice(1).split(/\s+/)
-        const args = parts.slice(1).join(' ')
-        sendMessage(
-          args ? `/${command.name} ${args}` : `/${command.name}`,
-        )
-        return
-      }
-      if (input.trim()) sendMessage()
+      sendMessage(resolveComposerText(input))
     }
 
     if (sendShortcut === 'ctrl-enter') {
@@ -2458,15 +2469,31 @@ function App() {
       }
     }
 
-    if (!input.startsWith('/')) return
-
     if (event.key === 'Escape') {
+      // First Esc hides the popover but keeps the draft; once the popover is
+      // gone (or was never open), Esc clears a command draft as before.
+      if (commandPrefixActive && (inlineCommandOpen || inlineCommandEmpty)) {
+        event.preventDefault()
+        setCommandDismissed(true)
+      } else if (input.startsWith('/')) {
+        event.preventDefault()
+        setInput('')
+      }
+      return
+    }
+
+    if (!commandPrefixActive) return
+
+    if (event.key === 'Tab' && inlineCommandOpen) {
+      // Complete the highlighted command without sending, so arguments can
+      // be filled in next.
       event.preventDefault()
-      setInput('')
-    } else if (event.key === 'ArrowDown' && filteredCommands.length > 0) {
+      const command = filteredCommands[commandIndex] || filteredCommands[0]
+      setInput(`/${command.name} `)
+    } else if (event.key === 'ArrowDown' && inlineCommandOpen) {
       event.preventDefault()
       setCommandIndex(prev => (prev + 1) % filteredCommands.length)
-    } else if (event.key === 'ArrowUp' && filteredCommands.length > 0) {
+    } else if (event.key === 'ArrowUp' && inlineCommandOpen) {
       event.preventDefault()
       setCommandIndex(
         prev => (prev - 1 + filteredCommands.length) % filteredCommands.length,
@@ -2762,20 +2789,39 @@ function App() {
     // The summary card is centered on the active marker via CSS. Keep a
     // small safe margin so the compact card never crosses the chat bounds.
     const rawTop = target.top + target.height / 2 - bounds.top
-    const cardHalfHeight = 62
+    const cardHalfHeight = CONVERSATION_SUMMARY_HALF_HEIGHT
     const maxTop = Math.max(cardHalfHeight, bounds.height - cardHalfHeight)
     setHoveredTurn({ id: item.id, top: Math.max(cardHalfHeight, Math.min(rawTop, maxTop)) })
   }
 
+  // Marker geometry is stable while the pointer is over the rail (the rail
+  // lives outside the scroll container), so measure once per hover session
+  // instead of on every mousemove. The cache key covers what can move
+  // markers mid-hover: appended turns (last id), a session switch (first id)
+  // and a window resize (innerHeight; reading it does not force layout).
+  const railGeometryRef = useRef<{ key: string; centers: number[] } | null>(null)
+
   const handleRailMouseMove = (event: React.MouseEvent<HTMLDivElement>) => {
     if (conversationTurns.length < 2) return
+    const key = `${conversationTurns[0]?.id}:${conversationTurns[conversationTurns.length - 1]?.id}:${window.innerHeight}`
+    let geometry = railGeometryRef.current
+    if (!geometry || geometry.key !== key) {
+      geometry = {
+        key,
+        centers: conversationTurns.map(item => {
+          const marker = conversationMarkerRefs.current[item.id]
+          if (!marker) return Number.NaN
+          const bounds = marker.getBoundingClientRect()
+          return bounds.top + bounds.height / 2
+        }),
+      }
+      railGeometryRef.current = geometry
+    }
     let nearestIndex = 0
     let nearestDistance = Number.POSITIVE_INFINITY
-    conversationTurns.forEach((item, index) => {
-      const marker = conversationMarkerRefs.current[item.id]
-      if (!marker) return
-      const bounds = marker.getBoundingClientRect()
-      const distance = Math.abs(event.clientY - (bounds.top + bounds.height / 2))
+    geometry.centers.forEach((center, index) => {
+      if (Number.isNaN(center)) return
+      const distance = Math.abs(event.clientY - center)
       if (distance < nearestDistance) {
         nearestDistance = distance
         nearestIndex = index
@@ -2786,6 +2832,7 @@ function App() {
 
   const scheduleHideTurnSummary = () => {
     if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
+    railGeometryRef.current = null
     hoverClearTimerRef.current = window.setTimeout(() => {
       setHoveredTurn(null)
       setHoveredTurnIndex(null)
@@ -2798,11 +2845,14 @@ function App() {
 
   const renderChat = () => (
     <div className="chat-view">
+      {/* .chat-scroll-area spans only the message pane, so the conversation
+       * rail is bounded by the composer in pure CSS — no JS height tracking
+       * needed when banners or the composer resize. */}
+      <div className="chat-scroll-area">
       {conversationTurns.length > 1 && (
         <div
           className="conversation-indicator"
           ref={conversationRailRef}
-          style={{ bottom: composerHeight + 28 }}
           aria-label="对话历史"
           onMouseEnter={keepTurnSummary}
           onMouseLeave={scheduleHideTurnSummary}
@@ -2817,7 +2867,12 @@ function App() {
               <button
                 type="button"
                 key={item.id}
-                ref={element => { conversationMarkerRefs.current[item.id] = element }}
+                ref={element => {
+                  // Delete on unmount (React 18 passes null) so refs for
+                  // removed turns don't accumulate forever.
+                  if (element) conversationMarkerRefs.current[item.id] = element
+                  else delete conversationMarkerRefs.current[item.id]
+                }}
                 className={`conversation-marker ${hoveredTurn?.id === item.id ? 'active' : ''}`}
                 style={{
                   '--marker-width': `${hoveredTurnIndex === null || Math.abs(index - hoveredTurnIndex) > 5 ? 11 : Math.max(11, 27 - Math.abs(index - hoveredTurnIndex) * 3)}px`,
@@ -2911,8 +2966,9 @@ function App() {
           )}
         </div>
       </div>
+      </div>
 
-      <div className="composer-wrap" ref={composerWrapRef}>
+      <div className="composer-wrap">
         {Math.max(
           queuedMessages.length,
           Number(sessionState?.queue?.pending || 0),
@@ -2969,37 +3025,6 @@ function App() {
               </div>
             </div>
           )}
-        {inlineCommandOpen && (
-          <div className="command-popover">
-            <div className="command-popover-head">
-              <span>可用命令</span>
-              <span>↑ ↓ 选择 · Enter 发送 · Esc 关闭</span>
-            </div>
-            {filteredCommands.map((command, index) => (
-                <button
-                  type="button"
-                  key={command.name}
-                  ref={element => {
-                    commandItemRefs.current[command.name] = element
-                  }}
-                  className={`command-item ${index === commandIndex ? 'active' : ''}`}
-                  onMouseDown={event => {
-                    event.preventDefault()
-                    setInput(`/${command.name} `)
-                    setCommandIndex(0)
-                  }}
-                >
-                  {command.kind === 'skill' ? <ApiOutlined /> : <CodeOutlined />}
-                  <span className="command-item-main">
-                    <strong>{command.usage || `/${command.name}`}</strong>
-                    <small>{command.kind === 'skill' ? '技能 · ' : ''}{command.description || '无描述'}</small>
-                  </span>
-                  <kbd>/</kbd>
-                </button>
-              ))}
-          </div>
-        )}
-
         <div className="composer">
           {pendingAttachments.length > 0 && (
             <div className="composer-attachments" aria-label="待发送附件">
@@ -3038,9 +3063,49 @@ function App() {
               })}
             </div>
           )}
+          {(inlineCommandOpen || inlineCommandEmpty) && (
+            <div className="command-popover" role="listbox" aria-label="可用命令">
+              <div className="command-popover-head">
+                <span>可用命令</span>
+                <span>↑ ↓ 选择 · {sendShortcutLabel} 发送 · Tab 补全 · Esc 关闭</span>
+              </div>
+              {inlineCommandOpen ? filteredCommands.map((command, index) => (
+                <button
+                  type="button"
+                  key={command.name}
+                  ref={element => {
+                    if (element) commandItemRefs.current[command.name] = element
+                    else delete commandItemRefs.current[command.name]
+                  }}
+                  className={`command-item ${index === commandIndex ? 'active' : ''}`}
+                  role="option"
+                  aria-selected={index === commandIndex}
+                  onMouseEnter={() => setCommandIndex(index)}
+                  onMouseDown={event => {
+                    event.preventDefault()
+                    setInput(`/${command.name} `)
+                    setCommandIndex(0)
+                  }}
+                >
+                  {command.kind === 'skill' ? <ApiOutlined /> : <CodeOutlined />}
+                  <span className="command-item-main">
+                    <strong>{command.usage || `/${command.name}`}</strong>
+                    <small>{command.kind === 'skill' ? '技能 · ' : ''}{command.description || '无描述'}</small>
+                  </span>
+                  <kbd>/</kbd>
+                </button>
+              )) : (
+                <div className="command-empty">没有匹配的命令，{sendShortcutLabel} 将按原文发送</div>
+              )}
+            </div>
+          )}
           <TextArea
             value={input}
-            onChange={event => setInput(event.target.value)}
+            onChange={event => {
+              setInput(event.target.value)
+              // Any edit re-opens the popover if it was dismissed with Esc.
+              setCommandDismissed(false)
+            }}
             onKeyDown={handleComposerKeyDown}
             placeholder={sendShortcut === 'ctrl-enter'
               ? '输入消息，/ 查看命令，Ctrl/Cmd + Enter 发送，Enter 换行'
@@ -3169,8 +3234,8 @@ function App() {
                   className="send-button"
                   aria-label={isStreaming ? '排队发送' : '发送'}
                   icon={<SendOutlined />}
-                  disabled={!isStreaming && (!input.trim() && pendingAttachments.length === 0 || creatingSession)}
-                  onClick={() => sendMessage()}
+                  disabled={!isStreaming && ((!input.trim() && pendingAttachments.length === 0) || creatingSession)}
+                  onClick={() => sendMessage(resolveComposerText(input))}
                 />
               </Tooltip>
             </Space>
