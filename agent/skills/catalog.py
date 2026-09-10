@@ -154,6 +154,7 @@ class SkillCatalog:
         self._registry: Optional[ToolRegistry] = None
         self._dirty: bool = False
         self._prompt_generation: int = 0
+        self._user_root_signature: Optional[tuple[float, int, int]] = None
 
     def load_all(self) -> None:
         self.user_root.mkdir(parents=True, exist_ok=True)
@@ -161,6 +162,33 @@ class SkillCatalog:
         self._aliases.clear()
         self._load_root(self.builtin_root, source="builtin")
         self._load_root(self.user_root, source="user")
+        self._user_root_signature = self._scan_user_root()
+
+    def _scan_user_root(self) -> tuple[float, int, int]:
+        """Cheap signature for "did the skills directory change on disk?".
+
+        Entry count is included so a bundle added within the same mtime tick
+        (or on a filesystem with coarse timestamps) is still noticed.
+        """
+        try:
+            stat = self.user_root.stat()
+            entries = len(list(self.user_root.iterdir()))
+        except OSError:
+            return (0.0, 0, 0)
+        return (float(stat.st_mtime), int(stat.st_ino), entries)
+
+    def refresh_if_stale(self) -> bool:
+        """Re-scan when skills changed on disk behind the running process.
+
+        Skills are installed by copying directories (or by a plugin), not
+        only through create_skill, so both the prompt's skill list and
+        activation must observe the directory rather than a startup
+        snapshot. Returns True when a reload happened.
+        """
+        if self._scan_user_root() == self._user_root_signature:
+            return False
+        self.reload()
+        return True
 
     def _load_root(self, root: Path, *, source: str) -> None:
         if not root.exists():
@@ -239,7 +267,13 @@ class SkillCatalog:
         self._prompt_generation += 1
 
     def consume_dirty(self) -> bool:
-        """Return True and clear if the catalog was mutated since last check."""
+        """Return True and clear if the catalog was mutated since last check.
+
+        Runs the on-disk staleness check first so a skill dropped into the
+        skills directory during a session refreshes the prompt without a
+        restart.
+        """
+        self.refresh_if_stale()
         if self._dirty:
             self._dirty = False
             return True
@@ -255,6 +289,16 @@ class SkillCatalog:
         ref = skill_ref.strip()
         if not ref:
             return None
+        found = self._lookup_ref(ref)
+        if found is not None:
+            return found
+        # A miss is exactly when a caller is about to report "not found";
+        # the directory may have gained the skill since the last scan.
+        if self.refresh_if_stale():
+            return self._lookup_ref(ref)
+        return None
+
+    def _lookup_ref(self, ref: str) -> Optional[str]:
         if ref in self._skills:
             return ref
         return self._aliases.get(ref)

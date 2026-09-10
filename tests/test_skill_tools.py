@@ -136,3 +136,67 @@ def test_skill_overwrites_are_durable_replacements(tmp_path, monkeypatch):
         if p.name.startswith(".")
     ]
     assert leftovers == []
+
+
+def _install_skill_on_disk(root: Path, skill_id: str, body: str = "Instructions.") -> None:
+    """Drop a bundle into the skills root, as an external install would."""
+    skill_dir = root / skill_id
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {skill_id}\n"
+        f"description: {skill_id} helper\n"
+        "user-invocable: true\n"
+        "---\n"
+        f"{body}\n",
+        encoding="utf-8",
+    )
+
+
+def test_skill_copied_in_during_session_is_found_without_restart(tmp_path):
+    """The catalog must observe the directory, not a startup snapshot.
+
+    A skill installed while the process runs (copying a directory, a plugin,
+    or another agent writing files) used to stay invisible until restart:
+    activate_skill returned "not found".
+    """
+    root = tmp_path / "skills"
+    root.mkdir()
+    catalog = SkillCatalog(user_root=root, builtin_root=tmp_path / "builtin")
+    catalog.load_all()
+    assert catalog.get("late-skill") is None
+
+    _install_skill_on_disk(root, "late-skill")
+
+    bundle = catalog.get("late-skill")
+    assert bundle is not None
+    assert bundle.id == "late-skill"
+
+
+def test_skill_copied_in_during_session_refreshes_prompt_listing(tmp_path):
+    root = tmp_path / "skills"
+    root.mkdir()
+    catalog = SkillCatalog(user_root=root, builtin_root=tmp_path / "builtin")
+    catalog.load_all()
+    assert catalog.consume_dirty() is False
+
+    _install_skill_on_disk(root, "late-skill")
+
+    assert catalog.consume_dirty() is True
+    listing = "\n".join(catalog.summary_lines())
+    assert "late-skill" in listing
+
+
+def test_activate_skill_tool_resolves_externally_installed_bundle(tmp_path):
+    root = tmp_path / "skills"
+    root.mkdir()
+    catalog = SkillCatalog(user_root=root, builtin_root=tmp_path / "builtin")
+    catalog.load_all()
+    registry = ToolRegistry()
+    catalog.register_tools(registry)
+
+    _install_skill_on_disk(root, "late-skill", body="Do the late thing.")
+
+    result = _call(registry, "activate_skill", {"skill_name": "late-skill"})
+    assert result["ok"] is True
+    assert "Do the late thing." in json.dumps(result, ensure_ascii=False)
