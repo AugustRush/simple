@@ -316,6 +316,10 @@ class SkillCatalog:
         return self._aliases.get(ref)
 
     def list_skills(self) -> list[SkillBundle]:
+        # Every discovery surface (/skills, slash-command routing, the web
+        # skill list, the prompt listing) goes through here, so the disk
+        # check belongs here rather than at each caller.
+        self.refresh_if_stale()
         return [self._skills[key] for key in sorted(self._skills)]
 
     def summary_lines(self) -> list[str]:

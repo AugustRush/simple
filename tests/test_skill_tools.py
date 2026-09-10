@@ -226,3 +226,15 @@ def test_user_skill_refresh_keeps_plugin_bundled_skills(tmp_path):
 
     assert catalog.get("late-skill") is not None
     assert catalog.get("demo:bundled") is not None
+
+
+def test_list_skills_observes_installs_on_disk(tmp_path):
+    root = tmp_path / "skills"
+    root.mkdir()
+    catalog = SkillCatalog(user_root=root, builtin_root=tmp_path / "builtin")
+    catalog.load_all()
+    assert [b.id for b in catalog.list_skills()] == []
+
+    _install_skill_on_disk(root, "late-skill")
+
+    assert [b.id for b in catalog.list_skills()] == ["late-skill"]
