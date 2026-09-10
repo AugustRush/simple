@@ -200,3 +200,29 @@ def test_activate_skill_tool_resolves_externally_installed_bundle(tmp_path):
     result = _call(registry, "activate_skill", {"skill_name": "late-skill"})
     assert result["ok"] is True
     assert "Do the late thing." in json.dumps(result, ensure_ascii=False)
+
+
+def test_user_skill_refresh_keeps_plugin_bundled_skills(tmp_path):
+    """A disk refresh must not drop skills PluginCatalog attached.
+
+    The user layer is re-read on staleness; plugin roots are attached after
+    load_all() and would be lost by a full reload.
+    """
+    root = tmp_path / "skills"
+    root.mkdir()
+    plugin_root = tmp_path / "plugin-skills"
+    plugin_dir = plugin_root / "bundled"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "SKILL.md").write_text(
+        "---\nname: bundled\n---\nPlugin instructions.\n", encoding="utf-8"
+    )
+    catalog = SkillCatalog(user_root=root, builtin_root=tmp_path / "builtin")
+    catalog.load_all()
+    catalog._load_root(plugin_root, source="plugin:demo")
+    # Plugin skills are namespaced by plugin name.
+    assert catalog.get("demo:bundled") is not None
+
+    _install_skill_on_disk(root, "late-skill")
+
+    assert catalog.get("late-skill") is not None
+    assert catalog.get("demo:bundled") is not None

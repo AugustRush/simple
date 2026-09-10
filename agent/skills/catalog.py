@@ -183,11 +183,23 @@ class SkillCatalog:
         Skills are installed by copying directories (or by a plugin), not
         only through create_skill, so both the prompt's skill list and
         activation must observe the directory rather than a startup
-        snapshot. Returns True when a reload happened.
+        snapshot. Returns True when the user layer was re-read.
+
+        Only the user layer is reloaded: plugin-bundled skills are attached
+        by PluginCatalog after ``load_all()``, so a full reload here would
+        silently drop them until the next plugin reload.
         """
         if self._scan_user_root() == self._user_root_signature:
             return False
-        self.reload()
+        for skill_id in [
+            skill_id
+            for skill_id, bundle in self._skills.items()
+            if bundle.source == "user"
+        ]:
+            del self._skills[skill_id]
+        self._load_root(self.user_root, source="user")
+        self._user_root_signature = self._scan_user_root()
+        self.invalidate()
         return True
 
     def _load_root(self, root: Path, *, source: str) -> None:
