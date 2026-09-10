@@ -661,6 +661,10 @@ function App() {
   // again re-opens it. Without this state, closing the popover would require
   // destroying the user's draft.
   const [commandDismissed, setCommandDismissed] = useState(false)
+  // Whether the highlight was moved by the user (arrow keys / hover) rather
+  // than merely defaulting to the first suggestion. A bare "/" must not send
+  // that default, but an explicitly chosen entry should still win.
+  const [commandIndexPinned, setCommandIndexPinned] = useState(false)
   const [expandedTraces, setExpandedTraces] = useState<Record<string, boolean>>({})
   const [hoveredTurn, setHoveredTurn] = useState<{ id: string; top: number } | null>(null)
   const [hoveredTurnIndex, setHoveredTurnIndex] = useState<number | null>(null)
@@ -803,8 +807,10 @@ function App() {
       setSelectedSessionIds(current =>
         current.filter(id => nextSessions.some((item: SessionInfo) => item.session_id === id)),
       )
+      return nextSessions as SessionInfo[]
     } catch {
       // API errors are surfaced by the shared request helper.
+      return [] as SessionInfo[]
     } finally {
       setLoadingSessions(false)
     }
@@ -1267,12 +1273,34 @@ function App() {
   )
 
   useEffect(() => {
-    loadSessions()
+    let cancelled = false
+    // Read the remembered session before awaiting the fetch: the persist
+    // effect below clears the key while activeSession is still null.
+    const stored = localStorage.getItem('agent_active_session')
+    const restore = async () => {
+      // A browser refresh used to dump the user on the welcome screen even
+      // though their conversation was still on the server. Re-open the last
+      // session when it still exists; otherwise start clean.
+      const list = await loadSessions()
+      if (cancelled) return
+      if (stored && list.some(item => item.session_id === stored)) {
+        selectSession(stored)
+      }
+    }
+    restore()
     api('/api/commands')
       .then(r => r.json())
       .then(data => setCommands(data.commands || []))
       .catch(() => {})
-  }, [api, loadSessions])
+    return () => { cancelled = true }
+  }, [api, loadSessions, selectSession])
+
+  // Remember the open conversation so a refresh can return to it. Deleting the
+  // active session clears the key and the next load starts fresh.
+  useEffect(() => {
+    if (activeSession) localStorage.setItem('agent_active_session', activeSession)
+    else localStorage.removeItem('agent_active_session')
+  }, [activeSession])
 
   useEffect(() => {
     if (activeSession) {
@@ -2342,6 +2370,7 @@ function App() {
 
   useEffect(() => {
     setCommandIndex(0)
+    setCommandIndexPinned(false)
   }, [filteredCommands])
 
   // Keep the highlighted command visible while navigating with ↑/↓. The
@@ -2430,6 +2459,10 @@ function App() {
     const parts = trimmed.slice(1).split(/\s+/)
     if (parts.length > 1) return trimmed
     const name = (parts[0] || '').toLowerCase()
+    // A lone "/" only opens the menu: nothing has been typed and no entry was
+    // highlighted, so there is no chosen command to complete to. Returning ''
+    // makes send a no-op instead of running the first suggestion by accident.
+    if (!name && !commandIndexPinned) return ''
     const isExact = commands.some(command =>
       (command.name || '').toLowerCase() === name ||
       (command.aliases || []).some(alias => alias.toLowerCase() === name),
@@ -2438,6 +2471,13 @@ function App() {
     const command = filteredCommands[commandIndex] || filteredCommands[0]
     return `/${command.name}`
   }
+
+  // The single source of truth for both send affordances (Enter and the
+  // button), so an incomplete command cannot look sendable on one but not
+  // the other.
+  const resolvedComposerText = resolveComposerText(input)
+  const composerSendable =
+    Boolean(resolvedComposerText) || pendingAttachments.length > 0
 
   const handleComposerKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // 输入法（IME）组合输入时，Enter 用于选中候选字/上屏，不应触发送出。
@@ -2492,9 +2532,11 @@ function App() {
       setInput(`/${command.name} `)
     } else if (event.key === 'ArrowDown' && inlineCommandOpen) {
       event.preventDefault()
+      setCommandIndexPinned(true)
       setCommandIndex(prev => (prev + 1) % filteredCommands.length)
     } else if (event.key === 'ArrowUp' && inlineCommandOpen) {
       event.preventDefault()
+      setCommandIndexPinned(true)
       setCommandIndex(
         prev => (prev - 1 + filteredCommands.length) % filteredCommands.length,
       )
@@ -3080,7 +3122,10 @@ function App() {
                   className={`command-item ${index === commandIndex ? 'active' : ''}`}
                   role="option"
                   aria-selected={index === commandIndex}
-                  onMouseEnter={() => setCommandIndex(index)}
+                  onMouseEnter={() => {
+                    setCommandIndex(index)
+                    setCommandIndexPinned(true)
+                  }}
                   onMouseDown={event => {
                     event.preventDefault()
                     setInput(`/${command.name} `)
@@ -3234,8 +3279,8 @@ function App() {
                   className="send-button"
                   aria-label={isStreaming ? '排队发送' : '发送'}
                   icon={<SendOutlined />}
-                  disabled={!isStreaming && ((!input.trim() && pendingAttachments.length === 0) || creatingSession)}
-                  onClick={() => sendMessage(resolveComposerText(input))}
+                  disabled={!isStreaming && (!composerSendable || creatingSession)}
+                  onClick={() => sendMessage(resolvedComposerText)}
                 />
               </Tooltip>
             </Space>
