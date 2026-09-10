@@ -2752,59 +2752,46 @@ function App() {
 
   const renderMessageList = () => {
     const nodes: React.ReactNode[] = []
-    let currentUser: Message | null = null
-    let currentTools: Message[] = []
-    let currentTail: Message[] = []
-    let hasTurn = false
+    // A turn is a user message plus everything up to the next one. Items are
+    // grouped without consulting local state so an assistant row received
+    // without its user message (another tab's turn, or a restored transcript)
+    // still owns its tool trace instead of orphaning it onto its own row.
+    let groupUser: Message | null = null
+    let groupItems: Message[] = []
+    let groupTools: Message[] = []
 
     const flushTurn = () => {
-      if (currentUser) nodes.push(renderMessage(currentUser))
+      if (groupUser) nodes.push(renderMessage(groupUser))
       let traceAttached = false
-      currentTail.forEach(item => {
+      groupItems.forEach(item => {
         const shouldAttachTrace =
-          !traceAttached && item.role === 'assistant' && currentTools.length > 0
+          !traceAttached && item.role === 'assistant' && groupTools.length > 0
         if (shouldAttachTrace) {
-          nodes.push(renderMessage(item, renderToolTraceContent(currentTools)))
+          nodes.push(renderMessage(item, renderToolTraceContent(groupTools)))
           traceAttached = true
         } else {
           nodes.push(renderMessage(item))
         }
       })
-      if (currentTools.length && !traceAttached) {
-        nodes.push(renderToolTrace(currentTools))
+      if (groupTools.length && !traceAttached) {
+        nodes.push(renderToolTrace(groupTools))
       }
-      currentUser = null
-      currentTools = []
-      currentTail = []
-      hasTurn = false
+      groupUser = null
+      groupItems = []
+      groupTools = []
     }
 
     messages.forEach(item => {
       if (item.role === 'user') {
-        if (hasTurn) flushTurn()
-        currentUser = item
-        currentTools = []
-        currentTail = []
-        hasTurn = true
-      } else if (item.role === 'tool') {
-        // Attachments (image/audio/video/file) are real inline content and must
-        // appear in the chat stream, not hidden inside the collapsible tool
-        // trace overlay.  Regular tool-trace rows carry no ``link``.  Feed them
-        // through ``currentTail`` so they render right after the user message
-        // (in order) rather than being collected into the trace.
-        if (item.tool === 'attachment' || item.link) {
-          if (hasTurn) {
-            currentTail.push(item)
-          } else {
-            nodes.push(renderMessage(item))
-          }
-        } else {
-          currentTools.push(item)
-        }
-      } else if (hasTurn) {
-        currentTail.push(item)
+        flushTurn()
+        groupUser = item
+      } else if (item.role === 'tool' && item.tool !== 'attachment' && !item.link) {
+        // Attachments (image/audio/video/file) are real inline content and
+        // must appear in the chat stream, not hidden inside the collapsible
+        // tool trace overlay. Regular tool-trace rows carry no ``link``.
+        groupTools.push(item)
       } else {
-        nodes.push(renderMessage(item))
+        groupItems.push(item)
       }
     })
     flushTurn()
