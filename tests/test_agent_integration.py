@@ -106,6 +106,17 @@ def _minimal_cfg():
     }
 
 
+# Real SkillCatalog contract: consume_dirty() gates the per-turn prompt
+# refresh; a clean catalog makes that refresh a no-op.
+class _CleanSkillCatalog:
+    def consume_dirty(self) -> bool:
+        return False
+
+
+_CLEAN_SKILL_CATALOG = _CleanSkillCatalog()
+
+
+
 def test_runtime_publishes_and_clears_user_id_per_turn():
     import agent.runtime.contracts as contracts
     from agent.runtime import TurnInput
@@ -7983,7 +7994,7 @@ def test_interactive_loop_delegates_every_input_to_command_coordinator(
         "agent": Agent(),
         "memory": SimpleNamespace(read_index=lambda: ""),
         "system_prompt": "system",
-        "skill_catalog": object(),
+        "skill_catalog": _CLEAN_SKILL_CATALOG,
         "user_tool_catalog": object(),
         "registry": agent_module.ToolRegistry(),
         "output_dir": tmp_path,
@@ -8046,7 +8057,7 @@ def test_interactive_loop_wires_coordinator_cancel_token_to_sigint(
         "agent": Agent(),
         "memory": SimpleNamespace(read_index=lambda: ""),
         "system_prompt": "system",
-        "skill_catalog": object(),
+        "skill_catalog": _CLEAN_SKILL_CATALOG,
         "user_tool_catalog": object(),
         "registry": agent_module.ToolRegistry(),
         "output_dir": tmp_path,
@@ -8138,7 +8149,8 @@ def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
             raise AssertionError("chat command should call TurnRunner")
 
     class _FakeSkillCatalog:
-        pass
+        def consume_dirty(self) -> bool:
+            return False
 
     class _FakeTurnRunner:
         def __init__(self):
@@ -8192,7 +8204,8 @@ def test_chat_command_delegates_turn_to_agent_core(monkeypatch):
             raise AssertionError("chat command should call AgentCore")
 
     class _FakeSkillCatalog:
-        pass
+        def consume_dirty(self) -> bool:
+            return False
 
     class _FakeAgentCore:
         def __init__(self):
@@ -8272,7 +8285,7 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
     components = {
         "agent": _ExplodingAgent(),
         "system_prompt": "system",
-        "skill_catalog": object(),
+        "skill_catalog": _CLEAN_SKILL_CATALOG,
         "output_dir": tmp_path,
         "turn_runner": turn_runner,
     }
@@ -8333,7 +8346,7 @@ def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_
     components = {
         "agent": _ExplodingAgent(),
         "system_prompt": "system",
-        "skill_catalog": object(),
+        "skill_catalog": _CLEAN_SKILL_CATALOG,
         "agent_core": agent_core,
         "output_dir": tmp_path,
     }
@@ -8401,7 +8414,7 @@ def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
             "agent": _FakeAgent(),
             "agent_core": isolated_core,
             "system_prompt": "system",
-            "skill_catalog": object(),
+            "skill_catalog": _CLEAN_SKILL_CATALOG,
         }
 
     async def fake_close(components):
