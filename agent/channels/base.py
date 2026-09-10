@@ -456,6 +456,28 @@ class ChannelRunner:
             state = sessions.get(session_id)
             if state is None or getattr(state, "operation_state", "idle") != "idle":
                 return
+            # Re-check idleness under the session's turn lock: the web
+            # channel processes messages concurrently, and between the check
+            # above and this eviction a message could claim the idle->active
+            # transition and start using the very state we are about to
+            # tear down. Popping from ``sessions`` inside the critical
+            # section makes the claim-vs-evict race decided atomically.
+            turn_lock = getattr(state, "turn_lock", None)
+            if turn_lock is not None:
+                try:
+                    await asyncio.wait_for(turn_lock.acquire(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    return
+            try:
+                if (
+                    sessions.get(session_id) is not state
+                    or getattr(state, "operation_state", "idle") != "idle"
+                ):
+                    return
+                sessions.pop(session_id, None)
+            finally:
+                if turn_lock is not None:
+                    turn_lock.release()
             worker = getattr(state, "memory_worker", None)
             if worker is not None:
                 with shared._suppress_with_log("session worker stop failed"):
@@ -469,7 +491,6 @@ class ChannelRunner:
             if callable(close):
                 with shared._suppress_with_log("session staging close failed"):
                     close()
-            sessions.pop(session_id, None)
             await _cleanup_session_runtime(session_id)
 
         async def _evict_idle_sessions(protected_session_id: str) -> None:

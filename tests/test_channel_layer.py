@@ -1781,3 +1781,98 @@ def test_channel_runner_exposes_feishu_delivery_target_to_scheduler_tools(
     assert task is not None
     assert task.delivery_mode == "channel"
     assert task.delivery_target.payload["chat_id"] == "oc_test_chat"
+
+
+def test_channel_runner_eviction_loses_race_against_turn_claim():
+    """Eviction must not tear down a session that a message just claimed.
+
+    The web channel processes messages concurrently. Eviction's teardown
+    awaits (worker join, staging close), so the session must leave the
+    registry before those awaits begin — otherwise a message arriving
+    mid-teardown claims the doomed state and its turn runs against a
+    staging buffer that is about to be closed.
+    """
+    class _Staging:
+        def __init__(self, session_id):
+            self.session_id = session_id
+            self.closed = False
+        def close(self): self.closed = True
+
+    class _Manager:
+        min_messages = 2
+        def __init__(self, session_id): self.staging = _Staging(session_id)
+        def mark_activity(self): pass
+        def record_turn(self, **_kwargs): return True
+        def should_enqueue_consolidation(self): return False
+        def should_compact_messages(self, _messages, input_token_budget): return False
+
+    class _RootManager:
+        def spawn_session(self, session_id): return _Manager(session_id)
+
+    worker_wait_started = asyncio.Event()
+    allow_eviction_finish = asyncio.Event()
+    turn_started = asyncio.Event()
+    allow_turn_finish = asyncio.Event()
+    staging_closed_flags: list[bool] = []
+
+    class _FakeWorker:
+        def stop(self): pass
+        async def wait(self):
+            worker_wait_started.set()
+            await allow_eviction_finish.wait()
+
+    class _Agent:
+        max_tokens = 1024
+        async def send_message(self, ctx, user_message, stream_callback=None):
+            turn_started.set()
+            await allow_turn_finish.wait()
+            manager = ctx.metadata.get("context_manager")
+            staging_closed_flags.append(
+                bool(getattr(getattr(manager, "staging", None), "closed", False))
+            )
+            return agent_module.AgentResult(agent_id="agent", content=user_message)
+
+    sessions = {}
+    runner = ChannelRunner(
+        channels=[],
+        components={
+            "agent": _Agent(), "skill_catalog": object(), "plugin_catalog": None,
+            "context_manager": _RootManager(), "system_prompt": "system",
+        },
+        cfg={"channels": {"web": {"max_active_sessions": 16, "session_idle_ttl_seconds": 60}}},
+    )
+    handler = runner._make_message_handler(sessions)
+
+    async def _run():
+        # Seed chat-a so a session state exists, then mark it idle-expired
+        # with a controllable memory worker whose wait() parks eviction
+        # mid-teardown. The gates only bite on the later turns.
+        allow_turn_finish.set()
+        await handler(IncomingMessage(text="seed", metadata={"chat_id": "chat-a"}), OutputSink())
+        doomed = sessions["chat-a"]
+        doomed.last_activity = 0.0
+        doomed.memory_worker = _FakeWorker()
+        allow_turn_finish.clear()
+
+        # chat-b's message triggers eviction of the expired chat-a; the
+        # eviction parks inside the worker wait.
+        task_b = asyncio.create_task(
+            handler(IncomingMessage(text="b", metadata={"chat_id": "chat-b"}), OutputSink())
+        )
+        await worker_wait_started.wait()
+
+        # A message for chat-a arrives mid-teardown and claims the session.
+        task_a = asyncio.create_task(
+            handler(IncomingMessage(text="a", metadata={"chat_id": "chat-a"}), OutputSink())
+        )
+        await turn_started.wait()
+        allow_eviction_finish.set()
+        allow_turn_finish.set()
+        await asyncio.gather(task_a, task_b)
+
+        # The claimed turn must have run on a live session: staging was
+        # never closed underneath it and the session is still registered.
+        assert staging_closed_flags and not any(staging_closed_flags)
+        assert "chat-a" in sessions
+
+    asyncio.run(_run())
