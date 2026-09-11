@@ -2331,13 +2331,15 @@ function App() {
     return groups
   }, [config])
 
-  // The composer shows the model id verbatim, so the control has to fit the
-  // longest id it can offer. A fixed width clipped longer ids to an ellipsis.
+  // Size the model picker to the id it currently shows, not to the longest id
+  // in the list: a short model should not reserve the width of a long one.
+  // The popup is width-independent (popupMatchSelectWidth={false}), so long
+  // entries still read in full while open; the closed control ellipsizes past
+  // the clamp.
   const modelSelectWidth = useMemo(() => {
-    const values = modelOptions.flatMap(group => group.options.map(option => option.value))
-    const longest = values.reduce((max, value) => Math.max(max, value.length), 0)
-    return `${Math.max(96, Math.min(240, longest * 7 + 56))}px`
-  }, [modelOptions])
+    const name = currentModel || ''
+    return `${Math.max(88, Math.min(240, name.length * 7 + 50))}px`
+  }, [currentModel])
 
   // Settings page: models of the currently selected provider. The default
   // model is chosen from a dropdown instead of free-text input, so the value

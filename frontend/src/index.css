@@ -4189,10 +4189,11 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 
 .composer-tools .model-select {
   min-width: 0;
-  /* Width is set inline from the longest offered model id; this only caps it
-     on narrow viewports. */
+  /* Width is set inline from the currently shown model id; this only caps it
+     on narrow viewports and smooths the change when the model switches. */
   flex: 0 1 auto;
   max-width: min(240px, 34vw);
+  transition: width .16s ease;
 }
 
 .composer-tools .model-select .ant-select-selector {
