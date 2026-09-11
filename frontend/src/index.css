@@ -4189,8 +4189,10 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 
 .composer-tools .model-select {
   min-width: 0;
-  width: min(200px, 26vw);
-  flex: 0 1 200px;
+  /* Width is set inline from the longest offered model id; this only caps it
+     on narrow viewports. */
+  flex: 0 1 auto;
+  max-width: min(240px, 34vw);
 }
 
 .composer-tools .model-select .ant-select-selector {
@@ -4218,8 +4220,8 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 
 @media (max-width: 640px) {
   .composer-tools .model-select {
-    width: min(150px, 31vw);
-    flex-basis: 150px;
+    /* Width comes from the longest model id; narrow screens just shrink it. */
+    max-width: min(170px, 34vw);
   }
 
   .workspace-picker {
@@ -4247,7 +4249,6 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 
 @media (max-width: 430px) {
   .composer-tools .model-select {
-    width: 112px;
-    flex-basis: 112px;
+    max-width: min(130px, 36vw);
   }
 }

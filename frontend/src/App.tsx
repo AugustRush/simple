@@ -2303,24 +2303,41 @@ function App() {
   }, [skills, skillSearch, skillFilter])
 
   const modelOptions = useMemo(() => {
-    // A running session is built from the configured active provider. Showing
-    // models from other providers in this control is misleading because a
-    // model id alone cannot switch the underlying API client/base URL.
-    const providerName = config?.active_provider
-    const provider = providerName ? config?.providers?.[providerName] : undefined
-    const models = provider?.models?.length
-      ? provider.models
-      : [provider?.default_model].filter(Boolean)
-    return providerName
-      ? [{
-          label: providerName,
-          options: (models || []).map((model: string) => ({
-            value: model,
-            label: model,
-          })),
-        }]
-      : []
+    // Every configured provider's models are selectable: the backend routes a
+    // model id to the provider that owns it, so the list is not limited to the
+    // active provider's group. The active provider's group comes first.
+    const providers = config?.providers || {}
+    const activeName = config?.active_provider
+    const groups: { label: string; options: { value: string; label: string }[] }[] = []
+    const seen = new Set<string>()
+    const push = (providerName: string) => {
+      const provider = providers[providerName]
+      if (!provider) return
+      const models = provider.models?.length
+        ? provider.models
+        : [provider.default_model].filter(Boolean)
+      const options: { value: string; label: string }[] = []
+      for (const model of models || []) {
+        if (!model || seen.has(model)) continue
+        seen.add(model)
+        options.push({ value: model, label: model })
+      }
+      if (options.length) groups.push({ label: providerName, options })
+    }
+    if (activeName) push(activeName)
+    for (const name of Object.keys(providers)) {
+      if (name !== activeName) push(name)
+    }
+    return groups
   }, [config])
+
+  // The composer shows the model id verbatim, so the control has to fit the
+  // longest id it can offer. A fixed width clipped longer ids to an ellipsis.
+  const modelSelectWidth = useMemo(() => {
+    const values = modelOptions.flatMap(group => group.options.map(option => option.value))
+    const longest = values.reduce((max, value) => Math.max(max, value.length), 0)
+    return `${Math.max(96, Math.min(240, longest * 7 + 56))}px`
+  }, [modelOptions])
 
   // Settings page: models of the currently selected provider. The default
   // model is chosen from a dropdown instead of free-text input, so the value
@@ -3243,6 +3260,7 @@ function App() {
                 onChange={handleModelChange}
                 options={modelOptions}
                 className="model-select"
+                style={{ width: modelSelectWidth }}
                 popupMatchSelectWidth={false}
                 variant="borderless"
               />
