@@ -57,7 +57,9 @@ class ModelTransport(abc.ABC):
     # ── Tool/schema shaping ────────────────────────────────────────────
 
     @abc.abstractmethod
-    def convert_tools(self, tools: list[dict]) -> Any:
+    def convert_tools(
+        self, tools: list[dict], model: Optional[str] = None
+    ) -> Any:
         """Convert Anthropic-shaped tool list into this provider's format.
 
         Returns whatever value should be passed to ``create``/``stream`` as
@@ -106,7 +108,9 @@ class ModelTransport(abc.ABC):
     # ── Response parsing ───────────────────────────────────────────────
 
     @abc.abstractmethod
-    def parse_response(self, response: Any) -> tuple[str, str, list[dict]]:
+    def parse_response(
+        self, response: Any, model: Optional[str] = None
+    ) -> tuple[str, str, list[dict]]:
         """Return ``(stop_reason, text, tool_calls)``.
 
         ``stop_reason`` is normalised to ``"tool_use"`` or ``"end_turn"``.
@@ -114,7 +118,9 @@ class ModelTransport(abc.ABC):
         """
 
     @abc.abstractmethod
-    def completion_error(self, response: Any) -> Optional[str]:
+    def completion_error(
+        self, response: Any, model: Optional[str] = None
+    ) -> Optional[str]:
         """Describe a non-clean completion (truncation, refusal) or None."""
 
     def has_incomplete_tool_calls(self, response: Any) -> bool:
@@ -139,21 +145,28 @@ class ModelTransport(abc.ABC):
     # ── Message-history shaping ────────────────────────────────────────
 
     @abc.abstractmethod
-    def build_assistant_message(self, response: Any, text: str) -> dict:
+    def build_assistant_message(
+        self, response: Any, text: str, model: Optional[str] = None
+    ) -> dict:
         """Construct the assistant turn entry to append to messages."""
 
     @abc.abstractmethod
     def build_tool_result_messages(
-        self, tool_calls: list[dict], results: list[str]
+        self, tool_calls: list[dict], results: list[str],
+        model: Optional[str] = None,
     ) -> list[dict]:
         """Build the tool-result message(s) to append after a tool batch."""
 
     @abc.abstractmethod
-    def tool_result_rollback_count(self, tool_call_count: int) -> int:
+    def tool_result_rollback_count(
+        self, tool_call_count: int, model: Optional[str] = None
+    ) -> int:
         """How many trailing messages a tool batch added, for rollback math."""
 
     @abc.abstractmethod
-    def build_final_message(self, response: Any, text: str) -> dict:
+    def build_final_message(
+        self, response: Any, text: str, model: Optional[str] = None
+    ) -> dict:
         """Build the assistant entry for an ``end_turn`` (no tool calls) response.
 
         Distinct from ``build_assistant_message`` because some providers
@@ -173,7 +186,9 @@ class ModelTransport(abc.ABC):
 
 
 class AnthropicTransport(ModelTransport):
-    def convert_tools(self, tools: list[dict]) -> Any:
+    def convert_tools(
+        self, tools: list[dict], model: Optional[str] = None
+    ) -> Any:
         return tools if tools else anthropic.NOT_GIVEN
 
     async def create(self, *, model, max_tokens, system, messages, tools):
@@ -214,7 +229,7 @@ class AnthropicTransport(ModelTransport):
                 return resp.content[0].text.strip()
         return None
 
-    def parse_response(self, response):
+    def parse_response(self, response, model=None):
         stop_reason = response.stop_reason  # "end_turn" | "tool_use"
         text_blocks = [b for b in response.content if hasattr(b, "text")]
         text = " ".join(b.text for b in text_blocks)
@@ -225,15 +240,15 @@ class AnthropicTransport(ModelTransport):
         ]
         return stop_reason, text, tool_calls
 
-    def completion_error(self, response):
+    def completion_error(self, response, model=None):
         if getattr(response, "stop_reason", None) == "max_tokens":
             return "Model response was truncated (stop_reason=max_tokens)"
         return None
 
-    def build_assistant_message(self, response, text):
+    def build_assistant_message(self, response, text, model=None):
         return {"role": "assistant", "content": response.content}
 
-    def build_tool_result_messages(self, tool_calls, results):
+    def build_tool_result_messages(self, tool_calls, results, model=None):
         return [
             {
                 "role": "user",
@@ -244,10 +259,10 @@ class AnthropicTransport(ModelTransport):
             }
         ]
 
-    def tool_result_rollback_count(self, tool_call_count):
+    def tool_result_rollback_count(self, tool_call_count, model=None):
         return 1  # All tool results live in a single user message
 
-    def build_final_message(self, response, text):
+    def build_final_message(self, response, text, model=None):
         # No tool_use blocks to preserve — plain text entry is canonical.
         return {"role": "assistant", "content": text}
 
@@ -268,7 +283,9 @@ class AnthropicTransport(ModelTransport):
 
 
 class OpenAITransport(ModelTransport):
-    def convert_tools(self, tools: list[dict]) -> Any:
+    def convert_tools(
+        self, tools: list[dict], model: Optional[str] = None
+    ) -> Any:
         if not tools:
             return None
         return [
@@ -394,7 +411,7 @@ class OpenAITransport(ModelTransport):
                 return resp.choices[0].message.content.strip()
         return None
 
-    def parse_response(self, response):
+    def parse_response(self, response, model=None):
         choice = response.choices[0]
         finish = choice.finish_reason
         msg = choice.message
@@ -409,7 +426,7 @@ class OpenAITransport(ModelTransport):
             return "tool_use", text, tool_calls
         return "end_turn", text, []
 
-    def completion_error(self, response):
+    def completion_error(self, response, model=None):
         try:
             finish = response.choices[0].finish_reason
         except Exception:
@@ -425,7 +442,7 @@ class OpenAITransport(ModelTransport):
         except Exception:
             return False
 
-    def build_assistant_message(self, response, text):
+    def build_assistant_message(self, response, text, model=None):
         msg = response.choices[0].message
         entry: dict = {"role": "assistant", "content": text}
         entry.update(self._message_extras(msg))
@@ -445,16 +462,16 @@ class OpenAITransport(ModelTransport):
             ]
         return entry
 
-    def build_tool_result_messages(self, tool_calls, results):
+    def build_tool_result_messages(self, tool_calls, results, model=None):
         return [
             {"role": "tool", "tool_call_id": tc["id"], "content": r}
             for tc, r in zip(tool_calls, results)
         ]
 
-    def tool_result_rollback_count(self, tool_call_count):
+    def tool_result_rollback_count(self, tool_call_count, model=None):
         return tool_call_count  # One tool message per call
 
-    def build_final_message(self, response, text):
+    def build_final_message(self, response, text, model=None):
         # Reuse the tool-batch entry shape so model_extra fields survive.
         return self.build_assistant_message(response, text)
 
@@ -639,3 +656,159 @@ def build_transport(api_format: str, client: Any) -> ModelTransport:
     if api_format == "openai":
         return OpenAITransport(client)
     raise ValueError(f"unsupported api_format: {api_format!r}")
+
+
+class RoutingTransport(ModelTransport):
+    """Route each call to the transport of the provider owning the model.
+
+    ``model_override`` carries only a model id, so without this layer a model
+    from another provider would be sent to the active provider's client and
+    fail (or worse, silently hit a same-named model there). Routing keeps the
+    override a plain string for callers while dispatching to the right SDK
+    client per call.
+
+    Every method that is per-call (create/stream/simple_chat and the
+    format-aware message builders) routes on the model. Methods that only
+    depend on the agent's own state (image blocks, tool-result rollback
+    counts for messages this transport built) delegate to the transport that
+    produced those messages — pass the model, or omit it for the default.
+
+    Routing table: model id → transport. Models absent from the table go to
+    the default transport (the active provider). When a model id exists under
+    several providers, the active provider wins — that is also what the
+    model dropdown offers, so the visible option and the routing agree.
+    """
+
+    def __init__(
+        self,
+        default: ModelTransport,
+        routes: dict[str, ModelTransport],
+    ) -> None:
+        super().__init__(default.client)
+        self.default = default
+        self.routes = routes
+
+    def _for(self, model: Optional[str]) -> ModelTransport:
+        if model is None:
+            return self.default
+        return self.routes.get(model, self.default)
+
+    def convert_tools(self, tools: list[dict], model: Optional[str] = None) -> Any:
+        return self._for(model).convert_tools(tools)
+
+    async def create(self, *, model, max_tokens, system, messages, tools):
+        transport = self._for(model)
+        return await transport.create(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            tools=tools,
+        )
+
+    async def stream(
+        self, *, model, max_tokens, system, messages, tools, callback
+    ):
+        transport = self._for(model)
+        return await transport.stream(
+            model=model,
+            max_tokens=max_tokens,
+            system=system,
+            messages=messages,
+            tools=tools,
+            callback=callback,
+        )
+
+    async def simple_chat(self, *, model, max_tokens, system, prompt):
+        transport = self._for(model)
+        return await transport.simple_chat(
+            model=model, max_tokens=max_tokens, system=system, prompt=prompt
+        )
+
+    def parse_response(
+        self, response: Any, model: Optional[str] = None
+    ) -> tuple[str, str, list[dict]]:
+        return self._for(model).parse_response(response)
+
+    def completion_error(
+        self, response: Any, model: Optional[str] = None
+    ) -> Optional[str]:
+        return self._for(model).completion_error(response)
+
+    def build_final_message(
+        self, response: Any, text: str, model: Optional[str] = None
+    ) -> dict:
+        return self._for(model).build_final_message(response, text)
+
+    def build_assistant_message(
+        self, response: Any, text: str, model: Optional[str] = None
+    ) -> dict:
+        return self._for(model).build_assistant_message(response, text)
+
+    def build_tool_result_messages(
+        self, tool_calls: list[dict], results: list[str], model: Optional[str] = None
+    ) -> list[dict]:
+        return self._for(model).build_tool_result_messages(tool_calls, results)
+
+    def truncate_images(self, messages: list[dict], keep: int) -> list[dict]:
+        # Not routed: the agent calls this once per turn on its own messages
+        # before any transport is chosen, and both implementations operate on
+        # Anthropic-shaped content lists. Delegate to the default provider's
+        # implementation (current behavior).
+        return self.default.truncate_images(messages, keep)
+
+    def tool_result_rollback_count(
+        self, tool_call_count: int, model: Optional[str] = None
+    ) -> int:
+        return self._for(model).tool_result_rollback_count(tool_call_count)
+
+    def image_content_block(self, mime_type: str, data: str) -> dict:
+        # Attachment blocks are built from agent-local state before a
+        # transport is chosen; use the default provider's shape.
+        return self.default.image_content_block(mime_type, data)
+
+
+def build_routing_transport(
+    cfg: dict,
+    default_format: str,
+    default_client: Any,
+    client_factory: Callable[[dict, str], Any],
+) -> RoutingTransport:
+    """Build a RoutingTransport from provider config.
+
+    ``client_factory(provider_cfg, api_format)`` constructs one SDK client;
+    it is called at most once per provider here. The active provider reuses
+    ``default_client`` so the routed and default paths share one client.
+    """
+    providers = cfg.get("providers", {}) or {}
+    active = str(cfg.get("active_provider") or "")
+    default_transport = build_transport(default_format, default_client)
+    routes: dict[str, ModelTransport] = {}
+    transports: dict[str, ModelTransport] = {}
+    for name, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        models = provider_cfg.get("models") or []
+        if not models and provider_cfg.get("default_model"):
+            models = [provider_cfg["default_model"]]
+        if not models:
+            continue
+        api_format = str(provider_cfg.get("api_format", "openai"))
+        if name == active and api_format == default_format:
+            # One instance for the active provider, so its models resolve to
+            # the very transport that handles unrouted calls.
+            transport = default_transport
+        else:
+            key = (name, api_format)
+            if key not in transports:
+                transports[key] = build_transport(
+                    api_format, client_factory(provider_cfg, api_format)
+                )
+            transport = transports[key]
+        for model in models:
+            # Active provider wins conflicts; iterate it last is not enough
+            # when it is not last in the dict, so guard explicitly.
+            if model in routes and name != active:
+                continue
+            routes[str(model)] = transport
+    return RoutingTransport(default_transport, routes)

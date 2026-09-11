@@ -38,6 +38,30 @@ def _project_memory_scope(workspace_root: Path) -> str:
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
     return f"project:{digest}"
 
+
+def _provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
+    """One SDK client for a non-active provider (used by RoutingTransport)."""
+    import anthropic
+
+    """One SDK client for a non-active provider (used by RoutingTransport)."""
+    raw_key = str(provider_cfg.get("api_key", "") or "")
+    if raw_key.startswith("$"):
+        raw_key = os.environ.get(raw_key[1:], "")
+    if api_format == "anthropic":
+        kwargs: dict[str, Any] = {"api_key": raw_key}
+        base_url = provider_cfg.get("base_url")
+        if base_url:
+            kwargs["base_url"] = base_url
+        return anthropic.AsyncAnthropic(**kwargs)
+    import openai as openai_lib
+
+    kwargs = {"api_key": raw_key}
+    base_url = provider_cfg.get("base_url")
+    if base_url:
+        kwargs["base_url"] = base_url
+    return openai_lib.AsyncOpenAI(**kwargs)
+
+
 def _web_session_home(session_id: str) -> Path:
     clean = re.sub(r"[^A-Za-z0-9_-]", "", str(session_id or ""))[:32]
     if not clean:
@@ -141,6 +165,16 @@ async def _build_web_session_components(
         api_format=global_agent.api_format,
         supports_vision=global_agent.supports_vision,
         context_window=global_agent.context_window,
+    )
+    # Same per-call model routing as the global agent: a session may switch to
+    # any configured provider's model.
+    from agent.core.transport import build_routing_transport
+
+    agent._transport = build_routing_transport(
+        session_cfg,
+        global_agent.api_format,
+        global_components["client"],
+        client_factory=_provider_client_factory,
     )
     for name in (
         "max_parallel_agents",
@@ -560,6 +594,18 @@ async def _build_components_async(
         api_format=api_format,
         supports_vision=supports_vision,
         context_window=context_window,
+    )
+    # Route per-call model overrides to the provider that owns the model, so
+    # the UI's model dropdown can offer every configured provider's models.
+    # The active provider stays the default; unknown model ids keep today's
+    # behavior (sent to the active client).
+    from agent.core.transport import build_routing_transport
+
+    agent._transport = build_routing_transport(
+        cfg,
+        api_format,
+        client,
+        client_factory=_provider_client_factory,
     )
     agent.max_parallel_agents = max(
         1,

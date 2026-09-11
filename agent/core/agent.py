@@ -1296,9 +1296,9 @@ class BaseAgent:
 
     # ── Format-aware API helpers ──────────────────────────────────────────
 
-    def _tools_for_api(self, tools: list[dict]) -> Any:
-        """Convert tools to the right format; return NOT_GIVEN/None if empty."""
-        return self._transport.convert_tools(tools)
+    def _tools_for_api(self, tools: list[dict], ctx: "AgentContext") -> Any:
+        """Convert tools to the format of the provider this turn will use."""
+        return self._transport.convert_tools(tools, model=self._effective_model(ctx))
 
     async def _create(
         self,
@@ -1547,11 +1547,19 @@ class BaseAgent:
             "single tool payload or increase the provider context/output budget.",
         )
 
-    def _parse_response(self, response: Any) -> tuple[str, str, list[dict]]:
-        return self._transport.parse_response(response)
+    def _parse_response(
+        self, response: Any, ctx: Optional["AgentContext"] = None
+    ) -> tuple[str, str, list[dict]]:
+        return self._transport.parse_response(
+            response, model=self._effective_model(ctx) if ctx else None
+        )
 
-    def _response_completion_error(self, response: Any) -> Optional[str]:
-        return self._transport.completion_error(response)
+    def _response_completion_error(
+        self, response: Any, ctx: Optional["AgentContext"] = None
+    ) -> Optional[str]:
+        return self._transport.completion_error(
+            response, model=self._effective_model(ctx) if ctx else None
+        )
 
     @staticmethod
     def _merge_continuation_text(prefix: str, continuation: str) -> str:
@@ -1597,15 +1605,21 @@ class BaseAgent:
                 {"role": "user", "content": self._CONTINUE_PROMPT}
             )
             response = await self._create(continuation_ctx, [])
-            stop_reason, text, tool_uses = self._parse_response(response)
+            stop_reason, text, tool_uses = self._parse_response(
+                response, continuation_ctx
+            )
             if stop_reason == "tool_use" and tool_uses:
                 break
             merged = self._merge_continuation_text(merged, text)
-            continuation_error = self._response_completion_error(response)
+            continuation_error = self._response_completion_error(
+                response, continuation_ctx
+            )
             if continuation_error is None:
                 return merged, None
             continuation_ctx.messages.append(
-                self._transport.build_final_message(response, text)
+                self._transport.build_final_message(
+                    response, text, model=self._effective_model(continuation_ctx)
+                )
             )
         return (
             merged,
@@ -1613,15 +1627,24 @@ class BaseAgent:
             f"{attempts} auto-continue attempts",
         )
 
-    def _assistant_message(self, response: Any, text: str) -> dict:
+    def _assistant_message(
+        self, response: Any, text: str, ctx: Optional["AgentContext"] = None
+    ) -> dict:
         """Build the assistant history entry after a tool_use stop."""
-        return self._transport.build_assistant_message(response, text)
+        return self._transport.build_assistant_message(
+            response, text, model=self._effective_model(ctx) if ctx else None
+        )
 
     def _tool_result_messages(
-        self, tool_calls: list[dict], results: list[str]
+        self,
+        tool_calls: list[dict],
+        results: list[str],
+        ctx: Optional["AgentContext"] = None,
     ) -> list[dict]:
         """Build tool-result history entries for both formats."""
-        return self._transport.build_tool_result_messages(tool_calls, results)
+        return self._transport.build_tool_result_messages(
+            tool_calls, results, model=self._effective_model(ctx) if ctx else None
+        )
 
     @staticmethod
     def _clear_context_restart_message(
@@ -1755,7 +1778,9 @@ class BaseAgent:
         if tool_uses:
             # The transport knows how many trailing tool-result messages it
             # appended for this batch; +1 for the preceding assistant turn.
-            result_msg_count = self._transport.tool_result_rollback_count(len(tool_uses))
+            result_msg_count = self._transport.tool_result_rollback_count(
+                len(tool_uses), model=self._effective_model(ctx)
+            )
             cut = result_msg_count + 1
             dropped_roles = [
                 str(message.get("role", "?")) for message in ctx.messages[-cut:]
@@ -2597,15 +2622,19 @@ class BaseAgent:
         result_text = text or streamed_text or prior_text
         if not result_text and tool_result_history:
             result_text = self._synthesize_tool_only_response(tool_result_history)
-        ctx.messages.append(self._transport.build_final_message(response, result_text))
+        ctx.messages.append(
+            self._transport.build_final_message(
+                response, result_text, model=self._effective_model(ctx)
+            )
+        )
 
-        completion_error = self._response_completion_error(response)
+        completion_error = self._response_completion_error(response, ctx)
         if completion_error:
             result_text, continuation_error = (
                 await self._continue_truncated_response(ctx, result_text)
             )
             ctx.messages[-1] = self._transport.build_final_message(
-                response, result_text
+                response, result_text, model=self._effective_model(ctx)
             )
             return result_text, continuation_error
 
@@ -2824,7 +2853,9 @@ class BaseAgent:
                             error=structured_output_error,
                         )
                     filter_recovery.forget_submission()
-                    stop_reason, text, tool_uses = self._parse_response(response)
+                    stop_reason, text, tool_uses = self._parse_response(
+                        response, ctx
+                    )
                     _trace_latency(
                         "model_response_received",
                         agent_id=ctx.agent_id,
@@ -2846,7 +2877,9 @@ class BaseAgent:
                     if stop_reason == "tool_use" and tool_uses:
                         if text:
                             result_text = text
-                        assistant_tool_message = self._assistant_message(response, text)
+                        assistant_tool_message = self._assistant_message(
+                            response, text, ctx
+                        )
 
                         # Set intent context so tool executors can enforce
                         # the intent-before-action protocol.
@@ -2932,7 +2965,9 @@ class BaseAgent:
                         # its matching result in persistent conversation state.
                         ctx.messages.append(assistant_tool_message)
                         ctx.messages.extend(
-                            self._tool_result_messages(tool_uses, filtered_results)
+                            self._tool_result_messages(
+                                tool_uses, filtered_results, ctx
+                            )
                         )
                         filter_recovery.record_submission(tool_uses, results)
                         # A long tool chain can be interrupted or the process

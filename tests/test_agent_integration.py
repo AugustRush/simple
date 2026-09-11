@@ -5490,15 +5490,15 @@ def test_anthropic_max_tokens_uses_existing_truncation_continuation():
             return next(self.responses)
 
         @staticmethod
-        def parse_response(response):
+        def parse_response(response, model=None):
             return response.stop_reason, response.content[0].text, []
 
         @staticmethod
-        def completion_error(response):
+        def completion_error(response, model=None):
             return AnthropicTransport.completion_error(AnthropicTransport(object()), response)
 
         @staticmethod
-        def build_final_message(response, text):
+        def build_final_message(response, text, model=None):
             return {"role": "assistant", "content": text}
 
     agent = agent_module.BaseAgent(
@@ -7129,15 +7129,15 @@ def test_agent_core_isolates_concurrent_session_model_overrides():
             return kwargs["model"]
 
         @staticmethod
-        def parse_response(response):
+        def parse_response(response, model=None):
             return "end_turn", f"reply from {response}", []
 
         @staticmethod
-        def completion_error(response):
+        def completion_error(response, model=None):
             return None
 
         @staticmethod
-        def build_final_message(response, text):
+        def build_final_message(response, text, model=None):
             return {"role": "assistant", "content": text}
 
     async def _run():
@@ -7270,11 +7270,11 @@ def test_truncation_continuation_preserves_request_model_override():
             return object()
 
         @staticmethod
-        def parse_response(response):
+        def parse_response(response, model=None):
             return "end_turn", " continued", []
 
         @staticmethod
-        def completion_error(response):
+        def completion_error(response, model=None):
             return None
 
     agent = agent_module.BaseAgent(
