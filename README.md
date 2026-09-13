@@ -217,7 +217,13 @@ editing, command palette and streamed responses, all through the same
 | GET | `/api/sessions/{id}/messages` | Recent messages for a session |
 | POST | `/api/sessions/{id}/messages` | Send a message (non-streaming) |
 | WS | `/api/sessions/{id}/stream` | Streaming events (`stream_chunk`, `tool_start`, `status`, `confirm_request`, `attachment`, `turn_complete`, …) |
-| GET | `/api/files?path=…` | Download a file from the current agent home |
+| GET | `/api/files?path=…&session_id=…` | Download a file owned by a session (its home: `output/`, `uploads/`, plus the workspace folder picked for it) |
+| GET | `/api/files?path=…&task_id=…&run_id=…` | Download the recorded output of a scheduled run |
+
+`path` alone is never enough: the request must name an owner so the gateway can
+prove the caller is entitled to the file. A request with no owner, an unknown
+session, or a path outside that owner's sandbox is refused with `403 forbidden
+path`.
 
 `auth_token` is empty by default because the server binds to localhost.  Set it
 when exposing the port beyond the local machine, and put the frontend behind

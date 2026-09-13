@@ -41,6 +41,7 @@ import zhCN from 'antd/locale/zh_CN'
 import {
   ApiOutlined,
   AppstoreOutlined,
+  ArrowUpOutlined,
   CheckCircleFilled,
   ClockCircleOutlined,
   CloseOutlined,
@@ -52,24 +53,22 @@ import {
   ExclamationCircleFilled,
   FileTextOutlined,
   FolderOpenOutlined,
-  GlobalOutlined,
   LoadingOutlined,
   MenuOutlined,
   MessageOutlined,
   MoonOutlined,
   MoreOutlined,
+  PaperClipOutlined,
   PlusOutlined,
   ReloadOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
   SearchOutlined,
-  SendOutlined,
   SettingOutlined,
   StopOutlined,
   SunOutlined,
   TagsOutlined,
   ThunderboltOutlined,
-  UploadOutlined,
   UserOutlined,
 } from '@ant-design/icons'
 import dayjs from 'dayjs'
@@ -82,8 +81,51 @@ const { Sider, Header, Content } = Layout
 const { TextArea } = Input
 const { Paragraph, Text } = Typography
 
-type MessageRole = 'user' | 'assistant' | 'tool' | 'command' | 'error'
+type MessageRole = 'user' | 'assistant' | 'tool' | 'command' | 'error' | 'subagent'
 type ToolState = 'running' | 'done' | 'blocked' | 'interrupted'
+type ConfirmDecision = 'allow_once' | 'allow_session' | 'deny'
+type ConfirmRisk = 'high' | 'medium' | 'low'
+
+/**
+ * Rolling state for one batch of sub-agent activity.
+ *
+ * Sub-agent progress is live telemetry, not conversation: a single batch emits
+ * a start/progress/finish event per agent, so appending a chat row per event
+ * buried the transcript under dozens of near-identical lines. The note is
+ * updated in place instead and rendered as one thin status strip.
+ */
+interface SubAgentNote {
+  /** Ordered event log, kept whole for the expanded view. */
+  logs: string[]
+  /** Distinct agent roles seen so far. */
+  roles: string[]
+  /** Roles that reached a terminal state (finished or failed). */
+  doneRoles: string[]
+  completed: number
+  total: number
+  failed: number
+  running: boolean
+  finished: boolean
+  open?: boolean
+  /** Local epoch millis of the first and last event, for the duration readout. */
+  startedAt: number
+  endedAt: number
+}
+
+/**
+ * A pending tool-approval prompt pushed by the server. `allow_session` is only
+ * true when the server holds a redeemable pending record for the command, so
+ * the "总是允许" option is never offered where it could not be honoured.
+ */
+interface ConfirmRequest {
+  name?: string
+  command?: string
+  risk_level?: string
+  reason?: string
+  confirmation_token?: string
+  allow_session?: boolean
+  timeout_seconds?: number
+}
 
 interface SessionInfo {
   session_id: string
@@ -103,6 +145,7 @@ interface Message {
   tool?: string
   toolState?: ToolState
   attachments?: AttachmentInfo[]
+  subagent?: SubAgentNote
 }
 
 interface AttachmentInfo {
@@ -297,9 +340,131 @@ function mediaKindForUrl(url: string): MediaKind {
   return 'file'
 }
 
-function markdownToHtml(text: string): string {
-  let t = escapeHtml(text || '')
+/** Build a /api/files link that names the session owning the file.
+ *
+ * The gateway treats a file URL as a read capability and only serves it to
+ * the session that owns the file, so the session id is part of the link. */
+function fileHref(path: string, sessionId?: string | null, token?: string | null): string {
+  const params = new URLSearchParams()
+  params.set('path', path)
+  if (sessionId) params.set('session_id', sessionId)
+  if (token) params.set('token', token)
+  return `/api/files?${params.toString()}`
+}
+
+/** Attach the owning session (and token) to a backend-supplied /api/files link. */
+function withFileSession(link: string, sessionId?: string | null, token?: string | null): string {
+  if (!link) return ''
+  let url: URL
+  try {
+    url = new URL(link, location.origin)
+  } catch {
+    return link
+  }
+  if (url.pathname !== '/api/files') return link
+  if (sessionId && !url.searchParams.get('session_id')) url.searchParams.set('session_id', sessionId)
+  if (token && !url.searchParams.get('token')) url.searchParams.set('token', token)
+  return `${url.pathname}?${url.searchParams.toString()}`
+}
+
+/** Resolve an image target emitted by the model into something the browser can load. */
+function markdownMediaHref(
+  rawTarget: string,
+  sessionId?: string | null,
+  token?: string | null,
+): string {
+  let target = rawTarget.trim()
+  if (target.startsWith('<') && target.endsWith('>')) {
+    target = target.slice(1, -1).trim()
+  }
+  // Markdown commonly escapes parentheses in filenames.
+  target = target.replace(/\\([\\() ])/g, '$1')
+  if (!target) return ''
+
+  if (/^(?:https?:|data:|blob:)/i.test(target) || target.startsWith('//')) return target
+  if (target.startsWith('/api/files?')) return withFileSession(target, sessionId, token)
+  // Scheduled-run Markdown has a different task_id/run_id ownership model.
+  // Without a session owner, preserve the target instead of manufacturing a
+  // file URL that the gateway must correctly reject.
+  if (!sessionId) return target
+
+  if (/^file:/i.test(target)) {
+    try {
+      const url = new URL(target)
+      target = decodeURIComponent(url.pathname)
+      // file:///C:/path becomes /C:/path in URL.pathname.
+      if (/^\/[A-Za-z]:\//.test(target)) target = target.slice(1)
+    } catch {
+      return target
+    }
+  }
+
+  const isAbsoluteLocalPath = target.startsWith('/') || /^[A-Za-z]:[\\/]/.test(target)
+  return isAbsoluteLocalPath ? fileHref(target, sessionId, token) : target
+}
+
+/**
+ * Replace Markdown images while balancing parentheses in the destination.
+ * A regex ending at the first `)` corrupts common names such as `result (1).png`.
+ */
+function replaceMarkdownImages(
+  text: string,
+  render: (alt: string, target: string) => string,
+): string {
+  let output = ''
+  let cursor = 0
+
+  while (cursor < text.length) {
+    const start = text.indexOf('![', cursor)
+    if (start < 0) {
+      output += text.slice(cursor)
+      break
+    }
+    output += text.slice(cursor, start)
+
+    let altEnd = start + 2
+    while (altEnd < text.length) {
+      if (text[altEnd] === ']' && text[altEnd - 1] !== '\\') break
+      altEnd += 1
+    }
+    if (altEnd >= text.length || text[altEnd + 1] !== '(') {
+      output += text[start]
+      cursor = start + 1
+      continue
+    }
+
+    let depth = 1
+    let targetEnd = altEnd + 2
+    while (targetEnd < text.length && depth > 0) {
+      const char = text[targetEnd]
+      const escaped = text[targetEnd - 1] === '\\'
+      if (!escaped && char === '(') depth += 1
+      if (!escaped && char === ')') depth -= 1
+      targetEnd += 1
+    }
+    if (depth !== 0) {
+      output += text[start]
+      cursor = start + 1
+      continue
+    }
+
+    const alt = text.slice(start + 2, altEnd).replace(/\\([\\\]])/g, '$1')
+    const target = text.slice(altEnd + 2, targetEnd - 1)
+    output += render(alt, target)
+    cursor = targetEnd
+  }
+
+  return output
+}
+
+function markdownToHtml(
+  text: string,
+  sessionId?: string | null,
+  token?: string | null,
+): string {
+  let t = String(text || '')
   const codeBlocks: string[] = []
+  const images: string[] = []
 
   // Replace fenced code with placeholders so line-level parsing can't corrupt it.
   t = t.replace(
@@ -310,16 +475,26 @@ function markdownToHtml(text: string): string {
       const index = codeBlocks.length
       codeBlocks.push(
         `<div class="code-block"><div class="code-block-head"><span>${label}</span></div>` +
-        `<pre><code>${body}</code></pre></div>`,
+        `<pre><code>${escapeHtml(body)}</code></pre></div>`,
       )
       return `\u0000CODE${index}\u0000`
     },
   )
 
+  t = replaceMarkdownImages(t, (alt, target) => {
+    const index = images.length
+    const href = markdownMediaHref(target, sessionId, token)
+    images.push(
+      `<img class="md-img" src="${escapeHtml(href)}" alt="${escapeHtml(alt)}" loading="lazy" />`,
+    )
+    return `\u0000IMAGE${index}\u0000`
+  })
+
+  t = escapeHtml(t)
+
   t = t.replace(/`([^`]+)`/g, '<code>$1</code>')
   t = t.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
   t = t.replace(/\*([^*]+)\*/g, '<em>$1</em>')
-  t = t.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img class="md-img" src="$2" alt="$1" loading="lazy" />')
   t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>')
 
   const lines = t.split('\n')
@@ -354,6 +529,7 @@ function markdownToHtml(text: string): string {
   if (listOpen) output.push('</ul>')
   t = output.join('\n')
   t = t.replace(/\u0000CODE(\d+)\u0000/g, (_m, index: string) => codeBlocks[Number(index)] || '')
+  t = t.replace(/\u0000IMAGE(\d+)\u0000/g, (_m, index: string) => images[Number(index)] || '')
   t = t.replace(/\n{2,}/g, '<br /><br />')
   t = t.replace(/\n/g, '<br />')
 
@@ -371,12 +547,11 @@ const CONVERSATION_SUMMARY_HALF_HEIGHT = 62
 
 function compactWorkspacePath(value: string, maxLength = 36): string {
   const path = String(value || '').trim()
-  if (!path || path.length <= maxLength) return path
+  if (!path) return path
   const parts = path.split(/[\\/]+/).filter(Boolean)
-  if (parts.length < 2) return truncate(path, maxLength)
+  if (parts.length < 3) return truncate(path, maxLength)
   const tail = parts.slice(-2).join('/')
-  const prefix = path.startsWith('/') ? '/' : ''
-  const compact = `${prefix}…/${tail}`
+  const compact = `…/${tail}`
   return compact.length <= maxLength ? compact : truncate(compact, maxLength)
 }
 
@@ -408,6 +583,147 @@ function toolStateIcon(state?: ToolState) {
   if (state === 'running') return <LoadingOutlined spin />
   if (state === 'blocked') return <ExclamationCircleFilled />
   return <CheckCircleFilled />
+}
+
+// Approval prompts arrive with the tool's internal name; the bar says what the
+// user is actually being asked about rather than echoing a code identifier.
+const CONFIRM_TOOL_LABELS: Record<string, string> = {
+  shell: '终端命令',
+  install_plugin: '安装插件',
+  create_tool: '激活用户工具',
+  memory_clear: '清空记忆',
+}
+
+const CONFIRM_RISK_LABELS: Record<ConfirmRisk, string> = {
+  high: '高风险',
+  medium: '中风险',
+  low: '低风险',
+}
+
+function confirmToolLabel(name?: string): string {
+  const key = String(name || '').trim()
+  if (!key) return '未知操作'
+  return CONFIRM_TOOL_LABELS[key] || key
+}
+
+function confirmRisk(level?: string): ConfirmRisk {
+  const value = String(level || '').trim().toLowerCase()
+  // An unrecognised tier is treated as the most dangerous one: a mislabelled
+  // prompt should look alarming, not reassuring.
+  if (value === 'medium' || value === 'low') return value
+  return 'high'
+}
+
+/**
+ * Task statuses where "continue or abandon?" is a real question.
+ *
+ * The working state is written on every turn end with one of
+ * `cancelled` / `failed` / `completed` / `in_progress`, so a blocklist of
+ * terminal states is not enough: `in_progress` (a turn that produced neither
+ * text nor an error) was also advertised as 「任务已中断」. After the user
+ * answered the prompt once, the continuation turn wrote exactly such a state,
+ * the card came back, and every further click queued another interjection.
+ */
+const TASK_INTERRUPTED_STATUSES = new Set(['cancelled', 'interrupted', 'failed'])
+
+const TASK_STATUS_LABELS: Record<string, string> = {
+  cancelled: '已取消',
+  interrupted: '已中断',
+  failed: '失败',
+}
+
+// Sub-agent progress is the noisiest thing the socket carries: one batch emits
+// a start/progress/finish event per agent. Stamping each event into the
+// transcript cost roughly 60px apiece — a 36px note row plus the 22–32px
+// conversation gap — for lines that mostly repeated each other, so a single
+// multi-agent turn could push 600–1800px of telemetry through the scroll area.
+// Folding the events into one note keeps that cost constant.
+const SUBAGENT_KIND_LABELS: Record<string, string> = {
+  batch_started: '批量启动',
+  batch_progress: '批量进度',
+  batch_finished: '批量结束',
+  agent_started: '开始执行',
+  agent_finished: '执行完成',
+  agent_failed: '执行失败',
+  agent_retry: '重试',
+}
+
+/** Kinds that end a batch; everything after them starts a fresh note. */
+const SUBAGENT_TERMINAL_KINDS = new Set(['batch_finished'])
+
+function subagentEventLine(evt: Record<string, unknown>): string {
+  const message = String(evt.message || '').trim()
+  if (message) return message
+  const role = String(evt.role || '').trim()
+  const kind = String(evt.kind || '').trim()
+  const label = SUBAGENT_KIND_LABELS[kind] || kind || '状态更新'
+  return role ? `${role} · ${label}` : label
+}
+
+function newSubAgentNote(now: number): SubAgentNote {
+  return {
+    logs: [],
+    roles: [],
+    doneRoles: [],
+    completed: 0,
+    total: 0,
+    failed: 0,
+    running: true,
+    finished: false,
+    startedAt: now,
+    endedAt: now,
+  }
+}
+
+/** Fold one socket event into a note, preserving the user's expanded state. */
+function foldSubAgentEvent(
+  note: SubAgentNote,
+  evt: Record<string, unknown>,
+  now: number,
+): SubAgentNote {
+  const kind = String(evt.kind || '').trim()
+  const role = String(evt.role || '').trim()
+  const line = subagentEventLine(evt)
+  const failed = note.failed + (kind === 'agent_failed' ? 1 : 0)
+  const finished = note.finished || SUBAGENT_TERMINAL_KINDS.has(kind)
+  const terminal = kind === 'agent_finished' || kind === 'agent_failed'
+  const lastLog = note.logs[note.logs.length - 1]
+  return {
+    ...note,
+    logs: lastLog === line ? note.logs : [...note.logs, line],
+    roles: role && !note.roles.includes(role) ? [...note.roles, role] : note.roles,
+    doneRoles:
+      terminal && role && !note.doneRoles.includes(role)
+        ? [...note.doneRoles, role]
+        : note.doneRoles,
+    completed: Math.max(note.completed, Number(evt.completed) || 0),
+    total: Math.max(note.total, Number(evt.total) || 0),
+    failed,
+    running: !finished,
+    finished,
+    endedAt: now,
+  }
+}
+
+/**
+ * Agent counts, preferring the server's own completed/total counters and
+ * falling back to the roles observed on the socket. A batch that never emits
+ * ``batch_progress`` would otherwise read as "0/0" the whole way through.
+ */
+function subagentCounts(note: SubAgentNote): { done: number; total: number } {
+  const observed = Math.max(note.roles.length, note.doneRoles.length)
+  return {
+    done: note.completed > 0 ? note.completed : note.doneRoles.length,
+    total: note.total > 0 ? note.total : observed,
+  }
+}
+
+function sealSubAgentNotes(list: Message[]): Message[] {
+  return list.map(item =>
+    item.role === 'subagent' && item.subagent && !item.subagent.finished
+      ? { ...item, subagent: { ...item.subagent, running: false, finished: true } }
+      : item,
+  )
 }
 
 const WEEKDAY_OPTIONS = [
@@ -589,7 +905,14 @@ function App() {
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentInfo[]>([])
   const [config, setConfig] = useState<any>(null)
   const [configText, setConfigText] = useState<string>('')
-  const [confirmReq, setConfirmReq] = useState<any>(null)
+  const [confirmReq, setConfirmReq] = useState<ConfirmRequest | null>(null)
+  const [confirmRemaining, setConfirmRemaining] = useState(0)
+  const [confirmDetailOpen, setConfirmDetailOpen] = useState(false)
+  const [confirmOverflowing, setConfirmOverflowing] = useState(false)
+  const approvalCommandRef = useRef<HTMLDivElement | null>(null)
+  // Absolute deadline rather than a decremented counter: background tabs get
+  // their timers throttled, and a counter would drift behind the server.
+  const confirmDeadlineRef = useRef(0)
   const [drafts, setDrafts] = useState<Record<string, string>>(() => {
     try {
       const raw = localStorage.getItem('chat_drafts')
@@ -621,7 +944,10 @@ function App() {
     if (!activeSession) return
     const t = setTimeout(() => {
       try {
-        localStorage.setItem(`chat_messages:${activeSession}`, JSON.stringify(messages))
+        // Sub-agent notes are live telemetry with no server-side record, so
+        // caching them would only produce a flash of stale strips on reload.
+        const durable = messages.filter(item => item.role !== 'subagent')
+        localStorage.setItem(`chat_messages:${activeSession}`, JSON.stringify(durable))
         const raw = localStorage.getItem('chat_messages:index')
         const index = (raw ? (JSON.parse(raw) as string[]) : []).filter(
           id => id !== activeSession,
@@ -642,7 +968,10 @@ function App() {
   const [pluginSearch, setPluginSearch] = useState('')
   const [skillSearch, setSkillSearch] = useState('')
   const [skillFilter, setSkillFilter] = useState<'all' | 'callable' | 'internal'>('all')
-  const [currentModel, setCurrentModel] = useState('默认模型')
+  // '' means "provider default": the backend resolves no override to the
+  // active provider's default model. Never a display string — the backend
+  // must not have to know the UI's wording.
+  const [currentModel, setCurrentModel] = useState('')
   const [currentProvider, setCurrentProvider] = useState('')
   const [permissionLevel, setPermissionLevel] = useState('ask')
   const [sandboxMode, setSandboxMode] = useState('read_all')
@@ -675,6 +1004,9 @@ function App() {
   const sendShortcutLabel = sendShortcut === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'
   const [sessionState, setSessionState] = useState<SessionState | null>(null)
   const [resumingTaskId, setResumingTaskId] = useState<string | null>(null)
+  // Guards the task-guidance buttons against a double click landing two
+  // decisions (and two queued interjections) before React re-renders.
+  const taskActionRef = useRef(false)
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([])
   const [form] = Form.useForm()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -848,10 +1180,9 @@ function App() {
         }
         const loaded = (data.messages || []).map(
           (item: any): Message => {
-            let link = item.link || ''
-            if (link && token) {
-              link += (link.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token)
-            }
+            // The backend only knows the path; the owner (this session) is
+            // attached here so the gateway can authorise the read.
+            const link = withFileSession(item.link || '', sid, token)
             return {
               id: makeId(),
               role: (item.role as MessageRole) || 'assistant',
@@ -865,7 +1196,9 @@ function App() {
         )
         const current = messagesRef.current
         const hasLiveTransient = current.some(item =>
-          item.streaming || (item.role === 'tool' && item.toolState === 'running'),
+          item.streaming ||
+          (item.role === 'tool' && item.toolState === 'running') ||
+          (item.role === 'subagent' && !!item.subagent?.running),
         )
         // A socket event may be newer than the state snapshot when a message
         // is submitted immediately after selecting the session.
@@ -882,6 +1215,11 @@ function App() {
           const runningTools = current.filter(
             item => item.role === 'tool' && item.toolState === 'running',
           )
+          // Sub-agent notes are socket-only; the server never persists them,
+          // so a state refresh mid-batch would erase a running note.
+          const runningSubagents = current.filter(
+            item => item.role === 'subagent' && !!item.subagent?.running,
+          )
           for (const tool of runningTools) {
             const durableIndex = merged.findIndex(item =>
               item.role === 'tool' &&
@@ -891,6 +1229,7 @@ function App() {
             if (durableIndex >= 0) merged[durableIndex] = tool
             else merged.push(tool)
           }
+          merged.push(...runningSubagents)
           if (latestStream) merged.push(latestStream)
         }
         messagesRef.current = merged
@@ -921,10 +1260,18 @@ function App() {
         setResumingTaskId(previous => {
           if (!previous) return null
           const task = data.task
-          const taskKey = task?.task_id || task?.active_goal || ''
-          const status = String(task?.status || '').toLowerCase()
-          const stillInterrupted = ['cancelled', 'interrupted', 'failed'].includes(status)
-          return taskKey === previous && stillInterrupted ? previous : null
+          // Defaulting to "show the card again" is what made the prompt come
+          // back after the user answered it: a refresh that briefly reports no
+          // task, or a task whose id has not been assigned yet, is not evidence
+          // that a new interruption happened. Only a genuinely different task
+          // in a non-interrupted state retires the suppression.
+          if (!task) return previous
+          const taskKey = task.task_id || task.active_goal || ''
+          if (!taskKey) return previous
+          const status = String(task.status || '').toLowerCase()
+          return taskKey === previous && TASK_INTERRUPTED_STATUSES.has(status)
+            ? previous
+            : null
         })
         // Restoring a session while its agent is still working should bring
         // back the generating state (and stop button) even before the first
@@ -1060,6 +1407,13 @@ function App() {
           }
           setIsStreaming(false)
           setActivity('')
+          // The turn is over, so any prompt still on screen was answered or
+          // timed out server-side; leaving it up would offer dead buttons.
+          setConfirmReq(null)
+          // A batch that never emitted ``batch_finished`` (interrupted, or an
+          // older server) must not keep spinning forever.
+          messagesRef.current = sealSubAgentNotes(messagesRef.current)
+          setMessages([...messagesRef.current])
           loadSessions()
           loadSessionState(sid)
           const nextQueued = queuedMessagesRef.current.shift()
@@ -1155,7 +1509,7 @@ function App() {
 
         if (evt.type === 'attachment') {
           const t = token
-          const link = `/api/files?path=${encodeURIComponent(evt.path)}${t ? `&token=${encodeURIComponent(t)}` : ''}`
+          const link = fileHref(evt.path, sid, t)
           let currentTurnStart = -1
           for (let index = messagesRef.current.length - 1; index >= 0; index -= 1) {
             if (messagesRef.current[index].role === 'user') {
@@ -1178,11 +1532,23 @@ function App() {
         }
 
         if (evt.type === 'subagent_event') {
-          appendMessage({
-            id: makeId(),
-            role: 'command',
-            content: `**${evt.agent || '子代理'}** · ${evt.event || evt.detail || '状态更新'}`,
-          })
+          // Update the open note in place; only start a new one once the
+          // previous batch has reported itself finished.
+          const now = Date.now()
+          const list = messagesRef.current
+          const last = list[list.length - 1]
+          if (last && last.role === 'subagent' && last.subagent && !last.subagent.finished) {
+            updateMessage(last.id, {
+              subagent: foldSubAgentEvent(last.subagent, evt, now),
+            })
+          } else {
+            appendMessage({
+              id: makeId(),
+              role: 'subagent',
+              content: '',
+              subagent: foldSubAgentEvent(newSubAgentNote(now), evt, now),
+            })
+          }
           return
         }
 
@@ -1214,11 +1580,18 @@ function App() {
           })
           setResumingTaskId(null)
           setIsStreaming(false)
+          setConfirmReq(null)
+          messagesRef.current = sealSubAgentNotes(messagesRef.current)
+          setMessages([...messagesRef.current])
           return
         }
 
         if (evt.type === 'confirm_request') {
-          setConfirmReq(evt)
+          const timeout = Number(evt.timeout_seconds) > 0 ? Number(evt.timeout_seconds) : 120
+          confirmDeadlineRef.current = Date.now() + timeout * 1000
+          setConfirmRemaining(timeout)
+          setConfirmDetailOpen(false)
+          setConfirmReq(evt as ConfirmRequest)
         }
       }
     },
@@ -1248,10 +1621,14 @@ function App() {
             // Streaming and running-tool rows are snapshots, not history.
             // A reconnecting socket will restore them if this session is
             // genuinely still active.
-            const durableCache = arr.filter(item =>
-              !item.streaming &&
-              !(item.role === 'tool' && item.toolState === 'running'),
-            )
+            const durableCache = arr
+              .filter(item =>
+                !item.streaming &&
+                item.role !== 'subagent' &&
+                !(item.role === 'tool' && item.toolState === 'running'),
+              )
+              // Cache entries can predate session-scoped file links.
+              .map(item => (item.link ? { ...item, link: withFileSession(item.link, sid, token) } : item))
             messagesRef.current = durableCache
             setMessages(durableCache)
           } else {
@@ -1269,7 +1646,7 @@ function App() {
       loadMessages(sid)
       loadSessionPermissions(sid)
     },
-    [loadMessages, loadSessionPermissions],
+    [loadMessages, loadSessionPermissions, token],
   )
 
   useEffect(() => {
@@ -1404,8 +1781,9 @@ function App() {
   }
 
   const dismissTaskGuidance = async () => {
-    if (!activeSession || !sessionState?.task) return
+    if (!activeSession || !sessionState?.task || taskActionRef.current) return
     const taskId = sessionState.task.task_id || ''
+    taskActionRef.current = true
     try {
       await api(`/api/sessions/${encodeURIComponent(activeSession)}/task-guidance/dismiss`, {
         method: 'POST',
@@ -1417,14 +1795,22 @@ function App() {
         : previous)
     } catch {
       // The shared request helper reports the server error to the user.
+    } finally {
+      taskActionRef.current = false
     }
   }
 
   const continueTask = async () => {
-    if (!sessionState?.task) return
-    const taskKey = sessionState.task.task_id || sessionState.task.active_goal || ''
-    setResumingTaskId(taskKey)
-    await sendMessage('继续当前任务')
+    const task = sessionState?.task
+    // A second click must not queue a second continuation for the same prompt.
+    if (!task || taskActionRef.current) return
+    taskActionRef.current = true
+    setResumingTaskId(task.task_id || task.active_goal || '')
+    try {
+      await sendMessage('继续当前任务')
+    } finally {
+      taskActionRef.current = false
+    }
   }
 
   const handleFilesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -1477,20 +1863,84 @@ function App() {
     }
   }
 
-  const sendConfirm = (approved: boolean) => {
-    if (!confirmReq || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
+  // Clear the prompt before sending: a double click on "允许" must not emit two
+  // replies for one token, and the bar should not linger while the turn resumes.
+  const sendConfirm = useCallback(
+    (decision: ConfirmDecision) => {
+      const request = confirmReq
       setConfirmReq(null)
+      setConfirmDetailOpen(false)
+      if (!request) return
+      const socket = wsRef.current
+      if (!socket || socket.readyState !== WebSocket.OPEN) return
+      socket.send(
+        JSON.stringify({
+          type: 'confirm_response',
+          decision,
+          confirmation_token: request.confirmation_token || '',
+        }),
+      )
+    },
+    [confirmReq],
+  )
+
+  // Countdown to the server-side deadline, so "it just silently expired" can't
+  // happen while the user is deciding.
+  useEffect(() => {
+    if (!confirmReq) {
+      setConfirmRemaining(0)
       return
     }
-    wsRef.current.send(
-      JSON.stringify({
-        type: 'confirm_response',
-        approved,
-        confirmation_token: confirmReq.confirmation_token || '',
-      }),
-    )
-    setConfirmReq(null)
-  }
+    const tick = () => {
+      setConfirmRemaining(
+        Math.max(0, Math.ceil((confirmDeadlineRef.current - Date.now()) / 1000)),
+      )
+    }
+    tick()
+    const timer = window.setInterval(tick, 1000)
+    return () => window.clearInterval(timer)
+  }, [confirmReq])
+
+  // Whether the command is actually clipped, measured from the rendered box.
+  // A character-count guess gets this wrong the moment the text is mostly
+  // CJK (one character is a full column wide, not a half) and would leave the
+  // user staring at a command they cannot expand.
+  useEffect(() => {
+    if (!confirmReq) {
+      setConfirmOverflowing(false)
+      return
+    }
+    // Keep the toggle available while expanded, otherwise collapsing becomes
+    // impossible as soon as the tall box stops overflowing.
+    if (confirmDetailOpen) return
+    const element = approvalCommandRef.current
+    if (!element) {
+      setConfirmOverflowing(false)
+      return
+    }
+    const measure = () => setConfirmOverflowing(element.scrollHeight > element.clientHeight + 1)
+    measure()
+    const observer = new ResizeObserver(measure)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [confirmReq, confirmDetailOpen])
+
+  useEffect(() => {
+    if (!confirmReq) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        sendConfirm('deny')
+        return
+      }
+      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        event.preventDefault()
+        sendConfirm(event.shiftKey && confirmReq.allow_session ? 'allow_session' : 'allow_once')
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [confirmReq, sendConfirm])
 
   const loadPlugins = useCallback(async () => {
     try {
@@ -1754,7 +2204,10 @@ function App() {
       const providers = cfg.providers || {}
       const active = providers[cfg.active_provider] || {}
       setCurrentProvider(cfg.active_provider || '')
-      setCurrentModel(active.default_model || '默认模型')
+      // Only seed the composer's model when the user has not picked one:
+      // reloading settings (opening the settings view, saving) must not
+      // silently revert a per-turn model selection.
+      setCurrentModel(prev => prev || active.default_model || '')
       form.setFieldsValue({
         active_provider: cfg.active_provider,
         model: active.default_model,
@@ -2335,10 +2788,14 @@ function App() {
   // in the list: a short model should not reserve the width of a long one.
   // The popup is width-independent (popupMatchSelectWidth={false}), so long
   // entries still read in full while open; the closed control ellipsizes past
-  // the clamp.
+  // the clamp. CJK characters are roughly twice a digit's width.
   const modelSelectWidth = useMemo(() => {
     const name = currentModel || ''
-    return `${Math.max(88, Math.min(240, name.length * 7 + 50))}px`
+    const units = [...name].reduce(
+      (sum, ch) => sum + (ch.charCodeAt(0) > 0x2e7f ? 14 : 7),
+      0,
+    )
+    return `${Math.max(88, Math.min(240, units + 50))}px`
   }, [currentModel])
 
   // Settings page: models of the currently selected provider. The default
@@ -2364,6 +2821,10 @@ function App() {
     currentModelRef.current = model
     setCurrentModel(model)
   }
+
+  // Placeholder while the config has not loaded yet; once loaded,
+  // currentModel holds the active provider's default model id.
+  const modelSelectPlaceholder = currentModel ? undefined : '默认模型'
 
   const filteredCommands = useMemo(() => {
     const query = input.startsWith('/')
@@ -2639,6 +3100,53 @@ function App() {
   const renderMessage = (item: Message, traceSummary?: React.ReactNode) => {
     if (item.role === 'tool') return renderToolEvent(item)
 
+    if (item.role === 'subagent' && item.subagent) {
+      const note = item.subagent
+      const { done, total } = subagentCounts(note)
+      const roleCount = Math.max(note.roles.length, note.doneRoles.length, note.total)
+      const seconds = Math.max(0, (note.endedAt - note.startedAt) / 1000)
+      const latest = note.logs[note.logs.length - 1] || ''
+      const tone = note.failed > 0 ? 'failed' : note.running ? 'running' : 'done'
+      const stateText = note.running
+        ? roleCount > 0 ? `${roleCount} 个代理运行中` : '正在运行'
+        : note.failed > 0
+          ? roleCount > 0 ? `${roleCount} 个代理已结束` : '已结束'
+          : roleCount > 0 ? `${roleCount} 个代理已完成` : '已完成'
+      return (
+        <div key={item.id} className={`subagent-note subagent-note-${tone}`}>
+          <button
+            type="button"
+            className="subagent-note-head"
+            aria-expanded={!!note.open}
+            onClick={() =>
+              updateMessage(item.id, { subagent: { ...note, open: !note.open } })
+            }
+          >
+            <span className="subagent-note-dot" />
+            <span className="subagent-note-title">子代理协作</span>
+            <span className="subagent-note-state">{stateText}</span>
+            {note.failed > 0 && (
+              <span className="subagent-note-failed">{note.failed} 个失败</span>
+            )}
+            {note.running && latest && (
+              <span className="subagent-note-latest">{latest}</span>
+            )}
+            <span className="subagent-note-metrics">
+              {note.running ? `${done}/${total || '?'}` : `${seconds.toFixed(1)}s`}
+            </span>
+            <DownOutlined className="subagent-note-chevron" rotate={note.open ? 180 : 0} />
+          </button>
+          {note.open && (
+            <ol className="subagent-note-logs">
+              {note.logs.map((line, index) => (
+                <li key={`${item.id}-${index}`}>{line}</li>
+              ))}
+            </ol>
+          )}
+        </div>
+      )
+    }
+
     if (item.role === 'command' || item.role === 'error') {
       return (
         <div
@@ -2647,7 +3155,7 @@ function App() {
         >
           <div
             className="markdown"
-            dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content) }}
+            dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, activeSession, token) }}
           />
         </div>
       )
@@ -2673,17 +3181,20 @@ function App() {
           <div className={`bubble ${isUser ? 'bubble-user' : 'bubble-assistant'} ${item.attachments?.length ? 'bubble-with-attachments' : ''}`}>
             {item.attachments && item.attachments.length > 0 && (
               <div className="message-attachments">
-                {item.attachments.map(attachment => (
-                  <a className="message-attachment" key={attachment.id || attachment.path} href={`/api/files?path=${encodeURIComponent(attachment.path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`} target="_blank" rel="noreferrer">
-                    {attachment.kind === 'image' ? <img src={`/api/files?path=${encodeURIComponent(attachment.path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`} alt={attachment.filename} /> : <FileTextOutlined />}
-                    <span>{attachment.filename}</span>
-                  </a>
-                ))}
+                {item.attachments.map(attachment => {
+                  const href = fileHref(attachment.path, activeSession, token)
+                  return (
+                    <a className="message-attachment" key={attachment.id || attachment.path} href={href} target="_blank" rel="noreferrer">
+                      {attachment.kind === 'image' ? <img src={href} alt={attachment.filename} /> : <FileTextOutlined />}
+                      <span>{attachment.filename}</span>
+                    </a>
+                  )
+                })}
               </div>
             )}
             <div
               className="markdown"
-              dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content) }}
+              dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, activeSession, token) }}
             />
             {item.streaming && (
               <span className="typing-dots" aria-label="正在输入">
@@ -3017,6 +3528,84 @@ function App() {
       </div>
 
       <div className="composer-wrap">
+        {confirmReq && (() => {
+          const risk = confirmRisk(confirmReq.risk_level)
+          const timedOut = confirmRemaining <= 0
+          const commandText = confirmReq.command || '未知命令'
+          const showDetailToggle = confirmOverflowing || confirmDetailOpen
+          return (
+            <div
+              className={`approval-bar approval-risk-${risk}`}
+              role="alertdialog"
+              aria-label="工具审批"
+              aria-live="assertive"
+            >
+              <div className="approval-head">
+                <SafetyCertificateOutlined className="approval-icon" />
+                <span className="approval-title">需要你的批准</span>
+                <span className={`approval-risk-tag approval-risk-tag-${risk}`}>
+                  {CONFIRM_RISK_LABELS[risk]}
+                </span>
+                <span className="approval-tool">{confirmToolLabel(confirmReq.name)}</span>
+                <span className={`approval-timer ${timedOut ? 'expired' : ''}`}>
+                  {timedOut ? '已超时，等待服务器确认' : `${confirmRemaining}s 后自动拒绝`}
+                </span>
+              </div>
+              {confirmReq.reason && (
+                <div className="approval-reason">{confirmReq.reason}</div>
+              )}
+              <div
+                className={`approval-command ${confirmDetailOpen ? 'expanded' : ''}`}
+                ref={approvalCommandRef}
+              >
+                <code>{commandText}</code>
+              </div>
+              {showDetailToggle && (
+                <button
+                  type="button"
+                  className="approval-detail-toggle"
+                  onClick={() => setConfirmDetailOpen(open => !open)}
+                >
+                  {confirmDetailOpen ? '收起命令' : '展开完整命令'}
+                  <DownOutlined rotate={confirmDetailOpen ? 180 : 0} />
+                </button>
+              )}
+              <div className="approval-actions">
+                <span className="approval-hints">
+                  <kbd>Esc</kbd> 拒绝
+                  <span className="approval-hint-sep" />
+                  <kbd>⌘</kbd><kbd>↵</kbd> 允许本次
+                  {confirmReq.allow_session && (
+                    <>
+                      <span className="approval-hint-sep" />
+                      <kbd>⌘</kbd><kbd>⇧</kbd><kbd>↵</kbd> 本会话总是允许
+                    </>
+                  )}
+                </span>
+                <Button size="small" disabled={timedOut} onClick={() => sendConfirm('deny')}>
+                  拒绝
+                </Button>
+                {confirmReq.allow_session && (
+                  <Button
+                    size="small"
+                    disabled={timedOut}
+                    onClick={() => sendConfirm('allow_session')}
+                  >
+                    本会话总是允许
+                  </Button>
+                )}
+                <Button
+                  size="small"
+                  type="primary"
+                  disabled={timedOut}
+                  onClick={() => sendConfirm('allow_once')}
+                >
+                  允许本次
+                </Button>
+              </div>
+            </div>
+          )
+        })()}
         {Math.max(
           queuedMessages.length,
           Number(sessionState?.queue?.pending || 0),
@@ -3036,15 +3625,19 @@ function App() {
           </div>
         )}
         {sessionState?.task?.active_goal &&
-          resumingTaskId !== (sessionState.task.task_id || sessionState.task.active_goal) &&
-          !['completed', 'success', 'done', 'updated', 'dismissed'].includes(
+          !isStreaming &&
+          resumingTaskId !== (sessionState.task.task_id || sessionState.task.active_goal || '') &&
+          TASK_INTERRUPTED_STATUSES.has(
             String(sessionState.task.status || '').toLowerCase(),
           ) && (
             <div className="task-guidance-card">
               <div className="task-guidance-head">
                 <span className="task-guidance-label">当前任务</span>
                 {sessionState.task.status && (
-                  <span className="task-guidance-status">{sessionState.task.status}</span>
+                  <span className="task-guidance-status">
+                    {TASK_STATUS_LABELS[String(sessionState.task.status).toLowerCase()]
+                      || sessionState.task.status}
+                  </span>
                 )}
               </div>
               <strong>{truncate(sessionState.task.active_goal, 140)}</strong>
@@ -3077,7 +3670,7 @@ function App() {
           {pendingAttachments.length > 0 && (
             <div className="composer-attachments" aria-label="待发送附件">
               {pendingAttachments.map(item => {
-                const fileUrl = `/api/files?path=${encodeURIComponent(item.path)}${token ? `&token=${encodeURIComponent(token)}` : ''}`
+                const fileUrl = fileHref(item.path, activeSession, token)
                 const kindLabel = item.kind === 'image'
                   ? '图片'
                   : item.kind === 'document'
@@ -3158,9 +3751,7 @@ function App() {
               setCommandDismissed(false)
             }}
             onKeyDown={handleComposerKeyDown}
-            placeholder={sendShortcut === 'ctrl-enter'
-              ? '输入消息，/ 查看命令，Ctrl/Cmd + Enter 发送，Enter 换行'
-              : '输入消息，/ 查看命令，Enter 发送，Shift + Enter 换行'}
+            placeholder="给 Simple Agent 发送消息"
             autoSize={{ minRows: 1, maxRows: 6 }}
             variant="borderless"
             disabled={false}
@@ -3168,35 +3759,34 @@ function App() {
           <div className="composer-footer">
             <div className="composer-tools">
               <Tooltip title="添加图片或文件">
-                <Button type="text" className="composer-icon-button" aria-label="添加附件" icon={<UploadOutlined />} onClick={() => fileInputRef.current?.click()} />
+                <Button type="text" className="composer-icon-button" aria-label="添加附件" icon={<PaperClipOutlined />} onClick={() => fileInputRef.current?.click()} />
               </Tooltip>
               <input ref={fileInputRef} type="file" multiple hidden onChange={handleFilesSelected} accept="image/*,.pdf,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" />
-              <Tooltip title={sessionState?.workspace_root ? `切换工作区：${sessionState.workspace_root}` : '选择 Agent 接下来工作的项目文件夹'}>
-                <button
-                  type="button"
-                  className={`workspace-picker ${sessionState?.workspace_status === 'missing' ? 'workspace-picker-missing' : ''}`}
-                  aria-label={sessionState?.workspace_root
-                    ? `当前工作区：${sessionState.workspace_root}，${sessionState.workspace_write ? '可写' : '只读'}，点击切换`
-                    : '选择工作区'}
-                  onClick={pickWorkspace}
-                >
-                  <FolderOpenOutlined aria-hidden="true" />
-                  {sessionState?.workspace_root ? (
-                    <>
-                      <span className="workspace-picker-label">工作区</span>
-                      <strong title={sessionState.workspace_root}>{compactWorkspacePath(sessionState.workspace_root)}</strong>
-                      <span className="workspace-status-dot" aria-hidden="true" />
-                      <span className="workspace-status-text">{sessionState.workspace_status === 'missing' ? '不可用' : (sessionState.workspace_write ? '可写' : '只读')}</span>
-                    </>
-                  ) : (
-                    <strong>选择工作区</strong>
-                  )}
-                </button>
-              </Tooltip>
-              <Dropdown
-                trigger={['click']}
-                placement="topLeft"
-                menu={{
+              <div className="composer-context-controls">
+                <Tooltip title={sessionState?.workspace_root ? `切换工作区：${sessionState.workspace_root}` : '选择 Agent 接下来工作的项目文件夹'}>
+                  <button
+                    type="button"
+                    className={`workspace-picker ${sessionState?.workspace_status === 'missing' ? 'workspace-picker-missing' : ''}`}
+                    aria-label={sessionState?.workspace_root
+                      ? `当前工作区：${sessionState.workspace_root}，${sessionState.workspace_write ? '可写' : '只读'}，点击切换`
+                      : '选择工作区'}
+                    onClick={pickWorkspace}
+                  >
+                    <FolderOpenOutlined aria-hidden="true" />
+                    {sessionState?.workspace_root ? (
+                      <>
+                        <strong title={sessionState.workspace_root}>{compactWorkspacePath(sessionState.workspace_root)}</strong>
+                        <span className="workspace-status-dot" aria-hidden="true" />
+                      </>
+                    ) : (
+                      <strong>选择工作区</strong>
+                    )}
+                  </button>
+                </Tooltip>
+                <Dropdown
+                  trigger={['click']}
+                  placement="topLeft"
+                  menu={{
                   items: [
                     {
                       key: 'permission-title',
@@ -3246,28 +3836,30 @@ function App() {
                       onClick: () => updateSessionPermissions({ sandbox: key }),
                     })),
                   ],
-                }}
-              >
-                <Button
-                  type="text"
-                  className="permission-button"
-                  icon={<GlobalOutlined />}
-                  aria-label={`当前权限：${permissionLabel}`}
+                  }}
                 >
-                  <span className="permission-button-label">{permissionLabel}</span>
-                </Button>
-              </Dropdown>
-              <Select
-                value={currentModel}
-                onChange={handleModelChange}
-                options={modelOptions}
-                className="model-select"
-                style={{ width: modelSelectWidth }}
-                popupMatchSelectWidth={false}
-                variant="borderless"
-              />
+                  <Button
+                    type="text"
+                    className="permission-button"
+                    icon={<SafetyCertificateOutlined />}
+                    aria-label={`当前权限：${permissionLabel}`}
+                  >
+                    <span className="permission-button-label">{permissionLabel}</span>
+                  </Button>
+                </Dropdown>
+                <Select
+                  value={currentModel || undefined}
+                  placeholder={modelSelectPlaceholder}
+                  onChange={handleModelChange}
+                  options={modelOptions}
+                  className="model-select"
+                  style={{ width: modelSelectWidth }}
+                  popupMatchSelectWidth={false}
+                  variant="borderless"
+                />
+              </div>
             </div>
-            <Space size={4}>
+            <div className="composer-actions">
               {isStreaming && (
                 <Tooltip title="终止生成">
                   <Button
@@ -3285,12 +3877,12 @@ function App() {
                   type="primary"
                   className="send-button"
                   aria-label={isStreaming ? '排队发送' : '发送'}
-                  icon={<SendOutlined />}
+                  icon={<ArrowUpOutlined />}
                   disabled={!isStreaming && (!composerSendable || creatingSession)}
                   onClick={() => sendMessage(resolvedComposerText)}
                 />
               </Tooltip>
-            </Space>
+            </div>
           </div>
         </div>
       </div>
@@ -3695,7 +4287,7 @@ function App() {
                   <Select
                     allowClear
                     showSearch
-                    placeholder={`默认模型 · ${currentModel}`}
+                    placeholder="默认模型"
                     value={scheduleDraft.model_override || undefined}
                     onChange={value => setScheduleDraft({ ...scheduleDraft, model_override: value || '' })}
                     options={modelOptions}
@@ -4667,35 +5259,6 @@ function App() {
               ))
             )}
           </div>
-        </div>
-      </Modal>
-
-      <Modal
-        open={!!confirmReq}
-        title={
-          <Space>
-            <SafetyCertificateOutlined />
-            工具审批
-          </Space>
-        }
-        onCancel={() => sendConfirm(false)}
-        footer={[
-          <Button key="deny" danger onClick={() => sendConfirm(false)}>
-            拒绝
-          </Button>,
-          <Button key="allow" type="primary" onClick={() => sendConfirm(true)}>
-            允许执行
-          </Button>,
-        ]}
-      >
-        <div className="confirm-command">
-          <code>{confirmReq?.command || '未知命令'}</code>
-        </div>
-        <div className="confirm-meta">
-          <Tag>
-            风险等级：{confirmReq?.risk_level || 'unknown'}
-          </Tag>
-          <Text type="secondary">{confirmReq?.reason || '需要你的确认后才会执行。'}</Text>
         </div>
       </Modal>
 

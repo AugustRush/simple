@@ -26,9 +26,36 @@ from agent import shared
 from agent.channels.base import Channel, IncomingMessage
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
+from agent.pathing import path_contains
 from agent.session_service import SessionService
 
 logger = logging.getLogger(__name__)
+
+# How long a browser is given to answer an approval prompt before the pending
+# action is declined.  Sent to the client as ``timeout_seconds`` so the UI can
+# count down honestly instead of going quiet and letting the approval expire.
+CONFIRMATION_TIMEOUT_SECONDS = 120
+
+# Approval decisions a client may return.  ``allow_session`` widens the consent
+# from "this one command" to "this command for the rest of the session" and is
+# only offered when the pending record can actually carry that intent.
+CONFIRM_DECISIONS = ("allow_once", "allow_session", "deny")
+
+def _normalize_confirm_decision(payload: dict[str, Any]) -> str:
+    """Map a client reply onto one of ``CONFIRM_DECISIONS``.
+
+    Accepts both the rich ``{"decision": "allow_session"}`` form and the
+    original ``{"approved": true}`` boolean, so an already-open browser tab
+    keeps working across a backend upgrade.
+    """
+    raw = str(payload.get("decision") or "").strip().casefold()
+    if raw == "allow_session":
+        return "allow_session"
+    if raw in ("allow_once", "allow", "approve"):
+        return "allow_once"
+    if raw in ("deny", "reject"):
+        return "deny"
+    return "allow_once" if payload.get("approved") else "deny"
 
 
 async def _pick_workspace_directory() -> str | None:
@@ -117,11 +144,31 @@ def _scheduler_run_payload(run: Any) -> dict[str, Any]:
         "config_snapshot": dict(getattr(run, "config_snapshot", {}) or {}),
         "output_available": output_available,
         "output_url": (
-            "/api/files?path=" + quote(output_path, safe="")
+            _scheduler_output_url(
+                str(getattr(run, "task_id", "") or ""),
+                str(getattr(run, "id", "") or ""),
+                output_path,
+            )
             if output_available
             else ""
         ),
     }
+
+
+def _scheduler_output_url(task_id: str, run_id: str, output_path: str) -> str:
+    """Build the ``/api/files`` link for a scheduled run's stored output.
+
+    The link names the run it belongs to so ``GET /api/files`` can verify the
+    entitlement against the scheduler store instead of trusting the path.
+    """
+    return (
+        "/api/files?path="
+        + quote(str(output_path), safe="")
+        + "&task_id="
+        + quote(str(task_id), safe="")
+        + "&run_id="
+        + quote(str(run_id), safe="")
+    )
 
 
 def _scheduler_task_payload(task: Any, latest_run: Any = None) -> dict[str, Any]:
@@ -359,12 +406,19 @@ class WebOutputSink(OutputSink):
         )
 
     def on_subagent_event(self, event: Any) -> None:
+        # ``SubAgentProgressEvent`` carries ``kind`` / ``role`` / ``message`` and
+        # an optional ``completed``/``total`` pair — not the ``agent``/``event``
+        # /``detail`` triple an earlier revision of this sink read.  Reading the
+        # wrong attributes silently produced empty strings, so every sub-agent
+        # update reached the browser as an unlabelled "状态更新" row.
         self._emit(
             {
                 "type": "subagent_event",
-                "agent": str(getattr(event, "agent", "") or ""),
-                "event": str(getattr(event, "event", "") or ""),
-                "detail": _jsonable(getattr(event, "detail", "") or ""),
+                "kind": str(getattr(event, "kind", "") or ""),
+                "role": str(getattr(event, "role", "") or ""),
+                "message": str(getattr(event, "message", "") or ""),
+                "completed": int(getattr(event, "completed", 0) or 0),
+                "total": int(getattr(event, "total", 0) or 0),
             }
         )
 
@@ -510,9 +564,24 @@ class WebOutputSink(OutputSink):
         confirmation_token: str,
         scope: Any,
     ) -> bool:
-        """Ask a connected web client for approval; deny when unavailable."""
+        """Ask a connected web client for approval; deny when unavailable.
+
+        The prompt is advisory to the browser only: whatever the human picks
+        still has to be redeemed against the pending record by the caller, so a
+        forged ``allow_session`` reply cannot widen consent for a token the
+        server never minted.
+        """
         if self._collect or self._websocket is None:
             return False
+        allow_session = self._session_scope_supported(
+            name, confirmation_token, scope
+        )
+        handler = self._confirmation_handler
+        # Claim the answer slot *before* the prompt goes out.  Registering it
+        # afterwards left a window in which a fast client's reply reached the
+        # socket reader while nothing was waiting on the token yet; the reply
+        # was dropped on the floor and the prompt then sat until it timed out.
+        pending = handler(confirmation_token) if callable(handler) else None
         self._emit(
             {
                 "type": "confirm_request",
@@ -521,23 +590,61 @@ class WebOutputSink(OutputSink):
                 "risk_level": risk_level,
                 "reason": reason,
                 "confirmation_token": confirmation_token,
+                "allow_session": allow_session,
+                "timeout_seconds": CONFIRMATION_TIMEOUT_SECONDS,
             }
         )
         await self.flush()
-        handler = self._confirmation_handler
-        if callable(handler):
+        decision = "deny"
+        if pending is not None:
             try:
-                return bool(await handler(confirmation_token))
+                decision = _normalize_confirm_decision(
+                    {"decision": await pending}
+                )
             except Exception:
                 return False
-        # Collection/testing sinks have no shared WebSocket reader.
-        try:
-            data = await asyncio.wait_for(self._websocket.receive_json(), timeout=120)
-        except Exception:
+        else:
+            # Collection/testing sinks have no shared WebSocket reader.
+            try:
+                data = await asyncio.wait_for(
+                    self._websocket.receive_json(),
+                    timeout=CONFIRMATION_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                return False
+            if not isinstance(data, dict) or data.get("type") != "confirm_response":
+                return False
+            decision = _normalize_confirm_decision(data)
+        if decision == "deny":
             return False
-        if not isinstance(data, dict) or data.get("type") != "confirm_response":
+        if decision == "allow_session" and allow_session:
+            # Hand the intent to the redeem step; it owns the pending record.
+            from agent.security.shell import shell_pending_mark_session_scope
+
+            try:
+                shell_pending_mark_session_scope(
+                    confirmation_token, scope=scope
+                )
+            except Exception:
+                logger.debug("session-scope consent mark failed", exc_info=True)
+        return True
+
+    @staticmethod
+    def _session_scope_supported(
+        name: str, confirmation_token: str, scope: Any
+    ) -> bool:
+        """Whether "always allow this command" is meaningful for this prompt.
+
+        Only shell approvals carry a redeemable pending record plus an
+        authorization scope, which is exactly the pair a session-wide entry is
+        keyed by.  Plugin installs and memory clears are one-shot by design and
+        must never advertise the option.
+        """
+        if str(name or "") != "shell" or not str(confirmation_token or ""):
             return False
-        return bool(data.get("approved", False))
+        from agent.security.shell import ShellAuthorizationScope
+
+        return isinstance(scope, ShellAuthorizationScope)
 
     # -- collection helpers ----------------------------------------------------
 
@@ -701,50 +808,32 @@ class WebChannel(Channel):
         return self._session_service
 
     @staticmethod
-    def _resolve_model_override(raw_model: Any, session_id: str = "") -> str | None:
+    def _resolve_model_override(raw_model: Any) -> str | None:
         """Validate a model selected by the browser.
 
-        The input control sends a model id, not a provider configuration.  Keep
-        this value scoped to the current turn and only accept ids advertised by
-        the local configuration (plus the configured top-level model).
+        The input control sends a model id, not a provider configuration.
+        Keep this value scoped to the current turn and only accept ids the
+        routing layer can dispatch — every configured provider's models, not
+        just the active provider's (RoutingTransport owns the model -> client
+        mapping, so a foreign provider's id is a valid per-turn override).
         """
         if raw_model is None:
             return None
         if not isinstance(raw_model, str):
             raise ValueError("model must be a string")
         model = raw_model.strip()
-        if not model or model == "默认模型":
+        if not model:
             return None
 
         cfg: dict[str, Any] = {}
         try:
             from agent.config import load_config
+            from agent.core.transport import routable_model_ids
 
             cfg, _ = load_config()
+            configured = routable_model_ids(cfg)
         except Exception:
-            cfg = {}
-        configured: set[str] = set()
-        top_level = cfg.get("model")
-        if isinstance(top_level, str) and top_level.strip():
-            configured.add(top_level.strip())
-        providers = cfg.get("providers")
-        if isinstance(providers, dict):
-            # A session's client is initialized for the active provider.  Keep
-            # the input selector honest by accepting only models that client
-            # can serve; changing provider remains an explicit settings action.
-            active_name = cfg.get("active_provider")
-            provider = providers.get(active_name, {})
-            if isinstance(provider, dict):
-                default = provider.get("default_model")
-                if isinstance(default, str) and default.strip():
-                    configured.add(default.strip())
-                models = provider.get("models")
-                if isinstance(models, (list, tuple)):
-                    configured.update(
-                        item.strip()
-                        for item in models
-                        if isinstance(item, str) and item.strip()
-                    )
+            configured = set()
         if configured and model not in configured:
             raise ValueError("model is not available in the current configuration")
         if not configured:
@@ -1223,7 +1312,9 @@ class WebChannel(Channel):
                 "available": True,
                 "content": content,
                 "truncated": truncated,
-                "output_url": "/api/files?path=" + quote(str(output_path), safe=""),
+                "output_url": _scheduler_output_url(
+                    task_id, str(getattr(run, "id", "") or run_id), str(output_path)
+                ),
             }
         )
 
@@ -1683,6 +1774,103 @@ class WebChannel(Channel):
             return JSONResponse({"error": response_text or "unable to reveal session"}, status_code=500)
         return JSONResponse({"ok": True, "path": str(target)})
 
+    def _file_roots_for(self, request: Any) -> list[Path]:
+        """Directories ``GET /api/files`` may serve for *this* request.
+
+        Serving a file is granting a capability to read one path, so the
+        gateway authorises each request against the owner of the file instead
+        of keeping one global allowlist of every directory it has ever seen.
+        The owner is named explicitly by the caller and there are exactly two
+        kinds:
+
+        * ``session_id`` — the Web session that produced the file. Its sandbox
+          is its own home (``output/``, ``uploads/``) plus the workspace folder
+          the user picked for it, which is exactly what the agent's
+          ``send_file`` tool was already allowed to write to.
+        * ``task_id`` + ``run_id`` — a scheduled run whose output the gateway
+          itself recorded.
+
+        A request that names neither owner gets nothing, which is the point:
+        without an owner there is no way to tell whether the caller is entitled
+        to the file.
+        """
+        session_id = str(request.query_params.get("session_id") or "").strip()
+        if session_id:
+            return self._session_file_roots(session_id)
+        task_id = str(request.query_params.get("task_id") or "").strip()
+        run_id = str(request.query_params.get("run_id") or "").strip()
+        if task_id and run_id:
+            return self._schedule_file_roots(task_id, run_id)
+        return []
+
+    def _session_file_roots(self, session_id: str) -> list[Path]:
+        """The sandbox one Web session is allowed to read attachments from."""
+        roots: list[Path] = []
+
+        def add(value: Any) -> None:
+            if not value:
+                return
+            try:
+                candidate = Path(str(value)).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                return
+            if candidate.is_dir() and candidate not in roots:
+                roots.append(candidate)
+
+        # A session id that does not match a real home resolves to a directory
+        # that is not there, so ``add`` drops it and the request is refused.
+        try:
+            add(shared.web_session_home(session_id))
+        except (OSError, ValueError):
+            pass
+        add(self._session_workspace_root(session_id))
+        return roots
+
+    def _session_workspace_root(self, session_id: str) -> str:
+        """The workspace folder recorded for one session, live or restored.
+
+        A live session keeps the value in context metadata; a session restored
+        from disk keeps it in its own ``.session.json`` manifest. Reading the
+        manifest only for the session being asked about keeps this per-request
+        lookup from ever widening into a scan of other sessions' folders.
+        """
+        state = self._sessions.get(session_id)
+        metadata = getattr(getattr(state, "ctx", None), "metadata", None)
+        if isinstance(metadata, dict):
+            value = str(metadata.get("workspace_root") or "").strip()
+            if value:
+                return value
+        try:
+            manifest = shared.web_session_home(session_id) / ".session.json"
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return ""
+        if isinstance(payload, dict):
+            return str(payload.get("workspace_root") or "").strip()
+        return ""
+
+    def _schedule_file_roots(self, task_id: str, run_id: str) -> list[Path]:
+        """The recorded output of one scheduled run, verified against the store.
+
+        The path is never taken from the query string; it is re-read from the
+        run so a forged ``path`` cannot point at an unrelated local file.
+        """
+        from agent.scheduler import SchedulerStore
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            run = store.get_run(task_id, run_id)
+        except Exception:
+            return []
+        finally:
+            store.close()
+        if run is None:
+            return []
+        output = _scheduler_output_path(task_id, run)
+        if output is None or not output.is_file():
+            return []
+        return [output]
+
     async def _file(self, request: Any) -> Any:
         from starlette.responses import FileResponse, JSONResponse
 
@@ -1691,25 +1879,15 @@ class WebChannel(Channel):
         raw_path = request.query_params.get("path", "")
         if not raw_path:
             return JSONResponse({"error": "path is required"}, status_code=400)
-        candidate = Path(raw_path).expanduser()
         try:
-            resolved = candidate.resolve()
-            allowed_roots = [shared.AGENT_HOME.resolve()]
-            try:
-                web_root = shared.web_session_root().resolve()
-                if web_root.is_dir():
-                    allowed_roots.append(web_root)
-            except OSError:
-                pass
-            if not any(
-                resolved == root or root in resolved.parents
-                for root in allowed_roots
-            ):
-                return JSONResponse({"error": "forbidden path"}, status_code=403)
-            if not resolved.is_file():
-                return JSONResponse({"error": "file not found"}, status_code=404)
+            resolved = Path(raw_path).expanduser().resolve()
         except OSError:
             return JSONResponse({"error": "invalid path"}, status_code=400)
+        roots = self._file_roots_for(request)
+        if not roots or not any(path_contains(root, resolved) for root in roots):
+            return JSONResponse({"error": "forbidden path"}, status_code=403)
+        if not resolved.is_file():
+            return JSONResponse({"error": "file not found"}, status_code=404)
         return FileResponse(resolved)
 
     async def _list_sessions(self, request: Any) -> Any:
@@ -1861,6 +2039,7 @@ class WebChannel(Channel):
         from agent.security.shell import (
             PERMISSION_LEVELS,
             ShellAuthorizationScope,
+            shell_session_allowlist_commands,
             shell_session_permission_get,
             shell_session_sandbox_get,
         )
@@ -1888,6 +2067,29 @@ class WebChannel(Channel):
             "session_sandbox": session_sandbox,
             "levels": list(PERMISSION_LEVELS),
             "sandbox_modes": list(SANDBOX_MODES),
+            # Commands the human approved for this session, so "always allow"
+            # answers are auditable and revocable rather than invisible.
+            "approved_commands": shell_session_allowlist_commands(scope=scope),
+        })
+
+    async def _delete_session_approvals(self, request: Any) -> Any:
+        """Revoke every session-scoped command approval for one session."""
+        from starlette.responses import JSONResponse
+        from agent.security.shell import (
+            ShellAuthorizationScope,
+            shell_session_allowlist_clear_scope,
+        )
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = str(request.path_params["session_id"])
+        scope = ShellAuthorizationScope(session_id, "web", "")
+        removed = shell_session_allowlist_clear_scope(scope)
+        return JSONResponse({
+            "ok": True,
+            "session_id": session_id,
+            "removed": removed,
+            "approved_commands": [],
         })
 
     async def _patch_session_permissions(self, request: Any) -> Any:
@@ -1955,7 +2157,7 @@ class WebChannel(Channel):
         )
         sink.mark_turn_start()
         try:
-            model = self._resolve_model_override(body.get("model"), session_id)
+            model = self._resolve_model_override(body.get("model"))
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         await self._handle_text(
@@ -2022,17 +2224,25 @@ class WebChannel(Channel):
                 except Exception:
                     pass
         active_tasks: set[asyncio.Task[Any]] = set()
-        confirmation_waiters: dict[str, asyncio.Future[bool]] = {}
+        confirmation_waiters: dict[str, asyncio.Future[str]] = {}
 
-        def wait_for_confirmation(token: str) -> asyncio.Future[bool]:
+        def wait_for_confirmation(token: str) -> asyncio.Future[str]:
+            """Resolve to an ``allow_once`` / ``allow_session`` / ``deny`` string.
+
+            A bare bool could not express "always allow", so the waiter carries
+            the human's decision verbatim and lets the sink decide what it
+            means for the pending record it is about to redeem.
+            """
             loop = asyncio.get_running_loop()
-            future: asyncio.Future[bool] = loop.create_future()
+            future: asyncio.Future[str] = loop.create_future()
             confirmation_waiters[token] = future
-            async def guarded() -> bool:
+            async def guarded() -> str:
                 try:
-                    return bool(await asyncio.wait_for(future, timeout=120))
+                    return str(await asyncio.wait_for(
+                        future, timeout=CONFIRMATION_TIMEOUT_SECONDS
+                    ))
                 except asyncio.TimeoutError:
-                    return False
+                    return "deny"
                 finally:
                     confirmation_waiters.pop(token, None)
             return asyncio.ensure_future(guarded())
@@ -2100,7 +2310,7 @@ class WebChannel(Channel):
                     token = str(data.get("confirmation_token") or "")
                     waiter = confirmation_waiters.get(token)
                     if waiter is not None and not waiter.done():
-                        waiter.set_result(bool(data.get("approved", False)))
+                        waiter.set_result(_normalize_confirm_decision(data))
                     continue
                 if data.get("type") != "message":
                     continue
@@ -2112,7 +2322,7 @@ class WebChannel(Channel):
                     continue
                 message_id = str(data.get("message_id") or uuid.uuid4().hex)
                 try:
-                    model = self._resolve_model_override(data.get("model"), session_id)
+                    model = self._resolve_model_override(data.get("model"))
                 except ValueError as exc:
                     await websocket.send_json({"type": "error", "error": str(exc)})
                     continue
@@ -2392,6 +2602,11 @@ class WebChannel(Channel):
                 "/api/sessions/{session_id}/permissions",
                 self._patch_session_permissions,
                 methods=["PATCH"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/approvals",
+                self._delete_session_approvals,
+                methods=["DELETE"],
             ),
             WebSocketRoute(
                 "/api/sessions/{session_id}/stream",

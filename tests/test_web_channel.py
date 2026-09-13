@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 
@@ -314,6 +316,194 @@ def test_web_stream_tool_confirmation_roundtrip():
             assert received[-1]["text"] == "approved"
 
 
+_T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+_DANGEROUS = "mkfs /dev/disk0"
+
+
+def _shell_confirm_handler_factory(scope):
+    """Mirror the shell tool's approval round trip for one dangerous command."""
+
+    async def handler(msg, sink):
+        from agent.security.shell import (
+            shell_command_check,
+            shell_command_confirm,
+            shell_pending_reject,
+        )
+
+        check = shell_command_check(_DANGEROUS, set(), scope=scope, now=_T0)
+        assert check.requires_confirmation
+        approved = await sink.on_tool_confirmation(
+            "shell",
+            command=_DANGEROUS,
+            risk_level=check.risk_level,
+            reason=check.reason,
+            confirmation_token=check.confirmation_token,
+            scope=scope,
+        )
+        # Mirrors agent.tools.builtin_tools._try_interactive_confirmation:
+        # a refusal retires the token, an approval redeems it.
+        if approved:
+            redeemed = shell_command_confirm(
+                check.confirmation_token, scope=scope, now=_T0
+            )
+        else:
+            shell_pending_reject(check.confirmation_token, scope=scope)
+            redeemed = False
+        sink.on_stream_chunk(f"approved={approved} redeemed={redeemed}")
+        sink.on_turn_complete("done", [])
+        return True
+
+    return handler
+
+
+def _run_shell_approval(decision_payload):
+    """Drive one approval round trip and report whether it outlived the token."""
+    from starlette.testclient import TestClient
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_allowlist_clear,
+        shell_session_allowlist_contains,
+    )
+
+    scope = ShellAuthorizationScope("web-approval", "web", "")
+    shell_session_allowlist_clear()
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    channel._handler = _shell_confirm_handler_factory(scope)
+    try:
+        with TestClient(channel.app) as client:
+            sid = client.post("/api/sessions").json()["session_id"]
+            with client.websocket_connect(f"/api/sessions/{sid}/stream") as ws:
+                ws.send_json({"type": "message", "text": "run it"})
+                req = ws.receive_json()
+                assert req["type"] == "confirm_request"
+                payload = {"type": "confirm_response", **decision_payload}
+                payload["confirmation_token"] = req["confirmation_token"]
+                ws.send_json(payload)
+                events = []
+                while True:
+                    event = ws.receive_json()
+                    events.append(event)
+                    # Break on error too: a handler that raises otherwise shows
+                    # up as a hung read instead of a diagnosable failure.
+                    if event["type"] in ("turn_complete", "error"):
+                        break
+        assert events[-1]["type"] == "turn_complete", events
+        decisions = [e["chunk"] for e in events if e["type"] == "stream_chunk"]
+        # Two hours past the five-minute pending-token window: only a
+        # session-scoped approval is still in force at this point.
+        still_allowed = shell_session_allowlist_contains(
+            _DANGEROUS, scope=scope, now=_T0 + timedelta(hours=2)
+        )
+        return req, (decisions[-1] if decisions else ""), still_allowed
+    finally:
+        shell_session_allowlist_clear()
+
+
+def test_web_confirm_request_advertises_session_scope():
+    req, _summary, _still = _run_shell_approval({"decision": "deny"})
+    assert req["allow_session"] is True
+    assert req["timeout_seconds"] > 0
+    assert req["name"] == "shell"
+
+
+def test_web_confirm_allow_session_outlives_the_token():
+    _req, summary, still_allowed = _run_shell_approval({"decision": "allow_session"})
+    assert summary == "approved=True redeemed=True"
+    assert still_allowed is True
+
+
+def test_web_confirm_allow_once_stays_bounded():
+    _req, summary, still_allowed = _run_shell_approval({"decision": "allow_once"})
+    assert summary == "approved=True redeemed=True"
+    assert still_allowed is False
+
+
+def test_web_confirm_legacy_approved_boolean_still_supported():
+    _req, summary, still_allowed = _run_shell_approval({"approved": True})
+    assert summary == "approved=True redeemed=True"
+    assert still_allowed is False
+
+
+def test_web_confirm_deny_is_not_redeemable():
+    _req, summary, still_allowed = _run_shell_approval({"decision": "deny"})
+    assert summary == "approved=False redeemed=False"
+    assert still_allowed is False
+
+
+def test_web_non_shell_prompt_rejects_session_scope():
+    """A plugin install prompt must not offer, nor honour, "always allow"."""
+    from starlette.testclient import TestClient
+
+    async def handler(msg, sink):
+        approved = await sink.on_tool_confirmation(
+            "install_plugin",
+            command="user plugin 'demo'",
+            risk_level="high",
+            reason="runs code",
+            confirmation_token="",
+            scope=None,
+        )
+        sink.on_stream_chunk("approved" if approved else "denied")
+        sink.on_turn_complete("done", [])
+        return True
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    channel._handler = handler
+    with TestClient(channel.app) as client:
+        sid = client.post("/api/sessions").json()["session_id"]
+        with client.websocket_connect(f"/api/sessions/{sid}/stream") as ws:
+            ws.send_json({"type": "message", "text": "install"})
+            req = ws.receive_json()
+            assert req["type"] == "confirm_request"
+            assert req["allow_session"] is False
+            # Even an over-eager client asking for it only ever gets one-off
+            # consent, because there is no pending record to widen.
+            ws.send_json({"type": "confirm_response", "decision": "allow_session"})
+            events = []
+            while True:
+                event = ws.receive_json()
+                events.append(event)
+                if event["type"] == "turn_complete":
+                    break
+    assert events[-1]["text"] == "done"
+    assert any(
+        e.get("chunk") == "approved" for e in events if e["type"] == "stream_chunk"
+    )
+
+
+def test_web_session_approvals_can_be_revoked():
+    from starlette.testclient import TestClient
+    from agent.security.shell import (
+        ShellAuthorizationScope,
+        shell_session_allowlist_add_persistent,
+        shell_session_allowlist_clear,
+    )
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    try:
+        with TestClient(channel.app) as client:
+            listed = client.get("/api/sessions/web-revoke/permissions")
+            assert listed.status_code == 200
+            assert listed.json()["approved_commands"] == []
+
+            shell_session_allowlist_add_persistent(
+                _DANGEROUS, scope=ShellAuthorizationScope("web-revoke", "web", "")
+            )
+            listed = client.get("/api/sessions/web-revoke/permissions")
+            assert listed.json()["approved_commands"] == [_DANGEROUS]
+
+            removed = client.delete("/api/sessions/web-revoke/approvals")
+            assert removed.status_code == 200
+            assert removed.json()["removed"] == 1
+            after = client.get("/api/sessions/web-revoke/permissions")
+            assert after.json()["approved_commands"] == []
+    finally:
+        shell_session_allowlist_clear()
+
+
 def test_web_stream_emits_json_events():
     from starlette.testclient import TestClient
 
@@ -377,27 +567,150 @@ def test_web_commands_endpoint_lists_all_channel_commands():
         assert "sessions" in names
 
 
-def test_web_files_endpoint_serves_agent_home_files(tmp_path):
+def test_web_files_endpoint_requires_an_owning_session(tmp_path):
+    """A file link is a capability: without a named owner it must be refused.
+
+    Even a real file inside the agent home is off limits when the request does
+    not name the session (or scheduled run) that owns it.
+    """
     from starlette.testclient import TestClient
     from agent import shared
 
     channel = _channel()
     channel.bind_runtime({}, {})
 
+    stray = shared.AGENT_HOME / "web-test-note.txt"
+    stray.write_text("hello from agent home", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+
+    try:
+        with TestClient(channel.app) as client:
+            assert client.get(f"/api/files?path={stray}").status_code == 403
+            assert client.get(f"/api/files?path={outside}").status_code == 403
+            # An unknown session owns nothing, so it unlocks nothing.
+            resp = client.get(f"/api/files?path={stray}&session_id=no-such-session")
+            assert resp.status_code == 403
+    finally:
+        stray.unlink(missing_ok=True)
+
+
+def test_web_files_endpoint_serves_session_workspace_files(tmp_path):
+    """An attachment written into the project workspace must be renderable.
+
+    Regression: ``send_file`` accepts anything inside the session workspace, but
+    ``/api/files`` only allowed the agent home. The agent could therefore send an
+    image that the browser was then refused with "forbidden path", so
+    attachments from the workspace never displayed while output-dir ones did.
+
+    The link must name the owning session, and another session's id must not
+    unlock this workspace.
+    """
+    import json as _json
+
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    session_id = "workspace-files"
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    picture = workspace / "chart.png"
+    picture.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    other_id = "other-session"
+    other_workspace = tmp_path / "other-project"
+    other_workspace.mkdir()
+
+    home = shared.web_session_home(session_id)
+    other_home = shared.web_session_home(other_id)
+    for sid, root in ((session_id, workspace), (other_id, other_workspace)):
+        target = shared.web_session_home(sid)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / ".session.json").write_text(
+            _json.dumps({"session_id": sid, "workspace_root": str(root)}),
+            encoding="utf-8",
+        )
+
+    try:
+        with TestClient(channel.app) as client:
+            resp = client.get(f"/api/files?path={picture}&session_id={session_id}")
+            assert resp.status_code == 200
+            assert resp.content == b"\x89PNG\r\n\x1a\n"
+
+            # No owner named -> refused even though the file is real.
+            assert client.get(f"/api/files?path={picture}").status_code == 403
+
+            # A different session's id does not unlock this workspace.
+            cross = client.get(f"/api/files?path={picture}&session_id={other_id}")
+            assert cross.status_code == 403
+
+            # A directory that no session ever selected stays off limits.
+            stranger = tmp_path / "stranger"
+            stranger.mkdir()
+            (stranger / "secret.png").write_bytes(b"nope")
+            denied = client.get(
+                f"/api/files?path={stranger / 'secret.png'}&session_id={session_id}"
+            )
+            assert denied.status_code == 403
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+        shutil.rmtree(other_home, ignore_errors=True)
+
+
+def test_web_files_endpoint_serves_session_home_files():
+    """Files inside a session's own home (output/, uploads/) are servable."""
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    session_id = "home-files"
+    home = shared.web_session_home(session_id)
+    out = home / "output" / "note.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("session output", encoding="utf-8")
+
+    try:
+        with TestClient(channel.app) as client:
+            resp = client.get(f"/api/files?path={out}&session_id={session_id}")
+            assert resp.status_code == 200
+            assert resp.text == "session output"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_web_files_endpoint_serves_live_session_workspace(tmp_path):
+    """A live session's workspace is honoured without a manifest on disk."""
+    from starlette.testclient import TestClient
+
+    workspace = tmp_path / "live-project"
+    workspace.mkdir()
+    (workspace / "figure.png").write_bytes(b"live")
+
+    class _Ctx:
+        metadata = {"workspace_root": str(workspace)}
+
+    class _State:
+        ctx = _Ctx()
+
+    channel = _channel()
+    channel.bind_runtime({"live-session": _State()}, {})
+
     with TestClient(channel.app) as client:
-        # Use the active agent home as the allowed root.
-        allowed = shared.AGENT_HOME
-        inside = allowed / "web-test-note.txt"
-        inside.write_text("hello from agent home", encoding="utf-8")
-        outside = tmp_path / "outside.txt"
-        outside.write_text("outside", encoding="utf-8")
-
-        resp = client.get(f"/api/files?path={inside}")
+        resp = client.get(
+            f"/api/files?path={workspace / 'figure.png'}&session_id=live-session"
+        )
         assert resp.status_code == 200
-        assert resp.text == "hello from agent home"
+        assert resp.content == b"live"
 
-        denied = client.get(f"/api/files?path={outside}")
-        assert denied.status_code == 403
+        # Without naming the session there is no entitlement to check.
+        assert (
+            client.get(f"/api/files?path={workspace / 'figure.png'}").status_code == 403
+        )
 
 
 def test_web_output_sink_emits_attachment_events():
@@ -432,6 +745,54 @@ def test_web_output_sink_deduplicates_equivalent_attachment_paths(tmp_path):
     attachments = [event for event in sink.events if event["type"] == "attachment"]
     assert len(attachments) == 1
     assert recorded == [(str(target), "result.png")]
+
+
+def test_web_output_sink_serialises_subagent_progress_fields():
+    """Sub-agent updates must carry the fields the event actually holds.
+
+    Regression: the sink read ``agent`` / ``event`` / ``detail``, none of which
+    exist on ``SubAgentProgressEvent`` (it carries ``kind`` / ``role`` /
+    ``message`` / ``completed`` / ``total``). Every lookup returned an empty
+    string, so the browser received unlabelled rows and the transcript filled
+    with identical "子代理 · 状态更新" placeholders.
+    """
+    from agent.channels.web import WebOutputSink
+    from agent.core import SubAgentProgressEvent
+
+    sink = WebOutputSink(collect=True)
+    sink.on_subagent_event(
+        SubAgentProgressEvent(
+            kind="batch_progress",
+            role="researcher",
+            message="Sub-agents running: 2/4 completed",
+            completed=2,
+            total=4,
+        )
+    )
+
+    event = sink.events[-1]
+    assert event["type"] == "subagent_event"
+    assert event["kind"] == "batch_progress"
+    assert event["role"] == "researcher"
+    assert event["message"] == "Sub-agents running: 2/4 completed"
+    assert event["completed"] == 2
+    assert event["total"] == 4
+
+
+def test_web_output_sink_subagent_event_tolerates_sparse_payload():
+    """A minimal event must still serialise, with zeroed counters."""
+    from agent.channels.web import WebOutputSink
+    from agent.core import SubAgentProgressEvent
+
+    sink = WebOutputSink(collect=True)
+    sink.on_subagent_event(SubAgentProgressEvent(kind="agent_started"))
+
+    event = sink.events[-1]
+    assert event["kind"] == "agent_started"
+    assert event["role"] == ""
+    assert event["message"] == ""
+    assert event["completed"] == 0
+    assert event["total"] == 0
 
 
 def test_web_management_endpoints_plugins_skills_context():
@@ -612,8 +973,51 @@ def test_web_model_override_uses_global_config(tmp_path, monkeypatch):
         ),
     )
 
-    assert WebChannel._resolve_model_override("global-alt", "abc123") == "global-alt"
-    assert WebChannel._resolve_model_override("global-model", "abc123") == "global-model"
+    assert WebChannel._resolve_model_override("global-alt") == "global-alt"
+    assert WebChannel._resolve_model_override("global-model") == "global-model"
+
+
+def test_web_model_override_accepts_other_providers_models(tmp_path, monkeypatch):
+    """The dropdown offers every provider's models and routing dispatches on
+    the id, so a foreign provider's model is a valid per-turn override."""
+    from pathlib import Path
+    from agent import shared
+    import agent.config as config_module
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: (
+            {
+                "active_provider": "anthropic",
+                "providers": {
+                    "anthropic": {
+                        "default_model": "claude-x",
+                        "models": ["claude-x"],
+                    },
+                    "openai": {
+                        "default_model": "gpt-y",
+                        "models": ["gpt-y"],
+                    },
+                },
+            },
+            False,
+        ),
+    )
+
+    assert WebChannel._resolve_model_override("gpt-y") == "gpt-y"
+    assert WebChannel._resolve_model_override("claude-x") == "claude-x"
+    # Unknown ids are still rejected, and no override resolves to None.
+    try:
+        WebChannel._resolve_model_override("not-a-model")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown model must be rejected")
+    assert WebChannel._resolve_model_override(None) is None
+    assert WebChannel._resolve_model_override("  ") is None
 
 
 def test_web_session_runtime_uses_global_resources_and_session_output(tmp_path, monkeypatch):
@@ -1068,6 +1472,25 @@ def test_web_schedule_run_history_and_output(tmp_path, monkeypatch):
         assert output.json()["available"] is True
         assert output.json()["content"].startswith("# Daily report")
         assert output.json()["truncated"] is False
+
+        # The output link names its owning run, and only that entitlement
+        # unlocks it — the bare path, or a forged foreign path, is refused.
+        output_url = output.json()["output_url"]
+        assert "task_id=" in output_url and "run_id=" in output_url
+        raw = client.get(output_url)
+        assert raw.status_code == 200
+        assert raw.text.startswith("# Daily report")
+        bare = client.get(f"/api/files?path={output_path}")
+        assert bare.status_code == 403
+        # A real file outside the run's recorded output, addressed with the
+        # run's ids, is still refused: the entitlement is checked against the
+        # store, not against the caller's path.
+        secret = agent_home / "secret.txt"
+        secret.write_text("not for the browser", encoding="utf-8")
+        forged = client.get(
+            f"/api/files?path={secret}&task_id={task.id}&run_id={claimed.run.id}"
+        )
+        assert forged.status_code == 403
 
         artifacts = client.get(
             f"/api/schedules/{task.id}/runs/{claimed.run.id}/artifacts"
