@@ -457,6 +457,45 @@ function replaceMarkdownImages(
   return output
 }
 
+// The model picker's label renders at 11px (see .composer-tools .model-select
+// .ant-select-selection-item). Measuring with that same font keeps the control's
+// inline width honest — counting characters under-read the small label font and
+// left ~40px of dead space to the right of the model name.
+const MODEL_LABEL_FONT =
+  "11px -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif"
+
+// What the control spends on chrome around the label: 8px of left padding plus
+// 28px on the right for the 10px chevron, its 11px inset and a 7px gap. The
+// last 2px absorb the subpixel difference between canvas metrics and DOM text
+// layout, which otherwise ellipsizes a label that exactly fits.
+const MODEL_PICKER_CHROME = 38
+
+let labelMeasureContext: CanvasRenderingContext2D | null | undefined
+
+function measureLabelWidth(text: string): number {
+  if (!text || typeof document === 'undefined') return 0
+  try {
+    if (labelMeasureContext === undefined) {
+      labelMeasureContext = document.createElement('canvas').getContext('2d')
+    }
+    if (!labelMeasureContext) return 0
+    labelMeasureContext.font = MODEL_LABEL_FONT
+    return labelMeasureContext.measureText(text).width
+  } catch {
+    return 0
+  }
+}
+
+// Fallback for when canvas measurement is unavailable: at this size CJK is
+// roughly twice as wide as Latin. It only ever over-estimates, so the control
+// cannot end up too narrow to read its own label.
+function estimateLabelWidth(text: string): number {
+  return [...text].reduce(
+    (sum, ch) => sum + (ch.charCodeAt(0) > 0x2e7f ? 13.4 : 5.9),
+    0,
+  )
+}
+
 function markdownToHtml(
   text: string,
   sessionId?: string | null,
@@ -2784,19 +2823,19 @@ function App() {
     return groups
   }, [config])
 
-  // Size the model picker to the id it currently shows, not to the longest id
-  // in the list: a short model should not reserve the width of a long one.
-  // The popup is width-independent (popupMatchSelectWidth={false}), so long
-  // entries still read in full while open; the closed control ellipsizes past
-  // the clamp. CJK characters are roughly twice a digit's width.
+  // Placeholder while the config has not loaded yet; once loaded,
+  // currentModel holds the active provider's default model id.
+  const modelSelectPlaceholder = currentModel ? undefined : '默认模型'
+
+  // Size the model picker to the label it currently shows, not to the longest
+  // id in the list: a short model should not reserve a long one's width. The
+  // popup is width-independent (popupMatchSelectWidth={false}), so long entries
+  // still read in full while open; the closed control ellipsizes past the clamp.
   const modelSelectWidth = useMemo(() => {
-    const name = currentModel || ''
-    const units = [...name].reduce(
-      (sum, ch) => sum + (ch.charCodeAt(0) > 0x2e7f ? 14 : 7),
-      0,
-    )
-    return `${Math.max(88, Math.min(240, units + 50))}px`
-  }, [currentModel])
+    const label = currentModel || modelSelectPlaceholder || ''
+    const measured = measureLabelWidth(label) || estimateLabelWidth(label)
+    return `${Math.max(88, Math.min(240, Math.ceil(measured) + MODEL_PICKER_CHROME))}px`
+  }, [currentModel, modelSelectPlaceholder])
 
   // Settings page: models of the currently selected provider. The default
   // model is chosen from a dropdown instead of free-text input, so the value
@@ -2821,10 +2860,6 @@ function App() {
     currentModelRef.current = model
     setCurrentModel(model)
   }
-
-  // Placeholder while the config has not loaded yet; once loaded,
-  // currentModel holds the active provider's default model id.
-  const modelSelectPlaceholder = currentModel ? undefined : '默认模型'
 
   const filteredCommands = useMemo(() => {
     const query = input.startsWith('/')
