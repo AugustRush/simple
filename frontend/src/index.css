@@ -4505,6 +4505,45 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
   background: linear-gradient(to top, var(--bg) 74%, transparent);
 }
 
+/* The live status line. `activity` was already maintained in every place the
+ * app does work -- "正在生成…", "正在执行 shell", "等待模型响应" -- but nothing
+ * ever rendered it, so the agent looked inert while it ran and an interrupt
+ * click had no visible effect at all. Matching the composer's width and auto
+ * margins keeps it aligned with the input it describes. */
+.composer-activity {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: min(780px, 100%);
+  min-height: 16px;
+  margin: 0 auto 6px;
+  padding: 0 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.composer-activity-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: composer-activity-pulse 1.2s ease-in-out infinite;
+}
+
+.composer-activity.is-interrupting {
+  color: var(--red);
+}
+
+.composer-activity.is-interrupting .composer-activity-dot {
+  background: var(--red);
+}
+
+@keyframes composer-activity-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+
 .composer {
   width: min(780px, 100%);
   padding: 0;

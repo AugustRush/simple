@@ -470,6 +470,14 @@ const MODEL_LABEL_FONT =
 // layout, which otherwise ellipsizes a label that exactly fits.
 const MODEL_PICKER_CHROME = 38
 
+// Stopping a turn is cooperative: the cancel request aborts the in-flight
+// model request or child process, but whatever step is already running has to
+// unwind before `turn_complete` arrives. These bound how long the UI stays
+// quiet about it — first by asking again on the user's behalf, then by saying
+// plainly that it has not taken effect.
+const INTERRUPT_RETRY_MS = 5000
+const INTERRUPT_STUCK_MS = 20000
+
 let labelMeasureContext: CanvasRenderingContext2D | null | undefined
 
 function measureLabelWidth(text: string): number {
@@ -1016,6 +1024,9 @@ function App() {
   const [sandboxMode, setSandboxMode] = useState('read_all')
   const [connected, setConnected] = useState(false)
   const [isStreaming, setIsStreaming] = useState(false)
+  // True between the user asking to stop and the turn actually unwinding.
+  // The abort is cooperative, so this cannot be derived from `isStreaming`.
+  const [interrupting, setInterrupting] = useState(false)
   const [activity, setActivity] = useState('')
   const [loadingSessions, setLoadingSessions] = useState(false)
   const [loadingView, setLoadingView] = useState(false)
@@ -1046,6 +1057,11 @@ function App() {
   // Guards the task-guidance buttons against a double click landing two
   // decisions (and two queued interjections) before React re-renders.
   const taskActionRef = useRef(false)
+  // Interrupt is cooperative, so the turn can outlive the request by seconds.
+  // These drive an app-side retry instead of making the user re-click, and are
+  // torn down the moment the turn ends.
+  const interruptTimersRef = useRef<number[]>([])
+  const interruptAttemptsRef = useRef(0)
   const [queuedMessages, setQueuedMessages] = useState<QueuedMessage[]>([])
   const [form] = Form.useForm()
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -1619,6 +1635,9 @@ function App() {
           })
           setResumingTaskId(null)
           setIsStreaming(false)
+          // The turn is over, so the status line must not keep narrating work
+          // that stopped.
+          setActivity('')
           setConfirmReq(null)
           messagesRef.current = sealSubAgentNotes(messagesRef.current)
           setMessages([...messagesRef.current])
@@ -1811,12 +1830,75 @@ function App() {
     connectWs(activeSession)
   }
 
+  const clearInterruptTimers = useCallback(() => {
+    interruptTimersRef.current.forEach(clearTimeout)
+    interruptTimersRef.current = []
+  }, [])
+
+  // Every way a turn can end -- turn_complete, an error, a session switch, a
+  // dropped socket -- lands on `isStreaming === false`, so this is the one
+  // place that retires the interrupt affordance. It can never outlive the turn
+  // it was aimed at, and a stale disabled button cannot appear on the next one.
+  useEffect(() => {
+    if (isStreaming) return
+    clearInterruptTimers()
+    interruptAttemptsRef.current = 0
+    setInterrupting(false)
+  }, [isStreaming, clearInterruptTimers])
+
+  const requestInterrupt = async (sid: string) => {
+    interruptAttemptsRef.current += 1
+    let accepted = false
+    try {
+      const response = await api(
+        `/api/sessions/${encodeURIComponent(sid)}/cancel`,
+        { method: 'POST' },
+      )
+      const payload = await response.json().catch(() => null)
+      accepted = !!(payload && payload.cancelled)
+    } catch {
+      // A transport error proves nothing either way; the retry timer and the
+      // eventual turn_complete still decide what the user is told.
+    }
+    if (sid !== activeSessionRef.current) return
+    if (!accepted) {
+      // The server reports no running turn for this session, so the local
+      // "streaming" flag is stale. Re-derive it instead of leaving a stop
+      // button that can never do anything.
+      loadSessionState(sid)
+    }
+  }
+
   const stopStreaming = () => {
     // Ask the backend to cancel the running turn. The stream flow emits
     // `turn_complete` (with whatever partial text was generated), which resets
     // `isStreaming` and flips the send button back to "发送".
     if (!activeSession) return
-    api(`/api/sessions/${activeSession}/cancel`, { method: 'POST' }).catch(() => {})
+    const sid = activeSession
+    // Acknowledge the click immediately. Force-cancel aborts the in-flight
+    // model request or child process, but the turn still has to unwind, and
+    // during that window nothing used to change on screen -- which is what made
+    // the button feel dead and get clicked over and over.
+    clearInterruptTimers()
+    interruptAttemptsRef.current = 0
+    setInterrupting(true)
+    setActivity('正在中断…')
+    void requestInterrupt(sid)
+    interruptTimersRef.current = [
+      window.setTimeout(() => {
+        if (activeSessionRef.current !== sid) return
+        // Still running. Ask again rather than making the user do it.
+        void requestInterrupt(sid)
+        setActivity('中断中，正在等待当前步骤结束…')
+      }, INTERRUPT_RETRY_MS),
+      window.setTimeout(() => {
+        if (activeSessionRef.current !== sid) return
+        // Say what is actually happening and hand the button back, so the user
+        // can decide whether to keep waiting or restart the gateway.
+        setActivity('中断请求已发送，但当前步骤仍未结束')
+        setInterrupting(false)
+      }, INTERRUPT_STUCK_MS),
+    ]
   }
 
   const dismissTaskGuidance = async () => {
@@ -3701,6 +3783,16 @@ function App() {
               </div>
             </div>
           )}
+        {activity && (
+          <div
+            className={`composer-activity ${interrupting ? 'is-interrupting' : ''}`}
+            role="status"
+            aria-live="polite"
+          >
+            <span className="composer-activity-dot" />
+            <span>{activity}</span>
+          </div>
+        )}
         <div className="composer">
           {pendingAttachments.length > 0 && (
             <div className="composer-attachments" aria-label="待发送附件">
@@ -3896,13 +3988,14 @@ function App() {
             </div>
             <div className="composer-actions">
               {isStreaming && (
-                <Tooltip title="终止生成">
+                <Tooltip title={interrupting ? '正在中断…' : '终止生成'}>
                   <Button
                     type="default"
                     danger
                     className="send-button stop-button"
-                    aria-label="终止生成"
+                    aria-label={interrupting ? '正在中断' : '终止生成'}
                     icon={<StopOutlined />}
+                    loading={interrupting}
                     onClick={stopStreaming}
                   />
                 </Tooltip>
