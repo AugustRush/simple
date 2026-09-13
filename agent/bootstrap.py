@@ -43,7 +43,6 @@ def _provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
     """One SDK client for a non-active provider (used by RoutingTransport)."""
     import anthropic
 
-    """One SDK client for a non-active provider (used by RoutingTransport)."""
     raw_key = str(provider_cfg.get("api_key", "") or "")
     if raw_key.startswith("$"):
         raw_key = os.environ.get(raw_key[1:], "")
@@ -73,6 +72,8 @@ async def _build_web_session_components(
     session_id: str,
     base_cfg: dict,
     global_components: dict,
+    *,
+    provider_client_cache: dict | None = None,
 ) -> dict:
     """Build a lightweight execution view for one multiplexed Web session.
 
@@ -167,7 +168,9 @@ async def _build_web_session_components(
         context_window=global_agent.context_window,
     )
     # Same per-call model routing as the global agent: a session may switch to
-    # any configured provider's model.
+    # any configured provider's model. SDK clients are shared through the
+    # process-lifetime cache so per-session rebuilds (config hot-reload) do
+    # not leak a connection pool per session per provider.
     from agent.core.transport import build_routing_transport
 
     agent._transport = build_routing_transport(
@@ -175,6 +178,7 @@ async def _build_web_session_components(
         global_agent.api_format,
         global_components["client"],
         client_factory=_provider_client_factory,
+        client_cache=provider_client_cache,
     )
     for name in (
         "max_parallel_agents",
@@ -601,11 +605,16 @@ async def _build_components_async(
     # behavior (sent to the active client).
     from agent.core.transport import build_routing_transport
 
+    # Process-lifetime SDK client cache shared with every web session's
+    # routing transport, so per-session rebuilds do not leak one connection
+    # pool per session per provider.
+    provider_client_cache: dict = {}
     agent._transport = build_routing_transport(
         cfg,
         api_format,
         client,
         client_factory=_provider_client_factory,
+        client_cache=provider_client_cache,
     )
     agent.max_parallel_agents = max(
         1,
@@ -783,6 +792,7 @@ async def _build_components_async(
             session_id,
             global_cfg or cfg,
             components,
+            provider_client_cache=provider_client_cache,
         )
 
     components["session_components_factory"] = _session_components_factory

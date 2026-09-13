@@ -11,6 +11,7 @@ from agent import shared
 
 from .context import ContextManager
 
+
 class BackgroundMemoryWorker:
     """Background thread that processes queued memory jobs during prompt idle time."""
 
@@ -165,7 +166,14 @@ class BackgroundMemoryWorkerPool:
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
+        self._woken_sessions: set[str] = set()
         self._thread: Optional[threading.Thread] = None
+        # Drain round bookkeeping for wait_for_idle: _draining is true while
+        # the pool thread is inside a round, and _idle_event is replaced at
+        # each round start so a waiter can wait out the round it observed.
+        self._draining = False
+        self._idle_event = threading.Event()
+        self._idle_event.set()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -192,8 +200,17 @@ class BackgroundMemoryWorkerPool:
     def unregister(self, session_id: str) -> None:
         with self._lock:
             self._sessions.pop(str(session_id), None)
+            self._woken_sessions.discard(str(session_id))
 
-    def wake(self, session_id: str | None = None) -> None:
+    def wake(self, session_id: str) -> None:
+        """Bypass the idle gate for one session's next drain.
+
+        Consolidation must not race the end of a conversation it is reading,
+        so the idle gate is per-session: a wake marks only the named session,
+        and every other session still has to satisfy its own idle gate.
+        """
+        with self._lock:
+            self._woken_sessions.add(str(session_id))
         self._wake_event.set()
 
     def stop(self) -> None:
@@ -201,8 +218,26 @@ class BackgroundMemoryWorkerPool:
         self._wake_event.set()
 
     async def wait(self) -> None:
+        """Wait for the worker thread to exit in async call sites."""
         if self._thread:
             await asyncio.to_thread(self._thread.join)
+
+    async def wait_for_idle(self) -> None:
+        """Wait until no drain round is running.
+
+        Session eviction unregisters the session and then closes its staging
+        buffer; a consolidation job already running for that session must
+        finish first, or it would read from a closed buffer. After unregister
+        no future round includes the session, so waiting out the round
+        observed here is sufficient. Returns immediately when the pool is
+        between rounds, so eviction does not pay a poll interval.
+        """
+        while True:
+            with self._lock:
+                if not self._draining:
+                    return
+                idle_event = self._idle_event
+            await asyncio.to_thread(idle_event.wait)
 
     async def _process(self, item: tuple[ContextManager, str, str], client: Any) -> bool:
         manager, model, api_format = item
@@ -210,8 +245,8 @@ class BackgroundMemoryWorkerPool:
             await manager.process_one_job(client, model, api_format=api_format)
         )
 
-    async def _drain_once(self, client: Any, on_demand: bool) -> bool:
-        """Run one job per registered session concurrently.
+    async def _drain_once(self, client: Any, woken_sessions: set[str]) -> bool:
+        """Run one job per eligible session concurrently.
 
         Each ContextManager serializes its own jobs via _processing_job, and
         managers share no mutable state with each other (the durable store
@@ -219,16 +254,22 @@ class BackgroundMemoryWorkerPool:
         safe. This matters for latency: consolidation jobs make LLM calls
         that can take tens of seconds, and a slow session must not starve
         the others.
+
+        ``woken_sessions`` names the sessions whose idle gate is bypassed
+        this round; every other session still needs ``should_process_jobs()``.
         """
         with self._lock:
             items = [
-                item for item in self._sessions.values()
-                if on_demand or item[0].should_process_jobs()
+                item for item in self._sessions.items()
+                if (
+                    item[0] in woken_sessions
+                    or item[1][0].should_process_jobs()
+                )
             ]
         if not items:
             return False
         tasks = [
-            asyncio.ensure_future(self._process(item, client))
+            asyncio.ensure_future(self._process(item[1], client))
             for item in items
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -250,17 +291,31 @@ class BackgroundMemoryWorkerPool:
         asyncio.set_event_loop(loop)
         try:
             while not self._stop_event.is_set():
-                on_demand = self._wake_event.is_set()
-                self._wake_event.clear()
+                with self._lock:
+                    # Consume the wake signal and the sessions it named in one
+                    # critical section: a wake arriving after this point sets
+                    # the event again, so the next wait returns immediately.
+                    self._wake_event.clear()
+                    woken = set(self._woken_sessions)
+                    self._woken_sessions.clear()
+                    self._draining = True
+                    self._idle_event = idle_event = threading.Event()
                 made_progress = False
                 try:
                     made_progress = loop.run_until_complete(
-                        self._drain_once(client, on_demand)
+                        self._drain_once(client, woken)
                     )
                 except asyncio.CancelledError:
                     break
-                if made_progress and on_demand:
-                    self._wake_event.set()
+                finally:
+                    with self._lock:
+                        self._draining = False
+                    idle_event.set()
+                # Keep draining while any explicitly woken session still has
+                # work queued; the idle gate applies to the rest.
+                if made_progress and woken:
+                    with self._lock:
+                        self._woken_sessions.update(woken)
                     continue
                 self._wake_event.wait(timeout=self.poll_seconds)
         finally:
@@ -290,7 +345,11 @@ class PooledMemoryWorkerHandle:
         self.pool.unregister(self.session_id)
 
     async def wait(self) -> None:
-        return None
+        # Unregister alone would leave an in-flight consolidation of this
+        # session running while eviction closes its staging buffer. Wait for
+        # the pool's current drain round to finish instead; the round is
+        # bounded by one LLM call per session.
+        await self.pool.wait_for_idle()
 
     def wake(self) -> None:
         self.pool.wake(self.session_id)

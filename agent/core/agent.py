@@ -1512,14 +1512,8 @@ class BaseAgent:
         response: Any,
     ) -> tuple[Any, Optional[str]]:
         """Retry truncated structured output without committing partial protocol."""
-        has_incomplete_tool_calls = getattr(
-            self._transport,
-            "has_incomplete_tool_calls",
-            None,
-        )
-        if not callable(has_incomplete_tool_calls) or not has_incomplete_tool_calls(
-            response
-        ):
+        model = self._effective_model(ctx)
+        if not self._transport.has_incomplete_tool_calls(response, model=model):
             return response, None
         current_budget = int(self.max_tokens)
         attempts = min(2, max(0, int(self.max_truncation_continuations)))
@@ -1538,7 +1532,9 @@ class BaseAgent:
                 tools,
                 output_max_tokens=current_budget,
             )
-            if not has_incomplete_tool_calls(response):
+            if not self._transport.has_incomplete_tool_calls(
+                response, model=model
+            ):
                 return response, None
         return (
             response,

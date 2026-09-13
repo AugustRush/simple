@@ -505,3 +505,89 @@ def test_background_worker_pool_slow_session_does_not_starve_others():
     assert slow.processed == 1
     assert fast.processed == 1
     assert fast_done_early, "fast session was serialized behind the slow one"
+
+
+def test_pool_wake_is_scoped_to_the_woken_session():
+    """One session's wake must not bypass another session's idle gate."""
+    from agent import BackgroundMemoryWorkerPool
+
+    class _FakeContextManager:
+        def __init__(self):
+            self.pending = 1
+            self.processed = 0
+
+        def should_process_jobs(self):
+            # Mid-conversation: the idle gate holds unless this is the session
+            # that was explicitly woken.
+            return False
+
+        async def process_one_job(self, *_args, **_kwargs):
+            if self.pending <= 0:
+                return False
+            self.pending -= 1
+            self.processed += 1
+            return True
+
+    woken = _FakeContextManager()
+    gated = _FakeContextManager()
+    pool = BackgroundMemoryWorkerPool(client=None, poll_seconds=0.01)
+    pool.register("woken", woken, "model", "openai")
+    pool.register("gated", gated, "model", "openai")
+
+    async def run():
+        pool.start()
+        pool.wake("woken")
+        await asyncio.sleep(0.1)
+        pool.stop()
+        await pool.wait()
+
+    asyncio.run(run())
+
+    assert woken.processed == 1
+    assert gated.processed == 0, "another session's idle gate was bypassed"
+
+
+def test_pooled_handle_wait_waits_out_inflight_job():
+    """Eviction unregisters, then closes the staging buffer.
+
+    Handle.wait() must wait for the session's in-flight consolidation rather
+    than returning immediately, or the buffer is closed under a running job.
+    """
+    from agent import BackgroundMemoryWorkerPool, PooledMemoryWorkerHandle
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowContextManager:
+        def __init__(self):
+            self.pending = 1
+
+        def should_process_jobs(self):
+            return self.pending > 0
+
+        async def process_one_job(self, *_args, **_kwargs):
+            if self.pending <= 0:
+                return False
+            self.pending -= 1
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.005)
+            return True
+
+    pool = BackgroundMemoryWorkerPool(client=None, poll_seconds=0.01)
+    pool.register("s", _SlowContextManager(), "model", "openai")
+    handle = PooledMemoryWorkerHandle(pool, "s")
+
+    async def run():
+        pool.start()
+        assert started.wait(timeout=1)
+        handle.stop()  # Eviction order: unregister first.
+        waiter = asyncio.ensure_future(handle.wait())
+        await asyncio.sleep(0.05)
+        assert not waiter.done(), "wait() returned while the job was running"
+        release.set()
+        await asyncio.wait_for(waiter, timeout=1)
+        pool.stop()
+        await pool.wait()
+
+    asyncio.run(run())

@@ -123,7 +123,9 @@ class ModelTransport(abc.ABC):
     ) -> Optional[str]:
         """Describe a non-clean completion (truncation, refusal) or None."""
 
-    def has_incomplete_tool_calls(self, response: Any) -> bool:
+    def has_incomplete_tool_calls(
+        self, response: Any, model: Optional[str] = None
+    ) -> bool:
         """Return true when a truncated response contains partial tool protocol."""
         return False
 
@@ -435,7 +437,9 @@ class OpenAITransport(ModelTransport):
             return "Model response was truncated (finish_reason=length)"
         return None
 
-    def has_incomplete_tool_calls(self, response: Any) -> bool:
+    def has_incomplete_tool_calls(
+        self, response: Any, model: Optional[str] = None
+    ) -> bool:
         try:
             choice = response.choices[0]
             return choice.finish_reason == "length" and bool(choice.message.tool_calls)
@@ -735,6 +739,11 @@ class RoutingTransport(ModelTransport):
     ) -> Optional[str]:
         return self._for(model).completion_error(response)
 
+    def has_incomplete_tool_calls(
+        self, response: Any, model: Optional[str] = None
+    ) -> bool:
+        return self._for(model).has_incomplete_tool_calls(response, model=model)
+
     def build_final_message(
         self, response: Any, text: str, model: Optional[str] = None
     ) -> dict:
@@ -750,13 +759,6 @@ class RoutingTransport(ModelTransport):
     ) -> list[dict]:
         return self._for(model).build_tool_result_messages(tool_calls, results)
 
-    def truncate_images(self, messages: list[dict], keep: int) -> list[dict]:
-        # Not routed: the agent calls this once per turn on its own messages
-        # before any transport is chosen, and both implementations operate on
-        # Anthropic-shaped content lists. Delegate to the default provider's
-        # implementation (current behavior).
-        return self.default.truncate_images(messages, keep)
-
     def tool_result_rollback_count(
         self, tool_call_count: int, model: Optional[str] = None
     ) -> int:
@@ -768,29 +770,88 @@ class RoutingTransport(ModelTransport):
         return self.default.image_content_block(mime_type, data)
 
 
+def _provider_models(provider_cfg: dict) -> list[str]:
+    """The model ids a provider offers.
+
+    Its ``models`` list, or its ``default_model`` alone when no list is
+    configured. Whitespace is stripped so the routing key, the validation
+    set, and the id sent to the provider are the same token.
+    """
+    models = provider_cfg.get("models") or []
+    if not models and provider_cfg.get("default_model"):
+        models = [provider_cfg["default_model"]]
+    return [
+        model.strip()
+        for model in models
+        if isinstance(model, str) and model.strip()
+    ]
+
+
+def routable_model_ids(cfg: dict) -> set[str]:
+    """Model ids a model_override may carry.
+
+    The composer dropdown offers every provider's models and the routing
+    table dispatches on the id, so this is the honest validation set: every
+    provider's models via the same definition the router uses, plus the
+    configured top-level ``model`` (which resolves to the active provider's
+    default anyway). Ambiguous ids belong to the active provider; the set
+    does not care about ownership.
+    """
+    ids: set[str] = set()
+    top_level = cfg.get("model")
+    if isinstance(top_level, str) and top_level.strip():
+        ids.add(top_level.strip())
+    providers = cfg.get("providers")
+    if isinstance(providers, dict):
+        for provider_cfg in providers.values():
+            if isinstance(provider_cfg, dict):
+                ids.update(_provider_models(provider_cfg))
+    return ids
+
+
 def build_routing_transport(
     cfg: dict,
     default_format: str,
     default_client: Any,
     client_factory: Callable[[dict, str], Any],
+    client_cache: Optional[dict[tuple[str, str, str], Any]] = None,
 ) -> RoutingTransport:
     """Build a RoutingTransport from provider config.
 
-    ``client_factory(provider_cfg, api_format)`` constructs one SDK client;
-    it is called at most once per provider here. The active provider reuses
-    ``default_client`` so the routed and default paths share one client.
+    ``client_factory(provider_cfg, api_format)`` constructs one SDK client.
+    Web sessions rebuild their routing transport on every session-runtime
+    creation (config is re-read there), while SDK clients each own a
+    connection pool that must not be leaked per session — pass a shared
+    ``client_cache`` so one provider configuration maps to one client for
+    the process lifetime. The cache key includes the api key/base_url so a
+    config edit yields a fresh client instead of reusing a stale one. The
+    active provider reuses ``default_client`` so its routed and default
+    paths share one client.
     """
     providers = cfg.get("providers", {}) or {}
     active = str(cfg.get("active_provider") or "")
     default_transport = build_transport(default_format, default_client)
     routes: dict[str, ModelTransport] = {}
-    transports: dict[str, ModelTransport] = {}
+    transports: dict[tuple[str, str], ModelTransport] = {}
+
+    def _client_for(provider_cfg: dict, api_format: str) -> Any:
+        if client_cache is None:
+            return client_factory(provider_cfg, api_format)
+        key = (
+            str(provider_cfg.get("api_key", "") or ""),
+            str(provider_cfg.get("base_url", "") or ""),
+            api_format,
+        )
+        client = client_cache.get(key)
+        if client is None:
+            client = client_factory(provider_cfg, api_format)
+            client_cache[key] = client
+        return client
+
     for name, provider_cfg in providers.items():
         if not isinstance(provider_cfg, dict):
             continue
-        models = provider_cfg.get("models") or []
-        if not models and provider_cfg.get("default_model"):
-            models = [provider_cfg["default_model"]]
+        models = _provider_models(provider_cfg)
         if not models:
             continue
         api_format = str(provider_cfg.get("api_format", "openai"))
@@ -802,13 +863,13 @@ def build_routing_transport(
             key = (name, api_format)
             if key not in transports:
                 transports[key] = build_transport(
-                    api_format, client_factory(provider_cfg, api_format)
+                    api_format, _client_for(provider_cfg, api_format)
                 )
             transport = transports[key]
         for model in models:
             # Active provider wins conflicts; iterate it last is not enough
-            # when it is not last in the dict, so guard explicitly.
+            # when it is not the last in the dict, so guard explicitly.
             if model in routes and name != active:
                 continue
-            routes[str(model)] = transport
+            routes[model] = transport
     return RoutingTransport(default_transport, routes)

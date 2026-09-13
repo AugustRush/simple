@@ -194,6 +194,12 @@ CWD_ESCAPE_COMMANDS: frozenset[str] = frozenset({"cd", "pushd", "popd"})
 
 CONFIRMATION_TTL = timedelta(minutes=5)
 
+# Sentinel expiry for "always allow this command" approvals.  The allowlist
+# itself is process state keyed by authorization scope, so a far-future
+# timestamp is exactly "until the session goes away" without a second
+# container to keep in sync.
+NEVER_EXPIRES = datetime.max.replace(tzinfo=timezone.utc)
+
 # Permission levels, from most restrictive to least.  ``ask`` is the default:
 # low- and medium-risk commands run without confirmation; only high-risk
 # constructs (destructive commands/options, shell operators, pipe-to-shell
@@ -224,6 +230,10 @@ class PendingShellConfirmation:
 _DEFAULT_SCOPE = ShellAuthorizationScope("default", "cli", "")
 _session_allowlist: dict[tuple[ShellAuthorizationScope, str], datetime] = {}
 _pending_tokens: dict[str, PendingShellConfirmation] = {}
+# Tokens the human approved with "always allow this command".  Redeeming such
+# a token widens the allowlist entry from the pending token's TTL to the whole
+# scope, so the mark has to travel with the token rather than with the reply.
+_pending_session_scope: set[str] = set()
 _session_auto_approve: set[ShellAuthorizationScope] = set()
 _session_permission_levels: dict[ShellAuthorizationScope, str] = {}
 _session_sandbox_modes: dict[ShellAuthorizationScope, str] = {}
@@ -261,10 +271,32 @@ def shell_session_allowlist_add(
     ] = expiry
 
 
+def shell_session_allowlist_add_persistent(
+    command_base: str,
+    *,
+    scope: ShellAuthorizationScope | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Allow one normalized command in one scope for the rest of the session.
+
+    Used when the human answers an approval prompt with "always allow this
+    command" instead of the one-off consent that ``shell_command_confirm``
+    grants.  Scope, not the command, is what the entry is keyed by, so this
+    never leaks across sessions or channels.
+    """
+    shell_session_allowlist_add(
+        command_base,
+        scope=scope,
+        now=now,
+        expires_at=NEVER_EXPIRES,
+    )
+
+
 def shell_session_allowlist_clear() -> None:
     """Clear all entries from the session allowlist."""
     _session_allowlist.clear()
     _pending_tokens.clear()
+    _pending_session_scope.clear()
     _session_auto_approve.clear()
     _session_permission_levels.clear()
     _session_sandbox_modes.clear()
@@ -364,6 +396,48 @@ def shell_session_allowlist_contains(
     return True
 
 
+def shell_session_allowlist_commands(
+    *,
+    scope: ShellAuthorizationScope | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """List the commands currently approved for one scope, longest-lived last.
+
+    Expired entries are pruned on the way out so the caller never reports an
+    approval the next check would reject anyway.
+    """
+    resolved = _authorization_scope(scope)
+    current = _authorization_time(now)
+    result: list[tuple[datetime, str]] = []
+    for (entry_scope, command), expiry in list(_session_allowlist.items()):
+        if entry_scope != resolved:
+            continue
+        if expiry <= current:
+            _session_allowlist.pop((entry_scope, command), None)
+            continue
+        result.append((expiry, command))
+    result.sort(key=lambda pair: (pair[0], pair[1]))
+    return [command for _expiry, command in result]
+
+
+def shell_session_allowlist_clear_scope(
+    scope: ShellAuthorizationScope | None = None,
+) -> int:
+    """Revoke every session approval for one scope; return the count removed.
+
+    This is the escape hatch for an "always allow" answer: consent that can be
+    granted but never taken back is not consent.  Outstanding prompts are left
+    alone — they are live questions, and revoking past answers must not silently
+    answer them.
+    """
+    resolved = _authorization_scope(scope)
+    removed = 0
+    for key in [key for key in _session_allowlist if key[0] == resolved]:
+        _session_allowlist.pop(key, None)
+        removed += 1
+    return removed
+
+
 def shell_command_uses_shell_features(command: str) -> bool:
     """Return True when *command* depends on shell parsing/control features."""
     try:
@@ -391,6 +465,26 @@ class ShellCheckResult:
         return not self.allowed
 
 
+def shell_pending_mark_session_scope(
+    token: str,
+    *,
+    scope: ShellAuthorizationScope,
+) -> bool:
+    """Record that *token* was approved for the whole session, not just once.
+
+    The consent UI knows the human's intent but not the pending record, and
+    the caller that redeems the token (``shell_command_confirm``) knows the
+    record but not the intent.  This is the hand-off between the two: without
+    it the "always allow" answer would decay into the same five-minute
+    allowlist entry as a plain approval.
+    """
+    stored = _pending_tokens.get(str(token))
+    if stored is None or stored.scope != scope:
+        return False
+    _pending_session_scope.add(str(token))
+    return True
+
+
 def shell_command_confirm(
     token: str,
     *,
@@ -399,12 +493,24 @@ def shell_command_confirm(
 ) -> bool:
     """Redeem one pending token using trusted request identity."""
     current = _authorization_time(now)
-    stored = _pending_tokens.get(str(token))
+    key = str(token)
+    stored = _pending_tokens.get(key)
     if stored is None or stored.scope != scope or stored.expires_at <= current:
         if stored is not None and stored.expires_at <= current:
-            _pending_tokens.pop(str(token), None)
+            _pending_tokens.pop(key, None)
+        _pending_session_scope.discard(key)
         return False
-    _pending_tokens.pop(str(token), None)
+    _pending_tokens.pop(key, None)
+    if key in _pending_session_scope:
+        # "Always allow this command": outlive the token that carried the
+        # approval instead of inheriting its five-minute window.
+        _pending_session_scope.discard(key)
+        shell_session_allowlist_add_persistent(
+            stored.command,
+            scope=stored.scope,
+            now=current,
+        )
+        return True
     shell_session_allowlist_add(
         stored.command,
         scope=stored.scope,
@@ -429,6 +535,7 @@ def shell_pending_reject(
     if stored is None or stored.scope != scope:
         return False
     _pending_tokens.pop(str(token), None)
+    _pending_session_scope.discard(str(token))
     return True
 
 

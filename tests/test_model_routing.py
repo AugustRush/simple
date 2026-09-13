@@ -127,6 +127,75 @@ def test_build_routing_transport_skips_providers_without_models():
     assert set(routing.routes) == {"m1", "d1"}
     # default_model alone still routes, but only the non-active provider
     # needed a client.
-    # default_model alone still routes, but only the non-active provider
-    # needed a client.
     assert made == ["openai"]
+
+
+def test_routing_transport_detects_truncated_tool_protocol_for_routed_model():
+    """A routed OpenAI response must keep its truncation signal.
+
+    The base ModelTransport reports False for every provider; without an
+    override the routing layer would drop truncated-tool-call recovery for
+    every OpenAI-format model it dispatches to, because the agent asks the
+    transport it actually used.
+    """
+    from agent import shared
+
+    partial = shared._OAIResponse(
+        [
+            shared._OAIChoice(
+                "length",
+                shared._OAIMsg(
+                    "creating file",
+                    [
+                        shared._OAITC(
+                            "call-1",
+                            shared._OAIFunc(
+                                "write_file", '{"path":"a.html","content":"<html>'
+                            ),
+                        )
+                    ],
+                ),
+            )
+        ]
+    )
+    active = _RecordingAnthropicTransport()
+    other = _RecordingOpenAITransport()
+    routing = RoutingTransport(active, {"gpt-4o": other})
+
+    assert routing.has_incomplete_tool_calls(partial, model="gpt-4o") is True
+    # The active (Anthropic) provider has no partial-tool protocol.
+    assert routing.has_incomplete_tool_calls(partial, model="claude-opus-4-5") is False
+    # No model means the default transport, same as every other routed call.
+    assert routing.has_incomplete_tool_calls(partial) is False
+
+
+def test_build_routing_transport_shares_cached_clients_across_rebuilds():
+    """Per-session routing rebuilds must not open a client per session."""
+    made: list[str] = []
+
+    def factory(provider_cfg: dict, api_format: str) -> Any:
+        made.append(str(provider_cfg.get("api_key")))
+        return object()
+
+    cache: dict = {}
+
+    def cfg_for(api_key: str) -> dict:
+        return {
+            "active_provider": "anthropic",
+            "providers": {
+                "anthropic": {"api_format": "anthropic", "models": ["m1"]},
+                "openai": {
+                    "api_format": "openai",
+                    "api_key": api_key,
+                    "models": ["g1"],
+                },
+            },
+        }
+
+    build_routing_transport(cfg_for("k1"), "anthropic", None, factory, client_cache=cache)
+    build_routing_transport(cfg_for("k1"), "anthropic", None, factory, client_cache=cache)
+    assert made == ["k1"], "a rebuild reused the cached client"
+
+    # A changed credential must build a fresh client, not reuse the stale one.
+    build_routing_transport(cfg_for("k2"), "anthropic", None, factory, client_cache=cache)
+    assert made == ["k1", "k2"]

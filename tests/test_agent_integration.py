@@ -5490,6 +5490,10 @@ def test_anthropic_max_tokens_uses_existing_truncation_continuation():
             return next(self.responses)
 
         @staticmethod
+        def has_incomplete_tool_calls(response, model=None):
+            return False
+
+        @staticmethod
         def parse_response(response, model=None):
             return response.stop_reason, response.content[0].text, []
 
@@ -5523,7 +5527,7 @@ def test_truncated_tool_protocol_retries_with_larger_safe_output_budget():
             self.budgets = []
 
         @staticmethod
-        def has_incomplete_tool_calls(response):
+        def has_incomplete_tool_calls(response, model=None):
             return response == "partial-tool-call"
 
         async def create(self, **kwargs):
@@ -5591,7 +5595,7 @@ def test_truncated_tool_protocol_fails_without_committing_partial_history():
 
     class Transport:
         @staticmethod
-        def has_incomplete_tool_calls(response):
+        def has_incomplete_tool_calls(response, model=None):
             return True
 
         async def create(self, **kwargs):
@@ -7135,6 +7139,10 @@ def test_agent_core_isolates_concurrent_session_model_overrides():
         @staticmethod
         def completion_error(response, model=None):
             return None
+
+        @staticmethod
+        def has_incomplete_tool_calls(response, model=None):
+            return False
 
         @staticmethod
         def build_final_message(response, text, model=None):
