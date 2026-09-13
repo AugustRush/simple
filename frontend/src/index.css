@@ -3527,6 +3527,18 @@ html[data-theme='light'] .app-main {
   padding: 14px 20px 20px;
 }
 
+/* Both trace lists are column flex containers with a max-height, so their rows
+ * are flex items -- and flex items shrink by default. Past a certain step count
+ * the list outgrows max-height and the layout compresses every row down to its
+ * min-height, which is shorter than the row actually needs. `.tool-event` does
+ * not clip, so the compressed detail line escapes the card's border and lands on
+ * top of the next card. The body is a scroll container, not a set of shrinkable
+ * tracks: rows keep their natural height and the list scrolls instead. */
+.tool-trace-modal-body > *,
+.tool-trace-items > * {
+  flex: 0 0 auto;
+}
+
 .tool-trace-modal .tool-event {
   gap: 8px;
   min-height: 38px;
