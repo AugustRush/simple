@@ -594,6 +594,7 @@ TERMINAL_RUN_STATUSES: tuple[str, ...] = (
     "failed",
     "cancelled",
     "interrupted",
+    "skipped",
 )
 
 
@@ -750,6 +751,12 @@ class ScheduledTask:
 #: surfacing it as something needing attention would train people to ignore
 #: the signal.  ``interrupted`` *is* present — a lost lease, a restart or a
 #: timeout is exactly the kind of silent outcome nobody is watching for.
+#:
+#: ``skipped`` is absent for a different reason: it is never the first thing
+#: that went wrong.  Something further up failed, and *that* run is already
+#: asking for attention.  Listing every step a failure blocked as its own
+#: thing to look at would turn one problem into a list of a dozen, and the
+#: list is where the one that matters stops being read.
 ATTENTION_STATUSES: tuple[str, ...] = ("failed", "interrupted")
 
 
@@ -839,6 +846,16 @@ STEP_KINDS: tuple[str, ...] = ("agent_prompt", "message", "system_job")
 #: then defaults to "did not succeed", which is the safe way for a downstream
 #: step to be wrong.
 RUN_SUCCESS_STATUS = "succeeded"
+
+#: The status of a step that was never started because something above it
+#: failed.
+#:
+#: It is its own status rather than ``cancelled`` because the two say different
+#: things.  Cancelled means somebody decided not to run it; skipped means the
+#: decision was made by a failure three steps up, and the person reading the
+#: history needs to be able to tell those apart -- one of them is asking to be
+#: fixed, and it is not the one they asked for.
+RUN_SKIPPED_STATUS = "skipped"
 
 
 @dataclass

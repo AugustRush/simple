@@ -34,6 +34,7 @@ from agent.scheduler import (
     DeliveryTarget,
     ExecutionResult,
     NewScheduledTask,
+    RUN_SKIPPED_STATUS,
     RUN_SUCCESS_STATUS,
     SchedulerService,
     SchedulerStore,
@@ -107,8 +108,21 @@ def clock(at: str = "2026-05-01T11:59:00+00:00") -> TriggerSpec:
     return TriggerSpec.once(at, "UTC")
 
 
-def make_service(store: SchedulerStore) -> SchedulerService:
+def make_service(
+    store: SchedulerStore, failing: set[str] | None = None
+) -> SchedulerService:
+    """A service whose ``agent_prompt`` steps succeed, except the named ones.
+
+    Failure is injected by step *name* rather than by patching the store, so
+    the test drives the same path a real failure takes: the runtime calls
+    ``complete_run`` with ``failed``, and everything downstream of that has to
+    happen on its own.
+    """
+    broken = {str(item) for item in (failing or set())}
+
     async def executor(task, run):
+        if task.name in broken:
+            raise RuntimeError(f"{task.name} blew up")
         return ExecutionResult(
             summary=f"ran {task.name}", text_output=f"out {task.name}"
         )
@@ -611,6 +625,328 @@ def test_the_blocked_steps_come_back_in_graph_order(tmp_path):
         blocked = store.workflow_blocked_steps(workflow.id, "left")
         assert [key for key, _ in blocked] == ["join"]
         assert store.workflow_blocked_steps(workflow.id, "join") == []
+    finally:
+        store.close()
+
+
+# ── 5b. A failure settles what it blocks instead of leaving it waiting ─────
+
+
+def test_a_failed_step_skips_the_step_below_it(tmp_path):
+    """The one failure mode a chain has that a lone task does not.
+
+    A step waits for its upstreams to *succeed*.  If one of them fails, that
+    success is never coming, so the step would wait for ever -- and in silence,
+    with no run and no error, looking exactly like a step nobody has gotten
+    around to running yet.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        async def scenario():
+            service = make_service(store, failing={"analyze"})
+            for hop in range(6):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        analyze_runs = store.list_runs(tasks["analyze"].id)
+        assert [run.status for run in analyze_runs] == ["failed"]
+        publish_runs = store.list_runs(tasks["publish"].id)
+        assert [run.status for run in publish_runs] == ["skipped"]
+        assert "analyze" in publish_runs[0].summary
+    finally:
+        store.close()
+
+
+def test_a_skip_reaches_the_whole_subtree_not_just_the_next_step(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(
+            Workflow(
+                name="deep",
+                steps=[
+                    step("collect", trigger=clock()),
+                    step("analyze", depends_on=["collect"]),
+                    step("review", depends_on=["analyze"]),
+                    step("publish", depends_on=["review"]),
+                ],
+            )
+        )
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        async def scenario():
+            service = make_service(store, failing={"analyze"})
+            for hop in range(6):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        assert [run.status for run in store.list_runs(tasks["analyze"].id)] == ["failed"]
+        # Both of the steps below it, not only the adjacent one.
+        assert [run.status for run in store.list_runs(tasks["review"].id)] == ["skipped"]
+        assert [run.status for run in store.list_runs(tasks["publish"].id)] == [
+            "skipped"
+        ]
+    finally:
+        store.close()
+
+
+def test_a_skip_says_which_step_blocked_it(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        async def scenario():
+            service = make_service(store, failing={"collect"})
+            for hop in range(6):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        for key in ("analyze", "publish"):
+            runs = store.list_runs(tasks[key].id)
+            assert [run.status for run in runs] == ["skipped"]
+            assert "collect" in runs[0].summary
+            assert runs[0].trigger_source == "workflow:collect"
+    finally:
+        store.close()
+
+
+def test_a_skipped_step_announces_itself_like_any_other_terminal_run(tmp_path):
+    """A status that exists is a signal that exists -- skips included."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        async def scenario():
+            service = make_service(store, failing={"analyze"})
+            for hop in range(6):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        names = {item.name for item in store.list_emissions()}
+        assert task_signal_name(tasks["analyze"].id, "failed") in names
+        assert task_signal_name(tasks["publish"].id, RUN_SKIPPED_STATUS) in names
+        # And the status is one a person can actually subscribe to, which is
+        # what makes "clean up after this step was skipped" sayable.
+        assert (
+            store.describe_signal_problem(
+                task_signal_name(tasks["publish"].id, RUN_SKIPPED_STATUS)
+            )
+            == ""
+        )
+    finally:
+        store.close()
+
+
+def test_a_skipped_step_is_not_something_to_be_told_about(tmp_path):
+    """One problem, not a dozen: the failure above is already asking."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        async def scenario():
+            service = make_service(store, failing={"analyze"})
+            for hop in range(6):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        from agent.scheduler import run_needs_attention
+
+        skipped = store.list_runs(tasks["publish"].id)[0]
+        failed = store.list_runs(tasks["analyze"].id)[0]
+        assert run_needs_attention(skipped) is False
+        assert run_needs_attention(failed) is True
+        # And the same rule as the one SQL query the interface uses, so the two
+        # cannot drift into disagreeing about what the badge counts.
+        counts = store.unacknowledged_attention_counts()
+        assert counts == {tasks["analyze"].id: 1}
+    finally:
+        store.close()
+
+
+def test_a_skip_does_not_claim_the_step_has_ever_run(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        async def scenario():
+            service = make_service(store, failing={"collect"})
+            for hop in range(6):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        publish = store.get_task(tasks["publish"].id)
+        assert publish.last_run_at is None
+        assert publish.last_success_at is None
+    finally:
+        store.close()
+
+
+def test_a_step_with_work_already_queued_is_not_skipped(tmp_path):
+    """An earlier round's queued run is work somebody asked for.
+
+    The failure arrives in a *later* round than the run still sitting in the
+    queue.  Cancelling that run to satisfy the skip would throw away work that
+    was legitimately asked for, so the step is left alone and its own outcome
+    is allowed to speak -- and if it fails, the skip happens then.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+
+        # One round that got as far as queueing publish and has not run it yet.
+        store.emit_signal(
+            task_signal_name(tasks["analyze"].id, RUN_SUCCESS_STATUS), source="manual"
+        )
+        store.deliver_signals(now=NOW)
+        assert [item.status for item in store.list_runs(tasks["publish"].id)] == [
+            "queued"
+        ]
+
+        # A running run for analyze, written directly so that claiming it does
+        # not also claim publish's queued one.
+        store._conn.execute(
+            """
+            INSERT INTO scheduled_task_runs (
+                id, task_id, scheduled_for, started_at, status, summary, error,
+                output_path, delivery_status, config_snapshot_json,
+                trigger_source, attempt, missed_count, created_at, updated_at
+            ) VALUES ('analyze-run', ?, ?, ?, 'running', '', '', '', '', '{}',
+                      'schedule', 1, 0, ?, ?)
+            """,
+            (
+                tasks["analyze"].id,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        store._conn.execute(
+            """
+            UPDATE scheduled_tasks SET active_run_id = 'analyze-run', lease_until = ?
+            WHERE id = ?
+            """,
+            ((NOW + timedelta(minutes=5)).isoformat(), tasks["analyze"].id),
+        )
+        store._conn.commit()
+
+        assert store.complete_run(
+            tasks["analyze"].id,
+            "analyze-run",
+            finished_at=NOW,
+            status="failed",
+            summary="boom",
+        )
+
+        # The queued run survives, and no skipped record was written.
+        assert [item.status for item in store.list_runs(tasks["publish"].id)] == [
+            "queued"
+        ]
+    finally:
+        store.close()
+
+
+def test_a_skipped_step_can_still_run_next_round(tmp_path):
+    """Being skipped is a verdict on one round, not on the step."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        async def scenario():
+            service = make_service(store, failing={"analyze"})
+            for hop in range(6):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+            # The next round goes well, started by hand so the entry step does
+            # not have to be re-armed.
+            service = make_service(store)
+            store.emit_signal(
+                task_signal_name(tasks["collect"].id, RUN_SUCCESS_STATUS),
+                source="manual",
+            )
+            for hop in range(6, 14):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        assert [item.status for item in store.list_runs(tasks["analyze"].id)] == [
+            "failed",
+            "succeeded",
+        ]
+        assert [item.status for item in store.list_runs(tasks["publish"].id)] == [
+            "skipped",
+            "succeeded",
+        ]
+    finally:
+        store.close()
+
+
+def test_a_step_that_succeeded_skips_nothing(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        async def scenario():
+            service = make_service(store)
+            for hop in range(6):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        assert [item.status for item in store.list_runs(tasks["publish"].id)] == [
+            "succeeded"
+        ]
+    finally:
+        store.close()
+
+
+def test_a_standalone_task_failing_skips_nothing(tmp_path):
+    """Nothing is blocked, because nothing was waiting on it."""
+    store = make_store(tmp_path)
+    try:
+        task = store.create_task(
+            NewScheduledTask(
+                name="lonely",
+                kind="agent_prompt",
+                trigger=clock(),
+                payload={"prompt": "do the thing"},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+        make_due(store, task.id)
+
+        async def scenario():
+            service = make_service(store, failing={"lonely"})
+            for hop in range(4):
+                await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+        asyncio.run(scenario())
+
+        assert [item.status for item in store.list_runs(task.id)] == ["failed"]
+        assert len(store.list_tasks()) == 1
     finally:
         store.close()
 

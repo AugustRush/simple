@@ -13,6 +13,8 @@ from agent import shared
 from .models import (
     ATTENTION_STATUSES,
     DEFAULT_SIGNAL_MAX_DEPTH,
+    RUN_SKIPPED_STATUS,
+    RUN_SUCCESS_STATUS,
     SIGNAL_MODE_ALL,
     TERMINAL_RUN_STATUSES,
     ClaimedTask,
@@ -1966,6 +1968,109 @@ class SchedulerStore:
         ).fetchone()
         return row is not None
 
+    def _skip_blocked_steps_in_transaction(
+        self,
+        workflow_id: str,
+        step_key: str,
+        status: str,
+        finished_at: datetime,
+    ) -> list[str]:
+        """Record the steps this failure blocks as skipped.  Caller owns the txn.
+
+        This is the one thing a chain needs that a lone task never did.  A step
+        runs when all of its upstreams succeeded, so a step whose upstream
+        failed waits for a signal that is no longer coming -- for ever, and in
+        silence.  Nothing would look wrong: no run, no error, a task that
+        appears simply not to have come up yet.
+
+        The whole subtree is written at once rather than one level at a time,
+        because the graph already knows it: each blocked step emits its own
+        ``skipped`` signal, and its own blocked steps are recorded here too, so
+        the recursion cannot stop halfway.  Its signals are still emitted, so a
+        task outside the workflow that subscribed to "this step was skipped"
+        still hears about it.
+
+        A step that already has a run queued or running is left alone.  That
+        run belongs to an earlier round and was legitimately asked for;
+        cancelling it to satisfy this skip would throw away work somebody
+        wanted, and it will announce its own outcome when it finishes.
+        """
+        if status == RUN_SUCCESS_STATUS:
+            return []
+        workflow = self.get_workflow(workflow_id)
+        if workflow is None:
+            return []
+        blocked_keys = workflow_downstream_steps(workflow.steps, step_key)
+        if not blocked_keys:
+            return []
+        reason = (
+            f"上游步骤「{step_key}」以 {status} 结束，这一步等不到它的成功信号，"
+            "因此没有运行"
+        )
+        skipped: list[str] = []
+        for step in workflow.steps:
+            key = str(step.key).strip()
+            if key not in blocked_keys:
+                continue
+            row = self._conn.execute(
+                """
+                SELECT id FROM scheduled_tasks
+                WHERE workflow_id = ? AND step_key = ?
+                LIMIT 1
+                """,
+                (workflow_id, key),
+            ).fetchone()
+            if row is None:
+                continue
+            blocked_task_id = row["id"]
+            if self._pending_run_for(blocked_task_id):
+                continue
+            run_id = _new_id()
+            snapshot = {
+                "workflow": {
+                    "workflow_id": workflow_id,
+                    "step_key": key,
+                    "blocked_by_step": step_key,
+                    "blocked_by_status": status,
+                }
+            }
+            self._conn.execute(
+                """
+                INSERT INTO scheduled_task_runs (
+                    id, task_id, scheduled_for, started_at, finished_at, status,
+                    summary, error, output_path, delivery_status,
+                    config_snapshot_json, trigger_source, attempt,
+                    missed_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, 1, 0, ?, ?)
+                """,
+                (
+                    run_id,
+                    blocked_task_id,
+                    _iso(finished_at),
+                    _iso(finished_at),
+                    _iso(finished_at),
+                    RUN_SKIPPED_STATUS,
+                    reason,
+                    json.dumps(snapshot, ensure_ascii=False),
+                    f"workflow:{step_key}",
+                    _iso(finished_at),
+                    _iso(finished_at),
+                ),
+            )
+            # ``last_run_at`` is deliberately not touched.  It answers "when did
+            # this task last run", and a skipped task has never run -- its never
+            # having run is the whole content of this record.  A step that looks
+            # like it ran is the failure this row exists to prevent.
+            self._emit_run_signal(
+                blocked_task_id,
+                run_id,
+                RUN_SKIPPED_STATUS,
+                finished_at,
+                reason,
+            )
+            skipped.append(blocked_task_id)
+        return skipped
+
     @_synchronized
     def complete_run(
         self,
@@ -2034,6 +2139,21 @@ class SchedulerStore:
             # task that visibly succeeded while whatever was waiting on it
             # waits forever -- the exact failure that is hardest to notice.
             self._emit_run_signal(task_id, run_id, status, finished_at, summary)
+            # Same reasoning, one step further: a step that did not do its work
+            # cannot unblock the steps below it, and their run will never
+            # happen.  Recorded here, with the status, so no control path can
+            # finish a step without the steps it blocks being settled.
+            membership = self._conn.execute(
+                "SELECT workflow_id, step_key FROM scheduled_tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if membership is not None and membership["workflow_id"]:
+                self._skip_blocked_steps_in_transaction(
+                    membership["workflow_id"],
+                    str(membership["step_key"] or ""),
+                    status,
+                    finished_at,
+                )
         return True
 
     @_synchronized
