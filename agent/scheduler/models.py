@@ -10,6 +10,15 @@ from zoneinfo import ZoneInfo
 
 
 UTC = timezone.utc
+
+#: How much of a subscription's list of names has to arrive before it runs.
+#: ``ANY`` is what a single name has always meant.  ``ALL`` is a join, and it
+#: exists so a step can wait for several upstreams without the caller having to
+#: invent a fake combined signal name nobody emits.
+SIGNAL_MODE_ANY = "any"
+SIGNAL_MODE_ALL = "all"
+SIGNAL_MODES: tuple[str, ...] = (SIGNAL_MODE_ANY, SIGNAL_MODE_ALL)
+
 _WEEKDAY_MAP = {
     "mon": 0,
     "monday": 0,
@@ -232,9 +241,33 @@ class SignalTrigger:
     correct rather than convenient: there is no calendar to fall behind.  A
     signal that arrives while nothing is running is a different problem, and it
     is handled where it belongs -- durably, by the emission record.
+
+    ``names`` is everything this task waits for, and ``mode`` says how much of
+    it is enough:
+
+    * ``any`` -- one emission of any listed name starts the run.  This is what
+      a single name means, and what a subscription has always meant.
+    * ``all`` -- every name must have been emitted *since this task last ran*
+      before it runs once.  That is how a step depending on several upstreams
+      is expressed, and the "since it last ran" part is what keeps a fast
+      upstream from making the join fire twice for one round of work.
     """
 
-    name: str
+    names: list[str]
+    mode: str = SIGNAL_MODE_ANY
+
+    @property
+    def name(self) -> str:
+        """The one name this waits for, for the single-signal case.
+
+        Kept as a read-only view rather than a field so the two cannot drift:
+        a caller asking for "the name" of a subscription that waits for three
+        gets the first, and should be reading ``names`` instead.
+        """
+        return self.names[0] if self.names else ""
+
+    def needs_all(self) -> bool:
+        return self.mode == SIGNAL_MODE_ALL
 
     def next_after(self, now: datetime) -> Optional[datetime]:
         return None
@@ -325,6 +358,21 @@ class TriggerSpec:
         """
         return cls("signal", {"name": str(name).strip()})
 
+    @classmethod
+    def signal_all(cls, names: list[str]) -> "TriggerSpec":
+        """A subscription that waits for every one of *names*.
+
+        Stored under a separate key from the single-name form on purpose.  The
+        two shapes are read by the same accessor, but keeping ``name`` intact
+        means every existing row, tool call and API response keeps meaning what
+        it meant, and a database written by an older build stays readable.
+        """
+        cleaned = [str(item).strip() for item in names if str(item).strip()]
+        deduped = list(dict.fromkeys(cleaned))
+        if not deduped:
+            raise ValueError("signal_all needs at least one signal name")
+        return cls("signal", {"names": deduped, "mode": SIGNAL_MODE_ALL})
+
     def instantiate(self):
         if self.trigger_type == "once":
             return OnceTrigger(
@@ -361,7 +409,10 @@ class TriggerSpec:
                 timezone_name=self.payload.get("timezone_name", "UTC"),
             )
         if self.trigger_type == "signal":
-            return SignalTrigger(name=str(self.payload["name"]))
+            return SignalTrigger(
+                names=signal_names(self),
+                mode=signal_mode(self),
+            )
         raise ValueError(f"Unknown trigger type: {self.trigger_type}")
 
     def initial_run_at(self, now: Optional[datetime] = None) -> Optional[datetime]:
@@ -449,17 +500,20 @@ def describe_missed_occurrences(missed_count: int) -> str:
     return f"⚠️ 本次运行前有 {missed} 次计划未能执行（进程未运行）。"
 
 
-#: What became of one emission.  ``coalesced``, ``refused`` and ``unmatched``
-#: are not failures to be hidden: they are the three ways a signal can arrive
-#: without producing a run, and each is stored with a reason so that "the
-#: automation did not run" is never something a person has to infer from a
+#: What became of one emission.  ``coalesced``, ``refused``, ``waiting`` and
+#: ``unmatched`` are not failures to be hidden: they are the four ways a signal
+#: can arrive without producing a run, and each is stored with a reason so that
+#: "the automation did not run" is never something a person has to infer from a
 #: silence.  ``unmatched`` in particular is what a typo looks like -- a signal
 #: nobody subscribes to, which without this state would be indistinguishable
-#: from a signal that worked.
+#: from a signal that worked.  ``waiting`` is what a join looks like one
+#: upstream short: accepted and recorded, with a run still to come, which is
+#: neither of the other two and must not be reported as either.
 SIGNAL_STATES: tuple[str, ...] = (
     "pending",
     "delivered",
     "coalesced",
+    "waiting",
     "refused",
     "unmatched",
 )
@@ -493,6 +547,43 @@ def task_signal_name(task_id: str, status: str) -> str:
     depending on a value that is allowed to change.
     """
     return f"{TASK_SIGNAL_PREFIX}{task_id}:{status}"
+
+
+def signal_names(trigger: "TriggerSpec") -> list[str]:
+    """Every signal name a subscription waits for, in the order given.
+
+    One accessor for both stored shapes, because two readers disagreeing about
+    what a subscription means is how a task ends up waiting forever.  The
+    single-name form written by older builds (``{"name": ...}``) and the
+    list form (``{"names": [...]}``) are the same thing to every caller, and a
+    subscription to several names is read as a set of one-name waits.
+    """
+    payload = getattr(trigger, "payload", None) or {}
+    listed = payload.get("names")
+    if isinstance(listed, (list, tuple)):
+        names = [str(item).strip() for item in listed]
+        return [item for item in names if item]
+    single = str(payload.get("name", "") or "").strip()
+    return [single] if single else []
+
+
+def signal_mode(trigger: "TriggerSpec") -> str:
+    """Whether one name is enough (``any``) or all of them are needed (``all``).
+
+    A trigger with no mode recorded is ``any``: that is what every subscription
+    written before joins existed meant, so reading it that way keeps old rows
+    behaving exactly as they did.
+    """
+    payload = getattr(trigger, "payload", None) or {}
+    mode = str(payload.get("mode", "") or "").strip().lower()
+    return mode if mode in SIGNAL_MODES else SIGNAL_MODE_ANY
+
+
+def subscribes_to(trigger: "TriggerSpec", name: str) -> bool:
+    """Whether this subscription wants to hear about *name*."""
+    if getattr(trigger, "trigger_type", "") != "signal":
+        return False
+    return str(name or "").strip() in signal_names(trigger)
 
 
 #: The statuses a run can finish in.  A subscription to anything else is a
@@ -610,6 +701,12 @@ class NewScheduledTask:
     )
     selected_skills: list[str] = field(default_factory=list)
     permission_profile: str = "inherit"
+    #: Set only when the task is one step of a workflow.  Part of the task's
+    #: *identity* rather than of its behaviour: an identical definition created
+    #: on its own is a different thing from a step, and deduplication that
+    #: confused the two would quietly fold one into the other.
+    workflow_id: str = ""
+    step_key: str = ""
 
 
 @dataclass
@@ -638,6 +735,13 @@ class ScheduledTask:
     last_success_at: Optional[datetime]
     created_at: datetime
     updated_at: datetime
+    #: Which workflow this task is a step of, and which step.  Empty for a
+    #: standalone task -- most tasks are, and a task does not have to belong to
+    #: anything to be scheduled.  Kept on the task rather than looked up from
+    #: the graph so an unattended run can tell, from its own row, that it has
+    #: consequences downstream when it finishes.
+    workflow_id: str = ""
+    step_key: str = ""
 
 
 #: Terminal statuses that mean "a person should look at this".
@@ -720,6 +824,338 @@ def execution_snapshot(task: ScheduledTask) -> dict[str, Any]:
             "payload": task.delivery_target.payload,
         },
     }
+
+
+#: The kinds of work a step can name.  Kept in step with what the runtime can
+#: actually execute -- a workflow that stores a kind nothing runs would fail at
+#: the point of use, in the middle of the night, one step into a chain.
+STEP_KINDS: tuple[str, ...] = ("agent_prompt", "message", "system_job")
+
+#: The one terminal status that means "the step's work happened".
+#:
+#: ``cancelled`` and ``interrupted`` are terminal but are *not* success, and
+#: neither is ``failed``.  Naming the single succeeding value rather than
+#: listing the failing ones is deliberate: a new terminal status invented later
+#: then defaults to "did not succeed", which is the safe way for a downstream
+#: step to be wrong.
+RUN_SUCCESS_STATUS = "succeeded"
+
+
+@dataclass
+class WorkflowStep:
+    """One step of a workflow: a task, plus what has to finish before it runs.
+
+    A step is a task definition *without a trigger* whenever something else has
+    to finish first, because in that case the upstreams are the trigger.  A step
+    with no upstreams is an entry step and keeps a trigger of its own -- it is
+    an ordinary scheduled task, which is why a workflow can start from a clock,
+    from an external signal, or from anything else the scheduler already
+    understands.
+
+    Storing ``trigger`` as optional rather than inventing a "workflow trigger"
+    type keeps that asymmetry visible in the data: whoever reads a step can see
+    whether it starts things or follows them, instead of having to work it out
+    from the graph.
+    """
+
+    key: str
+    name: str
+    kind: str
+    payload: dict[str, Any]
+    depends_on: list[str] = field(default_factory=list)
+    #: Entry steps only.  Rejected on a step that has upstreams, because "run
+    #: at 9am" and "run after A" are two different answers to when this runs,
+    #: and quietly preferring one of them would make the other a lie.
+    trigger: Optional[TriggerSpec] = None
+    workspace_root: str = ""
+    permission_profile: str = "inherit"
+    context_policy: str = "stateless"
+    model_override: Optional[str] = None
+    timeout_seconds: int = 1800
+    selected_skills: list[str] = field(default_factory=list)
+    delivery_mode: str = "standalone"
+    delivery_target: Optional[DeliveryTarget] = None
+
+    def is_entry(self) -> bool:
+        return not self.depends_on
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "name": self.name,
+            "kind": self.kind,
+            "payload": self.payload,
+            "depends_on": list(self.depends_on),
+            "trigger": self.trigger.to_json() if self.trigger is not None else None,
+            "workspace_root": self.workspace_root,
+            "permission_profile": self.permission_profile,
+            "context_policy": self.context_policy,
+            "model_override": self.model_override,
+            "timeout_seconds": int(self.timeout_seconds),
+            "selected_skills": list(self.selected_skills),
+            "delivery_mode": self.delivery_mode,
+            "delivery_target": (
+                self.delivery_target.to_json()
+                if self.delivery_target is not None
+                else None
+            ),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WorkflowStep":
+        raw_trigger = data.get("trigger")
+        raw_target = data.get("delivery_target")
+        return cls(
+            key=str(data.get("key", "")).strip(),
+            name=str(data.get("name", "")).strip(),
+            kind=str(data.get("kind", "")).strip(),
+            payload=dict(data.get("payload") or {}),
+            depends_on=[
+                str(item).strip()
+                for item in (data.get("depends_on") or [])
+                if str(item).strip()
+            ],
+            trigger=(
+                TriggerSpec.from_json(raw_trigger)
+                if isinstance(raw_trigger, str) and raw_trigger.strip()
+                else None
+            ),
+            workspace_root=str(data.get("workspace_root", "") or ""),
+            permission_profile=str(
+                data.get("permission_profile", "inherit") or "inherit"
+            ),
+            context_policy=str(data.get("context_policy", "stateless") or "stateless"),
+            model_override=data.get("model_override") or None,
+            timeout_seconds=int(data.get("timeout_seconds", 1800) or 1800),
+            selected_skills=[
+                str(item)
+                for item in (data.get("selected_skills") or [])
+                if str(item).strip()
+            ],
+            delivery_mode=str(data.get("delivery_mode", "standalone") or "standalone"),
+            delivery_target=(
+                DeliveryTarget.from_json(raw_target)
+                if isinstance(raw_target, str) and raw_target.strip()
+                else None
+            ),
+        )
+
+
+@dataclass
+class Workflow:
+    """A named graph of steps, where the edges are "this finished, so run that".
+
+    The edges are stored rather than inferred from signal names on purpose.
+    Two steps connected by a join of task signals are indistinguishable, from
+    the signals alone, from two unrelated tasks that happen to subscribe to
+    each other -- and the difference is exactly what a skip has to know: when a
+    step fails, the steps below it must not run, and only the graph can say
+    which those are.
+    """
+
+    name: str
+    steps: list[WorkflowStep]
+    id: str = ""
+    description: str = ""
+    enabled: bool = True
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    def step(self, key: str) -> Optional[WorkflowStep]:
+        wanted = str(key or "").strip()
+        for item in self.steps:
+            if item.key == wanted:
+                return item
+        return None
+
+    def to_graph(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "enabled": bool(self.enabled),
+            "steps": [item.to_dict() for item in self.steps],
+        }
+
+    @classmethod
+    def from_graph(
+        cls,
+        raw: str,
+        *,
+        workflow_id: str = "",
+        created_at: Optional[datetime] = None,
+        updated_at: Optional[datetime] = None,
+    ) -> "Workflow":
+        data = json.loads(raw or "{}")
+        if not isinstance(data, dict):
+            raise ValueError("workflow graph must be a JSON object")
+        steps = [
+            WorkflowStep.from_dict(item)
+            for item in (data.get("steps") or [])
+            if isinstance(item, dict)
+        ]
+        return cls(
+            id=workflow_id,
+            name=str(data.get("name", "")),
+            description=str(data.get("description", "")),
+            enabled=bool(data.get("enabled", True)),
+            steps=steps,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+
+def workflow_step_order(steps: list[WorkflowStep]) -> list[str]:
+    """The step keys in an order where every step follows its upstreams.
+
+    Raises ``ValueError`` on anything that makes such an order impossible:
+    a step naming an upstream that does not exist, a step that names itself,
+    or a cycle.  The message names the steps involved, because "the graph has a
+    cycle" is not actionable -- which steps, and in what order, is.
+
+    Materialization needs this order and not just the check: a downstream
+    step's trigger is built from its upstreams' task ids, so those tasks have
+    to exist first.
+    """
+    by_key: dict[str, WorkflowStep] = {}
+    for step in steps:
+        key = str(step.key or "").strip()
+        if not key:
+            raise ValueError("每个步骤都需要一个 key")
+        if key in by_key:
+            raise ValueError(f"步骤 key 重复：{key}")
+        by_key[key] = step
+    if not by_key:
+        raise ValueError("workflow 至少要有一个步骤")
+
+    for step in steps:
+        key = str(step.key).strip()
+        edges = [str(item).strip() for item in step.depends_on]
+        duplicates = [item for item in dict.fromkeys(edges) if edges.count(item) > 1]
+        if duplicates:
+            raise ValueError(f"步骤 {key} 重复声明了上游：{'、'.join(duplicates)}")
+        if key in edges:
+            raise ValueError(f"步骤 {key} 不能依赖自己")
+        missing = [item for item in edges if item not in by_key]
+        if missing:
+            raise ValueError(f"步骤 {key} 依赖了不存在的上游：{'、'.join(missing)}")
+
+    order: list[str] = []
+    visiting: list[str] = []
+    placed: set[str] = set()
+
+    def visit(key: str) -> None:
+        if key in placed:
+            return
+        if key in visiting:
+            # Cut the cycle open at the repeat, so the message can show the
+            # ring itself rather than the path that happened to reach it.
+            ring = visiting[visiting.index(key) :] + [key]
+            raise ValueError("workflow 存在循环依赖：" + " → ".join(ring))
+        visiting.append(key)
+        for upstream in by_key[key].depends_on:
+            visit(str(upstream).strip())
+        visiting.pop()
+        placed.add(key)
+        order.append(key)
+
+    for key in list(by_key):
+        visit(key)
+    return order
+
+
+def validate_workflow_graph(steps: list[WorkflowStep]) -> list[str]:
+    """Check a graph is buildable, and return its step order.
+
+    Everything a workflow can be wrong about is wrong *before* it runs: a step
+    with no work in it, a step whose trigger contradicts its edges, a cycle.
+    Catching them here means the failure lands where somebody can still read
+    it, rather than as a task that quietly never fires.
+    """
+    order = workflow_step_order(steps)
+    by_key = {str(step.key).strip(): step for step in steps}
+    for key in order:
+        step = by_key[key]
+        if not str(step.name or "").strip():
+            raise ValueError(f"步骤 {key} 缺少名称")
+        if step.kind not in STEP_KINDS:
+            raise ValueError(
+                f"步骤 {key} 的执行类型不支持：{step.kind!r}；"
+                "可选：" + "、".join(STEP_KINDS)
+            )
+        payload = step.payload or {}
+        if step.kind == "message" and not str(payload.get("message_text", "")).strip():
+            raise ValueError(f"步骤 {key} 是消息任务，但缺少 message_text")
+        if (
+            step.kind == "agent_prompt"
+            and not str(payload.get("prompt", "")).strip()
+        ):
+            raise ValueError(f"步骤 {key} 是 Agent 任务，但缺少 prompt")
+        if step.kind == "system_job" and not str(payload.get("job_name", "")).strip():
+            raise ValueError(f"步骤 {key} 是系统任务，但缺少 job_name")
+        if step.is_entry():
+            if step.trigger is None:
+                raise ValueError(
+                    f"步骤 {key} 没有任何上游，必须自带触发方式（时间或信号）"
+                )
+        elif step.trigger is not None:
+            raise ValueError(
+                f"步骤 {key} 有上游，它的触发方式由上游决定；"
+                "不能另外再给它一个时间或信号触发，否则「什么时候运行」会有两个答案"
+            )
+        if int(step.timeout_seconds) <= 0:
+            raise ValueError(f"步骤 {key} 的超时时间必须为正数")
+    return order
+
+
+def step_trigger_spec(
+    step: WorkflowStep, upstream_task_ids: list[str]
+) -> TriggerSpec:
+    """The trigger a step gets once its upstreams are real tasks.
+
+    A dependent step waits for **all** of its upstreams to have succeeded, and
+    it waits on their success signals specifically -- not on "they finished".
+    A step that ran because its upstream failed would usually produce something
+    wrong rather than nothing, and wrong output that looks like a result is
+    worse than a step that did not run.
+    """
+    if step.is_entry():
+        if step.trigger is None:
+            raise ValueError(f"步骤 {step.key} 没有触发方式")
+        return step.trigger
+    if len(upstream_task_ids) != len(step.depends_on):
+        raise ValueError(
+            f"步骤 {step.key} 需要 {len(step.depends_on)} 个上游任务 id，"
+            f"只拿到 {len(upstream_task_ids)} 个"
+        )
+    return TriggerSpec.signal_all(
+        [
+            task_signal_name(str(task_id), RUN_SUCCESS_STATUS)
+            for task_id in upstream_task_ids
+        ]
+    )
+
+
+def workflow_downstream_steps(steps: list[WorkflowStep], key: str) -> list[str]:
+    """Every step that would be blocked by *key* failing, transitively.
+
+    Used when a step fails: the steps that depend on it, and the steps that
+    depend on those, are all waiting for a success that is no longer coming.
+    Returning the whole set at once -- rather than just the direct children --
+    is what keeps a chain from stopping halfway and leaving the rest looking
+    like tasks nobody has gotten around to running.
+    """
+    blocked: set[str] = set()
+    frontier = [str(key).strip()]
+    while frontier:
+        current = frontier.pop()
+        for step in steps:
+            step_key = str(step.key).strip()
+            if step_key in blocked:
+                continue
+            if current in [str(item).strip() for item in step.depends_on]:
+                blocked.add(step_key)
+                frontier.append(step_key)
+    return [str(step.key).strip() for step in steps if str(step.key).strip() in blocked]
 
 
 @dataclass

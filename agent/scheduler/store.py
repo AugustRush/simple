@@ -13,6 +13,7 @@ from agent import shared
 from .models import (
     ATTENTION_STATUSES,
     DEFAULT_SIGNAL_MAX_DEPTH,
+    SIGNAL_MODE_ALL,
     TERMINAL_RUN_STATUSES,
     ClaimedTask,
     DeliveryTarget,
@@ -21,9 +22,17 @@ from .models import (
     SignalEmission,
     TaskRun,
     TriggerSpec,
+    Workflow,
+    WorkflowStep,
     execution_snapshot,
     parse_task_signal,
+    signal_mode,
+    signal_names,
+    step_trigger_spec,
+    subscribes_to,
     task_signal_name,
+    validate_workflow_graph,
+    workflow_downstream_steps,
 )
 
 
@@ -73,7 +82,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 8
+    SCHEMA_VERSION = 9
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -185,6 +194,20 @@ class SchedulerStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_signal_deliveries_emission
                     ON signal_deliveries(emission_id, created_at);
+                CREATE TABLE IF NOT EXISTS signal_joins (
+                    task_id TEXT PRIMARY KEY,
+                    satisfied_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workflows (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL,
+                    graph_json TEXT NOT NULL DEFAULT '{"steps": []}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             current_version = int(
@@ -320,6 +343,36 @@ class SchedulerStore:
                 # backfill, because a repository of emissions that were never
                 # made is empty, not zero-filled.
                 self._conn.execute("PRAGMA user_version = 8")
+            elif version == 9:
+                task_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_tasks)"
+                    ).fetchall()
+                }
+                # Which workflow and which step a task was materialised from.
+                # On the task rather than in the graph, because the graph is
+                # edited as one document while the task is what actually runs;
+                # a stale graph must not be able to lose track of a live task.
+                # Defaults to empty, which is what every task that predates
+                # workflows is -- a standalone task, not a member of anything.
+                additions = {
+                    "workflow_id": "TEXT NOT NULL DEFAULT ''",
+                    "step_key": "TEXT NOT NULL DEFAULT ''",
+                }
+                for name, declaration in additions.items():
+                    if name not in task_columns:
+                        self._conn.execute(
+                            f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}"
+                        )
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_workflow "
+                    "ON scheduled_tasks(workflow_id, step_key)"
+                )
+                # signal_joins and workflows are created by the DDL above;
+                # nothing to backfill for either.  A join's satisfied set starts
+                # empty by definition, and a workflow nobody has authored is
+                # absent rather than an empty row.
+                self._conn.execute("PRAGMA user_version = 9")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -347,6 +400,8 @@ class SchedulerStore:
             last_success_at=_dt(row["last_success_at"]),
             created_at=_dt(row["created_at"]) or datetime.now(UTC),
             updated_at=_dt(row["updated_at"]) or datetime.now(UTC),
+            workflow_id=row["workflow_id"] or "",
+            step_key=row["step_key"] or "",
         )
 
     def _run_from_row(self, row: sqlite3.Row) -> TaskRun:
@@ -390,8 +445,9 @@ class SchedulerStore:
                     selected_skills_json,
                     permission_profile,
                     next_run_at, lease_until,
-                    active_run_id, last_run_at, last_success_at, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+                    active_run_id, last_run_at, last_success_at, created_at, updated_at,
+                    workflow_id, step_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -414,6 +470,8 @@ class SchedulerStore:
                     _iso(next_run_at),
                     _iso(created_at),
                     _iso(created_at),
+                    task.workflow_id,
+                    task.step_key,
                 ),
             )
         created = self.get_task(task_id)
@@ -444,6 +502,8 @@ class SchedulerStore:
               AND retry_policy_json = ?
               AND selected_skills_json = ?
               AND permission_profile = ?
+              AND workflow_id = ?
+              AND step_key = ?
             ORDER BY created_at ASC
             LIMIT 1
             """,
@@ -465,6 +525,8 @@ class SchedulerStore:
                 json.dumps(task.retry_policy, ensure_ascii=False),
                 json.dumps(task.selected_skills, ensure_ascii=False),
                 task.permission_profile,
+                task.workflow_id,
+                task.step_key,
             ),
         ).fetchone()
         return self._task_from_row(row) if row else None
@@ -499,6 +561,8 @@ class SchedulerStore:
                 row["retry_policy_json"],
                 row["selected_skills_json"],
                 row["permission_profile"],
+                row["workflow_id"],
+                row["step_key"],
             )
             if signature in seen:
                 duplicate_ids.append(row["id"])
@@ -764,6 +828,12 @@ class SchedulerStore:
         of rows per delivery.  A repository with thousands of tasks would want
         subscriptions broken out into their own table; that is a change worth
         making when the row count says so, not before.
+
+        A join (``mode="all"``) is a subscriber too, but it is *not* run by
+        this emission alone: the caller has to accumulate, which is what
+        :meth:`_advance_join` is for.  Returning it here keeps "who is
+        listening" a single question with a single answer, and the delivery
+        loop decides what each answer means.
         """
         subscribers: list[ScheduledTask] = []
         rows = self._conn.execute(
@@ -771,11 +841,90 @@ class SchedulerStore:
         ).fetchall()
         for row in rows:
             task = self._task_from_row(row)
-            if task.trigger.trigger_type != "signal":
-                continue
-            if str(task.trigger.payload.get("name", "")).strip() == name:
+            if subscribes_to(task.trigger, name):
                 subscribers.append(task)
         return subscribers
+
+    def _satisfied_joins(self, task_id: str) -> set[str]:
+        row = self._conn.execute(
+            "SELECT satisfied_json FROM signal_joins WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return set()
+        try:
+            decoded = json.loads(row["satisfied_json"] or "[]")
+        except (TypeError, ValueError):
+            return set()
+        if not isinstance(decoded, list):
+            return set()
+        return {str(item) for item in decoded if str(item).strip()}
+
+    def _advance_join(self, task: ScheduledTask, name: str, now: datetime) -> list[str]:
+        """Record one arrival at a join.  Returns the names still missing.
+
+        An empty list means this arrival completed the round.  The satisfied
+        set means "upstreams heard from since the last completed round", and
+        the caller spends it the moment the round completes -- that is, as
+        soon as this returns an empty list, whether or not a run follows.
+        Spending it on completion rather than on queueing is what stops a
+        stale arrival from closing a second round later: if a completed round
+        that coalesced into a run already in flight left its set behind, then
+        the next report from any one upstream would find the set still full,
+        complete a round nobody opened, and run the step on evidence that had
+        already been acted on.
+
+        Because it is a set, a fast upstream succeeding three times while a
+        slow one is still working contributes one arrival, not three, so the
+        downstream step does not run repeatedly for one turn of the crank.
+
+        Caller owns the transaction.
+        """
+        required = set(signal_names(task.trigger))
+        satisfied = self._satisfied_joins(task.id)
+        satisfied.add(str(name))
+        # Intersected with what this join actually waits for, so a name that
+        # this task is not subscribed to can never contribute to completing it.
+        satisfied &= required
+        missing = sorted(required - satisfied)
+        self._conn.execute(
+            """
+            INSERT INTO signal_joins (task_id, satisfied_json, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                satisfied_json = excluded.satisfied_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                task.id,
+                json.dumps(sorted(satisfied), ensure_ascii=False),
+                _iso(now),
+            ),
+        )
+        return missing
+
+    def join_progress(self, task_id: str) -> dict[str, Any]:
+        """What a join has heard from so far, so the interface can show it.
+
+        Without this, a join that is one name short looks exactly like a task
+        that is broken -- nothing has run and nothing says why.
+        """
+        row = self._conn.execute(
+            "SELECT trigger_json FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        required: list[str] = []
+        if row is not None:
+            trigger = TriggerSpec.from_json(row["trigger_json"])
+            if signal_mode(trigger) == SIGNAL_MODE_ALL:
+                required = signal_names(trigger)
+        satisfied = self._satisfied_joins(task_id)
+        return {
+            "required": required,
+            "satisfied": sorted(satisfied),
+            "missing": [name for name in required if name not in satisfied],
+        }
+
+    def _clear_join(self, task_id: str) -> None:
+        self._conn.execute("DELETE FROM signal_joins WHERE task_id = ?", (task_id,))
 
     def _record_delivery(
         self,
@@ -821,6 +970,10 @@ class SchedulerStore:
         follows a signal is the only place that knows it: when *it* finishes
         and emits in turn, the depth and the cascade id have to travel with it
         or the ceiling has nothing to count.
+
+        A join's accumulated arrivals are *not* spent here: the delivery loop
+        spends them when the round completes, which it must do whether or not
+        this method runs.  See :meth:`_advance_join`.
         """
         run_id = _new_id()
         snapshot = execution_snapshot(task)
@@ -874,9 +1027,21 @@ class SchedulerStore:
         Idempotent by state: an emission leaves ``pending`` exactly once,
         inside the same transaction that queues its runs, so a crash midway
         cannot double-deliver -- it either committed both or neither.
+
+        A join (``mode="all"``) is the one case where an emission can be fully
+        accounted for and still start nothing: it arrived, it was recorded, and
+        the step it belongs to is waiting for its siblings.  That is
+        ``waiting``, and it is its own state because calling it ``delivered``
+        would claim a run that does not exist.
         """
         current = (now or datetime.now(UTC)).astimezone(UTC)
-        tally = {"delivered": 0, "coalesced": 0, "refused": 0, "unmatched": 0}
+        tally = {
+            "delivered": 0,
+            "coalesced": 0,
+            "waiting": 0,
+            "refused": 0,
+            "unmatched": 0,
+        }
         with self._immediate_transaction():
             rows = self._conn.execute(
                 """
@@ -919,8 +1084,41 @@ class SchedulerStore:
                     tally["refused"] += 1
                     continue
                 first_run_id = ""
-                delivered = coalesced = 0
+                delivered = coalesced = waiting = 0
+                waiting_on: list[str] = []
                 for task in subscribers:
+                    if signal_mode(task.trigger) == SIGNAL_MODE_ALL:
+                        # A join records this arrival and runs only when the
+                        # last one shows up.  Landing here without a run is the
+                        # normal case, not a failure, so it says so plainly
+                        # instead of being filed under a state that means
+                        # something else.  Recorded before the pending check
+                        # below, because an arrival during a run belongs to the
+                        # next round rather than to that run.
+                        missing = self._advance_join(task, emission.name, current)
+                        if missing:
+                            self._record_delivery(
+                                emission.id,
+                                task.id,
+                                "waiting",
+                                reason=(
+                                    "该任务在等所有上游信号，本次到达已记录；"
+                                    f"还在等：{'、'.join(missing)}"
+                                ),
+                                now=current,
+                            )
+                            waiting += 1
+                            waiting_on.extend(missing)
+                            continue
+                        # The round completed with this arrival, so it is spent
+                        # here, before the run question below decides what it
+                        # turns into.  A pending run is not a reason to keep
+                        # the set: the round is answered either way -- by a new
+                        # run or by the one already in flight -- and holding it
+                        # would let a stale arrival close a round that was
+                        # never opened.  ``test_the_next_round_starts_from_
+                        # nothing`` guards the rule.
+                        self._clear_join(task.id)
                     pending = self._pending_run_for(task.id)
                     if pending:
                         # Already something to do.  For a signal that repeats
@@ -965,6 +1163,17 @@ class SchedulerStore:
                         now=current,
                     )
                     tally["delivered"] += 1
+                elif waiting:
+                    self._settle_emission(
+                        emission,
+                        state="waiting",
+                        reason=(
+                            f"{waiting} 个订阅任务在等其余上游信号，"
+                            f"还在等：{'、'.join(dict.fromkeys(waiting_on))}"
+                        ),
+                        now=current,
+                    )
+                    tally["waiting"] += 1
                 else:
                     self._settle_emission(
                         emission,
@@ -1198,6 +1407,7 @@ class SchedulerStore:
                     workspace_root = ?, context_policy = ?, timeout_seconds = ?,
                     retry_policy_json = ?, next_run_at = ?, updated_at = ?
                     , selected_skills_json = ?, permission_profile = ?
+                    , workflow_id = ?, step_key = ?
                 WHERE id = ?
                 """,
                 (
@@ -1219,6 +1429,8 @@ class SchedulerStore:
                     _iso(updated_at),
                     json.dumps(task.selected_skills, ensure_ascii=False),
                     task.permission_profile,
+                    task.workflow_id,
+                    task.step_key,
                     task_id,
                 ),
             )
@@ -1847,6 +2059,11 @@ class SchedulerStore:
             self._conn.execute(
                 "DELETE FROM signal_deliveries WHERE task_id = ?", (task_id,)
             )
+            # Same reasoning for a half-satisfied join: it is this task's own
+            # progress, and it is meaningless without the task.
+            self._conn.execute(
+                "DELETE FROM signal_joins WHERE task_id = ?", (task_id,)
+            )
             self._conn.execute(
                 "DELETE FROM scheduled_task_runs WHERE task_id = ?", (task_id,)
             )
@@ -1855,3 +2072,298 @@ class SchedulerStore:
             # tasks whose runs point back at it; deleting it would rewrite
             # their history to make this deletion tidier.
             self._conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+
+    # -- workflows -------------------------------------------------------
+    #
+    # A workflow is a stored graph of steps.  The tasks that carry the steps
+    # are created from it, not the other way round, so the graph is the thing
+    # a person edits and the tasks are a consequence -- which is what makes
+    # "add a step" a single action instead of a re-wiring of signals.
+    #
+    # Steps are matched to tasks by ``step_key``, and the task id is kept
+    # across re-materialization.  That matters more than it looks: a task id
+    # appears in the signal names its downstream steps subscribe to, so
+    # recreating tasks on every edit would silently break every edge.
+
+    def _workflow_from_row(self, row: sqlite3.Row) -> Workflow:
+        return Workflow.from_graph(
+            row["graph_json"],
+            workflow_id=row["id"],
+            created_at=_dt(row["created_at"]),
+            updated_at=_dt(row["updated_at"]),
+        )
+
+    @_synchronized
+    def create_workflow(
+        self, workflow: Workflow, *, now: Optional[datetime] = None
+    ) -> Workflow:
+        """Store a graph, then build the tasks it describes.
+
+        The two happen together on purpose.  A graph with no tasks behind it
+        is a drawing: it looks like a plan and runs nothing, and the person who
+        made it has no way to tell the difference from the outside.
+        """
+        validate_workflow_graph(workflow.steps)
+        created_at = (now or datetime.now(UTC)).astimezone(UTC)
+        workflow_id = _new_id()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO workflows (
+                    id, name, description, enabled, graph_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workflow_id,
+                    workflow.name,
+                    workflow.description,
+                    1 if workflow.enabled else 0,
+                    json.dumps(workflow.to_graph(), ensure_ascii=False),
+                    _iso(created_at),
+                    _iso(created_at),
+                ),
+            )
+        self.materialize_workflow(workflow_id, now=created_at)
+        stored = self.get_workflow(workflow_id)
+        assert stored is not None
+        return stored
+
+    @_synchronized
+    def get_workflow(self, workflow_id: str) -> Optional[Workflow]:
+        row = self._conn.execute(
+            "SELECT * FROM workflows WHERE id = ? LIMIT 1", (workflow_id,)
+        ).fetchone()
+        return self._workflow_from_row(row) if row else None
+
+    @_synchronized
+    def list_workflows(self) -> list[Workflow]:
+        rows = self._conn.execute(
+            "SELECT * FROM workflows ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+        return [self._workflow_from_row(row) for row in rows]
+
+    @_synchronized
+    def update_workflow(
+        self,
+        workflow_id: str,
+        workflow: Workflow,
+        *,
+        now: Optional[datetime] = None,
+    ) -> Optional[Workflow]:
+        if self.get_workflow(workflow_id) is None:
+            return None
+        validate_workflow_graph(workflow.steps)
+        updated_at = (now or datetime.now(UTC)).astimezone(UTC)
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE workflows
+                SET name = ?, description = ?, enabled = ?, graph_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    workflow.name,
+                    workflow.description,
+                    1 if workflow.enabled else 0,
+                    json.dumps(workflow.to_graph(), ensure_ascii=False),
+                    _iso(updated_at),
+                    workflow_id,
+                ),
+            )
+        self.materialize_workflow(workflow_id, now=updated_at)
+        return self.get_workflow(workflow_id)
+
+    @_synchronized
+    def delete_workflow(
+        self, workflow_id: str, *, now: Optional[datetime] = None
+    ) -> list[str]:
+        """Drop the graph and disable the tasks it built.  Returns their ids.
+
+        The tasks are disabled rather than deleted, and their run history is
+        left where it is.  Deleting them would take the record of what the
+        workflow did with it, and a workflow is exactly the kind of thing
+        somebody deletes in order to stop it -- not in order to forget that it
+        ran.  Disabling also stops any subscription they hold from firing.
+        """
+        now_dt = (now or datetime.now(UTC)).astimezone(UTC)
+        disabled = [task.id for task in self.step_tasks(workflow_id).values()]
+        with self._conn:
+            for task_id in disabled:
+                self._conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET enabled = 0, next_run_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_iso(now_dt), task_id),
+                )
+            self._conn.execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
+        return sorted(disabled)
+
+    @_synchronized
+    def step_tasks(self, workflow_id: str) -> dict[str, ScheduledTask]:
+        """The tasks behind a workflow's steps, keyed by step key."""
+        rows = self._conn.execute(
+            """
+            SELECT * FROM scheduled_tasks
+            WHERE workflow_id = ? AND step_key != ''
+            ORDER BY created_at ASC
+            """,
+            (workflow_id,),
+        ).fetchall()
+        return {row["step_key"]: self._task_from_row(row) for row in rows}
+
+    def _step_task_spec(
+        self,
+        step: WorkflowStep,
+        trigger: TriggerSpec,
+        *,
+        workflow_id: str,
+        enabled: bool,
+        inherited_workspace: str = "",
+    ) -> NewScheduledTask:
+        workspace = str(step.workspace_root or "").strip()
+        if not workspace and inherited_workspace:
+            workspace = inherited_workspace
+        target = step.delivery_target
+        if target is None:
+            target = DeliveryTarget.standalone()
+        if workspace:
+            workspace = str(Path(workspace).expanduser().resolve(strict=False))
+        return NewScheduledTask(
+            name=step.name,
+            kind=step.kind,
+            trigger=trigger,
+            payload=dict(step.payload),
+            delivery_mode=step.delivery_mode,
+            delivery_target=target,
+            model_override=step.model_override,
+            timeout_seconds=int(step.timeout_seconds),
+            selected_skills=list(step.selected_skills),
+            workspace_root=workspace or str(Path.cwd().resolve()),
+            permission_profile=step.permission_profile,
+            context_policy=step.context_policy,
+            enabled=enabled,
+            workflow_id=workflow_id,
+            step_key=step.key,
+        )
+
+    @_synchronized
+    def materialize_workflow(
+        self, workflow_id: str, *, now: Optional[datetime] = None
+    ) -> dict[str, Any]:
+        """Build or refresh the tasks behind a workflow's steps.
+
+        Steps are walked in dependency order because a downstream step's
+        trigger names its upstreams' task ids, so those tasks have to exist
+        first.  The order comes from the same function that rejected a cycle,
+        so a graph that got this far has one.
+
+        Tasks that already belong to a step are updated rather than replaced.
+        Their ids are load-bearing: they are what the downstream subscriptions
+        point at, and what the run history hangs from.
+
+        Returns a report of what changed, including which steps inherited a
+        project folder from somewhere else -- an inheritance nobody can see is
+        indistinguishable from a step about to run in the wrong place.
+        """
+        workflow = self.get_workflow(workflow_id)
+        if workflow is None:
+            raise ValueError(f"找不到 workflow：{workflow_id}")
+        order = validate_workflow_graph(workflow.steps)
+        now_dt = (now or datetime.now(UTC)).astimezone(UTC)
+        by_key = {str(step.key).strip(): step for step in workflow.steps}
+        existing = self.step_tasks(workflow_id)
+
+        # A step with no folder of its own runs where the workflow's entry
+        # steps run.  A chain is one job, and steps that silently split across
+        # directories would write half a result to each.
+        inherited_workspace = ""
+        for key in order:
+            step = by_key[key]
+            if step.is_entry() and str(step.workspace_root or "").strip():
+                inherited_workspace = str(
+                    Path(step.workspace_root).expanduser().resolve(strict=False)
+                )
+                break
+
+        created: list[str] = []
+        updated: list[str] = []
+        inherited: list[str] = []
+        task_id_by_key: dict[str, str] = {}
+        for key in order:
+            step = by_key[key]
+            upstream_ids = [task_id_by_key[dep] for dep in step.depends_on]
+            trigger = step_trigger_spec(step, upstream_ids)
+            spec = self._step_task_spec(
+                step,
+                trigger,
+                workflow_id=workflow_id,
+                enabled=bool(workflow.enabled),
+                inherited_workspace=inherited_workspace,
+            )
+            if not str(step.workspace_root or "").strip() and inherited_workspace:
+                inherited.append(key)
+            current = existing.get(key)
+            if current is None:
+                task = self.create_task(spec, now=now_dt)
+                created.append(task.id)
+            else:
+                refreshed = self.update_task(current.id, spec, now=now_dt)
+                task = refreshed or current
+                updated.append(task.id)
+            task_id_by_key[key] = task.id
+
+        # A step that is no longer in the graph must stop running.  Its task
+        # and its history stay; what goes is its ability to fire.
+        removed: list[str] = []
+        for key, task in existing.items():
+            if key in task_id_by_key:
+                continue
+            if task.enabled:
+                with self._conn:
+                    self._conn.execute(
+                        """
+                        UPDATE scheduled_tasks
+                        SET enabled = 0, next_run_at = NULL, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (_iso(now_dt), task.id),
+                    )
+            removed.append(key)
+
+        return {
+            "workflow_id": workflow_id,
+            "order": order,
+            "created": created,
+            "updated": updated,
+            "removed": sorted(removed),
+            "inherited_workspace": sorted(inherited),
+            "tasks_by_step": dict(task_id_by_key),
+        }
+
+    @_synchronized
+    def workflow_blocked_steps(
+        self, workflow_id: str, failed_step_key: str
+    ) -> list[tuple[str, ScheduledTask]]:
+        """Steps that can no longer run because *failed_step_key* did not.
+
+        Returns them paired with their tasks, in the graph's own order, because
+        the caller has to record a skip against each one and then emit that
+        step's own signal so the steps below *it* are reached in turn.
+        """
+        workflow = self.get_workflow(workflow_id)
+        if workflow is None:
+            return []
+        blocked = workflow_downstream_steps(workflow.steps, failed_step_key)
+        if not blocked:
+            return []
+        tasks = self.step_tasks(workflow_id)
+        paired: list[tuple[str, ScheduledTask]] = []
+        for step in workflow.steps:
+            key = str(step.key).strip()
+            if key in blocked and key in tasks:
+                paired.append((key, tasks[key]))
+        return paired

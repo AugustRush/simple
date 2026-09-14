@@ -51,6 +51,9 @@ from agent.scheduler import (
     SchedulerStore,
     TriggerSpec,
     parse_task_signal,
+    signal_mode,
+    signal_names,
+    subscribes_to,
     task_signal_name,
 )
 
@@ -144,6 +147,31 @@ def make_due(store: SchedulerStore, task_id: str, when: datetime = NOW) -> None:
     store._conn.commit()
 
 
+#: Every outcome one delivery pass can count, spelled out in one place.  A test
+#: that asserts a whole tally should build it with :func:`tally` so that adding
+#: an outcome is a visible edit here rather than a silent extra key in every
+#: assertion -- while still insisting the pass produced nothing unexpected.
+DELIVERY_OUTCOMES = ("delivered", "coalesced", "waiting", "refused", "unmatched")
+
+
+def tally(**counts: int) -> dict[str, int]:
+    unknown = sorted(set(counts) - set(DELIVERY_OUTCOMES))
+    if unknown:
+        raise AssertionError(f"not a delivery outcome: {unknown}")
+    return {name: int(counts.get(name, 0)) for name in DELIVERY_OUTCOMES}
+
+
+def join_task(
+    store: SchedulerStore,
+    name: str,
+    signals: list[str],
+    *,
+    enabled: bool = True,
+):
+    """A task that waits for every one of *signals* before it runs once."""
+    return make_task(store, name, TriggerSpec.signal_all(signals), enabled=enabled)
+
+
 # ── 1. A signal task is invisible to the clock ──────────────────────────────
 
 
@@ -218,9 +246,9 @@ def test_pending_emission_is_delivered_when_a_subscriber_exists(tmp_path):
         store.emit_signal("report.ready")
         task = subscriber(store, "follows", "report.ready")
 
-        tally = store.deliver_signals(now=NOW)
+        result = store.deliver_signals(now=NOW)
 
-        assert tally == {"delivered": 1, "coalesced": 0, "refused": 0, "unmatched": 0}
+        assert result == tally(delivered=1)
         runs = store.list_runs(task.id)
         assert len(runs) == 1
         assert runs[0].status == "queued"
@@ -286,7 +314,7 @@ def test_delivery_is_idempotent(tmp_path):
         # A second pass over the same rows must not queue a second run: the
         # emission leaves ``pending`` inside the transaction that queues its
         # runs, so there is no window where both could happen.
-        assert second == {"delivered": 0, "coalesced": 0, "refused": 0, "unmatched": 0}
+        assert second == tally()
         assert len(store.list_runs(task.id)) == 1
     finally:
         store.close()
@@ -714,7 +742,10 @@ def test_v7_database_upgrades_and_keeps_its_tasks(tmp_path):
 
     upgraded = make_store(tmp_path)
     try:
-        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] == 8
+        # A floor, not an equality: the point is that the migration ran, and
+        # pinning the exact number means every later schema bump fails a test
+        # that has nothing to do with it.
+        assert upgraded._conn.execute("PRAGMA user_version").fetchone()[0] >= 8
         assert [item.id for item in upgraded.list_tasks()] == [task_id]
         # The new tables exist and work, which is the point of the migration:
         # nothing to backfill, but the upgrade must not fail on an old file.
@@ -729,10 +760,10 @@ def test_upgrade_is_idempotent(tmp_path):
     store.close()
     reopened = make_store(tmp_path)
     try:
-        assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == 8
+        assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] >= 8
         store_again = make_store(tmp_path)
         try:
-            assert store_again._conn.execute("PRAGMA user_version").fetchone()[0] == 8
+            assert store_again._conn.execute("PRAGMA user_version").fetchone()[0] >= 8
         finally:
             store_again.close()
     finally:
@@ -850,4 +881,267 @@ def test_a_subscriber_added_after_an_unmatched_signal_gets_nothing(tmp_path):
         assert len(store.list_runs(task.id)) == 1
     finally:
         store.close()
+
+
+# ── 9. A join waits for every upstream, not just one ────────────────────────
+
+
+def test_a_join_runs_once_every_upstream_has_arrived(tmp_path):
+    """The whole reason joins exist: "after A and B", not "after A or B"."""
+    store = make_store(tmp_path)
+    try:
+        task = join_task(store, "combine", ["a.ready", "b.ready"])
+
+        store.emit_signal("a.ready")
+        first = store.deliver_signals(now=NOW)
+        assert first == tally(waiting=1)
+        assert store.list_runs(task.id) == []
+
+        store.emit_signal("b.ready")
+        second = store.deliver_signals(now=NOW + timedelta(seconds=1))
+        assert second == tally(delivered=1)
+        runs = store.list_runs(task.id)
+        assert len(runs) == 1
+        assert runs[0].trigger_source == "signal:b.ready"
+    finally:
+        store.close()
+
+
+def test_a_join_does_not_care_which_order_the_upstreams_arrive(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        task = join_task(store, "combine", ["a.ready", "b.ready"])
+
+        store.emit_signal("b.ready")
+        assert store.deliver_signals(now=NOW) == tally(waiting=1)
+        store.emit_signal("a.ready")
+        assert store.deliver_signals(now=NOW + timedelta(seconds=1)) == tally(delivered=1)
+
+        assert len(store.list_runs(task.id)) == 1
+    finally:
+        store.close()
+
+
+def test_an_upstream_that_fires_twice_does_not_open_the_join_twice(tmp_path):
+    """One run per round, not one per emission.
+
+    A fast upstream succeeding repeatedly while a slow one is still working
+    contributes one arrival, not three.  Otherwise the downstream step would
+    run again for every burst of the upstream it already heard from.
+    """
+    store = make_store(tmp_path)
+    try:
+        task = join_task(store, "combine", ["a.ready", "b.ready"])
+
+        for step in range(3):
+            store.emit_signal("a.ready")
+            assert store.deliver_signals(now=NOW + timedelta(seconds=step)) == tally(
+                waiting=1
+            )
+        store.emit_signal("b.ready")
+        assert store.deliver_signals(now=NOW + timedelta(seconds=10)) == tally(
+            delivered=1
+        )
+
+        # Exactly one run for the one completed round.
+        assert len(store.list_runs(task.id)) == 1
+    finally:
+        store.close()
+
+
+def test_the_next_round_starts_from_nothing(tmp_path):
+    """A satisfied set that survived would let a stale arrival close a round."""
+    store = make_store(tmp_path)
+    try:
+        task = join_task(store, "combine", ["a.ready", "b.ready"])
+
+        store.emit_signal("a.ready")
+        store.deliver_signals(now=NOW)
+        store.emit_signal("b.ready")
+        store.deliver_signals(now=NOW + timedelta(seconds=1))
+        assert len(store.list_runs(task.id)) == 1
+        # a.ready is spent: b.ready arriving again must not be enough on its own.
+        assert store.join_progress(task.id)["satisfied"] == []
+
+        store.emit_signal("b.ready")
+        assert store.deliver_signals(now=NOW + timedelta(seconds=2)) == tally(waiting=1)
+        assert len(store.list_runs(task.id)) == 1
+    finally:
+        store.close()
+
+
+def test_a_waiting_emission_says_which_upstream_is_missing(tmp_path):
+    """A step that is one name short must not look like a step that is broken.
+
+    Nothing has run and nothing is wrong, so the record has to carry the
+    difference: which names arrived, and which are still outstanding.
+    """
+    store = make_store(tmp_path)
+    try:
+        task = join_task(store, "combine", ["a.ready", "b.ready"])
+        emission = store.emit_signal("a.ready")
+
+        store.deliver_signals(now=NOW)
+
+        settled = store.get_emission(emission.id)
+        assert settled.state == "waiting"
+        assert "b.ready" in settled.reason
+        delivery = store.signal_deliveries(emission.id)[0]
+        assert delivery["outcome"] == "waiting"
+        assert "b.ready" in delivery["reason"]
+        assert store.join_progress(task.id) == {
+            "required": ["a.ready", "b.ready"],
+            "satisfied": ["a.ready"],
+            "missing": ["b.ready"],
+        }
+    finally:
+        store.close()
+
+
+def test_a_join_that_is_already_queued_still_records_the_arrival(tmp_path):
+    """An arrival at a half-satisfied join is recorded, even mid-run.
+
+    A pending run is not the reason this step did not start, so filing the
+    arrival under ``coalesced`` would name the wrong cause.  The reason it did
+    not start is that its siblings have not reported -- and that reason is
+    what the record has to carry.
+    """
+    store = make_store(tmp_path)
+    try:
+        task = join_task(store, "combine", ["a.ready", "b.ready"])
+        store._conn.execute(
+            """
+            INSERT INTO scheduled_task_runs (
+                id, task_id, scheduled_for, started_at, status, summary, error,
+                output_path, delivery_status, config_snapshot_json,
+                trigger_source, attempt, missed_count, created_at, updated_at
+            ) VALUES ('pending-run', ?, ?, ?, 'queued', '', '', '', '', '{}',
+                      'manual', 1, 0, ?, ?)
+            """,
+            (
+                task.id,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        store._conn.commit()
+
+        store.emit_signal("a.ready")
+        assert store.deliver_signals(now=NOW) == tally(waiting=1)
+        # The arrival is still recorded -- the task already having work is a
+        # separate fact from whether this upstream has reported.
+        assert store.join_progress(task.id)["satisfied"] == ["a.ready"]
+    finally:
+        store.close()
+
+
+def test_a_completed_round_that_coalesces_is_still_spent(tmp_path):
+    """A round answered by a run already in flight must not stay open.
+
+    Both upstreams report while a run is pending: the round is complete and
+    the run already covers it, so nothing new is queued.  But the set has to
+    be spent all the same -- otherwise the next report from a *single*
+    upstream finds it still full and closes a round nobody opened, running the
+    step on evidence that was already acted on.
+    """
+    store = make_store(tmp_path)
+    try:
+        task = join_task(store, "combine", ["a.ready", "b.ready"])
+        store._conn.execute(
+            """
+            INSERT INTO scheduled_task_runs (
+                id, task_id, scheduled_for, started_at, status, summary, error,
+                output_path, delivery_status, config_snapshot_json,
+                trigger_source, attempt, missed_count, created_at, updated_at
+            ) VALUES ('pending-run', ?, ?, ?, 'queued', '', '', '', '', '{}',
+                      'manual', 1, 0, ?, ?)
+            """,
+            (
+                task.id,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        store._conn.commit()
+
+        store.emit_signal("a.ready")
+        assert store.deliver_signals(now=NOW) == tally(waiting=1)
+        store.emit_signal("b.ready")
+        assert store.deliver_signals(now=NOW + timedelta(seconds=1)) == tally(
+            coalesced=1
+        )
+        assert store.join_progress(task.id)["satisfied"] == []
+
+        # A stale b.ready on its own must not close the next round.
+        store.emit_signal("b.ready")
+        assert store.deliver_signals(now=NOW + timedelta(seconds=2)) == tally(
+            waiting=1
+        )
+        # Only the seeded run: nothing was queued throughout.
+        assert len(store.list_runs(task.id)) == 1
+    finally:
+        store.close()
+
+
+def test_a_single_name_trigger_is_not_a_join(tmp_path):
+    """``subscriber`` (one name) keeps firing on every emission, as before."""
+    store = make_store(tmp_path)
+    try:
+        task = subscriber(store, "follows", "a.ready")
+
+        store.emit_signal("a.ready")
+        assert store.deliver_signals(now=NOW) == tally(delivered=1)
+        assert store.join_progress(task.id) == {
+            "required": [],
+            "satisfied": [],
+            "missing": [],
+        }
+        assert len(store.list_runs(task.id)) == 1
+    finally:
+        store.close()
+
+
+def test_deleting_a_join_takes_its_half_satisfied_state(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        task = join_task(store, "combine", ["a.ready", "b.ready"])
+        store.emit_signal("a.ready")
+        store.deliver_signals(now=NOW)
+        assert store.join_progress(task.id)["satisfied"] == ["a.ready"]
+
+        store.delete_task(task.id)
+
+        remaining = store._conn.execute(
+            "SELECT COUNT(*) AS total FROM signal_joins WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()
+        assert remaining["total"] == 0
+    finally:
+        store.close()
+
+
+def test_signal_all_is_deduplicated_and_needs_a_name():
+    with pytest.raises(ValueError):
+        TriggerSpec.signal_all([])
+    with pytest.raises(ValueError):
+        TriggerSpec.signal_all(["  ", ""])
+
+    trigger = TriggerSpec.signal_all(["a.ready", " a.ready ", "b.ready"])
+    assert signal_names(trigger) == ["a.ready", "b.ready"]
+    assert signal_mode(trigger) == "all"
+
+
+def test_a_trigger_written_before_joins_reads_as_a_single_name_wait():
+    """Old rows must keep meaning what they meant."""
+    legacy = TriggerSpec("signal", {"name": "report.ready"})
+
+    assert signal_names(legacy) == ["report.ready"]
+    assert signal_mode(legacy) == "any"
+    assert subscribes_to(legacy, "report.ready")
+    assert not subscribes_to(legacy, "report.raddy")
+
 
