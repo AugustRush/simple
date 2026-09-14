@@ -2122,3 +2122,292 @@ def test_web_signals_endpoint_offers_names_and_shows_who_is_waiting(
     # Nothing emitted yet, but the subscription exists -- hiding it would make
     # the picker disagree with what the scheduler will actually do.
     assert payload["waiting"] == []
+
+
+def _workflow_body() -> dict:
+    return {
+        "name": "夜间报告",
+        "description": "每天采集、分析、发布",
+        "steps": [
+            {
+                "key": "collect",
+                "name": "采集",
+                "kind": "agent_prompt",
+                "payload": {"prompt": "采集数据"},
+                "trigger_type": "daily",
+                "time_of_day": "02:00",
+                "timezone_name": "Asia/Shanghai",
+            },
+            {
+                "key": "analyze",
+                "name": "分析",
+                "kind": "agent_prompt",
+                "payload": {"prompt": "分析数据"},
+                "depends_on": ["collect"],
+            },
+            {
+                "key": "publish",
+                "name": "发布",
+                "kind": "message",
+                "payload": {"message_text": "报告已生成"},
+                "depends_on": ["analyze"],
+            },
+        ],
+    }
+
+
+def test_web_workflow_round_trip(tmp_path, monkeypatch):
+    """Create, list, and see the tasks it built in the ordinary schedule list."""
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body())
+        assert created.status_code == 200, created.text
+        workflow = created.json()["workflow"]
+        assert [item["key"] for item in workflow["steps"]] == [
+            "collect",
+            "analyze",
+            "publish",
+        ]
+        # Each step names its upstreams by key and carries the task that will
+        # actually run, because everything else in the interface -- history,
+        # cancel, output -- is keyed by that id.
+        assert workflow["steps"][1]["depends_on"] == ["collect"]
+        assert all(item["task_id"] for item in workflow["steps"])
+        assert workflow["steps"][0]["trigger_type"] == "daily"
+        assert workflow["steps"][1]["trigger_type"] == "signal"
+
+        listed = client.get("/api/workflows")
+        assert listed.status_code == 200
+        payload = listed.json()
+        assert [item["id"] for item in payload["workflows"]] == [workflow["id"]]
+        assert payload["permission_profiles"]
+
+        schedules = client.get("/api/schedules").json()["tasks"]
+        placed = {item["step_key"]: item for item in schedules if item["workflow_id"]}
+        assert set(placed) == {"collect", "analyze", "publish"}
+        assert all(
+            item["workflow_id"] == workflow["id"] for item in placed.values()
+        )
+        # A step is a task like any other, so it appears in the list the page
+        # already renders instead of only inside the workflow view.
+        assert len(schedules) == 3
+
+
+def test_web_workflow_reports_each_steps_latest_state(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        by_key = {item["key"]: item["task_id"] for item in created["steps"]}
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            claimed = store.claim_task_now(by_key["collect"], lease_seconds=300)
+            assert claimed is not None
+            store.complete_run(
+                by_key["collect"],
+                claimed.run.id,
+                finished_at=datetime.now(timezone.utc),
+                status="succeeded",
+                summary="采集完成",
+            )
+        finally:
+            store.close()
+
+        listed = client.get("/api/workflows").json()["workflows"][0]
+        steps = {item["key"]: item for item in listed["steps"]}
+        assert steps["collect"]["latest_run"]["status"] == "succeeded"
+        assert steps["collect"]["latest_run"]["summary"] == "采集完成"
+        assert steps["analyze"]["latest_run"] is None
+
+
+def test_web_refuses_a_cyclic_workflow_and_says_which_steps(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        refused = client.post(
+            "/api/workflows",
+            json={
+                "name": "环",
+                "steps": [
+                    {
+                        "key": "a",
+                        "kind": "agent_prompt",
+                        "payload": {"prompt": "a"},
+                        "depends_on": ["b"],
+                    },
+                    {
+                        "key": "b",
+                        "kind": "agent_prompt",
+                        "payload": {"prompt": "b"},
+                        "depends_on": ["a"],
+                    },
+                ],
+            },
+        )
+        assert refused.status_code == 400
+        assert "循环依赖" in refused.json()["error"]
+        # Refused, not half-built: a rejected graph leaves nothing behind.
+        assert client.get("/api/workflows").json()["workflows"] == []
+        assert client.get("/api/schedules").json()["tasks"] == []
+
+
+def test_web_refuses_the_two_ways_a_steps_timing_can_contradict_itself(
+    tmp_path, monkeypatch
+):
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        no_trigger = client.post(
+            "/api/workflows",
+            json={
+                "name": "无触发",
+                "steps": [
+                    {"key": "solo", "kind": "agent_prompt", "payload": {"prompt": "x"}}
+                ],
+            },
+        )
+        assert no_trigger.status_code == 400
+        assert "必须指定触发方式" in no_trigger.json()["error"]
+
+        both = client.post(
+            "/api/workflows",
+            json={
+                "name": "两个答案",
+                "steps": [
+                    {
+                        "key": "collect",
+                        "kind": "agent_prompt",
+                        "payload": {"prompt": "x"},
+                        "trigger_type": "daily",
+                        "time_of_day": "02:00",
+                    },
+                    {
+                        "key": "analyze",
+                        "kind": "agent_prompt",
+                        "payload": {"prompt": "y"},
+                        "depends_on": ["collect"],
+                        "trigger_type": "daily",
+                        "time_of_day": "03:00",
+                    },
+                ],
+            },
+        )
+        assert both.status_code == 400
+        assert "不能另外再指定" in both.json()["error"]
+
+
+def test_web_editing_a_workflow_keeps_the_task_ids(tmp_path, monkeypatch):
+    """The ids are what the downstream subscriptions point at."""
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        before = {item["key"]: item["task_id"] for item in created["steps"]}
+
+        edited = _workflow_body()
+        edited["steps"].insert(
+            2,
+            {
+                "key": "review",
+                "name": "复核",
+                "kind": "agent_prompt",
+                "payload": {"prompt": "复核"},
+                "depends_on": ["analyze"],
+            },
+        )
+        edited["steps"][3]["depends_on"] = ["review"]
+        updated = client.put(
+            f"/api/workflows/{created['id']}", json=edited
+        )
+        assert updated.status_code == 200, updated.text
+        after = {
+            item["key"]: item["task_id"] for item in updated.json()["workflow"]["steps"]
+        }
+        assert after["collect"] == before["collect"]
+        assert after["analyze"] == before["analyze"]
+        assert after["publish"] == before["publish"]
+        assert after["review"] and after["review"] not in before.values()
+
+
+def test_web_deleting_a_workflow_disables_its_steps(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        task_ids = [item["task_id"] for item in created["steps"]]
+
+        deleted = client.delete(f"/api/workflows/{created['id']}")
+        assert deleted.status_code == 200
+        assert sorted(deleted.json()["disabled_task_ids"]) == sorted(task_ids)
+        assert client.get("/api/workflows").json()["workflows"] == []
+
+        # The tasks stay, disabled: deleting a workflow stops it, it does not
+        # erase the record of what it ran.
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            assert len(store.list_tasks()) == 3
+            assert all(not store.get_task(item).enabled for item in task_ids)
+        finally:
+            store.close()
+
+        assert client.delete(f"/api/workflows/{created['id']}").status_code == 404
+
+
+def test_web_refuses_to_delete_a_workflow_that_is_mid_run(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        first = created["steps"][0]["task_id"]
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            assert store.claim_task_now(first, lease_seconds=300) is not None
+        finally:
+            store.close()
+
+        refused = client.delete(f"/api/workflows/{created['id']}")
+        assert refused.status_code == 409
+        assert "正在运行" in refused.json()["error"]
+        # Still there, because the refusal is the point.
+        assert len(client.get("/api/workflows").json()["workflows"]) == 1

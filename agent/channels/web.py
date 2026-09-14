@@ -202,6 +202,11 @@ def _scheduler_task_payload(
         "retry_policy": task.retry_policy,
         "selected_skills": task.selected_skills,
         "permission_profile": task.permission_profile,
+        # Empty for a standalone task, which most are.  Carried on the task
+        # rather than looked up from the graph so a task row in the list can
+        # say where it belongs without the client holding the whole graph.
+        "workflow_id": str(getattr(task, "workflow_id", "") or ""),
+        "step_key": str(getattr(task, "step_key", "") or ""),
         "unseen_attention": int(unseen_attention or 0),
         "active_run_id": task.active_run_id,
         "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
@@ -210,6 +215,64 @@ def _scheduler_task_payload(
             task.last_success_at.isoformat() if task.last_success_at else None
         ),
         "latest_run": _scheduler_run_payload(latest_run) if latest_run else None,
+    }
+
+
+def _workflow_payload(
+    workflow: Any,
+    tasks_by_step: dict[str, Any],
+    unseen_attention: dict[str, int],
+    latest_runs: dict[str, Any],
+) -> dict[str, Any]:
+    """One workflow, with each step's task and its latest state.
+
+    The graph is sent as the client needs it to draw: every step names its
+    upstreams by key, so the client never has to parse a signal name to work
+    out what depends on what.  The task ids travel alongside because the run
+    history, the cancel button and the output links are all keyed by them.
+    """
+    steps: list[dict[str, Any]] = []
+    attention = 0
+    for step in workflow.steps:
+        key = str(step.key).strip()
+        task = tasks_by_step.get(key)
+        task_id = task.id if task is not None else ""
+        unseen = int(unseen_attention.get(task_id, 0)) if task_id else 0
+        latest = latest_runs.get(task_id) if task_id else None
+        attention += unseen
+        steps.append(
+            {
+                "key": key,
+                "name": step.name,
+                "kind": step.kind,
+                "payload": step.payload,
+                "depends_on": list(step.depends_on),
+                "trigger_type": (
+                    step.trigger.trigger_type if step.trigger is not None else "signal"
+                ),
+                "trigger": step.trigger.payload if step.trigger is not None else {},
+                "workspace_root": step.workspace_root,
+                "permission_profile": step.permission_profile,
+                "timeout_seconds": int(step.timeout_seconds),
+                "task_id": task_id,
+                "enabled": bool(task.enabled) if task is not None else False,
+                "unseen_attention": unseen,
+                "latest_run": _scheduler_run_payload(latest) if latest else None,
+            }
+        )
+    return {
+        "id": workflow.id,
+        "name": workflow.name,
+        "description": workflow.description,
+        "enabled": bool(workflow.enabled),
+        "created_at": (
+            workflow.created_at.isoformat() if workflow.created_at else None
+        ),
+        "updated_at": (
+            workflow.updated_at.isoformat() if workflow.updated_at else None
+        ),
+        "steps": steps,
+        "unseen_attention": attention,
     }
 
 
@@ -1083,15 +1146,15 @@ class WebChannel(Channel):
             })
         return JSONResponse({"attachments": result})
 
-    def _schedule_from_body(self, body: dict[str, Any], existing: Any = None):
-        from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec
-        from agent.scheduler.profiles import PERMISSION_PROFILES
+    def _trigger_from_body(self, body: dict[str, Any], existing: Any = None):
+        """Turn the trigger fields of a request body into a ``TriggerSpec``.
 
-        name = str(body.get("name", getattr(existing, "name", ""))).strip()
-        if not name:
-            raise ValueError("任务名称不能为空")
-        if len(name) > 80:
-            raise ValueError("任务名称不能超过 80 个字符")
+        Shared by the schedule API and by a workflow's entry step.  A second
+        copy of these rules would be free to disagree with this one about what
+        "每周三 09:00" means, and the disagreement would show up as a task that
+        fires on the wrong day rather than as an error.
+        """
+        from agent.scheduler import TriggerSpec
 
         trigger_type = str(
             body.get(
@@ -1145,6 +1208,19 @@ class WebChannel(Channel):
         else:
             raise ValueError("不支持的执行计划")
         trigger.instantiate().next_after(datetime.now(timezone.utc))
+        return trigger
+
+    def _schedule_from_body(self, body: dict[str, Any], existing: Any = None):
+        from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec
+        from agent.scheduler.profiles import PERMISSION_PROFILES
+
+        name = str(body.get("name", getattr(existing, "name", ""))).strip()
+        if not name:
+            raise ValueError("任务名称不能为空")
+        if len(name) > 80:
+            raise ValueError("任务名称不能超过 80 个字符")
+
+        trigger = self._trigger_from_body(body, existing)
 
         existing_kind = str(getattr(existing, "kind", "agent_prompt"))
         default_action = "message" if existing_kind == "message" else "agent_task"
@@ -1261,6 +1337,221 @@ class WebChannel(Channel):
             selected_skills=selected_skills,
             permission_profile=permission_profile,
         )
+
+    def _workflow_step_from_body(self, raw: dict[str, Any], index: int):
+        """One step of a workflow, from its JSON object.
+
+        A step with upstreams may not carry a trigger, and a step without them
+        must.  Both are refused here with a sentence about the step, and again
+        by the graph check -- the first so the message names the step, the
+        second so no other caller can get past it.
+        """
+        from agent.scheduler import WorkflowStep
+
+        key = str(raw.get("key", "")).strip()
+        if not key:
+            raise ValueError(f"第 {index + 1} 个步骤缺少 key")
+        if len(key) > 40:
+            raise ValueError(f"步骤 key「{key}」不能超过 40 个字符")
+        if any(ch.isspace() for ch in key):
+            raise ValueError(f"步骤 key「{key}」不能包含空格")
+        payload = raw.get("payload")
+        if payload is None:
+            payload = {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"步骤「{key}」的 payload 必须是对象")
+        depends_on = [
+            str(item).strip()
+            for item in (raw.get("depends_on") or [])
+            if str(item).strip()
+        ]
+        trigger = None
+        if depends_on:
+            if str(raw.get("trigger_type", "")).strip():
+                raise ValueError(
+                    f"步骤「{key}」有上游，不能另外再指定时间或信号触发"
+                )
+        else:
+            if not str(raw.get("trigger_type", "")).strip():
+                raise ValueError(
+                    f"步骤「{key}」没有上游，必须指定触发方式（trigger_type）"
+                )
+            trigger = self._trigger_from_body(raw)
+        return WorkflowStep(
+            key=key,
+            name=str(raw.get("name", "")).strip() or key,
+            kind=str(raw.get("kind", "agent_prompt")).strip(),
+            payload=dict(payload),
+            depends_on=depends_on,
+            trigger=trigger,
+            workspace_root=str(raw.get("workspace_root", "") or "").strip(),
+            permission_profile=str(
+                raw.get("permission_profile", "inherit") or "inherit"
+            ),
+            context_policy=str(raw.get("context_policy", "stateless") or "stateless"),
+            timeout_seconds=int(raw.get("timeout_seconds", 1800) or 1800),
+            delivery_mode=str(raw.get("delivery_mode", "standalone") or "standalone"),
+        )
+
+    def _workflow_from_body(self, body: dict[str, Any], existing: Any = None):
+        from agent.scheduler import Workflow, validate_workflow_graph
+
+        name = str(body.get("name", getattr(existing, "name", ""))).strip()
+        if not name:
+            raise ValueError("workflow 名称不能为空")
+        if len(name) > 60:
+            raise ValueError("workflow 名称不能超过 60 个字符")
+        description = str(
+            body.get("description", getattr(existing, "description", "")) or ""
+        ).strip()
+        raw_steps = body.get("steps")
+        if raw_steps is None and existing is not None:
+            raw_steps = [item.to_dict() for item in existing.steps]
+        if not isinstance(raw_steps, list):
+            raise ValueError("steps 必须是数组")
+        if not raw_steps:
+            raise ValueError("workflow 至少要有一个步骤")
+        if len(raw_steps) > 20:
+            raise ValueError("一个 workflow 最多 20 个步骤")
+        steps = []
+        for index, raw in enumerate(raw_steps):
+            if not isinstance(raw, dict):
+                raise ValueError(f"第 {index + 1} 个步骤必须是对象")
+            steps.append(self._workflow_step_from_body(raw, index))
+        # Checked here as well as in the store so a cycle comes back as a 400
+        # carrying the ring, rather than as a failure from inside the write.
+        validate_workflow_graph(steps)
+        return Workflow(
+            name=name,
+            description=description,
+            enabled=bool(body.get("enabled", getattr(existing, "enabled", True))),
+            steps=steps,
+        )
+
+    def _workflow_response(self, store: Any, workflow: Any) -> Any:
+        """A workflow plus the state of the tasks behind it."""
+        from starlette.responses import JSONResponse
+
+        tasks = store.step_tasks(workflow.id)
+        latest = {task.id: store.latest_run(task.id) for task in tasks.values()}
+        return JSONResponse(
+            {
+                "workflow": _workflow_payload(
+                    workflow,
+                    tasks,
+                    store.unacknowledged_attention_counts(),
+                    latest,
+                )
+            }
+        )
+
+    async def _workflows(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+        from agent.scheduler.profiles import profile_payloads
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            unseen = store.unacknowledged_attention_counts()
+            workflows = []
+            for workflow in store.list_workflows():
+                tasks = store.step_tasks(workflow.id)
+                latest = {
+                    task.id: store.latest_run(task.id) for task in tasks.values()
+                }
+                workflows.append(
+                    _workflow_payload(workflow, tasks, unseen, latest)
+                )
+            return JSONResponse(
+                {
+                    "workflows": workflows,
+                    # Travelled with the schedules list too, for the same
+                    # reason: the interface renders what this backend accepts.
+                    "permission_profiles": profile_payloads(),
+                }
+            )
+        finally:
+            store.close()
+
+    async def _create_workflow(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            from agent.scheduler import SchedulerStore
+
+            workflow = self._workflow_from_body(body)
+            store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            try:
+                created = store.create_workflow(workflow)
+                return self._workflow_response(store, created)
+            finally:
+                store.close()
+        except (KeyError, ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def _update_workflow(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            from agent.scheduler import SchedulerStore
+
+            workflow_id = str(request.path_params["workflow_id"])
+            store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            try:
+                existing = store.get_workflow(workflow_id)
+                if existing is None:
+                    return JSONResponse(
+                        {"error": "workflow not found"}, status_code=404
+                    )
+                workflow = self._workflow_from_body(body, existing)
+                updated = store.update_workflow(workflow_id, workflow)
+                return self._workflow_response(store, updated)
+            finally:
+                store.close()
+        except (KeyError, ValueError, TypeError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    async def _delete_workflow(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+
+        workflow_id = str(request.path_params["workflow_id"])
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            if store.get_workflow(workflow_id) is None:
+                return JSONResponse({"error": "workflow not found"}, status_code=404)
+            # Deleting a workflow stops it; it does not erase what it ran.
+            # Refused while a step is mid-run for the same reason deleting a
+            # task is: the run would be left with nothing to write home to.
+            running = [
+                task.id
+                for task in store.step_tasks(workflow_id).values()
+                if task.active_run_id
+            ]
+            if running:
+                return JSONResponse(
+                    {"error": "有步骤正在运行，请先取消运行"}, status_code=409
+                )
+            disabled = store.delete_workflow(workflow_id)
+            return JSONResponse({"ok": True, "disabled_task_ids": disabled})
+        finally:
+            store.close()
 
     async def _schedules(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -2739,6 +3030,18 @@ class WebChannel(Channel):
             ),
             Route("/api/scheduler/health", self._scheduler_health, methods=["GET"]),
             Route("/api/signals", self._signals, methods=["GET"]),
+            Route("/api/workflows", self._workflows, methods=["GET"]),
+            Route("/api/workflows", self._create_workflow, methods=["POST"]),
+            Route(
+                "/api/workflows/{workflow_id}",
+                self._update_workflow,
+                methods=["PUT"],
+            ),
+            Route(
+                "/api/workflows/{workflow_id}",
+                self._delete_workflow,
+                methods=["DELETE"],
+            ),
             Route(
                 "/api/schedules/{task_id}/run",
                 self._run_schedule_now,
