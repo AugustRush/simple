@@ -2270,7 +2270,15 @@ class SchedulerStore:
         workflow: Workflow,
         *,
         now: Optional[datetime] = None,
+        materialize: bool = True,
     ) -> Optional[Workflow]:
+        """Store a new graph, and by default rebuild the tasks behind it.
+
+        ``materialize=False`` is for the one caller that has just written a
+        step's *task* and is copying that change back into the graph: the task
+        is the newer of the two, and rebuilding it from the step that was
+        copied from it would be a round trip that only risks losing something.
+        """
         if self.get_workflow(workflow_id) is None:
             return None
         validate_workflow_graph(workflow.steps)
@@ -2292,7 +2300,8 @@ class SchedulerStore:
                     workflow_id,
                 ),
             )
-        self.materialize_workflow(workflow_id, now=updated_at)
+        if materialize:
+            self.materialize_workflow(workflow_id, now=updated_at)
         return self.get_workflow(workflow_id)
 
     @_synchronized

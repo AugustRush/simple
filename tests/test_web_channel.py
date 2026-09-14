@@ -2611,3 +2611,207 @@ def test_web_a_field_sent_empty_is_cleared_not_kept(tmp_path, monkeypatch):
             assert task.selected_skills == []
         finally:
             store.close()
+
+
+def _step_edit_body(**overrides) -> dict:
+    body = {
+        "name": "步骤",
+        "action_type": "agent_task",
+        "prompt": "改了内容",
+        "trigger_type": "signal",
+        "signal_name": "",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_web_editing_a_step_task_teaches_the_graph_about_it(tmp_path, monkeypatch):
+    """A step is edited as a task, but stored as a step; the two have to agree.
+
+    The next save of the workflow rebuilds each task from its step, so a prompt
+    changed only on the task would survive exactly until somebody moved an
+    edge.  The edit is copied back instead.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        analyze = next(item for item in created["steps"] if item["key"] == "analyze")
+
+        edited = client.put(
+            f"/api/schedules/{analyze['task_id']}",
+            json=_step_edit_body(name="分析", prompt="只改内容"),
+        )
+        assert edited.status_code == 200, edited.text
+
+        listed = client.get("/api/workflows").json()["workflows"][0]
+        after = {item["key"]: item for item in listed["steps"]}
+        assert after["analyze"]["payload"]["prompt"] == "只改内容"
+        assert after["analyze"]["task_id"] == analyze["task_id"]
+
+        # And it survives a later graph edit, which is the whole point.
+        graph_only = {
+            "name": "夜间报告",
+            "steps": [
+                {
+                    "key": item["key"],
+                    "name": item["name"],
+                    "kind": item["kind"],
+                    "payload": item["payload"],
+                    "depends_on": item["depends_on"],
+                }
+                for item in listed["steps"]
+            ],
+        }
+        resaved = client.put(f"/api/workflows/{listed['id']}", json=graph_only)
+        assert resaved.status_code == 200, resaved.text
+        steps = {item["key"]: item for item in resaved.json()["workflow"]["steps"]}
+        assert steps["analyze"]["payload"]["prompt"] == "只改内容"
+        # The entry step's clock, which the graph body never mentioned, is
+        # still where the user put it.
+        assert steps["collect"]["trigger"]["time_of_day"] == "02:00"
+
+
+def test_web_a_dependent_step_keeps_the_trigger_its_upstreams_give_it(
+    tmp_path, monkeypatch
+):
+    """Editing a middle step's content must not quietly detach it from the chain."""
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        by_key = {item["key"]: item for item in created["steps"]}
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            before = store.get_task(by_key["analyze"]["task_id"])
+            upstream_names = list(before.trigger.payload["names"])
+        finally:
+            store.close()
+        assert upstream_names == [f"task:{by_key['collect']['task_id']}:succeeded"]
+
+        edited = client.put(
+            f"/api/schedules/{by_key['analyze']['task_id']}",
+            json=_step_edit_body(name="分析", prompt="换了写法"),
+        )
+        assert edited.status_code == 200, edited.text
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            after = store.get_task(by_key["analyze"]["task_id"])
+            assert after.trigger.payload["names"] == upstream_names
+            assert after.trigger.payload["mode"] == "all"
+            assert after.payload["prompt"] == "换了写法"
+        finally:
+            store.close()
+
+
+def test_web_a_dependent_step_refuses_a_trigger_of_its_own(tmp_path, monkeypatch):
+    """Silently ignoring the answer would be worse than refusing to take it."""
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        analyze = next(item for item in created["steps"] if item["key"] == "analyze")
+
+        refused = client.put(
+            f"/api/schedules/{analyze['task_id']}",
+            json=_step_edit_body(
+                name="分析", trigger_type="daily", time_of_day="03:00"
+            ),
+        )
+        assert refused.status_code == 400
+        assert "由它上游的步骤决定" in refused.json()["error"]
+
+
+def test_web_an_entry_steps_clock_is_edited_from_either_end(tmp_path, monkeypatch):
+    """An entry step is an ordinary scheduled task, so its time is its own.
+
+    Changing it from the task endpoint writes it back into the graph, otherwise
+    the next save of the workflow would restore the old hour while the task list
+    had been showing the new one in the meantime.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        collect = next(item for item in created["steps"] if item["key"] == "collect")
+
+        moved = client.put(
+            f"/api/schedules/{collect['task_id']}",
+            json=_step_edit_body(
+                name="采集",
+                trigger_type="daily",
+                time_of_day="05:30",
+                timezone_name="Asia/Shanghai",
+            ),
+        )
+        assert moved.status_code == 200, moved.text
+
+        listed = client.get("/api/workflows").json()["workflows"][0]
+        steps = {item["key"]: item for item in listed["steps"]}
+        assert steps["collect"]["trigger"]["time_of_day"] == "05:30"
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            task = store.get_task(collect["task_id"])
+            assert task.trigger.payload["time_of_day"] == "05:30"
+        finally:
+            store.close()
+
+
+def test_web_editing_a_step_task_does_not_detach_it_from_its_workflow(
+    tmp_path, monkeypatch
+):
+    """Which workflow a step belongs to is not something a task edit can change.
+
+    Membership is decided by materialising the workflow, so a request that
+    could set it could also orphan a step: it would keep firing on its own
+    while the graph that explains it stopped mentioning it.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        analyze = next(item for item in created["steps"] if item["key"] == "analyze")
+
+        # A body that even tries to claim it is standalone.
+        body = _step_edit_body(name="分析", prompt="改了内容")
+        body["workflow_id"] = ""
+        body["step_key"] = ""
+        edited = client.put(f"/api/schedules/{analyze['task_id']}", json=body)
+        assert edited.status_code == 200, edited.text
+
+        placed = {
+            item["id"]: item
+            for item in client.get("/api/schedules").json()["tasks"]
+            if item["id"] == analyze["task_id"]
+        }
+        assert placed[analyze["task_id"]]["workflow_id"] == created["id"]
+        assert placed[analyze["task_id"]]["step_key"] == "analyze"

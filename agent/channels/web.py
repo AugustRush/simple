@@ -1210,7 +1210,9 @@ class WebChannel(Channel):
         trigger.instantiate().next_after(datetime.now(timezone.utc))
         return trigger
 
-    def _schedule_from_body(self, body: dict[str, Any], existing: Any = None):
+    def _schedule_from_body(
+        self, body: dict[str, Any], existing: Any = None, *, keep_trigger: bool = False
+    ):
         from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec
         from agent.scheduler.profiles import PERMISSION_PROFILES
 
@@ -1220,7 +1222,21 @@ class WebChannel(Channel):
         if len(name) > 80:
             raise ValueError("任务名称不能超过 80 个字符")
 
-        trigger = self._trigger_from_body(body, existing)
+        if keep_trigger:
+            # A step with upstreams does not own its trigger: the graph says it
+            # waits for them, and the task's own signal trigger is that answer
+            # written down.  Letting the task editor set a second one would
+            # either replace the edge with a clock or leave one of the two
+            # lying, and the task editor has no field that could express
+            # "after A and B succeed" anyway.  Saying so beats ignoring it.
+            asked = str(body.get("trigger_type", "")).strip().lower()
+            if asked and asked != existing.trigger.trigger_type:
+                raise ValueError(
+                    "这一步的触发方式由它上游的步骤决定，不能在这里改成别的"
+                )
+            trigger = existing.trigger
+        else:
+            trigger = self._trigger_from_body(body, existing)
 
         existing_kind = str(getattr(existing, "kind", "agent_prompt"))
         default_action = "message" if existing_kind == "message" else "agent_task"
@@ -1336,6 +1352,13 @@ class WebChannel(Channel):
             },
             selected_skills=selected_skills,
             permission_profile=permission_profile,
+            # Membership is inherited, never taken from the body.  Which
+            # workflow a task is a step of is decided by materialising that
+            # workflow, so a request that could set it could also detach a step
+            # from the chain it is part of -- and a detached step keeps running
+            # while the graph that explains it stops mentioning it.
+            workflow_id=str(getattr(existing, "workflow_id", "") or ""),
+            step_key=str(getattr(existing, "step_key", "") or ""),
         )
 
     def _workflow_step_from_body(
@@ -1843,6 +1866,86 @@ class WebChannel(Channel):
         finally: store.close()
         return JSONResponse({"ok": True, "enabled": bool(body["enabled"])})
 
+    def _step_owns_no_trigger(self, store: Any, task: Any) -> bool:
+        """True when *task* is a workflow step whose timing comes from upstreams.
+
+        Answered from the graph, not from the task: a fan-in trigger and a
+        hand-picked signal both report ``trigger_type`` "signal", and only the
+        graph knows which steps have upstreams.
+        """
+        if not task.workflow_id or not task.step_key:
+            return False
+        workflow = store.get_workflow(task.workflow_id)
+        if workflow is None:
+            return False
+        step = workflow.step(task.step_key)
+        return step is not None and bool(step.depends_on)
+
+    def _mirror_step_edit(self, store: Any, task: Any) -> None:
+        """Copy an edited step task back into the graph it belongs to.
+
+        A step is edited through the ordinary task endpoint -- it is an
+        ordinary task, with its own run history and its own switches -- but
+        what it is *stored* as is a step of a graph, and the next save of that
+        workflow rebuilds the task from the graph.  Without this, changing a
+        step's prompt in the task editor would survive exactly until somebody
+        moved an edge.
+
+        The graph is not re-materialised: the task in hand was written a
+        moment ago and is the newer of the two, so rebuilding it from the step
+        copied from it would be a round trip that can only lose something.
+        """
+        if not task.workflow_id or not task.step_key:
+            return
+        workflow = store.get_workflow(task.workflow_id)
+        if workflow is None:
+            return
+        from agent.scheduler import Workflow, WorkflowStep
+
+        steps = []
+        matched = False
+        for step in workflow.steps:
+            if str(step.key).strip() != str(task.step_key).strip():
+                steps.append(step)
+                continue
+            matched = True
+            steps.append(
+                WorkflowStep(
+                    key=step.key,
+                    name=task.name,
+                    kind=task.kind,
+                    payload=dict(task.payload),
+                    # A task cannot express an edge, so it must not be able to
+                    # break or invent one.
+                    depends_on=list(step.depends_on),
+                    # Nor a trigger, when it has upstreams: the upstreams *are*
+                    # its trigger, and this is the one field where the task row
+                    # and the graph would otherwise disagree.
+                    trigger=None if step.depends_on else task.trigger,
+                    workspace_root=task.workspace_root,
+                    permission_profile=task.permission_profile,
+                    context_policy=task.context_policy,
+                    model_override=task.model_override,
+                    timeout_seconds=int(task.timeout_seconds),
+                    selected_skills=list(task.selected_skills),
+                    delivery_mode=task.delivery_mode,
+                    delivery_target=task.delivery_target,
+                )
+            )
+        if not matched:
+            return
+        store.update_workflow(
+            workflow.id,
+            Workflow(
+                name=workflow.name,
+                steps=steps,
+                id=workflow.id,
+                description=workflow.description,
+                enabled=workflow.enabled,
+            ),
+            materialize=False,
+        )
+
     async def _update_schedule(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -1860,8 +1963,12 @@ class WebChannel(Channel):
                 existing = store.get_task(task_id)
                 if existing is None:
                     return JSONResponse({"error": "task not found"}, status_code=404)
-                spec = self._schedule_from_body(body, existing)
+                spec = self._schedule_from_body(
+                    body, existing, keep_trigger=self._step_owns_no_trigger(store, existing)
+                )
                 updated = store.update_task(task_id, spec)
+                if updated is not None:
+                    self._mirror_step_edit(store, updated)
                 unseen = store.unacknowledged_attention_counts().get(task_id, 0)
             finally:
                 store.close()
