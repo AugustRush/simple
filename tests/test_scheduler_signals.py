@@ -814,3 +814,40 @@ def test_a_coalesced_signal_says_it_did_not_reach_the_run(tmp_path):
         assert run.config_snapshot["signal"]["payload"] != {"note": "second"}
     finally:
         store.close()
+
+
+# ── 8. A subscriber added afterwards does not resurrect an unmatched signal ─
+
+
+def test_a_subscriber_added_after_an_unmatched_signal_gets_nothing(tmp_path):
+    """An emission is a record of what happened, not a queue of pending work.
+
+    An emission with nobody waiting is closed as ``unmatched`` and stays
+    closed.  Re-opening it when a subscriber appears would start a run for a
+    signal emitted before anyone asked for it, which the emitter has no way to
+    know about and did not ask for.  The ``emit_signal`` tool description used
+    to promise the opposite -- "an emission is never lost if the subscriber is
+    added later" -- which would have led a reader to emit first and subscribe
+    after, an order that silently produces no run at all.  The description now
+    says to subscribe first, and this pins the behaviour it describes.
+    """
+    store = make_store(tmp_path)
+    try:
+        early = store.emit_signal("report.ready")
+        store.deliver_signals(now=NOW)
+        assert store.get_emission(early.id).state == "unmatched"
+
+        task = subscriber(store, "added later", "report.ready")
+        for step in range(5):
+            store.deliver_signals(now=NOW + timedelta(seconds=30 * step))
+
+        assert store.list_runs(task.id) == []
+        assert store.get_emission(early.id).state == "unmatched"
+        # What was skipped is the ordering, not the subscription: the same
+        # subscription does fire for a signal emitted after it exists.
+        store.emit_signal("report.ready")
+        store.deliver_signals(now=NOW + timedelta(seconds=300))
+        assert len(store.list_runs(task.id)) == 1
+    finally:
+        store.close()
+

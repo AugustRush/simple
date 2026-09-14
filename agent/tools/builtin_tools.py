@@ -864,8 +864,9 @@ class BuiltinTools:
                 "Announce that something happened, so any task waiting on that signal runs. "
                 "Use this to make a step follow this one without waiting for a clock: emit a "
                 "signal here, and another task created with trigger_type=signal and the same "
-                "signal_name will run. The signal is recorded whether or not anyone is "
-                "subscribed, so an emission is never lost if the subscriber is added later. "
+                "signal_name will run. Subscribe before you emit: a signal with nobody "
+                "waiting is recorded and then closed as unmatched, and it will not start a "
+                "run for a subscriber created afterwards. "
                 "Signals a task emits by itself (task:<id>:succeeded / :failed / :cancelled) "
                 "need no call. Call `list_signals` first to see which names are already in use."
             ),
