@@ -926,14 +926,24 @@ class SchedulerStore:
                         # Already something to do.  For a signal that repeats
                         # -- "data.ready" while the report is still being
                         # written -- one pending run is the useful answer, and
-                        # the emission is recorded against the run that
-                        # absorbed it rather than being dropped in silence.
+                        # queueing another would let a fast emitter stack up
+                        # work nobody asked for.
+                        #
+                        # But the reason says only what is true.  The run it is
+                        # recorded against was built from an earlier emission,
+                        # so this signal's payload does not reach it: the
+                        # signal is accounted for, not passed on.  Saying
+                        # "merged in" would be the kind of comfortable wording
+                        # this whole record exists to replace.
                         self._record_delivery(
                             emission.id,
                             task.id,
                             "coalesced",
                             run_id=pending,
-                            reason="该任务已有待执行或执行中的运行，本次信号并入其中",
+                            reason=(
+                                "该任务已有待执行或执行中的运行，本次信号不再另起一次运行；"
+                                "信号本身已记录，但它的内容不会送达那次运行"
+                            ),
                             now=current,
                         )
                         coalesced += 1
@@ -959,7 +969,10 @@ class SchedulerStore:
                     self._settle_emission(
                         emission,
                         state="coalesced",
-                        reason=f"{coalesced} 个订阅任务都已有待执行或执行中的运行",
+                        reason=(
+                            f"{coalesced} 个订阅任务都已有待执行或执行中的运行，"
+                            "本次信号没有另起运行"
+                        ),
                         now=current,
                     )
                     tally["coalesced"] += 1
@@ -1827,7 +1840,18 @@ class SchedulerStore:
     @_synchronized
     def delete_task(self, task_id: str) -> None:
         with self._conn:
+            # Its deliveries go with it, for the same reason its runs do: they
+            # are that task's history, and rows left behind would name a task
+            # and a run that no longer exist -- a record that cannot be read
+            # and cannot be cleaned up, since nothing else knows the id.
+            self._conn.execute(
+                "DELETE FROM signal_deliveries WHERE task_id = ?", (task_id,)
+            )
             self._conn.execute(
                 "DELETE FROM scheduled_task_runs WHERE task_id = ?", (task_id,)
             )
+            # The emissions themselves stay.  A signal is a record of something
+            # that happened, and it may already have been delivered to other
+            # tasks whose runs point back at it; deleting it would rewrite
+            # their history to make this deletion tidier.
             self._conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))

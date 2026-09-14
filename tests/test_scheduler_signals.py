@@ -334,8 +334,14 @@ def test_subscriber_that_is_already_queued_folds_in_the_signal(tmp_path):
         # signal is accounted for rather than appearing to have been dropped.
         folded = store.signal_deliveries(second.id)
         assert folded[0]["outcome"] == "coalesced"
-        assert "并入" in folded[0]["reason"]
         assert folded[0]["run_id"] == store.list_runs(task.id)[0].id
+        # The reason has to be honest about what folding did: the second
+        # signal's payload never reaches the run that was already waiting, so
+        # the wording must not read as though it had been handed over.
+        reason = folded[0]["reason"]
+        assert "不会送达" in reason
+        assert "已记录" in reason
+        assert "并入" not in reason
     finally:
         store.close()
 
@@ -731,3 +737,80 @@ def test_upgrade_is_idempotent(tmp_path):
             store_again.close()
     finally:
         reopened.close()
+
+
+# ── 7. What a deletion is allowed to leave behind ──────────────────────────
+
+
+def test_deleting_a_task_takes_its_deliveries_with_it(tmp_path):
+    """A delivery names a task and a run. Both are gone when the task is.
+
+    Leaving the row would create a record that cannot be read -- it points at
+    ids nothing else knows -- and cannot be cleaned up either, since only the
+    task's own deletion is a moment when anyone still knows the id.
+    """
+    store = make_store(tmp_path)
+    try:
+        task = subscriber(store, "follows", "report.ready")
+        emission = store.emit_signal("report.ready")
+        store.deliver_signals(now=NOW)
+        assert len(store.signal_deliveries(emission.id)) == 1
+
+        store.delete_task(task.id)
+
+        assert store.signal_deliveries(emission.id) == []
+        remaining = store._conn.execute(
+            "SELECT COUNT(*) AS total FROM signal_deliveries WHERE task_id = ?",
+            (task.id,),
+        ).fetchone()
+        assert remaining["total"] == 0
+        # The emission stays. It is a record of something that happened, and
+        # another subscriber's run may point back at it; deleting it would
+        # rewrite that task's history to make this deletion look tidier.
+        assert store.get_emission(emission.id) is not None
+    finally:
+        store.close()
+
+
+def test_deleting_a_subscriber_does_not_disturb_the_others(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        keep = subscriber(store, "keep", "report.ready")
+        drop = subscriber(store, "drop", "report.ready")
+        emission = store.emit_signal("report.ready")
+        store.deliver_signals(now=NOW)
+
+        store.delete_task(drop.id)
+
+        outcomes = {row["task_id"]: row["outcome"] for row in store.signal_deliveries(emission.id)}
+        assert outcomes == {keep.id: "delivered"}
+        assert len(store.list_runs(keep.id)) == 1
+    finally:
+        store.close()
+
+
+def test_a_coalesced_signal_says_it_did_not_reach_the_run(tmp_path):
+    """The wording has to match what actually happened.
+
+    The run it is recorded against was built from an earlier emission, so this
+    signal's payload never reaches it. Calling that "merged in" would be
+    comfortable and false, which is the failure mode these records exist to
+    remove.
+    """
+    store = make_store(tmp_path)
+    try:
+        task = subscriber(store, "busy", "report.ready")
+        store.emit_signal("report.ready")
+        store.deliver_signals(now=NOW)
+        second = store.emit_signal("report.ready", {"note": "second"})
+        store.deliver_signals(now=NOW + timedelta(seconds=1))
+
+        delivery = store.signal_deliveries(second.id)[0]
+        assert delivery["outcome"] == "coalesced"
+        assert "不会送达" in delivery["reason"]
+        assert store.get_emission(second.id).reason
+        # And the run really does not carry it, which is what the reason says.
+        run = store.list_runs(task.id)[0]
+        assert run.config_snapshot["signal"]["payload"] != {"note": "second"}
+    finally:
+        store.close()
