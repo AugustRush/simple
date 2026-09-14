@@ -34,6 +34,7 @@ from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.runtime.lock import AgentHomeBusyError, acquire_agent_home_lock
+from agent.scheduler.models import DEFAULT_SIGNAL_MAX_DEPTH
 from agent.scheduler.profiles import (
     apply_profile_to_config,
     describe_profile_for_prompt,
@@ -557,6 +558,7 @@ async def _build_scheduler_service(
     poll_seconds: float,
     lease_seconds: int,
     max_concurrent_runs: int,
+    signal_max_depth: int = DEFAULT_SIGNAL_MAX_DEPTH,
     components: Optional[dict] = None,
 ):
     owned_components = components is None
@@ -708,6 +710,11 @@ async def _build_scheduler_service(
                         "turn_id": run_id,
                         "scheduler_task_id": task_id,
                         "scheduler_run_id": run_id,
+                        # Present only when this run was woken by a signal.
+                        # The tool that lets a run emit a signal reads it to
+                        # stay on the same cascade and one step further out,
+                        # rather than starting a new one at every hop.
+                        "signal_context": snapshot.get("signal"),
                     },
                 ),
                 state,
@@ -757,6 +764,7 @@ async def _build_scheduler_service(
         poll_seconds=poll_seconds,
         lease_seconds=lease_seconds,
         max_concurrent_runs=max_concurrent_runs,
+        signal_max_depth=signal_max_depth,
     )
     return service, store, components if owned_components else None
 
@@ -1272,6 +1280,9 @@ def gateway(
         scheduler_poll = float(sched_cfg.get("poll_seconds", 30))
         scheduler_lease = int(sched_cfg.get("lease_seconds", 300))
         scheduler_max_concurrent = int(sched_cfg.get("max_concurrent_runs", 3))
+        scheduler_signal_depth = int(
+            sched_cfg.get("signal_max_depth", DEFAULT_SIGNAL_MAX_DEPTH)
+        )
         scheduler_task: Optional[asyncio.Task] = None
         scheduler_store = None
         scheduler_components = None
@@ -1292,6 +1303,7 @@ def gateway(
                 poll_seconds=scheduler_poll,
                 lease_seconds=scheduler_lease,
                 max_concurrent_runs=scheduler_max_concurrent,
+                signal_max_depth=scheduler_signal_depth,
                 components=components,
             )
             components["scheduler_service"] = service
@@ -1680,6 +1692,9 @@ def scheduler(
     effective_poll = float(poll_seconds or sched_cfg.get("poll_seconds", 30))
     effective_lease = int(lease_seconds or sched_cfg.get("lease_seconds", 300))
     effective_max_concurrent = int(sched_cfg.get("max_concurrent_runs", 3))
+    effective_signal_depth = int(
+        sched_cfg.get("signal_max_depth", DEFAULT_SIGNAL_MAX_DEPTH)
+    )
 
     async def _run():
         service, store, components = await _build_scheduler_service(
@@ -1687,6 +1702,7 @@ def scheduler(
             poll_seconds=effective_poll,
             lease_seconds=effective_lease,
             max_concurrent_runs=effective_max_concurrent,
+            signal_max_depth=effective_signal_depth,
         )
         shared.CONSOLE.print(
             "[dim]Scheduler running "

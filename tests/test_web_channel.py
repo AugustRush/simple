@@ -1989,3 +1989,136 @@ def test_web_reports_a_run_that_succeeded_over_a_skipped_schedule(tmp_path, monk
         acked = client.post(f"/api/schedules/{task_id}/runs/{run_id}/acknowledge")
         assert acked.json()["acknowledged"] is True
         assert client.get("/api/schedules/attention").json() == {"unseen_attention": 0}
+
+
+def test_web_create_signal_schedule(tmp_path, monkeypatch):
+    """A signal trigger is creatable from the interface, and stored as one."""
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+        task_signal_name,
+    )
+
+    db_path = tmp_path / "scheduler.db"
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", db_path)
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    store = SchedulerStore(db_path=db_path)
+    try:
+        emitter = store.create_task(
+            NewScheduledTask(
+                name="emitter",
+                kind="agent_prompt",
+                trigger=TriggerSpec.daily("09:00", "UTC"),
+                payload={"prompt": "先跑这个"},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+        signal = task_signal_name(emitter.id, "succeeded")
+    finally:
+        store.close()
+
+    with TestClient(channel.app) as client:
+        created = client.post(
+            "/api/schedules",
+            json={
+                "name": "follower",
+                "action_type": "agent_task",
+                "prompt": "再跑这个",
+                "trigger_type": "signal",
+                "signal_name": signal,
+                "timezone_name": "UTC",
+            },
+        )
+        assert created.status_code == 200, created.json()
+        task = created.json()["task"]
+        assert task["trigger_type"] == "signal"
+        assert task["trigger"]["name"] == signal
+        # No calendar, so the interface has to be told that "no next run" here
+        # means "waiting", not "finished".
+        assert task["next_run_at"] is None
+
+
+def test_web_signal_schedule_needs_a_name_and_a_real_task(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    with TestClient(channel.app) as client:
+        missing = client.post(
+            "/api/schedules",
+            json={
+                "name": "follower",
+                "action_type": "agent_task",
+                "prompt": "再跑这个",
+                "trigger_type": "signal",
+                "signal_name": "   ",
+                "timezone_name": "UTC",
+            },
+        )
+        assert missing.status_code == 400
+        assert "信号" in missing.json()["error"]
+
+        bogus = client.post(
+            "/api/schedules",
+            json={
+                "name": "follower",
+                "action_type": "agent_task",
+                "prompt": "再跑这个",
+                "trigger_type": "signal",
+                "signal_name": "task:nope:succeeded",
+                "timezone_name": "UTC",
+            },
+        )
+        assert bogus.status_code == 400
+        assert "nope" in bogus.json()["error"]
+
+
+def test_web_signals_endpoint_offers_names_and_shows_who_is_waiting(
+    tmp_path, monkeypatch
+):
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    db_path = tmp_path / "scheduler.db"
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", db_path)
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    store = SchedulerStore(db_path=db_path)
+    try:
+        store.emit_signal("report.ready", source="agent")
+    finally:
+        store.close()
+
+    with TestClient(channel.app) as client:
+        client.post(
+            "/api/schedules",
+            json={
+                "name": "follower",
+                "action_type": "agent_task",
+                "prompt": "等报告就绪",
+                "trigger_type": "signal",
+                "signal_name": "report.ready",
+                "timezone_name": "UTC",
+            },
+        )
+
+        payload = client.get("/api/signals").json()
+
+    emitted = {item["name"]: item for item in payload["signals"]}
+    assert emitted["report.ready"]["subscriber_count"] == 1
+    assert emitted["report.ready"]["source"] == "custom"
+    # Nothing emitted yet, but the subscription exists -- hiding it would make
+    # the picker disagree with what the scheduler will actually do.
+    assert payload["waiting"] == []

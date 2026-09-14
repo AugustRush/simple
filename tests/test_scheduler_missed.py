@@ -420,7 +420,9 @@ def test_upgrading_an_older_database_adds_the_column_without_inventing_history(
 
     upgraded = SchedulerStore(db_path=db_path)
     try:
-        assert upgraded.SCHEMA_VERSION == 7
+        # The version is asserted only to prove the migration ran; the
+        # behaviour below is the point of the test.
+        assert upgraded.SCHEMA_VERSION >= 7
         row = upgraded._conn.execute(
             "SELECT missed_count FROM scheduled_task_runs WHERE id = ?", (run_id,)
         ).fetchone()

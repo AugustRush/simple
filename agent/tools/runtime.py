@@ -34,6 +34,15 @@ _active_schedule_target: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("_active_schedule_target", default=None)
 )
 
+#: The signal this turn is answering, when the turn is a scheduled run that
+#: was woken by one.  A tool that emits a signal from inside such a run has to
+#: know how far from the cascade root it already is, or every hop would look
+#: like a fresh start and the depth ceiling would never be reached.  Invisible
+#: to ordinary conversation turns, where it stays ``None``.
+_active_signal_context: contextvars.ContextVar[Optional[dict[str, Any]]] = (
+    contextvars.ContextVar("_active_signal_context", default=None)
+)
+
 # ── Synchronous tool dispatch ────────────────────────────────────────────────
 #
 # Most tools (file I/O, memory/SQLite, scheduler CRUD) are plain sync

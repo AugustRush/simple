@@ -18,7 +18,7 @@ from agent.core.output import (
 )
 from agent.runtime.heartbeat import heartbeat_path_for_session
 from agent.skills.catalog import prepare_user_message_for_skills
-from agent.tools.runtime import _active_schedule_target
+from agent.tools.runtime import _active_schedule_target, _active_signal_context
 
 T = TypeVar("T")
 OperationState: TypeAlias = Literal["idle", "active", "cancelling"]
@@ -693,6 +693,15 @@ class AgentCore:
             if schedule_target is not None
             else None
         )
+        # Set from turn metadata rather than derived, because the depth a
+        # cascade has already reached is not visible from anything in the
+        # conversation -- it is a property of the run that is being served.
+        signal_context = prompted_input.metadata.get("signal_context")
+        signal_context_token = (
+            _active_signal_context.set(dict(signal_context))
+            if isinstance(signal_context, dict)
+            else None
+        )
         try:
             final_result = TurnResult(text="")
             iteration_prompt = prompt
@@ -871,5 +880,7 @@ class AgentCore:
                 state.ctx.metadata.pop("cancel_token", None)
             if schedule_target_token is not None:
                 _active_schedule_target.reset(schedule_target_token)
+            if signal_context_token is not None:
+                _active_signal_context.reset(signal_context_token)
             if active_sink_token is not None:
                 _active_sink.reset(active_sink_token)

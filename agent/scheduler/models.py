@@ -219,6 +219,31 @@ class MonthlyTrigger:
 
 
 @dataclass
+class SignalTrigger:
+    """A task that runs when a named signal is emitted, not when a clock says.
+
+    Both ``next_after`` and ``advance_from`` return ``None``, and that is the
+    whole mechanism: a task with no next occurrence has ``next_run_at IS NULL``,
+    so the claim query -- which requires ``next_run_at IS NOT NULL`` -- can
+    never pick it up.  Nothing else has to know that signals exist in order to
+    stay out of their way.
+
+    It follows that ``count_missed`` reports zero for these tasks, which is
+    correct rather than convenient: there is no calendar to fall behind.  A
+    signal that arrives while nothing is running is a different problem, and it
+    is handled where it belongs -- durably, by the emission record.
+    """
+
+    name: str
+
+    def next_after(self, now: datetime) -> Optional[datetime]:
+        return None
+
+    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+        return None
+
+
+@dataclass
 class TriggerSpec:
     trigger_type: str
     payload: dict[str, Any]
@@ -288,6 +313,18 @@ class TriggerSpec:
             },
         )
 
+    @classmethod
+    def signal(cls, name: str) -> "TriggerSpec":
+        """A subscription to a named signal.
+
+        The name is the entire contract between whoever emits and whoever
+        subscribes, so it is stored verbatim and matched exactly.  A near-miss
+        is not a near-match: see the store's signal listing, which exists so
+        the name can be picked from what is actually emitted rather than
+        typed.
+        """
+        return cls("signal", {"name": str(name).strip()})
+
     def instantiate(self):
         if self.trigger_type == "once":
             return OnceTrigger(
@@ -323,6 +360,8 @@ class TriggerSpec:
                 time_of_day=str(self.payload["time_of_day"]),
                 timezone_name=self.payload.get("timezone_name", "UTC"),
             )
+        if self.trigger_type == "signal":
+            return SignalTrigger(name=str(self.payload["name"]))
         raise ValueError(f"Unknown trigger type: {self.trigger_type}")
 
     def initial_run_at(self, now: Optional[datetime] = None) -> Optional[datetime]:
@@ -408,6 +447,110 @@ def describe_missed_occurrences(missed_count: int) -> str:
             f"⚠️ 本次运行前至少 {missed} 次计划未能执行（进程未运行，计数已达上限）。"
         )
     return f"⚠️ 本次运行前有 {missed} 次计划未能执行（进程未运行）。"
+
+
+#: What became of one emission.  ``coalesced``, ``refused`` and ``unmatched``
+#: are not failures to be hidden: they are the three ways a signal can arrive
+#: without producing a run, and each is stored with a reason so that "the
+#: automation did not run" is never something a person has to infer from a
+#: silence.  ``unmatched`` in particular is what a typo looks like -- a signal
+#: nobody subscribes to, which without this state would be indistinguishable
+#: from a signal that worked.
+SIGNAL_STATES: tuple[str, ...] = (
+    "pending",
+    "delivered",
+    "coalesced",
+    "refused",
+    "unmatched",
+)
+
+#: How deep a cascade may go before delivery is refused.
+#:
+#: A declarable graph can be checked for cycles when it is built.  Signals
+#: cannot: task A emitting a signal that task B subscribes to, while B emits
+#: one A subscribes to, is not a mistake anybody makes on purpose -- it is a
+#: loop that assembles itself out of two edits made weeks apart.  So instead of
+#: trying to prove a property of the graph up front, every emission carries how
+#: far it is from the thing that started the cascade, and delivery stops at a
+#: ceiling.  That bounds the runaway whether it is a ring, a diamond that
+#: doubles at every level, or something nobody drew at all.
+DEFAULT_SIGNAL_MAX_DEPTH = 10
+
+#: The prefix that marks a signal as "a run of a particular task finished".
+#: Names outside this shape are free-form: only whoever emits them can say
+#: whether they are spelled right.
+TASK_SIGNAL_PREFIX = "task:"
+
+
+def task_signal_name(task_id: str, status: str) -> str:
+    """The signal a finished run emits: ``task:<id>:<status>``.
+
+    Keyed by id rather than by name.  A task can be renamed, and a
+    subscription that quietly stopped matching after a rename would be exactly
+    the kind of failure that looks like success -- the trigger would simply
+    never fire again.  The readable name travels in the emission payload
+    instead, so the interface can label the signal without the subscription
+    depending on a value that is allowed to change.
+    """
+    return f"{TASK_SIGNAL_PREFIX}{task_id}:{status}"
+
+
+#: The statuses a run can finish in.  A subscription to anything else is a
+#: typo that can be caught when it is written, rather than discovered as a
+#: task that mysteriously never runs.
+TERMINAL_RUN_STATUSES: tuple[str, ...] = (
+    "succeeded",
+    "failed",
+    "cancelled",
+    "interrupted",
+)
+
+
+def parse_task_signal(name: str) -> Optional[tuple[str, str]]:
+    """Split ``task:<id>:<status>`` into its two parts, or ``None``.
+
+    ``None`` means "not a task signal", which is not an error: it is how a
+    free-form name like ``report.ready`` is recognized as something only its
+    emitter can vouch for.
+    """
+    text = str(name or "").strip()
+    if not text.startswith(TASK_SIGNAL_PREFIX):
+        return None
+    task_id, separator, status = text[len(TASK_SIGNAL_PREFIX) :].rpartition(":")
+    if not separator or not task_id or not status:
+        return None
+    return task_id, status
+
+
+@dataclass
+class SignalEmission:
+    """One signal, recorded before anything is done about it.
+
+    The record exists so that an emission cannot be lost between "somebody
+    emitted" and "a task ran": delivery is a separate step that reads these
+    rows, so a process that stops mid-flight resumes and finishes the job
+    instead of dropping half of it.  It is the same reason the run record
+    exists at all -- a scheduled system that cannot say what it did not do is
+    not one you can leave alone.
+    """
+
+    id: str
+    name: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    #: What produced it: ``task``, ``agent`` or ``manual``.  Kept for the
+    #: audit trail rather than for behaviour -- the name is the contract.
+    source: str = "manual"
+    #: Distance from the emission that started this cascade.  Zero for
+    #: something a person or a clock started.
+    depth: int = 0
+    #: The root emission of the cascade, so a chain can be read end to end.
+    origin_id: str = ""
+    state: str = "pending"
+    #: Why it did not become its own run, when it did not.
+    reason: str = ""
+    delivered_run_id: str = ""
+    created_at: Optional[datetime] = None
+    delivered_at: Optional[datetime] = None
 
 
 @dataclass

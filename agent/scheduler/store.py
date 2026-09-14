@@ -12,13 +12,18 @@ from typing import Any, Callable, Optional, TypeVar
 from agent import shared
 from .models import (
     ATTENTION_STATUSES,
+    DEFAULT_SIGNAL_MAX_DEPTH,
+    TERMINAL_RUN_STATUSES,
     ClaimedTask,
     DeliveryTarget,
     NewScheduledTask,
     ScheduledTask,
+    SignalEmission,
     TaskRun,
     TriggerSpec,
     execution_snapshot,
+    parse_task_signal,
+    task_signal_name,
 )
 
 
@@ -68,7 +73,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 7
+    SCHEMA_VERSION = 8
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -152,6 +157,34 @@ class SchedulerStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_task_id
                     ON scheduled_task_runs(task_id, created_at);
+                CREATE TABLE IF NOT EXISTS signal_emissions (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    depth INTEGER NOT NULL DEFAULT 0,
+                    origin_id TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    reason TEXT NOT NULL DEFAULT '',
+                    delivered_run_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_signal_emissions_pending
+                    ON signal_emissions(state, created_at);
+                CREATE INDEX IF NOT EXISTS idx_signal_emissions_name
+                    ON signal_emissions(name, created_at);
+                CREATE TABLE IF NOT EXISTS signal_deliveries (
+                    id TEXT PRIMARY KEY,
+                    emission_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL DEFAULT '',
+                    outcome TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_signal_deliveries_emission
+                    ON signal_deliveries(emission_id, created_at);
                 """
             )
             current_version = int(
@@ -280,6 +313,13 @@ class SchedulerStore:
                         "missed_count INTEGER NOT NULL DEFAULT 0"
                     )
                 self._conn.execute("PRAGMA user_version = 7")
+            elif version == 8:
+                # The table itself is created by the DDL above (IF NOT EXISTS),
+                # which is what an existing database picks up on reopen.  The
+                # version bump records that signals exist; there is nothing to
+                # backfill, because a repository of emissions that were never
+                # made is empty, not zero-filled.
+                self._conn.execute("PRAGMA user_version = 8")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -516,6 +556,518 @@ class SchedulerStore:
             (task_id, run_id),
         ).fetchone()
         return self._run_from_row(row) if row else None
+
+    # ── Signals: what happened, and who was waiting for it ───────────────
+    #
+    # Emissions are written down before anything is done about them.  The
+    # tempting shortcut -- emit by directly queueing a run for each subscriber
+    # -- has no way to be honest: if the process stops between "somebody
+    # emitted" and "the runs are queued", the signal is simply gone, and the
+    # only evidence was in memory.  Recording first and delivering second costs
+    # one table and buys the ability to say what did *not* happen, which is the
+    # same trade the run record already makes.
+    #
+    # The other half of the design is that delivery is bounded.  Subscriptions
+    # are a graph nobody draws, so a loop can assemble itself out of two
+    # unrelated edits; every emission therefore carries its distance from the
+    # start of the cascade, and delivery stops at a ceiling rather than trying
+    # to prove the graph acyclic.
+
+    def _emission_from_row(self, row: sqlite3.Row) -> SignalEmission:
+        return SignalEmission(
+            id=row["id"],
+            name=row["name"],
+            payload=json.loads(row["payload_json"] or "{}"),
+            source=row["source"],
+            depth=int(row["depth"]),
+            origin_id=row["origin_id"],
+            state=row["state"],
+            reason=row["reason"],
+            delivered_run_id=row["delivered_run_id"],
+            created_at=_dt(row["created_at"]),
+            delivered_at=_dt(row["delivered_at"]),
+        )
+
+    @_synchronized
+    def emit_signal(
+        self,
+        name: str,
+        payload: Optional[dict[str, Any]] = None,
+        *,
+        source: str = "manual",
+        depth: int = 0,
+        origin_id: str = "",
+        now: Optional[datetime] = None,
+    ) -> SignalEmission:
+        """Record that a signal happened.  Delivery is a separate step.
+
+        Returns the stored emission, whose id is the handle for everything
+        downstream: the runs it produces point back at it, which is how a
+        cascade can be read end to end instead of guessed at from timestamps.
+        """
+        created = (now or datetime.now(UTC)).astimezone(UTC)
+        with self._conn:
+            return self._insert_emission(
+                name,
+                payload,
+                source=source,
+                depth=depth,
+                origin_id=origin_id,
+                now=created,
+            )
+
+    def _insert_emission(
+        self,
+        name: str,
+        payload: Optional[dict[str, Any]] = None,
+        *,
+        source: str = "manual",
+        depth: int = 0,
+        origin_id: str = "",
+        now: datetime,
+    ) -> SignalEmission:
+        """Insert one pending emission.  The caller owns the transaction.
+
+        Split out of :meth:`emit_signal` so that a run reaching a terminal
+        state can record its emission inside the transaction that records the
+        status.  A run recorded as finished and a signal recorded as emitted
+        then commit together, which is what makes "it succeeded and nothing
+        downstream ever heard about it" impossible rather than merely unlikely.
+        """
+        normalized = str(name or "").strip()
+        if not normalized:
+            raise ValueError("signal name cannot be empty")
+        emission_id = _new_id()
+        # A root emission is its own origin, so every cascade has exactly one
+        # id to group by without a second column meaning "no parent".
+        root = str(origin_id or "").strip() or emission_id
+        settled_depth = max(0, int(depth))
+        self._conn.execute(
+            """
+            INSERT INTO signal_emissions (
+                id, name, payload_json, source, depth, origin_id,
+                state, reason, delivered_run_id, created_at, delivered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', '', '', ?, NULL)
+            """,
+            (
+                emission_id,
+                normalized,
+                json.dumps(payload or {}, ensure_ascii=False),
+                str(source or "manual"),
+                settled_depth,
+                root,
+                _iso(now),
+            ),
+        )
+        return SignalEmission(
+            id=emission_id,
+            name=normalized,
+            payload=dict(payload or {}),
+            source=str(source or "manual"),
+            depth=settled_depth,
+            origin_id=root,
+            state="pending",
+            created_at=now,
+        )
+
+    @_synchronized
+    def get_emission(self, emission_id: str) -> Optional[SignalEmission]:
+        row = self._conn.execute(
+            "SELECT * FROM signal_emissions WHERE id = ?", (emission_id,)
+        ).fetchone()
+        return self._emission_from_row(row) if row else None
+
+    @_synchronized
+    def list_emissions(
+        self, name: Optional[str] = None, limit: int = 50
+    ) -> list[SignalEmission]:
+        """Recent emissions, newest first -- the audit trail for signals."""
+        params: list[Any] = []
+        clause = ""
+        if name:
+            clause = "WHERE name = ?"
+            params.append(str(name).strip())
+        params.append(max(1, int(limit)))
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM signal_emissions
+            {clause}
+            ORDER BY created_at DESC, rowid DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [self._emission_from_row(row) for row in rows]
+
+    @_synchronized
+    def signal_names(self, limit: int = 100) -> list[dict[str, Any]]:
+        """Every signal name that has ever been emitted, newest first.
+
+        Exists so a subscription can be *picked* rather than typed.  The name
+        is matched exactly and a near-miss never fires, so an interface that
+        only offered a text box would be inviting the one failure this design
+        cannot detect on its own.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT name, COUNT(*) AS total, MAX(created_at) AS last_at
+            FROM signal_emissions
+            GROUP BY name
+            ORDER BY last_at DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [
+            {"name": row["name"], "count": int(row["total"]), "last_at": row["last_at"]}
+            for row in rows
+        ]
+
+    @_synchronized
+    def describe_signal_problem(self, name: str) -> str:
+        """Why this subscription could never fire, or ``""`` if it might.
+
+        Refuses only what can be *proven* wrong, which for a signal is less
+        than it sounds.  A free-form name like ``report.ready`` cannot be
+        checked here -- nothing but the emitter knows whether it is spelled
+        right -- so it is accepted and left to the ``unmatched`` state, which
+        records the miss instead of hiding it.
+
+        A task signal is different: it names a task and a status, and both can
+        be looked up.  Checking them turns the two mistakes people actually
+        make -- a mistyped task id, and a status no run can reach -- into an
+        error at the moment of writing, which is the only time the person
+        still has the context to fix it.
+        """
+        text = str(name or "").strip()
+        if not text:
+            return "信号名称不能为空"
+        parsed = parse_task_signal(text)
+        if parsed is None:
+            return ""
+        task_id, status = parsed
+        if status not in TERMINAL_RUN_STATUSES:
+            return (
+                f"运行不会以「{status}」结束；可用的状态："
+                + "、".join(TERMINAL_RUN_STATUSES)
+            )
+        if self.get_task(task_id) is None:
+            return f"找不到 id 为 {task_id} 的任务"
+        return ""
+
+    def _signal_subscribers(self, name: str) -> list[ScheduledTask]:
+        """Enabled tasks waiting on this exact name.
+
+        Read by scanning the enabled tasks rather than by an index on the
+        trigger, because the subscription lives inside ``trigger_json``.  At
+        the scale this runs at -- the tasks of one person -- that is a handful
+        of rows per delivery.  A repository with thousands of tasks would want
+        subscriptions broken out into their own table; that is a change worth
+        making when the row count says so, not before.
+        """
+        subscribers: list[ScheduledTask] = []
+        rows = self._conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE enabled = 1"
+        ).fetchall()
+        for row in rows:
+            task = self._task_from_row(row)
+            if task.trigger.trigger_type != "signal":
+                continue
+            if str(task.trigger.payload.get("name", "")).strip() == name:
+                subscribers.append(task)
+        return subscribers
+
+    def _record_delivery(
+        self,
+        emission_id: str,
+        task_id: str,
+        outcome: str,
+        *,
+        run_id: str = "",
+        reason: str = "",
+        now: datetime,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO signal_deliveries (
+                id, emission_id, task_id, run_id, outcome, reason, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (_new_id(), emission_id, task_id, run_id, outcome, reason, _iso(now)),
+        )
+
+    def _pending_run_for(self, task_id: str) -> Optional[str]:
+        """The run already waiting for, or running, this task, if any."""
+        row = self._conn.execute(
+            """
+            SELECT id FROM scheduled_task_runs
+            WHERE task_id = ? AND status IN ('queued', 'running')
+            ORDER BY created_at ASC
+            LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        return row["id"] if row else None
+
+    def _enqueue_signal_run_in_transaction(
+        self,
+        task: ScheduledTask,
+        emission: SignalEmission,
+        now: datetime,
+    ) -> str:
+        """Queue one run for a subscriber, carrying the emission it answers.
+
+        The snapshot records where this run came from, because the run that
+        follows a signal is the only place that knows it: when *it* finishes
+        and emits in turn, the depth and the cascade id have to travel with it
+        or the ceiling has nothing to count.
+        """
+        run_id = _new_id()
+        snapshot = execution_snapshot(task)
+        snapshot["signal"] = {
+            "name": emission.name,
+            "emission_id": emission.id,
+            "origin_id": emission.origin_id,
+            "depth": emission.depth,
+            "payload": emission.payload,
+            "source": emission.source,
+        }
+        self._conn.execute(
+            """
+            INSERT INTO scheduled_task_runs (
+                id, task_id, scheduled_for, started_at, finished_at, status,
+                summary, error, output_path, delivery_status,
+                config_snapshot_json, trigger_source, attempt,
+                missed_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, 'queued', '', '', '', '', ?,
+                      ?, 1, 0, ?, ?)
+            """,
+            (
+                run_id,
+                task.id,
+                _iso(now),
+                _iso(now),
+                json.dumps(snapshot, ensure_ascii=False),
+                f"signal:{emission.name}",
+                _iso(now),
+                _iso(now),
+            ),
+        )
+        return run_id
+
+    @_synchronized
+    def deliver_signals(
+        self,
+        now: Optional[datetime] = None,
+        *,
+        limit: int = 50,
+        max_depth: int = DEFAULT_SIGNAL_MAX_DEPTH,
+    ) -> dict[str, int]:
+        """Turn waiting emissions into runs.  Returns a tally *by emission*.
+
+        One emission has exactly one outcome, even when it reached several
+        subscribers by different routes -- delivered to one, folded into
+        another's existing run -- so the tally counts emissions and each
+        emission settles into the state it was counted under.  The per-pair
+        detail lives in :meth:`signal_deliveries`.
+
+        Idempotent by state: an emission leaves ``pending`` exactly once,
+        inside the same transaction that queues its runs, so a crash midway
+        cannot double-deliver -- it either committed both or neither.
+        """
+        current = (now or datetime.now(UTC)).astimezone(UTC)
+        tally = {"delivered": 0, "coalesced": 0, "refused": 0, "unmatched": 0}
+        with self._immediate_transaction():
+            rows = self._conn.execute(
+                """
+                SELECT * FROM signal_emissions
+                WHERE state = 'pending'
+                ORDER BY created_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+            for row in rows:
+                emission = self._emission_from_row(row)
+                subscribers = self._signal_subscribers(emission.name)
+                if not subscribers:
+                    self._settle_emission(
+                        emission,
+                        state="unmatched",
+                        reason="没有任务订阅这个信号",
+                        now=current,
+                    )
+                    tally["unmatched"] += 1
+                    continue
+                if emission.depth > int(max_depth):
+                    # Refused for every subscriber: the cascade has gone as far
+                    # as it is allowed to, whatever shape it has.
+                    for task in subscribers:
+                        self._record_delivery(
+                            emission.id,
+                            task.id,
+                            "refused",
+                            reason=f"级联深度超过上限 {int(max_depth)}",
+                            now=current,
+                        )
+                    self._settle_emission(
+                        emission,
+                        state="refused",
+                        reason=f"级联深度超过上限 {int(max_depth)}",
+                        now=current,
+                    )
+                    tally["refused"] += 1
+                    continue
+                first_run_id = ""
+                delivered = coalesced = 0
+                for task in subscribers:
+                    pending = self._pending_run_for(task.id)
+                    if pending:
+                        # Already something to do.  For a signal that repeats
+                        # -- "data.ready" while the report is still being
+                        # written -- one pending run is the useful answer, and
+                        # the emission is recorded against the run that
+                        # absorbed it rather than being dropped in silence.
+                        self._record_delivery(
+                            emission.id,
+                            task.id,
+                            "coalesced",
+                            run_id=pending,
+                            reason="该任务已有待执行或执行中的运行，本次信号并入其中",
+                            now=current,
+                        )
+                        coalesced += 1
+                        continue
+                    run_id = self._enqueue_signal_run_in_transaction(
+                        task, emission, current
+                    )
+                    self._record_delivery(
+                        emission.id, task.id, "delivered", run_id=run_id, now=current
+                    )
+                    first_run_id = first_run_id or run_id
+                    delivered += 1
+                if delivered:
+                    self._settle_emission(
+                        emission,
+                        state="delivered",
+                        reason="",
+                        run_id=first_run_id,
+                        now=current,
+                    )
+                    tally["delivered"] += 1
+                else:
+                    self._settle_emission(
+                        emission,
+                        state="coalesced",
+                        reason=f"{coalesced} 个订阅任务都已有待执行或执行中的运行",
+                        now=current,
+                    )
+                    tally["coalesced"] += 1
+        return tally
+
+    def _settle_emission(
+        self,
+        emission: SignalEmission,
+        *,
+        state: str,
+        reason: str,
+        now: datetime,
+        run_id: str = "",
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE signal_emissions
+            SET state = ?, reason = ?, delivered_run_id = ?, delivered_at = ?
+            WHERE id = ? AND state = 'pending'
+            """,
+            (state, reason, run_id, _iso(now), emission.id),
+        )
+
+    @_synchronized
+    def signal_deliveries(self, emission_id: str) -> list[dict[str, Any]]:
+        """Per-subscriber outcomes for one emission.
+
+        One emission can be delivered to one task while being folded into a
+        run that another task had already queued, so the outcome belongs to the
+        pair, not to the emission -- a single state would have to pick one and
+        lie about the rest.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT * FROM signal_deliveries
+            WHERE emission_id = ?
+            ORDER BY created_at ASC, rowid ASC
+            """,
+            (emission_id,),
+        ).fetchall()
+        return [
+            {
+                "task_id": row["task_id"],
+                "run_id": row["run_id"],
+                "outcome": row["outcome"],
+                "reason": row["reason"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ]
+
+    def _emit_run_signal(
+        self,
+        task_id: str,
+        run_id: str,
+        status: str,
+        finished_at: datetime,
+        summary: str,
+    ) -> None:
+        """Announce that a run reached ``status``.  Caller owns the transaction.
+
+        Called from :meth:`complete_run` rather than from the runtime, which is
+        the point: the runtime has several ways to end a run, and every one of
+        them has to remember to announce it.  Recording the emission where the
+        status is recorded removes that class of forgetting -- a status that
+        exists is a signal that exists.
+
+        Depth is inherited from the emission this run answered, so a run that
+        was itself started by a signal emits one step further from the root.
+        A run a clock or a person started has no parent and emits at depth zero,
+        which is what makes it the readable start of a cascade.
+        """
+        row = self._conn.execute(
+            "SELECT config_snapshot_json FROM scheduled_task_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        snapshot: dict[str, Any] = {}
+        if row is not None:
+            try:
+                decoded = json.loads(row["config_snapshot_json"] or "{}")
+            except (TypeError, ValueError):
+                decoded = {}
+            if isinstance(decoded, dict):
+                snapshot = decoded
+        parent = snapshot.get("signal")
+        parent = parent if isinstance(parent, dict) else {}
+        task_row = self._conn.execute(
+            "SELECT name FROM scheduled_tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "task_name": str(task_row["name"]) if task_row is not None else "",
+            "run_id": run_id,
+            "status": status,
+        }
+        if summary:
+            # Long enough to be useful in a notification, short enough that a
+            # chatty task cannot turn every downstream run's record into a copy
+            # of its own output.
+            payload["summary"] = summary[:500]
+        self._insert_emission(
+            task_signal_name(task_id, status),
+            payload,
+            source="task",
+            depth=int(parent.get("depth", 0) or 0) + 1 if parent else 0,
+            origin_id=str(parent.get("origin_id", "") or "") if parent else "",
+            now=finished_at,
+        )
 
     # ── Attention: runs nobody has been told about ───────────────────────
     #
@@ -1252,6 +1804,11 @@ class SchedulerStore:
             )
             if run_cursor.rowcount != 1:
                 raise RuntimeError("owned scheduler run disappeared during completion")
+            # Inside the same transaction as the status, deliberately.  If the
+            # two could commit separately, a crash between them would leave a
+            # task that visibly succeeded while whatever was waiting on it
+            # waits forever -- the exact failure that is hardest to notice.
+            self._emit_run_signal(task_id, run_id, status, finished_at, summary)
         return True
 
     @_synchronized

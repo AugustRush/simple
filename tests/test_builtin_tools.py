@@ -2079,3 +2079,161 @@ def test_two_envelopes_are_two_tasks(tmp_path):
     assert first["task"]["existing"] is False
     assert second["task"]["existing"] is False
     assert first["task"]["id"] != second["task"]["id"]
+
+
+def test_schedule_create_accepts_a_signal_trigger(tmp_path):
+    """A subscription is a trigger like any other, and stored as one."""
+    from agent.scheduler import task_signal_name
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    emitter = _create_scheduled_task(registry, name="emitter", prompt="先跑这个")
+    signal = task_signal_name(emitter["task"]["id"], "succeeded")
+
+    created = _create_scheduled_task(
+        registry,
+        name="follower",
+        trigger_type="signal",
+        signal_name=signal,
+        prompt="再跑这个",
+    )
+
+    assert created["task"]["existing"] is False
+    task = _stored_task(created)
+    assert task.trigger.trigger_type == "signal"
+    assert task.trigger.payload["name"] == signal
+    # No calendar, so nothing for the clock to claim and nothing to fall
+    # behind on.
+    assert task.next_run_at is None
+    assert "收到信号" in created["summary_text"]
+
+
+def test_schedule_create_refuses_a_signal_for_a_task_that_does_not_exist(tmp_path):
+    """A mistyped id is a task that never runs, so it is worth catching now."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(
+        registry,
+        name="follower",
+        trigger_type="signal",
+        signal_name="task:no-such-task:succeeded",
+    )
+
+    assert "error" in payload
+    assert "no-such-task" in json.dumps(payload, ensure_ascii=False)
+
+
+def test_schedule_create_refuses_a_status_a_run_cannot_reach(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    emitter = _create_scheduled_task(registry, name="emitter", prompt="先跑这个")
+
+    payload = _create_scheduled_task(
+        registry,
+        name="follower",
+        trigger_type="signal",
+        signal_name=f"task:{emitter['task']['id']}:exploded",
+    )
+
+    assert "error" in payload
+    assert "exploded" in json.dumps(payload, ensure_ascii=False)
+
+
+def test_schedule_create_allows_a_signal_nobody_has_emitted_yet(tmp_path):
+    """Otherwise the two halves would have to be created in a fixed order."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(
+        registry,
+        name="follower",
+        trigger_type="signal",
+        signal_name="report.ready",
+        prompt="等报告就绪",
+    )
+
+    assert payload["task"]["existing"] is False
+    assert _stored_task(payload).trigger.payload["name"] == "report.ready"
+
+
+def test_schedule_create_requires_a_signal_name(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(registry, name="follower", trigger_type="signal")
+
+    assert "error" in payload
+
+
+def test_emit_signal_records_an_emission_and_names_its_subscribers(tmp_path):
+    from agent.scheduler import SchedulerStore
+    import agent.shared as shared_module
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    _create_scheduled_task(
+        registry,
+        name="follower",
+        trigger_type="signal",
+        signal_name="report.ready",
+        prompt="等报告就绪",
+    )
+
+    payload = json.loads(
+        asyncio.run(registry.call("emit_signal", {"name": "report.ready", "payload": {"rows": 2}}))
+    )
+
+    assert payload["name"] == "report.ready"
+    assert payload["subscribers"] == ["follower"]
+    assert "1 个任务" in payload["summary_text"]
+    store = SchedulerStore(db_path=Path(shared_module.SCHEDULER_DB_FILE))
+    try:
+        emissions = store.list_emissions(name="report.ready")
+        assert len(emissions) == 1
+        assert emissions[0].state == "pending"
+        assert emissions[0].payload == {"rows": 2}
+        # Recorded, not delivered: emitting and running are separate steps so
+        # that an emission survives a process that stops right after it.
+        assert store.list_runs(payload and store.list_tasks()[0].id) == []
+    finally:
+        store.close()
+
+
+def test_emit_signal_says_so_when_nobody_is_waiting(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = json.loads(asyncio.run(registry.call("emit_signal", {"name": "nobody.listens"})))
+
+    assert payload["subscribers"] == []
+    assert "没有任务订阅" in payload["summary_text"]
+
+
+def test_list_signals_reports_what_has_been_emitted_and_who_is_waiting(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    _create_scheduled_task(
+        registry,
+        name="follower",
+        trigger_type="signal",
+        signal_name="report.ready",
+        prompt="等报告就绪",
+    )
+    asyncio.run(registry.call("emit_signal", {"name": "report.ready"}))
+
+    payload = json.loads(asyncio.run(registry.call("list_signals", {})))
+
+    emitted = {item["name"]: item for item in payload["items"]}
+    assert emitted["report.ready"]["subscriber_count"] == 1
+    assert emitted["report.ready"]["emission_count"] == 1
+
+
+def test_list_signals_shows_a_subscription_nobody_has_emitted_yet(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    _create_scheduled_task(
+        registry,
+        name="follower",
+        trigger_type="signal",
+        signal_name="never.emitted",
+        prompt="等那个信号",
+    )
+
+    payload = json.loads(asyncio.run(registry.call("list_signals", {})))
+
+    assert payload["items"] == []
+    assert payload["waiting_on_unemitted"] == [
+        {"name": "never.emitted", "subscriber_count": 1}
+    ]

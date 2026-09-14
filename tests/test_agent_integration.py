@@ -6857,7 +6857,12 @@ def test_gateway_starts_background_scheduler(monkeypatch):
         return {"agent": object()}
 
     async def fake_build_scheduler_service(
-        cfg, poll_seconds, lease_seconds, max_concurrent_runs, components=None
+        cfg,
+        poll_seconds,
+        lease_seconds,
+        max_concurrent_runs,
+        signal_max_depth=None,
+        components=None,
     ):
         assert max_concurrent_runs == 3
         return _FakeService(), _FakeStore(), {"scheduler_components": True}
@@ -6911,7 +6916,12 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
         return primary_components
 
     async def fake_build_scheduler_service(
-        cfg, poll_seconds, lease_seconds, max_concurrent_runs, components=None
+        cfg,
+        poll_seconds,
+        lease_seconds,
+        max_concurrent_runs,
+        signal_max_depth=None,
+        components=None,
     ):
         assert max_concurrent_runs == 3
         observed["scheduler"] = components

@@ -102,6 +102,11 @@ DEFAULT_CONFIG: dict = {
         "poll_seconds": 30,
         "lease_seconds": 300,
         "max_concurrent_runs": 3,
+        # How far a signal may travel from what started it before delivery is
+        # refused.  The task graph that signals can form is never declared, so
+        # it cannot be checked for cycles when it is built -- this is the bound
+        # that stands in for that check.
+        "signal_max_depth": 10,
     },
     "audio": {
         "transcription_command": "$SIMPLE_AUDIO_TRANSCRIBE_COMMAND",
@@ -409,7 +414,14 @@ def _validate_config(cfg: dict) -> list[str]:
         _check_int("scheduler.poll_seconds", 1, 3600) if "poll_seconds" in scheduler else None
         _check_int("scheduler.lease_seconds", 1, 3600) if "lease_seconds" in scheduler else None
         # Check inline
-        for skey, smin in (("poll_seconds", 1), ("lease_seconds", 10)):
+        for skey, smin in (
+            ("poll_seconds", 1),
+            ("lease_seconds", 10),
+            # Zero is allowed and means "the first hop only": a signal emitted
+            # by a task is refused, but a signal a person or a clock raises
+            # still runs its subscribers.  Anything below zero is a mistake.
+            ("signal_max_depth", 0),
+        ):
             sv = scheduler.get(skey)
             if sv is not None:
                 try:

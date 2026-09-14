@@ -7,6 +7,7 @@ import React, {
 } from 'react'
 import { createPortal } from 'react-dom'
 import {
+  AutoComplete,
   Avatar,
   Badge,
   Button,
@@ -225,6 +226,17 @@ interface ScheduleInfo {
   unseen_attention?: number
 }
 
+interface SignalInfo {
+  name: string
+  source: 'task' | 'custom'
+  task_id: string
+  task_name: string
+  status: string
+  last_emitted_at?: string | null
+  emission_count: number
+  subscriber_count: number
+}
+
 interface ScheduleRun {
   id: string
   task_id: string
@@ -274,7 +286,7 @@ interface ScheduleArtifact {
 interface ScheduleDraft {
   name: string
   action_type: 'agent_task' | 'message'
-  trigger_type: 'once' | 'interval' | 'daily' | 'weekly' | 'weekdays' | 'monthly'
+  trigger_type: 'once' | 'interval' | 'daily' | 'weekly' | 'weekdays' | 'monthly' | 'signal'
   at: string
   every: number
   unit: 'minutes' | 'hours' | 'days' | 'weeks'
@@ -282,6 +294,7 @@ interface ScheduleDraft {
   time_of_day: string
   day_of_week: string
   day_of_month: number
+  signal_name: string
   prompt: string
   message_text: string
   workspace_root: string
@@ -863,6 +876,7 @@ function defaultScheduleDraft(workspaceRoot = ''): ScheduleDraft {
     time_of_day: start.format('HH:mm'),
     day_of_week: weekday,
     day_of_month: start.date(),
+    signal_name: '',
     prompt: '',
     message_text: '',
     workspace_root: workspaceRoot,
@@ -891,6 +905,7 @@ function scheduleDraftFromTask(task: ScheduleInfo): ScheduleDraft {
     time_of_day: String(trigger.time_of_day || fallback.time_of_day),
     day_of_week: String(trigger.day_of_week || fallback.day_of_week),
     day_of_month: Number(trigger.day_of_month || fallback.day_of_month),
+    signal_name: String(trigger.name || ''),
     prompt: String(task.payload?.prompt || ''),
     message_text: String(task.payload?.message_text || ''),
     workspace_root: task.workspace_root || '',
@@ -919,7 +934,23 @@ function scheduleTimeValue(value: string) {
   return dayjs().hour(hour).minute(minute).second(0).millisecond(0)
 }
 
-function scheduleTriggerLabel(task: ScheduleInfo): string {
+/**
+ * Turn a signal name into something a person recognizes.
+ *
+ * A task's own signal is `task:<id>:<status>` — exact and rename-proof, but
+ * not something to show anyone. The id is resolved against the tasks already
+ * on the page, so this stays a pure function of data the caller has rather
+ * than reaching for a second lookup.
+ */
+function describeSignalName(name: string, tasks: ScheduleInfo[] = []): string {
+  const match = /^task:([^:]+):(.+)$/.exec(name || '')
+  if (!match) return name
+  const [, taskId, status] = match
+  const taskName = tasks.find(item => item.id === taskId)?.name || taskId
+  return `「${taskName}」${scheduleRunStatusLabel(status)}`
+}
+
+function scheduleTriggerLabel(task: ScheduleInfo, tasks: ScheduleInfo[] = []): string {
   const trigger = task.trigger || {}
   if (task.trigger_type === 'once') {
     return trigger.at ? `一次 · ${new Date(trigger.at).toLocaleString()}` : '一次性执行'
@@ -935,6 +966,10 @@ function scheduleTriggerLabel(task: ScheduleInfo): string {
     const weekday = WEEKDAY_OPTIONS.find(item => item.value === trigger.day_of_week)?.label || trigger.day_of_week || ''
     return `每${weekday} ${trigger.time_of_day || ''}`
   }
+  if (task.trigger_type === 'signal') {
+    const name = String(trigger.name || '')
+    return name ? `当${describeSignalName(name, tasks)}发生时` : '等待信号'
+  }
   return '未设置计划'
 }
 
@@ -946,6 +981,49 @@ function scheduleRunStatusLabel(status?: string): string {
   if (status === 'interrupted') return '已中断'
   if (status === 'cancelled') return '已取消'
   return '等待首次执行'
+}
+
+/** Why this run started, in the terms that will make sense to the reader.
+ *
+ * "按计划运行" is the safe default and the wrong answer for a run that a
+ * signal woke, because the whole point of a signal is that it is not the
+ * clock. Saying which one fired is what lets a chain of runs be read as a
+ * chain instead of as unrelated activity.
+ */
+function describeRunTrigger(run: ScheduleRun, tasks: ScheduleInfo[] = []): string {
+  const source = run.trigger_source || 'schedule'
+  if (source === 'manual') return '手动运行'
+  if (source.startsWith('retry') || source === 'automatic_retry') {
+    return `重试 · 第 ${run.attempt || 1} 次`
+  }
+  if (source.startsWith('signal:')) {
+    const name = source.slice('signal:'.length)
+    return `由信号触发 · ${describeSignalName(name, tasks)}`
+  }
+  return '按计划运行'
+}
+
+/** How a run's cascade context reads, or null when there is none. */
+function describeCascade(run: ScheduleRun): string | null {
+  const signal = run.config_snapshot?.signal
+  if (!signal || typeof signal !== 'object') return null
+  const depth = Number(signal.depth || 0)
+  // Depth zero means the signal was raised by a person, a clock or the agent
+  // itself rather than by another run, so there is no chain to describe.
+  if (depth <= 0) return null
+  return `信号链第 ${depth + 1} 层`
+}
+
+/** How a task's next run reads, or the honest alternative when there is none.
+ *
+ * "暂无后续执行" is right for a task whose schedule has run out and wrong for
+ * one that is waiting on a signal: the second will run, and saying otherwise
+ * invites deleting a task that is working exactly as asked.
+ */
+function describeNextRun(task: ScheduleInfo): string {
+  if (task.next_run_at) return new Date(task.next_run_at).toLocaleString()
+  if (task.trigger_type === 'signal') return '等待信号触发'
+  return '暂无后续执行'
 }
 
 function scheduleRunStatusIcon(status?: string) {
@@ -1015,6 +1093,8 @@ function App() {
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [skills, setSkills] = useState<SkillInfo[]>([])
   const [schedules, setSchedules] = useState<ScheduleInfo[]>([])
+  const [signals, setSignals] = useState<SignalInfo[]>([])
+  const [signalsWaiting, setSignalsWaiting] = useState<{ name: string; subscriber_count: number }[]>([])
   const [unseenFailures, setUnseenFailures] = useState(0)
   const [permissionProfiles, setPermissionProfiles] = useState<PermissionProfileOption[]>([])
   const [scheduleQuery, setScheduleQuery] = useState('')
@@ -2206,6 +2286,18 @@ function App() {
     }
   }, [api])
 
+  const loadSignals = useCallback(async () => {
+    try {
+      const resp = await api('/api/signals')
+      const data = await resp.json()
+      setSignals(Array.isArray(data.signals) ? data.signals : [])
+      setSignalsWaiting(Array.isArray(data.waiting) ? data.waiting : [])
+    } catch {
+      // An unreachable list is not "no signals": leave the picker empty
+      // rather than telling the user that nothing has ever been emitted.
+    }
+  }, [api])
+
   const loadUnseenFailures = useCallback(async () => {
     try {
       const resp = await api('/api/schedules/attention')
@@ -2479,9 +2571,10 @@ function App() {
       loadSchedules()
       loadSkills(true)
       loadSchedulerHealth()
+      loadSignals()
     }
     if (view === 'settings') loadSettings()
-  }, [view, loadPlugins, loadSkills, loadSchedules, loadSchedulerHealth, loadSettings])
+  }, [view, loadPlugins, loadSkills, loadSchedules, loadSchedulerHealth, loadSignals, loadSettings])
 
   const createSession = async () => {
     try {
@@ -2781,6 +2874,10 @@ function App() {
   const openCreateSchedule = () => {
     setEditingScheduleId(null)
     setScheduleDraft(defaultScheduleDraft(sessionState?.workspace_root || config?.workspace_root || ''))
+    // Refreshed on open, not only when the page loaded: the signals worth
+    // waiting for are the ones emitted since, and a picker showing yesterday's
+    // list is how someone ends up typing a name by hand again.
+    void loadSignals()
     setScheduleModalOpen(true)
   }
 
@@ -2791,6 +2888,7 @@ function App() {
       ...draft,
       workspace_root: draft.workspace_root || sessionState?.workspace_root || config?.workspace_root || '',
     })
+    void loadSignals()
     setScheduleModalOpen(true)
   }
 
@@ -2802,6 +2900,7 @@ function App() {
       name: `${task.name} 副本`,
       workspace_root: draft.workspace_root || sessionState?.workspace_root || config?.workspace_root || '',
     })
+    void loadSignals()
     setScheduleModalOpen(true)
   }
 
@@ -2833,6 +2932,10 @@ function App() {
     }
     if (['daily', 'weekly', 'weekdays', 'monthly'].includes(scheduleDraft.trigger_type) && !scheduleDraft.time_of_day) {
       messageApi.warning('请选择每天的执行时间')
+      return
+    }
+    if (scheduleDraft.trigger_type === 'signal' && !scheduleDraft.signal_name.trim()) {
+      messageApi.warning('请选择或填写要等待的信号')
       return
     }
     try {
@@ -4545,9 +4648,12 @@ function App() {
           </Space>
         )}
       </div>
+      {/* Not "定时任务" any more, because the form no longer only offers
+          times -- calling it that while the user is choosing a signal to wait
+          for would be the form contradicting itself. */}
       <Modal
         open={scheduleModalOpen}
-        title={editingScheduleId ? '编辑定时任务' : '新建定时任务'}
+        title={editingScheduleId ? '编辑任务' : '新建任务'}
         width={700}
         okText={editingScheduleId ? '保存修改' : '创建任务'}
         cancelText="取消"
@@ -4670,7 +4776,9 @@ function App() {
             </>
           )}
 
-          <div className="schedule-form-section-title">执行时间</div>
+          <div className="schedule-form-section-title">
+            {scheduleDraft.trigger_type === 'signal' ? '触发方式' : '执行时间'}
+          </div>
 
           <div className="schedule-field">
             <label>执行计划</label>
@@ -4684,9 +4792,38 @@ function App() {
                 { value: 'weekly', label: '每周' },
                 { value: 'weekdays', label: '工作日（周一至周五）' },
                 { value: 'monthly', label: '每月指定日期' },
+                { value: 'signal', label: '当某个信号发生时' },
               ]}
             />
           </div>
+
+          {scheduleDraft.trigger_type === 'signal' && (
+            <div className="schedule-field">
+              <label>等待的信号</label>
+              {/* Autocomplete rather than a plain select: the known names are
+                  the ones that can actually fire today, but a name nobody has
+                  emitted yet is legitimate when the emitter is being set up in
+                  the same breath. Matching is exact, so a near-miss never
+                  fires — which is exactly why the known names are offered
+                  instead of left to memory. */}
+              <AutoComplete
+                value={scheduleDraft.signal_name}
+                onChange={value => setScheduleDraft({ ...scheduleDraft, signal_name: String(value || '') })}
+                placeholder="选择已有信号，或填写一个将要发出的信号名"
+                options={signals.map(item => ({
+                  value: item.name,
+                  label: `${describeSignalName(item.name, schedules)}${item.subscriber_count > 0 ? `（已有 ${item.subscriber_count} 个任务等待）` : ''}`,
+                }))}
+                filterOption={(input, option) => String(option?.value || '').toLowerCase().includes(String(input || '').toLowerCase())}
+                style={{ width: '100%' }}
+              />
+              {signalsWaiting.length > 0 && (
+                <div className="schedule-field-hint">
+                  还没有发出过的信号：{signalsWaiting.map(item => item.name).join('、')}
+                </div>
+              )}
+            </div>
+          )}
 
           {scheduleDraft.trigger_type === 'once' && (
             <div className="schedule-field">
@@ -4846,8 +4983,16 @@ function App() {
           )}
 
           <div className="schedule-preview">
-            <div><ClockCircleOutlined /><strong>未来执行时间</strong></div>
-            {schedulePreview.length > 0 ? (
+            <div><ClockCircleOutlined /><strong>{scheduleDraft.trigger_type === 'signal' ? '触发条件' : '未来执行时间'}</strong></div>
+            {scheduleDraft.trigger_type === 'signal' ? (
+              // No list of times to show, and showing an empty one would read
+              // as "this will never run" rather than "this waits".
+              <span>
+                {scheduleDraft.signal_name.trim()
+                  ? `收到信号「${scheduleDraft.signal_name.trim()}」时运行一次，没有固定时间。`
+                  : '选择一个信号后，任务会在它被发出时运行。'}
+              </span>
+            ) : schedulePreview.length > 0 ? (
               <ol>{schedulePreview.map(item => <li key={item}>{new Date(item).toLocaleString()}</li>)}</ol>
             ) : (
               <span>{schedulePreviewError || '填写完整任务信息后显示未来 5 次执行时间'}</span>
@@ -4894,7 +5039,7 @@ function App() {
                 <div>
                   <div className="schedule-detail-tags">
                     <Tag>{selectedSchedule.kind === 'agent_prompt' ? 'Agent 任务' : selectedSchedule.kind === 'message' ? '定时提醒' : '系统任务'}</Tag>
-                    <Tag>{scheduleTriggerLabel(selectedSchedule)}</Tag>
+                    <Tag>{scheduleTriggerLabel(selectedSchedule, schedules)}</Tag>
                     <Tag>{selectedSchedule.enabled === false ? '已暂停' : '已启用'}</Tag>
                     {selectedSchedule.context_policy && <Tag>{selectedSchedule.context_policy === 'stateless' ? '独立上下文' : selectedSchedule.context_policy === 'task_history' ? '任务历史' : '共享记忆'}</Tag>}
                     {selectedSchedule.kind === 'agent_prompt' && (
@@ -4913,9 +5058,7 @@ function App() {
               </div>
               <div className="schedule-detail-next">
                 <small>下次执行</small>
-                <strong>{selectedSchedule.next_run_at
-                  ? new Date(selectedSchedule.next_run_at).toLocaleString()
-                  : '暂无后续执行'}</strong>
+                <strong>{describeNextRun(selectedSchedule)}</strong>
               </div>
             </div>
 
@@ -5025,7 +5168,10 @@ function App() {
                         <div><small>开始时间</small><span>{selectedScheduleRun.started_at ? new Date(selectedScheduleRun.started_at).toLocaleString() : '—'}</span></div>
                         <div><small>完成时间</small><span>{selectedScheduleRun.finished_at ? new Date(selectedScheduleRun.finished_at).toLocaleString() : '—'}</span></div>
                         <div><small>执行耗时</small><span>{formatScheduleDuration(selectedScheduleRun.duration_ms)}</span></div>
-                        <div><small>触发方式</small><span>{selectedScheduleRun.trigger_source === 'manual' ? '手动运行' : selectedScheduleRun.trigger_source?.startsWith('retry') ? `重试 · 第 ${selectedScheduleRun.attempt || 1} 次` : '按计划运行'}</span></div>
+                        <div><small>触发方式</small><span>{describeRunTrigger(selectedScheduleRun, schedules)}</span></div>
+                        {describeCascade(selectedScheduleRun) && (
+                          <div><small>信号链</small><span>{describeCascade(selectedScheduleRun)}</span></div>
+                        )}
                         <div><small>运行模型</small><span>{selectedScheduleRun.config_snapshot?.model_override || '默认模型'}</span></div>
                       </div>
 
@@ -5141,7 +5287,7 @@ function App() {
                   {latestRun?.duration_ms !== null && latestRun?.duration_ms !== undefined && (
                     <span>耗时 {formatScheduleDuration(latestRun.duration_ms)}</span>
                   )}
-                  <span>下次执行：{task.next_run_at ? new Date(task.next_run_at).toLocaleString() : '暂无'}</span>
+                  <span>下次执行：{describeNextRun(task)}</span>
                   {task.last_run_at && <span>上次执行：{new Date(task.last_run_at).toLocaleString()}</span>}
                   <Button type="text" size="small" icon={<FileTextOutlined />} className="schedule-card-detail-button">运行记录</Button>
                 </div>

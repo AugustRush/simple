@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 from .models import (
+    DEFAULT_SIGNAL_MAX_DEPTH,
     DeliveryResult,
     DeliveryTarget,
     ExecutionResult,
@@ -30,6 +31,7 @@ class SchedulerService:
         poll_seconds: float = 30.0,
         lease_seconds: int = 300,
         max_concurrent_runs: int = 3,
+        signal_max_depth: int = DEFAULT_SIGNAL_MAX_DEPTH,
     ):
         self.store = store
         self.agent_executor = agent_executor
@@ -40,6 +42,7 @@ class SchedulerService:
         if self.lease_seconds < 3:
             raise ValueError("lease_seconds must be at least 3")
         self.max_concurrent_runs = max(1, int(max_concurrent_runs))
+        self.signal_max_depth = max(0, int(signal_max_depth))
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self._cancel_requested: set[str] = set()
@@ -74,6 +77,22 @@ class SchedulerService:
     async def run_once(self, now: Optional[datetime] = None) -> int:
         current = (now or datetime.now(UTC)).astimezone(UTC)
         await self._store_call("disable_duplicate_enabled_tasks", current)
+        # Before claiming, so a signal queued a moment ago becomes a run in
+        # this same iteration instead of waiting out another poll interval.
+        # It also means a signal emitted by a run in the previous iteration --
+        # or by an agent tool call between iterations -- is acted on here,
+        # which is what keeps a cascade costing one poll per hop rather than
+        # one poll per hop plus a delivery cycle.
+        try:
+            await self._store_call(
+                "deliver_signals", now=current, max_depth=self.signal_max_depth
+            )
+        except Exception:
+            # Delivery is idempotent and every emission is on disk, so a
+            # failure here defers the signal to the next poll rather than
+            # losing it.  Claiming clock-scheduled work must not be held
+            # hostage to that.
+            logger.exception("Signal delivery failed; emissions remain pending")
         claim_operation = asyncio.create_task(
             self._store_call(
                 "claim_due_tasks",
@@ -142,6 +161,7 @@ class SchedulerService:
             "active_runs": len(self._active_tasks),
             "poll_seconds": self.poll_seconds,
             "max_concurrent_runs": self.max_concurrent_runs,
+            "signal_max_depth": self.signal_max_depth,
         }
 
     async def shutdown(self) -> None:

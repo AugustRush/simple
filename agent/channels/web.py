@@ -27,7 +27,7 @@ from agent.channels.base import Channel, IncomingMessage
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
 from agent.pathing import path_contains
-from agent.scheduler.models import run_needs_attention
+from agent.scheduler.models import parse_task_signal, run_needs_attention
 from agent.session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -1123,6 +1123,25 @@ class WebChannel(Channel):
             trigger = TriggerSpec.monthly(
                 int(body["day_of_month"]), str(body["time_of_day"]), timezone_name
             )
+        elif trigger_type == "signal":
+            signal_name = str(body.get("signal_name", "")).strip()
+            if not signal_name:
+                raise ValueError("请选择或填写要等待的信号")
+            # A short-lived connection of its own, because this function
+            # deliberately knows nothing about the store: it turns a request
+            # body into a spec, and the caller owns persistence.  The check
+            # needs to read tasks, so it borrows a connection rather than
+            # widening the function's contract for one validation.
+            from agent.scheduler import SchedulerStore
+
+            probe = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            try:
+                problem = probe.describe_signal_problem(signal_name)
+            finally:
+                probe.close()
+            if problem:
+                raise ValueError(f"信号「{signal_name}」无法生效：{problem}")
+            trigger = TriggerSpec.signal(signal_name)
         else:
             raise ValueError("不支持的执行计划")
         trigger.instantiate().next_after(datetime.now(timezone.utc))
@@ -1725,6 +1744,65 @@ class WebChannel(Channel):
         if service is None:
             return JSONResponse({"status": "offline", "active_runs": 0})
         return JSONResponse(service.health())
+
+    async def _signals(self, request: Any) -> Any:
+        """What can be waited for, so a subscription is chosen rather than typed.
+
+        The interface offers these as options because a signal name is matched
+        exactly: a near miss does not fire late or fire anyway, it never fires,
+        and the only trace is an emission recorded as unmatched.  Listing the
+        names that exist turns that failure into one nobody can make by
+        accident.
+        """
+        from starlette.responses import JSONResponse
+        from agent.scheduler import SchedulerStore
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            emissions = store.signal_names()
+            subscribers: dict[str, int] = {}
+            task_labels: dict[str, str] = {}
+            for task in store.list_tasks():
+                task_labels[task.id] = task.name
+                if not task.enabled or task.trigger.trigger_type != "signal":
+                    continue
+                key = str(task.trigger.payload.get("name", "")).strip()
+                subscribers[key] = subscribers.get(key, 0) + 1
+        finally:
+            store.close()
+        items = []
+        for entry in emissions:
+            name = str(entry["name"])
+            # A task signal reads as gibberish on its own (task:9f2c…:succeeded),
+            # so the task it belongs to travels alongside.  The label itself is
+            # left to the interface, which already owns the wording for run
+            # statuses; duplicating it here would create a second place to keep
+            # in step for no gain.
+            parsed = parse_task_signal(name)
+            items.append(
+                {
+                    "name": name,
+                    "source": "task" if parsed else "custom",
+                    "task_id": parsed[0] if parsed else "",
+                    "task_name": task_labels.get(parsed[0], "") if parsed else "",
+                    "status": parsed[1] if parsed else "",
+                    "last_emitted_at": entry.get("last_at"),
+                    "emission_count": int(entry.get("count") or 0),
+                    "subscriber_count": subscribers.get(name, 0),
+                }
+            )
+        return JSONResponse(
+            {
+                "signals": items,
+                "waiting": [
+                    {"name": key, "subscriber_count": value}
+                    for key, value in sorted(subscribers.items())
+                    if key and key not in {item["name"] for item in items}
+                ],
+            }
+        )
 
     async def _delete_skill(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -2660,6 +2738,7 @@ class WebChannel(Channel):
                 methods=["POST"],
             ),
             Route("/api/scheduler/health", self._scheduler_health, methods=["GET"]),
+            Route("/api/signals", self._signals, methods=["GET"]),
             Route(
                 "/api/schedules/{task_id}/run",
                 self._run_schedule_now,

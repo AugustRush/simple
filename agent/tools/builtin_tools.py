@@ -166,7 +166,9 @@ def _resolve_user_plugin_target(name: str, root: Path | None = None) -> Path:
     return target
 
 
-from .runtime import _active_schedule_target  # noqa: E402
+from .runtime import _active_schedule_target, _active_signal_context  # noqa: E402
+
+
 class BuiltinTools:
     """Built-in tools with bounded file access and structured responses."""
 
@@ -725,6 +727,8 @@ class BuiltinTools:
                 "For once: provide `at`. For interval: provide `every`, `unit`, and `at` (anchor). "
                 "For daily or weekdays: provide `time_of_day`. For weekly: provide `day_of_week` and `time_of_day`. "
                 "For monthly: provide `day_of_month` and `time_of_day`. "
+                "For signal: provide `signal_name` -- the task runs when that signal is emitted, "
+                "which is how a step can be made to follow another task instead of a clock. "
                 "The run is unattended: set `permission_profile` to say what it may do "
                 "(inherit/read_only/workspace_write), and pass `workspace_root` when the "
                 "task should work in a directory other than the current session's."
@@ -735,7 +739,19 @@ class BuiltinTools:
                     "name": {"type": "string", "description": "Short task name"},
                     "trigger_type": {
                         "type": "string",
-                        "description": "one of: once, interval, daily, weekly, weekdays, monthly",
+                        "description": "one of: once, interval, daily, weekly, weekdays, monthly, signal",
+                    },
+                    "signal_name": {
+                        "type": "string",
+                        "description": (
+                            "Signal to wait for when trigger_type=signal. A "
+                            "finished task's own signal is "
+                            "task:<task_id>:succeeded, task:<task_id>:failed, "
+                            "task:<task_id>:cancelled or task:<task_id>:interrupted "
+                            "-- use schedule_list to find task ids. For a signal "
+                            "you will emit yourself, check list_signals for the "
+                            "name already in use."
+                        ),
                     },
                     "prompt": {
                         "type": "string",
@@ -839,6 +855,53 @@ class BuiltinTools:
                 "required": ["task_id"],
             },
             self._schedule_delete,
+            source="builtin",
+        )
+
+        r.register(
+            "emit_signal",
+            (
+                "Announce that something happened, so any task waiting on that signal runs. "
+                "Use this to make a step follow this one without waiting for a clock: emit a "
+                "signal here, and another task created with trigger_type=signal and the same "
+                "signal_name will run. The signal is recorded whether or not anyone is "
+                "subscribed, so an emission is never lost if the subscriber is added later. "
+                "Signals a task emits by itself (task:<id>:succeeded / :failed / :cancelled) "
+                "need no call. Call `list_signals` first to see which names are already in use."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Signal name. Use a dotted name you choose, e.g. "
+                            "report.ready, or task:<task_id>:succeeded to follow a task."
+                        ),
+                    },
+                    "payload": {
+                        "type": "object",
+                        "description": (
+                            "Facts to pass downstream, readable by the subscriber in the "
+                            "run's signal context. Keep it small."
+                        ),
+                    },
+                },
+                "required": ["name"],
+            },
+            self._emit_signal,
+            source="builtin",
+        )
+
+        r.register(
+            "list_signals",
+            (
+                "List signal names that have been emitted recently, with how many people "
+                "are waiting on each. Use before creating a signal-triggered task so the "
+                "subscription matches an existing emission instead of a guess."
+            ),
+            {"type": "object", "properties": {}, "required": []},
+            self._list_signals,
             source="builtin",
         )
 
@@ -2793,10 +2856,24 @@ class BuiltinTools:
         time_of_day: Optional[str] = None,
         day_of_week: Optional[str] = None,
         day_of_month: Optional[int] = None,
+        signal_name: Optional[str] = None,
     ):
         from agent.scheduler import TriggerSpec
 
         kind = str(trigger_type).strip().lower()
+        if kind == "signal":
+            wanted = str(signal_name or "").strip()
+            if not wanted:
+                raise ValueError("`signal_name` is required for signal triggers")
+            # Subscribing is exact-name matching, so a typo is not a near miss
+            # -- it is a task that never runs.  What can be checked is checked
+            # (see the store's validator); what cannot is allowed, because a
+            # new name is how a new emitter is paired and refusing it would
+            # make the two sides have to be created in a particular order.
+            problem = self._schedule_store().describe_signal_problem(wanted)
+            if problem:
+                raise ValueError(f"signal_name「{wanted}」无效：{problem}")
+            return TriggerSpec.signal(wanted)
         if kind == "once":
             if not at:
                 raise ValueError("`at` is required for once triggers")
@@ -2823,6 +2900,21 @@ class BuiltinTools:
             return TriggerSpec.monthly(day_of_month, time_of_day, timezone_name)
         raise ValueError(f"Unsupported trigger_type '{trigger_type}'")
 
+    @staticmethod
+    def _describe_trigger_when(trigger) -> str:
+        """How to say *when* a task runs, in the terms the trigger uses.
+
+        Returns a fragment meant to be followed by the action ("发送消息…",
+        "执行任务…"), or an empty string when there is no honest way to name a
+        time -- which is not a bug to paper over with "None" but the normal
+        case for a task that waits for a signal.
+        """
+        if trigger.trigger_type == "signal":
+            name = str(trigger.payload.get("name", "")).strip()
+            return f"收到信号「{name}」时"
+        initial = trigger.initial_run_at()
+        return f"将在 {initial.isoformat()} " if initial else ""
+
     def _schedule_create(
         self,
         name: str,
@@ -2839,6 +2931,7 @@ class BuiltinTools:
         time_of_day: Optional[str] = None,
         day_of_week: Optional[str] = None,
         day_of_month: Optional[int] = None,
+        signal_name: Optional[str] = None,
         delivery_mode: Optional[str] = None,
         permission_profile: Optional[str] = None,
         workspace_root: Optional[str] = None,
@@ -2852,10 +2945,18 @@ class BuiltinTools:
             time_of_day=time_of_day,
             day_of_week=day_of_week,
             day_of_month=day_of_month,
+            signal_name=signal_name,
         )
         resolved_mode, target = self._schedule_target(delivery_mode)
         from agent.scheduler import NewScheduledTask
 
+        # A task woken by a signal is still a scheduled task in every way that
+        # matters -- it just has no date to name.  Saying when it runs is
+        # therefore a different sentence, not a missing one, and the summary
+        # should read as "it will run", not as "it will run at None".
+        when_text = self._describe_trigger_when(trigger)
+        noun = "信号任务" if trigger.trigger_type == "signal" else "定时任务"
+        job_noun = f"系统{noun}"
         normalized_action = str(action_type or "message").strip().lower()
         task_kind = "message"
         payload: dict[str, Any]
@@ -2866,9 +2967,9 @@ class BuiltinTools:
             task_kind = "message"
             payload = {"message_text": text}
             summary_text = (
-                f"已设置好定时任务！将在 {trigger.initial_run_at().isoformat()} 发送消息“{text}”。"
-                if trigger.initial_run_at()
-                else f"已设置好定时任务，会发送消息“{text}”。"
+                f"已设置好{noun}！{when_text}发送消息“{text}”。"
+                if when_text
+                else f"已设置好{noun}，会发送消息“{text}”。"
             )
         elif normalized_action == "agent_task":
             text = str(instruction or prompt).strip()
@@ -2877,9 +2978,9 @@ class BuiltinTools:
             task_kind = "agent_prompt"
             payload = {"prompt": text}
             summary_text = (
-                f"已设置好定时任务！将在 {trigger.initial_run_at().isoformat()} 执行任务：{text}"
-                if trigger.initial_run_at()
-                else f"已设置好定时任务，会执行任务：{text}"
+                f"已设置好{noun}！{when_text}执行任务：{text}"
+                if when_text
+                else f"已设置好{noun}，会执行任务：{text}"
             )
         elif normalized_action == "system_job":
             text = str(job_name or "").strip()
@@ -2888,9 +2989,9 @@ class BuiltinTools:
             task_kind = "system_job"
             payload = {"job_name": text}
             summary_text = (
-                f"已设置好系统定时任务！将在 {trigger.initial_run_at().isoformat()} 执行 {text}。"
-                if trigger.initial_run_at()
-                else f"已设置好系统定时任务，会执行 {text}。"
+                f"已设置好{job_noun}！{when_text}执行 {text}。"
+                if when_text
+                else f"已设置好{job_noun}，会执行 {text}。"
             )
         else:
             raise ValueError(f"Unsupported action_type '{action_type}'")
@@ -2990,6 +3091,79 @@ class BuiltinTools:
         store = self._schedule_store()
         store.delete_task(task_id)
         return self._ok(task_id=task_id, deleted=True)
+
+    def _emit_signal(
+        self, name: str, payload: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """Record a signal so whoever is waiting on it runs.
+
+        Deliberately does *not* run the subscriber here.  Emitting and running
+        are separate steps on purpose: this call may be made from inside a run
+        that the scheduler is currently executing, and starting another run
+        from there would nest one scheduler lifetime inside another.  The
+        scheduler picks the emission up on its next pass, which is also what
+        lets an emission survive a process that stops right after it.
+        """
+        store = self._schedule_store()
+        parent = _active_signal_context.get() or {}
+        try:
+            emission = store.emit_signal(
+                name,
+                payload if isinstance(payload, dict) else {},
+                source="agent",
+                depth=int(parent.get("depth", 0) or 0) + 1 if parent else 0,
+                origin_id=str(parent.get("origin_id", "") or "") if parent else "",
+            )
+        except ValueError as exc:
+            return self._error(str(exc))
+        subscribers = [
+            task.name
+            for task in store.list_tasks()
+            if task.enabled
+            and task.trigger.trigger_type == "signal"
+            and str(task.trigger.payload.get("name", "")).strip() == emission.name
+        ]
+        return self._ok(
+            emission_id=emission.id,
+            name=emission.name,
+            depth=emission.depth,
+            cascade_id=emission.origin_id,
+            subscribers=subscribers,
+            summary_text=(
+                f"信号「{emission.name}」已发出，{len(subscribers)} 个任务会在下一轮运行。"
+                if subscribers
+                else f"信号「{emission.name}」已记录，但目前没有任务订阅它。"
+            ),
+        )
+
+    def _list_signals(self) -> dict[str, Any]:
+        store = self._schedule_store()
+        emissions = store.signal_names()
+        subscribers: dict[str, int] = {}
+        for task in store.list_tasks():
+            if not task.enabled or task.trigger.trigger_type != "signal":
+                continue
+            key = str(task.trigger.payload.get("name", "")).strip()
+            subscribers[key] = subscribers.get(key, 0) + 1
+        return self._ok(
+            count=len(emissions),
+            items=[
+                {
+                    "name": entry["name"],
+                    "last_emitted_at": entry.get("last_at"),
+                    "emission_count": entry.get("count"),
+                    "subscriber_count": subscribers.get(entry["name"], 0),
+                }
+                for entry in emissions
+            ],
+            # Names nobody has emitted yet cannot appear above, but a
+            # subscription written up front still exists and is worth seeing.
+            waiting_on_unemitted=[
+                {"name": key, "subscriber_count": value}
+                for key, value in sorted(subscribers.items())
+                if key and key not in {entry["name"] for entry in emissions}
+            ],
+        )
 
     def _clean_output(
         self, max_age_hours: float = 0, subdir: str = ""
