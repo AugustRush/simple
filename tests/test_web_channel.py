@@ -2411,3 +2411,203 @@ def test_web_refuses_to_delete_a_workflow_that_is_mid_run(tmp_path, monkeypatch)
         assert "正在运行" in refused.json()["error"]
         # Still there, because the refusal is the point.
         assert len(client.get("/api/workflows").json()["workflows"]) == 1
+
+
+def test_web_editing_a_workflow_keeps_the_entry_steps_trigger(tmp_path, monkeypatch):
+    """Omitting the trigger keeps it: editing the graph must not move the clock.
+
+    The graph editor never shows the entry step's schedule, so it must not be
+    able to overwrite one -- least of all one the user set in the task editor.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        collect = next(item for item in created["steps"] if item["key"] == "collect")
+        assert collect["trigger"]["time_of_day"] == "02:00"
+
+        edited = _workflow_body()
+        for step in edited["steps"]:
+            # No trigger fields at all on the entry step, exactly as the graph
+            # editor sends it back.
+            step.pop("trigger_type", None)
+            step.pop("time_of_day", None)
+            step.pop("timezone_name", None)
+        edited["steps"][1]["payload"]["prompt"] = "分析这些数据"
+
+        updated = client.put(f"/api/workflows/{created['id']}", json=edited)
+        assert updated.status_code == 200, updated.text
+        after = {
+            item["key"]: item for item in updated.json()["workflow"]["steps"]
+        }
+        assert after["collect"]["trigger"]["time_of_day"] == "02:00"
+        assert (
+            after["collect"]["trigger"]["timezone_name"] == "Asia/Shanghai"
+        )
+        assert after["collect"]["task_id"] == collect["task_id"]
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            task = store.get_task(collect["task_id"])
+            assert task.trigger.payload["time_of_day"] == "02:00"
+        finally:
+            store.close()
+
+
+def test_web_a_new_entry_step_without_a_trigger_is_still_refused(
+    tmp_path, monkeypatch
+):
+    """Omitting is only allowed when there is something to keep."""
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        edited = _workflow_body()
+        edited["steps"].append(
+            {
+                "key": "extra",
+                "kind": "agent_prompt",
+                "payload": {"prompt": "另一个起点"},
+            }
+        )
+        refused = client.put(f"/api/workflows/{created['id']}", json=edited)
+        assert refused.status_code == 400
+        assert "必须指定触发方式" in refused.json()["error"]
+
+
+def test_web_editing_a_workflow_keeps_the_fields_the_editor_never_shows(
+    tmp_path, monkeypatch
+):
+    """A graph editor edits the graph; it cannot erase a model by not asking.
+
+    The step body has more fields than the editor has controls -- a model, a
+    skill list, a timeout.  If leaving one out meant "reset it", then the only
+    way to change an edge would be to first reproduce every other setting, and
+    anyone who forgot one would lose it without being told.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        body = _workflow_body()
+        body["steps"][1].update(
+            {
+                "model_override": "deepseek-v4",
+                "selected_skills": ["pdf"],
+                "timeout_seconds": 900,
+                "context_policy": "task_history",
+                "permission_profile": "inherit",
+            }
+        )
+        created = client.post("/api/workflows", json=body).json()["workflow"]
+
+        # What the graph editor sends: the graph, and nothing else.
+        edited = {
+            "name": "夜间报告",
+            "description": "每天采集、分析、发布",
+            "steps": [
+                {
+                    "key": item["key"],
+                    "name": item["name"],
+                    "kind": item["kind"],
+                    "payload": item["payload"],
+                    "depends_on": item["depends_on"],
+                }
+                for item in created["steps"]
+            ],
+        }
+        edited["steps"][0]["trigger_type"] = "daily"
+        edited["steps"][0]["time_of_day"] = "02:00"
+        edited["steps"][0]["timezone_name"] = "Asia/Shanghai"
+        # The one field the editor does own, changed.
+        edited["steps"][1]["name"] = "分析（改名不改设置）"
+
+        updated = client.put(f"/api/workflows/{created['id']}", json=edited)
+        assert updated.status_code == 200, updated.text
+        after = {
+            item["key"]: item for item in updated.json()["workflow"]["steps"]
+        }
+        assert after["analyze"]["name"] == "分析（改名不改设置）"
+        assert after["analyze"]["permission_profile"] == "inherit"
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            task = store.get_task(after["analyze"]["task_id"])
+            assert task.model_override == "deepseek-v4"
+            assert task.selected_skills == ["pdf"]
+            assert task.timeout_seconds == 900
+            assert task.context_policy == "task_history"
+        finally:
+            store.close()
+
+
+def test_web_a_field_sent_empty_is_cleared_not_kept(tmp_path, monkeypatch):
+    """The other half of the rule: present means what it says.
+
+    "Omitted keeps" would be a trap if it also swallowed an explicit empty
+    value -- there would then be no way to remove a step's model at all.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        body = _workflow_body()
+        body["steps"][1].update(
+            {"model_override": "deepseek-v4", "selected_skills": ["pdf"]}
+        )
+        created = client.post("/api/workflows", json=body).json()["workflow"]
+
+        edited = {"name": "夜间报告", "steps": []}
+        for item in created["steps"]:
+            step = {
+                "key": item["key"],
+                "name": item["name"],
+                "kind": item["kind"],
+                "payload": item["payload"],
+                "depends_on": item["depends_on"],
+            }
+            if item["key"] == "analyze":
+                step["model_override"] = ""
+                step["selected_skills"] = []
+            edited["steps"].append(step)
+        edited["steps"][0].update(
+            {
+                "trigger_type": "daily",
+                "time_of_day": "02:00",
+                "timezone_name": "Asia/Shanghai",
+            }
+        )
+
+        updated = client.put(f"/api/workflows/{created['id']}", json=edited)
+        assert updated.status_code == 200, updated.text
+        after = {
+            item["key"]: item for item in updated.json()["workflow"]["steps"]
+        }
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            task = store.get_task(after["analyze"]["task_id"])
+            assert task.model_override in (None, "")
+            assert task.selected_skills == []
+        finally:
+            store.close()

@@ -1338,15 +1338,34 @@ class WebChannel(Channel):
             permission_profile=permission_profile,
         )
 
-    def _workflow_step_from_body(self, raw: dict[str, Any], index: int):
+    def _workflow_step_from_body(
+        self, raw: dict[str, Any], index: int, existing: Any = None
+    ):
         """One step of a workflow, from its JSON object.
 
         A step with upstreams may not carry a trigger, and a step without them
         must.  Both are refused here with a sentence about the step, and again
         by the graph check -- the first so the message names the step, the
         second so no other caller can get past it.
+
+        A field the body *omits* keeps the value the step already had, and only
+        a field that is present is taken as an answer.  The alternative is that
+        every edit of a graph has to resend everything the editor never shows
+        -- the entry step's schedule, a step's model, its skill list -- because
+        leaving one out would silently reset it.  A graph editor that edits the
+        graph should not be able to erase a step's model by not mentioning it.
+        Sending the field explicitly, empty string included, still means what it
+        says.
         """
-        from agent.scheduler import WorkflowStep
+        from agent.scheduler import DeliveryTarget, WorkflowStep
+
+        def answered(field_name: str, fallback: Any) -> Any:
+            """The value for *field_name*: what the body said, else what was."""
+            if field_name in raw:
+                return raw.get(field_name)
+            if existing is not None:
+                return getattr(existing, field_name, fallback)
+            return fallback
 
         key = str(raw.get("key", "")).strip()
         if not key:
@@ -1355,42 +1374,63 @@ class WebChannel(Channel):
             raise ValueError(f"步骤 key「{key}」不能超过 40 个字符")
         if any(ch.isspace() for ch in key):
             raise ValueError(f"步骤 key「{key}」不能包含空格")
-        payload = raw.get("payload")
+        given_name = str(answered("name", "") or "").strip()
+        payload = answered("payload", None)
         if payload is None:
             payload = {}
         if not isinstance(payload, dict):
             raise ValueError(f"步骤「{key}」的 payload 必须是对象")
         depends_on = [
             str(item).strip()
-            for item in (raw.get("depends_on") or [])
+            for item in (answered("depends_on", None) or [])
             if str(item).strip()
         ]
         trigger = None
+        given_trigger = str(raw.get("trigger_type", "")).strip()
         if depends_on:
-            if str(raw.get("trigger_type", "")).strip():
+            if given_trigger:
                 raise ValueError(
                     f"步骤「{key}」有上游，不能另外再指定时间或信号触发"
                 )
-        else:
-            if not str(raw.get("trigger_type", "")).strip():
-                raise ValueError(
-                    f"步骤「{key}」没有上游，必须指定触发方式（trigger_type）"
-                )
+        elif given_trigger:
             trigger = self._trigger_from_body(raw)
+        elif existing is not None and existing.trigger is not None:
+            trigger = existing.trigger
+        else:
+            raise ValueError(
+                f"步骤「{key}」没有上游，必须指定触发方式（trigger_type）"
+            )
+        delivery_mode = str(answered("delivery_mode", "standalone") or "standalone")
+        # A target is only ever kept, never parsed from the body: nothing in
+        # this interface can choose one yet, and inventing a parse for a shape
+        # no client sends would be a promise with no way to test it.
+        delivery_target = getattr(existing, "delivery_target", None)
+        if delivery_mode == "standalone" or delivery_target is None:
+            delivery_target = DeliveryTarget.standalone()
+        skills = answered("selected_skills", None)
+        if skills is not None and not isinstance(skills, list):
+            raise ValueError(f"步骤「{key}」的 selected_skills 必须是数组")
         return WorkflowStep(
             key=key,
-            name=str(raw.get("name", "")).strip() or key,
-            kind=str(raw.get("kind", "agent_prompt")).strip(),
+            name=given_name or key,
+            kind=str(answered("kind", "agent_prompt") or "agent_prompt").strip(),
             payload=dict(payload),
             depends_on=depends_on,
             trigger=trigger,
-            workspace_root=str(raw.get("workspace_root", "") or "").strip(),
+            workspace_root=str(answered("workspace_root", "") or "").strip(),
             permission_profile=str(
-                raw.get("permission_profile", "inherit") or "inherit"
+                answered("permission_profile", "inherit") or "inherit"
             ),
-            context_policy=str(raw.get("context_policy", "stateless") or "stateless"),
-            timeout_seconds=int(raw.get("timeout_seconds", 1800) or 1800),
-            delivery_mode=str(raw.get("delivery_mode", "standalone") or "standalone"),
+            context_policy=str(answered("context_policy", "stateless") or "stateless"),
+            model_override=answered("model_override", None) or None,
+            timeout_seconds=int(answered("timeout_seconds", 1800) or 1800),
+            selected_skills=[
+                str(item).strip()
+                for item in (skills or [])
+                if str(item).strip()
+            ],
+            delivery_mode=delivery_mode,
+            delivery_target=delivery_target,
         )
 
     def _workflow_from_body(self, body: dict[str, Any], existing: Any = None):
@@ -1414,10 +1454,20 @@ class WebChannel(Channel):
         if len(raw_steps) > 20:
             raise ValueError("一个 workflow 最多 20 个步骤")
         steps = []
+        existing_by_key = {
+            str(item.key).strip(): item
+            for item in (getattr(existing, "steps", None) or [])
+        }
         for index, raw in enumerate(raw_steps):
             if not isinstance(raw, dict):
                 raise ValueError(f"第 {index + 1} 个步骤必须是对象")
-            steps.append(self._workflow_step_from_body(raw, index))
+            steps.append(
+                self._workflow_step_from_body(
+                    raw,
+                    index,
+                    existing_by_key.get(str(raw.get("key", "")).strip()),
+                )
+            )
         # Checked here as well as in the store so a cycle comes back as a 400
         # carrying the ring, rather than as a failure from inside the write.
         validate_workflow_graph(steps)
