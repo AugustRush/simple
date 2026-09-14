@@ -2442,6 +2442,39 @@ html[data-theme='light'] .settings-json {
   box-shadow: none;
 }
 
+/* Unseen-failure badge on the navigation entry. The thing it has to report is
+   a scheduled run that failed while this page was closed, so the signal has to
+   live on the always-visible nav rather than inside the schedules view the
+   user never opened. Hidden with the label when the sider is collapsed. */
+.nav-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Only inside the sider does the label own the full row, because that is where
+   the badge should sit against the right edge. The same label node is reused
+   by the command palette, where the chip must keep shrinking to its content. */
+.sider-nav .nav-label {
+  justify-content: space-between;
+  width: 100%;
+}
+
+.nav-badge {
+  flex: 0 0 auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  color: var(--bg);
+  background: var(--red);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
 .sider-actions {
   padding: 8px 12px 12px;
 }
@@ -4088,6 +4121,9 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 .schedule-run-item-main strong { color:var(--text); font-size:11px; font-weight:600; }
 .schedule-run-item-main small { overflow:hidden; color:var(--text-muted); font-size:9px; text-overflow:ellipsis; white-space:nowrap; }
 .schedule-run-duration { flex:0 0 auto; color:var(--text-muted); font-size:9px; }
+.schedule-run-unseen { flex:0 0 auto; width:6px; height:6px; border-radius:50%; background:var(--red); }
+.schedule-run-history-tail { display:flex; align-items:center; gap:2px; }
+.schedule-run-history-tail .ant-btn-link { height:auto; padding:0 2px; font-size:10px; }
 .schedule-run-detail { min-width:0; padding:22px 24px 32px; }
 .schedule-run-detail-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
 .schedule-run-detail-head > div { display:flex; min-width:0; flex-direction:column; gap:8px; }

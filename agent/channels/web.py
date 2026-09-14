@@ -27,6 +27,7 @@ from agent.channels.base import Channel, IncomingMessage
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
 from agent.pathing import path_contains
+from agent.scheduler.models import ATTENTION_STATUSES
 from agent.session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -141,6 +142,15 @@ def _scheduler_run_payload(run: Any) -> dict[str, Any]:
             else None
         ),
         "retry_of_run_id": str(getattr(run, "retry_of_run_id", "") or ""),
+        "acknowledged_at": (
+            run.acknowledged_at.isoformat()
+            if getattr(run, "acknowledged_at", None)
+            else None
+        ),
+        "needs_attention": bool(
+            str(getattr(run, "status", "") or "") in ATTENTION_STATUSES
+            and getattr(run, "acknowledged_at", None) is None
+        ),
         "config_snapshot": dict(getattr(run, "config_snapshot", {}) or {}),
         "output_available": output_available,
         "output_url": (
@@ -171,7 +181,9 @@ def _scheduler_output_url(task_id: str, run_id: str, output_path: str) -> str:
     )
 
 
-def _scheduler_task_payload(task: Any, latest_run: Any = None) -> dict[str, Any]:
+def _scheduler_task_payload(
+    task: Any, latest_run: Any = None, unseen_failures: int = 0
+) -> dict[str, Any]:
     return {
         "id": task.id,
         "name": task.name,
@@ -192,8 +204,7 @@ def _scheduler_task_payload(task: Any, latest_run: Any = None) -> dict[str, Any]
         "retry_policy": task.retry_policy,
         "selected_skills": task.selected_skills,
         "permission_profile": task.permission_profile,
-        "overlap_policy": task.overlap_policy,
-        "missed_run_policy": task.missed_run_policy,
+        "unseen_failures": int(unseen_failures or 0),
         "active_run_id": task.active_run_id,
         "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
         "last_run_at": task.last_run_at.isoformat() if task.last_run_at else None,
@@ -1076,6 +1087,7 @@ class WebChannel(Channel):
 
     def _schedule_from_body(self, body: dict[str, Any], existing: Any = None):
         from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec
+        from agent.scheduler.profiles import PERMISSION_PROFILES
 
         name = str(body.get("name", getattr(existing, "name", ""))).strip()
         if not name:
@@ -1136,11 +1148,32 @@ class WebChannel(Channel):
         if len(content) > max_content_length:
             raise ValueError(f"任务内容不能超过 {max_content_length} 个字符")
 
-        workspace_value = str(
+        permission_profile = str(
+            body.get(
+                "permission_profile",
+                getattr(existing, "permission_profile", "inherit"),
+            )
+        )
+        if permission_profile not in PERMISSION_PROFILES:
+            raise ValueError("不支持的权限策略")
+        profile = PERMISSION_PROFILES[permission_profile]
+
+        # Resolved before the fallback chain on purpose.  A profile that
+        # grants writes needs a directory a *person* chose: falling back to
+        # the gateway process's working directory would make the task write
+        # somewhere nobody can predict from its definition.
+        chosen_workspace = str(
             body.get("workspace_root")
             or getattr(existing, "workspace_root", "")
-            or self._components.get("workspace_root")
-            or Path.cwd()
+            or ""
+        ).strip()
+        if profile.requires_workspace_root and not chosen_workspace:
+            raise ValueError(
+                f"权限策略「{profile.label}」需要显式指定项目文件夹，"
+                "不能回落到服务进程的当前目录"
+            )
+        workspace_value = chosen_workspace or str(
+            self._components.get("workspace_root") or Path.cwd()
         )
         workspace = Path(workspace_value).expanduser().resolve(strict=False)
         if task_kind == "agent_prompt" and not workspace.is_dir():
@@ -1192,15 +1225,6 @@ class WebChannel(Channel):
                 bundle = catalog.get(skill_id)
                 if bundle is None or not getattr(bundle, "user_invocable", False):
                     raise ValueError(f"技能不可用：{skill_id}")
-        permission_profile = str(
-            body.get(
-                "permission_profile",
-                getattr(existing, "permission_profile", "inherit"),
-            )
-        )
-        if permission_profile not in {"inherit", "read_only"}:
-            raise ValueError("不支持的权限策略")
-
         return NewScheduledTask(
             name=name,
             kind=task_kind,
@@ -1210,12 +1234,6 @@ class WebChannel(Channel):
             delivery_target=delivery_target,
             model_override=model_override,
             enabled=bool(body.get("enabled", getattr(existing, "enabled", True))),
-            overlap_policy=str(
-                body.get("overlap_policy", getattr(existing, "overlap_policy", "forbid_overlap"))
-            ),
-            missed_run_policy=str(
-                body.get("missed_run_policy", getattr(existing, "missed_run_policy", "coalesce"))
-            ),
             workspace_root=str(workspace),
             context_policy=context_policy,
             timeout_seconds=timeout_seconds,
@@ -1232,13 +1250,33 @@ class WebChannel(Channel):
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         from agent.scheduler import SchedulerStore
+        from agent.scheduler.profiles import profile_payloads
+
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
+            unseen = store.unacknowledged_failure_counts()
             tasks = []
             for task in store.list_tasks():
                 latest_run = store.latest_run(task.id)
-                tasks.append(_scheduler_task_payload(task, latest_run))
-            return JSONResponse({"tasks": tasks})
+                tasks.append(
+                    _scheduler_task_payload(
+                        task, latest_run, unseen.get(task.id, 0)
+                    )
+                )
+            # The profile list travels with the data so the UI renders what
+            # this backend accepts instead of keeping its own copy of the set
+            # -- the two would drift the moment a profile is added.
+            return JSONResponse(
+                {
+                    "tasks": tasks,
+                    "permission_profiles": profile_payloads(),
+                    # Failures that finished while nobody was watching.  The
+                    # scheduler runs precisely when no client is connected, so
+                    # this has to be part of the data rather than a push event
+                    # that only reaches whoever happened to be looking.
+                    "unseen_failures": sum(unseen.values()),
+                }
+            )
         finally:
             store.close()
 
@@ -1262,7 +1300,11 @@ class WebChannel(Channel):
             runs = list(reversed(store.list_runs(task_id)))[:limit]
             return JSONResponse(
                 {
-                    "task": _scheduler_task_payload(task, store.latest_run(task.id)),
+                    "task": _scheduler_task_payload(
+                        task,
+                        store.latest_run(task.id),
+                        store.unacknowledged_failure_counts().get(task_id, 0),
+                    ),
                     "runs": [_scheduler_run_payload(run) for run in runs],
                 }
             )
@@ -1462,11 +1504,14 @@ class WebChannel(Channel):
                     return JSONResponse({"error": "task not found"}, status_code=404)
                 spec = self._schedule_from_body(body, existing)
                 updated = store.update_task(task_id, spec)
+                unseen = store.unacknowledged_failure_counts().get(task_id, 0)
             finally:
                 store.close()
             if updated is None:
                 return JSONResponse({"error": "task not found"}, status_code=404)
-            return JSONResponse({"task": _scheduler_task_payload(updated)})
+            return JSONResponse(
+                {"task": _scheduler_task_payload(updated, None, unseen)}
+            )
         except (KeyError, ValueError, TypeError) as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
 
@@ -1587,6 +1632,91 @@ class WebChannel(Channel):
         if not cancelled:
             return JSONResponse({"error": "运行不存在或已经结束"}, status_code=409)
         return JSONResponse({"ok": True}, status_code=202)
+
+    async def _acknowledge_schedule_run(self, request: Any) -> Any:
+        """Record that a person has now seen one run's failure."""
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            acknowledged = store.acknowledge_run(
+                str(request.path_params["task_id"]),
+                str(request.path_params["run_id"]),
+            )
+            # Returning the fresh total lets the caller correct its badge
+            # without a second round trip, which is where a stale count would
+            # come from.
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "acknowledged": acknowledged,
+                    "unseen_failures": sum(
+                        store.unacknowledged_failure_counts().values()
+                    ),
+                }
+            )
+        finally:
+            store.close()
+
+    async def _schedule_attention(self, request: Any) -> Any:
+        """Just the count, for a badge that is polled from every view.
+
+        Separate from ``GET /api/schedules`` because the indicator has to work
+        for someone who never opens the schedules page -- making them load
+        every task and run just to find out whether anything failed would be
+        the opposite of a notification.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        from agent.scheduler import SchedulerStore
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            return JSONResponse(
+                {
+                    "unseen_failures": sum(
+                        store.unacknowledged_failure_counts().values()
+                    )
+                }
+            )
+        finally:
+            store.close()
+
+    async def _clear_schedule_attention(self, request: Any) -> Any:
+        """Mark every unseen failure as seen; optionally one task's only."""
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        task_id = str(body.get("task_id") or "").strip()
+        from agent.scheduler import SchedulerStore
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            cleared = store.acknowledge_failures(task_id or None)
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "cleared": cleared,
+                    "unseen_failures": sum(
+                        store.unacknowledged_failure_counts().values()
+                    ),
+                }
+            )
+        finally:
+            store.close()
 
     async def _scheduler_health(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -2519,6 +2649,18 @@ class WebChannel(Channel):
             Route("/api/schedules", self._create_schedule, methods=["POST"]),
             Route("/api/schedules", self._bulk_schedules, methods=["PATCH"]),
             Route("/api/schedules/preview", self._schedule_preview, methods=["POST"]),
+            # Registered before /api/schedules/{task_id}: a literal path that
+            # lost the race would be read as a task id.
+            Route(
+                "/api/schedules/attention",
+                self._schedule_attention,
+                methods=["GET"],
+            ),
+            Route(
+                "/api/schedules/attention",
+                self._clear_schedule_attention,
+                methods=["POST"],
+            ),
             Route("/api/scheduler/health", self._scheduler_health, methods=["GET"]),
             Route(
                 "/api/schedules/{task_id}/run",
@@ -2538,6 +2680,11 @@ class WebChannel(Channel):
             Route(
                 "/api/schedules/{task_id}/runs/{run_id}/cancel",
                 self._cancel_schedule_run,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/schedules/{task_id}/runs/{run_id}/acknowledge",
+                self._acknowledge_schedule_run,
                 methods=["POST"],
             ),
             Route(

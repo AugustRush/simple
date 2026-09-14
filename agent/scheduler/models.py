@@ -376,6 +376,16 @@ class DeliveryTarget:
         return cls(target_type=data["target_type"], payload=data["payload"])
 
 
+# ``overlap_policy`` and ``missed_run_policy`` are **identity only**.  Their
+# values are part of the signature that ``find_matching_task`` and
+# ``disable_duplicate_enabled_tasks`` compare to decide whether two
+# definitions describe the same task.  No scheduling decision reads them: the
+# claim path always requires ``active_run_id IS NULL`` (i.e. forbid_overlap)
+# and always advances the cursor past ``now`` (i.e. coalesce), which is what
+# the defaults below spell out.  They are therefore not exposed as API inputs
+# or outputs -- a configurable field that changes nothing is worse than no
+# field, because the UI implies a promise the runtime does not keep.  Change a
+# default here and you change dedup identity, so treat that as a migration.
 @dataclass
 class NewScheduledTask:
     name: str
@@ -426,6 +436,15 @@ class ScheduledTask:
     updated_at: datetime
 
 
+#: Terminal statuses that mean "a person should look at this".
+#:
+#: ``cancelled`` is deliberately absent: the user asked for that one, so
+#: surfacing it as something needing attention would train people to ignore
+#: the signal.  ``interrupted`` *is* present — a lost lease, a restart or a
+#: timeout is exactly the kind of silent outcome nobody is watching for.
+ATTENTION_STATUSES: tuple[str, ...] = ("failed", "interrupted")
+
+
 @dataclass
 class TaskRun:
     id: str
@@ -443,6 +462,10 @@ class TaskRun:
     attempt: int = 1
     cancel_requested_at: Optional[datetime] = None
     retry_of_run_id: str = ""
+    #: When a person has seen this run's failure.  ``None`` on a run in
+    #: ``ATTENTION_STATUSES`` means the run finished while nobody was looking
+    #: and nothing has told them yet.
+    acknowledged_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

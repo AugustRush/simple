@@ -43,6 +43,7 @@ import {
   AppstoreOutlined,
   ArrowUpOutlined,
   CheckCircleFilled,
+  CheckOutlined,
   ClockCircleOutlined,
   CloseOutlined,
   CodeOutlined,
@@ -181,6 +182,25 @@ interface CommandInfo {
   kind?: 'command' | 'skill'
 }
 
+interface PermissionProfileOption {
+  key: string
+  label: string
+  summary: string
+  detail: string
+}
+
+type PermissionProfileKey = 'inherit' | 'read_only' | 'workspace_write'
+
+// Display-only fallback, used only until the first /api/schedules response
+// arrives. The backend list is authoritative -- it is what decides which keys
+// are accepted, so duplicating the set here permanently would let the two
+// drift apart.
+const KNOWN_PERMISSION_PROFILES: PermissionProfileOption[] = [
+  { key: 'inherit', label: '继承全局权限', summary: '不改动任何权限配置。', detail: '' },
+  { key: 'read_only', label: '强制只读', summary: '不写工作区文件。', detail: '' },
+  { key: 'workspace_write', label: '可在项目内写入', summary: '可改文件、跑测试、出报告。', detail: '' },
+]
+
 interface ScheduleInfo {
   id: string
   name: string
@@ -201,9 +221,8 @@ interface ScheduleInfo {
   timeout_seconds?: number
   retry_policy?: { max_attempts?: number; backoff_seconds?: number }
   selected_skills?: string[]
-  permission_profile?: 'inherit' | 'read_only'
-  overlap_policy?: string
-  missed_run_policy?: string
+  permission_profile?: PermissionProfileKey
+  unseen_failures?: number
 }
 
 interface ScheduleRun {
@@ -223,6 +242,8 @@ interface ScheduleRun {
   attempt?: number
   cancel_requested_at?: string | null
   retry_of_run_id?: string
+  acknowledged_at?: string | null
+  needs_attention?: boolean
   config_snapshot?: Record<string, any>
 }
 
@@ -269,7 +290,7 @@ interface ScheduleDraft {
   max_attempts: number
   backoff_seconds: number
   selected_skills: string[]
-  permission_profile: 'inherit' | 'read_only'
+  permission_profile: PermissionProfileKey
 }
 
 interface SessionTaskGuidance {
@@ -834,7 +855,7 @@ function scheduleDraftFromTask(task: ScheduleInfo): ScheduleDraft {
     max_attempts: Number(task.retry_policy?.max_attempts || 1),
     backoff_seconds: Number(task.retry_policy?.backoff_seconds ?? 30),
     selected_skills: task.selected_skills || [],
-    permission_profile: task.permission_profile || 'inherit',
+    permission_profile: (task.permission_profile || 'inherit') as PermissionProfileKey,
   }
 }
 
@@ -931,6 +952,8 @@ function App() {
   const [plugins, setPlugins] = useState<PluginInfo[]>([])
   const [skills, setSkills] = useState<SkillInfo[]>([])
   const [schedules, setSchedules] = useState<ScheduleInfo[]>([])
+  const [unseenFailures, setUnseenFailures] = useState(0)
+  const [permissionProfiles, setPermissionProfiles] = useState<PermissionProfileOption[]>([])
   const [scheduleQuery, setScheduleQuery] = useState('')
   const [scheduleStatusFilter, setScheduleStatusFilter] = useState('all')
   const [selectedScheduleIds, setSelectedScheduleIds] = useState<string[]>([])
@@ -2095,6 +2118,10 @@ function App() {
       const resp = await api('/api/schedules')
       const data = await resp.json()
       setSchedules(data.tasks || [])
+      setPermissionProfiles(
+        Array.isArray(data.permission_profiles) ? data.permission_profiles : [],
+      )
+      setUnseenFailures(Number(data.unseen_failures || 0))
       setSelectedSchedule(current => {
         if (!current) return current
         const refreshed = (data.tasks || []).find(
@@ -2113,6 +2140,17 @@ function App() {
       setSchedulerHealth(await resp.json())
     } catch {
       setSchedulerHealth({ status: 'offline' })
+    }
+  }, [api])
+
+  const loadUnseenFailures = useCallback(async () => {
+    try {
+      const resp = await api('/api/schedules/attention')
+      const data = await resp.json()
+      setUnseenFailures(Number(data.unseen_failures || 0))
+    } catch {
+      // A transport failure is not "no failures"; leave the last known count
+      // alone rather than clearing a badge the user has not acted on.
     }
   }, [api])
 
@@ -2213,6 +2251,22 @@ function App() {
     })
   }, [scheduleQuery, scheduleStatusFilter, schedules])
 
+  const permissionProfileOptions = useMemo(
+    () => (permissionProfiles.length > 0 ? permissionProfiles : KNOWN_PERMISSION_PROFILES),
+    [permissionProfiles],
+  )
+
+  const activePermissionProfile = useMemo(
+    () => permissionProfileOptions.find(
+      item => item.key === scheduleDraft.permission_profile,
+    ),
+    [permissionProfileOptions, scheduleDraft.permission_profile],
+  )
+
+  const permissionProfileLabel = useCallback((key?: string) => (
+    permissionProfileOptions.find(item => item.key === key)?.label || key || '继承全局权限'
+  ), [permissionProfileOptions])
+
   useEffect(() => {
     if (!scheduleDetailOpen || !selectedSchedule || !selectedScheduleRun) {
       setScheduleRunOutput(null)
@@ -2311,6 +2365,14 @@ function App() {
     const timer = window.setInterval(loadSchedulerHealth, 10000)
     return () => window.clearInterval(timer)
   }, [loadSchedulerHealth, view])
+
+  // Polled from every view, not just the schedules page: the badge exists so
+  // that a failure is noticed by someone who is not looking at the page.
+  useEffect(() => {
+    void loadUnseenFailures()
+    const timer = window.setInterval(loadUnseenFailures, 30000)
+    return () => window.clearInterval(timer)
+  }, [loadUnseenFailures])
 
   const loadSettings = useCallback(async () => {
     try {
@@ -2764,6 +2826,57 @@ function App() {
     } catch { /* surfaced */ }
   }
 
+  // Marking a failure as seen is what removes the badge, so it is applied to
+  // local state right away: waiting for a refetch would leave the dot sitting
+  // there after the click and the control would read as broken.
+  const acknowledgeScheduleRun = async (task: ScheduleInfo, run: ScheduleRun) => {
+    try {
+      const resp = await api(
+        `/api/schedules/${encodeURIComponent(task.id)}/runs/${encodeURIComponent(run.id)}/acknowledge`,
+        { method: 'POST' },
+      )
+      const data = await resp.json()
+      const consumed = data.acknowledged ? 1 : 0
+      setScheduleRuns(prev => prev.map(item => item.id === run.id
+        ? { ...item, needs_attention: false, acknowledged_at: new Date().toISOString() }
+        : item))
+      const dropOne = (count?: number) => Math.max(0, (count || 0) - consumed)
+      setSchedules(prev => prev.map(item => item.id === task.id
+        ? { ...item, unseen_failures: dropOne(item.unseen_failures) }
+        : item))
+      setSelectedSchedule(current => current && current.id === task.id
+        ? { ...current, unseen_failures: dropOne(current.unseen_failures) }
+        : current)
+      setUnseenFailures(Number(data.unseen_failures || 0))
+    } catch { /* surfaced */ }
+  }
+
+  const clearScheduleAttention = async (taskId?: string) => {
+    try {
+      const resp = await api('/api/schedules/attention', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(taskId ? { task_id: taskId } : {}),
+      })
+      const data = await resp.json()
+      const affectsSelected = !taskId || taskId === selectedSchedule?.id
+      if (affectsSelected) {
+        setScheduleRuns(prev => prev.map(item => item.needs_attention
+          ? { ...item, needs_attention: false, acknowledged_at: new Date().toISOString() }
+          : item))
+      }
+      const zeroed = (item: ScheduleInfo) => !taskId || item.id === taskId
+      setSchedules(prev => prev.map(item => zeroed(item)
+        ? { ...item, unseen_failures: 0 }
+        : item))
+      setSelectedSchedule(current => current && zeroed(current)
+        ? { ...current, unseen_failures: 0 }
+        : current)
+      setUnseenFailures(Number(data.unseen_failures || 0))
+      if (data.cleared) messageApi.success(`已将 ${data.cleared} 次失败标记为已读`)
+    } catch { /* surfaced */ }
+  }
+
   const retryScheduleRun = async (task: ScheduleInfo, run: ScheduleRun, useLatest: boolean) => {
     try {
       await api(
@@ -2997,7 +3110,23 @@ function App() {
     { key: 'sessions', icon: <FolderOpenOutlined />, label: '会话管理' },
     { key: 'plugins', icon: <AppstoreOutlined />, label: '插件' },
     { key: 'skills', icon: <ApiOutlined />, label: '技能' },
-    { key: 'schedules', icon: <ClockCircleOutlined />, label: '定时任务' },
+    {
+      key: 'schedules',
+      icon: <ClockCircleOutlined />,
+      // The badge lives on the navigation entry, not on the schedules page,
+      // because the entire problem is a failure that finished while the page
+      // was closed.
+      label: (
+        <span className="nav-label">
+          定时任务
+          {unseenFailures > 0 && (
+            <span className="nav-badge" aria-label={`${unseenFailures} 次运行失败未查看`}>
+              {unseenFailures > 99 ? '99+' : unseenFailures}
+            </span>
+          )}
+        </span>
+      ),
+    },
     { key: 'settings', icon: <SettingOutlined />, label: '设置' },
   ]
 
@@ -4438,11 +4567,16 @@ function App() {
                   <Select
                     value={scheduleDraft.permission_profile}
                     onChange={value => setScheduleDraft({ ...scheduleDraft, permission_profile: value })}
-                    options={[
-                      { value: 'inherit', label: '继承全局权限' },
-                      { value: 'read_only', label: '强制只读' },
-                    ]}
+                    options={permissionProfileOptions.map(item => ({
+                      value: item.key,
+                      label: item.label,
+                    }))}
                   />
+                  {activePermissionProfile && (
+                    <small className="schedule-field-hint">
+                      {activePermissionProfile.detail || activePermissionProfile.summary}
+                    </small>
+                  )}
                 </div>
               </div>
               <div className="schedule-field">
@@ -4693,7 +4827,7 @@ function App() {
                     <Tag>{selectedSchedule.enabled === false ? '已暂停' : '已启用'}</Tag>
                     {selectedSchedule.context_policy && <Tag>{selectedSchedule.context_policy === 'stateless' ? '独立上下文' : selectedSchedule.context_policy === 'task_history' ? '任务历史' : '共享记忆'}</Tag>}
                     {selectedSchedule.kind === 'agent_prompt' && (
-                      <Tag>{selectedSchedule.permission_profile === 'read_only' ? '强制只读' : '继承全局权限'}</Tag>
+                      <Tag>{permissionProfileLabel(selectedSchedule.permission_profile)}</Tag>
                     )}
                   </div>
                   <p>{selectedSchedule.kind === 'agent_prompt'
@@ -4723,7 +4857,16 @@ function App() {
                 <aside className="schedule-run-list" aria-label="运行历史">
                   <div className="schedule-detail-section-title">
                     <strong>运行历史</strong>
-                    <span>{scheduleRuns.length} 次</span>
+                    <span className="schedule-run-history-tail">
+                      {scheduleRuns.length} 次
+                      {(selectedSchedule.unseen_failures || 0) > 0 && (
+                        <Button
+                          type="link"
+                          size="small"
+                          onClick={() => clearScheduleAttention(selectedSchedule.id)}
+                        >全部标记已读</Button>
+                      )}
+                    </span>
                   </div>
                   <div className="schedule-run-items">
                     {scheduleRuns.map(run => (
@@ -4740,6 +4883,13 @@ function App() {
                           <strong>{scheduleRunStatusLabel(run.status)}</strong>
                           <small>{run.started_at ? new Date(run.started_at).toLocaleString() : '等待开始'}</small>
                         </span>
+                        {run.needs_attention && (
+                          <span
+                            className="schedule-run-unseen"
+                            title="本次运行失败，你还没有查看"
+                            aria-label="本次运行失败，你还没有查看"
+                          />
+                        )}
                         <span className="schedule-run-duration">{formatScheduleDuration(run.duration_ms)}</span>
                       </button>
                     ))}
@@ -4761,6 +4911,13 @@ function App() {
                           />
                         </div>
                         <Space>
+                        {selectedScheduleRun.needs_attention && (
+                          <Button
+                            size="small"
+                            icon={<CheckOutlined />}
+                            onClick={() => acknowledgeScheduleRun(selectedSchedule, selectedScheduleRun)}
+                          >标记已读</Button>
+                        )}
                         {selectedScheduleRun.status === 'running' && (
                           <Button danger size="small" icon={<StopOutlined />} loading={!!selectedScheduleRun.cancel_requested_at} onClick={() => cancelScheduleRun(selectedSchedule, selectedScheduleRun)}>
                             {selectedScheduleRun.cancel_requested_at ? '正在取消' : '取消运行'}

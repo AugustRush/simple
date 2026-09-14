@@ -11,6 +11,7 @@ from typing import Callable, Optional, TypeVar
 
 from agent import shared
 from .models import (
+    ATTENTION_STATUSES,
     ClaimedTask,
     DeliveryTarget,
     NewScheduledTask,
@@ -67,7 +68,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 5
+    SCHEMA_VERSION = 6
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -143,6 +144,7 @@ class SchedulerStore:
                     attempt INTEGER NOT NULL DEFAULT 1,
                     cancel_requested_at TEXT,
                     retry_of_run_id TEXT NOT NULL DEFAULT '',
+                    acknowledged_at TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(task_id) REFERENCES scheduled_tasks(id)
@@ -240,6 +242,27 @@ class SchedulerStore:
                         "permission_profile TEXT NOT NULL DEFAULT 'inherit'"
                     )
                 self._conn.execute("PRAGMA user_version = 5")
+            elif version == 6:
+                run_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_task_runs)"
+                    ).fetchall()
+                }
+                if "acknowledged_at" not in run_columns:
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_task_runs ADD COLUMN "
+                        "acknowledged_at TEXT"
+                    )
+                    # Runs that predate this column were already reported
+                    # through the run list, which is how the user found out
+                    # about them.  Backfilling finished runs as seen keeps the
+                    # new counter from announcing a backlog of history on the
+                    # first launch after the upgrade.
+                    self._conn.execute(
+                        "UPDATE scheduled_task_runs SET acknowledged_at = finished_at "
+                        "WHERE finished_at IS NOT NULL"
+                    )
+                self._conn.execute("PRAGMA user_version = 6")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -286,6 +309,7 @@ class SchedulerStore:
             attempt=int(row["attempt"]),
             cancel_requested_at=_dt(row["cancel_requested_at"]),
             retry_of_run_id=row["retry_of_run_id"],
+            acknowledged_at=_dt(row["acknowledged_at"]),
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),
         )
@@ -474,6 +498,76 @@ class SchedulerStore:
             (task_id, run_id),
         ).fetchone()
         return self._run_from_row(row) if row else None
+
+    # ── Attention: failures nobody has been told about ───────────────────
+    #
+    # A scheduled run happens when nobody is watching, so "the run list shows
+    # it" only helps someone who already suspected something went wrong.  The
+    # marker below is what turns a silent failure into something the interface
+    # can insist on.  It lives in the database rather than in a push
+    # notification because the common case is that no client is connected: a
+    # notification that is only delivered to whoever happens to be looking is
+    # not a notification.
+
+    @staticmethod
+    def _attention_clause() -> tuple[str, list[str]]:
+        placeholders = ", ".join("?" for _ in ATTENTION_STATUSES)
+        return f"status IN ({placeholders})", list(ATTENTION_STATUSES)
+
+    @_synchronized
+    def unacknowledged_failure_counts(self) -> dict[str, int]:
+        """Task id -> number of failures nobody has looked at yet."""
+        clause, params = self._attention_clause()
+        rows = self._conn.execute(
+            f"""
+            SELECT task_id, COUNT(*) AS total
+            FROM scheduled_task_runs
+            WHERE {clause} AND acknowledged_at IS NULL
+            GROUP BY task_id
+            """,
+            params,
+        ).fetchall()
+        return {row["task_id"]: int(row["total"]) for row in rows}
+
+    @_synchronized
+    def acknowledge_run(
+        self, task_id: str, run_id: str, now: Optional[datetime] = None
+    ) -> bool:
+        """Mark one failure as seen.  False when there was nothing to see."""
+        clause, params = self._attention_clause()
+        stamp = _iso((now or datetime.now(UTC)).astimezone(UTC))
+        with self._conn:
+            cursor = self._conn.execute(
+                f"""
+                UPDATE scheduled_task_runs
+                SET acknowledged_at = ?, updated_at = ?
+                WHERE task_id = ? AND id = ?
+                  AND acknowledged_at IS NULL
+                  AND {clause}
+                """,
+                [stamp, stamp, task_id, run_id, *params],
+            )
+        return cursor.rowcount == 1
+
+    @_synchronized
+    def acknowledge_failures(
+        self, task_id: Optional[str] = None, now: Optional[datetime] = None
+    ) -> int:
+        """Mark every unseen failure as seen, for one task or for all."""
+        clause, params = self._attention_clause()
+        stamp = _iso((now or datetime.now(UTC)).astimezone(UTC))
+        scope = "task_id = ? AND " if task_id else ""
+        scope_params = [task_id] if task_id else []
+        with self._conn:
+            cursor = self._conn.execute(
+                f"""
+                UPDATE scheduled_task_runs
+                SET acknowledged_at = ?, updated_at = ?
+                WHERE acknowledged_at IS NULL AND {scope}{clause}
+                """,
+                [stamp, stamp, *scope_params, *params],
+            )
+        return int(cursor.rowcount)
 
     @_synchronized
     def latest_run(self, task_id: str) -> Optional[TaskRun]:

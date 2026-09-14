@@ -8382,7 +8382,14 @@ def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_
     assert turn_input.text == "scheduled prompt"
     assert turn_input.channel_name == "scheduler"
     assert state.turn_count == 1
-    assert sink is None
+    # An unattended run always gets a sink.  It used to get none, and a gate
+    # that found no sink refused anonymously -- indistinguishable, after the
+    # fact, from a gate that was never reached. The sink answers "no" and
+    # records the question.
+    from agent.scheduler import UnattendedOutputSink
+
+    assert isinstance(sink, UnattendedOutputSink)
+    assert sink.interactive_confirmation is False
     assert kwargs == {}
 
 
@@ -8479,6 +8486,148 @@ def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
         "quality/review"
     ]
     assert len(captured["closed"]) == 1
+
+
+def test_scheduler_agent_executor_grants_workspace_writes_and_states_the_envelope(
+    monkeypatch, tmp_path
+):
+    import types
+
+    import agent as agent_module
+    import agent.cli as cli_module
+    from agent.runtime import TurnExecution, TurnResult
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            self.agent_executor = kwargs["agent_executor"]
+
+    class _FakeStore:
+        pass
+
+    class _FakeAgent:
+        context_manager = object()
+
+    class _FakeAgentCore:
+        def __init__(self):
+            self.states = []
+
+        async def handle_turn(self, turn_input, state, **kwargs):
+            self.states.append(state)
+            return TurnExecution(result=TurnResult(text="done"))
+
+    captured = {"configs": []}
+    isolated_core = _FakeAgentCore()
+
+    async def fake_build(cfg, *, announce=True, resource_home=None):
+        captured["configs"].append(cfg)
+        return {
+            "agent": _FakeAgent(),
+            "agent_core": isolated_core,
+            "system_prompt": "system",
+            "skill_catalog": _CLEAN_SKILL_CATALOG,
+        }
+
+    async def fake_close(components):
+        return None
+
+    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
+    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
+    monkeypatch.setattr(agent_module, "_close_components", fake_close)
+
+    cfg = _minimal_cfg()
+    cfg["file_access"] = {"workspace": {"read": True, "write": False}}
+    cfg["permissions"] = {"shell_level": "ask", "shell_sandbox": "read_all"}
+    service, _store, _components = asyncio.run(
+        cli_module._build_scheduler_service(
+            cfg,
+            poll_seconds=1,
+            lease_seconds=30,
+            max_concurrent_runs=1,
+            components={"output_dir": tmp_path},
+        )
+    )
+    task = types.SimpleNamespace(
+        id="task-1",
+        name="nightly",
+        payload={"prompt": "run the tests"},
+        workspace_root=str(tmp_path),
+        context_policy="stateless",
+        permission_profile="workspace_write",
+        model_override=None,
+    )
+    run = types.SimpleNamespace(
+        id="run-1",
+        config_snapshot={
+            "payload": {"prompt": "run the tests"},
+            "workspace_root": str(tmp_path),
+            "context_policy": "stateless",
+            "permission_profile": "workspace_write",
+        },
+    )
+
+    result = asyncio.run(service.agent_executor(task, run))
+
+    run_cfg = captured["configs"][0]
+    assert result.text_output == "done"
+    assert run_cfg["file_access"]["workspace"]["write"] is True
+    assert run_cfg["permissions"]["shell_level"] == "high"
+    # The envelope is stated up front, so the run does not have to discover
+    # it one refusal at a time.
+    assert "workspace_write" in isolated_core.states[0].ctx.system_prompt
+    # A run-level profile never rewrites the process-wide configuration that
+    # the interactive channels are still using.
+    assert cfg["file_access"]["workspace"]["write"] is False
+    assert cfg["permissions"]["shell_level"] == "ask"
+
+
+def test_scheduler_agent_executor_refuses_write_profile_without_a_workspace(
+    monkeypatch, tmp_path
+):
+    import types
+
+    import agent.cli as cli_module
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            self.agent_executor = kwargs["agent_executor"]
+
+    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
+    monkeypatch.setattr(
+        cli_module, "_scheduler_store", lambda: types.SimpleNamespace()
+    )
+
+    service, _store, _components = asyncio.run(
+        cli_module._build_scheduler_service(
+            _minimal_cfg(),
+            poll_seconds=1,
+            lease_seconds=30,
+            max_concurrent_runs=1,
+            components={"output_dir": tmp_path},
+        )
+    )
+    task = types.SimpleNamespace(
+        id="task-1",
+        name="nightly",
+        payload={"prompt": "run the tests"},
+        workspace_root="",
+        context_policy="stateless",
+        permission_profile="workspace_write",
+        model_override=None,
+    )
+    run = types.SimpleNamespace(
+        id="run-1",
+        config_snapshot={
+            "payload": {"prompt": "run the tests"},
+            "workspace_root": "",
+            "permission_profile": "workspace_write",
+        },
+    )
+
+    # A profile that writes must not silently inherit the scheduler process's
+    # working directory: nobody could predict where the task would write.
+    with pytest.raises(RuntimeError, match="workspace"):
+        asyncio.run(service.agent_executor(task, run))
 
 
 def test_agent_core_rejects_deleted_required_skill():

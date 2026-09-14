@@ -1779,3 +1779,137 @@ def test_web_channel_is_registered_by_gateway_builder():
 
     channels = _build_gateway_channels({"channels": {"web": {"enabled": True}}})
     assert any(isinstance(ch, WebChannel) for ch in channels)
+
+
+def _seed_failed_run(db_path, name: str, scheduled_for):
+    """Create one task with one failed run already finished."""
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=db_path)
+    task = store.create_task(
+        NewScheduledTask(
+            name=name,
+            kind="agent_prompt",
+            trigger=TriggerSpec.once(scheduled_for, "Asia/Shanghai"),
+            payload={"prompt": f"run {name}"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            permission_profile="read_only",
+        ),
+        now=scheduled_for - timedelta(hours=1),
+    )
+    claimed = store.claim_due_tasks(now=scheduled_for + timedelta(seconds=2), lease_seconds=300)[0]
+    store.complete_run(
+        task.id,
+        claimed.run.id,
+        finished_at=scheduled_for + timedelta(seconds=5),
+        status="failed",
+        summary="",
+        error="boom",
+    )
+    store.close()
+    return task.id, claimed.run.id
+
+
+def test_web_schedule_failure_is_announced_and_can_be_acknowledged(tmp_path, monkeypatch):
+    """A failure nobody watched has to reach the user, then be dismissable.
+
+    The badge is the whole point of this endpoint pair: the scheduler runs
+    when no client is connected, so the count has to be readable from any view
+    and the acknowledgement has to stick, otherwise the same failure would
+    reappear on every poll.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    agent_home = tmp_path / ".agent"
+    db_path = agent_home / "tasks" / "scheduler.db"
+    monkeypatch.setattr(shared, "AGENT_HOME", agent_home)
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", db_path)
+    task_id, run_id = _seed_failed_run(
+        db_path, "nightly", datetime(2026, 9, 7, 2, 0, tzinfo=timezone.utc)
+    )
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        listed = client.get("/api/schedules")
+        assert listed.status_code == 200
+        assert listed.json()["unseen_failures"] == 1
+        assert listed.json()["tasks"][0]["unseen_failures"] == 1
+
+        # Readable without loading every task, which is what lets the badge be
+        # polled from a view that is not the schedules page.
+        assert client.get("/api/schedules/attention").json() == {"unseen_failures": 1}
+
+        run = client.get(f"/api/schedules/{task_id}/runs").json()["runs"][0]
+        assert run["id"] == run_id
+        assert run["needs_attention"] is True
+        assert run["acknowledged_at"] is None
+
+        acked = client.post(f"/api/schedules/{task_id}/runs/{run_id}/acknowledge")
+        assert acked.status_code == 200
+        assert acked.json() == {
+            "ok": True,
+            "acknowledged": True,
+            "unseen_failures": 0,
+        }
+
+        # Clicking again is honest rather than pretending to do work.
+        repeat = client.post(f"/api/schedules/{task_id}/runs/{run_id}/acknowledge")
+        assert repeat.json()["acknowledged"] is False
+
+        assert client.get("/api/schedules/attention").json() == {"unseen_failures": 0}
+        assert client.get("/api/schedules").json()["unseen_failures"] == 0
+        after = client.get(f"/api/schedules/{task_id}/runs").json()["runs"][0]
+        assert after["needs_attention"] is False
+        assert after["acknowledged_at"] is not None
+
+
+def test_web_schedule_attention_clears_one_task_or_all(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    agent_home = tmp_path / ".agent"
+    db_path = agent_home / "tasks" / "scheduler.db"
+    monkeypatch.setattr(shared, "AGENT_HOME", agent_home)
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", db_path)
+    first, _ = _seed_failed_run(
+        db_path, "first", datetime(2026, 9, 7, 2, 0, tzinfo=timezone.utc)
+    )
+    _seed_failed_run(db_path, "second", datetime(2026, 9, 7, 3, 0, tzinfo=timezone.utc))
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        assert client.get("/api/schedules/attention").json() == {"unseen_failures": 2}
+
+        scoped = client.post("/api/schedules/attention", json={"task_id": first})
+        assert scoped.status_code == 200
+        assert scoped.json() == {"ok": True, "cleared": 1, "unseen_failures": 1}
+
+        everything = client.post("/api/schedules/attention", json={})
+        assert everything.json() == {"ok": True, "cleared": 1, "unseen_failures": 0}
+
+        # Nothing left to clear, and it says so instead of claiming work.
+        assert client.post("/api/schedules/attention").json()["cleared"] == 0
+
+
+def test_web_schedule_attention_rejects_a_non_object_body(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    agent_home = tmp_path / ".agent"
+    monkeypatch.setattr(shared, "AGENT_HOME", agent_home)
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", agent_home / "tasks" / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        bad = client.post("/api/schedules/attention", json=["not", "an", "object"])
+        assert bad.status_code == 400
