@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sqlite3
 import threading
-from typing import Callable, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 from agent import shared
 from .models import (
@@ -68,7 +68,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 6
+    SCHEMA_VERSION = 7
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -145,6 +145,7 @@ class SchedulerStore:
                     cancel_requested_at TEXT,
                     retry_of_run_id TEXT NOT NULL DEFAULT '',
                     acknowledged_at TEXT,
+                    missed_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(task_id) REFERENCES scheduled_tasks(id)
@@ -263,6 +264,22 @@ class SchedulerStore:
                         "WHERE finished_at IS NOT NULL"
                     )
                 self._conn.execute("PRAGMA user_version = 6")
+            elif version == 7:
+                run_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_task_runs)"
+                    ).fetchall()
+                }
+                if "missed_count" not in run_columns:
+                    # No backfill: the column is not derivable after the fact,
+                    # and inventing a zero for history would claim those runs
+                    # were preceded by nothing missed.  Older runs simply
+                    # record nothing, which is what we actually know.
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_task_runs ADD COLUMN "
+                        "missed_count INTEGER NOT NULL DEFAULT 0"
+                    )
+                self._conn.execute("PRAGMA user_version = 7")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -310,6 +327,7 @@ class SchedulerStore:
             cancel_requested_at=_dt(row["cancel_requested_at"]),
             retry_of_run_id=row["retry_of_run_id"],
             acknowledged_at=_dt(row["acknowledged_at"]),
+            missed_count=int(row["missed_count"] or 0),
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),
         )
@@ -499,7 +517,7 @@ class SchedulerStore:
         ).fetchone()
         return self._run_from_row(row) if row else None
 
-    # ── Attention: failures nobody has been told about ───────────────────
+    # ── Attention: runs nobody has been told about ───────────────────────
     #
     # A scheduled run happens when nobody is watching, so "the run list shows
     # it" only helps someone who already suspected something went wrong.  The
@@ -510,13 +528,26 @@ class SchedulerStore:
     # not a notification.
 
     @staticmethod
-    def _attention_clause() -> tuple[str, list[str]]:
+    def _attention_clause() -> tuple[str, list[Any]]:
+        """Runs a person should look at.
+
+        Two ways in.  The run ended badly, or it arrived carrying the news
+        that earlier occurrences were skipped while nothing was running.  The
+        second is not a failure of *this* run -- it succeeded -- but it is the
+        one case where waiting to be read does not work: the run that resumes
+        the schedule reports success, so nothing else in the system will ever
+        mention the gap, and a daily report can be missing for a week with
+        every run marked fine.
+        """
         placeholders = ", ".join("?" for _ in ATTENTION_STATUSES)
-        return f"status IN ({placeholders})", list(ATTENTION_STATUSES)
+        return (
+            f"(status IN ({placeholders}) OR missed_count > 0)",
+            list(ATTENTION_STATUSES),
+        )
 
     @_synchronized
-    def unacknowledged_failure_counts(self) -> dict[str, int]:
-        """Task id -> number of failures nobody has looked at yet."""
+    def unacknowledged_attention_counts(self) -> dict[str, int]:
+        """Task id -> number of runs nobody has looked at yet."""
         clause, params = self._attention_clause()
         rows = self._conn.execute(
             f"""
@@ -533,7 +564,7 @@ class SchedulerStore:
     def acknowledge_run(
         self, task_id: str, run_id: str, now: Optional[datetime] = None
     ) -> bool:
-        """Mark one failure as seen.  False when there was nothing to see."""
+        """Mark one run as seen.  False when there was nothing to see."""
         clause, params = self._attention_clause()
         stamp = _iso((now or datetime.now(UTC)).astimezone(UTC))
         with self._conn:
@@ -550,10 +581,10 @@ class SchedulerStore:
         return cursor.rowcount == 1
 
     @_synchronized
-    def acknowledge_failures(
+    def acknowledge_attention(
         self, task_id: Optional[str] = None, now: Optional[datetime] = None
     ) -> int:
-        """Mark every unseen failure as seen, for one task or for all."""
+        """Mark every unseen run as seen, for one task or for all."""
         clause, params = self._attention_clause()
         stamp = _iso((now or datetime.now(UTC)).astimezone(UTC))
         scope = "task_id = ? AND " if task_id else ""
@@ -917,7 +948,15 @@ class SchedulerStore:
                     continue
                 run_id = _new_id()
                 started_at = now
-                next_run_at = task.trigger.advance_after_claim(task.next_run_at, now)
+                scheduled_for = task.next_run_at
+                next_run_at = task.trigger.advance_after_claim(scheduled_for, now)
+                # Counted here because this is the only place the jump is
+                # visible: `advance_after_claim` moves the cursor straight to
+                # the future and the occurrences it stepped over leave no other
+                # trace.  Doing it in the same transaction as the claim keeps
+                # the number attached to the run that actually resumes the
+                # schedule.
+                missed_count = task.trigger.count_missed(scheduled_for, next_run_at)
                 lease_until = now + timedelta(seconds=lease_seconds)
                 self._conn.execute(
                     """
@@ -925,8 +964,8 @@ class SchedulerStore:
                         id, task_id, scheduled_for, started_at, finished_at, status,
                         summary, error, output_path, delivery_status,
                         config_snapshot_json, trigger_source, attempt,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, 'schedule', 1, ?, ?)
+                        missed_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, 'schedule', 1, ?, ?, ?)
                     """,
                     (
                         run_id,
@@ -934,6 +973,7 @@ class SchedulerStore:
                         _iso(task.next_run_at),
                         _iso(started_at),
                         json.dumps(execution_snapshot(task), ensure_ascii=False),
+                        int(missed_count),
                         _iso(started_at),
                         _iso(started_at),
                     ),
@@ -966,6 +1006,11 @@ class SchedulerStore:
                 ).fetchone()
                 refreshed = self._task_from_row(refreshed_row) if refreshed_row else None
                 assert refreshed is not None
+                # Built by hand rather than re-read, so every field the row got
+                # has to be repeated here: one that is left out silently reads
+                # as its default while the database holds the real value, and
+                # the run the scheduler is about to execute would disagree with
+                # the run the history shows.
                 claimed.append(
                     ClaimedTask(
                         task=refreshed,
@@ -978,6 +1023,7 @@ class SchedulerStore:
                             status="running",
                             config_snapshot=execution_snapshot(task),
                             trigger_source="schedule",
+                            missed_count=missed_count,
                             created_at=started_at,
                             updated_at=started_at,
                         ),

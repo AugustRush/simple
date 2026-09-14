@@ -27,7 +27,7 @@ from agent.channels.base import Channel, IncomingMessage
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
 from agent.pathing import path_contains
-from agent.scheduler.models import ATTENTION_STATUSES
+from agent.scheduler.models import run_needs_attention
 from agent.session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -142,15 +142,13 @@ def _scheduler_run_payload(run: Any) -> dict[str, Any]:
             else None
         ),
         "retry_of_run_id": str(getattr(run, "retry_of_run_id", "") or ""),
+        "missed_count": int(getattr(run, "missed_count", 0) or 0),
         "acknowledged_at": (
             run.acknowledged_at.isoformat()
             if getattr(run, "acknowledged_at", None)
             else None
         ),
-        "needs_attention": bool(
-            str(getattr(run, "status", "") or "") in ATTENTION_STATUSES
-            and getattr(run, "acknowledged_at", None) is None
-        ),
+        "needs_attention": run_needs_attention(run),
         "config_snapshot": dict(getattr(run, "config_snapshot", {}) or {}),
         "output_available": output_available,
         "output_url": (
@@ -182,7 +180,7 @@ def _scheduler_output_url(task_id: str, run_id: str, output_path: str) -> str:
 
 
 def _scheduler_task_payload(
-    task: Any, latest_run: Any = None, unseen_failures: int = 0
+    task: Any, latest_run: Any = None, unseen_attention: int = 0
 ) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -204,7 +202,7 @@ def _scheduler_task_payload(
         "retry_policy": task.retry_policy,
         "selected_skills": task.selected_skills,
         "permission_profile": task.permission_profile,
-        "unseen_failures": int(unseen_failures or 0),
+        "unseen_attention": int(unseen_attention or 0),
         "active_run_id": task.active_run_id,
         "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
         "last_run_at": task.last_run_at.isoformat() if task.last_run_at else None,
@@ -1254,7 +1252,7 @@ class WebChannel(Channel):
 
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
-            unseen = store.unacknowledged_failure_counts()
+            unseen = store.unacknowledged_attention_counts()
             tasks = []
             for task in store.list_tasks():
                 latest_run = store.latest_run(task.id)
@@ -1274,7 +1272,7 @@ class WebChannel(Channel):
                     # scheduler runs precisely when no client is connected, so
                     # this has to be part of the data rather than a push event
                     # that only reaches whoever happened to be looking.
-                    "unseen_failures": sum(unseen.values()),
+                    "unseen_attention": sum(unseen.values()),
                 }
             )
         finally:
@@ -1303,7 +1301,7 @@ class WebChannel(Channel):
                     "task": _scheduler_task_payload(
                         task,
                         store.latest_run(task.id),
-                        store.unacknowledged_failure_counts().get(task_id, 0),
+                        store.unacknowledged_attention_counts().get(task_id, 0),
                     ),
                     "runs": [_scheduler_run_payload(run) for run in runs],
                 }
@@ -1504,7 +1502,7 @@ class WebChannel(Channel):
                     return JSONResponse({"error": "task not found"}, status_code=404)
                 spec = self._schedule_from_body(body, existing)
                 updated = store.update_task(task_id, spec)
-                unseen = store.unacknowledged_failure_counts().get(task_id, 0)
+                unseen = store.unacknowledged_attention_counts().get(task_id, 0)
             finally:
                 store.close()
             if updated is None:
@@ -1654,8 +1652,8 @@ class WebChannel(Channel):
                 {
                     "ok": True,
                     "acknowledged": acknowledged,
-                    "unseen_failures": sum(
-                        store.unacknowledged_failure_counts().values()
+                    "unseen_attention": sum(
+                        store.unacknowledged_attention_counts().values()
                     ),
                 }
             )
@@ -1680,8 +1678,8 @@ class WebChannel(Channel):
         try:
             return JSONResponse(
                 {
-                    "unseen_failures": sum(
-                        store.unacknowledged_failure_counts().values()
+                    "unseen_attention": sum(
+                        store.unacknowledged_attention_counts().values()
                     )
                 }
             )
@@ -1705,13 +1703,13 @@ class WebChannel(Channel):
 
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
-            cleared = store.acknowledge_failures(task_id or None)
+            cleared = store.acknowledge_attention(task_id or None)
             return JSONResponse(
                 {
                     "ok": True,
                     "cleared": cleared,
-                    "unseen_failures": sum(
-                        store.unacknowledged_failure_counts().values()
+                    "unseen_attention": sum(
+                        store.unacknowledged_attention_counts().values()
                     ),
                 }
             )

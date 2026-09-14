@@ -1918,3 +1918,164 @@ def test_set_identity_clears_a_field_with_an_empty_string(tmp_path):
         tools.memory.store.read_resolved_facts(subject="assistant", predicate="role")
         == []
     )
+
+
+# ---------------------------------------------------------------------------
+# The permission envelope of a task the *agent* created.
+#
+# A scheduled run has nobody attached to approve anything, so the envelope it
+# executes inside is the whole of its authority.  The UI asks the person to
+# choose one; the tool path was the way around that question -- it built the
+# task with the dataclass defaults, so every agent-created task inherited the
+# global config and was pinned to whatever directory the gateway process
+# happened to be started from.  These tests pin the four answers that matter:
+# the directory is the one the user opened, an unknown profile is refused
+# rather than substituted, a write-granting profile refuses to guess, and the
+# reply says which envelope was stored.
+# ---------------------------------------------------------------------------
+
+
+def _create_scheduled_task(registry, **overrides):
+    payload = {
+        "name": "automation",
+        "trigger_type": "once",
+        "prompt": "跑一下测试",
+        "at": "2026-04-20T10:00:00+08:00",
+        "timezone_name": "Asia/Shanghai",
+    }
+    payload.update(overrides)
+    return json.loads(asyncio.run(registry.call("schedule_create", payload)))
+
+
+def _stored_task(payload):
+    from agent.scheduler import SchedulerStore
+
+    store = SchedulerStore(db_path=Path(payload["task"]["db_path"]))
+    try:
+        return store.get_task(payload["task"]["id"])
+    finally:
+        store.close()
+
+
+def test_schedule_create_pins_the_task_to_the_chosen_workspace(tmp_path):
+    _tools, registry, workspace = make_builtin_tools(tmp_path)
+    chosen = tmp_path / "chosen-project"
+    chosen.mkdir()
+    registry.set_context("workspace_root", chosen)
+
+    payload = _create_scheduled_task(registry)
+    task = _stored_task(payload)
+
+    assert payload["ok"] is True
+    assert task.workspace_root == str(chosen.resolve())
+    assert task.workspace_root != str(Path.cwd().resolve())
+    # No profile asked for means the historical posture, not a widened one.
+    assert task.permission_profile == "inherit"
+
+
+def test_schedule_create_falls_back_to_the_workspace_it_was_built_with(tmp_path):
+    """With no session context the constructor argument is the chosen one."""
+    _tools, registry, workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(registry)
+    task = _stored_task(payload)
+
+    assert payload["ok"] is True
+    assert task.workspace_root == str(workspace.resolve())
+
+
+def test_schedule_create_refuses_a_write_profile_with_no_chosen_directory(tmp_path):
+    """The cwd fallback is exactly what a write-granting profile must not get.
+
+    ``workspace_write`` runs shell commands without asking, so aiming it at
+    the process working directory would be an unattended write task pointed
+    at a place nobody can predict from its definition.
+    """
+    from agent import BuiltinTools, MemoryPalace, ToolRegistry
+
+    registry = ToolRegistry()
+    memory = MemoryPalace(base_dir=tmp_path / "memory", context_dir=tmp_path / "ctx")
+    BuiltinTools(memory=memory, registry=registry)  # no workspace_root, no context
+
+    payload = _create_scheduled_task(registry, permission_profile="workspace_write")
+
+    assert payload["ok"] is False
+    assert "需要显式指定项目文件夹" in payload["error"]
+
+
+def test_schedule_create_stores_a_write_profile_when_a_directory_is_given(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+
+    payload = _create_scheduled_task(
+        registry,
+        action_type="agent_task",
+        instruction="跑一遍测试",
+        permission_profile="workspace_write",
+        workspace_root=str(project),
+    )
+    task = _stored_task(payload)
+
+    assert payload["ok"] is True
+    assert task.permission_profile == "workspace_write"
+    assert task.workspace_root == str(project.resolve())
+    assert task.kind == "agent_prompt"
+
+
+def test_schedule_create_refuses_an_unknown_profile_and_names_the_valid_ones(tmp_path):
+    """A typo must not become a silent substitution.
+
+    Resolving it to ``read_only`` would be safe but mute: the task would exist
+    under an envelope nobody chose and the caller would never learn its name
+    was wrong.  Listing the valid keys is what lets it retry correctly.
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(registry, permission_profile="workspac_write")
+
+    assert payload["ok"] is False
+    assert "workspac_write" in payload["error"]
+    for key in ("inherit", "read_only", "workspace_write"):
+        assert key in payload["error"]
+
+
+def test_schedule_create_refuses_a_workspace_that_does_not_exist(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(
+        registry,
+        action_type="agent_task",
+        instruction="跑一遍测试",
+        workspace_root=str(tmp_path / "does-not-exist"),
+    )
+
+    assert payload["ok"] is False
+    assert "项目文件夹不存在" in payload["error"]
+
+
+def test_schedule_create_reports_the_envelope_it_stored(tmp_path):
+    _tools, registry, workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(registry, permission_profile="read_only")
+
+    assert payload["task"]["permission_profile"] == "read_only"
+    assert payload["task"]["workspace_root"] == str(workspace.resolve())
+    assert "强制只读" in payload["summary_text"]
+
+
+def test_two_envelopes_are_two_tasks(tmp_path):
+    """Dedup identity includes the envelope.
+
+    Re-asking for the same task with a wider profile must create a task with
+    *that* profile, not hand back the earlier read-only one and quietly ignore
+    the request.
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    first = _create_scheduled_task(registry, permission_profile="read_only")
+    second = _create_scheduled_task(registry, permission_profile="inherit")
+
+    assert first["task"]["existing"] is False
+    assert second["task"]["existing"] is False
+    assert first["task"]["id"] != second["task"]["id"]

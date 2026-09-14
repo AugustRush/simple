@@ -107,7 +107,7 @@ def test_failed_run_nobody_looked_at_is_counted(tmp_path):
         task.id, claimed.run.id, finished_at=WHEN, status="failed", error="boom"
     )
 
-    assert store.unacknowledged_failure_counts() == {task.id: 1}
+    assert store.unacknowledged_attention_counts() == {task.id: 1}
 
 
 def test_successful_run_never_asks_for_attention(tmp_path):
@@ -116,7 +116,7 @@ def test_successful_run_never_asks_for_attention(tmp_path):
 
     _run_to_terminal(store, task, "succeeded")
 
-    assert store.unacknowledged_failure_counts() == {}
+    assert store.unacknowledged_attention_counts() == {}
 
 
 def test_user_requested_cancellation_is_not_an_attention_status(tmp_path):
@@ -127,7 +127,7 @@ def test_user_requested_cancellation_is_not_an_attention_status(tmp_path):
     _run_to_terminal(store, task, "cancelled")
 
     assert "cancelled" not in ATTENTION_STATUSES
-    assert store.unacknowledged_failure_counts() == {}
+    assert store.unacknowledged_attention_counts() == {}
 
 
 def test_interrupted_run_is_counted_because_its_outcome_is_unknown(tmp_path):
@@ -140,7 +140,7 @@ def test_interrupted_run_is_counted_because_its_outcome_is_unknown(tmp_path):
 
     assert recovered == 1
     assert store.get_run(task.id, claimed.run.id).status == "interrupted"
-    assert store.unacknowledged_failure_counts() == {task.id: 1}
+    assert store.unacknowledged_attention_counts() == {task.id: 1}
 
 
 def test_counts_accumulate_per_task_and_ignore_seen_ones(tmp_path):
@@ -153,7 +153,7 @@ def test_counts_accumulate_per_task_and_ignore_seen_ones(tmp_path):
     _run_to_terminal(store, second, "failed")
     assert store.acknowledge_run(first.id, seen) is True
 
-    assert store.unacknowledged_failure_counts() == {first.id: 1, second.id: 1}
+    assert store.unacknowledged_attention_counts() == {first.id: 1, second.id: 1}
 
 
 # --- acknowledging ----------------------------------------------------------
@@ -166,7 +166,7 @@ def test_acknowledging_a_failure_clears_its_task(tmp_path):
 
     assert store.acknowledge_run(task.id, run_id) is True
 
-    assert store.unacknowledged_failure_counts() == {}
+    assert store.unacknowledged_attention_counts() == {}
     assert store.get_run(task.id, run_id).acknowledged_at is not None
 
 
@@ -199,7 +199,7 @@ def test_acknowledgement_survives_reopening_the_database(tmp_path):
 
     reopened = _store(tmp_path)
 
-    assert reopened.unacknowledged_failure_counts() == {}
+    assert reopened.unacknowledged_attention_counts() == {}
     assert reopened.get_run(task.id, run_id).acknowledged_at is not None
 
 
@@ -212,7 +212,7 @@ def test_a_later_failure_still_asks_for_attention_after_an_earlier_one_was_seen(
     store.acknowledge_run(task.id, first)
     second = _run_to_terminal(store, task, "failed")
 
-    assert store.unacknowledged_failure_counts() == {task.id: 1}
+    assert store.unacknowledged_attention_counts() == {task.id: 1}
     assert store.get_run(task.id, second).acknowledged_at is None
 
 
@@ -226,10 +226,10 @@ def test_clearing_one_task_leaves_other_tasks_untouched(tmp_path):
     _run_to_terminal(store, first, "failed")
     _run_to_terminal(store, second, "failed")
 
-    cleared = store.acknowledge_failures(first.id)
+    cleared = store.acknowledge_attention(first.id)
 
     assert cleared == 1
-    assert store.unacknowledged_failure_counts() == {second.id: 1}
+    assert store.unacknowledged_attention_counts() == {second.id: 1}
 
 
 def test_clearing_everything_reports_how_many_were_cleared(tmp_path):
@@ -239,12 +239,12 @@ def test_clearing_everything_reports_how_many_were_cleared(tmp_path):
     _run_to_terminal(store, first, "failed")
     _run_to_terminal(store, second, "failed")
 
-    cleared = store.acknowledge_failures()
+    cleared = store.acknowledge_attention()
 
     assert cleared == 2
-    assert store.unacknowledged_failure_counts() == {}
+    assert store.unacknowledged_attention_counts() == {}
     # Idempotent: a second sweep has nothing to do and says so.
-    assert store.acknowledge_failures() == 0
+    assert store.acknowledge_attention() == 0
 
 
 def test_bulk_clear_ignores_runs_that_never_needed_attention(tmp_path):
@@ -253,8 +253,8 @@ def test_bulk_clear_ignores_runs_that_never_needed_attention(tmp_path):
     _run_to_terminal(store, task, "succeeded")
     _run_to_terminal(store, task, "failed")
 
-    assert store.acknowledge_failures() == 1
-    assert store.unacknowledged_failure_counts() == {}
+    assert store.acknowledge_attention() == 1
+    assert store.unacknowledged_attention_counts() == {}
 
 
 # --- upgrading an existing database ----------------------------------------
@@ -282,7 +282,7 @@ def test_upgrade_treats_pre_existing_history_as_already_seen(tmp_path):
 
     upgraded = _store(tmp_path)
 
-    assert upgraded.unacknowledged_failure_counts() == {}
+    assert upgraded.unacknowledged_attention_counts() == {}
     assert upgraded.get_run(task.id, old_run).acknowledged_at is not None
 
 
@@ -301,4 +301,4 @@ def test_upgrade_still_counts_failures_that_happen_afterwards(tmp_path):
     upgraded = _store(tmp_path)
     _run_to_terminal(upgraded, task, "failed")
 
-    assert upgraded.unacknowledged_failure_counts() == {task.id: 1}
+    assert upgraded.unacknowledged_attention_counts() == {task.id: 1}

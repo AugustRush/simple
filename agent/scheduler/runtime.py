@@ -6,7 +6,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
-from .models import DeliveryResult, DeliveryTarget, ExecutionResult
+from .models import (
+    DeliveryResult,
+    DeliveryTarget,
+    ExecutionResult,
+    describe_missed_occurrences,
+)
 from .store import SchedulerStore
 
 
@@ -368,13 +373,23 @@ class SchedulerService:
             if not successful_delivery and not delivery_error:
                 delivery_error = f"unexpected delivery status: {delivery_status or 'empty'}"
             finished_at = run_now()
+            # Prefix the summary when this run is the first one after a period
+            # in which nothing was running.  The run succeeded, so nothing else
+            # about it looks unusual; without this the history reads as a
+            # schedule that has been firing on time.
+            missed_note = describe_missed_occurrences(
+                getattr(run, "missed_count", 0)
+            )
+            run_summary = (
+                f"{missed_note}\n{result.summary}" if missed_note else result.summary
+            )
             await self._store_call(
                 "complete_run",
                 task.id,
                 run.id,
                 finished_at=finished_at,
                 status=status,
-                summary=result.summary,
+                summary=run_summary,
                 error=delivery_error,
                 output_path=output_path,
                 delivery_status=delivery_status,

@@ -337,6 +337,49 @@ class TriggerSpec:
     ) -> Optional[datetime]:
         return self.instantiate().advance_from(scheduled_for, now)
 
+    def count_missed(
+        self, scheduled_for: datetime, next_run_at: Optional[datetime]
+    ) -> int:
+        """How many occurrences fell between ``scheduled_for`` and the next one.
+
+        Advancing the cursor jumps straight to the next occurrence in the
+        future.  When the process was not running, that jump walks over every
+        occurrence it should have fired in the meantime, and they vanish
+        without a trace: the task looks like it ran on schedule, and the person
+        who scheduled a daily report finds out days later that none of them
+        ran.  This counts what the jump walked over so the run that resumes the
+        schedule can say so.
+
+        The count is derived from the trigger's own ``next_after`` rather than
+        from a second copy of its calendar arithmetic.  A parallel
+        implementation would be free to disagree with the schedule it claims
+        to be describing -- and "the record disagrees with the plan" is exactly
+        the kind of silence this exists to end.
+
+        ``next_run_at is None`` means the trigger has no further occurrence
+        (a ``once`` task that has just fired, late).  Running late is not a
+        miss: the occurrence still happened, so the count is zero.
+        """
+        if next_run_at is None:
+            return 0
+        trigger = self.instantiate()
+        count = 0
+        cursor = scheduled_for
+        while count < self.MISSED_COUNT_LIMIT:
+            following = trigger.next_after(cursor)
+            if following is None or following >= next_run_at:
+                return count
+            count += 1
+            cursor = following
+        return count
+
+    #: Where the walk above stops.  The count is taken inside the claim
+    #: transaction, so a minutely task left unclaimed for a year must not turn
+    #: into half a million steps while the write lock is held -- and nothing a
+    #: person would do about it changes between "many" and "exactly 525600".
+    #: Hitting the limit means "at least this many".
+    MISSED_COUNT_LIMIT = 1000
+
     def to_json(self) -> str:
         return json.dumps(
             {"trigger_type": self.trigger_type, "payload": self.payload},
@@ -347,6 +390,24 @@ class TriggerSpec:
     def from_json(cls, raw: str) -> "TriggerSpec":
         data = json.loads(raw)
         return cls(trigger_type=data["trigger_type"], payload=data["payload"])
+
+
+def describe_missed_occurrences(missed_count: int) -> str:
+    """The line that says scheduled work did not happen.
+
+    Spelled out rather than left as a number in a column: the count is only
+    meaningful next to what it counts, and the run it is attached to looks
+    entirely successful otherwise.  Empty string when nothing was missed, so
+    callers can concatenate without checking.
+    """
+    missed = int(missed_count or 0)
+    if missed <= 0:
+        return ""
+    if missed >= TriggerSpec.MISSED_COUNT_LIMIT:
+        return (
+            f"⚠️ 本次运行前至少 {missed} 次计划未能执行（进程未运行，计数已达上限）。"
+        )
+    return f"⚠️ 本次运行前有 {missed} 次计划未能执行（进程未运行）。"
 
 
 @dataclass
@@ -445,6 +506,26 @@ class ScheduledTask:
 ATTENTION_STATUSES: tuple[str, ...] = ("failed", "interrupted")
 
 
+def run_needs_attention(run: "TaskRun") -> bool:
+    """Whether a run is still something a person has to be told about.
+
+    Two ways in, and the second is why this is a function instead of an
+    ``in`` test at the call site: a run that *succeeded* still needs a person
+    if it arrived saying that earlier occurrences were skipped while nothing
+    was running.  Nothing else in the system ever mentions that gap.
+
+    This is the Python half of a rule that also has to exist as SQL --
+    ``SchedulerStore._attention_clause`` counts the same runs in one query.
+    Two representations cannot be merged, so they are kept beside each other
+    and a test walks a run through both.
+    """
+    if getattr(run, "acknowledged_at", None) is not None:
+        return False
+    if int(getattr(run, "missed_count", 0) or 0) > 0:
+        return True
+    return str(getattr(run, "status", "") or "") in ATTENTION_STATUSES
+
+
 @dataclass
 class TaskRun:
     id: str
@@ -462,6 +543,12 @@ class TaskRun:
     attempt: int = 1
     cancel_requested_at: Optional[datetime] = None
     retry_of_run_id: str = ""
+    #: How many occurrences of this task were skipped on the way to this run
+    #: because nothing was running to fire them.  Surviving a restart is the
+    #: point: the number is the only record that the work did *not* happen,
+    #: and it lives on the run that resumed the schedule, which is where
+    #: somebody looking at the history will find it.
+    missed_count: int = 0
     #: When a person has seen this run's failure.  ``None`` on a run in
     #: ``ATTENTION_STATUSES`` means the run finished while nobody was looking
     #: and nothing has told them yet.

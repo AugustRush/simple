@@ -1840,12 +1840,12 @@ def test_web_schedule_failure_is_announced_and_can_be_acknowledged(tmp_path, mon
     with TestClient(channel.app) as client:
         listed = client.get("/api/schedules")
         assert listed.status_code == 200
-        assert listed.json()["unseen_failures"] == 1
-        assert listed.json()["tasks"][0]["unseen_failures"] == 1
+        assert listed.json()["unseen_attention"] == 1
+        assert listed.json()["tasks"][0]["unseen_attention"] == 1
 
         # Readable without loading every task, which is what lets the badge be
         # polled from a view that is not the schedules page.
-        assert client.get("/api/schedules/attention").json() == {"unseen_failures": 1}
+        assert client.get("/api/schedules/attention").json() == {"unseen_attention": 1}
 
         run = client.get(f"/api/schedules/{task_id}/runs").json()["runs"][0]
         assert run["id"] == run_id
@@ -1857,15 +1857,15 @@ def test_web_schedule_failure_is_announced_and_can_be_acknowledged(tmp_path, mon
         assert acked.json() == {
             "ok": True,
             "acknowledged": True,
-            "unseen_failures": 0,
+            "unseen_attention": 0,
         }
 
         # Clicking again is honest rather than pretending to do work.
         repeat = client.post(f"/api/schedules/{task_id}/runs/{run_id}/acknowledge")
         assert repeat.json()["acknowledged"] is False
 
-        assert client.get("/api/schedules/attention").json() == {"unseen_failures": 0}
-        assert client.get("/api/schedules").json()["unseen_failures"] == 0
+        assert client.get("/api/schedules/attention").json() == {"unseen_attention": 0}
+        assert client.get("/api/schedules").json()["unseen_attention"] == 0
         after = client.get(f"/api/schedules/{task_id}/runs").json()["runs"][0]
         assert after["needs_attention"] is False
         assert after["acknowledged_at"] is not None
@@ -1887,14 +1887,14 @@ def test_web_schedule_attention_clears_one_task_or_all(tmp_path, monkeypatch):
     channel = _channel()
     channel.bind_runtime({}, {})
     with TestClient(channel.app) as client:
-        assert client.get("/api/schedules/attention").json() == {"unseen_failures": 2}
+        assert client.get("/api/schedules/attention").json() == {"unseen_attention": 2}
 
         scoped = client.post("/api/schedules/attention", json={"task_id": first})
         assert scoped.status_code == 200
-        assert scoped.json() == {"ok": True, "cleared": 1, "unseen_failures": 1}
+        assert scoped.json() == {"ok": True, "cleared": 1, "unseen_attention": 1}
 
         everything = client.post("/api/schedules/attention", json={})
-        assert everything.json() == {"ok": True, "cleared": 1, "unseen_failures": 0}
+        assert everything.json() == {"ok": True, "cleared": 1, "unseen_attention": 0}
 
         # Nothing left to clear, and it says so instead of claiming work.
         assert client.post("/api/schedules/attention").json()["cleared"] == 0
@@ -1913,3 +1913,79 @@ def test_web_schedule_attention_rejects_a_non_object_body(tmp_path, monkeypatch)
     with TestClient(channel.app) as client:
         bad = client.post("/api/schedules/attention", json=["not", "an", "object"])
         assert bad.status_code == 400
+
+
+def _seed_skipped_run(db_path, name: str, first_due):
+    """Create one daily task whose first run resumes a three-day gap."""
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=db_path)
+    task = store.create_task(
+        NewScheduledTask(
+            name=name,
+            kind="agent_prompt",
+            trigger=TriggerSpec.daily("09:00", "UTC"),
+            payload={"prompt": f"run {name}"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            permission_profile="read_only",
+            workspace_root="/tmp",
+        ),
+        now=first_due - timedelta(hours=1),
+    )
+    claimed = store.claim_due_tasks(
+        now=first_due + timedelta(days=3, hours=3), lease_seconds=300
+    )[0]
+    store.complete_run(
+        task.id,
+        claimed.run.id,
+        finished_at=first_due + timedelta(days=3, hours=3),
+        status="succeeded",
+        summary="日报已生成",
+    )
+    store.close()
+    return task.id, claimed.run.id
+
+
+def test_web_reports_a_run_that_succeeded_over_a_skipped_schedule(tmp_path, monkeypatch):
+    """A gap has to reach the user even though every run succeeded.
+
+    This is the case the interface used to be blind to: the schedule silently
+    caught up, the run reports success, and nothing anywhere says the daily
+    report did not happen for three days.  The count and the marker have to
+    survive the API round trip, because that is where the badge reads them.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    agent_home = tmp_path / ".agent"
+    db_path = agent_home / "tasks" / "scheduler.db"
+    monkeypatch.setattr(shared, "AGENT_HOME", agent_home)
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", db_path)
+    task_id, run_id = _seed_skipped_run(
+        db_path, "daily-report", datetime(2026, 9, 7, 9, 0, tzinfo=timezone.utc)
+    )
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        run = client.get(f"/api/schedules/{task_id}/runs").json()["runs"][0]
+        assert run["id"] == run_id
+        assert run["status"] == "succeeded"
+        assert run["missed_count"] == 3
+        assert run["needs_attention"] is True
+        # The wording is composed where the run finishes, not here; this test
+        # owns the wire, and the note itself is pinned end to end in
+        # tests/test_scheduler_missed.py.
+
+        # The task badge has to agree with the run it is pointing at.
+        assert client.get("/api/schedules").json()["tasks"][0]["unseen_attention"] == 1
+
+        acked = client.post(f"/api/schedules/{task_id}/runs/{run_id}/acknowledge")
+        assert acked.json()["acknowledged"] is True
+        assert client.get("/api/schedules/attention").json() == {"unseen_attention": 0}

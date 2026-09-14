@@ -15,6 +15,7 @@ from .models import (
     TriggerSpec,
     WeeklyTrigger,
     WeekdaysTrigger,
+    run_needs_attention,
 )
 from .profiles import (
     PERMISSION_PROFILES,
@@ -47,6 +48,7 @@ __all__ = [
     "SchedulerService",
     "SchedulerStore",
     "TaskRun",
+    "run_needs_attention",
     "TriggerSpec",
     "UnattendedAudit",
     "UnattendedOutputSink",

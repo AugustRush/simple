@@ -222,7 +222,7 @@ interface ScheduleInfo {
   retry_policy?: { max_attempts?: number; backoff_seconds?: number }
   selected_skills?: string[]
   permission_profile?: PermissionProfileKey
-  unseen_failures?: number
+  unseen_attention?: number
 }
 
 interface ScheduleRun {
@@ -242,6 +242,7 @@ interface ScheduleRun {
   attempt?: number
   cancel_requested_at?: string | null
   retry_of_run_id?: string
+  missed_count?: number
   acknowledged_at?: string | null
   needs_attention?: boolean
   config_snapshot?: Record<string, any>
@@ -641,6 +642,50 @@ function toolStateLabel(state?: ToolState): string {
   return '已完成'
 }
 
+// One mark per call does not scale: the width grows linearly while the
+// information per mark saturates -- nobody reads 90 dots differently from
+// 100 -- so past this budget the strip describes the shape of the turn
+// instead of indexing it. The exact step count stays in the label next to it,
+// which is why the marks are free to become summaries.
+const MAX_TRACE_DOTS = 20
+
+// A summarised mark reports its most severe member, never a sample of them.
+// That is the whole point of aggregating by worst case rather than picking
+// every n-th step: a single blocked call must not be able to disappear just
+// because the turn around it was long. ``done`` is the floor, matching the
+// `toolState || 'done'` the marks have always used.
+const TRACE_SEVERITY: Record<ToolState, number> = {
+  done: 0,
+  running: 1,
+  interrupted: 2,
+  blocked: 3,
+}
+
+interface ToolDotSummary {
+  state: ToolState
+  count: number
+}
+
+function summariseToolDots(tools: Message[]): ToolDotSummary[] {
+  if (tools.length <= MAX_TRACE_DOTS) {
+    return tools.map(tool => ({ state: tool.toolState || 'done', count: 1 }))
+  }
+  const summaries: ToolDotSummary[] = []
+  for (let index = 0; index < MAX_TRACE_DOTS; index += 1) {
+    // Contiguous, non-overlapping spans that together cover every step, so
+    // compressing cannot silently drop one from the count.
+    const start = Math.floor((index * tools.length) / MAX_TRACE_DOTS)
+    const end = Math.floor(((index + 1) * tools.length) / MAX_TRACE_DOTS)
+    let state: ToolState = 'done'
+    for (let cursor = start; cursor < end; cursor += 1) {
+      const candidate = tools[cursor].toolState || 'done'
+      if (TRACE_SEVERITY[candidate] > TRACE_SEVERITY[state]) state = candidate
+    }
+    summaries.push({ state, count: end - start })
+  }
+  return summaries
+}
+
 function toolStateColor(state?: ToolState): string {
   if (state === 'running') return 'processing'
   if (state === 'blocked') return 'error'
@@ -911,6 +956,24 @@ function scheduleRunStatusIcon(status?: string) {
     return <ExclamationCircleFilled />
   }
   return <ClockCircleOutlined />
+}
+
+/** Why this run is asking for attention, in the run's own words.
+ *
+ * There are two reasons and they are not the same thing: the run ended badly,
+ * or it is the first run after a stretch in which nothing was running and
+ * some occurrences never fired.  The second case succeeds, so saying "失败"
+ * about it would be false -- and the point of the marker is that a person can
+ * tell what happened without opening anything.
+ */
+function scheduleRunAttentionReason(run: ScheduleRun): string {
+  const reasons: string[] = []
+  const missed = run.missed_count || 0
+  if (missed > 0) reasons.push(`本次运行前有 ${missed} 次计划未能执行`)
+  if (run.status === 'failed' || run.status === 'interrupted') {
+    reasons.push(`本次运行${scheduleRunStatusLabel(run.status)}`)
+  }
+  return reasons.length ? `${reasons.join('；')}，你还没有查看` : '你还没有查看'
 }
 
 function formatScheduleDuration(durationMs?: number | null): string {
@@ -2121,7 +2184,7 @@ function App() {
       setPermissionProfiles(
         Array.isArray(data.permission_profiles) ? data.permission_profiles : [],
       )
-      setUnseenFailures(Number(data.unseen_failures || 0))
+      setUnseenFailures(Number(data.unseen_attention || 0))
       setSelectedSchedule(current => {
         if (!current) return current
         const refreshed = (data.tasks || []).find(
@@ -2147,7 +2210,7 @@ function App() {
     try {
       const resp = await api('/api/schedules/attention')
       const data = await resp.json()
-      setUnseenFailures(Number(data.unseen_failures || 0))
+      setUnseenFailures(Number(data.unseen_attention || 0))
     } catch {
       // A transport failure is not "no failures"; leave the last known count
       // alone rather than clearing a badge the user has not acted on.
@@ -2842,12 +2905,12 @@ function App() {
         : item))
       const dropOne = (count?: number) => Math.max(0, (count || 0) - consumed)
       setSchedules(prev => prev.map(item => item.id === task.id
-        ? { ...item, unseen_failures: dropOne(item.unseen_failures) }
+        ? { ...item, unseen_attention: dropOne(item.unseen_attention) }
         : item))
       setSelectedSchedule(current => current && current.id === task.id
-        ? { ...current, unseen_failures: dropOne(current.unseen_failures) }
+        ? { ...current, unseen_attention: dropOne(current.unseen_attention) }
         : current)
-      setUnseenFailures(Number(data.unseen_failures || 0))
+      setUnseenFailures(Number(data.unseen_attention || 0))
     } catch { /* surfaced */ }
   }
 
@@ -2867,12 +2930,12 @@ function App() {
       }
       const zeroed = (item: ScheduleInfo) => !taskId || item.id === taskId
       setSchedules(prev => prev.map(item => zeroed(item)
-        ? { ...item, unseen_failures: 0 }
+        ? { ...item, unseen_attention: 0 }
         : item))
       setSelectedSchedule(current => current && zeroed(current)
-        ? { ...current, unseen_failures: 0 }
+        ? { ...current, unseen_attention: 0 }
         : current)
-      setUnseenFailures(Number(data.unseen_failures || 0))
+      setUnseenFailures(Number(data.unseen_attention || 0))
       if (data.cleared) messageApi.success(`已将 ${data.cleared} 次失败标记为已读`)
     } catch { /* surfaced */ }
   }
@@ -3470,6 +3533,8 @@ function App() {
   const renderToolTraceContent = (tools: Message[]) => {
     const traceId = tools[0].id
     const expanded = !!expandedTraces[traceId]
+    const dots = summariseToolDots(tools)
+    const summarised = dots.length < tools.length
     return (
       <div
         className={`tool-trace ${expanded ? 'tool-trace-expanded' : ''}`}
@@ -3480,11 +3545,17 @@ function App() {
           className="tool-trace-summary"
           onClick={() => toggleTraceExpanded(traceId)}
         >
-          <span className="tool-trace-dots">
-            {tools.map(tool => (
+          <span
+            className="tool-trace-dots"
+            aria-hidden="true"
+            title={summarised
+              ? `${tools.length} 步已归并为 ${dots.length} 段显示，每段取其中最严重的一步；点击展开可看全部`
+              : undefined}
+          >
+            {dots.map((dot, index) => (
               <span
-                key={tool.id}
-                className={`tool-dot ${tool.toolState || 'done'}`}
+                key={index}
+                className={`tool-dot ${dot.state}`}
               />
             ))}
           </span>
@@ -4859,7 +4930,7 @@ function App() {
                     <strong>运行历史</strong>
                     <span className="schedule-run-history-tail">
                       {scheduleRuns.length} 次
-                      {(selectedSchedule.unseen_failures || 0) > 0 && (
+                      {(selectedSchedule.unseen_attention || 0) > 0 && (
                         <Button
                           type="link"
                           size="small"
@@ -4886,9 +4957,15 @@ function App() {
                         {run.needs_attention && (
                           <span
                             className="schedule-run-unseen"
-                            title="本次运行失败，你还没有查看"
-                            aria-label="本次运行失败，你还没有查看"
+                            title={scheduleRunAttentionReason(run)}
+                            aria-label={scheduleRunAttentionReason(run)}
                           />
+                        )}
+                        {(run.missed_count || 0) > 0 && (
+                          <span
+                            className="schedule-run-missed"
+                            title={`本次运行前有 ${run.missed_count} 次计划未能执行`}
+                          >跳过 {run.missed_count} 次</span>
                         )}
                         <span className="schedule-run-duration">{formatScheduleDuration(run.duration_ms)}</span>
                       </button>
@@ -4915,6 +4992,7 @@ function App() {
                           <Button
                             size="small"
                             icon={<CheckOutlined />}
+                            title={scheduleRunAttentionReason(selectedScheduleRun)}
                             onClick={() => acknowledgeScheduleRun(selectedSchedule, selectedScheduleRun)}
                           >标记已读</Button>
                         )}

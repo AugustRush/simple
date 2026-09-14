@@ -184,6 +184,15 @@ class BuiltinTools:
         self.registry = registry
         self.context_manager = context_manager
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
+        # The directory a person actually chose, kept apart from the cwd
+        # fallback above.  ``_active_workspace_root`` is happy to answer with
+        # the process working directory, which is fine for reading and never
+        # acceptable as the directory an unattended *write* task is pinned to.
+        self._declared_workspace_root = (
+            Path(workspace_root).expanduser().resolve(strict=False)
+            if workspace_root is not None
+            else None
+        )
         self.chapter_normalizer = chapter_normalizer or (lambda chapter: str(chapter))
         self._output_dir = output_dir
         self._injected_file_service = file_service
@@ -234,6 +243,21 @@ class BuiltinTools:
         if raw:
             return Path(str(raw)).expanduser().resolve(strict=False)
         return self.workspace_root.expanduser().resolve(strict=False)
+
+    def _chosen_workspace_root(self) -> Optional[Path]:
+        """The workspace a person picked, or ``None`` when only cwd is left.
+
+        Read the registry context first: a forked session carries the
+        directory the user opened, and that is the only value that counts as
+        *chosen*.  The process working directory is deliberately **not** a
+        fallback here -- see ``_schedule_create``, which refuses a
+        write-granting profile rather than pinning it to a directory nobody
+        can predict from the task's own definition.
+        """
+        raw = self.registry.get_context("workspace_root")
+        if raw:
+            return Path(str(raw)).expanduser().resolve(strict=False)
+        return self._declared_workspace_root
 
     def _process_output_dir(self) -> Path:
         raw = self.registry.get_context("output_dir")
@@ -700,7 +724,10 @@ class BuiltinTools:
                 "`action_type=system_job` for internal maintenance. "
                 "For once: provide `at`. For interval: provide `every`, `unit`, and `at` (anchor). "
                 "For daily or weekdays: provide `time_of_day`. For weekly: provide `day_of_week` and `time_of_day`. "
-                "For monthly: provide `day_of_month` and `time_of_day`."
+                "For monthly: provide `day_of_month` and `time_of_day`. "
+                "The run is unattended: set `permission_profile` to say what it may do "
+                "(inherit/read_only/workspace_write), and pass `workspace_root` when the "
+                "task should work in a directory other than the current session's."
             ),
             {
                 "type": "object",
@@ -763,6 +790,25 @@ class BuiltinTools:
                     "delivery_mode": {
                         "type": "string",
                         "description": "optional override: standalone or channel",
+                    },
+                    "permission_profile": {
+                        "type": "string",
+                        "description": (
+                            "What this unattended run may do. one of: inherit "
+                            "(no overrides; anything needing confirmation is refused), "
+                            "read_only (never write the workspace), "
+                            "workspace_write (write inside the workspace and run commands "
+                            "without asking -- also requires `workspace_root`). "
+                            "Defaults to inherit."
+                        ),
+                    },
+                    "workspace_root": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path of the project folder the run works in. "
+                            "Required for permission_profile=workspace_write; "
+                            "defaults to the current session's folder."
+                        ),
                     },
                 },
                 "required": ["name", "trigger_type"],
@@ -2794,6 +2840,8 @@ class BuiltinTools:
         day_of_week: Optional[str] = None,
         day_of_month: Optional[int] = None,
         delivery_mode: Optional[str] = None,
+        permission_profile: Optional[str] = None,
+        workspace_root: Optional[str] = None,
     ) -> dict[str, Any]:
         trigger = self._schedule_trigger(
             trigger_type=trigger_type,
@@ -2847,6 +2895,45 @@ class BuiltinTools:
         else:
             raise ValueError(f"Unsupported action_type '{action_type}'")
 
+        # The envelope is resolved here rather than left to the dataclass
+        # defaults.  Those defaults (``inherit`` plus the process working
+        # directory) describe a posture, but not one anybody chose: the task
+        # the user asked for in conversation would run under whatever the
+        # global config happened to say, writing wherever the gateway
+        # happened to be started from.  Naming both explicitly is what makes
+        # "which profile is this?" answerable from the task's own definition.
+        from agent.scheduler.profiles import (
+            PERMISSION_PROFILES,
+            resolve_permission_profile,
+        )
+
+        requested_profile = str(permission_profile or "").strip()
+        if requested_profile and requested_profile not in PERMISSION_PROFILES:
+            # Refused, not silently substituted.  A narrower profile would
+            # still be an envelope nobody picked, and the caller that asked
+            # for it deserves to hear that the name is wrong rather than
+            # discover the substitution when the task fails at 3am.
+            raise ValueError(
+                f"Unsupported permission_profile '{requested_profile}'; "
+                "expected one of: " + ", ".join(PERMISSION_PROFILES)
+            )
+        profile = resolve_permission_profile(requested_profile)
+
+        explicit_workspace = str(workspace_root or "").strip()
+        chosen_workspace = (
+            Path(explicit_workspace).expanduser().resolve(strict=False)
+            if explicit_workspace
+            else self._chosen_workspace_root()
+        )
+        if profile.requires_workspace_root and chosen_workspace is None:
+            raise ValueError(
+                f"权限策略「{profile.label}」需要显式指定项目文件夹，"
+                "不能回落到服务进程的当前目录"
+            )
+        task_workspace = chosen_workspace or self._active_workspace_root()
+        if task_kind == "agent_prompt" and not task_workspace.is_dir():
+            raise ValueError(f"项目文件夹不存在：{task_workspace}")
+
         store = self._schedule_store()
         new_task = NewScheduledTask(
             name=name,
@@ -2855,6 +2942,8 @@ class BuiltinTools:
             payload=payload,
             delivery_mode=resolved_mode,
             delivery_target=target,
+            workspace_root=str(task_workspace),
+            permission_profile=profile.key,
         )
         task = store.find_matching_task(new_task)
         existing = task is not None
@@ -2867,10 +2956,16 @@ class BuiltinTools:
                 "kind": task.kind,
                 "delivery_mode": task.delivery_mode,
                 "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
+                # Echoed back so the caller can confirm the envelope that was
+                # actually stored instead of assuming the defaults held.
+                "permission_profile": task.permission_profile,
+                "workspace_root": task.workspace_root,
                 "db_path": str(shared.SCHEDULER_DB_FILE),
                 "existing": existing,
             },
-            summary_text=summary_text,
+            summary_text=(
+                f"{summary_text}\n运行权限：{profile.label}；项目文件夹：{task_workspace}"
+            ),
         )
 
     def _schedule_list(self) -> dict[str, Any]:
