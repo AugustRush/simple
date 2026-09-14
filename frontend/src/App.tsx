@@ -944,7 +944,9 @@ function scheduleTimeValue(value: string) {
  */
 function describeSignalName(name: string, tasks: ScheduleInfo[] = []): string {
   const match = /^task:([^:]+):(.+)$/.exec(name || '')
-  if (!match) return name
+  // A free-form name is quoted too, so it reads as a name rather than as a
+  // word that happens to sit between two Chinese characters.
+  if (!match) return name ? `「${name}」` : name
   const [, taskId, status] = match
   const taskName = tasks.find(item => item.id === taskId)?.name || taskId
   return `「${taskName}」${scheduleRunStatusLabel(status)}`
@@ -2401,7 +2403,12 @@ function App() {
         || (scheduleStatusFilter === 'paused' && task.enabled === false)
       if (!statusMatches) return false
       if (!query) return true
-      const content = `${task.name} ${task.workspace_root || ''} ${task.payload?.prompt || task.payload?.message_text || ''}`.toLowerCase()
+      // The trigger is part of how a task is identified now that it is not
+      // only a time: "which task waits for report.ready" is a question people
+      // will ask this filter.
+      const trigger = task.trigger || {}
+      const triggerText = task.trigger_type === 'signal' ? String(trigger.name || '') : ''
+      const content = `${task.name} ${triggerText} ${task.workspace_root || ''} ${task.payload?.prompt || task.payload?.message_text || ''}`.toLowerCase()
       return content.includes(query)
     })
   }, [scheduleQuery, scheduleStatusFilter, schedules])
@@ -2819,7 +2826,7 @@ function App() {
   }
 
   const deleteSchedule = (task: ScheduleInfo) => {
-    confirmResourceDeletion('定时任务', task.name, async () => {
+    confirmResourceDeletion('任务', task.name, async () => {
       await api(`/api/schedules/${encodeURIComponent(task.id)}`, { method: 'DELETE' })
       setSchedules(prev => prev.filter(item => item.id !== task.id))
       if (selectedSchedule?.id === task.id) {
@@ -2865,7 +2872,7 @@ function App() {
       }
     }
     if (action === 'delete') {
-      confirmResourceDeletion('定时任务', `${selectedScheduleIds.length} 个所选任务`, execute)
+      confirmResourceDeletion('任务', `${selectedScheduleIds.length} 个所选任务`, execute)
     } else {
       await execute()
     }
@@ -2956,7 +2963,7 @@ function App() {
       if (selectedSchedule?.id === data.task.id) {
         setSelectedSchedule(data.task)
       }
-      messageApi.success(`定时任务“${data.task.name}”已${editingScheduleId ? '更新' : '创建'}`)
+      messageApi.success(`任务“${data.task.name}”已${editingScheduleId ? '更新' : '创建'}`)
     } catch { /* surfaced */ } finally {
       setScheduleSaving(false)
     }
@@ -3284,7 +3291,7 @@ function App() {
       // was closed.
       label: (
         <span className="nav-label">
-          定时任务
+          自动化
           {unseenFailures > 0 && (
             <span className="nav-badge" aria-label={`${unseenFailures} 次运行失败未查看`}>
               {unseenFailures > 99 ? '99+' : unseenFailures}
@@ -3315,7 +3322,10 @@ function App() {
       title: '技能',
       subtitle: `${skills.length} 个可用技能`,
     },
-    schedules: { title: '定时任务', subtitle: '管理一次性与周期性任务。' },
+    // Not "定时任务": the page now holds tasks that wait for a signal, and a
+    // name that promises a time would be wrong for them. "自动化" is what the
+    // page actually is -- work that runs without being asked each time.
+    schedules: { title: '自动化', subtitle: '管理定时执行与等待信号的任务。' },
     settings: {
       title: '设置',
       subtitle: '管理访问令牌、模型与频道',
@@ -4603,12 +4613,12 @@ function App() {
       <div className="page-head schedule-page-head">
         <div>
           <div className="schedule-title-row">
-            <h2>定时任务</h2>
+            <h2>自动化</h2>
             <span className={`scheduler-health ${schedulerHealth.status === 'online' ? 'online' : 'offline'}`}>
               <i />{schedulerHealth.status === 'online' ? '调度器在线' : '调度器离线'}
             </span>
           </div>
-          <p>安排 Agent 自动执行工作，或在指定时间发送提醒。</p>
+          <p>让 Agent 在指定时间执行，或等某个信号发生后接着执行。</p>
         </div>
         <Space>
           <Tooltip title="刷新运行状态">
@@ -5164,7 +5174,10 @@ function App() {
                       </div>
 
                       <div className="schedule-run-meta">
-                        <div><small>计划时间</small><span>{selectedScheduleRun.scheduled_for ? new Date(selectedScheduleRun.scheduled_for).toLocaleString() : '—'}</span></div>
+                        {/* A signal-triggered run has no planned time -- the
+                            value here is when the signal arrived, and calling
+                            that "计划时间" would imply a schedule it never had. */}
+                        <div><small>{selectedScheduleRun.trigger_source?.startsWith('signal:') ? '触发时间' : '计划时间'}</small><span>{selectedScheduleRun.scheduled_for ? new Date(selectedScheduleRun.scheduled_for).toLocaleString() : '—'}</span></div>
                         <div><small>开始时间</small><span>{selectedScheduleRun.started_at ? new Date(selectedScheduleRun.started_at).toLocaleString() : '—'}</span></div>
                         <div><small>完成时间</small><span>{selectedScheduleRun.finished_at ? new Date(selectedScheduleRun.finished_at).toLocaleString() : '—'}</span></div>
                         <div><small>执行耗时</small><span>{formatScheduleDuration(selectedScheduleRun.duration_ms)}</span></div>
@@ -5230,7 +5243,7 @@ function App() {
           </div>
         )}
       </Drawer>
-      {loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={schedules.length ? '没有符合条件的任务' : '暂无定时任务'} className="page-empty" /> : (
+      {loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={schedules.length ? '没有符合条件的任务' : '暂无自动化任务'} className="page-empty" /> : (
         <div className="schedule-list">
           {filteredSchedules.map(task => {
             const description = task.kind === 'agent_prompt'
