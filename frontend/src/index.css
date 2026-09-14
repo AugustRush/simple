@@ -4874,3 +4874,67 @@ html[data-theme='light'] .send-button.ant-btn-primary:disabled {
     max-width: min(118px, 34vw);
   }
 }
+
+/* ---- workflows: a chain of tasks, shown as the chain it is ---- */
+.schedule-tabs { display:flex; gap:3px; margin:0 0 12px; border-bottom:1px solid var(--border); }
+.schedule-tabs button { position:relative; padding:9px 14px; border:0; border-bottom:2px solid transparent; margin-bottom:-1px; color:var(--text-muted); background:transparent; font-size:12px; font-weight:600; cursor:pointer; transition:color .15s ease, border-color .15s ease; }
+.schedule-tabs button:hover { color:var(--text-secondary); }
+.schedule-tabs button.active { color:var(--text); border-bottom-color:var(--primary-border); }
+.schedule-tab-badge { display:inline-grid; place-items:center; min-width:16px; height:16px; margin-left:6px; padding:0 4px; border-radius:999px; color:var(--bg); background:var(--red); font-size:9px; font-weight:700; vertical-align:middle; }
+.schedule-step-origin { display:flex; align-items:center; gap:6px; margin-top:10px; color:var(--text-muted); font-size:10px; }
+.schedule-step-trigger-note { display:flex; align-items:flex-start; gap:8px; padding:11px 13px; border:1px solid var(--border); border-radius:8px; color:var(--text-secondary); background:var(--surface-hover); font-size:11px; line-height:1.6; }
+.schedule-step-trigger-note .anticon { margin-top:2px; color:var(--text-muted); }
+
+.workflow-list { display:grid; grid-template-columns:minmax(0, 1fr); gap:12px; }
+.workflow-card { min-width:0; border-radius:8px; }
+.workflow-card .ant-card-body { min-width:0; padding:16px 18px; }
+.workflow-card .schedule-card-head { margin-bottom:14px; }
+
+/* minmax above and min-width here, because a grid column sized to its content
+   lets a long chain widen the card instead of scrolling inside it -- and then
+   the whole page drifts sideways, taking the card headers with it. */
+.workflow-graph-scroll { max-width:100%; overflow-x:auto; padding:2px; }
+.workflow-graph { display:block; }
+.workflow-edge { fill:none; stroke:var(--border-strong); stroke-width:1.4px; }
+.workflow-node { cursor:pointer; }
+.workflow-node rect { fill:var(--surface-raised); stroke:var(--border); stroke-width:1px; transition:stroke .15s ease, fill .15s ease; }
+.workflow-node:hover rect { stroke:var(--border-strong); }
+.workflow-node:focus-visible { outline:none; }
+.workflow-node:focus-visible rect { stroke:var(--primary-border); }
+.workflow-node.active rect { stroke:var(--primary-border); }
+.workflow-node-dot { fill:currentColor; }
+.workflow-node-name { fill:var(--text); font-size:12px; font-weight:600; }
+.workflow-node-key { fill:var(--text-muted); font-size:10px; }
+.workflow-node.status-skipped rect { stroke-dasharray:4 3; }
+
+.workflow-step-list { display:grid; gap:2px; margin-top:14px; padding-top:12px; border-top:1px solid var(--border); }
+.workflow-step-row { display:flex; align-items:center; gap:9px; min-width:0; padding:6px 4px; border-radius:7px; }
+.workflow-step-row:hover { background:var(--surface-hover); }
+.workflow-step-dot { display:grid; place-items:center; width:22px; height:22px; flex:0 0 22px; border-radius:6px; color:var(--text-muted); background:var(--surface-hover); font-size:11px; }
+.workflow-step-main { display:flex; flex:1 1 auto; min-width:0; flex-direction:column; gap:2px; }
+.workflow-step-main strong { overflow:hidden; color:var(--text); font-size:12px; text-overflow:ellipsis; white-space:nowrap; }
+.workflow-step-main span { overflow:hidden; color:var(--text-muted); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
+
+.workflow-editor-hint { margin:0 0 12px; color:var(--text-muted); font-size:11px; line-height:1.7; }
+.workflow-step-editor { display:grid; gap:10px; margin-bottom:12px; }
+.workflow-step-card { display:grid; gap:9px; padding:12px; border:1px solid var(--border); border-radius:9px; background:var(--surface-hover); }
+.workflow-step-card-head { display:flex; align-items:center; gap:8px; }
+.workflow-step-index { display:grid; place-items:center; width:20px; height:20px; flex:0 0 20px; border-radius:6px; color:var(--text-secondary); background:var(--surface-raised); font-size:10px; font-weight:700; }
+.workflow-step-key { width:118px; flex:0 0 118px; }
+.workflow-step-name { flex:1 1 auto; min-width:0; }
+.workflow-step-card-foot { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
+.workflow-step-upstreams { display:flex; flex:1 1 260px; align-items:center; gap:8px; min-width:0; color:var(--text-muted); font-size:11px; }
+.workflow-step-upstreams > span { flex:0 0 auto; }
+.workflow-step-workspace { flex:1 1 240px; min-width:0; }
+.workflow-step-trigger { display:flex; align-items:center; flex-wrap:wrap; gap:8px; padding-top:8px; border-top:1px dashed var(--border); }
+.workflow-step-trigger-label { color:var(--text-muted); font-size:11px; }
+.workflow-step-trigger-suffix { display:grid; place-items:center; height:100%; padding:0 9px; border:1px solid var(--border); border-left:0; border-radius:0 6px 6px 0; color:var(--text-muted); background:var(--surface-raised); font-size:11px; }
+.workflow-step-trigger-stored { color:var(--text-secondary); font-size:11px; }
+.workflow-step-trigger-stored .ant-btn-link { height:auto; padding:0 2px; font-size:11px; }
+.workflow-problems { margin-top:12px; padding:11px 13px; border:1px solid color-mix(in srgb, var(--red) 38%, transparent); border-radius:8px; background:color-mix(in srgb, var(--red) 8%, transparent); }
+.workflow-problems strong { display:block; margin-bottom:6px; color:var(--red); font-size:11px; }
+.workflow-problems ul { margin:0; padding-left:18px; color:var(--text-secondary); font-size:11px; line-height:1.7; }
+
+.status-skipped { color:#8b8b93; }
+html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
+.workflow-step-status { flex:0 0 auto; color:var(--text-muted); font-size:10px; font-weight:600; white-space:nowrap; }

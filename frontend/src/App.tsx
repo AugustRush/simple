@@ -1,6 +1,7 @@
 import React, {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -41,6 +42,7 @@ import {
 import zhCN from 'antd/locale/zh_CN'
 import {
   ApiOutlined,
+  ApartmentOutlined,
   AppstoreOutlined,
   ArrowUpOutlined,
   CheckCircleFilled,
@@ -224,6 +226,73 @@ interface ScheduleInfo {
   selected_skills?: string[]
   permission_profile?: PermissionProfileKey
   unseen_attention?: number
+  // Empty for a standalone task, which most are. A step of a workflow carries
+  // both, so a task row can say where it belongs.
+  workflow_id?: string
+  step_key?: string
+}
+
+interface WorkflowStepInfo {
+  key: string
+  name: string
+  kind: string
+  payload?: Record<string, any>
+  depends_on: string[]
+  trigger_type?: string
+  trigger?: Record<string, any>
+  workspace_root?: string
+  permission_profile?: PermissionProfileKey
+  timeout_seconds?: number
+  task_id: string
+  enabled?: boolean
+  unseen_attention?: number
+  latest_run?: ScheduleRun | null
+}
+
+interface WorkflowInfo {
+  id: string
+  name: string
+  description?: string
+  enabled?: boolean
+  created_at?: string
+  updated_at?: string
+  steps: WorkflowStepInfo[]
+  unseen_attention?: number
+}
+
+interface WorkflowStepDraft {
+  key: string
+  name: string
+  kind: 'agent_prompt' | 'message'
+  content: string
+  depends_on: string[]
+  workspace_root: string
+  //: The parts of a payload that are not the content -- kept so that editing a
+  //: step's text cannot drop a key some other tool put there.
+  payload: Record<string, any>
+  //: How a step with no upstreams starts. `null` means "leave it as it is",
+  //: which is what an existing entry step sends: the graph editor does not
+  //: show a schedule, so it must not be able to overwrite one. A brand new
+  //: entry step has nothing to leave alone, so it must bring one.
+  trigger: WorkflowTriggerDraft | null
+}
+
+interface WorkflowTriggerDraft {
+  trigger_type: 'once' | 'daily' | 'weekly' | 'weekdays' | 'monthly' | 'interval' | 'signal'
+  at: string
+  every: number
+  unit: string
+  anchor_at: string
+  time_of_day: string
+  day_of_week: string
+  day_of_month: number
+  signal_name: string
+}
+
+interface WorkflowDraft {
+  name: string
+  description: string
+  steps: WorkflowStepDraft[]
 }
 
 interface SignalInfo {
@@ -934,6 +1003,273 @@ function scheduleTimeValue(value: string) {
   return dayjs().hour(hour).minute(minute).second(0).millisecond(0)
 }
 
+/** Where a step's text lives inside its payload, by kind. */
+function stepContentKey(kind: string): string {
+  return kind === 'message' ? 'message_text' : 'prompt'
+}
+
+function stepContent(kind: string, payload?: Record<string, any>): string {
+  if (!payload) return ''
+  const key = stepContentKey(kind)
+  if (typeof payload[key] === 'string') return payload[key]
+  return ''
+}
+
+function nextStepKey(steps: { key: string }[]): string {
+  const taken = new Set(steps.map(item => item.key.trim()))
+  for (let index = 1; index < 100; index += 1) {
+    const candidate = `step${index}`
+    if (!taken.has(candidate)) return candidate
+  }
+  return `step${Date.now()}`
+}
+
+function defaultWorkflowTrigger(): WorkflowTriggerDraft {
+  const at = dayjs().add(1, 'hour').startOf('minute')
+  return {
+    trigger_type: 'daily',
+    at: at.toISOString(),
+    every: 1,
+    unit: 'hours',
+    anchor_at: at.toISOString(),
+    time_of_day: '09:00',
+    day_of_week: 'monday',
+    day_of_month: at.date(),
+    signal_name: '',
+  }
+}
+
+function defaultWorkflowStep(workspaceRoot = ''): WorkflowStepDraft {
+  return {
+    key: 'step1',
+    name: '',
+    kind: 'agent_prompt',
+    content: '',
+    depends_on: [],
+    workspace_root: workspaceRoot,
+    payload: {},
+    trigger: defaultWorkflowTrigger(),
+  }
+}
+
+function defaultWorkflowDraft(workspaceRoot = ''): WorkflowDraft {
+  return {
+    name: '',
+    description: '',
+    steps: [defaultWorkflowStep(workspaceRoot)],
+  }
+}
+
+/**
+ * A stored workflow, as the editor holds it.
+ *
+ * The entry step's trigger comes back as `null` on purpose: the editor shows
+ * what it is but does not own it, and a body that omits it leaves it where the
+ * user put it. Only a step that has no upstreams and no stored trigger yet --
+ * a brand new one -- is given a trigger to fill in.
+ */
+function workflowDraftFromInfo(info: WorkflowInfo): WorkflowDraft {
+  return {
+    name: info.name,
+    description: info.description || '',
+    steps: info.steps.map(step => ({
+      key: step.key,
+      name: step.name || step.key,
+      kind: step.kind === 'message' ? 'message' : 'agent_prompt',
+      content: stepContent(step.kind, step.payload),
+      depends_on: [...(step.depends_on || [])],
+      workspace_root: step.workspace_root || '',
+      payload: { ...(step.payload || {}) },
+      trigger: null,
+    })),
+  }
+}
+
+function workflowDraftStepPayload(step: WorkflowStepDraft): Record<string, any> {
+  const key = stepContentKey(step.kind)
+  const payload: Record<string, any> = { ...step.payload }
+  // The other key is dropped rather than carried: a step that used to be a
+  // reminder and is now an Agent task should not still hold its old text.
+  delete payload[stepContentKey(step.kind === 'message' ? 'agent_prompt' : 'message')]
+  payload[key] = step.content
+  return payload
+}
+
+interface WorkflowGraphCheck {
+  order: string[]
+  problems: string[]
+}
+
+/**
+ * The same checks the backend makes, so the editor can answer before saving.
+ *
+ * Kept deliberately identical in what it refuses and how it says it: the
+ * message about a cycle names the ring, because "there is a cycle somewhere"
+ * leaves the reader to find it. This is a convenience, not the rule -- the
+ * server checks again, and it is the server's answer that counts.
+ */
+function checkWorkflowGraph(steps: WorkflowStepDraft[]): WorkflowGraphCheck {
+  const problems: string[] = []
+  const keys: string[] = []
+  const seen = new Map<string, number>()
+  steps.forEach((step, index) => {
+    const key = step.key.trim()
+    if (!key) {
+      problems.push(`第 ${index + 1} 个步骤缺少 key`)
+      keys.push('')
+      return
+    }
+    if (/\s/.test(key)) {
+      problems.push(`步骤 key「${key}」不能包含空格`)
+    }
+    if (seen.has(key)) {
+      problems.push(`步骤 key「${key}」重复了（第 ${seen.get(key)! + 1} 个和第 ${index + 1} 个）`)
+    } else {
+      seen.set(key, index)
+    }
+    keys.push(key)
+  })
+
+  const known = new Set(keys.filter(Boolean))
+  steps.forEach((step, index) => {
+    const key = keys[index] || `第 ${index + 1} 个`
+    const upstreams = step.depends_on.map(item => item.trim()).filter(Boolean)
+    const unique = new Set<string>()
+    upstreams.forEach(upstream => {
+      if (upstream === step.key.trim()) {
+        problems.push(`步骤「${key}」不能依赖自己`)
+      } else if (!known.has(upstream)) {
+        problems.push(`步骤「${key}」的上游「${upstream}」不存在`)
+      }
+      if (unique.has(upstream)) {
+        problems.push(`步骤「${key}」重复指定了上游「${upstream}」`)
+      }
+      unique.add(upstream)
+    })
+  })
+
+  // Longest-path layering, computed from the edges that are valid so far. It
+  // doubles as the order: a step whose upstreams have all been placed can be
+  // placed, and anything left over is part of a cycle.
+  const order: string[] = []
+  const pending = new Map(keys.filter(Boolean).map(key => [key, new Set<string>()]))
+  steps.forEach((step, index) => {
+    const key = keys[index]
+    if (!key || !pending.has(key)) return
+    step.depends_on.forEach(raw => {
+      const upstream = raw.trim()
+      if (upstream && upstream !== key && pending.has(upstream)) {
+        pending.get(key)!.add(upstream)
+      }
+    })
+  })
+  for (;;) {
+    const ready = [...pending.entries()]
+      .filter(([, waiting]) => waiting.size === 0)
+      .map(([key]) => key)
+    if (ready.length === 0) break
+    ready.forEach(key => {
+      order.push(key)
+      pending.delete(key)
+    })
+    pending.forEach(waiting => ready.forEach(key => waiting.delete(key)))
+  }
+  if (pending.size > 0) {
+    problems.push(`循环依赖：${describeWorkflowRing(pending)}`)
+  }
+  return { order, problems }
+}
+
+/** The ring itself, like `a → b → a`, so the reader does not have to hunt. */
+function describeWorkflowRing(pending: Map<string, Set<string>>): string {
+  const ring: string[] = []
+  let current = [...pending.keys()][0]
+  for (let hops = 0; hops <= pending.size + 1; hops += 1) {
+    ring.push(current)
+    const waiting = pending.get(current)
+    const next = waiting ? [...waiting][0] : undefined
+    if (!next) break
+    const seenAt = ring.indexOf(next)
+    if (seenAt >= 0) {
+      return [...ring.slice(seenAt), next].join(' → ')
+    }
+    current = next
+  }
+  return [...ring, ring[0]].join(' → ')
+}
+
+function workflowRequestBody(draft: WorkflowDraft) {
+  return {
+    name: draft.name.trim(),
+    description: draft.description.trim(),
+    steps: draft.steps.map(step => {
+      const body: Record<string, any> = {
+        key: step.key.trim(),
+        name: step.name.trim() || step.key.trim(),
+        kind: step.kind,
+        payload: workflowDraftStepPayload(step),
+        depends_on: step.depends_on.map(item => item.trim()).filter(Boolean),
+        workspace_root: step.workspace_root.trim(),
+      }
+      // Only a step with no upstreams has a schedule, and only a schedule the
+      // user just chose is sent. Everything else is left out so the server
+      // keeps whatever is there.
+      if (body.depends_on.length === 0 && step.trigger) {
+        const trigger = step.trigger
+        body.trigger_type = trigger.trigger_type
+        body.timezone_name = Intl.DateTimeFormat().resolvedOptions().timeZone
+        if (trigger.trigger_type === 'once') body.at = trigger.at
+        if (trigger.trigger_type === 'interval') {
+          body.every = trigger.every
+          body.unit = trigger.unit
+          body.anchor_at = trigger.anchor_at
+        }
+        if (trigger.trigger_type === 'daily' || trigger.trigger_type === 'weekdays') {
+          body.time_of_day = trigger.time_of_day
+        }
+        if (trigger.trigger_type === 'weekly') {
+          body.day_of_week = trigger.day_of_week
+          body.time_of_day = trigger.time_of_day
+        }
+        if (trigger.trigger_type === 'monthly') {
+          body.day_of_month = trigger.day_of_month
+          body.time_of_day = trigger.time_of_day
+        }
+        if (trigger.trigger_type === 'signal') body.signal_name = trigger.signal_name
+      }
+      return body
+    }),
+  }
+}
+
+/**
+ * A step's schedule in words, for the one place the editor shows one.
+ *
+ * Reads the stored trigger rather than reformatting the form: an entry step
+ * whose trigger was set elsewhere (a weekly clock, say) is shown as it is
+ * instead of being flattened into something the editor could have produced.
+ */
+function describeStepTrigger(step: WorkflowStepInfo): string {
+  const trigger = step.trigger || {}
+  const type = step.trigger_type || 'signal'
+  const time = String(trigger.time_of_day || '')
+  if (type === 'daily') return time ? `每天 ${time}` : '每天'
+  if (type === 'weekdays') return time ? `工作日 ${time}` : '工作日'
+  if (type === 'weekly') {
+    const day = WEEKDAY_OPTIONS.find(item => item.value === trigger.day_of_week)
+    return `${day ? day.label : String(trigger.day_of_week || '每周')} ${time}`.trim()
+  }
+  if (type === 'monthly') return `每月 ${trigger.day_of_month || ''} 日 ${time}`.trim()
+  if (type === 'interval') return `每 ${trigger.every || 1} ${trigger.unit === 'days' ? '天' : trigger.unit === 'weeks' ? '周' : trigger.unit === 'minutes' ? '分钟' : '小时'}`
+  if (type === 'once') {
+    return trigger.at ? `仅一次：${new Date(String(trigger.at)).toLocaleString()}` : '仅一次'
+  }
+  // A step with upstreams has no schedule of its own, and its stored trigger
+  // is the subscription that waits for them.
+  if (step.depends_on?.length) return '上游步骤完成后'
+  return trigger.name ? `信号「${trigger.name}」` : '等待信号'
+}
+
 /**
  * Turn a signal name into something a person recognizes.
  *
@@ -982,6 +1318,10 @@ function scheduleRunStatusLabel(status?: string): string {
   if (status === 'failed') return '执行失败'
   if (status === 'interrupted') return '已中断'
   if (status === 'cancelled') return '已取消'
+  // Not "已取消": nobody decided this. A step above it failed, and saying so
+  // is the difference between a chain that stopped working and a chain that
+  // somebody turned off.
+  if (status === 'skipped') return '已跳过'
   return '等待首次执行'
 }
 
@@ -1001,6 +1341,11 @@ function describeRunTrigger(run: ScheduleRun, tasks: ScheduleInfo[] = []): strin
   if (source.startsWith('signal:')) {
     const name = source.slice('signal:'.length)
     return `由信号触发 · ${describeSignalName(name, tasks)}`
+  }
+  // A skipped step carries `workflow:<step>` rather than the signal that
+  // blocked it, because the thing worth naming there is the step.
+  if (source.startsWith('workflow:')) {
+    return `上游步骤「${source.slice('workflow:'.length)}」未成功`
   }
   return '按计划运行'
 }
@@ -1080,6 +1425,196 @@ function scheduleDeliveryStatusLabel(status?: string): string {
   return status || '—'
 }
 
+/** A step of a workflow, as the picture of it needs the step. */
+interface WorkflowGraphNode {
+  key: string
+  name: string
+  kind: string
+  depends_on: string[]
+  status?: string
+  taskId?: string
+}
+
+const GRAPH_NODE_WIDTH = 178
+const GRAPH_NODE_HEIGHT = 54
+const GRAPH_COLUMN_GAP = 62
+const GRAPH_ROW_GAP = 14
+const GRAPH_PAD = 2
+
+function fitSvgLabel(text: string, maxWidth: number, fallback: string): string {
+  const value = text || fallback
+  if (estimateLabelWidth(value) <= maxWidth) return value
+  const chars = [...value]
+  for (let take = chars.length - 1; take > 0; take -= 1) {
+    const candidate = `${chars.slice(0, take).join('')}…`
+    if (estimateLabelWidth(candidate) <= maxWidth) return candidate
+  }
+  return '…'
+}
+
+/**
+ * Place each step in the column its depth puts it in.
+ *
+ * Depth is the longest path from an entry step, so a step that waits for two
+ * others sits one column past whichever of them is further along -- drawing it
+ * any earlier would mean drawing an edge backwards. Steps that already ran
+ * (or failed) keep their place: the picture is of the graph, not of how far
+ * along it got.
+ */
+function workflowGraphLayout(nodes: WorkflowGraphNode[]) {
+  const known = new Set(nodes.map(node => node.key.trim()))
+  const depths = new Map<string, number>()
+  const depthOf = (key: string, guard: Set<string>): number => {
+    const cached = depths.get(key)
+    if (cached !== undefined) return cached
+    if (guard.has(key)) return 0
+    const node = nodes.find(item => item.key.trim() === key)
+    const upstreams = (node?.depends_on || [])
+      .map(item => item.trim())
+      .filter(item => item && known.has(item) && item !== key)
+    // Written before recursing so a graph that somehow holds a cycle stops
+    // here instead of overflowing the stack.
+    depths.set(key, 0)
+    const depth = upstreams.length
+      ? 1 + Math.max(...upstreams.map(item => depthOf(item, new Set([...guard, key]))))
+      : 0
+    depths.set(key, depth)
+    return depth
+  }
+
+  const columns: string[][] = []
+  nodes.forEach(node => {
+    const key = node.key.trim()
+    const depth = Math.max(0, depthOf(key, new Set()))
+    while (columns.length <= depth) columns.push([])
+    columns[depth].push(key)
+  })
+
+  const placed = new Map<string, { x: number; y: number; node: WorkflowGraphNode }>()
+  columns.forEach((keys, column) => {
+    keys.forEach((key, row) => {
+      const node = nodes.find(item => item.key.trim() === key)!
+      placed.set(key, {
+        x: GRAPH_PAD + column * (GRAPH_NODE_WIDTH + GRAPH_COLUMN_GAP),
+        y: GRAPH_PAD + row * (GRAPH_NODE_HEIGHT + GRAPH_ROW_GAP),
+        node,
+      })
+    })
+  })
+
+  const widest = Math.max(1, ...columns.map(keys => keys.length))
+  return {
+    placed,
+    columns,
+    width: GRAPH_PAD * 2 + columns.length * GRAPH_NODE_WIDTH
+      + Math.max(0, columns.length - 1) * GRAPH_COLUMN_GAP,
+    height: GRAPH_PAD * 2 + widest * GRAPH_NODE_HEIGHT
+      + Math.max(0, widest - 1) * GRAPH_ROW_GAP,
+  }
+}
+
+/**
+ * The steps of a workflow as a picture, because a list of names cannot show
+ * that one step waits for two others and not the other way round.
+ */
+function WorkflowGraph({
+  nodes,
+  title,
+  selectedKey,
+  onSelect,
+}: {
+  nodes: WorkflowGraphNode[]
+  title: string
+  selectedKey?: string
+  onSelect?: (node: WorkflowGraphNode) => void
+}) {
+  const arrowId = `wf-arrow-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`
+  const layout = workflowGraphLayout(nodes)
+  const edges: { from: { x: number; y: number }; to: { x: number; y: number } }[] = []
+  layout.placed.forEach(({ x, y, node }, key) => {
+    ;(node.depends_on || []).map(item => item.trim()).forEach(upstream => {
+      const source = layout.placed.get(upstream)
+      if (!source || upstream === key) return
+      edges.push({
+        from: { x: source.x + GRAPH_NODE_WIDTH, y: source.y + GRAPH_NODE_HEIGHT / 2 },
+        to: { x, y: y + GRAPH_NODE_HEIGHT / 2 },
+      })
+    })
+  })
+
+  return (
+    <div className="workflow-graph-scroll">
+      <svg
+        className="workflow-graph"
+        viewBox={`0 0 ${layout.width} ${layout.height}`}
+        style={{ width: `${layout.width}px`, height: `${layout.height}px` }}
+        role="img"
+        aria-label={title}
+      >
+        <defs>
+          <marker
+            id={arrowId}
+            viewBox="0 0 8 8"
+            refX="7.2"
+            refY="4"
+            markerWidth="6.5"
+            markerHeight="6.5"
+            orient="auto-start-reverse"
+          >
+            <path d="M0,0.6 L8,4 L0,7.4 z" style={{ fill: 'var(--text-muted)' }} />
+          </marker>
+        </defs>
+        {edges.map((edge, index) => {
+          const midX = (edge.from.x + edge.to.x) / 2
+          return (
+            <path
+              key={`edge-${index}`}
+              className="workflow-edge"
+              d={`M ${edge.from.x} ${edge.from.y} C ${midX} ${edge.from.y}, ${midX} ${edge.to.y}, ${edge.to.x - 1} ${edge.to.y}`}
+              markerEnd={`url(#${arrowId})`}
+            />
+          )
+        })}
+        {[...layout.placed.entries()].map(([key, { x, y, node }]) => (
+          <g
+            key={key}
+            className={`workflow-node status-${node.status || 'pending'}${selectedKey === key ? ' active' : ''}`}
+            tabIndex={0}
+            role="button"
+            aria-label={`步骤 ${node.name || key}`}
+            onClick={() => onSelect?.(node)}
+            onKeyDown={event => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                onSelect?.(node)
+              }
+            }}
+          >
+            <rect
+              x={x}
+              y={y}
+              width={GRAPH_NODE_WIDTH}
+              height={GRAPH_NODE_HEIGHT}
+              rx="9"
+            />
+            <circle cx={x + 15} cy={y + 20} r="3.5" className="workflow-node-dot" />
+            <text x={x + 26} y={y + 24} className="workflow-node-name">
+              {fitSvgLabel(node.name || node.key, GRAPH_NODE_WIDTH - 40, node.key)}
+            </text>
+            <text x={x + 15} y={y + 42} className="workflow-node-key">
+              {fitSvgLabel(
+                `${node.key}${node.kind === 'message' ? ' · 提醒' : ''}`,
+                GRAPH_NODE_WIDTH - 30,
+                node.key,
+              )}
+            </text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  )
+}
+
 function App() {
   const [messageApi, contextHolder] = message.useMessage()
   const [themeMode, setThemeMode] = useState<string>(
@@ -1117,6 +1652,13 @@ function App() {
   const [scheduleRunOutput, setScheduleRunOutput] = useState<ScheduleRunOutput | null>(null)
   const [scheduleArtifacts, setScheduleArtifacts] = useState<ScheduleArtifact[]>([])
   const [scheduleOutputLoading, setScheduleOutputLoading] = useState(false)
+  const [workflows, setWorkflows] = useState<WorkflowInfo[]>([])
+  const [automationTab, setAutomationTab] = useState<'tasks' | 'workflows'>('tasks')
+  const [workflowModalOpen, setWorkflowModalOpen] = useState(false)
+  const [workflowSaving, setWorkflowSaving] = useState(false)
+  const [workflowDraft, setWorkflowDraft] = useState<WorkflowDraft>(defaultWorkflowDraft)
+  const [editingWorkflowId, setEditingWorkflowId] = useState<string | null>(null)
+  const [workflowQuery, setWorkflowQuery] = useState('')
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentInfo[]>([])
   const [config, setConfig] = useState<any>(null)
   const [configText, setConfigText] = useState<string>('')
@@ -2279,6 +2821,23 @@ function App() {
     }
   }, [api])
 
+  const loadWorkflows = useCallback(async (silent = false) => {
+    try {
+      if (!silent) setLoadingView(true)
+      const resp = await api('/api/workflows')
+      const data = await resp.json()
+      setWorkflows(Array.isArray(data.workflows) ? data.workflows : [])
+      if (Array.isArray(data.permission_profiles) && data.permission_profiles.length) {
+        setPermissionProfiles(data.permission_profiles)
+      }
+    } catch {
+      // Surfaced by the api helper; an unreachable list must not read as
+      // "you have no workflows", so the last known one is left standing.
+    } finally {
+      if (!silent) setLoadingView(false)
+    }
+  }, [api])
+
   const loadSchedulerHealth = useCallback(async () => {
     try {
       const resp = await api('/api/scheduler/health')
@@ -2311,6 +2870,25 @@ function App() {
     }
   }, [api])
 
+  /**
+   * The step being edited, when the task editor was opened on one.
+   *
+   * A step that has upstreams does not own its timing, so the form must stop
+   * offering one, must not send one -- the server refuses a contradicting
+   * trigger, and would refuse the form's own default of "wait for a signal"
+   * since a fan-in has no single name to show -- and must not ask for a
+   * preview of times it does not have.
+   */
+  const editingStep = useMemo(() => {
+    if (!editingScheduleId) return null
+    const task = schedules.find(item => item.id === editingScheduleId)
+    if (!task?.workflow_id) return null
+    const flow = workflows.find(item => item.id === task.workflow_id)
+    const step = flow?.steps.find(item => item.key === task.step_key)
+    if (!step) return null
+    return { flow, step, followsUpstreams: step.depends_on.length > 0 }
+  }, [editingScheduleId, schedules, workflows])
+
   useEffect(() => {
     if (!scheduleModalOpen) {
       setSchedulePreview([])
@@ -2324,6 +2902,14 @@ function App() {
       scheduleDraft.action_type === 'agent_task' && !scheduleDraft.workspace_root.trim()
     )) {
       setSchedulePreview([])
+      return
+    }
+    // A step that follows upstreams has no times to preview, and asking for
+    // them would come back as "pick a signal to wait for" -- an error about a
+    // question this form is not asking.
+    if (editingStep?.followsUpstreams) {
+      setSchedulePreview([])
+      setSchedulePreviewError('')
       return
     }
     let cancelled = false
@@ -2351,7 +2937,7 @@ function App() {
       cancelled = true
       window.clearTimeout(timer)
     }
-  }, [apiHeaders, scheduleDraft, scheduleModalOpen])
+  }, [apiHeaders, scheduleDraft, scheduleModalOpen, editingStep?.followsUpstreams])
 
   const loadScheduleRuns = useCallback(
     async (taskId: string, selectLatest = false, silent = false) => {
@@ -2412,6 +2998,24 @@ function App() {
       return content.includes(query)
     })
   }, [scheduleQuery, scheduleStatusFilter, schedules])
+
+  const filteredWorkflows = useMemo(() => {
+    const query = workflowQuery.trim().toLowerCase()
+    if (!query) return workflows
+    return workflows.filter(item => {
+      const text = [
+        item.name,
+        item.description || '',
+        ...item.steps.map(step => `${step.key} ${step.name} ${stepContent(step.kind, step.payload)}`),
+      ].join(' ').toLowerCase()
+      return text.includes(query)
+    })
+  }, [workflows, workflowQuery])
+
+  const workflowAttention = useMemo(
+    () => workflows.reduce((sum, item) => sum + (item.unseen_attention || 0), 0),
+    [workflows],
+  )
 
   const permissionProfileOptions = useMemo(
     () => (permissionProfiles.length > 0 ? permissionProfiles : KNOWN_PERMISSION_PROFILES),
@@ -2576,12 +3180,13 @@ function App() {
     if (view === 'skills') loadSkills()
     if (view === 'schedules') {
       loadSchedules()
+      loadWorkflows(true)
       loadSkills(true)
       loadSchedulerHealth()
       loadSignals()
     }
     if (view === 'settings') loadSettings()
-  }, [view, loadPlugins, loadSkills, loadSchedules, loadSchedulerHealth, loadSignals, loadSettings])
+  }, [view, loadPlugins, loadSkills, loadSchedules, loadWorkflows, loadSchedulerHealth, loadSignals, loadSettings])
 
   const createSession = async () => {
     try {
@@ -2888,6 +3493,169 @@ function App() {
     setScheduleModalOpen(true)
   }
 
+  const workflowGraph = useMemo(() => checkWorkflowGraph(workflowDraft.steps), [workflowDraft])
+
+  const openCreateWorkflow = () => {
+    setEditingWorkflowId(null)
+    setWorkflowDraft(defaultWorkflowDraft(sessionState?.workspace_root || config?.workspace_root || ''))
+    setWorkflowModalOpen(true)
+  }
+
+  const openEditWorkflow = (info: WorkflowInfo) => {
+    setEditingWorkflowId(info.id)
+    setWorkflowDraft(workflowDraftFromInfo(info))
+    setWorkflowModalOpen(true)
+  }
+
+  const patchWorkflowStep = (index: number, patch: Partial<WorkflowStepDraft>) => {
+    setWorkflowDraft(current => ({
+      ...current,
+      steps: current.steps.map((step, at) => (at === index ? { ...step, ...patch } : step)),
+    }))
+  }
+
+  const addWorkflowStep = () => {
+    setWorkflowDraft(current => {
+      const key = nextStepKey(current.steps)
+      const previous = current.steps[current.steps.length - 1]
+      return {
+        ...current,
+        steps: [
+          ...current.steps,
+          {
+            ...defaultWorkflowStep(previous?.workspace_root || ''),
+            key,
+            // Chained onto the last step, because "a step after this one" is
+            // the reason anybody is here, and re-pointing it is one click.
+            depends_on: previous?.key?.trim() ? [previous.key.trim()] : [],
+            trigger: null,
+          },
+        ],
+      }
+    })
+  }
+
+  const removeWorkflowStep = (index: number) => {
+    setWorkflowDraft(current => {
+      const removed = current.steps[index]?.key?.trim()
+      const steps = current.steps
+        .filter((_, at) => at !== index)
+        .map(step => ({
+          ...step,
+          depends_on: step.depends_on.filter(key => key.trim() !== removed),
+        }))
+      return { ...current, steps }
+    })
+  }
+
+  const saveWorkflow = async () => {
+    const check = checkWorkflowGraph(workflowDraft.steps)
+    if (!workflowDraft.name.trim()) {
+      messageApi.warning('请填写流程名称')
+      return
+    }
+    if (check.problems.length) {
+      messageApi.warning(check.problems[0])
+      return
+    }
+    const missingTrigger = workflowDraft.steps.find(
+      step => step.depends_on.filter(key => key.trim()).length === 0 && !step.trigger,
+    )
+    // Only a brand new entry step can be missing a trigger: an existing one
+    // sends none and keeps the schedule it has.
+    if (missingTrigger && !editingWorkflowId) {
+      messageApi.warning(`步骤「${missingTrigger.key}」没有上游，需要指定触发方式`)
+      return
+    }
+    if (workflowDraft.steps.some(step => !step.content.trim())) {
+      messageApi.warning('每个步骤都要有执行内容')
+      return
+    }
+    setWorkflowSaving(true)
+    try {
+      const body = workflowRequestBody(workflowDraft)
+      const resp = await api(
+        editingWorkflowId
+          ? `/api/workflows/${encodeURIComponent(editingWorkflowId)}`
+          : '/api/workflows',
+        {
+          method: editingWorkflowId ? 'PUT' : 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        },
+      )
+      const data = await resp.json()
+      if (data.error) {
+        messageApi.error(String(data.error))
+        return
+      }
+      setWorkflowModalOpen(false)
+      setEditingWorkflowId(null)
+      messageApi.success(editingWorkflowId ? '流程已保存' : '流程已创建')
+      // Steps are tasks, so both lists change: the graph gained or moved
+      // tasks, and the task list is where they are shown.
+      await Promise.all([loadWorkflows(true), loadSchedules(true)])
+    } catch {
+      // Surfaced by the api helper.
+    } finally {
+      setWorkflowSaving(false)
+    }
+  }
+
+  const deleteWorkflow = (info: WorkflowInfo) => {
+    confirmResourceDeletion('流程', info.name, async () => {
+      const resp = await api(`/api/workflows/${encodeURIComponent(info.id)}`, { method: 'DELETE' })
+      const data = await resp.json().catch(() => ({}))
+      if (data.error) {
+        messageApi.error(String(data.error))
+        return
+      }
+      await Promise.all([loadWorkflows(true), loadSchedules(true)])
+      messageApi.success('流程已删除，它的步骤已停止运行')
+    })
+  }
+
+  const toggleWorkflow = async (info: WorkflowInfo, enabled: boolean) => {
+    try {
+      // Sent as a whole-workflow switch rather than one per step: saving a
+      // workflow writes every step's enabled flag from its own, so a switch
+      // thrown on a single step would be undone by the next save.
+      const resp = await api(`/api/workflows/${encodeURIComponent(info.id)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (data.error) {
+        messageApi.error(String(data.error))
+        return
+      }
+      await Promise.all([loadWorkflows(true), loadSchedules(true)])
+    } catch { /* surfaced */ }
+  }
+
+  const runWorkflowNow = async (info: WorkflowInfo) => {
+    const entries = info.steps.filter(step => step.depends_on.length === 0 && step.task_id)
+    if (!entries.length) {
+      messageApi.warning('这个流程还没有可运行的入口步骤')
+      return
+    }
+    try {
+      // Started at the entries and only at the entries: the steps below them
+      // are waiting for those to succeed, and running them directly would be
+      // asking for a result that does not exist yet.
+      for (const step of entries) {
+        await api(`/api/schedules/${encodeURIComponent(step.task_id)}/run`, { method: 'POST' })
+      }
+      messageApi.success(
+        entries.length > 1
+          ? `已启动 ${entries.length} 个入口步骤`
+          : '入口步骤已开始运行',
+      )
+      await Promise.all([loadWorkflows(true), loadSchedules(true)])
+    } catch { /* surfaced */ }
+  }
+
   const openEditSchedule = (task: ScheduleInfo) => {
     setEditingScheduleId(task.id)
     const draft = scheduleDraftFromTask(task)
@@ -2923,7 +3691,8 @@ function App() {
       messageApi.warning(scheduleDraft.action_type === 'agent_task' ? '请填写任务执行要求' : '请填写提醒内容')
       return
     }
-    if (scheduleDraft.trigger_type === 'once') {
+    const followsUpstreams = !!editingStep?.followsUpstreams
+    if (!followsUpstreams && scheduleDraft.trigger_type === 'once') {
       if (!scheduleDraft.at || !dayjs(scheduleDraft.at).isValid()) {
         messageApi.warning('请选择执行时间')
         return
@@ -2933,15 +3702,15 @@ function App() {
         return
       }
     }
-    if (scheduleDraft.trigger_type === 'interval' && !scheduleDraft.anchor_at) {
+    if (!followsUpstreams && scheduleDraft.trigger_type === 'interval' && !scheduleDraft.anchor_at) {
       messageApi.warning('请选择首次执行时间')
       return
     }
-    if (['daily', 'weekly', 'weekdays', 'monthly'].includes(scheduleDraft.trigger_type) && !scheduleDraft.time_of_day) {
+    if (!followsUpstreams && ['daily', 'weekly', 'weekdays', 'monthly'].includes(scheduleDraft.trigger_type) && !scheduleDraft.time_of_day) {
       messageApi.warning('请选择每天的执行时间')
       return
     }
-    if (scheduleDraft.trigger_type === 'signal' && !scheduleDraft.signal_name.trim()) {
+    if (!followsUpstreams && scheduleDraft.trigger_type === 'signal' && !scheduleDraft.signal_name.trim()) {
       messageApi.warning('请选择或填写要等待的信号')
       return
     }
@@ -2950,16 +3719,37 @@ function App() {
       const target = editingScheduleId
         ? `/api/schedules/${encodeURIComponent(editingScheduleId)}`
         : '/api/schedules'
+      const body = scheduleRequestBody(scheduleDraft)
+      if (followsUpstreams) {
+        // Left out entirely rather than replaced: an omission keeps whatever
+        // the step already waits for, which is the only right answer here.
+        delete (body as Record<string, any>).trigger_type
+        delete (body as Record<string, any>).time_of_day
+        delete (body as Record<string, any>).day_of_week
+        delete (body as Record<string, any>).day_of_month
+        delete (body as Record<string, any>).at
+        delete (body as Record<string, any>).every
+        delete (body as Record<string, any>).unit
+        delete (body as Record<string, any>).anchor_at
+        delete (body as Record<string, any>).signal_name
+      }
       const resp = await api(target, {
         method: editingScheduleId ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(scheduleRequestBody(scheduleDraft)),
+        body: JSON.stringify(body),
       })
       const data = await resp.json()
+      if (data.error) {
+        messageApi.error(String(data.error))
+        return
+      }
       setScheduleModalOpen(false)
       setEditingScheduleId(null)
       setScheduleDraft(defaultScheduleDraft(sessionState?.workspace_root || config?.workspace_root || ''))
       await loadSchedules()
+      // A step's edit was copied back into its graph, so the picture of that
+      // graph is stale until it is read again.
+      if (editingStep) await loadWorkflows(true)
       if (selectedSchedule?.id === data.task.id) {
         setSelectedSchedule(data.task)
       }
@@ -4608,6 +5398,390 @@ function App() {
     </div>
   )
 
+  const editingWorkflow = useMemo(
+    () => workflows.find(item => item.id === editingWorkflowId) || null,
+    [workflows, editingWorkflowId],
+  )
+
+  const openStepDetails = (step: WorkflowStepInfo) => {
+    const task = schedules.find(item => item.id === step.task_id)
+    if (task) openScheduleDetails(task)
+    else messageApi.info('这一步的任务暂时读不到，先刷新一下')
+  }
+
+  const renderWorkflowTriggerEditor = (index: number, trigger: WorkflowTriggerDraft) => (
+    <div className="workflow-step-trigger">
+      <span className="workflow-step-trigger-label">入口触发</span>
+      <Space wrap size={8}>
+        <Select
+          value={trigger.trigger_type}
+          onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, trigger_type: value } })}
+          options={[
+            { value: 'daily', label: '每天' },
+            { value: 'weekdays', label: '工作日' },
+            { value: 'weekly', label: '每周' },
+            { value: 'monthly', label: '每月' },
+            { value: 'interval', label: '固定间隔' },
+            { value: 'once', label: '指定时间' },
+            { value: 'signal', label: '等某个信号' },
+          ]}
+          style={{ width: 132 }}
+        />
+        {trigger.trigger_type === 'weekly' && (
+          <Select
+            value={trigger.day_of_week}
+            onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, day_of_week: value } })}
+            options={WEEKDAY_OPTIONS}
+            style={{ width: 96 }}
+          />
+        )}
+        {trigger.trigger_type === 'monthly' && (
+          <Space.Compact>
+            <InputNumber
+              min={1}
+              max={31}
+              value={trigger.day_of_month || 1}
+              onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, day_of_month: Number(value || 1) } })}
+              style={{ width: 74 }}
+            />
+            <span className="workflow-step-trigger-suffix">日</span>
+          </Space.Compact>
+        )}
+        {['daily', 'weekdays', 'weekly', 'monthly'].includes(trigger.trigger_type) && (
+          <TimePicker
+            format="HH:mm"
+            minuteStep={5}
+            value={scheduleTimeValue(trigger.time_of_day)}
+            onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, time_of_day: value?.format('HH:mm') || '' } })}
+            style={{ width: 104 }}
+          />
+        )}
+        {trigger.trigger_type === 'interval' && (
+          <Space.Compact>
+            <InputNumber
+              min={1}
+              max={999}
+              value={trigger.every}
+              onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, every: Number(value || 1) } })}
+              style={{ width: 72 }}
+            />
+            <Select
+              value={trigger.unit}
+              onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, unit: value } })}
+              options={[
+                { value: 'minutes', label: '分钟' },
+                { value: 'hours', label: '小时' },
+                { value: 'days', label: '天' },
+                { value: 'weeks', label: '周' },
+              ]}
+              style={{ width: 88 }}
+            />
+          </Space.Compact>
+        )}
+        {trigger.trigger_type === 'once' && (
+          <DatePicker
+            showTime={{ format: 'HH:mm' }}
+            format="M月D日 HH:mm"
+            value={trigger.at ? dayjs(trigger.at) : null}
+            onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, at: value?.toISOString() || '' } })}
+            disabledDate={current => !!current && current.endOf('day').valueOf() < Date.now()}
+            style={{ width: 176 }}
+          />
+        )}
+        {trigger.trigger_type === 'signal' && (
+          <AutoComplete
+            value={trigger.signal_name}
+            onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, signal_name: String(value || '') } })}
+            placeholder="信号名"
+            options={signals.map(item => ({ value: item.name, label: describeSignalName(item.name, schedules) }))}
+            filterOption={(input, option) => String(option?.value || '').toLowerCase().includes(String(input || '').toLowerCase())}
+            style={{ width: 220 }}
+          />
+        )}
+      </Space>
+    </div>
+  )
+
+  const renderWorkflows = () => (
+    <>
+      <Modal
+        open={workflowModalOpen}
+        title={editingWorkflowId ? '编辑流程' : '新建流程'}
+        width={860}
+        okText={editingWorkflowId ? '保存流程' : '创建流程'}
+        cancelText="取消"
+        confirmLoading={workflowSaving}
+        okButtonProps={{ disabled: workflowGraph.problems.length > 0 }}
+        onCancel={() => {
+          setWorkflowModalOpen(false)
+          setEditingWorkflowId(null)
+        }}
+        onOk={saveWorkflow}
+        className="schedule-modal workflow-modal"
+      >
+        <div className="schedule-form">
+          <div className="schedule-field-grid">
+            <div className="schedule-field">
+              <label>流程名称</label>
+              <Input
+                maxLength={60}
+                placeholder="例如：夜间报告"
+                value={workflowDraft.name}
+                onChange={event => setWorkflowDraft({ ...workflowDraft, name: event.target.value })}
+              />
+            </div>
+            <div className="schedule-field">
+              <label>说明</label>
+              <Input
+                maxLength={200}
+                placeholder="这条链在做什么"
+                value={workflowDraft.description}
+                onChange={event => setWorkflowDraft({ ...workflowDraft, description: event.target.value })}
+              />
+            </div>
+          </div>
+
+          <div className="schedule-form-section-title">步骤与依赖</div>
+          <p className="workflow-editor-hint">
+            每一步都是一个任务。把「上游」留空的步骤是入口，它需要自己的触发方式；
+            填了上游的步骤等上游全部成功后才运行，所以不需要时间。
+          </p>
+
+          <div className="workflow-step-editor">
+            {workflowDraft.steps.map((step, index) => {
+              const stored = editingWorkflow?.steps.find(item => item.key === step.key)
+              const optionKeys = workflowDraft.steps
+                .map((item, at) => ({ key: item.key.trim(), at }))
+                .filter(item => item.key && item.at !== index)
+              return (
+                <div className="workflow-step-card" key={`step-${index}`}>
+                  <div className="workflow-step-card-head">
+                    <span className="workflow-step-index">{index + 1}</span>
+                    <Input
+                      className="workflow-step-key"
+                      maxLength={40}
+                      placeholder="key"
+                      value={step.key}
+                      onChange={event => patchWorkflowStep(index, { key: event.target.value })}
+                    />
+                    <Input
+                      className="workflow-step-name"
+                      maxLength={60}
+                      placeholder="步骤名称"
+                      value={step.name}
+                      onChange={event => patchWorkflowStep(index, { name: event.target.value })}
+                    />
+                    <Select
+                      value={step.kind}
+                      onChange={value => patchWorkflowStep(index, { kind: value })}
+                      options={[
+                        { value: 'agent_prompt', label: 'Agent 任务' },
+                        { value: 'message', label: '提醒' },
+                      ]}
+                      style={{ width: 124 }}
+                    />
+                    <Tooltip title={workflowDraft.steps.length > 1 ? '删除这一步' : '流程至少要有一个步骤'}>
+                      <Button
+                        type="text"
+                        danger
+                        icon={<DeleteOutlined />}
+                        disabled={workflowDraft.steps.length <= 1}
+                        onClick={() => removeWorkflowStep(index)}
+                      />
+                    </Tooltip>
+                  </div>
+                  <TextArea
+                    rows={3}
+                    maxLength={6000}
+                    placeholder={step.kind === 'message' ? '到这一步时发送的内容' : '这一步要完成的工作'}
+                    value={step.content}
+                    onChange={event => patchWorkflowStep(index, { content: event.target.value })}
+                  />
+                  <div className="workflow-step-card-foot">
+                    <label className="workflow-step-upstreams">
+                      <span>上游</span>
+                      <Select
+                        mode="multiple"
+                        allowClear
+                        placeholder="留空 = 入口步骤"
+                        value={step.depends_on}
+                        onChange={value => patchWorkflowStep(index, { depends_on: value })}
+                        options={optionKeys.map(item => ({ value: item.key, label: item.key }))}
+                        optionFilterProp="label"
+                        style={{ minWidth: 220, flex: '1 1 220px' }}
+                      />
+                    </label>
+                    <Input
+                      prefix={<FolderOpenOutlined />}
+                      placeholder="项目目录（留空跟随入口步骤）"
+                      value={step.workspace_root}
+                      onChange={event => patchWorkflowStep(index, { workspace_root: event.target.value })}
+                      className="workflow-step-workspace"
+                    />
+                  </div>
+                  {step.depends_on.filter(key => key.trim()).length === 0 && (
+                    step.trigger
+                      ? renderWorkflowTriggerEditor(index, step.trigger)
+                      : (
+                        <div className="workflow-step-trigger workflow-step-trigger-stored">
+                          <span className="workflow-step-trigger-label">入口触发</span>
+                          <span>{stored ? describeStepTrigger(stored) : '保持原样'}</span>
+                          <Button
+                            type="link"
+                            size="small"
+                            onClick={() => {
+                              if (!stored) return
+                              const task = schedules.find(item => item.id === stored.task_id)
+                              if (task) {
+                                setWorkflowModalOpen(false)
+                                openEditSchedule(task)
+                              }
+                            }}
+                          >
+                            改时间
+                          </Button>
+                        </div>
+                      )
+                  )}
+                </div>
+              )
+            })}
+          </div>
+
+          <Button type="dashed" block icon={<PlusOutlined />} onClick={addWorkflowStep}>
+            添加步骤
+          </Button>
+
+          {workflowGraph.problems.length > 0 && (
+            <div className="workflow-problems" role="alert">
+              <strong>这条链还不能保存</strong>
+              <ul>{workflowGraph.problems.map(item => <li key={item}>{item}</li>)}</ul>
+            </div>
+          )}
+
+          {workflowDraft.steps.length > 0 && workflowGraph.problems.length === 0 && (
+            <>
+              <div className="schedule-form-section-title">依赖关系</div>
+              <WorkflowGraph
+                nodes={workflowDraft.steps.map((step, index) => ({
+                  key: step.key.trim() || `第${index + 1}步`,
+                  name: step.name.trim() || step.key.trim() || `第 ${index + 1} 步`,
+                  kind: step.kind,
+                  depends_on: step.depends_on,
+                }))}
+                title="将要保存的步骤依赖关系"
+              />
+            </>
+          )}
+        </div>
+      </Modal>
+
+      {loadingView && workflows.length === 0 ? (
+        <Skeleton active paragraph={{ rows: 6 }} />
+      ) : filteredWorkflows.length === 0 ? (
+        <Empty
+          description={workflows.length
+            ? '没有符合条件的流程'
+            : '还没有流程。流程把几个任务串成一条链：上一步成功，下一步才运行。'}
+          className="page-empty"
+        />
+      ) : (
+        <div className="workflow-list">
+          {filteredWorkflows.map(flow => (
+            <Card key={flow.id} className={`workflow-card ${flow.enabled === false ? 'schedule-card-disabled' : ''}`}>
+              <div className="schedule-card-head">
+                <div className="schedule-card-title">
+                  <span className="schedule-card-icon"><ApartmentOutlined /></span>
+                  <div>
+                    <strong>{flow.name}</strong>
+                    <span>
+                      {flow.steps.length} 个步骤
+                      {flow.description ? ` · ${flow.description}` : ''}
+                    </span>
+                  </div>
+                </div>
+                <Space>
+                  {(flow.unseen_attention || 0) > 0 && (
+                    <Tag color="error">{flow.unseen_attention} 条待处理</Tag>
+                  )}
+                  <Tooltip title={flow.enabled === false ? '启用这个流程' : '暂停这个流程'}>
+                    <Switch
+                      size="small"
+                      checked={flow.enabled !== false}
+                      onChange={value => toggleWorkflow(flow, value)}
+                    />
+                  </Tooltip>
+                  <Tooltip title={schedulerHealth.status === 'online' ? '从现在开始跑一遍入口步骤' : '调度器离线'}>
+                    <Button
+                      type="text"
+                      icon={<ThunderboltOutlined />}
+                      aria-label={`立即运行 ${flow.name}`}
+                      disabled={schedulerHealth.status !== 'online' || flow.enabled === false}
+                      onClick={() => runWorkflowNow(flow)}
+                    />
+                  </Tooltip>
+                  <Tooltip title="编辑流程">
+                    <Button type="text" icon={<EditOutlined />} aria-label={`编辑 ${flow.name}`} onClick={() => openEditWorkflow(flow)} />
+                  </Tooltip>
+                  <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteWorkflow(flow)}>删除</Button>
+                </Space>
+              </div>
+
+              <WorkflowGraph
+                nodes={flow.steps.map(step => ({
+                  key: step.key,
+                  name: step.name || step.key,
+                  kind: step.kind,
+                  depends_on: step.depends_on || [],
+                  status: step.latest_run?.status,
+                  taskId: step.task_id,
+                }))}
+                title={`流程「${flow.name}」的步骤依赖关系`}
+                onSelect={node => {
+                  const step = flow.steps.find(item => item.key === node.key)
+                  if (step) openStepDetails(step)
+                }}
+              />
+
+              <div className="workflow-step-list">
+                {flow.steps.map(step => (
+                  <div className="workflow-step-row" key={step.key}>
+                    <span className={`workflow-step-dot status-${step.latest_run?.status || 'pending'}`}>
+                      {scheduleRunStatusIcon(step.latest_run?.status)}
+                    </span>
+                    <div className="workflow-step-main">
+                      <strong>{step.name || step.key}</strong>
+                      <span>
+                        {step.key} · {step.kind === 'message' ? '提醒' : 'Agent 任务'} · {describeStepTrigger(step)}
+                      </span>
+                    </div>
+                    {(step.unseen_attention || 0) > 0 && (
+                      <span className="schedule-run-unseen" aria-label="有未读的运行结果" />
+                    )}
+                    {step.latest_run && (
+                      <span className={`workflow-step-status status-${step.latest_run.status}`}>
+                        {scheduleRunStatusLabel(step.latest_run.status)}
+                      </span>
+                    )}
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<FileTextOutlined />}
+                      disabled={!step.task_id}
+                      onClick={() => openStepDetails(step)}
+                    >
+                      运行记录
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </Card>
+          ))}
+        </div>
+      )}
+    </>
+  )
+
   const renderSchedules = () => (
     <div className="page-view schedules-view">
       <div className="page-head schedule-page-head">
@@ -4618,44 +5792,88 @@ function App() {
               <i />{schedulerHealth.status === 'online' ? '调度器在线' : '调度器离线'}
             </span>
           </div>
-          <p>让 Agent 在指定时间执行，或等某个信号发生后接着执行。</p>
+          <p>
+            {automationTab === 'tasks'
+              ? '让 Agent 在指定时间执行，或等某个信号发生后接着执行。'
+              : '把几个任务串成一条链：上一步完成后，下一步才运行。'}
+          </p>
         </div>
         <Space>
           <Tooltip title="刷新运行状态">
             <Button
               aria-label="刷新运行状态"
               icon={<ReloadOutlined />}
-              onClick={() => loadSchedules()}
+              onClick={() => {
+                void loadSchedules()
+                if (automationTab === 'workflows') void loadWorkflows()
+              }}
             />
           </Tooltip>
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreateSchedule}>新建任务</Button>
+          {automationTab === 'tasks'
+            ? <Button type="primary" icon={<PlusOutlined />} onClick={openCreateSchedule}>新建任务</Button>
+            : <Button type="primary" icon={<PlusOutlined />} onClick={openCreateWorkflow}>新建流程</Button>}
         </Space>
       </div>
+      <div className="schedule-tabs" role="tablist" aria-label="自动化视图">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={automationTab === 'tasks'}
+          className={automationTab === 'tasks' ? 'active' : ''}
+          onClick={() => setAutomationTab('tasks')}
+        >
+          任务
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={automationTab === 'workflows'}
+          className={automationTab === 'workflows' ? 'active' : ''}
+          onClick={() => setAutomationTab('workflows')}
+        >
+          流程
+          {workflowAttention > 0 && <span className="schedule-tab-badge">{workflowAttention}</span>}
+        </button>
+      </div>
       <div className="schedule-toolbar">
-        <Input
-          allowClear
-          prefix={<SearchOutlined />}
-          placeholder="搜索任务、项目目录或执行内容"
-          value={scheduleQuery}
-          onChange={event => setScheduleQuery(event.target.value)}
-        />
-        <div className="schedule-filter" role="group" aria-label="任务状态筛选">
-          {[
-            ['all', '全部'],
-            ['running', '运行中'],
-            ['failed', '失败'],
-            ['paused', '已暂停'],
-          ].map(([value, label]) => (
-            <button key={value} type="button" className={scheduleStatusFilter === value ? 'active' : ''} onClick={() => setScheduleStatusFilter(value)}>{label}</button>
-          ))}
-        </div>
-        {selectedScheduleIds.length > 0 && (
-          <Space className="schedule-bulk-actions">
-            <span>已选 {selectedScheduleIds.length} 个</span>
-            <Button size="small" onClick={() => bulkScheduleAction('enable')}>启用</Button>
-            <Button size="small" onClick={() => bulkScheduleAction('disable')}>暂停</Button>
-            <Button size="small" danger icon={<DeleteOutlined />} onClick={() => bulkScheduleAction('delete')}>删除</Button>
-          </Space>
+        {automationTab === 'tasks' ? (
+          <Input
+            allowClear
+            prefix={<SearchOutlined />}
+            placeholder="搜索任务、项目目录或执行内容"
+            value={scheduleQuery}
+            onChange={event => setScheduleQuery(event.target.value)}
+          />
+        ) : (
+          <Input
+            allowClear
+            prefix={<SearchOutlined />}
+            placeholder="搜索流程、步骤名称或执行内容"
+            value={workflowQuery}
+            onChange={event => setWorkflowQuery(event.target.value)}
+          />
+        )}
+        {automationTab === 'tasks' && (
+          <>
+            <div className="schedule-filter" role="group" aria-label="任务状态筛选">
+              {[
+                ['all', '全部'],
+                ['running', '运行中'],
+                ['failed', '失败'],
+                ['paused', '已暂停'],
+              ].map(([value, label]) => (
+                <button key={value} type="button" className={scheduleStatusFilter === value ? 'active' : ''} onClick={() => setScheduleStatusFilter(value)}>{label}</button>
+              ))}
+            </div>
+            {selectedScheduleIds.length > 0 && (
+              <Space className="schedule-bulk-actions">
+                <span>已选 {selectedScheduleIds.length} 个</span>
+                <Button size="small" onClick={() => bulkScheduleAction('enable')}>启用</Button>
+                <Button size="small" onClick={() => bulkScheduleAction('disable')}>暂停</Button>
+                <Button size="small" danger icon={<DeleteOutlined />} onClick={() => bulkScheduleAction('delete')}>删除</Button>
+              </Space>
+            )}
+          </>
         )}
       </div>
       {/* Not "定时任务" any more, because the form no longer only offers
@@ -4786,6 +6004,29 @@ function App() {
             </>
           )}
 
+          {/* A step that follows upstreams has no schedule of its own: it runs
+              when they succeed. Showing a schedule picker here would offer a
+              choice the server refuses, and a wrong one would detach the step
+              from the chain it is part of. */}
+          {editingStep?.followsUpstreams ? (
+            <>
+              <div className="schedule-form-section-title">触发方式</div>
+              <div className="schedule-field">
+                <div className="schedule-step-trigger-note">
+                  <ApartmentOutlined />
+                  <span>
+                    这一步属于流程「{editingStep.flow?.name}」，在上游步骤
+                    {editingStep.step.depends_on.map(key => `「${key}」`).join('、')}
+                    成功后才运行，没有自己的执行时间。
+                  </span>
+                </div>
+                <small className="schedule-field-hint">
+                  依赖关系在「流程」里编辑；确认上游都成功是运行的前提。
+                </small>
+              </div>
+            </>
+          ) : (
+            <>
           <div className="schedule-form-section-title">
             {scheduleDraft.trigger_type === 'signal' ? '触发方式' : '执行时间'}
           </div>
@@ -4925,6 +6166,8 @@ function App() {
               </div>
             </div>
           )}
+            </>
+          )}
 
           <div className="schedule-field">
             <label>{scheduleDraft.action_type === 'agent_task' ? '任务执行要求' : '提醒内容'}</label>
@@ -4993,8 +6236,14 @@ function App() {
           )}
 
           <div className="schedule-preview">
-            <div><ClockCircleOutlined /><strong>{scheduleDraft.trigger_type === 'signal' ? '触发条件' : '未来执行时间'}</strong></div>
-            {scheduleDraft.trigger_type === 'signal' ? (
+            <div><ClockCircleOutlined /><strong>{editingStep?.followsUpstreams ? '触发条件' : scheduleDraft.trigger_type === 'signal' ? '触发条件' : '未来执行时间'}</strong></div>
+            {editingStep?.followsUpstreams ? (
+              <span>
+                上游步骤
+                {editingStep.step.depends_on.map(key => `「${key}」`).join('、')}
+                全部成功后才运行，没有固定时间。
+              </span>
+            ) : scheduleDraft.trigger_type === 'signal' ? (
               // No list of times to show, and showing an empty one would read
               // as "this will never run" rather than "this waits".
               <span>
@@ -5243,7 +6492,8 @@ function App() {
           </div>
         )}
       </Drawer>
-      {loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={schedules.length ? '没有符合条件的任务' : '暂无自动化任务'} className="page-empty" /> : (
+      {automationTab === 'workflows' ? renderWorkflows() : (
+      loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={schedules.length ? '没有符合条件的任务' : '暂无自动化任务'} className="page-empty" /> : (
         <div className="schedule-list">
           {filteredSchedules.map(task => {
             const description = task.kind === 'agent_prompt'
@@ -5252,6 +6502,16 @@ function App() {
                 ? task.payload?.job_name
                 : task.payload?.message_text
             const latestRun = task.latest_run
+            // A step of a workflow is a task like any other, so it is listed
+            // like one -- but two of the controls here would be wrong on it.
+            // Deleting it would leave the steps below subscribed to a signal
+            // nobody emits, and its own switch is rewritten from the
+            // workflow's on the next save. The workflow card is where both
+            // belong, so this card says where it comes from instead.
+            const owningWorkflow = task.workflow_id
+              ? workflows.find(item => item.id === task.workflow_id)
+              : undefined
+            const isStep = !!task.workflow_id
             return (
               <Card
                 key={task.id}
@@ -5285,12 +6545,37 @@ function App() {
                         ? [...prev, task.id]
                         : prev.filter(id => id !== task.id))}
                     />
-                    <Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} />
-                    <Tooltip title={schedulerHealth.status === 'online' ? '立即运行' : '调度器离线'}><Button type="text" icon={<ThunderboltOutlined />} disabled={schedulerHealth.status !== 'online' || !!task.active_run_id} onClick={() => runScheduleNow(task)} /></Tooltip>
-                    <Tooltip title="编辑"><Button type="text" icon={<EditOutlined />} onClick={() => openEditSchedule(task)} /></Tooltip>
-                    <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button>
+                    {!isStep && (
+                      <Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} />
+                    )}
+                    <Tooltip title={schedulerHealth.status === 'online' ? '立即运行' : '调度器离线'}><Button type="text" icon={<ThunderboltOutlined />} aria-label={`立即运行 ${task.name}`} disabled={schedulerHealth.status !== 'online' || !!task.active_run_id} onClick={() => runScheduleNow(task)} /></Tooltip>
+                    <Tooltip title={isStep ? '编辑这一步的内容' : '编辑'}><Button type="text" icon={<EditOutlined />} aria-label={`编辑 ${task.name}`} onClick={() => openEditSchedule(task)} /></Tooltip>
+                    {isStep ? (
+                      <Tooltip title="这一步属于一个流程，请到流程里删除它">
+                        <Button
+                          type="text"
+                          icon={<ApartmentOutlined />}
+                          aria-label={`查看 ${task.name} 所属的流程`}
+                          onClick={() => {
+                            setWorkflowQuery('')
+                            setAutomationTab('workflows')
+                          }}
+                        >流程</Button>
+                      </Tooltip>
+                    ) : (
+                      <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button>
+                    )}
                   </Space>
                 </div>
+                {isStep && (
+                  <div className="schedule-step-origin">
+                    <ApartmentOutlined />
+                    <span>
+                      流程「{owningWorkflow?.name || '未知'}」
+                      {task.step_key ? ` · 步骤 ${task.step_key}` : ''}
+                    </span>
+                  </div>
+                )}
                 <p className="schedule-card-description">{description || '暂无任务描述'}</p>
                 <div className="schedule-card-footer">
                   <span className={`schedule-run-status status-${latestRun?.status || 'pending'}`}>
@@ -5308,7 +6593,7 @@ function App() {
             )
           })}
         </div>
-      )}
+      ))}
     </div>
   )
 
