@@ -2815,3 +2815,74 @@ def test_web_editing_a_step_task_does_not_detach_it_from_its_workflow(
         }
         assert placed[analyze["task_id"]]["workflow_id"] == created["id"]
         assert placed[analyze["task_id"]]["step_key"] == "analyze"
+
+
+def test_web_refuses_to_delete_or_pause_one_step_of_a_workflow(
+    tmp_path, monkeypatch
+):
+    """Both would be undone, or would break the chain, so both are refused.
+
+    Deleting a step leaves the steps below it subscribed to a signal nobody
+    emits, and the next save of the workflow builds a fresh task for it -- so
+    the history the deletion was about reappears under a new id.  Pausing one
+    is rewritten from the workflow's own flag on the next save.  Either way the
+    graph is where the answer is, and the message has to say so.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        analyze = next(item for item in created["steps"] if item["key"] == "analyze")
+
+        removed = client.delete(f"/api/schedules/{analyze['task_id']}")
+        assert removed.status_code == 409
+        assert "流程中的步骤" in removed.json()["error"]
+
+        paused = client.patch(
+            f"/api/schedules/{analyze['task_id']}", json={"enabled": False}
+        )
+        assert paused.status_code == 409
+        assert "请暂停整个流程" in paused.json()["error"]
+
+        assert len(client.get("/api/schedules").json()["tasks"]) == 3
+
+        bulk = client.patch(
+            "/api/schedules",
+            json={"action": "delete", "task_ids": [item["task_id"] for item in created["steps"]]},
+        ).json()
+        assert bulk["completed"] == []
+        assert {item["reason"] for item in bulk["skipped"]} == {"workflow_step"}
+        assert len(client.get("/api/schedules").json()["tasks"]) == 3
+
+
+def test_web_pausing_a_whole_workflow_stops_all_of_its_steps(tmp_path, monkeypatch):
+    """The switch that holds, because it is the one the save writes from."""
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+
+        paused = client.put(
+            f"/api/workflows/{created['id']}", json={"enabled": False}
+        )
+        assert paused.status_code == 200, paused.text
+        steps = paused.json()["workflow"]["steps"]
+        assert all(item["enabled"] is False for item in steps)
+        # And the graph is intact: pausing is not deleting.
+        assert [item["key"] for item in steps] == ["collect", "analyze", "publish"]
+
+        resumed = client.put(
+            f"/api/workflows/{created['id']}", json={"enabled": True}
+        )
+        assert resumed.status_code == 200, resumed.text
+        assert all(item["enabled"] is True for item in resumed.json()["workflow"]["steps"])

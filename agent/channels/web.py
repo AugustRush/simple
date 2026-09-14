@@ -1849,6 +1849,22 @@ class WebChannel(Channel):
                 return JSONResponse(
                     {"error": "任务正在运行，请先取消运行"}, status_code=409
                 )
+            if task is not None and task.workflow_id:
+                # Removing a step on its own would leave the steps below it
+                # subscribed to a signal nobody emits any more, and the next
+                # save of the workflow would build a fresh task for the step --
+                # so the run history the deletion was meant to tidy up would
+                # reappear under a new id.  Which step a graph should have is
+                # the graph's question to answer.
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"「{task.name}」是流程中的步骤，"
+                            "请到流程里删除该步骤，或删除整个流程"
+                        )
+                    },
+                    status_code=409,
+                )
             ok = task is not None
             store.delete_task(task_id)
         finally: store.close()
@@ -1862,7 +1878,23 @@ class WebChannel(Channel):
         if not isinstance(body, dict) or "enabled" not in body: return JSONResponse({"error": "enabled is required"}, status_code=400)
         from agent.scheduler import SchedulerStore
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
-        try: store.set_enabled(str(request.path_params["task_id"]), bool(body["enabled"]))
+        try:
+            task_id = str(request.path_params["task_id"])
+            task = store.get_task(task_id)
+            if task is not None and task.workflow_id:
+                # Saving a workflow writes every step's enabled flag from the
+                # workflow's own, so a switch thrown on one step would be undone
+                # by the next save.  Refusing says why; accepting would not.
+                return JSONResponse(
+                    {
+                        "error": (
+                            f"「{task.name}」是流程中的步骤，"
+                            "请暂停整个流程，或到流程里删除该步骤"
+                        )
+                    },
+                    status_code=409,
+                )
+            store.set_enabled(task_id, bool(body["enabled"]))
         finally: store.close()
         return JSONResponse({"ok": True, "enabled": bool(body["enabled"])})
 
@@ -2014,7 +2046,19 @@ class WebChannel(Channel):
                     if task.active_run_id:
                         skipped.append({"id": task_id, "reason": "running"})
                         continue
+                    if task.workflow_id:
+                        # Same reason as deleting one on its own: the graph,
+                        # not the task list, decides which steps exist.
+                        skipped.append({"id": task_id, "reason": "workflow_step"})
+                        continue
                     store.delete_task(task_id)
+                elif task.workflow_id:
+                    # A step's own switch is rewritten from its workflow's every
+                    # time that workflow is saved, so flipping it here would be
+                    # a promise the next save breaks.  Pausing the workflow is
+                    # the switch that holds.
+                    skipped.append({"id": task_id, "reason": "workflow_step"})
+                    continue
                 else:
                     store.set_enabled(task_id, action == "enable")
                 completed.append(task_id)
