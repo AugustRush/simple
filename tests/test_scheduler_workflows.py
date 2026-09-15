@@ -2128,3 +2128,47 @@ def test_the_tool_clamps_against_the_budget_the_core_publishes(tmp_path):
     finally:
         store.close()
 
+
+def test_an_automatic_retry_keeps_the_upstreams_the_run_was_told_about(tmp_path):
+    """The retry queue is the one road to a run that does not pass through the
+    claim that derives arrivals -- it copies the failed run's own snapshot.
+
+    That only works because the claim filled it in first, so the two halves
+    have to hold together: a manual run gets its upstreams from the graph, and
+    the retry of that run inherits them rather than starting from nothing.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+
+        claimed = store.claim_task_now(
+            tasks["analyze"].id, now=NOW + timedelta(hours=1)
+        )
+        assert claimed is not None
+        # End it the way a failure does: terminal, and the task released.
+        store._conn.execute(
+            "UPDATE scheduled_task_runs SET status = 'failed' WHERE id = ?",
+            (claimed.run.id,),
+        )
+        store._conn.execute(
+            "UPDATE scheduled_tasks SET active_run_id = NULL WHERE id = ?",
+            (tasks["analyze"].id,),
+        )
+        store._conn.commit()
+
+        queued = store.enqueue_retry(
+            tasks["analyze"].id,
+            claimed.run.id,
+            retry_at=NOW + timedelta(hours=2),
+        )
+
+        assert queued is not None
+        assert queued.trigger_source == "automatic_retry"
+        signals = queued.config_snapshot["signals"]
+        assert [item["payload"]["step_key"] for item in signals] == ["collect"]
+    finally:
+        store.close()
+

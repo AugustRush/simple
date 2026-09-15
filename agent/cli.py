@@ -555,9 +555,8 @@ def _scheduler_print_task_table(tasks: list) -> None:
 def _describe_upstream_results(snapshot: dict) -> str:
     """What the steps above this run produced, as a prompt block.
 
-    A run woken by a signal is told that its upstreams succeeded and nothing
-    else, so without this the step below knows *that* work happened and not
-    what it produced.  The block hands over the *address* of each result rather
+    Without this, a run knows only *that* its upstreams succeeded and not what
+    they produced.  The block hands over the *address* of each result rather
     than the result: a step's output can be kilobytes, the run's context budget
     is finite, and a pointer costs a line.  A step that needs the text reads it
     with ``read_step_output`` or straight from the path.

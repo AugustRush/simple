@@ -1394,6 +1394,41 @@ def test_scheduler_standalone_delivery_skips_empty_output(tmp_path):
     assert not (tmp_path / "scheduler" / "task-1" / "run-1.md").exists()
 
 
+def test_scheduler_standalone_delivery_writes_and_sends_nothing(tmp_path, monkeypatch):
+    """``standalone`` means "write it down and stop".
+
+    Every mode now persists before it does anything else, so the risk the
+    refactor introduced is that the shared write turned the quiet mode into a
+    sender -- which would start posting to a chat that the task never asked
+    for, and would only be noticed by whoever received it.
+    """
+    from agent.scheduler.delivery import SchedulerDelivery
+
+    delivery = SchedulerDelivery(cfg={}, output_root=tmp_path / "scheduler")
+    attempts = []
+
+    async def send(*args, **kwargs):
+        attempts.append(True)
+        raise AssertionError("standalone delivery must not send")
+
+    monkeypatch.setattr(delivery, "deliver_channel", send)
+
+    result = asyncio.run(
+        delivery.deliver(
+            task_id="task-1",
+            run_id="run-1",
+            delivery_mode="standalone",
+            target=SimpleNamespace(),
+            text="the report",
+        )
+    )
+
+    assert attempts == []
+    assert result.status == "stored"
+    assert result.output_path
+    assert Path(result.output_path).read_text(encoding="utf-8") == "the report"
+
+
 def test_schedule_cli_creates_daily_task(monkeypatch, tmp_path):
     import agent.shared as shared_module
     from agent.cli import app
