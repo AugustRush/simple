@@ -734,6 +734,27 @@ function relativeTime(value?: string): string {
   return `${Math.floor(diff / 86_400_000)} 天前`
 }
 
+/**
+ * Every absolute timestamp the user reads.
+ *
+ * These went through `new Date(x).toLocaleString()`, which follows the
+ * *browser's* locale rather than the app's -- so an English browser rendered
+ * `9/16/2026, 3:30:00 PM` inside an otherwise all-Chinese screen, on the same
+ * card as a trigger reading `15:30`. Two clocks on one line, and the format
+ * changed with the browser rather than with the app. dayjs is already imported
+ * and already pinned to zh-cn, so these go through it and the format becomes
+ * the app's decision.
+ *
+ * `relativeTime` above stays as it is: "3 分钟前" answers a different question
+ * from "when exactly", and it does not depend on the locale.
+ */
+function formatDateTime(value?: string | null, withSeconds = false): string {
+  if (!value) return '—'
+  const at = dayjs(value)
+  if (!at.isValid()) return String(value)
+  return at.format(withSeconds ? 'YYYY-MM-DD HH:mm:ss' : 'YYYY-MM-DD HH:mm')
+}
+
 function toolStateLabel(state?: ToolState): string {
   if (state === 'running') return '执行中'
   if (state === 'blocked') return '已阻止'
@@ -1304,7 +1325,7 @@ function describeStepTrigger(step: WorkflowStepInfo): string {
   if (type === 'monthly') return `每月 ${trigger.day_of_month || ''} 日 ${time}`.trim()
   if (type === 'interval') return `每 ${trigger.every || 1} ${trigger.unit === 'days' ? '天' : trigger.unit === 'weeks' ? '周' : trigger.unit === 'minutes' ? '分钟' : '小时'}`
   if (type === 'once') {
-    return trigger.at ? `仅一次：${new Date(String(trigger.at)).toLocaleString()}` : '仅一次'
+    return trigger.at ? `仅一次：${formatDateTime(String(trigger.at))}` : '仅一次'
   }
   // A step with upstreams has no schedule of its own, and its stored trigger
   // is the subscription that waits for them.
@@ -1333,7 +1354,7 @@ function describeSignalName(name: string, tasks: ScheduleInfo[] = []): string {
 function scheduleTriggerLabel(task: ScheduleInfo, tasks: ScheduleInfo[] = []): string {
   const trigger = task.trigger || {}
   if (task.trigger_type === 'once') {
-    return trigger.at ? `一次 · ${new Date(trigger.at).toLocaleString()}` : '一次性执行'
+    return trigger.at ? `一次 · ${formatDateTime(trigger.at)}` : '一次性执行'
   }
   if (task.trigger_type === 'interval') {
     const units: Record<string, string> = { minutes: '分钟', hours: '小时', days: '天', weeks: '周' }
@@ -1410,7 +1431,7 @@ function describeCascade(run: ScheduleRun): string | null {
  * invites deleting a task that is working exactly as asked.
  */
 function describeNextRun(task: ScheduleInfo): string {
-  if (task.next_run_at) return new Date(task.next_run_at).toLocaleString()
+  if (task.next_run_at) return formatDateTime(task.next_run_at)
   if (task.trigger_type === 'signal') return '等待信号触发'
   return '暂无后续执行'
 }
@@ -6531,7 +6552,7 @@ function App() {
                   : '选择一个信号后，任务会在它被发出时运行。'}
               </span>
             ) : schedulePreview.length > 0 ? (
-              <ol>{schedulePreview.map(item => <li key={item}>{new Date(item).toLocaleString()}</li>)}</ol>
+              <ol>{schedulePreview.map(item => <li key={item}>{formatDateTime(item)}</li>)}</ol>
             ) : (
               <span>{schedulePreviewError || '填写完整任务信息后显示未来 5 次执行时间'}</span>
             )}
@@ -6634,7 +6655,7 @@ function App() {
                         </span>
                         <span className="schedule-run-item-main">
                           <strong>{scheduleRunStatusLabel(run.status)}</strong>
-                          <small>{run.started_at ? new Date(run.started_at).toLocaleString() : '等待开始'}</small>
+                          <small>{run.started_at ? formatDateTime(run.started_at, true) : '等待开始'}</small>
                         </span>
                         {run.needs_attention && (
                           <span
@@ -6706,9 +6727,14 @@ function App() {
                         {/* A signal-triggered run has no planned time -- the
                             value here is when the signal arrived, and calling
                             that "计划时间" would imply a schedule it never had. */}
-                        <div><small>{selectedScheduleRun.trigger_source?.startsWith('signal:') ? '触发时间' : '计划时间'}</small><span>{selectedScheduleRun.scheduled_for ? new Date(selectedScheduleRun.scheduled_for).toLocaleString() : '—'}</span></div>
-                        <div><small>开始时间</small><span>{selectedScheduleRun.started_at ? new Date(selectedScheduleRun.started_at).toLocaleString() : '—'}</span></div>
-                        <div><small>完成时间</small><span>{selectedScheduleRun.finished_at ? new Date(selectedScheduleRun.finished_at).toLocaleString() : '—'}</span></div>
+                        {/* All three carry seconds, deliberately: this row sits
+                            beside "执行耗时 4 分 37 秒", and a person checks
+                            that number by subtracting 开始 from 完成. Dropping
+                            seconds on any one of them makes the row ragged and
+                            the subtraction impossible. */}
+                        <div><small>{selectedScheduleRun.trigger_source?.startsWith('signal:') ? '触发时间' : '计划时间'}</small><span>{formatDateTime(selectedScheduleRun.scheduled_for, true)}</span></div>
+                        <div><small>开始时间</small><span>{formatDateTime(selectedScheduleRun.started_at, true)}</span></div>
+                        <div><small>完成时间</small><span>{formatDateTime(selectedScheduleRun.finished_at, true)}</span></div>
                         <div><small>执行耗时</small><span>{formatScheduleDuration(selectedScheduleRun.duration_ms)}</span></div>
                         <div><small>触发方式</small><span>{describeRunTrigger(selectedScheduleRun, schedules)}</span></div>
                         {describeCascade(selectedScheduleRun) && (
@@ -6866,7 +6892,9 @@ function App() {
                     <span>耗时 {formatScheduleDuration(latestRun.duration_ms)}</span>
                   )}
                   <span>下次执行：{describeNextRun(task)}</span>
-                  {task.last_run_at && <span>上次执行：{new Date(task.last_run_at).toLocaleString()}</span>}
+                  {/* Same precision as 下次执行 beside it -- two timestamps on
+                      one line should not disagree about how much they know. */}
+                  {task.last_run_at && <span>上次执行：{formatDateTime(task.last_run_at)}</span>}
                   <Button type="text" size="small" icon={<FileTextOutlined />} className="schedule-card-detail-button">运行记录</Button>
                 </div>
               </Card>
