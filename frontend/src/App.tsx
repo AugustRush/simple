@@ -3414,8 +3414,13 @@ function App() {
   // Dropdown menus are rendered through a React portal. Guard the session
   // container click as well as the menu itself so selecting an action cannot
   // bubble into selectSession() and immediately reset the pending state.
+  // Takes a keyboard event as well as a mouse one: a row is activated with
+  // Enter or Space as well as a click, and the guard below (do not act when the
+  // event landed on the row's own dropdown or delete buttons) is the same
+  // question either way, so it stays in one place rather than being restated
+  // per call site.
   const handleSessionContainerClick = (
-    event: React.MouseEvent<HTMLElement>,
+    event: React.MouseEvent<HTMLElement> | React.KeyboardEvent<HTMLElement>,
     sid: string,
   ) => {
     const target = event.target as HTMLElement | null
@@ -5304,7 +5309,21 @@ function App() {
               <Card
                 className={`session-card ${item.session_id === activeSession ? 'session-card-active' : ''}`}
                 hoverable
+                role="button"
+                tabIndex={0}
+                aria-label={`打开会话 ${item.title || '未命名会话'}`}
+                aria-current={item.session_id === activeSession ? 'true' : undefined}
                 onClick={event => handleSessionContainerClick(event, item.session_id)}
+                onKeyDown={event => {
+                  // The card holds its own checkbox and delete buttons; without
+                  // this, activating one of those with the keyboard would also
+                  // open the session behind it.
+                  if (event.target !== event.currentTarget) return
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault()
+                    handleSessionContainerClick(event, item.session_id)
+                  }
+                }}
               >
                 <div className="session-card-head">
                   <div className="session-card-title">
@@ -7133,7 +7152,18 @@ function App() {
                       className={`session-item ${
                         item.session_id === activeSession ? 'active' : ''
                       }`}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`打开会话 ${item.title || '未命名会话'}`}
+                      aria-current={item.session_id === activeSession ? 'true' : undefined}
                       onClick={event => handleSessionContainerClick(event, item.session_id)}
+                      onKeyDown={event => {
+                        if (event.target !== event.currentTarget) return
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault()
+                          handleSessionContainerClick(event, item.session_id)
+                        }
+                      }}
                     >
                       <div className="session-item-status">
                         <span className={item.live ? 'live' : 'durable'} />

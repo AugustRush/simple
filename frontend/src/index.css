@@ -4751,10 +4751,21 @@ html[data-theme='light'] .composer:focus-within {
   background: transparent !important;
 }
 
-.composer-tools .model-select:hover .ant-select-selector,
-.composer-tools .model-select.ant-select-focused .ant-select-selector {
+.composer-tools .model-select:hover .ant-select-selector {
   background: var(--surface-hover) !important;
   box-shadow: none !important;
+}
+
+/* Focus used to share the rule above and be flattened to `box-shadow: none`
+   along with hover, which left the picker with no focus indication at all --
+   measured with the caret in it, border colour, box-shadow and outline were all
+   identical to rest, and the tint alone cannot carry it because that is the
+   same tint hover produces. The ring is inset because
+   `.composer-context-controls` is `overflow: hidden` and clips anything drawn
+   outside the box. */
+.composer-tools .model-select.ant-select-focused .ant-select-selector {
+  background: var(--surface-hover) !important;
+  box-shadow: inset 0 0 0 1.5px var(--primary-border) !important;
 }
 
 .composer-tools .model-select .ant-select-selection-item,
@@ -4946,3 +4957,196 @@ html[data-theme='light'] .send-button.ant-btn-primary:disabled {
 .status-skipped { color:#8b8b93; }
 html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
 .workflow-step-status { flex:0 0 auto; color:var(--text-muted); font-size:10px; font-weight:600; white-space:nowrap; }
+
+/* ---- interaction feedback: a control that is pressed has to look pressed ----
+ *
+ * Every custom clickable surface in this file had a hover state and nothing
+ * else. `:active` appeared exactly once in 4900 lines (`.send-button`), so the
+ * rows, cards and icon buttons the user actually clicks answered the pointer
+ * when it arrived and went silent the moment it went down. That reads as
+ * broken precisely where it matters: on the slow paths -- a session row that
+ * waits for a fetch before anything changes, a card that opens a drawer, an
+ * icon button whose only feedback is a later screen. The press is the one
+ * acknowledgement that costs nothing and needs no round trip.
+ *
+ * These rules are appended last on purpose. The components above exist in
+ * several generations (`.session-item` three times, `.composer` seventeen), and
+ * an equal-specificity rule placed later is what makes a state land without
+ * minting another `!important`. Where an earlier rule already reached for
+ * `!important` -- the composer chips -- so does the rule here; matching that is
+ * the only way to win, and leaving it out would silently do nothing.
+ *
+ * Pressed feedback is deliberately instant. Every surface below already eases
+ * its hover over 140-160ms, which is right for arriving and wrong for
+ * pressing: a press that eases in finishes after the user has let go, so the
+ * state is only ever half-drawn. `transition-duration: 0s` on `:active` snaps
+ * it in and lets the base rule ease it back out on release.
+ */
+
+/* ---- surfaces: rows and cards ----
+ *
+ * These own a background and a border, so hover and press are told apart by
+ * depth. `.session-item` is the clearest case: it is the app's primary
+ * navigation and clicking it kicks off a fetch, so the press is the only
+ * immediate answer the user gets.
+ */
+.session-item:active,
+.command-item:active,
+.global-search-item:active,
+.schedule-run-item:active {
+  background: var(--primary-soft);
+  transform: scale(0.99);
+  transition-duration: 0s;
+}
+
+/* A selected row is already tinted by `.active`, so a press has to go deeper
+   than that tint rather than replace it -- otherwise pressing the row you are
+   already on looks like de-selecting it. */
+.session-item.active:active,
+.schedule-run-item.active:active,
+.global-search-item.active:active {
+  background: var(--primary-soft);
+  border-color: var(--primary-border);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+/* Cards get no transform. A card is wide enough that scaling it slides its own
+   text under the pointer, and a click target that shifts away from the cursor
+   is worse than one that does not answer at all. */
+.session-card:active,
+.schedule-card:active {
+  border-color: var(--primary-border);
+  background: var(--primary-soft);
+}
+
+/* `.schedule-card` is clickable -- it carries `cursor:pointer` and opens the
+   detail drawer -- but it was the one card in the app with no hover state,
+   while `.session-card`, its neighbour and near-twin, had one. Same gesture,
+   same feedback. */
+.schedule-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
+}
+
+/* ---- borderless toggles ----
+ *
+ * `.tool-trace-summary`, `.subagent-note-head` and `.approval-detail-toggle`
+ * are text-only controls: transparent, no border, and a hover that only
+ * deepens the text colour. Giving them a fill or a scale would invent a box
+ * the design does not have, so the press is a dip in opacity instead -- which
+ * is legible in both themes and costs no layout.
+ */
+.tool-trace-summary:active,
+.subagent-note-head:active,
+.approval-detail-toggle:active {
+  opacity: 0.7;
+  transition-duration: 0s;
+}
+
+/* ---- icon buttons ----
+ *
+ * Small and borderless, so a background change alone is easy to miss at the
+ * edge of vision. They shrink under the finger instead.
+ */
+.composer-icon-button:active,
+.tool-trace-modal-close:active,
+.composer-attachment-remove:active {
+  transform: scale(0.92);
+  transition-duration: 0s;
+}
+
+.composer-icon-button:active {
+  color: var(--text) !important;
+  background: var(--primary-soft) !important;
+}
+
+.composer-attachment-remove:active {
+  color: var(--text);
+  background: var(--primary-soft);
+}
+
+/* The composer chips share one bordered strip, so they press by filling rather
+   than by moving -- a chip that moved would drag the strip's divider with it. */
+.workspace-picker:active,
+.composer-tools .permission-button:active {
+  color: var(--text) !important;
+  background: var(--primary-soft) !important;
+  transition-duration: 0s;
+}
+
+/* ---- keyboard focus ----
+ *
+ * Focus-visible existed on nine selectors and was absent on the rest, so the
+ * keyboard path was half-lit: a user could tab into the session list or onto
+ * the trace summary and see nothing move. One ring, drawn from the same token
+ * every other focus ring in this file uses, rather than re-specified per
+ * component.
+ */
+.session-item:focus-visible,
+.session-card:focus-visible,
+.command-item:focus-visible,
+.global-search-item:focus-visible,
+.schedule-run-item:focus-visible,
+.tool-trace-summary:focus-visible,
+.approval-detail-toggle:focus-visible,
+.tool-trace-modal-close:focus-visible,
+.composer-attachment-remove:focus-visible,
+.session-item-delete-actions:focus-visible,
+.settings-inline-save:focus-visible {
+  outline: 2px solid var(--primary-border);
+  outline-offset: 2px;
+}
+
+/* Chrome matches `:focus-visible` on a mouse click too, so a pressed row would
+   otherwise wear both the ring and the fill -- which reads as a stuck
+   selection. Keep the ring, close the gap. */
+.session-item:active:focus-visible,
+.command-item:active:focus-visible,
+.global-search-item:active:focus-visible,
+.schedule-run-item:active:focus-visible,
+.tool-trace-summary:active:focus-visible,
+.approval-detail-toggle:active:focus-visible {
+  outline-offset: 0;
+}
+
+/* ---- the copy action, made legible when it is finally looked at ----
+ *
+ * `.message-copy` rests at `--text-muted` (133,133,141) under 55% opacity,
+ * which over the light shell (238,240,242) composites to roughly 180,181,184
+ * -- a contrast ratio of 1.8:1. It is meant to be a reveal-on-hover action, so
+ * a faint rest state is the design; the defect is what it reveals to: the same
+ * `--text-muted` at full opacity is 3.2:1, still under the 4.5:1 that 12px
+ * text needs, so the label stayed hard to read at the exact moment the user
+ * was looking straight at it.
+ *
+ * Hover now lands on `--text-secondary` (6.8:1) and the rest state is lifted
+ * just enough to be discoverable without announcing itself.
+ */
+.message-copy {
+  opacity: 0.62;
+}
+
+.message-row-assistant:hover .message-copy,
+.message-copy:focus-visible {
+  color: var(--text-secondary);
+  opacity: 1;
+}
+
+/* ---- the composer chips cannot use an outline ----
+ *
+ * `.workspace-picker` and `.permission-button` sit inside
+ * `.composer-context-controls`, which is `overflow: hidden`. A ring drawn
+ * outside the box is clipped there, and that is why the existing rule pairs
+ * `:focus-visible` with `:hover` and then sets `outline: none`.
+ *
+ * The consequence is that keyboard focus on these chips was only ever a
+ * background tint -- indistinguishable from a mouse passing over. The model
+ * picker's half of the same problem is fixed where it was caused, in the
+ * `.ant-select-focused` rule above, because there an `!important` had to be
+ * matched rather than appended to.
+ *
+ * An inset ring is not clipped, so it can exist where an outline cannot. */
+.workspace-picker:focus-visible,
+.composer-tools .permission-button:focus-visible {
+  box-shadow: inset 0 0 0 1.5px var(--primary-border);
+}
