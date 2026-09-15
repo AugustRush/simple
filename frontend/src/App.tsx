@@ -67,7 +67,9 @@ import {
   ReloadOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
+  SaveOutlined,
   SearchOutlined,
+  SendOutlined,
   SettingOutlined,
   StopOutlined,
   SunOutlined,
@@ -216,6 +218,7 @@ interface ScheduleInfo {
   last_run_at?: string
   last_success_at?: string
   delivery_mode?: string
+  delivery_target?: { target_type?: string; payload?: Record<string, any> }
   active_run_id?: string | null
   latest_run?: ScheduleRun | null
   model_override?: string | null
@@ -374,6 +377,20 @@ interface ScheduleDraft {
   backoff_seconds: number
   selected_skills: string[]
   permission_profile: PermissionProfileKey
+  //: Where a run's output goes. `channel` today means "发到飞书" -- the one
+  //: channel the runtime delivers to -- and the chat fields say which of the
+  //: bot's conversations. The name is kept only for display, so an edit still
+  //: reads back a chat whose list has not been fetched yet.
+  delivery_mode: 'standalone' | 'channel'
+  delivery_chat_id: string
+  delivery_chat_name: string
+}
+
+interface FeishuChatInfo {
+  chat_id: string
+  name: string
+  description?: string
+  external?: boolean
 }
 
 interface SessionTaskGuidance {
@@ -956,6 +973,9 @@ function defaultScheduleDraft(workspaceRoot = ''): ScheduleDraft {
     backoff_seconds: 30,
     selected_skills: [],
     permission_profile: 'inherit',
+    delivery_mode: 'standalone',
+    delivery_chat_id: '',
+    delivery_chat_name: '',
   }
 }
 
@@ -985,13 +1005,35 @@ function scheduleDraftFromTask(task: ScheduleInfo): ScheduleDraft {
     backoff_seconds: Number(task.retry_policy?.backoff_seconds ?? 30),
     selected_skills: task.selected_skills || [],
     permission_profile: (task.permission_profile || 'inherit') as PermissionProfileKey,
+    delivery_mode: task.delivery_mode === 'channel' ? 'channel' : 'standalone',
+    delivery_chat_id: task.delivery_mode === 'channel'
+      ? String(task.delivery_target?.payload?.chat_id || '')
+      : '',
+    delivery_chat_name: '',
   }
 }
 
 function scheduleRequestBody(draft: ScheduleDraft) {
-  const { max_attempts, backoff_seconds, ...rest } = draft
+  const {
+    max_attempts,
+    backoff_seconds,
+    delivery_chat_id: chatId,
+    delivery_chat_name: _chatName,
+    ...rest
+  } = draft
   return {
     ...rest,
+    // A standalone delivery sends no target at all: the server answers
+    // "standalone" with a standalone target, and sending one anyway would
+    // only be a second opinion about nothing.
+    ...(draft.delivery_mode === 'channel'
+      ? {
+          delivery_target: {
+            target_type: 'feishu_chat',
+            payload: { chat_id: chatId, chat_type: 'group' },
+          },
+        }
+      : {}),
     retry_policy: { max_attempts, backoff_seconds },
     timezone_name: Intl.DateTimeFormat().resolvedOptions().timeZone,
   }
@@ -1632,6 +1674,11 @@ function App() {
   const [schedules, setSchedules] = useState<ScheduleInfo[]>([])
   const [signals, setSignals] = useState<SignalInfo[]>([])
   const [signalsWaiting, setSignalsWaiting] = useState<{ name: string; subscriber_count: number }[]>([])
+  const [feishuChats, setFeishuChats] = useState<FeishuChatInfo[]>([])
+  const [feishuChatsLoading, setFeishuChatsLoading] = useState(false)
+  const [feishuChatsError, setFeishuChatsError] = useState('')
+  const [feishuTesting, setFeishuTesting] = useState(false)
+  const [pickingDirectory, setPickingDirectory] = useState(false)
   const [unseenFailures, setUnseenFailures] = useState(0)
   const [permissionProfiles, setPermissionProfiles] = useState<PermissionProfileOption[]>([])
   const [scheduleQuery, setScheduleQuery] = useState('')
@@ -2859,6 +2906,57 @@ function App() {
     }
   }, [api])
 
+  const loadFeishuChats = useCallback(async () => {
+    setFeishuChatsLoading(true)
+    setFeishuChatsError('')
+    try {
+      const resp = await api('/api/feishu/chats')
+      const data = await resp.json()
+      setFeishuChats(Array.isArray(data.chats) ? data.chats : [])
+    } catch (error) {
+      // Keep the reason on the form itself: "no permission" and "no config"
+      // read identically as an empty dropdown, and the user cannot fix what
+      // they cannot see.
+      setFeishuChatsError(error instanceof Error ? error.message : '会话列表获取失败')
+    } finally {
+      setFeishuChatsLoading(false)
+    }
+  }, [api])
+
+  const sendFeishuTest = useCallback(async (chatId: string) => {
+    setFeishuTesting(true)
+    try {
+      await api('/api/feishu/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId }),
+      })
+      messageApi.success('测试消息已发送，请检查飞书会话')
+    } catch {
+      // The server message (missing config, wrong scope, chat not found)
+      // already surfaced as a toast; there is nothing more specific to say.
+    } finally {
+      setFeishuTesting(false)
+    }
+  }, [api, messageApi])
+
+  const pickDirectory = useCallback(async (apply: (path: string) => void) => {
+    setPickingDirectory(true)
+    try {
+      // The native dialog lives as long as the user needs, so this request
+      // simply waits; cancelling the dialog is a normal outcome, not an error.
+      const resp = await api('/api/fs/pick-directory', { method: 'POST' })
+      const data = await resp.json()
+      if (!data.cancelled && typeof data.workspace_root === 'string' && data.workspace_root) {
+        apply(data.workspace_root)
+      }
+    } catch {
+      // Surfaced by the api helper.
+    } finally {
+      setPickingDirectory(false)
+    }
+  }, [api])
+
   const loadUnseenFailures = useCallback(async () => {
     try {
       const resp = await api('/api/schedules/attention')
@@ -2888,6 +2986,40 @@ function App() {
     if (!step) return null
     return { flow, step, followsUpstreams: step.depends_on.length > 0 }
   }, [editingScheduleId, schedules, workflows])
+
+  // Folders a task has already run in are the folders most likely to be
+  // wanted again, so the form offers them as one-click answers instead of
+  // asking the user to type (or re-pick) a path they already trusted.
+  const recentWorkspaceRoots = useMemo(() => {
+    const roots: string[] = []
+    for (const task of schedules) {
+      if (task.workspace_root) roots.push(task.workspace_root)
+    }
+    for (const flow of workflows) {
+      for (const step of flow.steps) {
+        if (step.workspace_root) roots.push(step.workspace_root)
+      }
+    }
+    if (sessionState?.workspace_root) roots.push(sessionState.workspace_root)
+    if (config?.workspace_root) roots.push(config.workspace_root)
+    return Array.from(new Set(roots)).slice(0, 6)
+  }, [schedules, workflows, sessionState?.workspace_root, config?.workspace_root])
+
+  // The chat list is a network call against the user's Feishu app, so it is
+  // fetched only when the form can actually show it -- opening the editor on
+  // a channel task, or choosing 发到飞书 -- and not on every modal open.
+  useEffect(() => {
+    if (!scheduleModalOpen) return
+    if (scheduleDraft.delivery_mode !== 'channel') return
+    if (feishuChats.length || feishuChatsLoading) return
+    void loadFeishuChats()
+  }, [
+    scheduleModalOpen,
+    scheduleDraft.delivery_mode,
+    feishuChats.length,
+    feishuChatsLoading,
+    loadFeishuChats,
+  ])
 
   useEffect(() => {
     if (!scheduleModalOpen) {
@@ -3712,6 +3844,10 @@ function App() {
     }
     if (!followsUpstreams && scheduleDraft.trigger_type === 'signal' && !scheduleDraft.signal_name.trim()) {
       messageApi.warning('请选择或填写要等待的信号')
+      return
+    }
+    if (scheduleDraft.delivery_mode === 'channel' && !scheduleDraft.delivery_chat_id.trim()) {
+      messageApi.warning('发到飞书需要选择一个会话')
       return
     }
     try {
@@ -5611,13 +5747,20 @@ function App() {
                         style={{ minWidth: 220, flex: '1 1 220px' }}
                       />
                     </label>
-                    <Input
-                      prefix={<FolderOpenOutlined />}
-                      placeholder="项目目录（留空跟随入口步骤）"
-                      value={step.workspace_root}
-                      onChange={event => patchWorkflowStep(index, { workspace_root: event.target.value })}
-                      className="workflow-step-workspace"
-                    />
+                    <Space.Compact className="workflow-step-workspace">
+                      <Input
+                        prefix={<FolderOpenOutlined />}
+                        placeholder="项目目录（留空跟随入口步骤）"
+                        value={step.workspace_root}
+                        onChange={event => patchWorkflowStep(index, { workspace_root: event.target.value })}
+                      />
+                      <Button
+                        loading={pickingDirectory}
+                        onClick={() => pickDirectory(path => patchWorkflowStep(index, { workspace_root: path }))}
+                      >
+                        浏览…
+                      </Button>
+                    </Space.Compact>
                   </div>
                   {step.depends_on.filter(key => key.trim()).length === 0 && (
                     step.trigger
@@ -5935,12 +6078,36 @@ function App() {
               <div className="schedule-form-section-title">运行环境</div>
               <div className="schedule-field">
                 <label>项目文件夹</label>
-                <Input
-                  prefix={<FolderOpenOutlined />}
-                  placeholder="Agent 执行任务时使用的项目目录"
-                  value={scheduleDraft.workspace_root}
-                  onChange={event => setScheduleDraft({ ...scheduleDraft, workspace_root: event.target.value })}
-                />
+                <Space.Compact block>
+                  <Input
+                    prefix={<FolderOpenOutlined />}
+                    placeholder="Agent 执行任务时使用的项目目录"
+                    value={scheduleDraft.workspace_root}
+                    onChange={event => setScheduleDraft({ ...scheduleDraft, workspace_root: event.target.value })}
+                  />
+                  <Button
+                    loading={pickingDirectory}
+                    onClick={() => pickDirectory(path => setScheduleDraft(current => ({ ...current, workspace_root: path })))}
+                  >
+                    浏览…
+                  </Button>
+                </Space.Compact>
+                {recentWorkspaceRoots.length > 0 && (
+                  <div className="schedule-workspace-recents">
+                    <span>最近使用：</span>
+                    {recentWorkspaceRoots.map(path => (
+                      <button
+                        key={path}
+                        type="button"
+                        className={scheduleDraft.workspace_root === path ? 'active' : ''}
+                        title={path}
+                        onClick={() => setScheduleDraft({ ...scheduleDraft, workspace_root: path })}
+                      >
+                        {compactWorkspacePath(path)}
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <small className="schedule-field-hint">任务会固定使用此目录，不受当前会话切换影响。</small>
               </div>
               <div className="schedule-field-grid schedule-field-grid-three">
@@ -6196,6 +6363,99 @@ function App() {
             </div>
           </div>
 
+          <div className="schedule-form-section-title">投递方式</div>
+          <div className="schedule-field">
+            <div className="schedule-action-picker" role="radiogroup" aria-label="投递方式">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={scheduleDraft.delivery_mode === 'standalone'}
+                className={scheduleDraft.delivery_mode === 'standalone' ? 'active' : ''}
+                onClick={() => setScheduleDraft({ ...scheduleDraft, delivery_mode: 'standalone' })}
+              >
+                <SaveOutlined />
+                <span><strong>存到本机</strong><small>
+                  {scheduleDraft.action_type === 'agent_task'
+                    ? '运行结果写入输出目录，在任务卡片和运行记录里查看'
+                    : '提醒内容写入输出目录，不会发到任何聊天'}
+                </small></span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={scheduleDraft.delivery_mode === 'channel'}
+                className={scheduleDraft.delivery_mode === 'channel' ? 'active' : ''}
+                onClick={() => setScheduleDraft({ ...scheduleDraft, delivery_mode: 'channel' })}
+              >
+                <SendOutlined />
+                <span><strong>发到飞书</strong><small>
+                  {scheduleDraft.action_type === 'agent_task'
+                    ? '运行结束后把执行摘要发到所选飞书会话'
+                    : '到时间后把提醒内容发到所选飞书会话'}
+                </small></span>
+              </button>
+            </div>
+            {scheduleDraft.delivery_mode === 'channel' && (
+              <>
+                <div className="schedule-field" style={{ marginTop: 10 }}>
+                  <label>发到哪个会话</label>
+                  <Space.Compact block>
+                    <Select
+                      showSearch
+                      optionFilterProp="label"
+                      loading={feishuChatsLoading}
+                      placeholder={feishuChatsLoading ? '正在获取会话列表…' : '选择机器人所在的飞书会话'}
+                      value={scheduleDraft.delivery_chat_id || undefined}
+                      onChange={value => setScheduleDraft({ ...scheduleDraft, delivery_chat_id: String(value || '') })}
+                      options={(() => {
+                        const options = feishuChats.map(chat => ({
+                          value: chat.chat_id,
+                          label: chat.name ? `${chat.name}（${chat.chat_id}）` : chat.chat_id,
+                        }))
+                        // A chat the task already targets must stay selectable
+                        // even when the list has not loaded or the bot has
+                        // since left it -- dropping the option would make the
+                        // form silently blank out a value it is about to save.
+                        if (
+                          scheduleDraft.delivery_chat_id
+                          && !options.some(item => item.value === scheduleDraft.delivery_chat_id)
+                        ) {
+                          options.push({
+                            value: scheduleDraft.delivery_chat_id,
+                            label: scheduleDraft.delivery_chat_id,
+                          })
+                        }
+                        return options
+                      })()}
+                    />
+                    <Button
+                      disabled={!scheduleDraft.delivery_chat_id}
+                      loading={feishuTesting}
+                      onClick={() => void sendFeishuTest(scheduleDraft.delivery_chat_id)}
+                    >
+                      发送测试
+                    </Button>
+                  </Space.Compact>
+                  {feishuChatsError ? (
+                    <div className="schedule-field-hint schedule-delivery-error">
+                      {feishuChatsError}
+                      <Button type="link" size="small" onClick={() => void loadFeishuChats()}>重新获取</Button>
+                    </div>
+                  ) : (
+                    !feishuChatsLoading && feishuChats.length === 0 && (
+                      <small className="schedule-field-hint">
+                        只能选到机器人所在的会话；把机器人拉进群后点「重新获取」。
+                      </small>
+                    )
+                  )}
+                  <small className="schedule-field-hint">
+                    使用设置页里填写的飞书应用发消息；不确定是否可用时，先点「发送测试」验证。
+                  </small>
+                </div>
+              </>
+            )}
+          </div>
+
           {scheduleDraft.action_type === 'agent_task' && (
             <>
               <div className="schedule-form-section-title">失败与超时</div>
@@ -6304,6 +6564,7 @@ function App() {
                     {selectedSchedule.kind === 'agent_prompt' && (
                       <Tag>{permissionProfileLabel(selectedSchedule.permission_profile)}</Tag>
                     )}
+                    <Tag>{selectedSchedule.delivery_mode === 'channel' ? '投递：飞书' : '投递：本机'}</Tag>
                   </div>
                   <p>{selectedSchedule.kind === 'agent_prompt'
                     ? selectedSchedule.payload?.prompt

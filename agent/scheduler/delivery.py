@@ -38,13 +38,21 @@ class SchedulerDelivery:
         feishu_cfg = self.cfg.get("channels", {}).get("feishu", {})
         if not feishu_cfg.get("app_id") or not feishu_cfg.get("app_secret"):
             raise RuntimeError("Feishu delivery requires app_id and app_secret")
-        sink = FeishuOutputSink(
-            client=build_feishu_client(FeishuConfig(**feishu_cfg)),
-            receive_id_type=(
+        # An explicit receive_id_type wins over the chat_type heuristic: the
+        # schedule editor writes one because every chat it offers came from
+        # the bot's chat list, which only hands out chat_ids -- and the
+        # heuristic would read "p2p" and try open_id on a value that is not
+        # one.  Old targets without the field keep guessing as before.
+        receive_id_type = str(target.payload.get("receive_id_type", "")).strip()
+        if not receive_id_type:
+            receive_id_type = (
                 "chat_id"
                 if target.payload.get("chat_type", "p2p") == "group"
                 else "open_id"
-            ),
+            )
+        sink = FeishuOutputSink(
+            client=build_feishu_client(FeishuConfig(**feishu_cfg)),
+            receive_id_type=receive_id_type,
             receive_id=target.payload["chat_id"],
             reply_message_id=None,
             output_dir=output_dir,

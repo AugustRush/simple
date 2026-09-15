@@ -1299,6 +1299,78 @@ def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_
     assert sent["drained"] is True
 
 
+def test_scheduler_feishu_delivery_honors_an_explicit_receive_id_type(monkeypatch, tmp_path):
+    """A target written by the schedule editor carries its own answer.
+
+    The chat_type -> receive_id_type heuristic predates the chat picker: it
+    reads "p2p" and tries open_id, but every chat the picker offers came from
+    the bot's chat list and only has a chat_id.  An explicit receive_id_type
+    must win; targets written before the field existed keep the old guess.
+    """
+    from agent.scheduler import DeliveryTarget
+    from agent.scheduler.delivery import SchedulerDelivery
+
+    sent = {}
+
+    class _FakeSink:
+        def __init__(
+            self,
+            client,
+            receive_id_type,
+            receive_id,
+            reply_message_id=None,
+            output_dir=None,
+            streaming=True,
+        ):
+            sent["receive_id_type"] = receive_id_type
+            sent["receive_id"] = receive_id
+
+        async def _send_response_async(self, text: str):
+            sent["text"] = text
+
+        async def drain(self):
+            pass
+
+    monkeypatch.setattr("agent.channels.feishu.FeishuOutputSink", _FakeSink)
+    monkeypatch.setattr(
+        "agent.channels.feishu.build_feishu_client", lambda config: object()
+    )
+
+    delivery = SchedulerDelivery(
+        cfg={
+            "channels": {
+                "feishu": {"app_id": "app", "app_secret": "secret", "streaming": False}
+            }
+        }
+    )
+
+    explicit = asyncio.run(
+        delivery.deliver_channel(
+            target=DeliveryTarget(
+                "feishu_chat",
+                {"chat_id": "oc_picked", "chat_type": "p2p", "receive_id_type": "chat_id"},
+            ),
+            text="picked chat",
+            output_dir=tmp_path,
+        )
+    )
+    assert explicit == "delivered"
+    # chat_type says "p2p", so the heuristic alone would have guessed open_id
+    # and sent a chat_id to the open_id field -- a guaranteed API error.
+    assert sent["receive_id_type"] == "chat_id"
+    assert sent["receive_id"] == "oc_picked"
+
+    legacy = asyncio.run(
+        delivery.deliver_channel(
+            target=DeliveryTarget("feishu_chat", {"chat_id": "ou_user", "chat_type": "p2p"}),
+            text="legacy target",
+            output_dir=tmp_path,
+        )
+    )
+    assert legacy == "delivered"
+    assert sent["receive_id_type"] == "open_id"
+
+
 def test_scheduler_standalone_delivery_skips_empty_output(tmp_path):
     from agent.scheduler.delivery import SchedulerDelivery
 

@@ -1210,10 +1210,80 @@ class WebChannel(Channel):
         trigger.instantiate().next_after(datetime.now(timezone.utc))
         return trigger
 
+    def _feishu_channel_config(self) -> dict[str, Any]:
+        """The global Feishu channel config, as delivery reads it at run time.
+
+        Delivery resolves credentials from the global config when a run
+        finishes, so this is the same source -- asking here what the runtime
+        will see then, not a copy that can drift.
+        """
+        from agent.config import load_config
+
+        cfg, _ = load_config()
+        feishu = cfg.get("channels", {}).get("feishu", {})
+        return feishu if isinstance(feishu, dict) else {}
+
+    def _delivery_from_body(self, body: dict[str, Any], existing: Any = None):
+        """Delivery mode and target, from the body or from what the task had.
+
+        "发到飞书" is the one channel the runtime can deliver to, and it reads
+        the global Feishu app credentials -- per-task credentials are not a
+        thing this interface offers.  Checking them here is the difference
+        between a form that says what it does and one that accepts a task
+        whose every run fails at 3am with a RuntimeError nobody typed.
+        """
+        from agent.scheduler import DeliveryTarget
+
+        delivery_mode = str(
+            body.get("delivery_mode", getattr(existing, "delivery_mode", "standalone"))
+            or "standalone"
+        )
+        if delivery_mode not in {"standalone", "channel"}:
+            raise ValueError("不支持的投递方式")
+        if delivery_mode == "standalone":
+            return "standalone", DeliveryTarget.standalone()
+
+        raw_target = body.get("delivery_target")
+        if isinstance(raw_target, dict) and raw_target:
+            target_type = str(raw_target.get("target_type", "")).strip()
+            payload = raw_target.get("payload")
+            if not isinstance(payload, dict):
+                raise ValueError("delivery_target.payload 必须是对象")
+            if target_type != "feishu_chat":
+                given = target_type or "（空）"
+                raise ValueError(f"暂不支持的投递渠道：{given}")
+            chat_id = str(payload.get("chat_id", "")).strip()
+            if not chat_id:
+                raise ValueError("发到飞书需要选择一个会话")
+            target = DeliveryTarget(
+                target_type="feishu_chat",
+                payload={
+                    "chat_id": chat_id,
+                    # Every chat the picker offers comes from the bot's chat
+                    # list, so a chat_id addresses it; receive_id_type is
+                    # written down because the pre-picker heuristic guessed
+                    # open_id for anything not marked "group" and would have
+                    # misread these.
+                    "chat_type": str(payload.get("chat_type", "group") or "group"),
+                    "receive_id_type": "chat_id",
+                },
+            )
+        else:
+            # Nothing chosen in this body: keep what the task already had,
+            # which is the only honest answer for an edit that did not touch
+            # delivery.  A task that never had one is asked to pick.
+            target = getattr(existing, "delivery_target", None)
+            if target is None or target.target_type != "feishu_chat":
+                raise ValueError("发到飞书需要选择一个会话")
+        feishu = self._feishu_channel_config()
+        if not feishu.get("app_id") or not feishu.get("app_secret"):
+            raise ValueError("发到飞书需要先在设置里填好飞书应用（app_id / app_secret）")
+        return "channel", target
+
     def _schedule_from_body(
         self, body: dict[str, Any], existing: Any = None, *, keep_trigger: bool = False
     ):
-        from agent.scheduler import DeliveryTarget, NewScheduledTask, TriggerSpec
+        from agent.scheduler import NewScheduledTask, TriggerSpec
         from agent.scheduler.profiles import PERMISSION_PROFILES
 
         name = str(body.get("name", getattr(existing, "name", ""))).strip()
@@ -1307,12 +1377,7 @@ class WebChannel(Channel):
         if backoff_seconds < 0 or backoff_seconds > 86400:
             raise ValueError("重试间隔必须在 0 到 86400 秒之间")
 
-        delivery_mode = str(
-            body.get("delivery_mode", getattr(existing, "delivery_mode", "standalone"))
-        )
-        delivery_target = getattr(existing, "delivery_target", None)
-        if delivery_mode == "standalone" or delivery_target is None:
-            delivery_target = DeliveryTarget.standalone()
+        delivery_mode, delivery_target = self._delivery_from_body(body, existing)
 
         raw_model = (
             body.get("model_override")
@@ -1380,7 +1445,7 @@ class WebChannel(Channel):
         Sending the field explicitly, empty string included, still means what it
         says.
         """
-        from agent.scheduler import DeliveryTarget, WorkflowStep
+        from agent.scheduler import WorkflowStep
 
         def answered(field_name: str, fallback: Any) -> Any:
             """The value for *field_name*: what the body said, else what was."""
@@ -1423,13 +1488,7 @@ class WebChannel(Channel):
             raise ValueError(
                 f"步骤「{key}」没有上游，必须指定触发方式（trigger_type）"
             )
-        delivery_mode = str(answered("delivery_mode", "standalone") or "standalone")
-        # A target is only ever kept, never parsed from the body: nothing in
-        # this interface can choose one yet, and inventing a parse for a shape
-        # no client sends would be a promise with no way to test it.
-        delivery_target = getattr(existing, "delivery_target", None)
-        if delivery_mode == "standalone" or delivery_target is None:
-            delivery_target = DeliveryTarget.standalone()
+        delivery_mode, delivery_target = self._delivery_from_body(raw, existing)
         skills = answered("selected_skills", None)
         if skills is not None and not isinstance(skills, list):
             raise ValueError(f"步骤「{key}」的 selected_skills 必须是数组")
@@ -2732,6 +2791,147 @@ class WebChannel(Channel):
             "events": sink.events,
         })
 
+    async def _pick_directory(self, request: Any) -> Any:
+        """The OS folder picker, for a form field instead of a session.
+
+        Session picking goes through ``/api/sessions/{id}/workspace/pick``
+        because it has to reroute the session afterwards; a form just wants
+        the path back.  Same native dialog either way, so both places see the
+        same folders the user sees in Finder/Explorer.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        selected = await _pick_workspace_directory()
+        if not selected:
+            return JSONResponse({"cancelled": True, "workspace_root": ""})
+        return JSONResponse({"cancelled": False, "workspace_root": selected})
+
+    @staticmethod
+    def _list_feishu_chats(feishu_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+        """The chats the bot sits in, page by page.
+
+        The lark client is synchronous; callers run this in a thread so the
+        event loop is never blocked, the same rule FeishuOutputSink follows.
+        """
+        from agent.channels.feishu import FeishuConfig, build_feishu_client
+        from lark_oapi.api.im.v1 import ListChatRequestBuilder  # type: ignore[import]
+
+        client = build_feishu_client(FeishuConfig(**feishu_cfg))
+        chats: list[dict[str, Any]] = []
+        page_token = ""
+        for _ in range(10):  # 10 pages x 100 is far past any real bot
+            builder = ListChatRequestBuilder().page_size(100)
+            if page_token:
+                builder = builder.page_token(page_token)
+            resp = client.im.v1.chat.list(builder.build())
+            if not resp.success():
+                raise RuntimeError(
+                    f"飞书会话列表获取失败：code={resp.code} msg={resp.msg}"
+                )
+            data = resp.data
+            for item in getattr(data, "items", None) or []:
+                chat_id = str(getattr(item, "chat_id", "") or "")
+                if not chat_id:
+                    continue
+                chats.append(
+                    {
+                        "chat_id": chat_id,
+                        "name": str(getattr(item, "name", "") or ""),
+                        "description": str(getattr(item, "description", "") or ""),
+                        "external": bool(getattr(item, "external", False)),
+                    }
+                )
+            if not getattr(data, "has_more", False):
+                break
+            page_token = str(getattr(data, "page_token", "") or "")
+            if not page_token:
+                break
+        return chats
+
+    async def _feishu_chats(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        feishu = self._feishu_channel_config()
+        if not feishu.get("app_id") or not feishu.get("app_secret"):
+            return JSONResponse(
+                {"error": "还没有配置飞书应用（app_id / app_secret），请先在设置里填写"},
+                status_code=400,
+            )
+        try:
+            chats = await asyncio.to_thread(self._list_feishu_chats, feishu)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        return JSONResponse({"chats": chats})
+
+    @staticmethod
+    def _send_feishu_text(feishu_cfg: dict[str, Any], chat_id: str, text: str) -> None:
+        """One plain text message, sent the same way a run's delivery sends."""
+        from agent.channels.feishu import FeishuConfig, build_feishu_client
+        from lark_oapi.api.im.v1 import (  # type: ignore[import]
+            CreateMessageRequest,
+            CreateMessageRequestBody,
+        )
+
+        client = build_feishu_client(FeishuConfig(**feishu_cfg))
+        req = (
+            CreateMessageRequest.builder()
+            .receive_id_type("chat_id")
+            .request_body(
+                CreateMessageRequestBody.builder()
+                .receive_id(chat_id)
+                .msg_type("text")
+                .content(json.dumps({"text": text}, ensure_ascii=False))
+                .build()
+            )
+            .build()
+        )
+        resp = client.im.v1.message.create(req)
+        if not resp.success():
+            raise RuntimeError(
+                f"飞书消息发送失败：code={resp.code} msg={resp.msg}"
+            )
+
+    async def _feishu_test(self, request: Any) -> Any:
+        """A short test message to one chat, before the user trusts the form.
+
+        Whether the app credentials carry the send permission is not knowable
+        from the config alone, and finding out at 3am from a failed run is
+        the worst answer.  Finding out now, from a button, is the best one.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        chat_id = str(body.get("chat_id", "")).strip()
+        if not chat_id:
+            return JSONResponse({"error": "缺少 chat_id"}, status_code=400)
+        feishu = self._feishu_channel_config()
+        if not feishu.get("app_id") or not feishu.get("app_secret"):
+            return JSONResponse(
+                {"error": "还没有配置飞书应用（app_id / app_secret），请先在设置里填写"},
+                status_code=400,
+            )
+        try:
+            await asyncio.to_thread(
+                self._send_feishu_text,
+                feishu,
+                chat_id,
+                "测试消息：定时任务的飞书投递配置正确，这条由设置页发出。",
+            )
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=502)
+        return JSONResponse({"ok": True})
+
     async def _get_session_permissions(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
         from agent.security.shell import (
@@ -3230,6 +3430,9 @@ class WebChannel(Channel):
                 methods=["POST"],
             ),
             Route("/api/scheduler/health", self._scheduler_health, methods=["GET"]),
+            Route("/api/fs/pick-directory", self._pick_directory, methods=["POST"]),
+            Route("/api/feishu/chats", self._feishu_chats, methods=["GET"]),
+            Route("/api/feishu/test", self._feishu_test, methods=["POST"]),
             Route("/api/signals", self._signals, methods=["GET"]),
             Route("/api/workflows", self._workflows, methods=["GET"]),
             Route("/api/workflows", self._create_workflow, methods=["POST"]),

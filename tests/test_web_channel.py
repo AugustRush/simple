@@ -2886,3 +2886,209 @@ def test_web_pausing_a_whole_workflow_stops_all_of_its_steps(tmp_path, monkeypat
         )
         assert resumed.status_code == 200, resumed.text
         assert all(item["enabled"] is True for item in resumed.json()["workflow"]["steps"])
+
+
+def _feishu_config(app_id: str = "app", app_secret: str = "secret") -> dict:
+    return (
+        {"channels": {"feishu": {"app_id": app_id, "app_secret": app_secret}}},
+        False,
+    )
+
+
+def test_web_schedule_delivery_to_feishu_stores_the_chosen_chat(tmp_path, monkeypatch):
+    """The form's 发到飞书 choice is a target the runtime can deliver to.
+
+    Saving it writes the chat_id down with the receive_id_type that address
+    needs; leaving it out of a later edit keeps what was saved, because the
+    body that does not mention delivery is not an answer about delivery.
+    """
+    from datetime import datetime, timedelta, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+    import agent.config as config_module
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    monkeypatch.setattr(config_module, "load_config", _feishu_config)
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    body = {
+        "name": "晨报",
+        "action_type": "message",
+        "message_text": "早上好",
+        "trigger_type": "once",
+        "at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+        "timezone_name": "Asia/Shanghai",
+        "delivery_mode": "channel",
+        "delivery_target": {
+            "target_type": "feishu_chat",
+            "payload": {"chat_id": "oc_morning", "chat_type": "group"},
+        },
+    }
+    with TestClient(channel.app) as client:
+        created = client.post("/api/schedules", json=body)
+        assert created.status_code == 200, created.text
+        task = created.json()["task"]
+        assert task["delivery_mode"] == "channel"
+        assert task["delivery_target"]["target_type"] == "feishu_chat"
+        payload = task["delivery_target"]["payload"]
+        assert payload["chat_id"] == "oc_morning"
+        # Written down, not left to the chat_type heuristic, because the
+        # heuristic predates the picker and would misread a p2p chat_id.
+        assert payload["receive_id_type"] == "chat_id"
+
+        renamed = client.put(
+            f"/api/schedules/{task['id']}",
+            json={**{key: value for key, value in body.items() if key != "delivery_target"},
+                  "name": "晨报改", "delivery_mode": "channel"},
+        )
+        assert renamed.status_code == 200, renamed.text
+        kept = renamed.json()["task"]["delivery_target"]["payload"]
+        assert kept["chat_id"] == "oc_morning"
+
+        back = client.put(
+            f"/api/schedules/{task['id']}",
+            json={**body, "delivery_mode": "standalone"},
+        )
+        assert back.status_code == 200, back.text
+        assert back.json()["task"]["delivery_mode"] == "standalone"
+
+
+def test_web_schedule_delivery_to_feishu_needs_config_and_a_chat(tmp_path, monkeypatch):
+    """Both refusals happen at save time, where the user is, not at run time.
+
+    A task whose every run fails with "app_id required" is a form that let
+    the user write a promise the code cannot keep -- the same class of bug as
+    the wording that promised sending while only storing.
+    """
+    from datetime import datetime, timedelta, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+    import agent.config as config_module
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    monkeypatch.setattr(config_module, "load_config", lambda: ({"channels": {}}, False))
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    base = {
+        "name": "提醒",
+        "action_type": "message",
+        "message_text": "喝水",
+        "trigger_type": "once",
+        "at": (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+        "timezone_name": "UTC",
+        "delivery_mode": "channel",
+        "delivery_target": {
+            "target_type": "feishu_chat",
+            "payload": {"chat_id": "oc_x"},
+        },
+    }
+    with TestClient(channel.app) as client:
+        no_config = client.post("/api/schedules", json=base)
+        assert no_config.status_code == 400
+        assert "app_id" in no_config.json()["error"]
+
+        monkeypatch.setattr(config_module, "load_config", _feishu_config)
+        no_chat = client.post(
+            "/api/schedules",
+            json={**base, "delivery_target": {"target_type": "feishu_chat", "payload": {}}},
+        )
+        assert no_chat.status_code == 400
+        assert "选择一个会话" in no_chat.json()["error"]
+
+        foreign = client.post(
+            "/api/schedules",
+            json={**base, "delivery_target": {"target_type": "wecom", "payload": {"chat_id": "x"}}},
+        )
+        assert foreign.status_code == 400
+        assert "暂不支持的投递渠道" in foreign.json()["error"]
+
+        # And the refusal leaves nothing half-created behind.
+        assert client.get("/api/schedules").json()["tasks"] == []
+
+
+def test_web_feishu_chat_listing_and_test_message(tmp_path, monkeypatch):
+    """The two endpoints the picker leans on, with Feishu itself faked.
+
+    A missing config is answered in words the settings page can act on; an
+    upstream failure keeps its own code and message, because "会话列表为空"
+    and "应用没权限" must not read as the same thing.
+    """
+    from starlette.testclient import TestClient
+    import agent.config as config_module
+
+    monkeypatch.setattr(
+        config_module, "load_config", lambda: ({"channels": {}}, False)
+    )
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        missing = client.get("/api/feishu/chats")
+        assert missing.status_code == 400
+        assert "app_id" in missing.json()["error"]
+
+        monkeypatch.setattr(config_module, "load_config", _feishu_config)
+        monkeypatch.setattr(
+            WebChannel,
+            "_list_feishu_chats",
+            staticmethod(
+                lambda cfg: [
+                    {"chat_id": "oc_1", "name": "日报群", "description": "", "external": False}
+                ]
+            ),
+        )
+        listed = client.get("/api/feishu/chats")
+        assert listed.status_code == 200
+        assert listed.json()["chats"] == [
+            {"chat_id": "oc_1", "name": "日报群", "description": "", "external": False}
+        ]
+
+        sent = []
+
+        def _fake_send(cfg, chat_id, text):
+            sent.append((chat_id, text))
+
+        monkeypatch.setattr(WebChannel, "_send_feishu_text", staticmethod(_fake_send))
+        tested = client.post("/api/feishu/test", json={"chat_id": "oc_1"})
+        assert tested.status_code == 200
+        assert sent and sent[0][0] == "oc_1"
+
+        def _failing_send(cfg, chat_id, text):
+            raise RuntimeError("飞书消息发送失败：code=99991663 msg=no permission")
+
+        monkeypatch.setattr(WebChannel, "_send_feishu_text", staticmethod(_failing_send))
+        failed = client.post("/api/feishu/test", json={"chat_id": "oc_1"})
+        assert failed.status_code == 502
+        assert "99991663" in failed.json()["error"]
+
+        empty = client.post("/api/feishu/test", json={})
+        assert empty.status_code == 400
+
+
+def test_web_pick_directory_returns_the_os_dialogs_answer(tmp_path, monkeypatch):
+    """One endpoint, one dialog; cancelling it is an answer, not an error."""
+    from starlette.testclient import TestClient
+    import agent.channels.web as web_module
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    async def _picked():
+        return "/Users/demo/projects/report"
+
+    monkeypatch.setattr(web_module, "_pick_workspace_directory", _picked)
+    with TestClient(channel.app) as client:
+        picked = client.post("/api/fs/pick-directory")
+        assert picked.status_code == 200
+        assert picked.json() == {"cancelled": False, "workspace_root": "/Users/demo/projects/report"}
+
+    async def _cancelled():
+        return None
+
+    monkeypatch.setattr(web_module, "_pick_workspace_directory", _cancelled)
+    with TestClient(channel.app) as client:
+        cancelled = client.post("/api/fs/pick-directory")
+        assert cancelled.status_code == 200
+        assert cancelled.json() == {"cancelled": True, "workspace_root": ""}
