@@ -4112,6 +4112,25 @@ html[data-theme='dark'] .settings-save-button:disabled {
 .schedule-form-section-title:not(:first-child) { border-top:1px solid var(--border); padding-top:16px; }
 .schedule-field-hint { color:var(--text-muted); font-size:10px; line-height:1.45; }
 .schedule-field .ant-select { width:100%; }
+/* Inside a Space.Compact that `width:100%` becomes a flex-basis that fights the
+   button beside it. Let the compact do the sizing there instead: grow into
+   whatever the button leaves. */
+.schedule-field .ant-space-compact .ant-select { width:auto; flex:1 1 auto; min-width:0; }
+/* antd's compact squares the *wrapper* at the seam -- `.ant-select` gets
+   border-radius: 0 and margin-right: -1px -- so its two halves read as one
+   control. But the box you actually see is `.ant-select-selector`, and the
+   global `border-radius: 14px !important` keeps all four of its corners round;
+   the button is the same story, from `.ant-btn-default`'s 13px. So the halves
+   stayed two separate pills overlapping by a single pixel, their borders
+   crossing at the join -- which reads as the button cutting into the select.
+   Square the inner boxes to match their wrappers, and give the outer corners
+   one radius instead of two. */
+.schedule-field .ant-space-compact > .ant-select:first-child .ant-select-selector {
+  border-radius:14px 0 0 14px !important;
+}
+.schedule-field .ant-space-compact > .ant-btn:last-child {
+  border-radius:0 14px 14px 0 !important;
+}
 .schedule-action-picker { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
 .schedule-action-picker button { display:flex; align-items:flex-start; gap:10px; min-height:68px; padding:12px; border:1px solid var(--border); border-radius:8px; color:var(--text-secondary); background:transparent; text-align:left; cursor:pointer; transition:border-color .16s ease, background-color .16s ease, color .16s ease; }
 .schedule-action-picker button:hover { border-color:var(--border-strong); background:var(--surface-hover); }

@@ -1697,6 +1697,12 @@ function App() {
   const [signalsWaiting, setSignalsWaiting] = useState<{ name: string; subscriber_count: number }[]>([])
   const [feishuChats, setFeishuChats] = useState<FeishuChatInfo[]>([])
   const [feishuChatsLoading, setFeishuChatsLoading] = useState(false)
+  // "Have we asked yet" is not the same question as "did we get anything".
+  // Inferring the first from `feishuChats.length` treats a *successful* empty
+  // list -- a bot that is in no groups yet, which is the normal first-run state
+  // -- as "never fetched", and the effect below re-fires every time loading
+  // falls back to false. That loop keeps the spinner up forever.
+  const [feishuChatsLoaded, setFeishuChatsLoaded] = useState(false)
   const [feishuChatsError, setFeishuChatsError] = useState('')
   const [feishuTesting, setFeishuTesting] = useState(false)
   const [pickingDirectory, setPickingDirectory] = useState(false)
@@ -2930,17 +2936,32 @@ function App() {
   const loadFeishuChats = useCallback(async () => {
     setFeishuChatsLoading(true)
     setFeishuChatsError('')
+    // This is a network round-trip out to Feishu on the user's own app
+    // credentials. Unbounded, a hung connection leaves the picker spinning with
+    // nothing to click and no way to tell it apart from a slow success -- which
+    // is exactly how it was reported. 15s is far past a healthy list call.
+    const controller = new AbortController()
+    const timer = window.setTimeout(() => controller.abort(), 15_000)
     try {
-      const resp = await api('/api/feishu/chats')
+      const resp = await api('/api/feishu/chats', { signal: controller.signal })
       const data = await resp.json()
       setFeishuChats(Array.isArray(data.chats) ? data.chats : [])
     } catch (error) {
       // Keep the reason on the form itself: "no permission" and "no config"
       // read identically as an empty dropdown, and the user cannot fix what
       // they cannot see.
-      setFeishuChatsError(error instanceof Error ? error.message : '会话列表获取失败')
+      if (error instanceof Error && error.name === 'AbortError') {
+        setFeishuChatsError('获取会话列表超时，请检查网络或飞书配置后点「重新获取」')
+      } else {
+        setFeishuChatsError(error instanceof Error ? error.message : '会话列表获取失败')
+      }
     } finally {
+      window.clearTimeout(timer)
       setFeishuChatsLoading(false)
+      // Set last: this is what stops the effect from asking again. A failure
+      // counts as "asked" too, or a broken config would loop instead of
+      // settling on the error message with its 重新获取 button.
+      setFeishuChatsLoaded(true)
     }
   }, [api])
 
@@ -3029,15 +3050,22 @@ function App() {
   // The chat list is a network call against the user's Feishu app, so it is
   // fetched only when the form can actually show it -- opening the editor on
   // a channel task, or choosing 发到飞书 -- and not on every modal open.
+  //
+  // The guard has to test `feishuChatsLoaded`, not `feishuChats.length`. An
+  // empty list is a perfectly good answer, and `0` is falsy, so a length test
+  // reads "we have no chats" as "we have not asked": the effect re-fires the
+  // moment `feishuChatsLoading` drops back to false, and the picker spins
+  // forever on a successful response. It never settles because it never stops
+  // asking.
   useEffect(() => {
     if (!scheduleModalOpen) return
     if (scheduleDraft.delivery_mode !== 'channel') return
-    if (feishuChats.length || feishuChatsLoading) return
+    if (feishuChatsLoaded || feishuChatsLoading) return
     void loadFeishuChats()
   }, [
     scheduleModalOpen,
     scheduleDraft.delivery_mode,
-    feishuChats.length,
+    feishuChatsLoaded,
     feishuChatsLoading,
     loadFeishuChats,
   ])
