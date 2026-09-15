@@ -6536,17 +6536,32 @@ function App() {
                       <Button type="link" size="small" onClick={() => void loadFeishuChats()}>重新获取</Button>
                     </div>
                   ) : (
-                    !feishuChatsLoading && feishuChats.length === 0 && (
+                    feishuChatsLoaded && !feishuChatsLoading && feishuChats.length === 0 && (
                       /* A bot that is in no group yet is the normal first-run
                          state, not an error -- but it left the field with zero
                          options and no way out: the hint below told the user to
                          press 重新获取 and 重新获取 only existed on the error
                          branch. So the list could never be refreshed into a
                          usable one, and "发到飞书" was a dead end. Carry the
-                         action here too, and keep the muted (not error) colour. */
+                         action here too, and keep the muted (not error) colour.
+
+                         Gate on `feishuChatsLoaded`, not just an empty array:
+                         "the bot is in no group" is a claim about the server's
+                         answer, and before the first request returns we have no
+                         answer to make it from.
+
+                         The second line exists because an empty picker reads as
+                         "the bot's chat is missing", and the obvious guess --
+                         that the bot's own 1:1 conversation should be in here --
+                         is wrong for a reason the user cannot see: 飞书's
+                         im/v1/chats returns groups only ("获取到的群列表中，
+                         不包含单聊（群模式为 p2p）"). Without saying so, the user
+                         keeps looking for a chat that can never be listed. */
                       <div className="schedule-field-hint">
-                        只能选到机器人所在的会话；把机器人拉进群后点
+                        机器人当前不在任何群里，所以没有可选的会话。把机器人拉进一个群，再点
                         <Button type="link" size="small" onClick={() => void loadFeishuChats()}>重新获取</Button>
+                        <br />
+                        与机器人的单聊不会出现在这里：飞书的会话列表接口只返回群，不返回单聊。
                       </div>
                     )
                   )}
