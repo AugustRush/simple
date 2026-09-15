@@ -60,9 +60,19 @@ WEB_FETCH_TIMEOUT = 20
 #: output is unbounded: a run that reads three upstream reports whole can spend
 #: its entire budget before it starts working.  The default is a comfortable
 #: read; the ceiling is what a caller who has asked for "all of it" gets, with
-#: the path returned alongside so the rest is one more call away.
+#: the path returned alongside so the rest is one more call away -- and with
+#: ``READ_STEP_OUTPUT_BUDGET_SHARE`` applied on top, so "all of it" cannot mean
+#: "all of the window".
 READ_STEP_OUTPUT_DEFAULT_CHARS = 8000
 READ_STEP_OUTPUT_MAX_CHARS = 40000
+#: The largest share of a run's input budget one read may spend.
+#:
+#: A flat character ceiling cannot know whether it is asking for a tenth of the
+#: budget or three quarters of it, because the cost of a read is measured in the
+#: units the wall is: CJK text is about one token per character, so 40000
+#: characters of Chinese is 40000 tokens.  A quarter is a read that cannot by
+#: itself exhaust the window, and a run that wants more reads it in pieces.
+READ_STEP_OUTPUT_BUDGET_SHARE = 4
 WEB_SEARCH_MAX_RESULTS = 10
 TAVILY_SEARCH_MAX_RESULTS = 10
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -964,7 +974,9 @@ class BuiltinTools:
                         "type": "integer",
                         "description": (
                             f"Maximum characters of the output to return "
-                            f"(1-{READ_STEP_OUTPUT_MAX_CHARS})"
+                            f"(1-{READ_STEP_OUTPUT_MAX_CHARS}). May be capped "
+                            f"lower by this run's remaining context budget; the "
+                            f"result says so and gives the path to read the rest."
                         ),
                         "default": READ_STEP_OUTPUT_DEFAULT_CHARS,
                     },
@@ -3235,6 +3247,41 @@ class BuiltinTools:
             ],
         )
 
+    def _step_output_limit(self, requested: Any) -> tuple[int, str]:
+        """How much of an upstream's output one read may bring in, and why.
+
+        The ceiling comes from this run's input budget, which the agent core
+        publishes before every provider call, rather than from a constant: the
+        flat 40000 was three quarters of a 53841-token budget in a single call,
+        so a run could walk into the limit and lose everything it had done --
+        the failure mode being a provider error that says nothing about the
+        tool that caused it.
+
+        Returns the limit and a sentence explaining it when the budget is what
+        bound, because a caller told "you got less than you asked for" with no
+        reason will simply ask again.
+        """
+        budget = 0
+        with contextlib.suppress(Exception):
+            from agent.core.agent import _active_agent_context
+
+            active_ctx = _active_agent_context.get()
+            if active_ctx is not None:
+                metadata = getattr(active_ctx, "metadata", {}) or {}
+                budget = int(metadata.get("_last_input_token_budget", 0) or 0)
+        ceiling = READ_STEP_OUTPUT_MAX_CHARS
+        if budget > 0:
+            ceiling = min(ceiling, max(1, budget // READ_STEP_OUTPUT_BUDGET_SHARE))
+        wanted = int(requested or 0) or READ_STEP_OUTPUT_DEFAULT_CHARS
+        limit = max(1, min(wanted, ceiling))
+        if budget > 0 and wanted > ceiling:
+            return limit, (
+                f"本次运行的输入预算约 {budget} tokens，单次读取最多用掉其中 "
+                f"{budget // READ_STEP_OUTPUT_BUDGET_SHARE} tokens，"
+                f"所以这里最多返回 {limit} 个字符。"
+            )
+        return limit, ""
+
     def _read_step_output(
         self, step: str, max_chars: int = READ_STEP_OUTPUT_DEFAULT_CHARS
     ) -> dict[str, Any]:
@@ -3257,6 +3304,10 @@ class BuiltinTools:
         the tool's whole safety property: it is not a file reader with a
         narrower name, it is a lookup into this workflow's own history, and a
         path it was not told about is not reachable through it.
+
+        How much comes back is capped by this run's input budget as well as by
+        ``max_chars`` (see ``_step_output_limit``), so asking for everything
+        cannot cost the run the context it needs to act on what it read.
         """
         wanted = str(step or "").strip()
         if not wanted:
@@ -3323,9 +3374,15 @@ class BuiltinTools:
         except OSError as exc:
             return self._error(f"读取步骤「{wanted}」的输出失败：{exc}")
 
-        limit = max(1, min(int(max_chars or 0) or READ_STEP_OUTPUT_DEFAULT_CHARS,
-                           READ_STEP_OUTPUT_MAX_CHARS))
+        limit, budget_note = self._step_output_limit(max_chars)
         truncated = len(text) > limit
+        notes: list[str] = []
+        if truncated:
+            notes.append(f"只返回了前 {limit} 个字符，共 {len(text)} 个。")
+        if budget_note:
+            notes.append(budget_note)
+        if notes:
+            notes.append("需要其余内容就读上面的 output_path。")
         return self._ok(
             step=wanted,
             task_id=target.id,
@@ -3340,12 +3397,7 @@ class BuiltinTools:
             # Said out loud rather than left to be discovered: a step that
             # believes it read the whole report and got two thirds of it will
             # act on the two thirds.
-            note=(
-                f"只返回了前 {limit} 个字符，共 {len(text)} 个。"
-                f"需要其余内容就读上面的 output_path。"
-                if truncated
-                else ""
-            ),
+            note=" ".join(notes),
         )
 
     def _clean_output(

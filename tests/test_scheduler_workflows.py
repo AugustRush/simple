@@ -1289,19 +1289,22 @@ def _handoff_tools(store: SchedulerStore, tmp_path: Path):
     return tools
 
 
-def _as_step_of(workflow_id: str, step_key: str, task_id: str):
-    """The metadata a scheduled run publishes, as a context manager would."""
+def _as_step_of(workflow_id: str, step_key: str, task_id: str, budget: int | None = None):
+    """The metadata a scheduled run publishes, as a context manager would.
+
+    ``budget`` is what the agent core records before each provider call; the
+    tool reads it to size a read against the window it has to fit in.
+    """
     from agent.core.agent import _active_agent_context
 
-    return _active_agent_context.set(
-        SimpleNamespace(
-            metadata={
-                "scheduler_task_id": task_id,
-                "scheduler_step_key": step_key,
-                "scheduler_workflow_id": workflow_id,
-            }
-        )
-    )
+    metadata = {
+        "scheduler_task_id": task_id,
+        "scheduler_step_key": step_key,
+        "scheduler_workflow_id": workflow_id,
+    }
+    if budget is not None:
+        metadata["_last_input_token_budget"] = budget
+    return _active_agent_context.set(SimpleNamespace(metadata=metadata))
 
 
 def test_read_step_output_returns_what_the_upstream_step_produced(tmp_path):
@@ -1930,6 +1933,198 @@ def test_an_emission_says_how_big_the_output_was(tmp_path):
             name=task_signal_name(tasks["collect"].id, RUN_SUCCESS_STATUS)
         )
         assert emissions[0].payload["output_bytes"] == len("out collect")
+    finally:
+        store.close()
+
+
+# ── 11. A read is sized against the window it has to fit in ──────────────
+
+
+def _plant_output(store: SchedulerStore, task, tmp_path: Path, text: str) -> str:
+    """Give a step a successful run with an output file, the way delivery does."""
+    directory = tmp_path / "output" / task.id
+    if not directory.exists():
+        directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "planted.md"
+    path.write_text(text, encoding="utf-8")
+    store._conn.execute(
+        "INSERT INTO scheduled_task_runs ("
+        " id, task_id, scheduled_for, started_at, finished_at, status,"
+        " summary, error, output_path, delivery_status, config_snapshot_json,"
+        " trigger_source, attempt, missed_count, created_at, updated_at"
+        ") VALUES (?, ?, ?, ?, ?, 'succeeded', 'done', '', ?, '', '{}',"
+        " 'manual', 1, 0, ?, ?)",
+        (
+            "run-planted",
+            task.id,
+            NOW.isoformat(),
+            NOW.isoformat(),
+            NOW.isoformat(),
+            str(path),
+            NOW.isoformat(),
+            NOW.isoformat(),
+        ),
+    )
+    store._conn.commit()
+    return str(path)
+
+
+def test_read_step_output_clamps_to_a_share_of_the_input_budget(tmp_path):
+    """CJK runs about one token per character, so the flat 40000-character
+    ceiling was three quarters of a 53841-token budget in a single call -- and
+    the run then died of the limit it had just walked into, losing everything
+    it had done and reporting a provider error that names no tool."""
+    from agent.core.agent import _active_agent_context
+    from agent.tools.builtin_tools import READ_STEP_OUTPUT_MAX_CHARS
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        _plant_output(store, tasks["collect"], tmp_path, "字" * 40000)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id, budget=4000)
+        try:
+            result = tools._read_step_output(
+                "collect", max_chars=READ_STEP_OUTPUT_MAX_CHARS
+            )
+        finally:
+            _active_agent_context.reset(token)
+
+        # A quarter of 4000 tokens, and one Chinese character is one token.
+        assert len(result["text"]) == 1000
+        assert result["truncated"] is True
+        # Told why, not just that: a caller told "less than you asked for"
+        # with no reason simply asks again.
+        assert "4000 tokens" in result["note"]
+        assert "1000" in result["note"]
+        assert "output_path" in result["note"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_keeps_a_comfortable_read_when_the_budget_allows(tmp_path):
+    from agent.core.agent import _active_agent_context
+    from agent.tools.builtin_tools import READ_STEP_OUTPUT_DEFAULT_CHARS
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        _plant_output(store, tasks["collect"], tmp_path, "x" * 50000)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(
+            workflow.id, "analyze", tasks["analyze"].id, budget=200000
+        )
+        try:
+            result = tools._read_step_output("collect")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert len(result["text"]) == READ_STEP_OUTPUT_DEFAULT_CHARS
+        # The default bound, not the budget: the note must not blame the
+        # window for a limit the caller's own default set.
+        assert "预算" not in result["note"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_uses_the_static_ceiling_when_no_budget_is_known(tmp_path):
+    """A tool can be called outside a run -- from a test, or straight off the
+    registry -- and then there is no window to size against."""
+    from agent.core.agent import _active_agent_context
+    from agent.tools.builtin_tools import READ_STEP_OUTPUT_MAX_CHARS
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        _plant_output(store, tasks["collect"], tmp_path, "x" * 50000)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
+        try:
+            result = tools._read_step_output(
+                "collect", max_chars=READ_STEP_OUTPUT_MAX_CHARS
+            )
+        finally:
+            _active_agent_context.reset(token)
+
+        assert len(result["text"]) == READ_STEP_OUTPUT_MAX_CHARS
+        assert "预算" not in result["note"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_asks_for_more_when_the_budget_is_tiny(tmp_path):
+    """The default is only comfortable if the window can afford it.  A small
+    budget has to clamp the default too, or the footgun just moves."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        _plant_output(store, tasks["collect"], tmp_path, "字" * 5000)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id, budget=400)
+        try:
+            result = tools._read_step_output("collect")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert len(result["text"]) == 100
+        assert "400 tokens" in result["note"]
+    finally:
+        store.close()
+
+
+def test_the_tool_clamps_against_the_budget_the_core_publishes(tmp_path):
+    """The clamp is only real if the number it reads is the one the agent core
+    records.  Driven through the real ``_prepare_provider_context`` rather than
+    by writing the metadata by hand: a test that fakes the seam proves only
+    that the seam was faked."""
+    import agent as agent_module
+    from agent.core.agent import AgentContext, BaseAgent, _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        _plant_output(store, tasks["collect"], tmp_path, "字" * 40000)
+
+        agent = BaseAgent(
+            object(),
+            agent_module.ToolRegistry(),
+            model="fake-model",
+            api_format="openai",
+            context_window=20000,
+            max_tokens=4096,
+        )
+        ctx = AgentContext(system_prompt="you are an assistant")
+        # What the executor publishes on the same dict, plus what the core adds
+        # before every provider call.
+        ctx.metadata["scheduler_workflow_id"] = workflow.id
+        ctx.metadata["scheduler_step_key"] = "analyze"
+        agent._prepare_provider_context(
+            ctx,
+            [{"name": "read_file", "description": "read", "input_schema": {"type": "object"}}],
+        )
+        budget = ctx.metadata["_last_input_token_budget"]
+        assert budget > 0
+
+        handoff = _handoff_tools(store, tmp_path)
+        token = _active_agent_context.set(ctx)
+        try:
+            result = handoff._read_step_output("collect", max_chars=40000)
+        finally:
+            _active_agent_context.reset(token)
+
+        assert len(result["text"]) == max(1, budget // 4)
+        assert f"{budget} tokens" in result["note"]
     finally:
         store.close()
 
