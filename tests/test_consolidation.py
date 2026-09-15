@@ -1,5 +1,6 @@
 """Tests for ConsolidationEngine and ContextManager — sleep/decay/parse/dirty-flag/idle."""
 
+import json
 import threading
 import time
 
@@ -2767,3 +2768,156 @@ def test_retention_prunes_stale_usage_events(tmp_path):
     assert store.usage_summary("old")["calls"] == 0
     assert store.usage_summary("new")["calls"] == 1
     assert store.usage_summary("new")["input_tokens"] == 20
+
+
+# ── Budget fitting must not require memory ────────────────────────────────────
+#
+# The scheduler's `stateless` policy deliberately runs without a context
+# manager so nothing carries between runs.  It used to get *no* budget fitting
+# either: `_prepare_provider_context` compacted only when a manager existed, so
+# a run whose own transcript outgrew the provider window hard-failed with
+# `ContextLimitError` where the interactive path would simply have dropped its
+# oldest turns.  Fitting a payload into the window reads no durable memory and
+# writes none, so it must work with or without a manager.
+
+
+def _oversized_ascii_transcript(turns=100, filler=400):
+    """A mid-run transcript large enough to blow a small context window.
+
+    ASCII on purpose: the estimator is faithful for Latin text, so a failure
+    here is the missing compaction rather than an estimator artefact.
+    """
+    messages = []
+    for index in range(turns):
+        messages.append(
+            {"role": "user", "content": f"turn {index}: analyse this file. " + "a" * filler}
+        )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": f"t{index}",
+                        "name": "read_file",
+                        "input": {"path": f"/tmp/f{index}.txt"},
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": f"t{index}",
+                        "content": "b" * filler,
+                    }
+                ],
+            }
+        )
+        messages.append({"role": "assistant", "content": f"turn {index} conclusion"})
+    messages.append({"role": "user", "content": "Now produce the final report."})
+    return messages
+
+
+def _bare_agent(context_window=20000):
+    import agent as agent_module
+    from agent.core.agent import BaseAgent
+
+    return BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="openai",
+        context_window=context_window,
+        max_tokens=4096,
+    )
+
+
+def _tools():
+    return [{"name": "read_file", "description": "read", "input_schema": {"type": "object"}}]
+
+
+def test_prepare_provider_context_compacts_without_a_context_manager(tmp_path):
+    """A run with no manager must still drop its oldest turns, not hard-fail."""
+    from agent.core.agent import AgentContext
+
+    agent = _bare_agent()
+    agent.context_manager = None
+    ctx = AgentContext(system_prompt="you are an assistant")
+    ctx.messages = _oversized_ascii_transcript()
+    tools = _tools()
+
+    budget = agent._input_token_budget(ctx, tools)
+    assert agent._estimate_input_tokens(ctx.messages, ctx=ctx) >= budget, (
+        "fixture must start over budget, or the test proves nothing"
+    )
+
+    agent._prepare_provider_context(ctx, tools)
+
+    assert len(ctx.messages) < 401, "oldest turns must have been dropped"
+    assert agent._estimate_input_tokens(ctx.messages, ctx=ctx) < budget
+
+
+def test_prepare_provider_context_without_manager_matches_the_managed_path(tmp_path):
+    """Both paths must land on the same payload for the same input."""
+    from agent.core.agent import AgentContext
+
+    tools = _tools()
+    payloads = {}
+    for label, managed in (("managed", True), ("bare", False)):
+        agent = _bare_agent()
+        if managed:
+            agent.context_manager = make_ctx_manager(tmp_path)
+        else:
+            agent.context_manager = None
+        ctx = AgentContext(system_prompt="you are an assistant")
+        ctx.messages = _oversized_ascii_transcript()
+        agent._prepare_provider_context(ctx, tools)
+        payloads[label] = (len(ctx.messages), agent._estimate_input_tokens(ctx.messages, ctx=ctx))
+
+    assert payloads["bare"] == payloads["managed"]
+
+
+def test_free_estimator_agrees_with_the_engine(tmp_path):
+    """`estimate_message_tokens` is the engine's model, minus the store."""
+    from agent.memory.consolidation import estimate_message_tokens
+
+    engine = make_engine(tmp_path)
+    for messages in (
+        [{"role": "user", "content": ""}] * 10,
+        [{"role": "user", "content": "hello world " * 50}],
+        [{"role": "user", "content": "中文内容" * 200}],
+        [{"role": "user", "content": [{"type": "tool_use", "id": "t", "name": "x", "input": {"a": "b" * 100}}]}],
+        [{"role": "user", "content": [{"type": "image", "source": {"data": "x" * 200000}}]}],
+    ):
+        assert estimate_message_tokens(messages) == engine.estimate_tokens(messages)
+
+
+def test_free_estimator_counts_cjk_as_tokens_not_quarter_tokens(tmp_path):
+    """The old fallback was `len(json.dumps)/4`, ~4x low for Chinese.
+
+    Under-reporting a payload that is about to be sent is the expensive
+    direction: the budget moves with the estimate, so the wall moves too.
+    """
+    from agent.memory.consolidation import estimate_message_tokens
+
+    messages = [{"role": "user", "content": "中文" * 500}]
+    naive = len(json.dumps(messages, ensure_ascii=False, sort_keys=True)) // 4
+    assert estimate_message_tokens(messages) > naive * 2
+
+def test_fit_to_budget_is_usable_without_an_instance(tmp_path):
+    """The classmethod is the seam; `compact_messages` is a thin wrapper."""
+    from agent import ContextManager
+    from agent.memory.consolidation import estimate_message_tokens
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    messages = _long_conversation(8, filler=300)
+
+    via_instance = ctx_mgr.compact_messages(messages, input_token_budget=900)
+    via_class = ContextManager.fit_to_budget(
+        messages, input_token_budget=900, estimate_tokens=estimate_message_tokens
+    )
+    assert via_class == via_instance

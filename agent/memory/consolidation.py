@@ -13,6 +13,100 @@ from ._helpers import _new_id, _now
 from .models import ConsolidationResult, LTMEntry
 from .store import LTMStore
 
+# Providers charge for an image by its rendered dimensions, not by the length of
+# its base64 transport encoding.  Anthropic caps a single image at roughly 1.6k
+# tokens; OpenAI's high-detail tiling lands in the same order of magnitude.
+# Estimating `len(base64)/4` instead reports a 1.5MB image as ~512k tokens --
+# 320x its real cost -- which alone can exceed any budget and force the whole
+# conversation to be evicted for one screenshot.
+MAX_IMAGE_TOKENS = 1600
+
+
+def non_text_block_tokens(
+    block: dict,
+    count_text: Callable[[str], int],
+    *,
+    max_image_tokens: int = MAX_IMAGE_TOKENS,
+) -> int:
+    """Cost of a non-text content block under the provider's price model."""
+    block_type = str(block.get("type") or "")
+    if block_type in {"image", "input_image", "image_url"}:
+        return max_image_tokens
+    source = block.get("source")
+    if isinstance(source, dict) and source.get("data") is not None:
+        # An inline base64 payload of unknown type: price it as an image
+        # rather than by transport length.
+        return max_image_tokens
+    # Anything else genuinely is text the provider reads verbatim.
+    return count_text(json.dumps(block, ensure_ascii=False, default=str))
+
+
+def estimate_message_tokens(
+    messages: list[dict],
+    *,
+    chars_per_token: float = float(shared.CHARS_PER_TOKEN),
+    cjk_chars_per_token: float = 1.0,
+    calibration: float = 1.0,
+    max_image_tokens: int = MAX_IMAGE_TOKENS,
+) -> int:
+    """Token estimate with CJK-awareness.
+
+    Non-CJK text:    ``len(text) / chars_per_token``   (default 4 chars/token)
+    CJK characters:  ``len(cjk) / cjk_chars_per_token`` (default 1 char/token)
+
+    Both ratios are configurable via ``context.consolidation.token_estimation``
+    in config.json so they can be tuned for different languages and model
+    tokenisers.  Without the CJK distinction the estimate for Chinese
+    conversations is ~4x too low, causing the compact trigger to fire far
+    later than intended.  Also counts tool_use ``input`` payloads which the
+    previous implementation silently ignored.
+
+    Deliberately a free function: the estimate is a property of the messages in
+    hand and nothing else, so budget fitting must not require a memory store to
+    exist.  ``ConsolidationEngine.estimate_tokens`` is a thin wrapper over this
+    that supplies the configured ratios and the learned calibration.
+    """
+    per_cjk = max(0.1, float(cjk_chars_per_token))
+    per_chars = max(0.1, float(chars_per_token))
+
+    def _count(text: str) -> int:
+        cjk = count_cjk_chars(text)
+        non_cjk = len(text) - cjk
+        return int(cjk / per_cjk) + int(non_cjk / per_chars)
+
+    total = 0.0
+    for msg in messages:
+        # Provider chat protocols charge a small envelope cost per message
+        # even when content is empty.
+        total += 4
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += _count(content)
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    total += _count(str(block))
+                    continue
+                text_value = block.get("text", "") or block.get("content", "")
+                if text_value:
+                    total += _count(str(text_value))
+                tool_input = block.get("input")
+                if tool_input is not None:
+                    total += _count(
+                        json.dumps(tool_input, ensure_ascii=False, default=str)
+                    )
+                if not text_value and tool_input is None:
+                    total += non_text_block_tokens(
+                        block, _count, max_image_tokens=max_image_tokens
+                    )
+        tool_calls = msg.get("tool_calls")
+        if tool_calls:
+            total += _count(
+                json.dumps(tool_calls, ensure_ascii=False, default=str)
+            )
+    return int(total * calibration)
+
+
 class ConsolidationEngine:
     """LLM-driven context consolidation — the 'sleep' mechanism.
 
@@ -55,79 +149,34 @@ class ConsolidationEngine:
 
     # ── Trigger ───────────────────────────────────────────────────────────────
 
-    # Providers charge for an image by its rendered dimensions, not by the
-    # length of its base64 transport encoding.  Anthropic caps a single image at
-    # roughly 1.6k tokens; OpenAI's high-detail tiling lands in the same order of
-    # magnitude.  Estimating `len(base64)/4` instead reports a 1.5MB image as
-    # ~512k tokens — 320x its real cost — which alone can exceed any budget and
-    # force the whole conversation to be evicted for one screenshot.
-    MAX_IMAGE_TOKENS = 1600
+    # Re-exported so `engine.MAX_IMAGE_TOKENS` keeps working and subclasses can
+    # still override the cap; the estimate itself now lives in the free
+    # function above, which takes it as a parameter.
+    MAX_IMAGE_TOKENS = MAX_IMAGE_TOKENS
 
     @classmethod
     def _non_text_block_tokens(
         cls, block: dict, count_text: Callable[[str], int]
     ) -> int:
         """Cost of a non-text content block under the provider's price model."""
-        block_type = str(block.get("type") or "")
-        if block_type in {"image", "input_image", "image_url"}:
-            return cls.MAX_IMAGE_TOKENS
-        source = block.get("source")
-        if isinstance(source, dict) and source.get("data") is not None:
-            # An inline base64 payload of unknown type: price it as an image
-            # rather than by transport length.
-            return cls.MAX_IMAGE_TOKENS
-        # Anything else genuinely is text the provider reads verbatim.
-        return count_text(json.dumps(block, ensure_ascii=False, default=str))
+        return non_text_block_tokens(
+            block, count_text, max_image_tokens=cls.MAX_IMAGE_TOKENS
+        )
 
     def estimate_tokens(self, messages: list[dict]) -> int:
-        """Token estimate with CJK-awareness.
+        """Token estimate with CJK-awareness, using this engine's settings.
 
-        Non-CJK text:    ``len(text) / chars_per_token``   (default 4 chars/token)
-        CJK characters:  ``len(cjk) / cjk_chars_per_token`` (default 1 char/token)
-
-        Both ratios are configurable via ``context.consolidation.token_estimation``
-        in config.json so they can be tuned for different languages and model
-        tokenisers.  Without the CJK distinction the estimate for Chinese
-        conversations is ~4x too low, causing the compact trigger to fire far
-        later than intended.  Also counts tool_use ``input`` payloads which the
-        previous implementation silently ignored.
+        See ``estimate_message_tokens`` for the model and the reasoning behind
+        the CJK split.  The learned ``token_calibration`` is applied here so a
+        calibrated engine and the free function agree on everything else.
         """
-        def _count(text: str) -> int:
-            cjk = count_cjk_chars(text)
-            non_cjk = len(text) - cjk
-            return int(cjk / self.cjk_chars_per_token) + int(
-                non_cjk / self.chars_per_token
-            )
-
-        total = 0.0
-        for msg in messages:
-            # Provider chat protocols charge a small envelope cost per message
-            # even when content is empty.
-            total += 4
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                total += _count(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict):
-                        total += _count(str(block))
-                        continue
-                    text_value = block.get("text", "") or block.get("content", "")
-                    if text_value:
-                        total += _count(str(text_value))
-                    tool_input = block.get("input")
-                    if tool_input is not None:
-                        total += _count(
-                            json.dumps(tool_input, ensure_ascii=False, default=str)
-                        )
-                    if not text_value and tool_input is None:
-                        total += self._non_text_block_tokens(block, _count)
-            tool_calls = msg.get("tool_calls")
-            if tool_calls:
-                total += _count(
-                    json.dumps(tool_calls, ensure_ascii=False, default=str)
-                )
-        return int(total * self.token_calibration)
+        return estimate_message_tokens(
+            messages,
+            chars_per_token=self.chars_per_token,
+            cjk_chars_per_token=self.cjk_chars_per_token,
+            calibration=self.token_calibration,
+            max_image_tokens=self.MAX_IMAGE_TOKENS,
+        )
 
     # Bounds on the learned multiplier.  A heuristic that needs more than a 4x
     # correction is broken in a way calibration should not paper over, and one

@@ -658,34 +658,66 @@ class ContextManager:
     def compact_messages(
         self, messages: list[dict], *, input_token_budget: int
     ) -> list[dict]:
+        """Drop the oldest turns until the payload fits ``input_token_budget``."""
+        return self.fit_to_budget(
+            messages,
+            input_token_budget=input_token_budget,
+            estimate_tokens=self.consolidation.estimate_tokens,
+        )
+
+    @classmethod
+    def fit_to_budget(
+        cls,
+        messages: list[dict],
+        *,
+        input_token_budget: int,
+        estimate_tokens: Callable[[list[dict]], int],
+    ) -> list[dict]:
+        """Fit a provider payload into ``input_token_budget``, dropping oldest first.
+
+        This is the whole of ``compact_messages``, minus the dependency on an
+        instance.  That dependency was the bug: fitting a request into the
+        provider's window is a property of the request, not of memory -- it
+        reads no durable memory and writes none -- but it lived only on
+        ``ContextManager``, so a run that deliberately has no manager (the
+        scheduler's ``stateless`` policy nulls it to stop anything carrying
+        between runs) also lost the ability to drop its own oldest turns.  Such
+        a run hard-failed with ``ContextLimitError`` the moment its transcript
+        outgrew the window, where the interactive path would simply have
+        compacted.
+
+        ``estimate_tokens`` is injected rather than read from a consolidation
+        engine for the same reason: the caller that has no manager still has to
+        be able to say what a message costs.
+        """
         budget = int(input_token_budget)
         if budget <= 0:
             raise ContextLimitError("provider input token budget is not positive")
         # Collapse any prior notice into a running count so repeated compactions
         # report cumulative loss instead of stacking notices.
-        messages, dropped_before = self._strip_eviction_notices(messages)
-        messages = self._repair_tool_history(messages)
+        messages, dropped_before = cls._strip_eviction_notices(messages)
+        messages = cls._repair_tool_history(messages)
         newest_request_index = next(
             (
                 index
                 for index in range(len(messages) - 1, -1, -1)
-                if self._is_real_user_request(messages[index])
+                if cls._is_real_user_request(messages[index])
             ),
             -1,
         )
-        if newest_request_index >= 0 and self.consolidation.estimate_tokens(
+        if newest_request_index >= 0 and estimate_tokens(
             [messages[newest_request_index]]
         ) >= budget:
             raise ContextLimitError("newest user request exceeds provider input budget")
 
-        retained = self._complete_message_units(messages, newest_request_index)
+        retained = cls._complete_message_units(messages, newest_request_index)
 
         def materialize() -> list[dict]:
             kept_indexes = {item for unit in retained for item in unit}
             return [msg for index, msg in enumerate(messages) if index in kept_indexes]
 
         compacted = materialize()
-        while self.consolidation.estimate_tokens(compacted) >= budget:
+        while estimate_tokens(compacted) >= budget:
             removable = next(
                 (
                     unit
@@ -711,8 +743,8 @@ class ContextManager:
             # missing, so leave an explicit notice.  The notice is an aid, not a
             # requirement: if it does not fit alongside the conversation it is
             # omitted rather than allowed to fail the compaction it describes.
-            notice = self._eviction_notice(dropped_now)
-            if self.consolidation.estimate_tokens([notice] + compacted) < budget:
+            notice = cls._eviction_notice(dropped_now)
+            if estimate_tokens([notice] + compacted) < budget:
                 compacted = [notice] + compacted
         if len(compacted) != len(messages):
             # Counts alone say how much was lost but not what: a caller
@@ -723,8 +755,8 @@ class ContextManager:
                 messages_before=len(messages),
                 messages_after=len(compacted),
                 messages_dropped=dropped_now,
-                dropped_roles=self._role_sequence(dropped_messages),
-                dropped_tokens=self.consolidation.estimate_tokens(dropped_messages)
+                dropped_roles=cls._role_sequence(dropped_messages),
+                dropped_tokens=estimate_tokens(dropped_messages)
                 if dropped_messages
                 else 0,
             )

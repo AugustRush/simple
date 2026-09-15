@@ -21,6 +21,7 @@ from agent.config import _compose_system_prompt
 from agent.core.context_assembler import ContextAssembler
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
+from agent.memory.consolidation import estimate_message_tokens
 from agent.memory.system import ContextLimitError, ContextManager, LTMEntry
 from agent.orchestration.runtime import (
     RendezvousDirective,
@@ -1395,8 +1396,14 @@ class BaseAgent:
         estimate = getattr(consolidation, "estimate_tokens", None)
         if callable(estimate):
             return estimate(messages)
-        serialized = json.dumps(messages, ensure_ascii=False, sort_keys=True)
-        return max(0, int(len(serialized) / max(1.0, float(shared.CHARS_PER_TOKEN))))
+        # No manager to borrow an estimator from.  Use the same CJK-aware model
+        # the manager would have used, rather than
+        # `len(json.dumps) / CHARS_PER_TOKEN`: that older fallback counted a
+        # Chinese character as a quarter of a token, so it under-reported
+        # exactly the payloads most likely to be too large -- and because the
+        # budget is derived from this same estimator, it moved the wall along
+        # with the measurement instead of correcting anything.
+        return estimate_message_tokens(messages)
 
     def _prepare_provider_context(
         self,
@@ -1417,6 +1424,20 @@ class BaseAgent:
         if context_manager is not None:
             ctx.messages = context_manager.compact_messages(
                 ctx.messages, input_token_budget=budget
+            )
+        else:
+            # Fitting the request into the window is not a memory operation: it
+            # drops the oldest turns of *this* payload and reads or writes
+            # nothing durable.  So a turn with no manager -- the scheduler's
+            # `stateless` policy nulls it to keep runs independent -- still has
+            # to be able to compact.  Without this, such a run raised
+            # ContextLimitError the moment its own transcript outgrew the
+            # window, where the interactive path would simply have dropped
+            # turns and carried on.
+            ctx.messages = ContextManager.fit_to_budget(
+                ctx.messages,
+                input_token_budget=budget,
+                estimate_tokens=estimate_message_tokens,
             )
         estimate = self._estimate_input_tokens(ctx.messages, ctx=ctx)
         if estimate >= budget:

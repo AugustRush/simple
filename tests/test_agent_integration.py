@@ -4847,6 +4847,55 @@ def test_create_enforces_input_budget_before_transport(tmp_path):
     assert calls[0]["messages"][-1]["content"] == "latest"
 
 
+def test_create_fits_the_budget_without_a_context_manager(tmp_path):
+    """A run with no manager must still fit its payload, not hard-fail.
+
+    The scheduler's `stateless` policy nulls the context manager so nothing
+    carries between runs.  That must cost the run cross-run memory, not the
+    ability to fit its own transcript into the provider window: compaction
+    only drops the oldest turns of the request in hand.  Before, it was
+    skipped entirely and `_create` raised `ContextLimitError` where the
+    managed path would have compacted.
+    """
+    import agent as agent_module
+
+    calls = []
+
+    class Transport:
+        async def create(self, **kwargs):
+            calls.append(kwargs)
+            return object()
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="openai",
+        context_window=100,
+        max_tokens=20,
+    )
+    agent.context_manager = None
+    agent._transport = Transport()
+    tools = [{"name": "tool", "description": "y" * 40}]
+    ctx = agent_module.AgentContext(
+        system_prompt="s" * 40,
+        messages=[
+            {"role": "user", "content": "x" * 400},
+            {"role": "assistant", "content": "old"},
+            {"role": "user", "content": "latest"},
+        ],
+    )
+
+    asyncio.run(agent._create(ctx, tools))
+
+    assert len(calls) == 1
+    budget = agent._input_token_budget(ctx, tools)
+    assert agent._estimate_input_tokens(calls[0]["messages"], ctx=ctx) < budget
+    # The oversized opening turn is what had to go; the live request stays.
+    assert len(calls[0]["messages"]) < 3
+    assert calls[0]["messages"][-1]["content"] == "latest"
+
+
 def test_send_message_reports_terminal_error_when_openai_length_stays_truncated(
     monkeypatch,
 ):
