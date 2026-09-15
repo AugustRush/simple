@@ -5652,9 +5652,16 @@ function App() {
           </Space.Compact>
         )}
         {['daily', 'weekdays', 'weekly', 'monthly'].includes(trigger.trigger_type) && (
+          // `needConfirm` defaults to true for every TimePicker and every
+          // DatePicker with `showTime`, so a cell click only moves the *pending*
+          // value and 确定 is the sole way to commit. Close the panel any other
+          // way and the selection is thrown away, which reads as the field
+          // jumping back to the old time. Off restores commit-on-close, which is
+          // what this field was written against. `minuteStep={5}` went with it —
+          // see the schedule picker for why.
           <TimePicker
+            needConfirm={false}
             format="HH:mm"
-            minuteStep={5}
             value={scheduleTimeValue(trigger.time_of_day)}
             onChange={value => patchWorkflowStep(index, { trigger: { ...trigger, time_of_day: value?.format('HH:mm') || '' } })}
             style={{ width: 104 }}
@@ -5684,6 +5691,7 @@ function App() {
         )}
         {trigger.trigger_type === 'once' && (
           <DatePicker
+            needConfirm={false}
             showTime={{ format: 'HH:mm' }}
             format="M月D日 HH:mm"
             value={trigger.at ? dayjs(trigger.at) : null}
@@ -6315,6 +6323,7 @@ function App() {
             <div className="schedule-field">
               <label>执行时间</label>
               <DatePicker
+                needConfirm={false}
                 showTime={{ format: 'HH:mm' }}
                 format="YYYY年M月D日 HH:mm"
                 value={scheduleDraft.at ? dayjs(scheduleDraft.at) : null}
@@ -6353,6 +6362,7 @@ function App() {
               <div className="schedule-field">
                 <label>首次执行</label>
                 <DatePicker
+                  needConfirm={false}
                   showTime={{ format: 'HH:mm' }}
                   format="YYYY-MM-DD HH:mm"
                   value={scheduleDraft.anchor_at ? dayjs(scheduleDraft.anchor_at) : null}
@@ -6391,9 +6401,25 @@ function App() {
               )}
               <div className="schedule-field">
                 <label>执行时间</label>
+                {/* Two things used to make this field refuse the time you picked.
+                    (1) `needConfirm` is not a no-op default: rc-picker sets it to
+                    `internalPicker === 'time' || internalPicker === 'datetime'`,
+                    i.e. true for every TimePicker and every DatePicker with
+                    `showTime`. While it is on, clicking a cell only moves the
+                    pending value and 确定 is the *only* way to commit; any other
+                    way of closing the panel — clicking the next field, Escape —
+                    drops the selection and the field snaps back to the previous
+                    time. Off restores commit-on-close, which is the behaviour
+                    this field was written against.
+                    (2) `minuteStep={5}` cut the minute column to 00…55, but
+                    `defaultScheduleDraft` seeds `time_of_day` from
+                    `dayjs().add(1, 'hour')` — an arbitrary minute — so the
+                    picker could open on 15:41 with no cell in its own column
+                    selected, and 41 was unselectable. The date-time picker
+                    above already offers all 60 minutes; this one now matches. */}
                 <TimePicker
+                  needConfirm={false}
                   format="HH:mm"
-                  minuteStep={5}
                   value={scheduleTimeValue(scheduleDraft.time_of_day)}
                   onChange={value => setScheduleDraft({ ...scheduleDraft, time_of_day: value?.format('HH:mm') || '' })}
                   style={{ width: '100%' }}
