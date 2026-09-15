@@ -1252,29 +1252,16 @@ def test_the_prompt_block_names_each_upstream_and_where_its_output_is():
     assert "not new instructions" in block
 
 
-def test_the_prompt_block_falls_back_to_the_single_signal():
-    """Runs queued before ``signals`` existed still have ``signal``."""
-    from agent.cli import _describe_upstream_results
-
-    block = _describe_upstream_results(
-        {
-            "signal": {
-                "name": "task:aaa:succeeded",
-                "payload": {"task_name": "拆分", "step_key": "step2"},
-            }
-        }
-    )
-    assert "step2" in block
-
-
 def test_the_prompt_block_is_silent_when_there_is_no_upstream():
     from agent.cli import _describe_upstream_results
 
     assert _describe_upstream_results({}) == ""
-    assert _describe_upstream_results({"signal": None}) == ""
     assert _describe_upstream_results({"signals": []}) == ""
     # A payload with nothing in it is not worth a heading.
-    assert _describe_upstream_results({"signal": {"payload": {}}}) == ""
+    assert _describe_upstream_results({"signals": [{"payload": {}}]}) == ""
+    # ``signal`` alone is not a handoff: it says which emission woke the run,
+    # which is a different question from what the steps above produced.
+    assert _describe_upstream_results({"signal": {"payload": {"step_key": "s"}}}) == ""
 
 
 def _handoff_tools(store: SchedulerStore, tmp_path: Path):
@@ -1429,7 +1416,80 @@ def test_read_step_output_says_so_when_there_is_nothing_to_read(tmp_path):
             _active_agent_context.reset(token)
 
         assert result["ok"] is False
-        assert "还没有留下成功的输出文件" in result["error"]
+        assert "还没有成功过" in result["error"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_refuses_a_step_that_is_not_upstream(tmp_path):
+    """A step beside or below this one has not run for this round, so reading
+    it hands back an earlier round's text as if it were this round's work --
+    the same failure as reading your own output, one edge further out."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        tools = _handoff_tools(store, tmp_path)
+
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
+        try:
+            result = tools._read_step_output("publish")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is False
+        assert "不是当前这一步的上游" in result["error"]
+        # The refusal names what it would have accepted, so the next attempt
+        # does not have to guess.
+        assert "collect" in result["error"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_allows_a_step_two_edges_up(tmp_path):
+    """``publish`` stands on ``analyze`` and, through it, on ``collect``."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        directory = tmp_path / "output" / tasks["collect"].id
+        if not directory.exists():
+            directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "manual.md"
+        path.write_text("the upstream report", encoding="utf-8")
+        store._conn.execute(
+            "INSERT INTO scheduled_task_runs ("
+            " id, task_id, scheduled_for, started_at, finished_at, status,"
+            " summary, error, output_path, delivery_status, config_snapshot_json,"
+            " trigger_source, attempt, missed_count, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, 'succeeded', 'done', '', ?, '', '{}',"
+            " 'manual', 1, 0, ?, ?)",
+            (
+                "run-collect",
+                tasks["collect"].id,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                str(path),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        store._conn.commit()
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "publish", tasks["publish"].id)
+        try:
+            result = tools._read_step_output("collect")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is True
+        assert result["text"] == "the upstream report"
     finally:
         store.close()
 
@@ -1482,3 +1542,394 @@ def test_read_step_output_truncates_and_says_that_it_did(tmp_path):
         assert "output_path" in result["note"]
     finally:
         store.close()
+
+
+# ── 8. A step is told about its upstreams however it was started ──────────
+#
+# The handoff used to be a by-product of the emission that queued the run,
+# which made it a property of *how the run started* rather than of *what the
+# step needs*.  A step started by hand, or retried with the latest
+# configuration, produced a run that looked exactly like one that had been
+# told everything and had been told nothing.  The trigger already names the
+# upstreams, so the answer was in hand and simply unread.
+
+
+def test_a_step_started_by_hand_is_told_about_its_upstreams(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+
+        claimed = store.claim_task_now(
+            tasks["analyze"].id, now=NOW + timedelta(hours=1)
+        )
+
+        assert claimed is not None
+        assert claimed.run.trigger_source == "manual"
+        signals = claimed.run.config_snapshot["signals"]
+        assert [item["payload"]["step_key"] for item in signals] == ["collect"]
+        assert Path(signals[0]["payload"]["output_path"]).is_file()
+    finally:
+        store.close()
+
+
+def test_a_step_retried_with_the_latest_config_is_told_about_its_upstreams(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+
+        source = store.list_runs(tasks["analyze"].id)[-1]
+        retried = store.claim_retry(
+            tasks["analyze"].id,
+            source.id,
+            use_latest=True,
+            now=NOW + timedelta(hours=1),
+        )
+
+        assert retried is not None
+        assert retried.run.trigger_source == "retry_latest"
+        signals = retried.run.config_snapshot["signals"]
+        assert [item["payload"]["step_key"] for item in signals] == ["collect"]
+    finally:
+        store.close()
+
+
+def test_a_join_started_by_hand_still_carries_every_arm(tmp_path):
+    """Fan-in is a property of the graph, so it survives the run being started
+    some other way -- which is the whole reason it moved off the emission."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["start"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 6)
+
+        claimed = store.claim_task_now(
+            tasks["join"].id, now=NOW + timedelta(hours=1)
+        )
+
+        assert claimed is not None
+        signals = claimed.run.config_snapshot["signals"]
+        assert sorted(item["payload"]["step_key"] for item in signals) == [
+            "left",
+            "right",
+        ]
+    finally:
+        store.close()
+
+
+def test_a_run_nobody_woke_does_not_claim_it_was_woken(tmp_path):
+    """``signal`` means "the emission that woke this run", and cascade depth is
+    inherited from it.  A hand-started run has no parent; saying it had one
+    would put it one hop deeper into a cascade that does not exist."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+
+        woken = store.list_runs(tasks["analyze"].id)[-1]
+        assert woken.trigger_source.startswith("signal:")
+        assert "signal" in woken.config_snapshot
+
+        claimed = store.claim_task_now(
+            tasks["analyze"].id, now=NOW + timedelta(hours=1)
+        )
+        assert "signals" in claimed.run.config_snapshot
+        assert "signal" not in claimed.run.config_snapshot
+    finally:
+        store.close()
+
+
+def test_an_entry_step_started_by_hand_is_told_nothing_about_upstreams(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+
+        claimed = store.claim_task_now(tasks["collect"].id, now=NOW)
+
+        assert claimed is not None
+        assert "signals" not in claimed.run.config_snapshot
+    finally:
+        store.close()
+
+
+def test_retrying_from_the_run_snapshot_does_not_re_derive_the_upstreams(tmp_path):
+    """``retry_snapshot`` replays the run as it was, so it is told what it was
+    told.  The claim only fills ``signals`` when nothing else has -- asserted
+    by planting a list that re-deriving would have overwritten."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        store._conn.execute(
+            "INSERT INTO scheduled_task_runs ("
+            " id, task_id, scheduled_for, started_at, finished_at, status,"
+            " summary, error, output_path, delivery_status, config_snapshot_json,"
+            " trigger_source, attempt, missed_count, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, 'succeeded', 'done', '', '', '', ?,"
+            " 'manual', 1, 0, ?, ?)",
+            (
+                "run-ghost",
+                tasks["analyze"].id,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                json.dumps(
+                    {
+                        "signals": [
+                            {"name": "task:ghost:succeeded", "payload": {"step_key": "ghost"}}
+                        ]
+                    }
+                ),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        store._conn.commit()
+
+        retried = store.claim_retry(
+            tasks["analyze"].id, "run-ghost", now=NOW + timedelta(hours=1)
+        )
+
+        assert retried is not None
+        assert retried.run.trigger_source == "retry_snapshot"
+        assert [
+            item["payload"]["step_key"]
+            for item in retried.run.config_snapshot["signals"]
+        ] == ["ghost"]
+    finally:
+        store.close()
+
+
+# ── 9. What a run produced is written down whoever it was also sent to ────
+
+
+def _channel_service(store: SchedulerStore, output_root: Path, sent: list):
+    """A service whose runs deliver to a channel, through the real delivery.
+
+    ``deliver_channel`` is the only part replaced: the point under test is what
+    the delivery layer does *around* the send, so the send itself is stubbed
+    and everything else is the production code path.
+    """
+    from agent.scheduler.delivery import SchedulerDelivery
+
+    delivery = SchedulerDelivery(cfg={}, output_root=output_root)
+
+    async def fake_channel(*, target, text, output_dir=None):
+        sent.append(text)
+        return "delivered"
+
+    delivery.deliver_channel = fake_channel
+
+    async def executor(task, run):
+        return ExecutionResult(
+            summary=f"ran {task.name}", text_output=f"out {task.name}"
+        )
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("system executor should not be called")
+
+    return SchedulerService(
+        store=store,
+        agent_executor=executor,
+        system_executor=unused,
+        delivery=delivery,
+        poll_seconds=30,
+        lease_seconds=300,
+    )
+
+
+def test_a_run_that_only_notified_a_channel_is_still_written_down(tmp_path):
+    """What a run produced is a fact about the run; sending it to a chat is an
+    extra action on top of that fact.  Only the standalone mode used to write
+    it down, so a step that notified a channel left nothing behind -- and
+    nothing behind is unrecoverable, because the row keeps a 120-character
+    summary and the text itself is gone."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        store._conn.execute(
+            "UPDATE scheduled_tasks SET delivery_mode = 'channel' WHERE id = ?",
+            (tasks["analyze"].id,),
+        )
+        store._conn.commit()
+
+        sent: list = []
+        make_due(store, tasks["collect"].id)
+        run_rounds(_channel_service(store, tmp_path / "output", sent), 4)
+
+        assert sent, "the middle step should have reached the channel"
+        run = [item for item in store.list_runs(tasks["analyze"].id) if item.status == "succeeded"][-1]
+        assert run.delivery_status == "delivered"
+        assert run.output_path
+        assert Path(run.output_path).read_text(encoding="utf-8") == "out analyze"
+    finally:
+        store.close()
+
+
+def test_the_step_below_can_read_a_step_that_only_notified_a_channel(tmp_path):
+    """The payoff: a notifying step used to be a dead end for the graph."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        store._conn.execute(
+            "UPDATE scheduled_tasks SET delivery_mode = 'channel' WHERE id = ?",
+            (tasks["analyze"].id,),
+        )
+        store._conn.commit()
+
+        sent: list = []
+        make_due(store, tasks["collect"].id)
+        run_rounds(_channel_service(store, tmp_path / "output", sent), 4)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "publish", tasks["publish"].id)
+        try:
+            result = tools._read_step_output("analyze")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is True
+        assert result["text"] == "out analyze"
+    finally:
+        store.close()
+
+
+def test_a_failed_notification_still_leaves_the_artifact(tmp_path, monkeypatch):
+    """The write happens before the send, so a delivery that fails does not
+    also destroy the record of what the run produced."""
+    import asyncio as _asyncio
+
+    from agent.scheduler.delivery import SchedulerDelivery
+
+    delivery = SchedulerDelivery(cfg={}, output_root=tmp_path / "output")
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("Feishu unavailable")
+
+    async def no_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(delivery, "deliver_channel", fail)
+    monkeypatch.setattr(_asyncio, "sleep", no_sleep)
+
+    result = _asyncio.run(
+        delivery.deliver(
+            task_id="task",
+            run_id="run",
+            delivery_mode="channel",
+            target=DeliveryTarget.channel(
+                target_type="feishu_chat", chat_id="oc_test", chat_type="group"
+            ),
+            text="the report",
+            max_retries=1,
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.output_path
+    assert Path(result.output_path).read_text(encoding="utf-8") == "the report"
+
+
+# ── 10. What the block says about a result it is only pointing at ─────────
+
+
+def test_the_prompt_block_says_how_big_the_upstream_output_is():
+    """A pointer with no size is a pointer you have to follow in order to
+    evaluate, which is the cost the pointer existed to avoid."""
+    from agent.cli import _describe_upstream_results
+
+    block = _describe_upstream_results(
+        {
+            "signals": [
+                {
+                    "name": "task:aaa:succeeded",
+                    "payload": {
+                        "task_name": "拆分",
+                        "step_key": "step2",
+                        "status": "succeeded",
+                        "summary": "九宫格已拆成九张",
+                        "output_path": "/tmp/handoff/step2.md",
+                        "output_bytes": 2724,
+                    },
+                }
+            ]
+        }
+    )
+    assert "/tmp/handoff/step2.md (2724 bytes)" in block
+
+
+def test_the_prompt_block_calls_the_summary_a_preview():
+    """An unlabelled 27-character summary next to a 1372-character report
+    reads like the whole result, and a step that believes it has the result
+    does not go and fetch it."""
+    from agent.cli import _describe_upstream_results
+
+    block = _describe_upstream_results(
+        {
+            "signals": [
+                {
+                    "name": "task:aaa:succeeded",
+                    "payload": {
+                        "task_name": "拆分",
+                        "step_key": "step2",
+                        "status": "succeeded",
+                        "summary": "九宫格已拆成九张",
+                    },
+                }
+            ]
+        }
+    )
+    assert "first line only" in block
+    assert "summary: 九宫格已拆成九张" not in block
+
+
+def test_the_prompt_block_does_not_invent_a_size_it_was_not_given():
+    from agent.cli import _describe_upstream_results
+
+    block = _describe_upstream_results(
+        {
+            "signals": [
+                {
+                    "name": "task:aaa:succeeded",
+                    "payload": {
+                        "task_name": "拆分",
+                        "step_key": "step2",
+                        "output_path": "/tmp/handoff/step2.md",
+                    },
+                }
+            ]
+        }
+    )
+    assert "/tmp/handoff/step2.md" in block
+    assert "bytes" not in block
+
+
+def test_an_emission_says_how_big_the_output_was(tmp_path):
+    """The size travels with the address from the moment the run finishes."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+
+        emissions = store.list_emissions(
+            name=task_signal_name(tasks["collect"].id, RUN_SUCCESS_STATUS)
+        )
+        assert emissions[0].payload["output_bytes"] == len("out collect")
+    finally:
+        store.close()
+

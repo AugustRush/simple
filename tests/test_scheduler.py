@@ -1206,10 +1206,10 @@ def test_scheduler_delivery_failure_is_persisted_without_losing_executor_output(
     assert refreshed.last_success_at is None
 
 
-def test_scheduler_delivery_failure_uses_error_field(monkeypatch):
+def test_scheduler_delivery_failure_uses_error_field(monkeypatch, tmp_path):
     from agent.scheduler.delivery import SchedulerDelivery
 
-    delivery = SchedulerDelivery(cfg={})
+    delivery = SchedulerDelivery(cfg={}, output_root=tmp_path / "scheduler")
     attempts = []
 
     async def fail(*args, **kwargs):
@@ -1235,7 +1235,12 @@ def test_scheduler_delivery_failure_uses_error_field(monkeypatch):
     assert len(attempts) == 3
     assert result.status == "failed"
     assert result.error == "send failed"
-    assert result.output_path == ""
+    # A failed notification does not un-produce the run.  The text is written
+    # down before the send, so the path is reported even here -- otherwise a
+    # step that failed to reach its chat would leave nothing behind at all,
+    # and the row would keep a 120-character summary as its only record.
+    assert result.output_path
+    assert Path(result.output_path).read_text(encoding="utf-8") == "payload"
 
 
 def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_path):

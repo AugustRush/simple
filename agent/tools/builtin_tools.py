@@ -70,6 +70,32 @@ WEB_USER_AGENT = (
     "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
 )
 
+
+def _workflow_ancestors(steps, key: str) -> set[str]:
+    """Every step ``key`` transitively stands on.
+
+    Read from the authored graph rather than from the triggers, because the
+    question is about the shape of the chain: a step may read what it stands
+    on, and nothing else.  A step beside it has not run for this round, and a
+    step below it has not run at all -- reading either returns an earlier
+    round's text, which is exactly the confusion the "not your own step" rule
+    exists to prevent, one edge further out.
+    """
+    depends = {
+        str(step.key).strip(): [str(item).strip() for item in (step.depends_on or [])]
+        for step in steps
+    }
+    seen: set[str] = set()
+    pending = list(depends.get(str(key).strip(), []))
+    while pending:
+        current = pending.pop()
+        if not current or current in seen:
+            continue
+        seen.add(current)
+        pending.extend(depends.get(current, []))
+    return seen
+
+
 # Model-facing guidance attached to every confirmation-required shell error.
 _SHELL_CONFIRMATION_GUIDANCE = (
     "Only high-risk commands (disk/system destruction, destructive options, "
@@ -919,12 +945,13 @@ class BuiltinTools:
         r.register(
             "read_step_output",
             (
-                "Read the latest successful output of another step of the same workflow. "
+                "Read the latest successful output of a step this one stands on. "
                 "Use it when this run needs what an upstream step actually produced, rather "
                 "than the one-line summary already in this run's context -- for example to "
                 "decide what a message should say. Address the step by its key (step2), not "
-                "by a task or run id. Only steps of this workflow are reachable, and only "
-                "outputs the scheduler itself recorded, so this cannot read arbitrary files."
+                "by a task or run id. Only the steps this one depends on, directly or "
+                "transitively, are readable, and only outputs the scheduler itself recorded, "
+                "so this cannot read arbitrary files."
             ),
             {
                 "type": "object",
@@ -3211,7 +3238,7 @@ class BuiltinTools:
     def _read_step_output(
         self, step: str, max_chars: int = READ_STEP_OUTPUT_DEFAULT_CHARS
     ) -> dict[str, Any]:
-        """The latest successful output of another step of this workflow.
+        """The latest successful output of a step this one stands on.
 
         Addressed by *step key* because that is the name the graph gives a
         step and the only one a model can be expected to know: task ids and run
@@ -3219,6 +3246,12 @@ class BuiltinTools:
         will look them up wrong.  The workflow is taken from the run being
         served, not from an argument, so a step cannot reach outside its own
         graph by naming one.
+
+        Restricted to ancestors of the current step, not to the whole graph.
+        A step beside it has not run for this round and a step below it has not
+        run at all, so reading either hands back an earlier round's text as if
+        it were this round's work -- which is the failure the tool exists to
+        make impossible rather than to make unlikely.
 
         Only ``output_path`` values the scheduler recorded are read.  That is
         the tool's whole safety property: it is not a file reader with a
@@ -3258,6 +3291,22 @@ class BuiltinTools:
             return self._error(
                 f"「{wanted}」就是当前这一步，读它只会拿到自己上一轮的结果。"
             )
+        workflow = store.get_workflow(workflow_id)
+        current_key = str(context.get("scheduler_step_key", "") or "").strip()
+        ancestors = (
+            _workflow_ancestors(workflow.steps, current_key)
+            if workflow is not None
+            else set()
+        )
+        if wanted not in ancestors:
+            # Same reasoning as the line above, one edge further out: a step
+            # that has not run yet, or ran in an earlier round, has nothing
+            # about *this* round to hand over.
+            known = "、".join(sorted(ancestors)) or "（无）"
+            return self._error(
+                f"「{wanted}」不是当前这一步的上游，读它只会拿到它上一轮的文本。"
+                f"当前步骤的上游：{known}"
+            )
 
         latest = None
         for run in store.list_runs(target.id):
@@ -3265,8 +3314,7 @@ class BuiltinTools:
                 latest = run
         if latest is None:
             return self._error(
-                f"步骤「{wanted}」还没有留下成功的输出文件"
-                "（只有投递方式为「仅保存」的运行会落盘；发到飞书的运行不落盘）。"
+                f"步骤「{wanted}」还没有成功过，所以没有产物可读。"
             )
 
         path = Path(str(latest.output_path)).expanduser()

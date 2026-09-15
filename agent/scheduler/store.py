@@ -51,6 +51,62 @@ def _iso(value: Optional[datetime]) -> Optional[str]:
     return value.astimezone(UTC).isoformat()
 
 
+def _output_byte_count(path: str) -> int:
+    """How big a run's output file is, or 0 if it cannot be measured.
+
+    Carried in the report so a reader can tell a paragraph from a report
+    before deciding whether to fetch it.  A pointer with no size is a pointer
+    you have to follow in order to evaluate, which is the cost the pointer
+    existed to avoid.
+    """
+    try:
+        return int(Path(path).expanduser().stat().st_size)
+    except OSError:
+        return 0
+
+
+def _run_report_payload(
+    *,
+    task_id: str,
+    task_name: str,
+    run_id: str,
+    status: str,
+    workflow_id: str = "",
+    step_key: str = "",
+    summary: str = "",
+    output_path: str = "",
+) -> dict[str, Any]:
+    """One run's report, in the shape every reader of it expects.
+
+    Two things produce this: the emission a run makes when it finishes, and
+    the graph, read at the moment a run is claimed.  They have to agree.  A
+    step told one thing when a signal woke it and another when somebody
+    started it by hand is a step whose behaviour depends on how it started,
+    which is exactly the distinction the handoff is supposed to erase.
+    """
+    payload: dict[str, Any] = {
+        "task_id": task_id,
+        "task_name": task_name,
+        "run_id": run_id,
+        "status": status,
+    }
+    if workflow_id:
+        payload["workflow_id"] = workflow_id
+    if step_key:
+        payload["step_key"] = step_key
+    if summary:
+        # Long enough to be useful in a notification, short enough that a
+        # chatty task cannot turn every downstream run's record into a copy of
+        # its own output.
+        payload["summary"] = summary[:500]
+    if str(output_path or ""):
+        payload["output_path"] = str(output_path)
+        size = _output_byte_count(str(output_path))
+        if size:
+            payload["output_bytes"] = size
+    return payload
+
+
 _F = TypeVar("_F", bound=Callable)
 
 
@@ -1348,6 +1404,9 @@ class SchedulerStore:
         output" reachable at all -- without it a subscriber knows a step
         succeeded but has no way to say where its work went.
 
+        The size of that file travels with the address, so a reader can tell a
+        paragraph from a report before deciding whether to go and read it.
+
         ``workflow_id`` and ``step_key`` travel with it for the same reason:
         they are the names a downstream step can use, and the ids it cannot
         guess.
@@ -1375,24 +1434,18 @@ class SchedulerStore:
             "SELECT name, workflow_id, step_key FROM scheduled_tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
-        payload: dict[str, Any] = {
-            "task_id": task_id,
-            "task_name": str(task_row["name"]) if task_row is not None else "",
-            "run_id": run_id,
-            "status": status,
-        }
-        if task_row is not None:
-            if str(task_row["workflow_id"] or ""):
-                payload["workflow_id"] = str(task_row["workflow_id"])
-            if str(task_row["step_key"] or ""):
-                payload["step_key"] = str(task_row["step_key"])
-        if summary:
-            # Long enough to be useful in a notification, short enough that a
-            # chatty task cannot turn every downstream run's record into a copy
-            # of its own output.
-            payload["summary"] = summary[:500]
-        if str(output_path or ""):
-            payload["output_path"] = str(output_path)
+        payload = _run_report_payload(
+            task_id=task_id,
+            task_name=str(task_row["name"]) if task_row is not None else "",
+            run_id=run_id,
+            status=status,
+            workflow_id=(
+                str(task_row["workflow_id"] or "") if task_row is not None else ""
+            ),
+            step_key=str(task_row["step_key"] or "") if task_row is not None else "",
+            summary=summary,
+            output_path=str(output_path or ""),
+        )
         self._insert_emission(
             task_signal_name(task_id, status),
             payload,
@@ -1547,6 +1600,64 @@ class SchedulerStore:
             )
         return self.get_task(task_id) if cursor.rowcount else None
 
+    def _upstream_reports_in_transaction(
+        self, task: ScheduledTask
+    ) -> dict[str, dict[str, Any]]:
+        """What the runs this task waits for last produced, read off its trigger.
+
+        A run used to be told about its upstreams only by the emission that
+        woke it, which made the handoff a property of *how the run started*
+        rather than of *what the step needs*.  Starting a step by hand ("run
+        now"), or retrying it with the latest configuration, produced a run
+        that looked like any other and had been told nothing about the work it
+        depends on -- while the trigger already names those upstreams, so the
+        answer was in hand and simply unread.
+
+        Keyed by the signal name the subscription waits for, which makes these
+        arrivals indistinguishable from the ones a real emission would have
+        left: the same dict reaches ``_describe_upstream_results`` either way.
+
+        The trigger is read rather than the workflow's ``depends_on`` because
+        the trigger is what the task actually waits on, and it exists for
+        hand-wired signal chains that have no workflow at all.
+        """
+        arrivals: dict[str, dict[str, Any]] = {}
+        for name in signal_names(task.trigger):
+            parsed = parse_task_signal(name)
+            if parsed is None:
+                # A free-form name like ``report.ready``.  Nothing in this
+                # database can vouch for what it produced, so it is not a
+                # report and has no address to hand over.
+                continue
+            upstream_id, status = parsed
+            upstream = self._conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE id = ?", (upstream_id,)
+            ).fetchone()
+            if upstream is None:
+                continue
+            latest = self._conn.execute(
+                """
+                SELECT * FROM scheduled_task_runs
+                WHERE task_id = ? AND status = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (upstream_id, status),
+            ).fetchone()
+            if latest is None:
+                continue
+            arrivals[name] = _run_report_payload(
+                task_id=upstream_id,
+                task_name=str(upstream["name"] or ""),
+                run_id=str(latest["id"]),
+                status=str(latest["status"]),
+                workflow_id=str(upstream["workflow_id"] or ""),
+                step_key=str(upstream["step_key"] or ""),
+                summary=str(latest["summary"] or ""),
+                output_path=str(latest["output_path"] or ""),
+            )
+        return arrivals
+
     def _claim_task_in_transaction(
         self,
         task: ScheduledTask,
@@ -1560,6 +1671,22 @@ class SchedulerStore:
     ) -> Optional[ClaimedTask]:
         run_id = _new_id()
         lease_until = now + timedelta(seconds=lease_seconds)
+        # A run started by hand or by a retry is owed the same picture of the
+        # steps above it as one a signal woke.  Only filled when nothing else
+        # has: a snapshot that already carries ``signals`` came from the
+        # emission that queued this run and describes that round exactly,
+        # which is more faithful than re-deriving it here.  ``signal`` is
+        # deliberately left unset -- that key means "the emission that woke
+        # this run" and is where cascade depth is inherited from, and nothing
+        # woke this one.
+        snapshot = dict(snapshot or {})
+        if "signals" not in snapshot:
+            arrivals = self._upstream_reports_in_transaction(task)
+            if arrivals:
+                snapshot["signals"] = [
+                    {"name": name, "payload": payload}
+                    for name, payload in sorted(arrivals.items())
+                ]
         self._conn.execute(
             """
             INSERT INTO scheduled_task_runs (

@@ -8663,6 +8663,12 @@ def test_scheduler_agent_executor_hands_the_run_its_upstream_results(
     # about them -- the ordinary case is the common one.
     assert "Upstream results" not in plain.ctx.system_prompt
 
+    # The data goes last, after the envelope.  Everything before it is the
+    # same for every run of this task, so it stays one cacheable prefix, and
+    # data belongs after the instructions rather than in the middle of them.
+    prompt = woken.ctx.system_prompt
+    assert prompt.index("Permission profile") < prompt.index("Upstream results")
+
     # ``read_step_output`` resolves the workflow from this metadata, so the
     # executor has to publish it or the tool can only ever answer "not in a
     # workflow" -- which is exactly the answer that looks like a missing

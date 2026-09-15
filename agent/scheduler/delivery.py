@@ -73,19 +73,30 @@ class SchedulerDelivery:
         output_dir: Optional[Path] = None,
         max_retries: int = 3,
     ) -> DeliveryResult:
+        if delivery_mode not in ("standalone", "channel"):
+            # Refused here rather than inside the retry loop below: a mode
+            # nothing can deliver is not a mode that waiting five seconds
+            # will make deliverable.
+            raise ValueError(f"Unsupported delivery mode: {delivery_mode}")
+        # Written down first, whichever mode this is.  What a run produced is a
+        # fact about the run; sending it to a chat is an extra action on top of
+        # that fact.  Only the standalone mode used to persist it, so a step
+        # that notified a channel left nothing behind -- and nothing behind is
+        # unrecoverable: the row keeps a 120-character summary and the text
+        # itself is gone.  Writing before the send also means the artifact
+        # survives a delivery that fails.
+        stored = await self.deliver_standalone(task_id, run_id, text)
+        if delivery_mode == "standalone":
+            return stored
         last_error: Optional[Exception] = None
         for attempt in range(max_retries + 1):
             try:
-                if delivery_mode == "standalone":
-                    return await self.deliver_standalone(task_id, run_id, text)
-                if delivery_mode == "channel":
-                    status = await self.deliver_channel(
-                        target=target,
-                        text=text,
-                        output_dir=output_dir,
-                    )
-                    return DeliveryResult(status=status)
-                raise ValueError(f"Unsupported delivery mode: {delivery_mode}")
+                status = await self.deliver_channel(
+                    target=target,
+                    text=text,
+                    output_dir=output_dir,
+                )
+                return DeliveryResult(status=status, output_path=stored.output_path)
             except Exception as e:
                 last_error = e
                 if attempt < max_retries:
@@ -93,4 +104,5 @@ class SchedulerDelivery:
         return DeliveryResult(
             status="failed",
             error=str(last_error) if last_error else "unknown error",
+            output_path=stored.output_path,
         )
