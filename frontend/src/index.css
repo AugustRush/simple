@@ -4131,6 +4131,17 @@ html[data-theme='dark'] .settings-save-button:disabled {
 .schedule-field .ant-space-compact > .ant-btn:last-child {
   border-radius:0 14px 14px 0 !important;
 }
+/* ...and the two halves have to agree on *height* as well. `Space.Compact` is a
+   flex row, so any child with `height: auto` stretches to the tallest sibling --
+   which is how the 项目文件夹 row's input lines up with its 浏览… button.
+   `Button.controlHeight: 38` is the only control height this app raises (every
+   Select/Input/DatePicker stays at antd's 32), so the button is always the
+   tallest thing in a compact row. antd pins `.ant-select-single` to an explicit
+   32px, so the select is the one control that refuses to stretch and ends up 6px
+   shorter than the button beside it -- which reads as the button overhanging the
+   field it is supposed to be a suffix of. Let it stretch like the input does. */
+.schedule-field .ant-space-compact > .ant-select { height:auto; }
+.schedule-field .ant-space-compact > .ant-select .ant-select-selector { height:100%; }
 .schedule-action-picker { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
 .schedule-action-picker button { display:flex; align-items:flex-start; gap:10px; min-height:68px; padding:12px; border:1px solid var(--border); border-radius:8px; color:var(--text-secondary); background:transparent; text-align:left; cursor:pointer; transition:border-color .16s ease, background-color .16s ease, color .16s ease; }
 .schedule-action-picker button:hover { border-color:var(--border-strong); background:var(--surface-hover); }
@@ -4147,7 +4158,10 @@ html[data-theme='dark'] .settings-save-button:disabled {
 .schedule-workspace-recents button:hover { border-color:var(--border-strong); color:var(--text); background:var(--surface-hover); }
 .schedule-workspace-recents button.active { border-color:var(--primary-border); color:var(--text); background:var(--primary-soft); }
 .schedule-delivery-error { color:var(--danger, #b45309); }
-.schedule-delivery-error .ant-btn-link { padding:0 0 0 6px; height:auto; font-size:10px; }
+/* Any hint that names a button has to actually carry that button. The
+   empty-chat-list case tells the user to press 重新获取 as well, so the action is
+   styled for the hint generally rather than only for the error variant. */
+.schedule-field-hint .ant-btn-link { padding:0 0 0 5px; height:auto; font-size:10px; }
 .workflow-step-workspace .ant-input-affix-wrapper { flex:1 1 auto; min-width:0; }
 .schedule-preview { display:grid; gap:8px; padding:11px 12px; border:1px solid var(--border); border-radius:8px; background:var(--surface-hover); }
 .schedule-preview > div { display:flex; align-items:center; gap:7px; color:var(--text-secondary); font-size:11px; }

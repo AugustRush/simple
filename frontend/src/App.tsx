@@ -6537,9 +6537,17 @@ function App() {
                     </div>
                   ) : (
                     !feishuChatsLoading && feishuChats.length === 0 && (
-                      <small className="schedule-field-hint">
-                        只能选到机器人所在的会话；把机器人拉进群后点「重新获取」。
-                      </small>
+                      /* A bot that is in no group yet is the normal first-run
+                         state, not an error -- but it left the field with zero
+                         options and no way out: the hint below told the user to
+                         press 重新获取 and 重新获取 only existed on the error
+                         branch. So the list could never be refreshed into a
+                         usable one, and "发到飞书" was a dead end. Carry the
+                         action here too, and keep the muted (not error) colour. */
+                      <div className="schedule-field-hint">
+                        只能选到机器人所在的会话；把机器人拉进群后点
+                        <Button type="link" size="small" onClick={() => void loadFeishuChats()}>重新获取</Button>
+                      </div>
                     )
                   )}
                   <small className="schedule-field-hint">
