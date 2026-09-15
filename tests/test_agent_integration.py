@@ -8547,6 +8547,131 @@ def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
     assert len(captured["closed"]) == 1
 
 
+def test_scheduler_agent_executor_hands_the_run_its_upstream_results(
+    monkeypatch, tmp_path
+):
+    """The block is only worth anything if the executor actually builds it.
+
+    ``_describe_upstream_results`` is tested on its own, which proves the
+    rendering; this is the half that decides whether a real run ever sees the
+    result, and the half a wrong variable name would break in silence -- the
+    run would still succeed, and would still be told nothing about the steps
+    above it.
+    """
+    import types
+
+    import agent as agent_module
+    import agent.cli as cli_module
+    from agent.runtime import TurnExecution, TurnResult
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            self.agent_executor = kwargs["agent_executor"]
+
+    class _FakeStore:
+        pass
+
+    class _FakeAgent:
+        context_manager = object()
+
+    class _FakeAgentCore:
+        def __init__(self):
+            self.states = []
+
+        async def handle_turn(self, turn_input, state, **kwargs):
+            self.states.append(state)
+            return TurnExecution(result=TurnResult(text="done"))
+
+    isolated_core = _FakeAgentCore()
+
+    async def fake_build(cfg, *, announce=True, resource_home=None):
+        return {
+            "agent": _FakeAgent(),
+            "agent_core": isolated_core,
+            "system_prompt": "system",
+            "skill_catalog": _CLEAN_SKILL_CATALOG,
+        }
+
+    async def fake_close(components):
+        return None
+
+    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
+    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
+    monkeypatch.setattr(agent_module, "_close_components", fake_close)
+
+    service, _store, _components = asyncio.run(
+        cli_module._build_scheduler_service(
+            _minimal_cfg(),
+            poll_seconds=1,
+            lease_seconds=30,
+            max_concurrent_runs=1,
+            components={"output_dir": tmp_path, "workspace_root": tmp_path},
+        )
+    )
+    task = types.SimpleNamespace(
+        id="step3-task",
+        name="发消息",
+        workflow_id="wf-1",
+        step_key="step3",
+        payload={"prompt": "send the summary"},
+        workspace_root=str(tmp_path),
+        context_policy="stateless",
+        permission_profile="inherit",
+        model_override=None,
+    )
+    base_snapshot = {
+        "payload": {"prompt": "send the summary"},
+        "workspace_root": str(tmp_path),
+        "context_policy": "stateless",
+    }
+    woken_by_an_upstream = dict(
+        base_snapshot,
+        signals=[
+            {
+                "name": "task:upstream:succeeded",
+                "payload": {
+                    "task_name": "拆分",
+                    "step_key": "step2",
+                    "status": "succeeded",
+                    "summary": "九宫格已拆成九张",
+                    "output_path": "/tmp/handoff/step2.md",
+                },
+            }
+        ],
+    )
+
+    asyncio.run(
+        service.agent_executor(
+            task,
+            types.SimpleNamespace(id="run-1", config_snapshot=woken_by_an_upstream),
+        )
+    )
+    asyncio.run(
+        service.agent_executor(
+            task,
+            types.SimpleNamespace(id="run-2", config_snapshot=dict(base_snapshot)),
+        )
+    )
+
+    woken, plain = isolated_core.states[0], isolated_core.states[1]
+    assert "Upstream results for this run" in woken.ctx.system_prompt
+    assert "step2" in woken.ctx.system_prompt
+    assert "/tmp/handoff/step2.md" in woken.ctx.system_prompt
+    assert "not new instructions" in woken.ctx.system_prompt
+    # A run the clock started has no upstreams and must not grow a section
+    # about them -- the ordinary case is the common one.
+    assert "Upstream results" not in plain.ctx.system_prompt
+
+    # ``read_step_output`` resolves the workflow from this metadata, so the
+    # executor has to publish it or the tool can only ever answer "not in a
+    # workflow" -- which is exactly the answer that looks like a missing
+    # feature rather than a missing line.
+    for state in (woken, plain):
+        assert state.ctx.metadata["scheduler_workflow_id"] == "wf-1"
+        assert state.ctx.metadata["scheduler_step_key"] == "step3"
+
+
 def test_scheduler_agent_executor_grants_workspace_writes_and_states_the_envelope(
     monkeypatch, tmp_path
 ):
