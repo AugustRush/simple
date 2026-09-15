@@ -84,7 +84,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 9
+    SCHEMA_VERSION = 10
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -199,6 +199,7 @@ class SchedulerStore:
                 CREATE TABLE IF NOT EXISTS signal_joins (
                     task_id TEXT PRIMARY KEY,
                     satisfied_json TEXT NOT NULL DEFAULT '[]',
+                    arrivals_json TEXT NOT NULL DEFAULT '{}',
                     updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS workflows (
@@ -375,6 +376,26 @@ class SchedulerStore:
                 # empty by definition, and a workflow nobody has authored is
                 # absent rather than an empty row.
                 self._conn.execute("PRAGMA user_version = 9")
+            elif version == 10:
+                # A join used to remember only *which* upstreams had reported --
+                # which is all it needs to decide when to run, and exactly what
+                # it needs to lose their results.  The payloads are kept now, so
+                # a step with several upstreams is told about all of them
+                # instead of only whichever one happened to finish last.
+                # Existing rows start empty, which reads as "this arrival
+                # carried nothing", the honest answer for a round that was
+                # recorded before there was anywhere to put it.
+                join_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(signal_joins)"
+                    ).fetchall()
+                }
+                if "arrivals_json" not in join_columns:
+                    self._conn.execute(
+                        "ALTER TABLE signal_joins ADD COLUMN "
+                        "arrivals_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                self._conn.execute("PRAGMA user_version = 10")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -861,7 +882,9 @@ class SchedulerStore:
             return set()
         return {str(item) for item in decoded if str(item).strip()}
 
-    def _advance_join(self, task: ScheduledTask, name: str, now: datetime) -> list[str]:
+    def _advance_join(
+        self, task: ScheduledTask, emission: SignalEmission, now: datetime
+    ) -> list[str]:
         """Record one arrival at a join.  Returns the names still missing.
 
         An empty list means this arrival completed the round.  The satisfied
@@ -879,30 +902,62 @@ class SchedulerStore:
         slow one is still working contributes one arrival, not three, so the
         downstream step does not run repeatedly for one turn of the crank.
 
+        The arrival's *payload* is kept alongside its name, because knowing
+        that three upstreams reported is not the same as being able to tell the
+        step below what any of them produced.  Keyed by signal name, so the
+        same "one arrival per round" rule applies to the content as to the
+        name: the last payload from a name is the one that describes the round.
+
         Caller owns the transaction.
         """
         required = set(signal_names(task.trigger))
         satisfied = self._satisfied_joins(task.id)
-        satisfied.add(str(name))
+        satisfied.add(emission.name)
         # Intersected with what this join actually waits for, so a name that
         # this task is not subscribed to can never contribute to completing it.
         satisfied &= required
         missing = sorted(required - satisfied)
+        arrivals = self._join_arrivals(task.id)
+        if emission.name in required:
+            arrivals[emission.name] = dict(emission.payload)
         self._conn.execute(
             """
-            INSERT INTO signal_joins (task_id, satisfied_json, updated_at)
-            VALUES (?, ?, ?)
+            INSERT INTO signal_joins (
+                task_id, satisfied_json, arrivals_json, updated_at
+            )
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET
                 satisfied_json = excluded.satisfied_json,
+                arrivals_json = excluded.arrivals_json,
                 updated_at = excluded.updated_at
             """,
             (
                 task.id,
                 json.dumps(sorted(satisfied), ensure_ascii=False),
+                json.dumps(arrivals, ensure_ascii=False),
                 _iso(now),
             ),
         )
         return missing
+
+    def _join_arrivals(self, task_id: str) -> dict[str, dict[str, Any]]:
+        """The payloads a join has collected since its last completed round."""
+        row = self._conn.execute(
+            "SELECT arrivals_json FROM signal_joins WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return {}
+        try:
+            decoded = json.loads(row["arrivals_json"] or "{}")
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(decoded, dict):
+            return {}
+        return {
+            str(name): dict(payload)
+            for name, payload in decoded.items()
+            if isinstance(payload, dict)
+        }
 
     def join_progress(self, task_id: str) -> dict[str, Any]:
         """What a join has heard from so far, so the interface can show it.
@@ -925,8 +980,17 @@ class SchedulerStore:
             "missing": [name for name in required if name not in satisfied],
         }
 
-    def _clear_join(self, task_id: str) -> None:
+    def _take_join(self, task_id: str) -> dict[str, dict[str, Any]]:
+        """Read a join's collected arrivals, then spend them.  Caller owns the txn.
+
+        Read-and-delete in one call because the two are never wanted apart: an
+        arrival that is read but not spent would let a stale payload describe a
+        later round, and one spent without being read is exactly the loss this
+        column exists to fix.
+        """
+        arrivals = self._join_arrivals(task_id)
         self._conn.execute("DELETE FROM signal_joins WHERE task_id = ?", (task_id,))
+        return arrivals
 
     def _record_delivery(
         self,
@@ -965,6 +1029,7 @@ class SchedulerStore:
         task: ScheduledTask,
         emission: SignalEmission,
         now: datetime,
+        arrivals: Optional[dict[str, dict[str, Any]]] = None,
     ) -> str:
         """Queue one run for a subscriber, carrying the emission it answers.
 
@@ -975,7 +1040,8 @@ class SchedulerStore:
 
         A join's accumulated arrivals are *not* spent here: the delivery loop
         spends them when the round completes, which it must do whether or not
-        this method runs.  See :meth:`_advance_join`.
+        this method runs, and hands them in as *arrivals*.  See
+        :meth:`_advance_join` and :meth:`_take_join`.
         """
         run_id = _new_id()
         snapshot = execution_snapshot(task)
@@ -987,6 +1053,21 @@ class SchedulerStore:
             "payload": emission.payload,
             "source": emission.source,
         }
+        # ``signal`` is the emission that *triggered* this run, and the depth
+        # is inherited from it.  ``signals`` is every upstream whose report
+        # this round is made of -- all of them for a join, the same single one
+        # for an ordinary subscriber.  Two keys rather than one list because
+        # they answer different questions, and collapsing them would make "who
+        # woke this run" and "whose results it has" the same answer, which is
+        # only true when there is exactly one upstream.
+        snapshot["signals"] = (
+            [
+                {"name": name, "payload": dict(payload)}
+                for name, payload in sorted(arrivals.items())
+            ]
+            if arrivals
+            else [{"name": emission.name, "payload": dict(emission.payload)}]
+        )
         self._conn.execute(
             """
             INSERT INTO scheduled_task_runs (
@@ -1089,6 +1170,7 @@ class SchedulerStore:
                 delivered = coalesced = waiting = 0
                 waiting_on: list[str] = []
                 for task in subscribers:
+                    arrivals: dict[str, dict[str, Any]] = {}
                     if signal_mode(task.trigger) == SIGNAL_MODE_ALL:
                         # A join records this arrival and runs only when the
                         # last one shows up.  Landing here without a run is the
@@ -1097,7 +1179,7 @@ class SchedulerStore:
                         # something else.  Recorded before the pending check
                         # below, because an arrival during a run belongs to the
                         # next round rather than to that run.
-                        missing = self._advance_join(task, emission.name, current)
+                        missing = self._advance_join(task, emission, current)
                         if missing:
                             self._record_delivery(
                                 emission.id,
@@ -1120,7 +1202,13 @@ class SchedulerStore:
                         # would let a stale arrival close a round that was
                         # never opened.  ``test_the_next_round_starts_from_
                         # nothing`` guards the rule.
-                        self._clear_join(task.id)
+                        #
+                        # Taken rather than cleared, because the payloads are
+                        # the round's content and the run below is the last
+                        # chance to hand them on.  A round that coalesces into
+                        # an in-flight run drops them, which is what the
+                        # ``coalesced`` reason below already says.
+                        arrivals = self._take_join(task.id)
                     pending = self._pending_run_for(task.id)
                     if pending:
                         # Already something to do.  For a signal that repeats
@@ -1149,7 +1237,7 @@ class SchedulerStore:
                         coalesced += 1
                         continue
                     run_id = self._enqueue_signal_run_in_transaction(
-                        task, emission, current
+                        task, emission, current, arrivals
                     )
                     self._record_delivery(
                         emission.id, task.id, "delivered", run_id=run_id, now=current
@@ -1242,6 +1330,7 @@ class SchedulerStore:
         status: str,
         finished_at: datetime,
         summary: str,
+        output_path: str = "",
     ) -> None:
         """Announce that a run reached ``status``.  Caller owns the transaction.
 
@@ -1250,6 +1339,18 @@ class SchedulerStore:
         them has to remember to announce it.  Recording the emission where the
         status is recorded removes that class of forgetting -- a status that
         exists is a signal that exists.
+
+        The payload carries a *pointer* to the run's output, not the output.
+        ``summary`` is a first line capped at 120 characters by the caller, so
+        it is a notification rather than a payload; anything a downstream step
+        actually needs to read lives at ``output_path``.  Handing over the
+        address costs a few dozen bytes and is what makes "the previous step's
+        output" reachable at all -- without it a subscriber knows a step
+        succeeded but has no way to say where its work went.
+
+        ``workflow_id`` and ``step_key`` travel with it for the same reason:
+        they are the names a downstream step can use, and the ids it cannot
+        guess.
 
         Depth is inherited from the emission this run answered, so a run that
         was itself started by a signal emits one step further from the root.
@@ -1271,7 +1372,8 @@ class SchedulerStore:
         parent = snapshot.get("signal")
         parent = parent if isinstance(parent, dict) else {}
         task_row = self._conn.execute(
-            "SELECT name FROM scheduled_tasks WHERE id = ?", (task_id,)
+            "SELECT name, workflow_id, step_key FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         payload: dict[str, Any] = {
             "task_id": task_id,
@@ -1279,11 +1381,18 @@ class SchedulerStore:
             "run_id": run_id,
             "status": status,
         }
+        if task_row is not None:
+            if str(task_row["workflow_id"] or ""):
+                payload["workflow_id"] = str(task_row["workflow_id"])
+            if str(task_row["step_key"] or ""):
+                payload["step_key"] = str(task_row["step_key"])
         if summary:
             # Long enough to be useful in a notification, short enough that a
             # chatty task cannot turn every downstream run's record into a copy
             # of its own output.
             payload["summary"] = summary[:500]
+        if str(output_path or ""):
+            payload["output_path"] = str(output_path)
         self._insert_emission(
             task_signal_name(task_id, status),
             payload,
@@ -2138,7 +2247,9 @@ class SchedulerStore:
             # two could commit separately, a crash between them would leave a
             # task that visibly succeeded while whatever was waiting on it
             # waits forever -- the exact failure that is hardest to notice.
-            self._emit_run_signal(task_id, run_id, status, finished_at, summary)
+            self._emit_run_signal(
+                task_id, run_id, status, finished_at, summary, output_path
+            )
             # Same reasoning, one step further: a step that did not do its work
             # cannot unblock the steps below it, and their run will never
             # happen.  Recorded here, with the status, so no control path can

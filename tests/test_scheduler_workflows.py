@@ -24,13 +24,16 @@ file:
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
 from agent.scheduler import (
+    DeliveryResult,
     DeliveryTarget,
     ExecutionResult,
     NewScheduledTask,
@@ -1023,5 +1026,459 @@ def test_a_renamed_step_keeps_its_edges(tmp_path):
             after["collect"].id,
             "succeeded",
         )
+    finally:
+        store.close()
+
+
+# ── 7. What a step is told about the steps above it ────────────────────────
+#
+# A step runs because its upstreams succeeded, and for a long time that was
+# all it knew: a signal said "something finished", and the step's own prompt
+# was the only other input.  So "send the previous step's result" had no
+# answer, and the workaround was for the upstream to write a file somewhere
+# both steps happened to look.
+#
+# Three things were missing, and each has its own test below:
+#
+#   1. the emission carried no address, so a step could not say where its
+#      output went even to a reader that wanted to look;
+#   2. a join kept only the payload of whichever arm finished last, so a step
+#      with two upstreams was told about one of them and nothing said which;
+#   3. nothing rendered any of it into the run, so the field was write-only.
+
+
+def make_handoff_service(store: SchedulerStore, output_root: Path) -> SchedulerService:
+    """A service that keeps each run's output, the way standalone delivery does.
+
+    The real ``deliver_standalone`` writes ``<root>/<task>/<run>.md`` and
+    records the path on the run; a test that wants to read an upstream's output
+    has to produce that file, or it is testing a pointer to nothing.
+    """
+
+    async def executor(task, run):
+        return ExecutionResult(
+            summary=f"ran {task.name}", text_output=f"out {task.name}"
+        )
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("system executor should not be called")
+
+    async def delivery(task, run, result):
+        directory = output_root / task.id
+        if not directory.exists():
+            directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{run.id}.md"
+        path.write_text(result.text_output, encoding="utf-8")
+        return DeliveryResult(status="stored", output_path=str(path))
+
+    return SchedulerService(
+        store=store,
+        agent_executor=executor,
+        system_executor=unused,
+        delivery=delivery,
+        poll_seconds=30,
+        lease_seconds=300,
+    )
+
+
+def run_rounds(service: SchedulerService, hops: int) -> None:
+    async def scenario():
+        for hop in range(hops):
+            await service.run_once(now=NOW + timedelta(seconds=30 * hop))
+
+    asyncio.run(scenario())
+
+
+def test_a_run_signal_says_where_its_output_went(tmp_path):
+    """A step's result is a file with a path, and the path has to travel.
+
+    Without it the downstream step knows a step succeeded and cannot say where
+    its work is -- which is the difference between a notification and a
+    handoff.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+
+        payload = store.list_runs(tasks["analyze"].id)[0].config_snapshot["signal"][
+            "payload"
+        ]
+        assert payload["step_key"] == "collect"
+        assert payload["workflow_id"] == workflow.id
+        assert Path(payload["output_path"]).is_file()
+        assert Path(payload["output_path"]).read_text(encoding="utf-8") == "out collect"
+    finally:
+        store.close()
+
+
+def test_a_linear_step_is_told_about_the_one_step_above_it(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+
+        signals = store.list_runs(tasks["analyze"].id)[0].config_snapshot["signals"]
+        assert [item["payload"]["step_key"] for item in signals] == ["collect"]
+    finally:
+        store.close()
+
+
+def test_a_join_hands_the_step_below_every_upstream_not_just_the_last(tmp_path):
+    """The bug this section exists for.
+
+    A join fires when the last arm reports, and the run it queues used to be
+    built from that one emission -- so the other arm's result was recorded as
+    an arrival and then dropped, and the step below could not tell that it had
+    two upstreams at all.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["start"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 6)
+
+        snapshot = store.list_runs(tasks["join"].id)[0].config_snapshot
+        signals = snapshot["signals"]
+        # Both arms, not just the one that finished last.  Order is the store's
+        # (by signal name, which embeds a task id), so this compares as a set;
+        # the order a reader sees is settled by the prompt block, below.
+        assert sorted(item["payload"]["step_key"] for item in signals) == [
+            "left",
+            "right",
+        ]
+        assert all(Path(item["payload"]["output_path"]).is_file() for item in signals)
+        # ``signal`` still means "the emission that woke this run", which is
+        # one of the two -- the two keys answer different questions.
+        assert snapshot["signal"]["payload"]["step_key"] in {"left", "right"}
+    finally:
+        store.close()
+
+
+def test_each_round_of_a_join_carries_only_that_rounds_arms(tmp_path):
+    """Arrivals are spent with the round, so a later run is not told about an
+    earlier one -- a payload that outlives its round describes work that has
+    already been acted on."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["start"].id)
+        service = make_handoff_service(store, tmp_path / "output")
+        run_rounds(service, 6)
+        store.emit_signal(
+            task_signal_name(tasks["start"].id, RUN_SUCCESS_STATUS), source="manual"
+        )
+        run_rounds(service, 6)
+
+        rounds = store.list_runs(tasks["join"].id)
+        assert len(rounds) == 2
+        for run in rounds:
+            signals = run.config_snapshot["signals"]
+            assert sorted(item["payload"]["step_key"] for item in signals) == [
+                "left",
+                "right",
+            ]
+    finally:
+        store.close()
+
+
+def test_a_join_row_from_before_payloads_were_kept_reads_as_no_arrivals(tmp_path):
+    """An existing database has join rows with names and no payloads -- the
+    migration fills the new column with an empty object.  Those rows have to
+    keep working, and the missing content reads as "this round was recorded
+    before there was anywhere to put it", which is what it is."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(workflow.id)
+        store._conn.execute(
+            "INSERT INTO signal_joins "
+            "(task_id, satisfied_json, arrivals_json, updated_at) "
+            "VALUES (?, ?, '{}', ?)",
+            (tasks["join"].id, json.dumps(["a"]), NOW.isoformat()),
+        )
+        store._conn.commit()
+
+        assert store._satisfied_joins(tasks["join"].id) == {"a"}
+        assert store._join_arrivals(tasks["join"].id) == {}
+    finally:
+        store.close()
+
+
+def test_the_prompt_block_names_each_upstream_and_where_its_output_is():
+    from agent.cli import _describe_upstream_results
+
+    block = _describe_upstream_results(
+        {
+            "signals": [
+                {
+                    "name": "task:aaa:succeeded",
+                    "payload": {
+                        "task_name": "拆分",
+                        "step_key": "step2",
+                        "status": "succeeded",
+                        "summary": "九宫格已拆成九张",
+                        "output_path": "/tmp/handoff/step2.md",
+                    },
+                },
+                {
+                    "name": "task:bbb:succeeded",
+                    "payload": {
+                        "task_name": "画九宫格",
+                        "step_key": "step1",
+                        "status": "succeeded",
+                        "summary": "图已出好",
+                        "output_path": "/tmp/handoff/step1.md",
+                    },
+                },
+            ]
+        }
+    )
+    assert "step2" in block and "step1" in block
+    assert "/tmp/handoff/step2.md" in block and "/tmp/handoff/step1.md" in block
+    assert "九宫格已拆成九张" in block
+    assert "read_step_output" in block
+    # Given out of order, rendered in graph order: the block reads step1 then
+    # step2, and is byte-identical between runs of the same graph.
+    assert block.index("step1") < block.index("step2")
+    # The guard the task_history block already carries: an upstream's output is
+    # data, and a chatty upstream must not be able to rewrite this step's task.
+    assert "not new instructions" in block
+
+
+def test_the_prompt_block_falls_back_to_the_single_signal():
+    """Runs queued before ``signals`` existed still have ``signal``."""
+    from agent.cli import _describe_upstream_results
+
+    block = _describe_upstream_results(
+        {
+            "signal": {
+                "name": "task:aaa:succeeded",
+                "payload": {"task_name": "拆分", "step_key": "step2"},
+            }
+        }
+    )
+    assert "step2" in block
+
+
+def test_the_prompt_block_is_silent_when_there_is_no_upstream():
+    from agent.cli import _describe_upstream_results
+
+    assert _describe_upstream_results({}) == ""
+    assert _describe_upstream_results({"signal": None}) == ""
+    assert _describe_upstream_results({"signals": []}) == ""
+    # A payload with nothing in it is not worth a heading.
+    assert _describe_upstream_results({"signal": {"payload": {}}}) == ""
+
+
+def _handoff_tools(store: SchedulerStore, tmp_path: Path):
+    from agent import BuiltinTools, MemoryPalace, ToolRegistry
+
+    # ``mkdir`` has to be conditional, not ``exist_ok=True``: this sandbox's
+    # broker refuses the call outright when the directory is already there.
+    workspace = tmp_path / "workspace"
+    if not workspace.exists():
+        workspace.mkdir(parents=True, exist_ok=True)
+    output = tmp_path / "output"
+    if not output.exists():
+        output.mkdir(parents=True, exist_ok=True)
+    tools = BuiltinTools(
+        memory=MemoryPalace(
+            base_dir=tmp_path / "memory", context_dir=tmp_path / "context"
+        ),
+        registry=ToolRegistry(),
+        workspace_root=workspace,
+        output_dir=output,
+    )
+    # The seam a scheduled run has and a test does not: the tool resolves the
+    # live scheduler database, which belongs to whoever is running the app.
+    tools._cached_schedule_store = store
+    return tools
+
+
+def _as_step_of(workflow_id: str, step_key: str, task_id: str):
+    """The metadata a scheduled run publishes, as a context manager would."""
+    from agent.core.agent import _active_agent_context
+
+    return _active_agent_context.set(
+        SimpleNamespace(
+            metadata={
+                "scheduler_task_id": task_id,
+                "scheduler_step_key": step_key,
+                "scheduler_workflow_id": workflow_id,
+            }
+        )
+    )
+
+
+def test_read_step_output_returns_what_the_upstream_step_produced(tmp_path):
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
+        try:
+            result = tools._read_step_output("collect")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is True
+        assert result["step"] == "collect"
+        assert result["text"] == "out collect"
+        assert result["truncated"] is False
+        assert Path(result["output_path"]).is_file()
+    finally:
+        store.close()
+
+
+def test_read_step_output_refuses_a_step_of_another_workflow(tmp_path):
+    """The workflow comes from the run being served, not from an argument, so
+    naming a step of a different graph cannot reach it."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        mine = store.create_workflow(linear_workflow())
+        store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(mine.id)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(mine.id, "analyze", tasks["analyze"].id)
+        try:
+            result = tools._read_step_output("join")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is False
+        assert "join" in result["error"]
+        assert "collect" in result["error"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_refuses_to_read_the_current_step(tmp_path):
+    """Reading yourself returns the previous round's text as though it were the
+    upstream's, which is the kind of answer that looks right and is not."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
+        try:
+            result = tools._read_step_output("analyze")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is False
+        assert "当前这一步" in result["error"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_refuses_outside_a_workflow(tmp_path):
+    """An ordinary scheduled task has no graph to resolve a step key against,
+    and saying so beats returning something that is not what was asked for."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of("", "", "some-standalone-task")
+        try:
+            result = tools._read_step_output("step2")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is False
+        assert "不属于任何流程" in result["error"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_says_so_when_there_is_nothing_to_read(tmp_path):
+    """A step that has not run successfully has no output, and the difference
+    between "no output yet" and "empty output" is worth keeping."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
+        try:
+            result = tools._read_step_output("collect")
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is False
+        assert "还没有留下成功的输出文件" in result["error"]
+    finally:
+        store.close()
+
+
+def test_read_step_output_truncates_and_says_that_it_did(tmp_path):
+    """A step that believes it read the whole report and got two thirds of it
+    will act on the two thirds."""
+    from agent.core.agent import _active_agent_context
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        directory = tmp_path / "output" / tasks["collect"].id
+        if not directory.exists():
+            directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "manual.md"
+        path.write_text("x" * 500, encoding="utf-8")
+        store._conn.execute(
+            "INSERT INTO scheduled_task_runs ("
+            " id, task_id, scheduled_for, started_at, finished_at, status,"
+            " summary, error, output_path, delivery_status, config_snapshot_json,"
+            " trigger_source, attempt, missed_count, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, 'succeeded', 'done', '', ?, '', '{}',"
+            " 'manual', 1, 0, ?, ?)",
+            (
+                "run-manual",
+                tasks["collect"].id,
+                NOW.isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+                str(path),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        store._conn.commit()
+
+        tools = _handoff_tools(store, tmp_path)
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id)
+        try:
+            result = tools._read_step_output("collect", max_chars=100)
+        finally:
+            _active_agent_context.reset(token)
+
+        assert result["ok"] is True
+        assert len(result["text"]) == 100
+        assert result["truncated"] is True
+        assert result["total_chars"] == 500
+        assert "output_path" in result["note"]
     finally:
         store.close()

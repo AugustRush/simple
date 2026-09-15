@@ -53,6 +53,16 @@ _atomic_write_text = shared._atomic_write_text
 
 WEB_FETCH_MAX_BYTES = 512 * 1024
 WEB_FETCH_TIMEOUT = 20
+
+#: How much of an upstream step's output ``read_step_output`` hands back.
+#:
+#: Bounded because the tool exists to feed a model's context, and a step's
+#: output is unbounded: a run that reads three upstream reports whole can spend
+#: its entire budget before it starts working.  The default is a comfortable
+#: read; the ceiling is what a caller who has asked for "all of it" gets, with
+#: the path returned alongside so the rest is one more call away.
+READ_STEP_OUTPUT_DEFAULT_CHARS = 8000
+READ_STEP_OUTPUT_MAX_CHARS = 40000
 WEB_SEARCH_MAX_RESULTS = 10
 TAVILY_SEARCH_MAX_RESULTS = 10
 TAVILY_SEARCH_URL = "https://api.tavily.com/search"
@@ -903,6 +913,38 @@ class BuiltinTools:
             ),
             {"type": "object", "properties": {}, "required": []},
             self._list_signals,
+            source="builtin",
+        )
+
+        r.register(
+            "read_step_output",
+            (
+                "Read the latest successful output of another step of the same workflow. "
+                "Use it when this run needs what an upstream step actually produced, rather "
+                "than the one-line summary already in this run's context -- for example to "
+                "decide what a message should say. Address the step by its key (step2), not "
+                "by a task or run id. Only steps of this workflow are reachable, and only "
+                "outputs the scheduler itself recorded, so this cannot read arbitrary files."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "step": {
+                        "type": "string",
+                        "description": "Step key of the upstream step, e.g. step2",
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "description": (
+                            f"Maximum characters of the output to return "
+                            f"(1-{READ_STEP_OUTPUT_MAX_CHARS})"
+                        ),
+                        "default": READ_STEP_OUTPUT_DEFAULT_CHARS,
+                    },
+                },
+                "required": ["step"],
+            },
+            self._read_step_output,
             source="builtin",
         )
 
@@ -3164,6 +3206,98 @@ class BuiltinTools:
                 for key, value in sorted(subscribers.items())
                 if key and key not in {entry["name"] for entry in emissions}
             ],
+        )
+
+    def _read_step_output(
+        self, step: str, max_chars: int = READ_STEP_OUTPUT_DEFAULT_CHARS
+    ) -> dict[str, Any]:
+        """The latest successful output of another step of this workflow.
+
+        Addressed by *step key* because that is the name the graph gives a
+        step and the only one a model can be expected to know: task ids and run
+        ids are internal, and a step that has to look them up is a step that
+        will look them up wrong.  The workflow is taken from the run being
+        served, not from an argument, so a step cannot reach outside its own
+        graph by naming one.
+
+        Only ``output_path`` values the scheduler recorded are read.  That is
+        the tool's whole safety property: it is not a file reader with a
+        narrower name, it is a lookup into this workflow's own history, and a
+        path it was not told about is not reachable through it.
+        """
+        wanted = str(step or "").strip()
+        if not wanted:
+            return self._error("step 不能为空；用上游步骤的 key，例如 step2")
+
+        context: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            from agent.core.agent import _active_agent_context
+
+            active_ctx = _active_agent_context.get()
+            if active_ctx is not None:
+                context = dict(getattr(active_ctx, "metadata", {}) or {})
+        workflow_id = str(context.get("scheduler_workflow_id", "") or "").strip()
+        if not workflow_id:
+            return self._error(
+                "当前运行不属于任何流程，read_step_output 只能读同一条流程里的步骤。"
+                "单独的任务请用 read_file 或 shell 读它的产物路径。"
+            )
+
+        store = self._schedule_store()
+        steps = store.step_tasks(workflow_id)
+        target = steps.get(wanted)
+        if target is None:
+            available = "、".join(sorted(steps)) or "（无）"
+            return self._error(
+                f"流程里没有步骤「{wanted}」。可选的步骤：{available}"
+            )
+        if wanted == str(context.get("scheduler_step_key", "") or "").strip():
+            # Reading your own output would return the previous round's text
+            # as if it were the upstream's, which is the kind of answer that
+            # looks right and is not.
+            return self._error(
+                f"「{wanted}」就是当前这一步，读它只会拿到自己上一轮的结果。"
+            )
+
+        latest = None
+        for run in store.list_runs(target.id):
+            if run.status == "succeeded" and str(run.output_path or "").strip():
+                latest = run
+        if latest is None:
+            return self._error(
+                f"步骤「{wanted}」还没有留下成功的输出文件"
+                "（只有投递方式为「仅保存」的运行会落盘；发到飞书的运行不落盘）。"
+            )
+
+        path = Path(str(latest.output_path)).expanduser()
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return self._error(f"读取步骤「{wanted}」的输出失败：{exc}")
+
+        limit = max(1, min(int(max_chars or 0) or READ_STEP_OUTPUT_DEFAULT_CHARS,
+                           READ_STEP_OUTPUT_MAX_CHARS))
+        truncated = len(text) > limit
+        return self._ok(
+            step=wanted,
+            task_id=target.id,
+            task_name=target.name,
+            run_id=latest.id,
+            finished_at=latest.finished_at.isoformat() if latest.finished_at else None,
+            summary=latest.summary,
+            output_path=str(path),
+            text=text[:limit],
+            truncated=truncated,
+            total_chars=len(text),
+            # Said out loud rather than left to be discovered: a step that
+            # believes it read the whole report and got two thirds of it will
+            # act on the two thirds.
+            note=(
+                f"只返回了前 {limit} 个字符，共 {len(text)} 个。"
+                f"需要其余内容就读上面的 output_path。"
+                if truncated
+                else ""
+            ),
         )
 
     def _clean_output(
