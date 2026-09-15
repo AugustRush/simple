@@ -1786,6 +1786,18 @@ html[data-theme='light'] .settings-json {
 .app-header .header-menu .anticon {
   font-size: 18px;
 }
+/* The sidebar toggle was the one header control with no interaction styling of
+ * its own, so it fell back to antd's defaults: a 4% hover and a 15% press. Its
+ * neighbour `.brand-action` -- same header, same shape, same job -- uses the
+ * app's own tokens. Measured side by side, hover was rgba(0,0,0,.04) against
+ * rgba(17,18,21,.067). Same header, two vocabularies. */
+.app-header .header-menu:hover {
+  background: var(--surface-hover) !important;
+}
+.app-header .header-menu:active {
+  background: var(--primary-soft) !important;
+  transform: scale(.92);
+}
 
 /* Shared workspace search control. */
 .workspace-search {
@@ -1842,6 +1854,19 @@ html[data-theme='light'] .settings-json {
   color: #fff !important;
   background: #2563eb !important;
   border-color: #2563eb !important;
+}
+/* Both buttons darkened #3b82f6 -> #2563eb on hover and then stopped, so a
+ * press looked exactly like a hover. Same shape as `.brand-action`: an
+ * `!important` hover with no `:active` to follow it. A third step, plus a dip,
+ * makes the press legible -- the shadow shrinks at the same time, which is what
+ * sells the movement. */
+.settings-save-button:active:not(:disabled),
+.settings-inline-save:active:not(:disabled) {
+  color: #fff !important;
+  background: #1d4ed8 !important;
+  border-color: #1d4ed8 !important;
+  box-shadow: 0 2px 6px rgba(59,130,246,.28);
+  transform: translateY(1px);
 }
 .settings-save-button:disabled {
   color: var(--text-muted) !important;
@@ -2096,6 +2121,18 @@ html[data-theme='light'] .settings-json {
 .brand-action:hover {
   color: var(--text) !important;
   background: var(--surface-hover) !important;
+}
+
+/* Hover used to be the whole story: the `!important` above froze the pressed
+ * state at the hover value, because a held mouse button matches `:hover` *and*
+ * `:active`, and antd's own `:active` has no `!important` to outrank it.
+ * Measured: rest/hover/pressed were transparent / rgba(17,18,21,.067) /
+ * rgba(17,18,21,.067) -- the press was invisible. Every other icon button in
+ * the app presses by dipping, so this one does too. */
+.brand-action:active {
+  color: var(--text) !important;
+  background: var(--primary-soft) !important;
+  transform: scale(.92);
 }
 
 .global-search-modal .ant-modal-content {
@@ -3156,6 +3193,14 @@ html[data-theme='light'] .app-header {
   border-color: var(--border-strong);
   background: var(--surface-hover) !important;
 }
+/* The chips lifted on hover and had nothing for the press, so the `!important`
+ * hover held them at the lifted position while the button was down. They now
+ * land and dim, which is the same lift-then-land the send button uses. */
+.chat-empty-suggestions .ant-btn:active {
+  transform: translateY(0) scale(.98);
+  border-color: var(--border-strong);
+  background: var(--primary-soft) !important;
+}
 
 .bubble-user {
   padding: 12px 17px;
@@ -3244,11 +3289,16 @@ html[data-theme='light'] .composer {
   border-color: #f1f1f2 !important;
 }
 
-.send-button.ant-btn-primary:not(:disabled):hover {
-  background: #ffffff !important;
-  border-color: #ffffff !important;
-  transform: translateY(-1px);
-}
+/* The `.send-button.ant-btn-primary:not(:disabled):hover` rule that used to sit
+   here is gone on purpose. It was an older generation: its `background` and
+   `border-color` were already dead, because the identical selector further down
+   (the one that also sets `color` and `filter`) overrides both. But it also set
+   `transform: translateY(-1px)` at specificity (0,4,0), which outranked the
+   intended `.send-button:not(:disabled):active { transform: translateY(0)
+   scale(.96) }` at (0,3,0). While a mouse button is held the element matches
+   `:hover` *and* `:active`, so the hover won and the send button -- the most
+   pressed control in the app -- never appeared to press. The lift now comes
+   from the lower-specificity hover rule, and `:active` finally wins. */
 
 .send-button.ant-btn-primary:disabled {
   color: var(--text-secondary) !important;
