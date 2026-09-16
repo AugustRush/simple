@@ -212,7 +212,12 @@ def _resolve_user_plugin_target(name: str, root: Path | None = None) -> Path:
     return target
 
 
-from .runtime import _active_schedule_target, _active_signal_context  # noqa: E402
+from .runtime import (  # noqa: E402
+    _active_run_self_report,
+    _active_schedule_target,
+    _active_signal_context,
+)
+from agent.verification import VERDICT_FAILED  # noqa: E402
 
 
 class BuiltinTools:
@@ -872,6 +877,31 @@ class BuiltinTools:
                             "defaults to the current session's folder."
                         ),
                     },
+                    "criteria": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "What has to be true for a run of this task to count as a "
+                            "success, in plain sentences. Read by whoever looks at a "
+                            "failed run, and given to the run itself so it knows what "
+                            "it is aiming at. Omit for a task with no checkable "
+                            "outcome, which then succeeds as soon as it delivers."
+                        ),
+                    },
+                    "verify_command": {
+                        "type": "string",
+                        "description": (
+                            "Optional command that decides success by its exit code -- "
+                            "run in the task's folder after the work, 0 means it "
+                            "worked. Use this whenever success is mechanically "
+                            "checkable (a test suite, a build, a linter, a script that "
+                            "validates the output); it is the only evidence a run "
+                            "cannot talk its way out of. Must be a single low-risk "
+                            "command: no pipes, redirection, `rm`, or inline "
+                            "interpreters such as `python -c`. A command that cannot "
+                            "be run is refused here, while you can still fix it."
+                        ),
+                    },
                 },
                 "required": ["name", "trigger_type"],
             },
@@ -901,6 +931,167 @@ class BuiltinTools:
                 "required": ["task_id"],
             },
             self._schedule_delete,
+            source="builtin",
+        )
+
+        r.register(
+            "workflow_create",
+            (
+                "Create a chain of scheduled tasks, where each step runs only after the "
+                "steps it depends on have succeeded. Use this when a request is really "
+                "several jobs in an order -- fetch, then transform, then report -- rather "
+                "than one job. Do not chain steps with schedule_create and signals "
+                "instead: a chain built that way has no recorded edges, so nothing knows "
+                "which steps a failure should stop. "
+                "Give every step a `key`, and list its upstreams in `depends_on`. A step "
+                "with no upstreams is where the chain starts and must carry its own "
+                "`trigger_type` (the same vocabulary as schedule_create); a step with "
+                "upstreams must NOT have one, because its upstreams are what starts it. "
+                "Give each step `criteria` saying what has to be true for it to count as "
+                "done, and a `verify_command` whenever that is mechanically checkable -- "
+                "that check is what decides whether the next step runs. The graph is "
+                "validated before anything is written: a cycle, a missing upstream, or a "
+                "step that can never be judged is refused with the step named."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short workflow name"},
+                    "description": {
+                        "type": "string",
+                        "description": "What this chain is for, in one line",
+                        "default": "",
+                    },
+                    "workspace_root": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path of the project folder the chain works in. "
+                            "Steps that do not name their own folder use this one."
+                        ),
+                    },
+                    "steps": {
+                        "type": "array",
+                        "description": "The steps, in any order; `depends_on` gives the order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": {
+                                    "type": "string",
+                                    "description": (
+                                        "Short stable id for this step, used by other "
+                                        "steps' depends_on, e.g. collect or summarise"
+                                    ),
+                                },
+                                "name": {"type": "string", "description": "Short step name"},
+                                "action_type": {
+                                    "type": "string",
+                                    "description": "one of: message, agent_task, system_job",
+                                },
+                                "instruction": {
+                                    "type": "string",
+                                    "description": "Agent instruction, for action_type=agent_task",
+                                },
+                                "message_text": {
+                                    "type": "string",
+                                    "description": "Literal message, for action_type=message",
+                                },
+                                "job_name": {
+                                    "type": "string",
+                                    "description": "Internal job name, for action_type=system_job",
+                                },
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "Keys of the steps that must succeed before this "
+                                        "one runs. Empty or absent makes this an entry step."
+                                    ),
+                                },
+                                "trigger_type": {
+                                    "type": "string",
+                                    "description": (
+                                        "Entry steps only: one of once, interval, daily, "
+                                        "weekly, weekdays, monthly, signal. A step with "
+                                        "upstreams must leave this out."
+                                    ),
+                                },
+                                "signal_name": {"type": "string"},
+                                "at": {"type": "string", "description": "ISO datetime for once"},
+                                "every": {"type": "integer"},
+                                "unit": {"type": "string", "description": "minutes|hours|days|weeks"},
+                                "time_of_day": {"type": "string", "description": "HH:MM"},
+                                "day_of_week": {"type": "string", "description": "mon|tue|...|sun"},
+                                "day_of_month": {"type": "integer", "description": "1-31"},
+                                "timezone_name": {"type": "string", "default": "UTC"},
+                                "workspace_root": {
+                                    "type": "string",
+                                    "description": "Overrides the workflow's folder for this step",
+                                },
+                                "permission_profile": {
+                                    "type": "string",
+                                    "description": "inherit|read_only|workspace_write",
+                                },
+                                "delivery_mode": {
+                                    "type": "string",
+                                    "description": "optional override: standalone or channel",
+                                },
+                                "criteria": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "What has to be true for this step to count as a "
+                                        "success. Decides whether the steps below it run."
+                                    ),
+                                },
+                                "verify_command": {
+                                    "type": "string",
+                                    "description": (
+                                        "Command whose exit code decides this step's "
+                                        "success; run in the step's folder. Must be a "
+                                        "single low-risk command -- no pipes, redirection, "
+                                        "`rm`, or inline interpreters."
+                                    ),
+                                },
+                            },
+                            "required": ["key", "name", "action_type"],
+                        },
+                    },
+                },
+                "required": ["name", "steps"],
+            },
+            self._workflow_create,
+            source="builtin",
+        )
+
+        r.register(
+            "workflow_list",
+            (
+                "List workflows, with each one's steps and the edges between them. "
+                "Use before creating a chain, to see whether one already exists."
+            ),
+            {"type": "object", "properties": {}, "required": []},
+            self._workflow_list,
+            source="builtin",
+        )
+
+        r.register(
+            "workflow_delete",
+            (
+                "Delete a workflow by id. The tasks it built are disabled rather than "
+                "erased, so their run history stays readable; this stops the chain and "
+                "stops any signal subscription its steps hold."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "workflow_id": {
+                        "type": "string",
+                        "description": "Workflow id to delete; workflow_list shows them",
+                    }
+                },
+                "required": ["workflow_id"],
+            },
+            self._workflow_delete,
             source="builtin",
         )
 
@@ -984,6 +1175,34 @@ class BuiltinTools:
                 "required": ["step"],
             },
             self._read_step_output,
+            source="builtin",
+        )
+
+        r.register(
+            "report_outcome",
+            (
+                "Declare that this scheduled run could not do the job it was given. "
+                "Call it when you discover the work cannot be done -- the data source is "
+                "gone, a required file is missing, the inputs contradict each other -- "
+                "instead of writing a plausible answer anyway. The run is then recorded "
+                "as failed with your reason, the steps below it do not run, and a person "
+                "is told. Do not call it to report success: an unattended run is judged "
+                "by its own acceptance check, and your assurance is not evidence. Only "
+                "usable inside a scheduled run."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Why the work could not be done, in one or two sentences"
+                        ),
+                    },
+                },
+                "required": ["reason"],
+            },
+            self._report_outcome,
             source="builtin",
         )
 
@@ -3017,6 +3236,8 @@ class BuiltinTools:
         delivery_mode: Optional[str] = None,
         permission_profile: Optional[str] = None,
         workspace_root: Optional[str] = None,
+        criteria: Optional[list[str]] = None,
+        verify_command: Optional[str] = None,
     ) -> dict[str, Any]:
         trigger = self._schedule_trigger(
             trigger_type=trigger_type,
@@ -3030,7 +3251,7 @@ class BuiltinTools:
             signal_name=signal_name,
         )
         resolved_mode, target = self._schedule_target(delivery_mode)
-        from agent.scheduler import NewScheduledTask
+        from agent.scheduler import Acceptance, NewScheduledTask
 
         # A task woken by a signal is still a scheduled task in every way that
         # matters -- it just has no date to name.  Saying when it runs is
@@ -3039,44 +3260,31 @@ class BuiltinTools:
         when_text = self._describe_trigger_when(trigger)
         noun = "信号任务" if trigger.trigger_type == "signal" else "定时任务"
         job_noun = f"系统{noun}"
-        normalized_action = str(action_type or "message").strip().lower()
-        task_kind = "message"
-        payload: dict[str, Any]
-        if normalized_action == "message":
-            text = str(message_text or prompt).strip()
-            if not text:
-                raise ValueError("`message_text` is required for message actions")
-            task_kind = "message"
-            payload = {"message_text": text}
+        task_kind, payload = self._action_payload(
+            action_type,
+            prompt=prompt,
+            message_text=message_text,
+            instruction=instruction,
+            job_name=job_name,
+        )
+        if task_kind == "message":
             summary_text = (
-                f"已设置好{noun}！{when_text}发送消息“{text}”。"
+                f"已设置好{noun}！{when_text}发送消息“{payload['message_text']}”。"
                 if when_text
-                else f"已设置好{noun}，会发送消息“{text}”。"
+                else f"已设置好{noun}，会发送消息“{payload['message_text']}”。"
             )
-        elif normalized_action == "agent_task":
-            text = str(instruction or prompt).strip()
-            if not text:
-                raise ValueError("`instruction` is required for agent_task actions")
-            task_kind = "agent_prompt"
-            payload = {"prompt": text}
+        elif task_kind == "agent_prompt":
             summary_text = (
-                f"已设置好{noun}！{when_text}执行任务：{text}"
+                f"已设置好{noun}！{when_text}执行任务：{payload['prompt']}"
                 if when_text
-                else f"已设置好{noun}，会执行任务：{text}"
-            )
-        elif normalized_action == "system_job":
-            text = str(job_name or "").strip()
-            if not text:
-                raise ValueError("`job_name` is required for system_job actions")
-            task_kind = "system_job"
-            payload = {"job_name": text}
-            summary_text = (
-                f"已设置好{job_noun}！{when_text}执行 {text}。"
-                if when_text
-                else f"已设置好{job_noun}，会执行 {text}。"
+                else f"已设置好{noun}，会执行任务：{payload['prompt']}"
             )
         else:
-            raise ValueError(f"Unsupported action_type '{action_type}'")
+            summary_text = (
+                f"已设置好{job_noun}！{when_text}执行 {payload['job_name']}。"
+                if when_text
+                else f"已设置好{job_noun}，会执行 {payload['job_name']}。"
+            )
 
         # The envelope is resolved here rather than left to the dataclass
         # defaults.  Those defaults (``inherit`` plus the process working
@@ -3118,6 +3326,10 @@ class BuiltinTools:
             raise ValueError(f"项目文件夹不存在：{task_workspace}")
 
         store = self._schedule_store()
+        acceptance = Acceptance(
+            criteria=[str(item) for item in (criteria or []) if str(item).strip()],
+            verify_command=str(verify_command or "").strip(),
+        )
         new_task = NewScheduledTask(
             name=name,
             kind=task_kind,
@@ -3127,6 +3339,7 @@ class BuiltinTools:
             delivery_target=target,
             workspace_root=str(task_workspace),
             permission_profile=profile.key,
+            acceptance=acceptance,
         )
         task = store.find_matching_task(new_task)
         existing = task is not None
@@ -3143,13 +3356,68 @@ class BuiltinTools:
                 # actually stored instead of assuming the defaults held.
                 "permission_profile": task.permission_profile,
                 "workspace_root": task.workspace_root,
+                "acceptance": task.acceptance.to_dict(),
                 "db_path": str(shared.SCHEDULER_DB_FILE),
                 "existing": existing,
             },
             summary_text=(
                 f"{summary_text}\n运行权限：{profile.label}；项目文件夹：{task_workspace}"
+                f"{self._describe_acceptance(task.acceptance)}"
             ),
         )
+
+    @staticmethod
+    def _describe_acceptance(acceptance: Any) -> str:
+        """What this task will be judged by, in one line for the user.
+
+        Said out loud rather than stored quietly, because a criterion nobody
+        was told about is indistinguishable from no criterion -- and the
+        difference decides whether a failed run looks like a bug.
+        """
+        criteria = list(getattr(acceptance, "criteria", []) or [])
+        command = str(getattr(acceptance, "verify_command", "") or "").strip()
+        if not criteria and not command:
+            return ""
+        parts = []
+        if criteria:
+            parts.append("；".join(str(item) for item in criteria))
+        if command:
+            parts.append(f"验收命令：{command}")
+        return "\n判定成功的依据：" + "；".join(parts)
+
+    @staticmethod
+    def _action_payload(
+        action_type: Optional[str],
+        *,
+        prompt: str = "",
+        message_text: Optional[str] = None,
+        instruction: Optional[str] = None,
+        job_name: Optional[str] = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Translate a tool's action vocabulary into a task kind and payload.
+
+        One definition, because two callers need it: creating a single
+        scheduled task, and creating each step of a workflow.  A workflow whose
+        steps understood ``action_type`` differently from a standalone task
+        would be a second dialect of the same language.
+        """
+        normalized = str(action_type or "message").strip().lower()
+        if normalized == "message":
+            text = str(message_text or prompt).strip()
+            if not text:
+                raise ValueError("`message_text` is required for message actions")
+            return "message", {"message_text": text}
+        if normalized == "agent_task":
+            text = str(instruction or prompt).strip()
+            if not text:
+                raise ValueError("`instruction` is required for agent_task actions")
+            return "agent_prompt", {"prompt": text}
+        if normalized == "system_job":
+            text = str(job_name or "").strip()
+            if not text:
+                raise ValueError("`job_name` is required for system_job actions")
+            return "system_job", {"job_name": text}
+        raise ValueError(f"Unsupported action_type '{action_type}'")
 
     def _schedule_list(self) -> dict[str, Any]:
         store = self._schedule_store()
@@ -3173,6 +3441,272 @@ class BuiltinTools:
         store = self._schedule_store()
         store.delete_task(task_id)
         return self._ok(task_id=task_id, deleted=True)
+
+    def _workflow_create(
+        self,
+        name: str,
+        steps: list[dict[str, Any]],
+        description: str = "",
+        workspace_root: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Create a chain of tasks whose order is the graph, not a clock.
+
+        The whole reason this exists as one tool rather than as "call
+        schedule_create a few times" is the edges.  Two tasks that happen to
+        subscribe to each other's signals look identical, from the signals
+        alone, to two tasks that were meant to be one job -- and the
+        difference is exactly what a failure has to know: when a step fails,
+        the steps below it must not run, and only the graph can say which
+        those are.  Building the chain here records that.
+
+        Every refusal comes from the same validator the store uses on write,
+        so a graph rejected here is rejected before any row exists.  A
+        workflow row with no tasks behind it is the failure mode this tool is
+        shaped to make impossible: it looks like a plan and runs nothing.
+        """
+        from agent.scheduler import Acceptance, Workflow, WorkflowStep
+        from agent.scheduler.profiles import resolve_permission_profile
+
+        raw_steps = [item for item in (steps or []) if isinstance(item, dict)]
+        if not raw_steps:
+            raise ValueError("`steps` 至少要有一个步骤")
+
+        # Resolved once for the whole graph.  A step without a folder of its
+        # own inherits the entry step's, so this is what decides where the
+        # chain runs -- and leaving it to the store's fallback would put it
+        # wherever the gateway happened to be started from, which is the one
+        # thing nobody can predict from the graph's own definition.
+        chosen_workspace = self._chosen_workspace_root()
+        fallback_workspace = self._active_workspace_root()
+
+        built: list[WorkflowStep] = []
+        for index, raw in enumerate(raw_steps, start=1):
+            key = str(raw.get("key") or "").strip()
+            label = f"步骤「{key or index}」"
+            kind, payload = self._action_payload(
+                raw.get("action_type"),
+                instruction=raw.get("instruction"),
+                message_text=raw.get("message_text"),
+                job_name=raw.get("job_name"),
+            )
+            depends_on = [
+                str(item).strip()
+                for item in (raw.get("depends_on") or [])
+                if str(item).strip()
+            ]
+            # Only an entry step carries a trigger.  A dependent step's
+            # trigger *is* its upstreams, and giving it both would be two
+            # answers to "when does this run".  Refused rather than ignored:
+            # dropping a `trigger_type` the caller wrote down would answer
+            # "run this daily at 10" with a step that runs at no particular
+            # time, and say nothing about having done so.
+            trigger_fields = {
+                "trigger_type": raw.get("trigger_type"),
+                "signal_name": raw.get("signal_name"),
+                "at": raw.get("at"),
+                "every": raw.get("every"),
+                "unit": raw.get("unit"),
+                "time_of_day": raw.get("time_of_day"),
+                "day_of_week": raw.get("day_of_week"),
+                "day_of_month": raw.get("day_of_month"),
+            }
+            asked_when = [
+                field for field, value in trigger_fields.items()
+                if value is not None and str(value).strip()
+            ]
+            if depends_on and asked_when:
+                raise ValueError(
+                    f"{label}既有上游（{'、'.join(depends_on)}），又写了"
+                    f"{'、'.join(asked_when)}。它的触发方式由上游决定，"
+                    "不能再另外指定；否则「什么时候运行」会有两个答案。"
+                    "如果这一步真的需要按时间运行，把它改成没有上游的入口步骤。"
+                )
+            trigger = None
+            if not depends_on:
+                trigger_type = str(raw.get("trigger_type") or "").strip()
+                if trigger_type:
+                    trigger = self._schedule_trigger(
+                        trigger_type=trigger_type,
+                        timezone_name=str(raw.get("timezone_name") or "UTC"),
+                        at=raw.get("at"),
+                        every=raw.get("every"),
+                        unit=raw.get("unit"),
+                        time_of_day=raw.get("time_of_day"),
+                        day_of_week=raw.get("day_of_week"),
+                        day_of_month=raw.get("day_of_month"),
+                        signal_name=raw.get("signal_name"),
+                    )
+            profile = resolve_permission_profile(raw.get("permission_profile"))
+            own_workspace = str(raw.get("workspace_root") or "").strip()
+            if own_workspace:
+                step_workspace = str(
+                    Path(own_workspace).expanduser().resolve(strict=False)
+                )
+            elif chosen_workspace is not None:
+                step_workspace = str(chosen_workspace)
+            elif profile.requires_workspace_root:
+                # Same refusal, and for the same reason, as ``schedule_create``:
+                # a write-granting step pinned to the process working directory
+                # would write somewhere nobody can derive from the graph.
+                raise ValueError(
+                    f"{label}使用了权限策略「{profile.label}」，需要显式指定项目文件夹，"
+                    "不能回落到服务进程的当前目录"
+                )
+            else:
+                step_workspace = str(fallback_workspace)
+            mode, target = self._schedule_target(raw.get("delivery_mode"))
+            built.append(
+                WorkflowStep(
+                    key=key,
+                    name=str(raw.get("name") or key or label).strip(),
+                    kind=kind,
+                    payload=payload,
+                    depends_on=depends_on,
+                    trigger=trigger,
+                    workspace_root=step_workspace,
+                    permission_profile=profile.key,
+                    acceptance=Acceptance(
+                        criteria=[
+                            str(item)
+                            for item in (raw.get("criteria") or [])
+                            if str(item).strip()
+                        ],
+                        verify_command=str(raw.get("verify_command") or "").strip(),
+                    ),
+                    delivery_mode=mode,
+                    delivery_target=target,
+                )
+            )
+
+        workflow = Workflow(
+            name=str(name or "").strip(),
+            description=str(description or "").strip(),
+            steps=built,
+        )
+        store = self._schedule_store()
+        created = store.create_workflow(workflow)
+        tasks = store.step_tasks(created.id)
+        return self._ok(
+            workflow={
+                "id": created.id,
+                "name": created.name,
+                "description": created.description,
+                "enabled": created.enabled,
+                "steps": [
+                    {
+                        "key": step.key,
+                        "name": step.name,
+                        "kind": step.kind,
+                        "depends_on": list(step.depends_on),
+                        "trigger": (
+                            json.loads(step.trigger.to_json())
+                            if step.trigger is not None
+                            else None
+                        ),
+                        "task_id": tasks[step.key].id if step.key in tasks else None,
+                        "workspace_root": step.workspace_root,
+                        "permission_profile": step.permission_profile,
+                        "acceptance": step.acceptance.to_dict(),
+                    }
+                    for step in created.steps
+                ],
+                "db_path": str(shared.SCHEDULER_DB_FILE),
+            },
+            summary_text=self._describe_workflow(created),
+        )
+
+    @staticmethod
+    def _describe_workflow(workflow: Any) -> str:
+        """The chain, in the order it will run, as a sentence.
+
+        Written out rather than summarised as a count, because the two things
+        that go wrong with a graph -- a step in the wrong place, and a step
+        whose criterion was not what the person meant -- are both visible in
+        the sequence and invisible in "created 3 steps".
+        """
+        lines = [f"已创建流程「{workflow.name}」，共 {len(workflow.steps)} 个步骤："]
+        for step in workflow.steps:
+            upstreams = "、".join(str(item) for item in step.depends_on)
+            when = f"在 {upstreams} 成功后运行" if upstreams else "按自身触发方式运行"
+            lines.append(f"- {step.key}（{step.name}）：{when}")
+            criteria = list(getattr(step.acceptance, "criteria", []) or [])
+            command = str(getattr(step.acceptance, "verify_command", "") or "").strip()
+            if criteria or command:
+                judged = "；".join(str(item) for item in criteria)
+                if command:
+                    judged = f"{judged}；验收命令：{command}" if judged else f"验收命令：{command}"
+                lines.append(f"  判定成功的依据：{judged}")
+        return "\n".join(lines)
+
+    def _workflow_list(self) -> dict[str, Any]:
+        store = self._schedule_store()
+        workflows = store.list_workflows()
+        return self._ok(
+            count=len(workflows),
+            items=[
+                {
+                    "id": workflow.id,
+                    "name": workflow.name,
+                    "description": workflow.description,
+                    "enabled": workflow.enabled,
+                    "steps": [
+                        {
+                            "key": step.key,
+                            "name": step.name,
+                            "depends_on": list(step.depends_on),
+                        }
+                        for step in workflow.steps
+                    ],
+                }
+                for workflow in workflows
+            ],
+        )
+
+    def _workflow_delete(self, workflow_id: str) -> dict[str, Any]:
+        """Stop a workflow, keeping the record that it ran.
+
+        The tasks behind it are disabled rather than deleted, which is what the
+        store does; this only says so, because "deleted" would suggest the run
+        history went with it and somebody reading the log later would not know
+        to look for it.
+        """
+        store = self._schedule_store()
+        disabled = store.delete_workflow(workflow_id)
+        return self._ok(
+            workflow_id=workflow_id,
+            deleted=True,
+            disabled_task_ids=disabled,
+        )
+
+    def _report_outcome(self, reason: str) -> dict[str, Any]:
+        """Record that this run could not do its job.
+
+        There is deliberately no way to report success.  An unattended run is
+        judged by its acceptance check, and an agent's own assurance that it
+        did well is a claim rather than evidence -- offering a parameter that
+        could only ever be used in the harmful direction would be an invitation
+        to use it.
+
+        Refused outside a scheduled run rather than quietly accepted: in a
+        conversation there is a person to tell, and a tool that wrote a verdict
+        to nowhere would look as though it had done something.
+        """
+        text = str(reason or "").strip()
+        if not text:
+            raise ValueError("`reason` is required")
+        report = _active_run_self_report.get()
+        if report is None:
+            raise ValueError(
+                "report_outcome 只能在定时任务的运行中使用；"
+                "在会话里直接说明遇到的问题即可。"
+            )
+        report.verdict = VERDICT_FAILED
+        report.reason = text
+        return self._ok(
+            reported=True,
+            reason=text,
+            note="本次运行将被记为失败，下游步骤不会运行。",
+        )
 
     def _emit_signal(
         self, name: str, payload: Optional[dict[str, Any]] = None

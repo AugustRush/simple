@@ -4,10 +4,25 @@ import asyncio
 import contextlib
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+
+from agent import shared
+from agent.verification import (
+    VERDICT_FAILED,
+    VERDICT_NONE,
+    VERDICT_UNKNOWN,
+    CommandVerifier,
+    VerificationResult,
+    combine_verdicts,
+)
 
 from .models import (
     DEFAULT_SIGNAL_MAX_DEPTH,
+    RETRYABLE_RUN_STATUSES,
+    RUN_SUCCESS_STATUS,
+    RUN_UNVERIFIED_STATUS,
+    Acceptance,
     DeliveryResult,
     DeliveryTarget,
     ExecutionResult,
@@ -305,6 +320,66 @@ class SchedulerService:
         except Exception:
             return False
 
+    def _acceptance_for(self, task, run) -> Acceptance:
+        """The criterion this execution is judged by.
+
+        Read from the run's own snapshot rather than from the task, because
+        that is what makes the judgement stable: editing a task while one of
+        its runs is in flight must not change what that run is measured
+        against halfway through.
+        """
+        snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+        raw = snapshot.get("acceptance")
+        if raw is None:
+            return getattr(task, "acceptance", None) or Acceptance()
+        return Acceptance.from_dict(raw)
+
+    async def _evaluate_acceptance(
+        self, task, run, result: ExecutionResult
+    ) -> tuple[str, Optional[VerificationResult]]:
+        """Decide what the work was worth, from every source that has a say.
+
+        Two sources, and the rule between them is asymmetric: either can fail
+        the run, and both must pass for it to pass.  A self-report is weaker
+        evidence than a command, so it can only ever *lower* the verdict -- an
+        agent saying "done" must never stand in for a check that could not run.
+        """
+        acceptance = self._acceptance_for(task, run)
+        self_verdict = str(getattr(result, "self_report_verdict", "") or "")
+        command = str(acceptance.verify_command or "").strip()
+        if not command:
+            return combine_verdicts(self_verdict), None
+        snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+        workspace = str(
+            snapshot.get("workspace_root") or getattr(task, "workspace_root", "") or ""
+        ).strip()
+        verifier = CommandVerifier(
+            workspace_root=workspace or Path.cwd(),
+            # The same root the criterion was validated against when the task
+            # was written.  A narrower one here would reject at 3am a command
+            # that was accepted while somebody was still looking at the screen.
+            output_dir=shared.DEFAULT_OUTPUT_DIR,
+        )
+        verification = await verifier.verify(command)
+        return combine_verdicts(self_verdict, verification.verdict), verification
+
+    @staticmethod
+    def _status_for(verdict: str, delivered: bool) -> str:
+        """The run's outcome, from the verdict and whether the result arrived.
+
+        A known problem in either axis is a failure: work that did not meet its
+        bar, and a result that did not arrive, both mean the run did not
+        achieve what it was for.  ``unverified`` is reserved for the genuinely
+        unknown case -- a criterion that could not be evaluated with nothing
+        else wrong -- because calling that ``failed`` would assert something
+        nobody observed.
+        """
+        if verdict == VERDICT_FAILED or not delivered:
+            return "failed"
+        if verdict == VERDICT_UNKNOWN:
+            return RUN_UNVERIFIED_STATUS
+        return RUN_SUCCESS_STATUS
+
     async def _execute_claimed(self, task, run) -> None:
         loop = asyncio.get_running_loop()
         monotonic_start = loop.time()
@@ -389,9 +464,23 @@ class SchedulerService:
             successful_delivery = delivery_status in {"stored", "delivered"}
             if delivery_status == "skipped" and not result.text_output.strip():
                 successful_delivery = True
-            status = "succeeded" if successful_delivery else "failed"
             if not successful_delivery and not delivery_error:
                 delivery_error = f"unexpected delivery status: {delivery_status or 'empty'}"
+            verdict, verification = await self._evaluate_acceptance(task, run, result)
+            status = self._status_for(verdict, successful_delivery)
+            # Every reason this run is not a clean success, kept together
+            # rather than reduced to one.  A run can be wrong in more than one
+            # way at once, and "which of these was it" is a question the record
+            # should not have to answer by discarding the others.
+            error = "\n".join(
+                part
+                for part in (
+                    str(getattr(result, "self_report_reason", "") or "").strip(),
+                    verification.diagnostic() if verification is not None else "",
+                    delivery_error,
+                )
+                if part
+            )
             finished_at = run_now()
             # Prefix the summary when this run is the first one after a period
             # in which nothing was running.  The run succeeded, so nothing else
@@ -410,11 +499,13 @@ class SchedulerService:
                 finished_at=finished_at,
                 status=status,
                 summary=run_summary,
-                error=delivery_error,
+                error=error,
                 output_path=output_path,
                 delivery_status=delivery_status,
+                verdict=verdict,
+                verification=verification,
             )
-            if status == "failed":
+            if status in RETRYABLE_RUN_STATUSES:
                 await self._enqueue_automatic_retry(task, run, finished_at)
         except asyncio.CancelledError:
             if run.id in self._cancel_requested:
@@ -453,7 +544,7 @@ class SchedulerService:
                 error=str(exc),
                 output_path=result.output_path if result is not None else "",
             )
-            if status == "failed":
+            if status in RETRYABLE_RUN_STATUSES:
                 await self._enqueue_automatic_retry(task, run, finished_at)
         finally:
             self._active_tasks.pop(run.id, None)

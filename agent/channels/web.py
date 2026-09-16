@@ -162,6 +162,14 @@ def _scheduler_run_payload(run: Any, *, with_snapshot: bool = True) -> dict[str,
         "summary": str(getattr(run, "summary", "") or ""),
         "error": str(getattr(run, "error", "") or ""),
         "delivery_status": str(getattr(run, "delivery_status", "") or ""),
+        # Two answers that are not the same question: ``status`` says whether
+        # the run happened, ``verdict`` says whether what it produced met the
+        # bar the task was given.  They travel separately because a run can
+        # deliver a result that does not do the job, and a result that does the
+        # job can fail to arrive -- and collapsing them is what made a useless
+        # answer read as success.
+        "verdict": str(getattr(run, "verdict", "") or ""),
+        "verification": _verification_payload(getattr(run, "verification", None)),
         "trigger_source": str(getattr(run, "trigger_source", "schedule") or "schedule"),
         "attempt": int(getattr(run, "attempt", 1) or 1),
         "cancel_requested_at": (
@@ -209,6 +217,43 @@ def _scheduler_output_url(task_id: str, run_id: str, output_path: str) -> str:
     )
 
 
+def _acceptance_payload(acceptance: Any) -> dict[str, Any]:
+    """What a task or step is judged by, always as an object.
+
+    Always present and always an object -- possibly with an empty ``criteria``
+    and an empty ``verify_command`` -- so the client can read the fields
+    without checking whether the key exists.  "Nothing was declared" is a
+    value here, not an absence.
+    """
+    if acceptance is None:
+        return {"criteria": [], "verify_command": ""}
+    to_dict = getattr(acceptance, "to_dict", None)
+    if callable(to_dict):
+        data = dict(to_dict())
+    else:
+        data = {}
+    criteria = data.get("criteria")
+    return {
+        "criteria": [str(item) for item in criteria] if isinstance(criteria, list) else [],
+        "verify_command": str(data.get("verify_command") or ""),
+    }
+
+
+def _verification_payload(result: Any) -> Optional[dict[str, Any]]:
+    """The acceptance check's own result, or ``None`` when there was none.
+
+    ``None`` rather than an empty object, because "no check was declared" and
+    "a check ran and reported nothing" are different facts, and the interface
+    says different things about them.
+    """
+    if result is None:
+        return None
+    to_dict = getattr(result, "to_dict", None)
+    if callable(to_dict):
+        return dict(to_dict())
+    return None
+
+
 def _scheduler_task_payload(
     task: Any, latest_run: Any = None, unseen_attention: int = 0
 ) -> dict[str, Any]:
@@ -232,6 +277,10 @@ def _scheduler_task_payload(
         "retry_policy": task.retry_policy,
         "selected_skills": task.selected_skills,
         "permission_profile": task.permission_profile,
+        # What this task's runs are judged by.  Sent so the interface can say
+        # it, because a criterion the person never saw is indistinguishable
+        # from a run that failed for no reason.
+        "acceptance": _acceptance_payload(getattr(task, "acceptance", None)),
         # Empty for a standalone task, which most are.  Carried on the task
         # rather than looked up from the graph so a task row in the list can
         # say where it belongs without the client holding the whole graph.
@@ -290,6 +339,7 @@ def _workflow_payload(
                 "trigger": step.trigger.payload if step.trigger is not None else {},
                 "workspace_root": step.workspace_root,
                 "permission_profile": step.permission_profile,
+                "acceptance": _acceptance_payload(getattr(step, "acceptance", None)),
                 "timeout_seconds": int(step.timeout_seconds),
                 "task_id": task_id,
                 "enabled": bool(task.enabled) if task is not None else False,

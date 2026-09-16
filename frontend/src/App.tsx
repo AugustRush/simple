@@ -64,6 +64,7 @@ import {
   MoreOutlined,
   PaperClipOutlined,
   PlusOutlined,
+  QuestionCircleFilled,
   ReloadOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
@@ -234,6 +235,8 @@ interface ScheduleInfo {
   retry_policy?: { max_attempts?: number; backoff_seconds?: number }
   selected_skills?: string[]
   permission_profile?: PermissionProfileKey
+  //: What this task's runs are judged by. Always present, possibly empty.
+  acceptance?: AcceptanceInfo
   unseen_attention?: number
   // Empty for a standalone task, which most are. A step of a workflow carries
   // both, so a task row can say where it belongs.
@@ -251,6 +254,7 @@ interface WorkflowStepInfo {
   trigger?: Record<string, any>
   workspace_root?: string
   permission_profile?: PermissionProfileKey
+  acceptance?: AcceptanceInfo
   timeout_seconds?: number
   task_id: string
   enabled?: boolean
@@ -318,6 +322,24 @@ interface SignalInfo {
   subscriber_count: number
 }
 
+/** What a task's runs are judged by. */
+interface AcceptanceInfo {
+  criteria: string[]
+  //: Empty when nothing mechanical decides it, which is the ordinary case.
+  verify_command: string
+}
+
+/** The acceptance check's own result, when one ran. */
+interface VerificationInfo {
+  //: One of the six verification statuses. Only `passed` and `failed` are
+  //: statements about the work; the rest are statements about the check.
+  status: string
+  exit_code?: number | null
+  stdout_tail?: string
+  stderr_tail?: string
+  error?: string | null
+}
+
 interface ScheduleRun {
   id: string
   task_id: string
@@ -329,6 +351,11 @@ interface ScheduleRun {
   summary?: string
   error?: string
   delivery_status?: string
+  //: Whether what the run produced met the bar the task was given. A
+  //: different question from `status`, which only says whether the run
+  //: happened; see scheduleRunVerdictLabel.
+  verdict?: string
+  verification?: VerificationInfo | null
   output_available?: boolean
   output_url?: string
   trigger_source?: string
@@ -1398,6 +1425,12 @@ function scheduleRunStatusLabel(status?: string, run?: ScheduleRun | null): stri
   if (status === 'failed') return '执行失败'
   if (status === 'interrupted') return '已中断'
   if (status === 'cancelled') return '已取消'
+  // Not 「执行失败」: the run happened, and what it produced was delivered --
+  // what nobody can say is whether that was the right thing, because the
+  // acceptance check could not be evaluated. Calling it a failure would
+  // assert something nobody observed, and calling it a success would be
+  // worse.
+  if (status === 'unverified') return '结果未能判定'
   // Not "已取消": nobody decided this. A step above it failed, and saying so
   // is the difference between a chain that stopped working and a chain that
   // somebody turned off.
@@ -1561,6 +1594,7 @@ function scheduleRunStatusIcon(status?: string) {
   if (status === 'running') return <LoadingOutlined spin />
   if (status === 'queued') return <ClockCircleOutlined />
   if (status === 'succeeded') return <CheckCircleFilled />
+  if (status === 'unverified') return <QuestionCircleFilled />
   if (status === 'failed' || status === 'interrupted' || status === 'cancelled') {
     return <ExclamationCircleFilled />
   }
@@ -1581,8 +1615,56 @@ function scheduleRunAttentionReason(run: ScheduleRun): string {
   if (missed > 0) reasons.push(`本次运行前有 ${missed} 次计划未能执行`)
   if (run.status === 'failed' || run.status === 'interrupted') {
     reasons.push(`本次运行${scheduleRunStatusLabel(run.status)}`)
+  } else if (run.status === 'unverified') {
+    // Its own sentence rather than a status label, because what needs looking
+    // at is not the run -- that finished fine -- but the criterion that could
+    // not be evaluated.
+    reasons.push('本次运行的结果未能判定是否达标')
   }
   return reasons.length ? `${reasons.join('；')}，你还没有查看` : '你还没有查看'
+}
+
+/** What the run's result was worth, as opposed to whether it ran.
+ *
+ * `status` answers "did this happen"; this answers "did it do the job". They
+ * are different questions and a run can get either one wrong on its own, so
+ * the two are shown side by side rather than folded into one word. Returns
+ * null when there is nothing to say -- a task with no criterion and no
+ * self-report has no verdict, and inventing one would be the collapse this
+ * exists to undo.
+ */
+function scheduleRunVerdictLabel(run: ScheduleRun): string | null {
+  if (run.verdict === 'failed') return '未达验收标准'
+  if (run.verdict === 'passed') return '已达验收标准'
+  if (run.verdict === 'unknown') return '验收无法判定'
+  return null
+}
+
+/** Why the verdict came out that way, in the check's own words, or null. */
+function scheduleRunVerificationDetail(run: ScheduleRun): string | null {
+  const verification = run.verification
+  if (!verification) return null
+  if (verification.status === 'passed') return null
+  if (verification.status === 'failed') {
+    const detail = String(verification.stderr_tail || verification.stdout_tail || '').trim()
+    const head = `退出码 ${verification.exit_code}`
+    return detail ? `${head}：${detail}` : head
+  }
+  // The remaining statuses are statements about the *check*, not the work:
+  // it was refused, timed out, was cancelled, or could not be set up. Saying
+  // so is what keeps "we could not tell" from reading as "it was wrong".
+  return String(verification.error || '').trim() || `验收状态：${verification.status}`
+}
+
+/** The criterion a task is judged by, as one line, or null when there is none. */
+function describeAcceptance(acceptance?: AcceptanceInfo): string | null {
+  if (!acceptance) return null
+  const criteria = (acceptance.criteria || []).filter((item) => String(item).trim())
+  const command = String(acceptance.verify_command || '').trim()
+  if (!criteria.length && !command) return null
+  const parts = [...criteria.map((item) => String(item))]
+  if (command) parts.push(`验收命令：${command}`)
+  return parts.join('；')
 }
 
 function formatScheduleDuration(durationMs?: number | null): string {
@@ -3344,6 +3426,15 @@ function App() {
   const selectedScheduleRun = useMemo(
     () => scheduleRuns.find(run => run.id === selectedScheduleRunId) || null,
     [scheduleRuns, selectedScheduleRunId],
+  )
+
+  // The task a run belongs to, for the criterion it was judged by. Taken from
+  // the list the page already holds rather than fetched with the run: the
+  // criterion is a property of the definition, and every run row was opened
+  // from a task that already carries it.
+  const selectedScheduleRunTask = useMemo(
+    () => schedules.find(task => task.id === selectedScheduleRun?.task_id) || null,
+    [schedules, selectedScheduleRun],
   )
 
   const filteredSchedules = useMemo(() => {
@@ -6947,6 +7038,14 @@ function App() {
                   {selectedSchedule.workspace_root && (
                     <div className="schedule-workspace"><FolderOpenOutlined />{selectedSchedule.workspace_root}</div>
                   )}
+                  {/* What a run of this task is judged by, said before it ever
+                      runs.  A criterion nobody was shown is indistinguishable
+                      from a run that failed for no reason. */}
+                  {describeAcceptance(selectedSchedule.acceptance) && (
+                    <div className="schedule-workspace schedule-acceptance">
+                      <SafetyCertificateOutlined />判定依据：{describeAcceptance(selectedSchedule.acceptance)}
+                    </div>
+                  )}
                 </div>
               </div>
               <div className="schedule-detail-next">
@@ -7081,6 +7180,20 @@ function App() {
                         )}
                         <div><small>运行模型</small><span>{selectedScheduleRun.config_snapshot?.model_override || '默认模型'}</span></div>
                       </div>
+
+                      {scheduleRunVerdictLabel(selectedScheduleRun) && (
+                        <div className={`schedule-run-verdict verdict-${selectedScheduleRun.verdict || 'unknown'}`}>
+                          <strong>{scheduleRunVerdictLabel(selectedScheduleRun)}</strong>
+                          {scheduleRunVerificationDetail(selectedScheduleRun) && (
+                            <pre>{scheduleRunVerificationDetail(selectedScheduleRun)}</pre>
+                          )}
+                          {describeAcceptance(selectedScheduleRunTask?.acceptance) && (
+                            <small>
+                              判定依据：{describeAcceptance(selectedScheduleRunTask?.acceptance)}
+                            </small>
+                          )}
+                        </div>
+                      )}
 
                       {selectedScheduleRun.error && (
                         <div className="schedule-run-error">

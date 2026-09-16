@@ -43,6 +43,33 @@ _active_signal_context: contextvars.ContextVar[Optional[dict[str, Any]]] = (
     contextvars.ContextVar("_active_signal_context", default=None)
 )
 
+
+@dataclass
+class RunSelfReport:
+    """What a scheduled run says about whether it did the job.
+
+    A mutable object rather than the verdict itself, and that is the whole
+    reason this is a class instead of a string.  Sync tools are dispatched into
+    a worker thread under ``copy_context()``, so a contextvar *set* inside a
+    tool would be written to the copy and never seen by the caller that needs
+    it.  Mutating a shared object survives the copy.
+
+    Only a failure is worth acting on, so the tool that writes this records
+    "could not do it" and stays silent otherwise; a run that believes it
+    succeeded is making a claim, not producing evidence.
+    """
+
+    verdict: str = ""
+    reason: str = ""
+
+
+#: Present only inside a scheduled run, so ``report_outcome`` can reach the
+#: executor that is waiting to hear it.  ``None`` in an ordinary conversation,
+#: where there is nothing to report to.
+_active_run_self_report: contextvars.ContextVar[Optional[RunSelfReport]] = (
+    contextvars.ContextVar("_active_run_self_report", default=None)
+)
+
 # ── Synchronous tool dispatch ────────────────────────────────────────────────
 #
 # Most tools (file I/O, memory/SQLite, scheduler CRUD) are plain sync

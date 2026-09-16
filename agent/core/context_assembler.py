@@ -17,6 +17,12 @@ _MANAGEMENT_TOOLS = {
     "delete_skill", "write_skill_file",
 }
 _SCHEDULE_TOOLS = {"schedule_create", "schedule_list", "schedule_delete"}
+_WORKFLOW_TOOLS = {"workflow_create", "workflow_list", "workflow_delete"}
+#: Meaningful only inside a scheduled run -- outside one it refuses, because
+#: there is a person to tell instead.  Gated on *the run* rather than on words:
+#: no sentence in a conversation makes it usable, and a schema that can only be
+#: called in error is not worth the tokens.
+_RUN_SELF_REPORT_TOOLS = {"report_outcome"}
 _DEEP_MEMORY_TOOLS = {"memory_index", "memory_clear"}
 _SKILL_RUNTIME_TOOLS = {"activate_skill", "list_skill_files", "read_skill_file"}
 _ORCHESTRATION_TOOLS = {"spawn_agent"}
@@ -24,6 +30,44 @@ _SEARCH_EXTRAS = {"tavily_search"}
 # Only useful when the turn actually carries audio; gated so the schema
 # does not ride along in every prompt.
 _ATTACHMENT_GATED_TOOLS = {"transcribe_audio"}
+
+#: Words that mean "do this later", or "do these in an order".  One list for
+#: both groups on purpose: "make this a chain of steps" and "make this one
+#: step" are the same request at different sizes, and which size a given
+#: sentence means is a judgement the model makes.  A second keyword list would
+#: be the matcher pretending to make that judgement, and getting it wrong in
+#: the direction that hides the tool.
+#:
+#: The product's own word is here because it is what the user reads on the
+#: automation page and therefore what they type: a gate that understood only
+#: "定时" answered "帮我创建一个自动化" as though the agent could not do it.
+_SCHEDULED_WORK_TERMS = (
+    "schedule",
+    "remind",
+    "recurring",
+    "cron",
+    "automation",
+    "automate",
+    "workflow",
+    "pipeline",
+    "chain",
+    "定时",
+    "提醒",
+    "周期",
+    "定期",
+    "自动化",
+    "工作流",
+    "流程",
+    "流水线",
+    "串联",
+    "链路",
+    "拆",
+    "每天",
+    "每日",
+    "每周",
+    "每月",
+    "每年",
+)
 
 
 def _matches(text: str, terms: Iterable[str]) -> bool:
@@ -49,19 +93,24 @@ class ContextAssembler:
         *,
         required_skills: Iterable[str] = (),
         attachment_kinds: Iterable[str] = (),
+        scheduled_run: bool = False,
     ) -> list[dict[str, Any]]:
         names = {str(tool.get("name") or "") for tool in tools}
         selected = names - (
             _MANAGEMENT_TOOLS
             | _SCHEDULE_TOOLS
+            | _WORKFLOW_TOOLS
+            | _RUN_SELF_REPORT_TOOLS
             | _DEEP_MEMORY_TOOLS
             | _ORCHESTRATION_TOOLS
             | _SEARCH_EXTRAS
             | _ATTACHMENT_GATED_TOOLS
         )
 
-        if _matches(query, ("schedule", "remind", "recurring", "cron", "定时", "提醒", "周期")):
-            selected |= _SCHEDULE_TOOLS
+        if _matches(query, _SCHEDULED_WORK_TERMS):
+            selected |= _SCHEDULE_TOOLS | _WORKFLOW_TOOLS
+        if scheduled_run:
+            selected |= _RUN_SELF_REPORT_TOOLS
         if _matches(query, ("memory", "remember", "forget", "记忆", "记住", "忘记", "上下文")):
             selected |= _DEEP_MEMORY_TOOLS
         if _matches(query, ("plugin", "skill", "tool", "插件", "技能", "工具")):

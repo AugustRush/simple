@@ -802,6 +802,36 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "`action_type=system_job` for internal maintenance. "
                 "Do not pretend the scheduled action has already run."
             )
+            lines.append(
+                "Give the task `criteria` saying what has to be true for a run "
+                "of it to count as a success, and a `verify_command` whenever "
+                "that is mechanically checkable — a test suite, a build, a "
+                "script that checks the output. That is not documentation: the "
+                "criterion is what decides whether the run is recorded as "
+                "having done its job, and a task with no criterion is judged "
+                "only on whether its result was delivered."
+            )
+        if "workflow_create" in builtin_names:
+            lines.append(
+                "When a request is really several jobs in an order — fetch, "
+                "then transform, then report — build it with `workflow_create` "
+                "rather than with several `schedule_create` calls. Hand-chaining "
+                "separate tasks through signals produces the same runs with no "
+                "recorded edges, and the edges are what tell a failure which "
+                "steps below it must not run. Say which steps depend on which "
+                "in `depends_on`, and give each step its own `criteria`."
+            )
+        if "report_outcome" in builtin_names:
+            lines.append(
+                "This turn is a scheduled run, not a conversation. If you "
+                "cannot do what the run was for, call `report_outcome` with "
+                "the reason instead of describing the problem in your reply: "
+                "the reply is only a summary, and `report_outcome` is what "
+                "records the run as failed and stops the steps below it. There "
+                "is deliberately no way to report success — that is decided by "
+                "the acceptance check, not by you, and claiming it would not "
+                "make it so."
+            )
         if "shell" in builtin_names:
             lines.append(
                 "Every shell tool call must include an `intent` input that explains what that exact command "

@@ -40,12 +40,21 @@ from .service import (
     RalphRunResult,
     RalphService,
 )
-from .verify import (
-    RALPH_DEFAULT_VERIFY_TIMEOUT_SECONDS,
-    RALPH_VERIFICATION_OUTPUT_LIMIT,
-    RALPH_VERIFY_ENV_ALLOWLIST,
-    RalphVerifier,
+from agent.verification import (
+    DEFAULT_VERIFY_TIMEOUT_SECONDS,
+    VERIFICATION_OUTPUT_LIMIT,
+    VERIFY_ENV_ALLOWLIST,
+    CommandVerifier,
 )
+
+# Historical names.  The verifier is shared with the scheduler now, so the
+# neutral names are the real ones; these keep existing imports working.  They
+# are assignments rather than a second class on purpose -- an alias cannot
+# drift from the thing it aliases, and a subclass could.
+RALPH_DEFAULT_VERIFY_TIMEOUT_SECONDS = DEFAULT_VERIFY_TIMEOUT_SECONDS
+RALPH_VERIFICATION_OUTPUT_LIMIT = VERIFICATION_OUTPUT_LIMIT
+RALPH_VERIFY_ENV_ALLOWLIST = VERIFY_ENV_ALLOWLIST
+RalphVerifier = CommandVerifier
 
 __all__ = [
     "RALPH_COMPLETION_PROMISE",

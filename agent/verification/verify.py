@@ -1,3 +1,20 @@
+"""Run one command and read its exit code, under an unattended envelope.
+
+The safety posture is inherited unchanged from the Ralph design: verification
+runs *less* privileged than an interactive shell, not more.  Only commands the
+shell safety gate classifies as low risk, never through an inline interpreter,
+with a curated environment rather than the process's own.
+
+The distinction this module exists to preserve is between the two halves of a
+refusal.  ``command_rejection_reason`` answers "could this command ever be used
+as a check?" *without running it*, which is what a caller needs at the moment
+somebody writes a task down.  :meth:`CommandVerifier.verify` asks the same
+question again before running, because the answer can change between writing a
+task and its 3am run, and returns ``REJECTED`` rather than raising.
+
+One rule, two moments, no second implementation to drift.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -13,9 +30,9 @@ from agent.security.shell import shell_command_check
 from .models import VerificationResult, VerificationStatus
 
 
-RALPH_VERIFICATION_OUTPUT_LIMIT = 64 * 1024
-RALPH_DEFAULT_VERIFY_TIMEOUT_SECONDS = 60.0
-RALPH_VERIFY_ENV_ALLOWLIST = (
+VERIFICATION_OUTPUT_LIMIT = 64 * 1024
+DEFAULT_VERIFY_TIMEOUT_SECONDS = 60.0
+VERIFY_ENV_ALLOWLIST = (
     "PATH",
     "HOME",
     "LANG",
@@ -26,14 +43,89 @@ RALPH_VERIFY_ENV_ALLOWLIST = (
 )
 
 
-class RalphVerifier:
+def command_rejection_reason(
+    command: str,
+    *,
+    workspace_root: str | Path,
+    output_dir: str | Path,
+    blocked_commands: Sequence[str] = (),
+) -> str | None:
+    """Why *command* can never serve as an acceptance check, or ``None``.
+
+    Decidable without running anything, which is the point: a caller writing a
+    task down can refuse a check that would never have been allowed to run,
+    while somebody is still looking at the screen, instead of discovering it at
+    3am in a run that then has no verdict at all.
+    """
+    try:
+        argv = shlex.split(str(command or ""), posix=True)
+    except (TypeError, ValueError) as exc:
+        return f"验收命令无法解析：{exc}"
+    if not argv:
+        return "验收命令不能为空"
+    inline_reason = _inline_interpreter_reason(argv)
+    if inline_reason is not None:
+        return f"验收命令被拒绝：{inline_reason}"
+    safety = shell_command_check(
+        str(command or ""),
+        extra_blocked=list(blocked_commands),
+        allowed_roots=frozenset(
+            (
+                Path(workspace_root).expanduser().resolve(strict=False),
+                Path(output_dir).expanduser().resolve(strict=False),
+            )
+        ),
+    )
+    return _refusal_reason(safety)
+
+
+#: ``shell_command_check`` fills ``reason`` with a *refusal* explanation only on
+#: the branches that refuse.  The path that falls through to the end returns
+#: this string whatever the risk level turned out to be, so quoting it back
+#: would produce "refused: command is allowed" -- a message that names the
+#: opposite of what happened.  Recognised, and replaced by a description of
+#: what actually stopped the command.
+_GENERIC_ALLOWED_REASON = "command is allowed"
+
+
+def _refusal_reason(safety: Any) -> str | None:
+    """The reason this command cannot be a check, in the reader's terms.
+
+    Composed from whichever condition actually refused it rather than from
+    ``safety.reason``, because that field is populated on some refusing
+    branches and misleading on the rest.  The reader here is whoever wrote the
+    criterion and now has to change it, so every branch has to say what to
+    change.
+    """
+    if not safety.allowed:
+        return f"验收命令被拒绝：{safety.reason}"
+    if safety.reason == "command was confirmed for this session":
+        # A confirmation is a fact about one interactive use, not a property
+        # of the command itself.  Nobody will be there to confirm it at 3am,
+        # and a check that only runs when somebody is watching is not a check.
+        return (
+            "验收命令被拒绝：该命令只是本次会话中被人工确认过一次，"
+            "本身并不在允许范围内"
+        )
+    detail = "" if safety.reason == _GENERIC_ALLOWED_REASON else f"（{safety.reason}）"
+    if safety.requires_confirmation:
+        return f"验收命令被拒绝：该命令需要人工确认{detail}，而验收时没有人在场"
+    if safety.risk_level != "low":
+        return (
+            f"验收命令被拒绝：该命令的风险等级是 {safety.risk_level}{detail}，"
+            "验收只接受低风险命令"
+        )
+    return None
+
+
+class CommandVerifier:
     def __init__(
         self,
         *,
         workspace_root: str | Path,
         output_dir: str | Path,
         blocked_commands: Sequence[str] = (),
-        timeout_seconds: float = RALPH_DEFAULT_VERIFY_TIMEOUT_SECONDS,
+        timeout_seconds: float = DEFAULT_VERIFY_TIMEOUT_SECONDS,
         termination_grace_seconds: float = 2.0,
     ) -> None:
         self.workspace_root = Path(workspace_root).expanduser().resolve(strict=False)
@@ -52,38 +144,16 @@ class RalphVerifier:
         *,
         cancel_token: Any = None,
     ) -> VerificationResult:
-        try:
-            argv = shlex.split(command, posix=True)
-        except (TypeError, ValueError) as exc:
-            return VerificationResult(
-                status=VerificationStatus.REJECTED,
-                error=f"Verification command is malformed: {exc}",
-            )
-        if not argv:
-            return VerificationResult(
-                status=VerificationStatus.REJECTED,
-                error="Verification command cannot be empty",
-            )
-        inline_reason = _inline_interpreter_reason(argv)
-        if inline_reason is not None:
-            return VerificationResult(
-                status=VerificationStatus.REJECTED,
-                error=f"Verification command rejected: {inline_reason}",
-            )
-        safety = shell_command_check(
+        reason = command_rejection_reason(
             command,
-            extra_blocked=list(self.blocked_commands),
-            allowed_roots=frozenset((self.workspace_root, self.output_dir)),
+            workspace_root=self.workspace_root,
+            output_dir=self.output_dir,
+            blocked_commands=self.blocked_commands,
         )
-        if (
-            not safety.allowed
-            or safety.risk_level != "low"
-            or safety.requires_confirmation
-            or safety.reason == "command was confirmed for this session"
-        ):
+        if reason is not None:
             return VerificationResult(
                 status=VerificationStatus.REJECTED,
-                error=f"Verification command rejected: {safety.reason}",
+                error=reason,
             )
 
         if cancel_token is not None and bool(
@@ -94,9 +164,15 @@ class RalphVerifier:
                 error="Verification was cancelled before process creation",
             )
 
+        # Already parsed once inside ``command_rejection_reason`` and found
+        # well formed, so this cannot raise -- re-splitting rather than
+        # threading the argv out keeps that function's signature about the
+        # question it answers ("may this run?") instead of its by-products.
+        argv = shlex.split(command, posix=True)
+
         env = {
             name: os.environ[name]
-            for name in RALPH_VERIFY_ENV_ALLOWLIST
+            for name in VERIFY_ENV_ALLOWLIST
             if name in os.environ
         }
         env["AGENT_WORKSPACE_ROOT"] = str(self.workspace_root)
@@ -124,8 +200,8 @@ class RalphVerifier:
         except (ProcessLookupError, PermissionError):
             process_group_id = process.pid
 
-        stdout_tail = _TailBuffer(RALPH_VERIFICATION_OUTPUT_LIMIT)
-        stderr_tail = _TailBuffer(RALPH_VERIFICATION_OUTPUT_LIMIT)
+        stdout_tail = _TailBuffer(VERIFICATION_OUTPUT_LIMIT)
+        stderr_tail = _TailBuffer(VERIFICATION_OUTPUT_LIMIT)
         stdout_task = asyncio.create_task(_drain_stream(process.stdout, stdout_tail))
         stderr_task = asyncio.create_task(_drain_stream(process.stderr, stderr_tail))
         process_wait = asyncio.create_task(process.wait())
@@ -506,8 +582,9 @@ def _parse_env_short_options(
 
 
 __all__ = [
-    "RALPH_DEFAULT_VERIFY_TIMEOUT_SECONDS",
-    "RALPH_VERIFICATION_OUTPUT_LIMIT",
-    "RALPH_VERIFY_ENV_ALLOWLIST",
-    "RalphVerifier",
+    "DEFAULT_VERIFY_TIMEOUT_SECONDS",
+    "VERIFICATION_OUTPUT_LIMIT",
+    "VERIFY_ENV_ALLOWLIST",
+    "CommandVerifier",
+    "command_rejection_reason",
 ]

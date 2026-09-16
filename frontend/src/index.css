@@ -4209,6 +4209,10 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 .schedule-detail-overview-main > div { min-width:0; }
 .schedule-detail-overview-main p { max-width:580px; margin:9px 0 0; color:var(--text-secondary); font-size:12px; line-height:1.65; white-space:pre-wrap; }
 .schedule-workspace { display:flex; align-items:center; gap:6px; max-width:580px; margin-top:8px; overflow:hidden; color:var(--text-muted); font-size:10px; text-overflow:ellipsis; white-space:nowrap; }
+/* A criterion is a sentence, so this one wraps where a folder path is
+   deliberately held to a single ellipsised line. */
+.schedule-acceptance { max-width:620px; align-items:flex-start; white-space:normal; line-height:1.6; }
+.schedule-acceptance > .anticon { flex:0 0 auto; margin-top:2px; }
 .schedule-detail-tags { display:flex; flex-wrap:wrap; gap:6px; }
 .schedule-detail-tags .ant-tag { margin:0; }
 .schedule-detail-next { display:flex; flex:0 0 auto; flex-direction:column; align-items:flex-end; gap:4px; padding-top:2px; }
@@ -4246,6 +4250,19 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 .schedule-run-error { margin:0 0 18px; padding:12px 14px; border:1px solid color-mix(in srgb, var(--red) 28%, transparent); border-radius:8px; color:var(--red); background:var(--red-soft); }
 .schedule-run-error strong { font-size:11px; }
 .schedule-run-error pre { margin:7px 0 0; overflow:auto; color:inherit; font:10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; }
+/* What the run's result was worth, as opposed to whether it ran.  Three
+   treatments for three answers, because the whole point of separating this
+   from the status is that "we could not tell" must not look like either of
+   the other two -- an unknown verdict shown in the failure colour would be
+   the same collapse the field exists to undo. */
+.schedule-run-verdict { margin:0 0 14px; padding:12px 14px; border:1px solid var(--border-strong); border-radius:8px; background:var(--surface-hover); }
+.schedule-run-verdict strong { font-size:11px; }
+.schedule-run-verdict pre { margin:7px 0 0; overflow:auto; color:inherit; font:10px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; }
+.schedule-run-verdict small { display:block; margin-top:7px; font-size:10px; line-height:1.6; }
+.schedule-run-verdict.verdict-passed { border-color:color-mix(in srgb, var(--green) 34%, transparent); color:var(--green); background:var(--green-soft); }
+.schedule-run-verdict.verdict-failed { border-color:color-mix(in srgb, var(--red) 32%, transparent); color:var(--red); background:var(--red-soft); }
+.schedule-run-verdict.verdict-unknown { border-color:color-mix(in srgb, var(--amber) 36%, transparent); color:var(--amber); background:color-mix(in srgb, var(--amber) 12%, transparent); }
+.schedule-run-verdict.verdict-passed small, .schedule-run-verdict.verdict-failed small, .schedule-run-verdict.verdict-unknown small { color:inherit; opacity:.72; }
 .schedule-output-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:9px; }
 .schedule-output-head strong { font-size:12px; }
 .schedule-output-head span { color:var(--text-muted); font-size:9px; }

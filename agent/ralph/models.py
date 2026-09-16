@@ -8,6 +8,11 @@ from enum import Enum
 from typing import Any, Mapping
 
 from .parser import RALPH_DEFAULT_MAX_ITERATIONS, RALPH_MAX_ITERATIONS
+from agent.verification.models import (
+    VerificationError,
+    VerificationResult,
+    VerificationStatus,
+)
 
 
 RALPH_COMPLETION_PROMISE = "<promise>COMPLETE</promise>"
@@ -28,15 +33,6 @@ class RalphTaskStatus(str, Enum):
     MAX_ITERATIONS_REACHED = "max_iterations_reached"
     INTERRUPTED = "interrupted"
     FAILED = "failed"
-
-
-class VerificationStatus(str, Enum):
-    PASSED = "passed"
-    FAILED = "failed"
-    TIMEOUT = "timeout"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-    SETUP_ERROR = "setup_error"
 
 
 def validate_task_id(task_id: str, *, label: str = "task ID") -> str:
@@ -68,71 +64,11 @@ def _require_int(value: Any, *, field_name: str) -> int:
     return value
 
 
-@dataclass(frozen=True, slots=True)
-class VerificationResult:
-    status: VerificationStatus
-    exit_code: int | None = None
-    stdout_tail: str = ""
-    stderr_tail: str = ""
-    error: str | None = None
-
-    def __post_init__(self) -> None:
-        try:
-            status = VerificationStatus(self.status)
-        except ValueError as exc:
-            raise RalphValidationError(
-                "invalid_verification_status", "unknown verification status"
-            ) from exc
-        object.__setattr__(self, "status", status)
-        if self.exit_code is not None:
-            _require_int(self.exit_code, field_name="exit_code")
-        if self.status is VerificationStatus.PASSED and self.exit_code != 0:
-            raise RalphValidationError("invalid_schema", "passed verification requires exit code 0")
-        if self.status is VerificationStatus.FAILED and (
-            self.exit_code is None or self.exit_code == 0
-        ):
-            raise RalphValidationError(
-                "invalid_schema", "failed verification requires a nonzero exit code"
-            )
-        for name in ("stdout_tail", "stderr_tail"):
-            if not isinstance(getattr(self, name), str):
-                raise RalphValidationError("invalid_schema", f"{name} must be text")
-        if self.error is not None and not isinstance(self.error, str):
-            raise RalphValidationError("invalid_schema", "error must be text or null")
-
-    @property
-    def passed(self) -> bool:
-        return self.status is VerificationStatus.PASSED
-
-    @property
-    def infrastructure_error(self) -> bool:
-        return self.status is VerificationStatus.SETUP_ERROR
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": self.status.value,
-            "exit_code": self.exit_code,
-            "stdout_tail": self.stdout_tail,
-            "stderr_tail": self.stderr_tail,
-            "error": self.error,
-        }
-
-    @classmethod
-    def from_dict(cls, data: Mapping[str, Any]) -> "VerificationResult":
-        if not isinstance(data, Mapping):
-            raise RalphValidationError("invalid_schema", "verification result must be an object")
-        try:
-            return cls(
-                status=VerificationStatus(data["status"]),
-                exit_code=data.get("exit_code"),
-                stdout_tail=data.get("stdout_tail", ""),
-                stderr_tail=data.get("stderr_tail", ""),
-                error=data.get("error"),
-            )
-        except (KeyError, ValueError) as exc:
-            if isinstance(exc, RalphValidationError):
-                raise
-            raise RalphValidationError("invalid_schema", "invalid verification result") from exc
+# ``VerificationResult`` and ``VerificationStatus`` are imported above and
+# re-exported through this module's ``__all__``.  Their definition moved to
+# ``agent.verification`` when the scheduler needed the same answer, and having
+# exactly one definition is what keeps the two callers from disagreeing about
+# what "verified" means.
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +132,10 @@ class RalphIterationResult:
                 created_at=data.get("created_at") or _now_iso(),
             )
         except (KeyError, TypeError, ValueError) as exc:
-            if isinstance(exc, RalphValidationError):
+            if isinstance(exc, (RalphValidationError, VerificationError)):
+                # A verification error already says what was wrong with which
+                # field; re-wrapping it as "invalid iteration result" would
+                # replace a precise message with a vaguer one.
                 raise
             raise RalphValidationError("invalid_schema", "invalid iteration result") from exc
 

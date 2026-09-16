@@ -42,6 +42,7 @@ from agent.scheduler.profiles import (
 )
 from agent.scheduler.unattended import UnattendedAudit, UnattendedOutputSink
 from agent.shared import CancelToken
+from agent.tools.runtime import RunSelfReport, _active_run_self_report
 from agent.tui import TuiSession
 
 AgentContext = agent_module.AgentContext
@@ -740,6 +741,13 @@ async def _build_scheduler_service(
             or getattr(task, "context_policy", "stateless")
             or "stateless"
         )
+        # Where ``report_outcome`` writes.  Created here, and read back after
+        # the turn, because the verdict belongs to the *run* -- not to the
+        # conversation, and not to the task definition.  A fresh object per
+        # execution is what keeps one run's self-report from being read as the
+        # next run's.
+        self_report = RunSelfReport()
+        self_report_token = None
         try:
             system_prompt = run_components["system_prompt"]
             if context_policy == "task_history":
@@ -809,6 +817,13 @@ async def _build_scheduler_service(
                     else getattr(task, "model_override", None)
                 ),
             )
+            # Set for the span of the turn, so a tool dispatched anywhere below
+            # this line -- including a sync tool on a worker thread, which runs
+            # under a *copy* of this context -- writes into the same object.
+            # That is why the contextvar holds a mutable report rather than the
+            # verdict itself: a value set inside the copy would be discarded
+            # with the copy, and the report would arrive here empty.
+            self_report_token = _active_run_self_report.set(self_report)
             execution = await _agent_core_for_components(run_components).handle_turn(
                 TurnInput.from_text(
                     prompt,
@@ -843,8 +858,20 @@ async def _build_scheduler_service(
                     report += f"审计明细：{audit_path}\n"
                 content = f"{content}\n\n{report}" if content.strip() else report
             summary = content.strip().splitlines()[0][:120] if content.strip() else task.name
-            return ExecutionResult(summary=summary, text_output=content)
+            return ExecutionResult(
+                summary=summary,
+                text_output=content,
+                # The run's own answer to "did this work?", if it chose to give
+                # one.  It travels beside the result rather than inside it
+                # because it is a *judgement* about the result, and the caller
+                # combines it with the acceptance check -- see
+                # ``SchedulerRuntime._evaluate_acceptance``.
+                self_report_verdict=self_report.verdict,
+                self_report_reason=self_report.reason,
+            )
         finally:
+            if self_report_token is not None:
+                _active_run_self_report.reset(self_report_token)
             if isolated_runtime:
                 await agent_module._close_components(run_components)
 

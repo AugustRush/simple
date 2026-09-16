@@ -17,6 +17,7 @@ from .models import (
     RUN_SUCCESS_STATUS,
     SIGNAL_MODE_ALL,
     TERMINAL_RUN_STATUSES,
+    Acceptance,
     ClaimedTask,
     DeliveryTarget,
     NewScheduledTask,
@@ -26,6 +27,8 @@ from .models import (
     TriggerSpec,
     Workflow,
     WorkflowStep,
+    decode_verification,
+    encode_verification,
     execution_snapshot,
     parse_task_signal,
     signal_mode,
@@ -33,8 +36,10 @@ from .models import (
     step_trigger_spec,
     subscribes_to,
     task_signal_name,
+    validate_acceptance,
     validate_workflow_graph,
     workflow_downstream_steps,
+    workflow_step_order,
 )
 
 
@@ -140,7 +145,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 10
+    SCHEMA_VERSION = 11
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -190,6 +195,7 @@ class SchedulerStore:
                     retry_policy_json TEXT NOT NULL DEFAULT '{"max_attempts": 1, "backoff_seconds": 30}',
                     selected_skills_json TEXT NOT NULL DEFAULT '[]',
                     permission_profile TEXT NOT NULL DEFAULT 'inherit',
+                    acceptance_json TEXT NOT NULL DEFAULT '',
                     next_run_at TEXT,
                     lease_until TEXT,
                     active_run_id TEXT,
@@ -211,6 +217,8 @@ class SchedulerStore:
                     error TEXT NOT NULL DEFAULT '',
                     output_path TEXT NOT NULL DEFAULT '',
                     delivery_status TEXT NOT NULL DEFAULT '',
+                    verdict TEXT NOT NULL DEFAULT '',
+                    verification_json TEXT NOT NULL DEFAULT '',
                     config_snapshot_json TEXT NOT NULL DEFAULT '{}',
                     trigger_source TEXT NOT NULL DEFAULT 'schedule',
                     attempt INTEGER NOT NULL DEFAULT 1,
@@ -452,6 +460,40 @@ class SchedulerStore:
                         "arrivals_json TEXT NOT NULL DEFAULT '{}'"
                     )
                 self._conn.execute("PRAGMA user_version = 10")
+            elif version == 11:
+                # What the work had to be true for, and what was concluded.
+                #
+                # No backfill, and the empty defaults are the correct reading
+                # of every existing row rather than a placeholder: a task that
+                # never declared an acceptance criterion has not been judged,
+                # which is a different statement from having been judged and
+                # passed.  Backfilling a pass would invent a verdict nobody
+                # ever reached.
+                task_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_tasks)"
+                    ).fetchall()
+                }
+                if "acceptance_json" not in task_columns:
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_tasks ADD COLUMN "
+                        "acceptance_json TEXT NOT NULL DEFAULT ''"
+                    )
+                run_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_task_runs)"
+                    ).fetchall()
+                }
+                for name, declaration in (
+                    ("verdict", "TEXT NOT NULL DEFAULT ''"),
+                    ("verification_json", "TEXT NOT NULL DEFAULT ''"),
+                ):
+                    if name not in run_columns:
+                        self._conn.execute(
+                            f"ALTER TABLE scheduled_task_runs ADD COLUMN "
+                            f"{name} {declaration}"
+                        )
+                self._conn.execute("PRAGMA user_version = 11")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -479,6 +521,7 @@ class SchedulerStore:
             last_success_at=_dt(row["last_success_at"]),
             created_at=_dt(row["created_at"]) or datetime.now(UTC),
             updated_at=_dt(row["updated_at"]) or datetime.now(UTC),
+            acceptance=Acceptance.from_json(row["acceptance_json"]),
             workflow_id=row["workflow_id"] or "",
             step_key=row["step_key"] or "",
         )
@@ -495,6 +538,8 @@ class SchedulerStore:
             error=row["error"],
             output_path=row["output_path"],
             delivery_status=row["delivery_status"],
+            verdict=row["verdict"] or "",
+            verification=decode_verification(row["verification_json"]),
             config_snapshot=json.loads(row["config_snapshot_json"]),
             trigger_source=row["trigger_source"],
             attempt=int(row["attempt"]),
@@ -506,10 +551,27 @@ class SchedulerStore:
             updated_at=_dt(row["updated_at"]),
         )
 
+    def _check_acceptance(self, task: NewScheduledTask) -> None:
+        """Refuse an acceptance criterion this task could never be judged by.
+
+        Called on every write of a task definition, which is the only moment
+        the check can be refused while somebody is still looking at the screen.
+        The workspace is the task's own; the output root is the same one a run's
+        verifier will be given, so a command that passes here is not rejected
+        later for being pointed at the wrong directory.
+        """
+        validate_acceptance(
+            getattr(task, "acceptance", None),
+            workspace_root=str(getattr(task, "workspace_root", "") or ""),
+            output_dir=str(shared.DEFAULT_OUTPUT_DIR),
+            label=f"任务「{getattr(task, 'name', '')}」",
+        )
+
     @_synchronized
     def create_task(
         self, task: NewScheduledTask, now: Optional[datetime] = None
     ) -> ScheduledTask:
+        self._check_acceptance(task)
         created_at = (now or datetime.now(UTC)).astimezone(UTC)
         task_id = _new_id()
         next_run_at = task.trigger.initial_run_at(created_at)
@@ -523,10 +585,11 @@ class SchedulerStore:
                     context_policy, timeout_seconds, retry_policy_json,
                     selected_skills_json,
                     permission_profile,
+                    acceptance_json,
                     next_run_at, lease_until,
                     active_run_id, last_run_at, last_success_at, created_at, updated_at,
                     workflow_id, step_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -546,6 +609,7 @@ class SchedulerStore:
                     json.dumps(task.retry_policy, ensure_ascii=False),
                     json.dumps(task.selected_skills, ensure_ascii=False),
                     task.permission_profile,
+                    task.acceptance.to_json(),
                     _iso(next_run_at),
                     _iso(created_at),
                     _iso(created_at),
@@ -581,6 +645,7 @@ class SchedulerStore:
               AND retry_policy_json = ?
               AND selected_skills_json = ?
               AND permission_profile = ?
+              AND acceptance_json = ?
               AND workflow_id = ?
               AND step_key = ?
             ORDER BY created_at ASC
@@ -604,6 +669,13 @@ class SchedulerStore:
                 json.dumps(task.retry_policy, ensure_ascii=False),
                 json.dumps(task.selected_skills, ensure_ascii=False),
                 task.permission_profile,
+                # Part of the identity, not a decoration on it.  Two tasks that
+                # disagree about what "done" means are two different tasks, and
+                # treating them as one would answer "make this run only when
+                # the tests pass" with the existing task that runs regardless
+                # -- reporting success while the criterion the caller just
+                # stated is silently discarded.
+                task.acceptance.to_json(),
                 task.workflow_id,
                 task.step_key,
             ),
@@ -1476,6 +1548,11 @@ class SchedulerStore:
         the schedule reports success, so nothing else in the system will ever
         mention the gap, and a daily report can be missing for a week with
         every run marked fine.
+
+        The status list is read from :data:`ATTENTION_STATUSES` rather than
+        written out here, which is what keeps this query and
+        :func:`run_needs_attention` -- the same rule in Python -- from
+        disagreeing when a status is added.  ``unverified`` arrived that way.
         """
         placeholders = ", ".join("?" for _ in ATTENTION_STATUSES)
         return (
@@ -1559,6 +1636,7 @@ class SchedulerStore:
         *,
         now: Optional[datetime] = None,
     ) -> Optional[ScheduledTask]:
+        self._check_acceptance(task)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
         next_run_at = task.trigger.initial_run_at(updated_at)
         with self._conn:
@@ -1571,6 +1649,7 @@ class SchedulerStore:
                     workspace_root = ?, context_policy = ?, timeout_seconds = ?,
                     retry_policy_json = ?, next_run_at = ?, updated_at = ?
                     , selected_skills_json = ?, permission_profile = ?
+                    , acceptance_json = ?
                     , workflow_id = ?, step_key = ?
                 WHERE id = ?
                 """,
@@ -1593,6 +1672,7 @@ class SchedulerStore:
                     _iso(updated_at),
                     json.dumps(task.selected_skills, ensure_ascii=False),
                     task.permission_profile,
+                    task.acceptance.to_json(),
                     task.workflow_id,
                     task.step_key,
                     task_id,
@@ -2319,6 +2399,8 @@ class SchedulerStore:
         error: str = "",
         output_path: str = "",
         delivery_status: str = "",
+        verdict: str = "",
+        verification: Any = None,
     ) -> bool:
         finished_at = finished_at.astimezone(UTC)
         with self._immediate_transaction():
@@ -2353,7 +2435,8 @@ class SchedulerStore:
                 """
                 UPDATE scheduled_task_runs
                 SET status = ?, summary = ?, error = ?, output_path = ?,
-                    delivery_status = ?, finished_at = ?, updated_at = ?
+                    delivery_status = ?, verdict = ?, verification_json = ?,
+                    finished_at = ?, updated_at = ?
                 WHERE id = ? AND task_id = ? AND status = 'running'
                 """,
                 (
@@ -2362,6 +2445,8 @@ class SchedulerStore:
                     error,
                     output_path,
                     delivery_status,
+                    verdict,
+                    encode_verification(verification),
                     _iso(finished_at),
                     _iso(finished_at),
                     run_id,
@@ -2451,6 +2536,23 @@ class SchedulerStore:
             updated_at=_dt(row["updated_at"]),
         )
 
+    def _validate_graph(self, steps: list[WorkflowStep]) -> list[str]:
+        """Check a graph, including every step's acceptance criterion.
+
+        The folders are resolved first so each criterion is checked against the
+        directory its step will actually run in.  Nothing is written before this
+        returns, which is what keeps a refused graph from leaving a workflow row
+        with no tasks behind it -- the state ``create_workflow`` exists to make
+        impossible.
+        """
+        order = workflow_step_order(steps)
+        workspaces, _ = self._step_workspaces(steps, order)
+        return validate_workflow_graph(
+            steps,
+            acceptance_workspaces=workspaces,
+            output_dir=str(shared.DEFAULT_OUTPUT_DIR),
+        )
+
     @_synchronized
     def create_workflow(
         self, workflow: Workflow, *, now: Optional[datetime] = None
@@ -2461,7 +2563,7 @@ class SchedulerStore:
         is a drawing: it looks like a plan and runs nothing, and the person who
         made it has no way to tell the difference from the outside.
         """
-        validate_workflow_graph(workflow.steps)
+        self._validate_graph(workflow.steps)
         created_at = (now or datetime.now(UTC)).astimezone(UTC)
         workflow_id = _new_id()
         with self._conn:
@@ -2519,7 +2621,7 @@ class SchedulerStore:
         """
         if self.get_workflow(workflow_id) is None:
             return None
-        validate_workflow_graph(workflow.steps)
+        self._validate_graph(workflow.steps)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
         with self._conn:
             self._conn.execute(
@@ -2582,6 +2684,51 @@ class SchedulerStore:
         ).fetchall()
         return {row["step_key"]: self._task_from_row(row) for row in rows}
 
+    def _step_workspaces(
+        self, steps: list[WorkflowStep], order: list[str]
+    ) -> tuple[dict[str, str], list[str]]:
+        """Where each step will run, resolved, and which ones inherited it.
+
+        One answer, decided in one place, because two callers need it and they
+        must agree: materialization writes the folder onto each task, and graph
+        validation checks each step's acceptance criterion against the folder
+        the step will actually run in.  The shell safety gate exempts absolute
+        paths only inside the roots it is handed, so a criterion checked against
+        the wrong folder is refused for a reason that has nothing to do with the
+        command -- which is why "where does this run" cannot have two answers.
+        """
+        by_key = {str(step.key).strip(): step for step in steps}
+        # A step with no folder of its own runs where the workflow's entry
+        # steps run.  A chain is one job, and steps that silently split across
+        # directories would write half a result to each.
+        inherited = ""
+        for key in order:
+            step = by_key.get(key)
+            if step is not None and step.is_entry() and str(
+                step.workspace_root or ""
+            ).strip():
+                inherited = str(
+                    Path(step.workspace_root).expanduser().resolve(strict=False)
+                )
+                break
+        resolved: dict[str, str] = {}
+        took_inherited: list[str] = []
+        for key in order:
+            step = by_key.get(key)
+            if step is None:
+                continue
+            own = str(step.workspace_root or "").strip()
+            if not own and inherited:
+                took_inherited.append(key)
+                resolved[key] = inherited
+                continue
+            resolved[key] = (
+                str(Path(own).expanduser().resolve(strict=False))
+                if own
+                else str(Path.cwd().resolve())
+            )
+        return resolved, took_inherited
+
     def _step_task_spec(
         self,
         step: WorkflowStep,
@@ -2589,16 +2736,11 @@ class SchedulerStore:
         *,
         workflow_id: str,
         enabled: bool,
-        inherited_workspace: str = "",
+        workspace: str,
     ) -> NewScheduledTask:
-        workspace = str(step.workspace_root or "").strip()
-        if not workspace and inherited_workspace:
-            workspace = inherited_workspace
         target = step.delivery_target
         if target is None:
             target = DeliveryTarget.standalone()
-        if workspace:
-            workspace = str(Path(workspace).expanduser().resolve(strict=False))
         return NewScheduledTask(
             name=step.name,
             kind=step.kind,
@@ -2609,9 +2751,17 @@ class SchedulerStore:
             model_override=step.model_override,
             timeout_seconds=int(step.timeout_seconds),
             selected_skills=list(step.selected_skills),
-            workspace_root=workspace or str(Path.cwd().resolve()),
+            # Already resolved by ``_step_workspaces``, which is the only place
+            # that decides where a step runs.  Resolving again here would be a
+            # second answer to the same question.
+            workspace_root=workspace,
             permission_profile=step.permission_profile,
             context_policy=step.context_policy,
+            # Carried through so the step's own task is judged by the criterion
+            # written on the graph.  A step's acceptance is what decides whether
+            # the steps below it run, so losing it here would turn a chained
+            # workflow back into a sequence of unrelated tasks.
+            acceptance=step.acceptance,
             enabled=enabled,
             workflow_id=workflow_id,
             step_key=step.key,
@@ -2643,18 +2793,7 @@ class SchedulerStore:
         now_dt = (now or datetime.now(UTC)).astimezone(UTC)
         by_key = {str(step.key).strip(): step for step in workflow.steps}
         existing = self.step_tasks(workflow_id)
-
-        # A step with no folder of its own runs where the workflow's entry
-        # steps run.  A chain is one job, and steps that silently split across
-        # directories would write half a result to each.
-        inherited_workspace = ""
-        for key in order:
-            step = by_key[key]
-            if step.is_entry() and str(step.workspace_root or "").strip():
-                inherited_workspace = str(
-                    Path(step.workspace_root).expanduser().resolve(strict=False)
-                )
-                break
+        workspaces, took_inherited = self._step_workspaces(workflow.steps, order)
 
         created: list[str] = []
         updated: list[str] = []
@@ -2669,9 +2808,9 @@ class SchedulerStore:
                 trigger,
                 workflow_id=workflow_id,
                 enabled=bool(workflow.enabled),
-                inherited_workspace=inherited_workspace,
+                workspace=workspaces.get(key) or str(Path.cwd().resolve()),
             )
-            if not str(step.workspace_root or "").strip() and inherited_workspace:
+            if key in took_inherited:
                 inherited.append(key)
             current = existing.get(key)
             if current is None:

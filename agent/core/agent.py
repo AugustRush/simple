@@ -2543,6 +2543,10 @@ class BaseAgent:
             user_message,
             required_skills=ctx.metadata.get("required_skills", ()),
             attachment_kinds=(attachment.kind for attachment in attachments),
+            # The run's own report channel, and only inside a run: it refuses
+            # in a conversation, so shipping its schema there would be
+            # shipping a tool whose only possible outcome is an error.
+            scheduled_run=bool(ctx.metadata.get("scheduler_run_id")),
         )
         if decision.mode == "explicit":
             selected_names = {str(tool.get("name") or "") for tool in selected_tools}

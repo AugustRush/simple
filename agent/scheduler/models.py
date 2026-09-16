@@ -8,6 +8,14 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+from agent.verification import (
+    VERDICT_NONE,
+    VerificationResult,
+    command_rejection_reason,
+    decode_verification,
+    encode_verification,
+)
+
 
 UTC = timezone.utc
 
@@ -595,6 +603,10 @@ TERMINAL_RUN_STATUSES: tuple[str, ...] = (
     "cancelled",
     "interrupted",
     "skipped",
+    #: The work was not judged: an acceptance check was declared and could not
+    #: be evaluated.  See :data:`RUN_UNVERIFIED_STATUS` for why this is not
+    #: ``failed``.
+    "unverified",
 )
 
 
@@ -682,6 +694,132 @@ class DeliveryTarget:
 # or outputs -- a configurable field that changes nothing is worse than no
 # field, because the UI implies a promise the runtime does not keep.  Change a
 # default here and you change dedup identity, so treat that as a migration.
+
+
+#: Bounds on a declared acceptance criterion.  A criterion is a sentence, not a
+#: document: it is injected into a run's system prompt on every execution, so
+#: an unbounded one is paid for again on every run, forever.
+MAX_ACCEPTANCE_CRITERIA = 20
+MAX_ACCEPTANCE_CRITERION_CHARS = 500
+MAX_VERIFY_COMMAND_CHARS = 2000
+
+
+@dataclass
+class Acceptance:
+    """What has to be true of this task's work for the run to count as success.
+
+    Two halves answering the same question from opposite directions, and
+    neither is redundant:
+
+    ``criteria`` is *what the agent is aiming at*.  A scheduled run has nobody
+    to ask, so a prompt with no stated target is judged only by whether the
+    model replied -- which it always does.  These go into the run's system
+    prompt, where they are the difference between work and output.
+
+    ``verify_command`` is *what the record can be trusted to say*.  An agent's
+    opinion of its own work is not evidence, so the machine-checkable half is a
+    command whose exit code decides.
+
+    An empty ``Acceptance`` is the honest default, and it means "nothing was
+    declared": the run is not judged, which is a different statement from
+    having been judged and passing.
+    """
+
+    criteria: list[str] = field(default_factory=list)
+    verify_command: str = ""
+
+    def is_declared(self) -> bool:
+        return bool(self.criteria) or bool(self.verify_command.strip())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "criteria": list(self.criteria),
+            "verify_command": self.verify_command,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "Acceptance":
+        if not isinstance(data, dict):
+            return cls()
+        raw_criteria = data.get("criteria")
+        criteria = (
+            [str(item).strip() for item in raw_criteria if str(item).strip()]
+            if isinstance(raw_criteria, list)
+            else []
+        )
+        return cls(
+            criteria=criteria,
+            verify_command=str(data.get("verify_command") or "").strip(),
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, raw: Any) -> "Acceptance":
+        """Read back a stored criterion.
+
+        An unparseable column reads as "nothing declared" rather than raising:
+        the value is attached to a task that already exists, and a corrupt blob
+        must not make that task unloadable.  "We have no criterion" is the
+        honest reading of a criterion nobody can parse.
+        """
+        if not raw:
+            return cls()
+        if isinstance(raw, dict):
+            return cls.from_dict(raw)
+        try:
+            return cls.from_dict(json.loads(str(raw)))
+        except (TypeError, ValueError):
+            return cls()
+
+
+def validate_acceptance(
+    acceptance: Optional["Acceptance"],
+    *,
+    workspace_root: str,
+    output_dir: str,
+    label: str = "任务",
+) -> None:
+    """Refuse an acceptance criterion that could never be evaluated.
+
+    Called where a task is *written*, not where it runs.  The alternative --
+    finding out at 3am that the check was never going to be allowed to run --
+    produces a run with no verdict at all, which is strictly worse than
+    refusing the definition while somebody is still looking at it.
+
+    This is a gate on the common refusals (an inline interpreter, a high-risk
+    command, shell operators), none of which depend on where the command runs.
+    The verifier checks again before running, because the answer can change
+    between writing a task and its next execution, and *that* check is the
+    authoritative one.
+    """
+    if acceptance is None:
+        return
+    if len(acceptance.criteria) > MAX_ACCEPTANCE_CRITERIA:
+        raise ValueError(
+            f"{label}的验收条件最多 {MAX_ACCEPTANCE_CRITERIA} 条，"
+            f"当前 {len(acceptance.criteria)} 条"
+        )
+    for item in acceptance.criteria:
+        if len(str(item)) > MAX_ACCEPTANCE_CRITERION_CHARS:
+            raise ValueError(
+                f"{label}有一条验收条件超过 {MAX_ACCEPTANCE_CRITERION_CHARS} 个字符"
+            )
+    command = str(acceptance.verify_command or "").strip()
+    if not command:
+        return
+    if len(command) > MAX_VERIFY_COMMAND_CHARS:
+        raise ValueError(f"{label}的验收命令超过 {MAX_VERIFY_COMMAND_CHARS} 个字符")
+    reason = command_rejection_reason(
+        command,
+        workspace_root=workspace_root,
+        output_dir=output_dir,
+    )
+    if reason is not None:
+        raise ValueError(f"{label}的{reason}")
+
+
 @dataclass
 class NewScheduledTask:
     name: str
@@ -702,6 +840,10 @@ class NewScheduledTask:
     )
     selected_skills: list[str] = field(default_factory=list)
     permission_profile: str = "inherit"
+    #: What this task's work has to be true for the run to count as a success.
+    #: Empty means nothing was declared, which is not the same as having been
+    #: judged and passing -- see :class:`Acceptance`.
+    acceptance: Acceptance = field(default_factory=Acceptance)
     #: Set only when the task is one step of a workflow.  Part of the task's
     #: *identity* rather than of its behaviour: an identical definition created
     #: on its own is a different thing from a step, and deduplication that
@@ -736,6 +878,7 @@ class ScheduledTask:
     last_success_at: Optional[datetime]
     created_at: datetime
     updated_at: datetime
+    acceptance: Acceptance = field(default_factory=Acceptance)
     #: Which workflow this task is a step of, and which step.  Empty for a
     #: standalone task -- most tasks are, and a task does not have to belong to
     #: anything to be scheduled.  Kept on the task rather than looked up from
@@ -757,7 +900,13 @@ class ScheduledTask:
 #: asking for attention.  Listing every step a failure blocked as its own
 #: thing to look at would turn one problem into a list of a dozen, and the
 #: list is where the one that matters stops being read.
-ATTENTION_STATUSES: tuple[str, ...] = ("failed", "interrupted")
+#:
+#: ``unverified`` *is* present, and it is the case this list exists for.  A run
+#: whose acceptance check could not be evaluated is the one outcome nobody can
+#: find by reading a success and nobody is alerted to by reading a failure: the
+#: task declared what it needed to be true, and the system could not say whether
+#: it was.  Silence here would be the only way to lose that entirely.
+ATTENTION_STATUSES: tuple[str, ...] = ("failed", "interrupted", "unverified")
 
 
 def run_needs_attention(run: "TaskRun") -> bool:
@@ -792,6 +941,14 @@ class TaskRun:
     error: str = ""
     output_path: str = ""
     delivery_status: str = ""
+    #: What the task's acceptance check said about the work.  ``""`` means no
+    #: criterion was declared, so nothing was judged -- which is not the same
+    #: as having been judged and passing.
+    verdict: str = VERDICT_NONE
+    #: The verification result behind the verdict, kept whole so the run detail
+    #: can show the exit code and the tail of what the check said.  ``None``
+    #: when no criterion was declared.
+    verification: Optional[VerificationResult] = None
     config_snapshot: dict[str, Any] = field(default_factory=dict)
     trigger_source: str = "schedule"
     attempt: int = 1
@@ -825,6 +982,11 @@ def execution_snapshot(task: ScheduledTask) -> dict[str, Any]:
         "retry_policy": task.retry_policy,
         "selected_skills": task.selected_skills,
         "permission_profile": task.permission_profile,
+        # Carried on the run so the acceptance check that judges this execution
+        # is the one that was declared when it was scheduled.  Reading it from
+        # the task at completion time would let an edit made mid-run change
+        # what an already-running execution is judged against.
+        "acceptance": task.acceptance.to_dict(),
         "delivery_mode": task.delivery_mode,
         "delivery_target": {
             "target_type": task.delivery_target.target_type,
@@ -874,6 +1036,35 @@ RUN_SUCCESS_STATUS = "succeeded"
 RUN_SKIPPED_STATUS = "skipped"
 
 
+#: The status of a run whose work was never judged.
+#:
+#: A task may declare an acceptance check -- a command whose exit code says
+#: whether the work met the bar.  When that check cannot be *evaluated* (it was
+#: refused, it timed out, it failed to start), the run has not been shown to
+#: succeed, and it has not been shown to fail either.  ``failed`` would assert
+#: something nobody observed: it would skip every downstream step, raise an
+#: alert, and read in the history as "the work was wrong" when the truth is
+#: "we never looked".
+#:
+#: Its own status for the same reason ``skipped`` has one: two different facts
+#: that a reader has to be able to tell apart, and collapsing them loses the
+#: one that needs a person.
+RUN_UNVERIFIED_STATUS = "unverified"
+
+
+#: The statuses worth trying again when a retry policy allows it.
+#:
+#: ``unverified`` is here because its cause is usually environmental -- a check
+#: that timed out may well pass next time.  ``failed`` is here because that is
+#: what it has always meant.  Nothing else is: a cancelled run was cancelled on
+#: purpose, and an interrupted one is being resumed by the recovery path.
+#:
+#: This is a list of *what a retry could help with*, not of what is wrong; the
+#: opt-in lives in ``retry_policy.max_attempts``, which defaults to 1, so no
+#: task retries unless somebody asked for it.
+RETRYABLE_RUN_STATUSES: tuple[str, ...] = ("failed", RUN_UNVERIFIED_STATUS)
+
+
 @dataclass
 class WorkflowStep:
     """One step of a workflow: a task, plus what has to finish before it runs.
@@ -906,6 +1097,11 @@ class WorkflowStep:
     model_override: Optional[str] = None
     timeout_seconds: int = 1800
     selected_skills: list[str] = field(default_factory=list)
+    #: What this step's work has to be true for it to count as a success.
+    #: Load-bearing for the graph rather than merely informative: a dependent
+    #: step runs only when its upstreams *succeeded*, so this is what decides
+    #: whether the chain continues or stops here.
+    acceptance: Acceptance = field(default_factory=Acceptance)
     delivery_mode: str = "standalone"
     delivery_target: Optional[DeliveryTarget] = None
 
@@ -926,6 +1122,7 @@ class WorkflowStep:
             "model_override": self.model_override,
             "timeout_seconds": int(self.timeout_seconds),
             "selected_skills": list(self.selected_skills),
+            "acceptance": self.acceptance.to_dict(),
             "delivery_mode": self.delivery_mode,
             "delivery_target": (
                 self.delivery_target.to_json()
@@ -965,6 +1162,7 @@ class WorkflowStep:
                 for item in (data.get("selected_skills") or [])
                 if str(item).strip()
             ],
+            acceptance=Acceptance.from_dict(data.get("acceptance")),
             delivery_mode=str(data.get("delivery_mode", "standalone") or "standalone"),
             delivery_target=(
                 DeliveryTarget.from_json(raw_target)
@@ -1096,13 +1294,25 @@ def workflow_step_order(steps: list[WorkflowStep]) -> list[str]:
     return order
 
 
-def validate_workflow_graph(steps: list[WorkflowStep]) -> list[str]:
+def validate_workflow_graph(
+    steps: list[WorkflowStep],
+    *,
+    acceptance_workspaces: Optional[dict[str, str]] = None,
+    output_dir: str = "",
+) -> list[str]:
     """Check a graph is buildable, and return its step order.
 
     Everything a workflow can be wrong about is wrong *before* it runs: a step
     with no work in it, a step whose trigger contradicts its edges, a cycle.
     Catching them here means the failure lands where somebody can still read
     it, rather than as a task that quietly never fires.
+
+    ``acceptance_workspaces`` maps a step key to the folder that step will run
+    in, and is what makes the acceptance criterion checkable at this point.
+    It is optional because the caller that knows the folders is the store, and
+    because the command safety gate is root-sensitive: checking a criterion
+    against a folder the step will not use would refuse a perfectly good
+    command.  Omitting it skips that one check and does everything else.
     """
     order = workflow_step_order(steps)
     by_key = {str(step.key).strip(): step for step in steps}
@@ -1137,6 +1347,13 @@ def validate_workflow_graph(steps: list[WorkflowStep]) -> list[str]:
             )
         if int(step.timeout_seconds) <= 0:
             raise ValueError(f"步骤 {key} 的超时时间必须为正数")
+        if acceptance_workspaces is not None:
+            validate_acceptance(
+                step.acceptance,
+                workspace_root=str(acceptance_workspaces.get(key, "") or ""),
+                output_dir=output_dir,
+                label=f"步骤「{key}」",
+            )
     return order
 
 
@@ -1202,6 +1419,16 @@ class ExecutionResult:
     summary: str
     text_output: str
     output_path: str = ""
+    #: What the run said about its own work, via ``report_outcome``.  Empty
+    #: when it said nothing, which is the ordinary case.
+    #:
+    #: A self-report can only ever *lower* the verdict -- see
+    #: :func:`agent.verification.combine_verdicts`.  An agent saying "I could
+    #: not do this" is worth acting on; an agent saying "I did this" is not
+    #: evidence, and must not be able to stand in for an acceptance check that
+    #: could not run.
+    self_report_verdict: str = VERDICT_NONE
+    self_report_reason: str = ""
 
 
 @dataclass
