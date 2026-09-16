@@ -1782,6 +1782,9 @@ def schedule_pause(task_id: str = typer.Argument(..., help="Task id")):
     store = _scheduler_store()
     try:
         store.set_enabled(task_id, False)
+    except ValueError as exc:
+        shared.CONSOLE.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
     finally:
         store.close()
     shared.CONSOLE.print(f"[green]Paused[/green] {task_id}")
@@ -1792,6 +1795,9 @@ def schedule_resume(task_id: str = typer.Argument(..., help="Task id")):
     store = _scheduler_store()
     try:
         store.set_enabled(task_id, True)
+    except ValueError as exc:
+        shared.CONSOLE.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
     finally:
         store.close()
     shared.CONSOLE.print(f"[green]Resumed[/green] {task_id}")
@@ -1802,6 +1808,9 @@ def schedule_delete(task_id: str = typer.Argument(..., help="Task id")):
     store = _scheduler_store()
     try:
         store.delete_task(task_id)
+    except ValueError as exc:
+        shared.CONSOLE.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
     finally:
         store.close()
     shared.CONSOLE.print(f"[green]Deleted[/green] {task_id}")

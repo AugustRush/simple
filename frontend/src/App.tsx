@@ -1939,6 +1939,15 @@ function App() {
   const [scheduleArtifacts, setScheduleArtifacts] = useState<ScheduleArtifact[]>([])
   const [scheduleOutputLoading, setScheduleOutputLoading] = useState(false)
   const [workflows, setWorkflows] = useState<WorkflowInfo[]>([])
+  /**
+   * Whether the workflow list on screen is the server's answer rather than its
+   * initial value.  A task that names a workflow it cannot find in the list is
+   * either a step of a deleted workflow or a step of one that has not arrived
+   * yet, and those two want opposite things: the first is an ordinary task now
+   * and can be deleted, the second must not be offered a deletion the server
+   * will refuse.  An empty list is only evidence once it is loaded evidence.
+   */
+  const [workflowsLoaded, setWorkflowsLoaded] = useState(false)
   const [automationTab, setAutomationTab] = useState<'tasks' | 'workflows'>('tasks')
   const [workflowModalOpen, setWorkflowModalOpen] = useState(false)
   const [workflowSaving, setWorkflowSaving] = useState(false)
@@ -3156,6 +3165,7 @@ function App() {
         return
       }
       setWorkflows(Array.isArray(data.workflows) ? data.workflows : [])
+      setWorkflowsLoaded(true)
       if (Array.isArray(data.permission_profiles) && data.permission_profiles.length) {
         setPermissionProfiles(data.permission_profiles)
       }
@@ -3993,7 +4003,7 @@ function App() {
       setSelectedScheduleIds(prev => prev.filter(id => !completed.includes(id)))
       await loadSchedules(true)
       if (data.skipped?.length) {
-        messageApi.warning(`${completed.length} 个任务已处理，${data.skipped.length} 个运行中或不存在的任务已跳过`)
+        messageApi.warning(`${completed.length} 个任务已处理，${data.skipped.length} 个任务已跳过（运行中、属于流程或不存在）`)
       } else {
         messageApi.success(`${completed.length} 个任务已${action === 'delete' ? '删除' : action === 'enable' ? '启用' : '暂停'}`)
       }
@@ -4133,7 +4143,7 @@ function App() {
         return
       }
       await Promise.all([loadWorkflows(true), loadSchedules(true)])
-      messageApi.success('流程已删除，它的步骤已停止运行')
+      messageApi.success('流程已删除，它的步骤已停止运行，可在任务列表里单独删除')
     })
   }
 
@@ -7266,10 +7276,19 @@ function App() {
             // nobody emits, and its own switch is rewritten from the
             // workflow's on the next save. The workflow card is where both
             // belong, so this card says where it comes from instead.
+            //
+            // That reasoning holds only while the workflow exists. Deleting a
+            // workflow leaves its steps behind on purpose -- their run history
+            // is the record that it ran -- and from that moment nothing owns
+            // them: no save will rewrite them and no graph knows they are
+            // steps. They are ordinary disabled tasks, and the only thing left
+            // to do with one is delete it, which used to be refused by a
+            // pointer to a workflow nobody could open.
             const owningWorkflow = task.workflow_id
               ? workflows.find(item => item.id === task.workflow_id)
               : undefined
-            const isStep = !!task.workflow_id
+            const orphanedStep = !!task.workflow_id && workflowsLoaded && !owningWorkflow
+            const isStep = !!task.workflow_id && !orphanedStep
             return (
               <Card
                 key={task.id}
@@ -7325,15 +7344,17 @@ function App() {
                     )}
                   </Space>
                 </div>
-                {isStep && (
+                {isStep || orphanedStep ? (
                   <div className="schedule-step-origin">
                     <ApartmentOutlined />
                     <span>
-                      流程「{owningWorkflow?.name || '未知'}」
+                      {isStep
+                        ? `流程「${owningWorkflow?.name || '未知'}」`
+                        : '原属的流程已删除'}
                       {task.step_key ? ` · 步骤 ${task.step_key}` : ''}
                     </span>
                   </div>
-                )}
+                ) : null}
                 <p className="schedule-card-description">{description || '暂无任务描述'}</p>
                 <div className="schedule-card-footer">
                   <span className={`schedule-run-status status-${latestRun?.status || 'pending'}`}>

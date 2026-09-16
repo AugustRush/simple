@@ -1996,28 +1996,14 @@ class WebChannel(Channel):
         try:
             task_id = str(request.path_params["task_id"])
             task = store.get_task(task_id)
-            if task is not None and task.active_run_id:
-                return JSONResponse(
-                    {"error": "任务正在运行，请先取消运行"}, status_code=409
-                )
-            if task is not None and task.workflow_id:
-                # Removing a step on its own would leave the steps below it
-                # subscribed to a signal nobody emits any more, and the next
-                # save of the workflow would build a fresh task for the step --
-                # so the run history the deletion was meant to tidy up would
-                # reappear under a new id.  Which step a graph should have is
-                # the graph's question to answer.
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"「{task.name}」是流程中的步骤，"
-                            "请到流程里删除该步骤，或删除整个流程"
-                        )
-                    },
-                    status_code=409,
-                )
             ok = task is not None
-            store.delete_task(task_id)
+            try:
+                store.delete_task(task_id)
+            except ValueError as exc:
+                # A running task, or a step of a workflow that still exists:
+                # both are the store's call, and both are conflicts rather
+                # than bad requests -- the id is right, the moment is not.
+                return JSONResponse({"error": str(exc)}, status_code=409)
         finally: store.close()
         return JSONResponse({"ok": bool(ok)})
 
@@ -2031,21 +2017,15 @@ class WebChannel(Channel):
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
             task_id = str(request.path_params["task_id"])
-            task = store.get_task(task_id)
-            if task is not None and task.workflow_id:
-                # Saving a workflow writes every step's enabled flag from the
-                # workflow's own, so a switch thrown on one step would be undone
-                # by the next save.  Refusing says why; accepting would not.
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"「{task.name}」是流程中的步骤，"
-                            "请暂停整个流程，或到流程里删除该步骤"
-                        )
-                    },
-                    status_code=409,
-                )
-            store.set_enabled(task_id, bool(body["enabled"]))
+            try:
+                store.set_enabled(task_id, bool(body["enabled"]))
+            except ValueError as exc:
+                # A step of a workflow that still exists: its switch is the
+                # workflow's to write, so the refusal says where to go.  The
+                # store decides, because the same question is asked by the
+                # bulk endpoint and by the agent's tools, and one rule should
+                # not have three copies to drift.
+                return JSONResponse({"error": str(exc)}, status_code=409)
         finally: store.close()
         return JSONResponse({"ok": True, "enabled": bool(body["enabled"])})
 
@@ -2185,33 +2165,28 @@ class WebChannel(Channel):
         from agent.scheduler import SchedulerStore
 
         completed: list[str] = []
+        # One convention for both kinds of skip: the sentence that says why.
+        # A code would need a table on the other side to become a sentence, and
+        # the only reader here counts them -- while the reasons worth having
+        # are the ones the store writes, which are already sentences.
         skipped: list[dict[str, str]] = []
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
             for task_id in ids:
                 task = store.get_task(task_id)
                 if task is None:
-                    skipped.append({"id": task_id, "reason": "not_found"})
+                    skipped.append({"id": task_id, "reason": "任务不存在"})
                     continue
-                if action == "delete":
-                    if task.active_run_id:
-                        skipped.append({"id": task_id, "reason": "running"})
-                        continue
-                    if task.workflow_id:
-                        # Same reason as deleting one on its own: the graph,
-                        # not the task list, decides which steps exist.
-                        skipped.append({"id": task_id, "reason": "workflow_step"})
-                        continue
-                    store.delete_task(task_id)
-                elif task.workflow_id:
-                    # A step's own switch is rewritten from its workflow's every
-                    # time that workflow is saved, so flipping it here would be
-                    # a promise the next save breaks.  Pausing the workflow is
-                    # the switch that holds.
-                    skipped.append({"id": task_id, "reason": "workflow_step"})
+                try:
+                    if action == "delete":
+                        store.delete_task(task_id)
+                    else:
+                        store.set_enabled(task_id, action == "enable")
+                except ValueError as exc:
+                    # The store's own refusal -- a running task, or a step
+                    # whose workflow still exists.
+                    skipped.append({"id": task_id, "reason": str(exc)})
                     continue
-                else:
-                    store.set_enabled(task_id, action == "enable")
                 completed.append(task_id)
         finally:
             store.close()

@@ -2173,7 +2173,7 @@ def test_an_automatic_retry_keeps_the_upstreams_the_run_was_told_about(tmp_path)
         store.close()
 
 
-# ── 9. The tools that build a graph ─────────────────────────────────────────
+# ── 12. The tools that build a graph ────────────────────────────────────────
 #
 # The tests above drive the store; the agent drives the tools.  A tool that
 # refuses what the store's validator would refuse is still not the same
@@ -2456,6 +2456,152 @@ def test_workflow_delete_disables_the_steps_and_keeps_the_runs(tmp_path):
         # The history was not taken with it.
         assert store.list_runs(tasks["collect"].id)
         assert store.list_runs(tasks["analyze"].id)
+    finally:
+        store.close()
+
+
+# ── 13. A step is a step only while its graph exists ───────────────────────
+#
+# The refusals that send a step's owner to the workflow -- do not delete one
+# step, do not throw one step's switch -- are all about a graph that can still
+# be saved: deleting a step outright leaves the steps below it subscribed to a
+# signal nobody emits any more, and the next save of the workflow rebuilds the
+# step under a new id.  Deleting a workflow takes that graph away and leaves
+# its steps behind on purpose, and everything those refusals are protecting
+# stopped existing with it.  A refusal that outlives its reason is not caution;
+# it is a row nobody can remove from any surface.
+
+
+def test_a_deleted_workflows_steps_can_then_be_deleted(tmp_path):
+    """The leftovers are the record that it ran, and the record is removable.
+
+    Which is the whole point of keeping them: whoever wants the history keeps
+    it, and whoever is done with it can say so.  There used to be no way to
+    say so.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        store.delete_workflow(workflow.id)
+
+        for task in tasks.values():
+            store.delete_task(task.id)
+
+        assert store.list_tasks() == []
+    finally:
+        store.close()
+
+
+def test_a_live_workflows_step_refuses_deletion_and_its_own_switch(tmp_path):
+    """While the graph is there, both answers are still the graph's.
+
+    The refusal has to come from the store rather than from one caller,
+    because every surface asks the same question and a copy of the rule in
+    each is how the answer drifts -- the interface refused these two and the
+    agent's own tool deleted the step without comment.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        analyze = tasks["analyze"]
+
+        with pytest.raises(ValueError) as refused_delete:
+            store.delete_task(analyze.id)
+        assert "流程中的步骤" in str(refused_delete.value)
+
+        with pytest.raises(ValueError) as refused_switch:
+            store.set_enabled(analyze.id, False)
+        assert "请暂停整个流程" in str(refused_switch.value)
+
+        # Refused, and nothing moved: the step is still there and still on.
+        remaining = {task.id for task in store.list_tasks()}
+        assert {task.id for task in tasks.values()} <= remaining
+        assert store.step_tasks(workflow.id)["analyze"].enabled is True
+    finally:
+        store.close()
+
+
+def test_a_step_is_deletable_the_moment_its_workflow_is_gone(tmp_path):
+    """Membership survives the graph, and is not what the refusals turn on.
+
+    The step task still says which workflow it came from -- that is how the
+    list can explain what it is looking at -- but the question the refusals
+    ask is whether that workflow still exists, not whether it was ever named.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        analyze = tasks["analyze"]
+
+        store.delete_workflow(workflow.id)
+
+        after = store.get_task(analyze.id)
+        assert after is not None
+        assert after.workflow_id == workflow.id
+        assert after.step_key == "analyze"
+        store.delete_task(analyze.id)
+        assert store.get_task(analyze.id) is None
+    finally:
+        store.close()
+
+
+def test_a_running_task_refuses_to_be_deleted(tmp_path):
+    """Its completion writes back to the row this would remove.
+
+    Left to run, the deletion turns into an "owned run disappeared" error in
+    the scheduler thread -- a failure nobody asked for, in place of the
+    cancellation the person can still make.
+    """
+    store = make_store(tmp_path)
+    try:
+        task = store.create_task(
+            NewScheduledTask(
+                name="collect",
+                kind="agent_prompt",
+                trigger=clock(),
+                payload={"prompt": "do collect"},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+        assert store.claim_task_now(task.id, now=NOW) is not None
+
+        with pytest.raises(ValueError) as refused:
+            store.delete_task(task.id)
+        assert "正在运行" in str(refused.value)
+        assert store.get_task(task.id) is not None
+    finally:
+        store.close()
+
+
+def test_the_delete_tool_refuses_a_live_step_and_takes_an_orphan(tmp_path):
+    """What the agent may delete is the store's answer, from the caller's side.
+
+    A tool that deleted a live step would break the chain and see the step
+    rebuilt by the next save -- the failure the store exists to refuse -- and
+    a tool that kept refusing a step left behind by a deleted workflow would
+    make the leftover unreachable from the conversation that could remove it.
+    """
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        created = tools._workflow_create("nightly report", _chain_steps())
+        workflow_id = created["workflow"]["id"]
+        tasks = store.step_tasks(workflow_id)
+
+        with pytest.raises(ValueError) as refused:
+            tools._schedule_delete(tasks["analyze"].id)
+        assert "流程中的步骤" in str(refused.value)
+        assert store.get_task(tasks["analyze"].id) is not None
+
+        tools._workflow_delete(workflow_id)
+        result = tools._schedule_delete(tasks["analyze"].id)
+        assert result["ok"] is True
+        assert result["deleted"] is True
+        assert store.get_task(tasks["analyze"].id) is None
     finally:
         store.close()
 

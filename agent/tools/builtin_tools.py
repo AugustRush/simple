@@ -919,7 +919,14 @@ class BuiltinTools:
 
         r.register(
             "schedule_delete",
-            "Delete a persistent scheduled task by id.",
+            (
+                "Delete a persistent scheduled task by id, along with its run "
+                "history. Refused for a task that is running (cancel the run "
+                "first) and for a step of a workflow that still exists -- a step "
+                "is the graph's to remove, so delete the workflow or edit it "
+                "instead. A step left behind by an already-deleted workflow is "
+                "an ordinary task and can be deleted here."
+            ),
             {
                 "type": "object",
                 "properties": {
@@ -1079,7 +1086,9 @@ class BuiltinTools:
             (
                 "Delete a workflow by id. The tasks it built are disabled rather than "
                 "erased, so their run history stays readable; this stops the chain and "
-                "stops any signal subscription its steps hold."
+                "stops any signal subscription its steps hold. The leftovers are then "
+                "ordinary tasks: schedule_delete removes any of them, and its history, "
+                "when nobody needs to read it any more."
             ),
             {
                 "type": "object",
@@ -3438,6 +3447,15 @@ class BuiltinTools:
         )
 
     def _schedule_delete(self, task_id: str) -> dict[str, Any]:
+        """Delete a task, and its run history with it.
+
+        Which tasks may be deleted here is the store's answer, not this
+        tool's: a running task, and a step of a workflow that still exists,
+        are refused with a reason.  Asking the store rather than checking
+        first is what keeps the rule in one place -- the interface refuses
+        the same two cases, and a step left behind by a deleted workflow is
+        deletable from both.
+        """
         store = self._schedule_store()
         store.delete_task(task_id)
         return self._ok(task_id=task_id, deleted=True)
@@ -3668,7 +3686,9 @@ class BuiltinTools:
         The tasks behind it are disabled rather than deleted, which is what the
         store does; this only says so, because "deleted" would suggest the run
         history went with it and somebody reading the log later would not know
-        to look for it.
+        to look for it.  Nothing else refers to the graph afterwards, so the
+        leftovers are ordinary tasks from that moment on: they show up in the
+        task list and schedule_delete removes them.
         """
         store = self._schedule_store()
         disabled = store.delete_workflow(workflow_id)

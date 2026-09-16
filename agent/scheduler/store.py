@@ -2479,8 +2479,33 @@ class SchedulerStore:
                 )
         return True
 
+    def _live_workflow_step(self, task: ScheduledTask) -> bool:
+        """True when *task* is a step whose workflow still exists.
+
+        The guards that send a step's owner to the graph are all about a graph
+        that can still be saved: deleting a step outright leaves the steps
+        below it subscribed to a signal nobody emits any more, and the next
+        save of the workflow builds a fresh task for it.  A workflow that has
+        been deleted leaves its steps behind on purpose -- the record that
+        they ran is their history -- and owns nothing any more: for those
+        tasks every one of those reasons is gone, and a refusal that points
+        at a workflow nobody can open is how a leftover becomes undeletable.
+        """
+        if not task.workflow_id:
+            return False
+        return self.get_workflow(task.workflow_id) is not None
+
     @_synchronized
     def set_enabled(self, task_id: str, enabled: bool) -> None:
+        task = self.get_task(task_id)
+        if task is not None and self._live_workflow_step(task):
+            # A step's own switch is rewritten from its workflow's every time
+            # that workflow is saved, so flipping it here would be a promise
+            # the next save breaks.  Pausing the workflow is the switch that
+            # holds.
+            raise ValueError(
+                f"「{task.name}」是流程中的步骤，请暂停整个流程，或到流程里删除该步骤"
+            )
         now = datetime.now(UTC)
         with self._conn:
             self._conn.execute(
@@ -2494,6 +2519,23 @@ class SchedulerStore:
 
     @_synchronized
     def delete_task(self, task_id: str) -> None:
+        task = self.get_task(task_id)
+        if task is not None and task.active_run_id:
+            # The run's completion writes back to the row this would remove,
+            # and would fail with an "owned run disappeared" error in the
+            # scheduler thread -- a cancellation the person asked for and can
+            # see beats a crash they cannot.
+            raise ValueError(f"「{task.name}」正在运行，请先取消运行")
+        if task is not None and self._live_workflow_step(task):
+            # The graph, not the task list, decides which steps exist.
+            # Deleting a step on its own would leave the steps below it
+            # subscribed to a signal nobody emits any more, and the next save
+            # of the workflow would build a fresh task for the step -- so the
+            # run history this deletion was meant to tidy up would reappear
+            # under a new id.
+            raise ValueError(
+                f"「{task.name}」是流程中的步骤，请删除整个流程，或到流程里移除该步骤"
+            )
         with self._conn:
             # Its deliveries go with it, for the same reason its runs do: they
             # are that task's history, and rows left behind would name a task

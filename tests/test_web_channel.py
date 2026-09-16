@@ -1608,7 +1608,11 @@ def test_web_bulk_schedule_management_skips_running_tasks(tmp_path, monkeypatch)
         )
         assert deleted.status_code == 200
         assert deleted.json()["completed"] == [ids[0]]
-        assert deleted.json()["skipped"] == [{"id": ids[1], "reason": "running"}]
+        # The reason is the refusal itself, in the words the single-task
+        # endpoint would have used: one rule, so no second wording to drift.
+        skipped = deleted.json()["skipped"]
+        assert [item["id"] for item in skipped] == [ids[1]]
+        assert "正在运行" in skipped[0]["reason"]
 
 
 def test_web_bulk_delete_sessions():
@@ -2856,8 +2860,64 @@ def test_web_refuses_to_delete_or_pause_one_step_of_a_workflow(
             json={"action": "delete", "task_ids": [item["task_id"] for item in created["steps"]]},
         ).json()
         assert bulk["completed"] == []
-        assert {item["reason"] for item in bulk["skipped"]} == {"workflow_step"}
+        assert all("流程中的步骤" in item["reason"] for item in bulk["skipped"])
         assert len(client.get("/api/schedules").json()["tasks"]) == 3
+
+
+def test_web_deleting_a_workflow_leaves_steps_that_can_still_be_deleted(
+    tmp_path, monkeypatch
+):
+    """The steps a deleted workflow leaves behind are ordinary tasks.
+
+    Deleting a workflow stops it and keeps its steps so their runs stay
+    readable.  Those tasks still name a workflow that no longer exists, and
+    every surface refused them for that reason alone -- pointing at a graph
+    nobody can open, which left rows that could not be removed at all.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        analyze = next(item for item in created["steps"] if item["key"] == "analyze")
+
+        deleted = client.delete(f"/api/workflows/{created['id']}")
+        assert deleted.status_code == 200, deleted.text
+        assert client.get("/api/workflows").json()["workflows"] == []
+
+        # Still listed -- the record outlives the graph -- and now removable.
+        listed = client.get("/api/schedules").json()["tasks"]
+        assert any(item["id"] == analyze["task_id"] for item in listed)
+
+        paused = client.patch(
+            f"/api/schedules/{analyze['task_id']}", json={"enabled": True}
+        )
+        assert paused.status_code == 200, paused.text
+
+        removed = client.delete(f"/api/schedules/{analyze['task_id']}")
+        assert removed.status_code == 200, removed.text
+
+        left = client.get("/api/schedules").json()["tasks"]
+        assert analyze["task_id"] not in {item["id"] for item in left}
+
+        # The bulk path answers the same way, rather than skipping them.
+        bulk = client.patch(
+            "/api/schedules",
+            json={
+                "action": "delete",
+                "task_ids": [
+                    item["task_id"] for item in created["steps"]
+                    if item["task_id"] != analyze["task_id"]
+                ],
+            },
+        ).json()
+        assert len(bulk["completed"]) == 2
+        assert bulk["skipped"] == []
+        assert client.get("/api/schedules").json()["tasks"] == []
 
 
 def test_web_pausing_a_whole_workflow_stops_all_of_its_steps(tmp_path, monkeypatch):
