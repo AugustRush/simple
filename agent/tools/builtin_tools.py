@@ -772,6 +772,9 @@ class BuiltinTools:
             (
                 "Create a persistent scheduled task. Use when the user asks for a reminder, "
                 "a delayed follow-up, or a recurring future message. "
+                "The user has to ask: a question about how something works, or about the "
+                "process behind it, is answered in the reply and is not a request to add a "
+                "task -- if one would help, propose it and let the user say yes. "
                 "Choose `action_type=message` for a literal future message, "
                 "`action_type=agent_task` for future agent work, or "
                 "`action_type=system_job` for internal maintenance. "
@@ -945,9 +948,11 @@ class BuiltinTools:
             "workflow_create",
             (
                 "Create a chain of scheduled tasks, where each step runs only after the "
-                "steps it depends on have succeeded. Use this when a request is really "
-                "several jobs in an order -- fetch, then transform, then report -- rather "
-                "than one job. Do not chain steps with schedule_create and signals "
+                "steps it depends on have succeeded. Use this when the user asks for "
+                "several jobs to run in an order -- fetch, then transform, then report -- "
+                "rather than one job; describing an existing process is not asking for a "
+                "new one to be built, so propose the chain instead of creating it. "
+                "Do not chain steps with schedule_create and signals "
                 "instead: a chain built that way has no recorded edges, so nothing knows "
                 "which steps a failure should stop. "
                 "Give every step a `key`, and list its upstreams in `depends_on`. A step "

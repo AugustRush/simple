@@ -6,9 +6,16 @@ escape hatch: a tool the user names explicitly is ALWAYS available, no
 matter which group it belongs to or whether the phrase matched a keyword.
 These tests pin that, because a silent regression here removes capability
 without any error surfacing.
+
+The second invariant is the boundary between *mentioning* scheduled work and
+*asking for* it. Shipping a listing nobody wanted costs tokens; shipping a
+creator nobody asked for costs a task that outlives the conversation, so the
+two halves are gated separately and the creator side is the strict one.
 """
 
 from __future__ import annotations
+
+import pytest
 
 from agent.core.context_assembler import ContextAssembler
 
@@ -29,11 +36,31 @@ ALL_GROUPS = _tools(
     "transcribe_audio",       # attachment-gated
 )
 
+#: Both halves of the scheduled-work group, so a test can tell which one a
+#: sentence opened.
+SCHEDULED_WORK_TOOLS = _tools(
+    "read_file",
+    "schedule_list", "schedule_create", "schedule_delete",
+    "workflow_list", "workflow_create", "workflow_delete",
+    "emit_signal",
+)
+
+_CREATORS = {"schedule_create", "workflow_create"}
+
 
 def _selected_names(assembler: ContextAssembler, query: str, **kwargs) -> set[str]:
     return {
         tool["name"]
         for tool in assembler.select_tools(ALL_GROUPS, query, **kwargs)
+    }
+
+
+def _scheduled(query: str, **kwargs) -> set[str]:
+    return {
+        tool["name"]
+        for tool in ContextAssembler().select_tools(
+            SCHEDULED_WORK_TOOLS, query, **kwargs
+        )
     }
 
 
@@ -105,3 +132,91 @@ def test_audio_attachment_opens_transcription():
     assert "transcribe_audio" in _selected_names(
         assembler, "看看这个", attachment_kinds=("audio",)
     )
+
+
+#: The sentence that caused this: a research question, matched on 流程, shipped
+#: both creators, and came back with a signal-triggered task nobody wanted.
+_THE_REPORTED_SENTENCE = "听一个真实的案例，订单都是如何接的，具体流程是什么，帮我做一下调研"
+
+
+#: Sentences that name or describe scheduled work while asking about it.  A
+#: creator here leaves a task behind for a question that was answered in words.
+_QUESTIONS_ABOUT_SCHEDULED_WORK = [
+    _THE_REPORTED_SENTENCE,
+    "订单都是如何接的，具体流程是什么，帮我做一下调研",
+    "我每天都在做订单，这个流程能优化吗",
+    "什么会触发这个流程",
+    "你们的工作流怎么用",
+    "我有哪些定时任务",
+    "怎么设置定时任务",
+    "为什么我的定时任务没跑",
+    "现在有哪些 workflow",
+    "这个流程挺好的",
+    "帮我梳理一下发布流程",
+    "看看信号有哪些",
+    "how do I address a failing workflow",
+    "show me the pipeline",
+]
+
+
+#: Sentences that do ask for scheduled work to exist, by cadence or by verb.
+_REQUESTS_FOR_SCHEDULED_WORK = [
+    "把这个流程创建为一个workflow",
+    "帮我搞个定时任务",
+    "每天早上9点提醒我",
+    "每天给我发一份简报",
+    "建一个工作流把这几步串起来",
+    "把这个流程拆成几个步骤",
+    "帮我做个自动化",
+    "新建一个 workflow",
+    "给我加一个提醒",
+    "设一个每周提醒",
+    "能不能帮我建一个定时任务",
+    "帮我设置一个每日提醒",
+    "把 xhs.package.ready 这个信号发出去",
+]
+
+
+@pytest.mark.parametrize("query", _QUESTIONS_ABOUT_SCHEDULED_WORK)
+def test_a_question_about_scheduled_work_ships_no_creator(query: str):
+    assert not (_CREATORS & _scheduled(query))
+
+
+@pytest.mark.parametrize("query", _QUESTIONS_ABOUT_SCHEDULED_WORK)
+def test_a_question_about_scheduled_work_still_ships_the_listing(query: str):
+    """Reading is what answers the question, so it is never what gets withheld."""
+    assert {"schedule_list", "workflow_list"} <= _scheduled(query)
+
+
+@pytest.mark.parametrize("query", _REQUESTS_FOR_SCHEDULED_WORK)
+def test_a_request_for_scheduled_work_ships_the_creators(query: str):
+    assert _CREATORS <= _scheduled(query)
+
+
+def test_an_incidental_cadence_does_not_count_as_a_request():
+    """`每天` describes a routine far more often than it requests a schedule."""
+    assert not (_CREATORS & _scheduled("我每天都在做订单，这个流程能优化吗"))
+
+
+def test_a_verb_still_wins_over_the_question_marker():
+    """Asking *whether* you may is still asking for it."""
+    assert "schedule_create" in _scheduled("能不能帮我建一个定时任务")
+
+
+def test_emitting_a_signal_needs_a_request_but_a_run_keeps_it():
+    """A stray emission is not inert: it starts whatever subscribed to the name.
+
+    The only custom signal this machine ever recorded was emitted two seconds
+    after the unwanted task was created, by the same turn nobody had asked for.
+    """
+    assert "emit_signal" not in _scheduled("订单都是如何接的，具体流程是什么")
+    assert "emit_signal" not in _scheduled("看看信号有哪些")
+    assert "emit_signal" in _scheduled("把 xhs.package.ready 这个信号发出去")
+    assert "emit_signal" in _scheduled("做点事", scheduled_run=True)
+
+
+def test_ascii_request_verbs_respect_word_boundaries():
+    """`add` inside `address` and `how` inside `show` are not requests."""
+    assert "workflow_create" not in _scheduled("how do I address a failing workflow")
+    assert "workflow_create" not in _scheduled("show me the pipeline")
+    assert "workflow_create" in _scheduled("build a workflow for the releases")

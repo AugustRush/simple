@@ -791,6 +791,19 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "not match a Chinese question, and one empty search proves "
                 "nothing."
             )
+        if builtin_names & {"schedule_create", "workflow_create"}:
+            lines.append(
+                "Creating is something the user asks you to do, not something "
+                "you volunteer. A question about how some process works — "
+                "「订单都是如何接的，具体流程是什么」 — is answered in this turn, "
+                "in words; it is not a request to build a task, and answering "
+                "it by creating one leaves behind a schedule nobody asked for "
+                "that outlives the conversation. Build only when the user asks "
+                "for something to exist and keep running: a cadence "
+                "(「每天早上」), a reminder, or an explicit 「建一个 / 创建 / "
+                "拆成」. If you think a task would help but were not asked for "
+                "one, offer it in your reply and let the user say yes."
+            )
         if "schedule_create" in builtin_names:
             lines.append(
                 "If the user asks for a reminder, delayed follow-up, or recurring future message, "
