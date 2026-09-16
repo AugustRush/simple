@@ -2490,6 +2490,188 @@ def test_web_a_new_entry_step_without_a_trigger_is_still_refused(
         assert "必须指定触发方式" in refused.json()["error"]
 
 
+def _chain_with_its_first_two_steps_exchanged() -> dict:
+    """The editor's request after somebody swaps the first two steps.
+
+    Nothing here mentions a time, a timezone or a signal: an editor that can
+    only draw "每天 02:00" cannot send it back without guessing, so the swap
+    names the step the schedule comes from instead.  `publish` is re-pointed
+    onto `collect` because that is the step it now follows.
+    """
+    return {
+        "name": "夜间报告",
+        "description": "每天采集、分析、发布",
+        "steps": [
+            {
+                "key": "analyze",
+                "name": "分析",
+                "kind": "agent_prompt",
+                "payload": {"prompt": "分析数据"},
+                "depends_on": [],
+                "trigger_from": "collect",
+            },
+            {
+                "key": "collect",
+                "name": "采集",
+                "kind": "agent_prompt",
+                "payload": {"prompt": "采集数据"},
+                "depends_on": ["analyze"],
+            },
+            {
+                "key": "publish",
+                "name": "发布",
+                "kind": "message",
+                "payload": {"message_text": "报告已生成"},
+                "depends_on": ["collect"],
+            },
+        ],
+    }
+
+
+def test_web_swapping_two_steps_moves_the_schedule_without_rebuilding_tasks(
+    tmp_path, monkeypatch
+):
+    """Reordering a chain moves the clock and keeps every task it already had.
+
+    The schedule is the *chain's*: whoever is first is the task that fires, so
+    changing which step is first has to move the clock to it.  The steps
+    themselves keep their keys, and a step's key is what its task is found by,
+    so no task is rebuilt and no run history is disturbed.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        before = {item["key"]: item for item in created["steps"]}
+        assert before["collect"]["trigger"]["time_of_day"] == "02:00"
+
+        updated = client.put(
+            f"/api/workflows/{created['id']}",
+            json=_chain_with_its_first_two_steps_exchanged(),
+        )
+        assert updated.status_code == 200, updated.text
+        after = {
+            item["key"]: item for item in updated.json()["workflow"]["steps"]
+        }
+
+        # The clock travelled, whole: the request never said 02:00 or which
+        # timezone it was in, so this can only have come from the stored spec.
+        assert after["analyze"]["trigger_type"] == "daily"
+        assert after["analyze"]["trigger"]["time_of_day"] == "02:00"
+        assert after["analyze"]["trigger"]["timezone_name"] == "Asia/Shanghai"
+        # And the step that lost the entry role is driven by its upstream now.
+        assert after["collect"]["depends_on"] == ["analyze"]
+        assert after["collect"]["trigger_type"] == "signal"
+        assert after["collect"]["trigger"] == {}
+
+        # Nothing was rebuilt: same task ids, so the run history is still there.
+        assert after["analyze"]["task_id"] == before["analyze"]["task_id"]
+        assert after["collect"]["task_id"] == before["collect"]["task_id"]
+        assert after["publish"]["task_id"] == before["publish"]["task_id"]
+
+        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            assert len(store.step_tasks(created["id"])) == 3
+            analyze_task = store.get_task(before["analyze"]["task_id"])
+            assert analyze_task.trigger.trigger_type == "daily"
+            assert analyze_task.trigger.payload["time_of_day"] == "02:00"
+            for driven, waiting_for in (
+                (before["collect"]["task_id"], before["analyze"]["task_id"]),
+                (before["publish"]["task_id"], before["collect"]["task_id"]),
+            ):
+                waiting = store.get_task(driven).trigger
+                assert waiting.trigger_type == "signal"
+                # A step waits on its upstreams' *success* signals, one per
+                # upstream, and it is namespaced by the task id.
+                assert any(
+                    waiting_for in item for item in waiting.payload["names"]
+                )
+        finally:
+            store.close()
+
+
+def test_web_a_borrowed_trigger_has_to_come_from_an_entry_step(
+    tmp_path, monkeypatch
+):
+    """Only an entry step has a schedule to lend.
+
+    A step with upstreams carries a subscription instead, and copying that onto
+    an entry step would make the chain wait for a task that is already part of
+    it.  The message says which step cannot lend, because "invalid trigger" is
+    not something a reader can act on.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        body = _chain_with_its_first_two_steps_exchanged()
+        body["steps"][0]["trigger_from"] = "publish"
+
+        refused = client.put(f"/api/workflows/{created['id']}", json=body)
+        assert refused.status_code == 400
+        assert "不是入口步骤" in refused.json()["error"]
+        assert "publish" in refused.json()["error"]
+
+
+def test_web_a_step_with_upstreams_cannot_borrow_a_trigger(
+    tmp_path, monkeypatch
+):
+    """The two rules about triggers do not get to contradict each other."""
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        body = _chain_with_its_first_two_steps_exchanged()
+        # A real entry step lending to a step that already has upstreams: the
+        # donor check passes and the "no trigger with upstreams" rule catches it.
+        body["steps"][2]["trigger_from"] = "collect"
+
+        refused = client.put(f"/api/workflows/{created['id']}", json=body)
+        assert refused.status_code == 400
+        assert "不能沿用别的步骤的触发方式" in refused.json()["error"]
+
+
+def test_web_a_borrowed_trigger_must_name_another_step_that_exists(
+    tmp_path, monkeypatch
+):
+    """Including on creation, where there is nothing to borrow from."""
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        fresh = _chain_with_its_first_two_steps_exchanged()
+        refused = client.post("/api/workflows", json=fresh)
+        assert refused.status_code == 400
+        assert "没有这一步" in refused.json()["error"]
+
+        created = client.post("/api/workflows", json=_workflow_body()).json()["workflow"]
+        body = _chain_with_its_first_two_steps_exchanged()
+        body["steps"][0]["trigger_from"] = "analyze"
+        refused = client.put(f"/api/workflows/{created['id']}", json=body)
+        assert refused.status_code == 400
+        assert "不能沿用自己" in refused.json()["error"]
+
+
 def test_web_editing_a_workflow_keeps_the_fields_the_editor_never_shows(
     tmp_path, monkeypatch
 ):

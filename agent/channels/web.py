@@ -1534,8 +1534,50 @@ class WebChannel(Channel):
             step_key=str(getattr(existing, "step_key", "") or ""),
         )
 
+    def _borrowed_trigger(
+        self, raw: dict[str, Any], key: str, existing_by_key: dict[str, Any]
+    ) -> Any:
+        """The trigger a step asks to take over from another step, if it asks.
+
+        A schedule belongs to the *chain*, not to the step that happens to hold
+        it: "每天早上九点" is when the workflow runs, and the entry step's task
+        is only where the clock lives, because that is the task that fires.
+        So when an edit moves the entry role from one step to another -- which
+        is what reordering a chain does -- the schedule has to move with it.
+
+        ``trigger_from`` is how the editor says that without ever holding the
+        trigger itself.  It names the step whose schedule moves, and the spec is
+        copied from what is stored, so a reorder cannot round-trip somebody's
+        weekly clock through a form that only knows how to render it.
+
+        The donor must be a step of the *stored* graph, and the answer is read
+        before anything is written, so it does not matter what order the body
+        lists the steps in.
+        """
+        donor_key = str(raw.get("trigger_from", "") or "").strip()
+        if not donor_key:
+            return None
+        if donor_key == key:
+            raise ValueError(f"步骤「{key}」不能沿用自己现有的触发方式")
+        donor = existing_by_key.get(donor_key)
+        if donor is None:
+            raise ValueError(
+                f"步骤「{key}」想沿用「{donor_key}」的触发方式，"
+                "但这个流程里没有这一步"
+            )
+        if getattr(donor, "trigger", None) is None:
+            raise ValueError(
+                f"步骤「{key}」想沿用「{donor_key}」的触发方式，"
+                f"但「{donor_key}」不是入口步骤，它由上游驱动，没有自己的触发方式"
+            )
+        return donor.trigger
+
     def _workflow_step_from_body(
-        self, raw: dict[str, Any], index: int, existing: Any = None
+        self,
+        raw: dict[str, Any],
+        index: int,
+        existing: Any = None,
+        borrowed_trigger: Any = None,
     ):
         """One step of a workflow, from its JSON object.
 
@@ -1552,6 +1594,10 @@ class WebChannel(Channel):
         graph should not be able to erase a step's model by not mentioning it.
         Sending the field explicitly, empty string included, still means what it
         says.
+
+        Where a step's own schedule is concerned, an explicit ``trigger_type``
+        is an answer, an inherited one from ``borrowed_trigger`` is the next
+        best thing, and only then does the step keep what it had.
         """
         from agent.scheduler import WorkflowStep
 
@@ -1588,8 +1634,15 @@ class WebChannel(Channel):
                 raise ValueError(
                     f"步骤「{key}」有上游，不能另外再指定时间或信号触发"
                 )
+            if borrowed_trigger is not None:
+                raise ValueError(
+                    f"步骤「{key}」有上游，不能沿用别的步骤的触发方式；"
+                    "触发方式跟着入口步骤走"
+                )
         elif given_trigger:
             trigger = self._trigger_from_body(raw)
+        elif borrowed_trigger is not None:
+            trigger = borrowed_trigger
         elif existing is not None and existing.trigger is not None:
             trigger = existing.trigger
         else:
@@ -1651,11 +1704,19 @@ class WebChannel(Channel):
         for index, raw in enumerate(raw_steps):
             if not isinstance(raw, dict):
                 raise ValueError(f"第 {index + 1} 个步骤必须是对象")
+            key = str(raw.get("key", "")).strip()
             steps.append(
                 self._workflow_step_from_body(
                     raw,
                     index,
-                    existing_by_key.get(str(raw.get("key", "")).strip()),
+                    existing_by_key.get(key),
+                    # Resolved against the stored graph rather than against the
+                    # body, so a step may name a donor that this same request is
+                    # about to give upstreams to: what moves is the schedule
+                    # that is there now.
+                    borrowed_trigger=self._borrowed_trigger(
+                        raw, key, existing_by_key
+                    ),
                 )
             )
         # Checked here as well as in the store so a cycle comes back as a 400

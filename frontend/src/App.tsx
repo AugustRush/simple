@@ -44,6 +44,7 @@ import {
   ApiOutlined,
   ApartmentOutlined,
   AppstoreOutlined,
+  ArrowDownOutlined,
   ArrowUpOutlined,
   CheckCircleFilled,
   CheckOutlined,
@@ -299,6 +300,15 @@ interface WorkflowStepDraft {
   //: show a schedule, so it must not be able to overwrite one. A brand new
   //: entry step has nothing to leave alone, so it must bring one.
   trigger: WorkflowTriggerDraft | null
+  //: A step whose schedule is moving onto this one, named rather than copied.
+  //:
+  //: A schedule belongs to the chain, not to the step holding it: whoever runs
+  //: first is the task that fires. So reordering a chain has to hand the
+  //: schedule over -- and the editor must not do that by reading it out into a
+  //: form and writing it back, because a weekly clock rendered as a sentence
+  //: cannot be rendered back into a weekly clock. It names the step instead,
+  //: and the server copies the spec that is actually stored.
+  triggerFrom: string
 }
 
 interface WorkflowTriggerDraft {
@@ -1156,6 +1166,7 @@ function defaultWorkflowStep(workspaceRoot = ''): WorkflowStepDraft {
     workspace_root: workspaceRoot,
     payload: {},
     trigger: defaultWorkflowTrigger(),
+    triggerFrom: '',
   }
 }
 
@@ -1179,7 +1190,10 @@ function workflowDraftFromInfo(info: WorkflowInfo): WorkflowDraft {
   return {
     name: info.name,
     description: info.description || '',
-    steps: info.steps.map(step => ({
+    // Listed in the order they run, not the order the array happens to be in.
+    // The stored order is an artefact of how the graph was written and means
+    // nothing; the editor is where people read the chain, so it reads it right.
+    steps: stepsInRunningOrder(info.steps).map(step => ({
       key: step.key,
       name: step.name || step.key,
       kind: step.kind === 'message' ? 'message' : 'agent_prompt',
@@ -1188,6 +1202,7 @@ function workflowDraftFromInfo(info: WorkflowInfo): WorkflowDraft {
       workspace_root: step.workspace_root || '',
       payload: { ...(step.payload || {}) },
       trigger: null,
+      triggerFrom: '',
     })),
   }
 }
@@ -1214,8 +1229,15 @@ interface WorkflowGraphCheck {
  * message about a cycle names the ring, because "there is a cycle somewhere"
  * leaves the reader to find it. This is a convenience, not the rule -- the
  * server checks again, and it is the server's answer that counts.
+ *
+ * Takes anything with a key and upstreams rather than a draft, because the
+ * running order it computes is also what the stored workflow's step list is
+ * sorted by -- the same edges, from the same function, so the two readings of a
+ * chain cannot disagree.
  */
-function checkWorkflowGraph(steps: WorkflowStepDraft[]): WorkflowGraphCheck {
+function checkWorkflowGraph(
+  steps: { key: string; depends_on: string[] }[],
+): WorkflowGraphCheck {
   const problems: string[] = []
   const keys: string[] = []
   const seen = new Map<string, number>()
@@ -1305,6 +1327,223 @@ function describeWorkflowRing(pending: Map<string, Set<string>>): string {
   return [...ring, ring[0]].join(' → ')
 }
 
+/** A step's key and upstreams, with the blank entries taken out. */
+function cleanStepKeys(keys: string[]): string[] {
+  return keys.map(item => item.trim()).filter(Boolean)
+}
+
+/**
+ * Rows in the order they will run.
+ *
+ * The array a workflow is stored as makes no promise about order -- the edges
+ * do -- so anything listed in array order can show the step that runs last as
+ * if it ran second. A graph that does not sort (a cycle, written before the
+ * checks existed) keeps the order it came in rather than dropping rows: this is
+ * a reading of the chain, not another gate in front of it.
+ */
+function stepsInRunningOrder<T extends { key: string; depends_on: string[] }>(
+  rows: T[],
+): T[] {
+  const order = checkWorkflowGraph(rows).order
+  if (order.length !== rows.length) return rows
+  const byKey = new Map(rows.map(step => [step.key.trim(), step]))
+  return order.map(key => byKey.get(key)).filter(Boolean) as T[]
+}
+
+/** Whether a stored step is the one the chain starts from. */
+function storedEntryStep(stored: WorkflowStepInfo | undefined): boolean {
+  return !!stored && cleanStepKeys(stored.depends_on || []).length === 0
+}
+
+/** The steps that wait on *key*, by key. */
+function workflowDownstreamKeys(
+  steps: { key: string; depends_on: string[] }[],
+  key: string,
+): string[] {
+  return steps
+    .map(step => step.key.trim())
+    .filter(item => item && item !== key)
+    .filter(item =>
+      steps
+        .find(step => step.key.trim() === item)!
+        .depends_on.some(dep => dep.trim() === key),
+    )
+}
+
+interface WorkflowStepMovePlan {
+  //: The two steps that trade places, the earlier one first.
+  pair: [string, string] | null
+  //: Why this move cannot be made, in a sentence, or `` when it can.
+  problem: string
+}
+
+/**
+ * Whether a step can trade places with the one next to it, and with which.
+ *
+ * Order is what the edges say, so "move it up" is not a list operation: it
+ * means exchanging this step with the nearest step it is actually linked to.
+ * That has a unique answer only when the step being overtaken waits on nothing
+ * else -- with a second upstream, moving past it would drop one of the two
+ * edges and leave a step with nothing waiting on it, which is a change nobody
+ * asked for. Refusing is the honest answer there, and the upstream field is
+ * still there for the case this cannot express.
+ */
+function planWorkflowStepMove(
+  steps: WorkflowStepDraft[],
+  key: string,
+  direction: 'earlier' | 'later',
+): WorkflowStepMovePlan {
+  const step = steps.find(item => item.key.trim() === key)
+  if (!step) return { pair: null, problem: '这一步不在流程里' }
+  const upstreams = cleanStepKeys(step.depends_on)
+  if (direction === 'earlier') {
+    if (!upstreams.length) return { pair: null, problem: '它没有上游，已经在最前面' }
+    if (upstreams.length > 1) {
+      return {
+        pair: null,
+        problem: `它同时在等「${upstreams.join('」「')}」，换位没有唯一答案；请直接改上游`,
+      }
+    }
+    return { pair: [upstreams[0], key], problem: '' }
+  }
+  const followers = workflowDownstreamKeys(steps, key)
+  if (!followers.length) return { pair: null, problem: '没有步骤在等它，已经在最后面' }
+  if (followers.length > 1) {
+    return {
+      pair: null,
+      problem: `有「${followers.join('」「')}」在等它，换位没有唯一答案；请直接改上游`,
+    }
+  }
+  const follower = followers[0]
+  const followerUpstreams = cleanStepKeys(
+    steps.find(item => item.key.trim() === follower)?.depends_on || [],
+  )
+  if (followerUpstreams.length > 1) {
+    return {
+      pair: null,
+      problem: `「${follower}」除了它还在等别的步骤，换位没有唯一答案；请直接改上游`,
+    }
+  }
+  return { pair: [key, follower], problem: '' }
+}
+
+/**
+ * The step that is actually carrying the chain's schedule.
+ *
+ * A handover is a reference to another step, and more than one can be made in a
+ * single edit, so the answer is at the end of the chain of references. Bounded
+ * by the number of steps, because a reference left over from a graph that has
+ * since changed must not be able to loop.
+ */
+function triggerBearingKey(steps: WorkflowStepDraft[], key: string): string {
+  const byKey = new Map(steps.map(step => [step.key.trim(), step]))
+  let current = key
+  for (let hops = 0; hops <= steps.length; hops += 1) {
+    const step = byKey.get(current)
+    if (!step || step.trigger || !step.triggerFrom) return current
+    current = step.triggerFrom
+  }
+  return current
+}
+
+/**
+ * Two linked steps exchanged, as edge rewrites.
+ *
+ * The later step takes the earlier one's place -- it inherits the upstreams the
+ * earlier one waited on -- and the earlier one follows it. Everything that
+ * waited on the later step now waits on the earlier one, so it stays where it
+ * was in the chain. Keys never change, and a step's key is what its task is
+ * found by, so a reorder rebuilds nothing and no run history moves.
+ *
+ * The one thing that has to travel is the schedule: it belongs to whoever runs
+ * first, so a swap that changes which step is the entry hands it over instead
+ * of leaving a clock ticking on a step in the middle of the chain.
+ */
+function swapWorkflowSteps(
+  steps: WorkflowStepDraft[],
+  earlierKey: string,
+  laterKey: string,
+): WorkflowStepDraft[] {
+  const earlier = steps.find(step => step.key.trim() === earlierKey)
+  const later = steps.find(step => step.key.trim() === laterKey)
+  if (!earlier || !later) return steps
+  // Read before anything is written: both steps are being rewritten.
+  const earlierUpstreams = cleanStepKeys(earlier.depends_on)
+  const laterFollowers = workflowDownstreamKeys(steps, laterKey)
+  const becomesEntry = earlierUpstreams.length === 0
+  // A trigger the editor is holding moves across as it is; one that is stored is
+  // handed over by name. When the schedule is already sitting on the step that
+  // is about to need it -- a swap and its undo -- there is nothing to say, and
+  // the body says nothing so the server keeps what that step already has.
+  const bearing = triggerBearingKey(steps, earlier.key.trim())
+  const handover = !becomesEntry
+    ? { trigger: null as WorkflowTriggerDraft | null, triggerFrom: '' }
+    : bearing === laterKey
+      ? { trigger: null as WorkflowTriggerDraft | null, triggerFrom: '' }
+      : earlier.trigger
+        ? { trigger: earlier.trigger, triggerFrom: '' }
+        : { trigger: null as WorkflowTriggerDraft | null, triggerFrom: bearing }
+  const rewired = steps.map(step => {
+    const key = step.key.trim()
+    if (key === laterKey) {
+      return { ...step, depends_on: earlierUpstreams, ...handover }
+    }
+    if (key === earlierKey) {
+      return { ...step, depends_on: [laterKey], trigger: null, triggerFrom: '' }
+    }
+    if (laterFollowers.includes(key)) {
+      return {
+        ...step,
+        depends_on: step.depends_on.map(item =>
+          item.trim() === laterKey ? earlierKey : item,
+        ),
+      }
+    }
+    return step
+  })
+  // The list is reordered to match, so the row the reader just moved moves.
+  // Only the array is touched: what runs is decided by the edges above, and the
+  // array was never one of the things that decides it.
+  const at = (key: string) => rewired.findIndex(step => step.key.trim() === key)
+  const [from, to] = [at(earlierKey), at(laterKey)]
+  const ordered = [...rewired]
+  ;[ordered[from], ordered[to]] = [ordered[to], ordered[from]]
+  return ordered
+}
+
+/**
+ * A chain with a new step spliced into it, right after *afterIndex*.
+ *
+ * Whatever waited on the step being inserted behind waits on the new one
+ * instead. That second half is what makes this an insert rather than a branch
+ * off the side: leaving it out is how "in between" quietly becomes "in
+ * parallel", which is a different chain and not the one anybody asked for.
+ */
+function spliceWorkflowStep(
+  steps: WorkflowStepDraft[],
+  afterIndex: number,
+  newStep: WorkflowStepDraft,
+  adoptFollowers: boolean,
+): WorkflowStepDraft[] {
+  const anchorKey = steps[afterIndex]?.key.trim() || ''
+  const followers = anchorKey ? workflowDownstreamKeys(steps, anchorKey) : []
+  const repointed = steps.map(step =>
+    adoptFollowers && followers.includes(step.key.trim())
+      ? {
+          ...step,
+          depends_on: step.depends_on.map(item =>
+            item.trim() === anchorKey ? newStep.key.trim() : item,
+          ),
+        }
+      : step,
+  )
+  return [
+    ...repointed.slice(0, afterIndex + 1),
+    newStep,
+    ...repointed.slice(afterIndex + 1),
+  ]
+}
+
 function workflowRequestBody(draft: WorkflowDraft) {
   return {
     name: draft.name.trim(),
@@ -1319,8 +1558,11 @@ function workflowRequestBody(draft: WorkflowDraft) {
         workspace_root: step.workspace_root.trim(),
       }
       // Only a step with no upstreams has a schedule, and only a schedule the
-      // user just chose is sent. Everything else is left out so the server
-      // keeps whatever is there.
+      // user just chose is sent field by field. A schedule moving onto this step
+      // from another is sent as the name of that step -- a weekly clock the
+      // editor can only render as a sentence would not survive being written
+      // back out of a form. Everything else is left out so the server keeps
+      // whatever is there.
       if (body.depends_on.length === 0 && step.trigger) {
         const trigger = step.trigger
         body.trigger_type = trigger.trigger_type
@@ -1343,6 +1585,8 @@ function workflowRequestBody(draft: WorkflowDraft) {
           body.time_of_day = trigger.time_of_day
         }
         if (trigger.trigger_type === 'signal') body.signal_name = trigger.signal_name
+      } else if (body.depends_on.length === 0 && step.triggerFrom.trim()) {
+        body.trigger_from = step.triggerFrom.trim()
       }
       return body
     }),
@@ -1375,6 +1619,47 @@ function describeStepTrigger(step: WorkflowStepInfo): string {
   // is the subscription that waits for them.
   if (step.depends_on?.length) return '上游步骤完成后'
   return trigger.name ? `信号「${trigger.name}」` : '等待信号'
+}
+
+/**
+ * A trigger the editor is holding, in the words `describeStepTrigger` uses for
+ * a stored one.
+ *
+ * The two shapes differ in one place -- a signal's name is `signal_name` before
+ * it is saved and `name` after -- so the draft is handed over in the stored
+ * shape rather than described a second time. Two descriptions of "每天 09:00"
+ * would be free to disagree about what the user actually chose.
+ */
+function describeTriggerDraft(trigger: WorkflowTriggerDraft): string {
+  return describeStepTrigger({
+    key: '',
+    name: '',
+    kind: 'agent_prompt',
+    depends_on: [],
+    task_id: '',
+    trigger_type: trigger.trigger_type,
+    trigger: { ...trigger, name: trigger.signal_name },
+  })
+}
+
+/**
+ * The chain's schedule in words, wherever it currently sits.
+ *
+ * A schedule can be mid-handover -- moved from one step to another earlier in
+ * the same edit -- so the step being asked about is not always the step holding
+ * it. Following the handovers to the end is what keeps a preview from quoting a
+ * schedule the step it names no longer has.
+ */
+function describeChainTrigger(
+  steps: WorkflowStepDraft[],
+  stored: WorkflowStepInfo[] | undefined,
+  key: string,
+): string {
+  const bearing = triggerBearingKey(steps, key)
+  const held = steps.find(step => step.key.trim() === bearing)?.trigger
+  if (held) return describeTriggerDraft(held)
+  const storedStep = stored?.find(item => item.key === bearing)
+  return storedStep ? describeStepTrigger(storedStep) : ''
 }
 
 /**
@@ -1961,6 +2246,17 @@ function App() {
   const [workflowSaving, setWorkflowSaving] = useState(false)
   const [workflowDraft, setWorkflowDraft] = useState<WorkflowDraft>(defaultWorkflowDraft)
   const [editingWorkflowId, setEditingWorkflowId] = useState<string | null>(null)
+  //: The one step whose key is open for rewriting, and the key it started with.
+  //:
+  //: A step's key is its identity: the task behind it is found by that key, so
+  //: changing it does not rename anything -- it points the graph at a task that
+  //: does not exist yet and leaves the old one, with its run history, behind.
+  //: Renaming is therefore an explicit act rather than a text field to nudge,
+  //: and this holds the original key so the rest of the editor can keep
+  //: treating the step as the one that is stored.
+  const [workflowKeyRewrite, setWorkflowKeyRewrite] = useState<
+    { at: number; key: string } | null
+  >(null)
   const [workflowQuery, setWorkflowQuery] = useState('')
   const [pendingAttachments, setPendingAttachments] = useState<AttachmentInfo[]>([])
   const [config, setConfig] = useState<any>(null)
@@ -4053,15 +4349,27 @@ function App() {
 
   const workflowGraph = useMemo(() => checkWorkflowGraph(workflowDraft.steps), [workflowDraft])
 
+  // Whether the cards and the running order have come apart. They agree as long
+  // as steps are only ever added at the end, so a difference means somebody
+  // moved something -- and then the numbers stop reading 1, 2, 3, which needs
+  // saying rather than leaving the reader to work out why.
+  const workflowOrderDiffersFromArray =
+    workflowGraph.order.length === workflowDraft.steps.length
+    && workflowGraph.order.some(
+      (key, at) => key !== (workflowDraft.steps[at]?.key.trim() || ''),
+    )
+
   const openCreateWorkflow = () => {
     setEditingWorkflowId(null)
     setWorkflowDraft(defaultWorkflowDraft(sessionState?.workspace_root || config?.workspace_root || ''))
+    setWorkflowKeyRewrite(null)
     setWorkflowModalOpen(true)
   }
 
   const openEditWorkflow = (info: WorkflowInfo) => {
     setEditingWorkflowId(info.id)
     setWorkflowDraft(workflowDraftFromInfo(info))
+    setWorkflowKeyRewrite(null)
     setWorkflowModalOpen(true)
   }
 
@@ -4072,24 +4380,172 @@ function App() {
     }))
   }
 
+  /**
+   * Re-point a step's upstreams, and keep its trigger section telling the truth.
+   *
+   * A step that gains upstreams has no schedule of its own -- the rules say so
+   * and the server drops one on sight -- so nothing about a trigger may be sent
+   * for it, and a handover left over from an earlier edit has to go with it or
+   * the next save would name a step that no longer has a schedule to hand over.
+   *
+   * Clearing them makes this the step the chain starts from, and it needs a way
+   * to say when. A step that was already the entry keeps the stored schedule it
+   * has; one that never was has nothing to keep, so the form gets a trigger to
+   * fill in rather than a line claiming to hold one.
+   */
+  const changeWorkflowStepUpstreams = (index: number, upstreams: string[]) => {
+    setWorkflowDraft(current => ({
+      ...current,
+      steps: current.steps.map((step, at) => {
+        if (at !== index) return step
+        if (upstreams.length) {
+          return { ...step, depends_on: upstreams, trigger: null, triggerFrom: '' }
+        }
+        const stored = editingWorkflow?.steps.find(item => item.key === step.key.trim())
+        return {
+          ...step,
+          depends_on: upstreams,
+          trigger: step.trigger || (storedEntryStep(stored) ? null : defaultWorkflowTrigger()),
+          triggerFrom: step.triggerFrom,
+        }
+      }),
+    }))
+  }
+
+  /** A blank step for the chain, chained onto whatever it is put behind. */
+  const blankWorkflowStep = (
+    steps: WorkflowStepDraft[],
+    afterKey: string,
+    workspaceRoot: string,
+  ): WorkflowStepDraft => ({
+    ...defaultWorkflowStep(workspaceRoot),
+    key: nextStepKey(steps),
+    depends_on: afterKey ? [afterKey] : [],
+    // A step with an upstream is driven by it and carries no schedule; a step
+    // that ended up with no upstream at all -- because the step it was put
+    // behind has no key yet -- does need one.
+    trigger: afterKey ? null : defaultWorkflowTrigger(),
+    triggerFrom: '',
+  })
+
   const addWorkflowStep = () => {
     setWorkflowDraft(current => {
-      const key = nextStepKey(current.steps)
-      const previous = current.steps[current.steps.length - 1]
+      // The end of the *running* order, not the end of the array. The two agree
+      // until an edit makes them disagree, and the array is the one that means
+      // nothing -- chaining onto a step picked by array position is how a new
+      // step ends up waiting on something it has nothing to do with.
+      const order = checkWorkflowGraph(current.steps).order
+      const lastKey = order[order.length - 1] || ''
+      const at = current.steps.findIndex(step => step.key.trim() === lastKey)
+      const anchor = current.steps[at < 0 ? current.steps.length - 1 : at]
       return {
         ...current,
-        steps: [
-          ...current.steps,
-          {
-            ...defaultWorkflowStep(previous?.workspace_root || ''),
-            key,
-            // Chained onto the last step, because "a step after this one" is
-            // the reason anybody is here, and re-pointing it is one click.
-            depends_on: previous?.key?.trim() ? [previous.key.trim()] : [],
-            trigger: null,
-          },
-        ],
+        steps: spliceWorkflowStep(
+          current.steps,
+          at < 0 ? current.steps.length - 1 : at,
+          blankWorkflowStep(current.steps, anchor?.key?.trim() || '', anchor?.workspace_root || ''),
+          false,
+        ),
       }
+    })
+  }
+
+  /**
+   * Put a new step behind the one at *index*, between it and whatever follows.
+   *
+   * Everything that waited on that step waits on the new one instead. That
+   * second half is the whole point: skipping it is how "in between" silently
+   * becomes "off to the side", and the two are indistinguishable afterwards
+   * because both are a valid graph. It re-points other steps though, so it is
+   * asked about first and the question names them.
+   */
+  const insertWorkflowStepAfter = (index: number) => {
+    const anchor = workflowDraft.steps[index]
+    const anchorKey = anchor?.key?.trim() || ''
+    const followers = anchorKey
+      ? workflowDownstreamKeys(workflowDraft.steps, anchorKey)
+      : []
+    const apply = (adoptFollowers: boolean) => {
+      setWorkflowDraft(current => {
+        const step = current.steps[index]
+        const key = step?.key?.trim() || ''
+        return {
+          ...current,
+          steps: spliceWorkflowStep(
+            current.steps,
+            index,
+            blankWorkflowStep(current.steps, key, step?.workspace_root || ''),
+            adoptFollowers,
+          ),
+        }
+      })
+    }
+    // Nothing waited on it: this is an ordinary append and there is nothing to
+    // ask about.
+    if (!followers.length) {
+      apply(false)
+      return
+    }
+    Modal.confirm({
+      title: `在「${anchor.name.trim() || anchorKey}」后面插入一步？`,
+      content: `现在「${followers.join('」「')}」接在它后面，插入后改接新步骤，仍然排在它后面。`,
+      okText: '插入',
+      cancelText: '取消',
+      centered: true,
+      onOk: () => apply(true),
+    })
+  }
+
+  /**
+   * Trade a step's place with the step it is linked to.
+   *
+   * Two steps and the edges around them get rewritten, and one of them may have
+   * to hand the chain's schedule over -- there is no undo, so the question says
+   * which way round they end up, who follows whom, and where the clock goes.
+   */
+  const moveWorkflowStep = (index: number, direction: 'earlier' | 'later') => {
+    const step = workflowDraft.steps[index]
+    const plan = planWorkflowStepMove(
+      workflowDraft.steps,
+      step?.key?.trim() || '',
+      direction,
+    )
+    if (!plan.pair) {
+      messageApi.warning(plan.problem || '这一步现在换不了位置')
+      return
+    }
+    const [earlierKey, laterKey] = plan.pair
+    const earlier = workflowDraft.steps.find(item => item.key.trim() === earlierKey)
+    const later = workflowDraft.steps.find(item => item.key.trim() === laterKey)
+    const label = (item?: WorkflowStepDraft) => item?.name.trim() || item?.key.trim() || ''
+    const followers = workflowDownstreamKeys(workflowDraft.steps, laterKey)
+    const becomesEntry = cleanStepKeys(earlier?.depends_on || []).length === 0
+    const clock = becomesEntry
+      ? describeChainTrigger(workflowDraft.steps, editingWorkflow?.steps, earlierKey)
+      : ''
+    Modal.confirm({
+      title: `把「${label(later)}」${direction === 'earlier' ? '上移' : '下移'}一位？`,
+      content: (
+        <div className="workflow-move-confirm">
+          <p>
+            {`「${label(earlier)}」和「${label(later)}」调换位置：`
+              + `${earlierKey} → ${laterKey} 变成 ${laterKey} → ${earlierKey}。`}
+          </p>
+          {followers.length > 0 && (
+            <p>{`「${followers.join('」「')}」改接在「${label(earlier)}」后面，仍然排在最后。`}</p>
+          )}
+          {clock && <p>{`入口触发方式（${clock}）会跟着入口移到「${label(later)}」上。`}</p>}
+        </div>
+      ),
+      okText: '换位',
+      cancelText: '取消',
+      centered: true,
+      onOk: () => {
+        setWorkflowDraft(current => ({
+          ...current,
+          steps: swapWorkflowSteps(current.steps, earlierKey, laterKey),
+        }))
+      },
     })
   }
 
@@ -4116,12 +4572,19 @@ function App() {
       messageApi.warning(check.problems[0])
       return
     }
-    const missingTrigger = workflowDraft.steps.find(
-      step => step.depends_on.filter(key => key.trim()).length === 0 && !step.trigger,
-    )
-    // Only a brand new entry step can be missing a trigger: an existing one
-    // sends none and keeps the schedule it has.
-    if (missingTrigger && !editingWorkflowId) {
+    // A step with no upstreams has to say when the chain starts. Checked here
+    // for an edit as well as for a new chain, because reordering is exactly the
+    // edit that changes which step is first: without this the save goes out,
+    // comes back refused, and names a step the user just moved. A step that was
+    // already the entry keeps the stored schedule it is not sending, and one
+    // taking over a schedule says so by name.
+    const missingTrigger = workflowDraft.steps.find(step => {
+      if (cleanStepKeys(step.depends_on).length) return false
+      if (step.trigger || step.triggerFrom) return false
+      const stored = editingWorkflow?.steps.find(item => item.key === step.key.trim())
+      return !storedEntryStep(stored)
+    })
+    if (missingTrigger) {
       messageApi.warning(`步骤「${missingTrigger.key}」没有上游，需要指定触发方式`)
       return
     }
@@ -6145,25 +6608,65 @@ function App() {
           <p className="workflow-editor-hint">
             每一步都是一个任务。把「上游」留空的步骤是入口，它需要自己的触发方式；
             填了上游的步骤等上游全部成功后才运行，所以不需要时间。
+            顺序由依赖决定，编号就是真正会跑的次序。
           </p>
+
+          {workflowOrderDiffersFromArray && (
+            <p className="workflow-editor-order">
+              执行顺序：{workflowGraph.order.join(' → ')}
+            </p>
+          )}
 
           <div className="workflow-step-editor">
             {workflowDraft.steps.map((step, index) => {
-              const stored = editingWorkflow?.steps.find(item => item.key === step.key)
+              const key = step.key.trim()
+              // While a key is being rewritten, the step is still the stored
+              // one for everything else: its task, its schedule, whether it was
+              // the entry. Otherwise opening the field to retype `step2` would
+              // make the editor forget what it is editing halfway.
+              const rewriting = workflowKeyRewrite?.at === index ? workflowKeyRewrite : null
+              const stored = editingWorkflow?.steps.find(
+                item => item.key === (rewriting ? rewriting.key : key),
+              )
+              // The card is numbered by when it runs, not by where it sits in
+              // the array. Those are the same thing until an edit separates
+              // them, and the number is the one people read as "order".
+              const position = workflowGraph.order.indexOf(key)
+              const isEntry = cleanStepKeys(step.depends_on).length === 0
+              const earlier = planWorkflowStepMove(workflowDraft.steps, key, 'earlier')
+              const later = planWorkflowStepMove(workflowDraft.steps, key, 'later')
+              const handoverWords = isEntry && step.triggerFrom
+                ? describeChainTrigger(workflowDraft.steps, editingWorkflow?.steps, key)
+                : ''
               const optionKeys = workflowDraft.steps
                 .map((item, at) => ({ key: item.key.trim(), at }))
                 .filter(item => item.key && item.at !== index)
               return (
                 <div className="workflow-step-card" key={`step-${index}`}>
                   <div className="workflow-step-card-head">
-                    <span className="workflow-step-index">{index + 1}</span>
-                    <Input
-                      className="workflow-step-key"
-                      maxLength={40}
-                      placeholder="key"
-                      value={step.key}
-                      onChange={event => patchWorkflowStep(index, { key: event.target.value })}
-                    />
+                    <span className="workflow-step-index">{position >= 0 ? position + 1 : index + 1}</span>
+                    {stored && !rewriting ? (
+                      <span className="workflow-step-key-static">
+                        <code>{key}</code>
+                        <Tooltip title="改 key 等于换一个任务，这一步的运行记录会留在旧任务上">
+                          <Button
+                            type="link"
+                            size="small"
+                            onClick={() => setWorkflowKeyRewrite({ at: index, key })}
+                          >
+                            重命名
+                          </Button>
+                        </Tooltip>
+                      </span>
+                    ) : (
+                      <Input
+                        className="workflow-step-key"
+                        maxLength={40}
+                        placeholder="key"
+                        value={step.key}
+                        onChange={event => patchWorkflowStep(index, { key: event.target.value })}
+                      />
+                    )}
                     <Input
                       className="workflow-step-name"
                       maxLength={60}
@@ -6180,16 +6683,57 @@ function App() {
                       ]}
                       style={{ width: 124 }}
                     />
-                    <Tooltip title={workflowDraft.steps.length > 1 ? '删除这一步' : '流程至少要有一个步骤'}>
-                      <Button
-                        type="text"
-                        danger
-                        icon={<DeleteOutlined />}
-                        disabled={workflowDraft.steps.length <= 1}
-                        onClick={() => removeWorkflowStep(index)}
-                      />
-                    </Tooltip>
+                    <Space size={2} className="workflow-step-tools">
+                      <Tooltip title="在它后面插入一步">
+                        <Button
+                          type="text"
+                          size="small"
+                          icon={<PlusOutlined />}
+                          onClick={() => insertWorkflowStepAfter(index)}
+                        />
+                      </Tooltip>
+                      {/* Wrapped in a span because a disabled button swallows the
+                          hover, and here the tooltip is the only place the reason
+                          it cannot move is written down. */}
+                      <Tooltip title={earlier.pair ? '和上一步换位' : earlier.problem}>
+                        <span className="workflow-step-tool">
+                          <Button
+                            type="text"
+                            size="small"
+                            icon={<ArrowUpOutlined />}
+                            disabled={!earlier.pair}
+                            onClick={() => moveWorkflowStep(index, 'earlier')}
+                          />
+                        </span>
+                      </Tooltip>
+                      <Tooltip title={later.pair ? '和下一步换位' : later.problem}>
+                        <span className="workflow-step-tool">
+                          <Button
+                            type="text"
+                            size="small"
+                            icon={<ArrowDownOutlined />}
+                            disabled={!later.pair}
+                            onClick={() => moveWorkflowStep(index, 'later')}
+                          />
+                        </span>
+                      </Tooltip>
+                      <Tooltip title={workflowDraft.steps.length > 1 ? '删除这一步' : '流程至少要有一个步骤'}>
+                        <Button
+                          type="text"
+                          danger
+                          icon={<DeleteOutlined />}
+                          disabled={workflowDraft.steps.length <= 1}
+                          onClick={() => removeWorkflowStep(index)}
+                        />
+                      </Tooltip>
+                    </Space>
                   </div>
+                  {rewriting && (
+                    <p className="workflow-step-key-warning">
+                      改名不是换个写法：保存后会按新 key 建一个任务，
+                      这一步现在的运行记录留在旧任务上，不会跟过来。
+                    </p>
+                  )}
                   <TextArea
                     rows={3}
                     maxLength={6000}
@@ -6205,7 +6749,7 @@ function App() {
                         allowClear
                         placeholder="留空 = 入口步骤"
                         value={step.depends_on}
-                        onChange={value => patchWorkflowStep(index, { depends_on: value })}
+                        onChange={value => changeWorkflowStepUpstreams(index, value)}
                         options={optionKeys.map(item => ({ value: item.key, label: item.key }))}
                         optionFilterProp="label"
                         style={{ minWidth: 220, flex: '1 1 220px' }}
@@ -6226,29 +6770,52 @@ function App() {
                       </Button>
                     </Space.Compact>
                   </div>
-                  {step.depends_on.filter(key => key.trim()).length === 0 && (
+                  {isEntry && (
                     step.trigger
                       ? renderWorkflowTriggerEditor(index, step.trigger)
-                      : (
-                        <div className="workflow-step-trigger workflow-step-trigger-stored">
-                          <span className="workflow-step-trigger-label">入口触发</span>
-                          <span>{stored ? describeStepTrigger(stored) : '保持原样'}</span>
-                          <Button
-                            type="link"
-                            size="small"
-                            onClick={() => {
-                              if (!stored) return
-                              const task = schedules.find(item => item.id === stored.task_id)
-                              if (task) {
-                                setWorkflowModalOpen(false)
-                                openEditSchedule(task)
-                              }
-                            }}
-                          >
-                            改时间
-                          </Button>
-                        </div>
-                      )
+                      : step.triggerFrom
+                        ? (
+                          <div className="workflow-step-trigger workflow-step-trigger-stored">
+                            <span className="workflow-step-trigger-label">入口触发</span>
+                            <span>
+                              {`沿用「${step.triggerFrom}」的触发方式`}
+                              {handoverWords ? `（${handoverWords}）` : ''}
+                            </span>
+                          </div>
+                        )
+                        : storedEntryStep(stored)
+                          ? (
+                            <div className="workflow-step-trigger workflow-step-trigger-stored">
+                              <span className="workflow-step-trigger-label">入口触发</span>
+                              <span>{describeStepTrigger(stored!)}</span>
+                              <Button
+                                type="link"
+                                size="small"
+                                onClick={() => {
+                                  const task = schedules.find(item => item.id === stored!.task_id)
+                                  if (task) {
+                                    setWorkflowModalOpen(false)
+                                    openEditSchedule(task)
+                                  }
+                                }}
+                              >
+                                改时间
+                              </Button>
+                            </div>
+                          )
+                          : (
+                            <div className="workflow-step-trigger workflow-step-trigger-stored">
+                              <span className="workflow-step-trigger-label">入口触发</span>
+                              <span>它现在没有上游，还没有触发方式</span>
+                              <Button
+                                type="link"
+                                size="small"
+                                onClick={() => patchWorkflowStep(index, { trigger: defaultWorkflowTrigger() })}
+                              >
+                                指定
+                              </Button>
+                            </div>
+                          )
                   )}
                 </div>
               )
@@ -6256,7 +6823,7 @@ function App() {
           </div>
 
           <Button type="dashed" block icon={<PlusOutlined />} onClick={addWorkflowStep}>
-            添加步骤
+            在最后一步后面添加步骤
           </Button>
 
           {workflowGraph.problems.length > 0 && (
@@ -6351,7 +6918,7 @@ function App() {
               />
 
               <div className="workflow-step-list">
-                {flow.steps.map(step => (
+                {stepsInRunningOrder(flow.steps).map(step => (
                   <div className="workflow-step-row" key={step.key}>
                     <span className={`workflow-step-dot status-${step.latest_run?.status || 'pending'}`}>
                       {scheduleRunStatusIcon(step.latest_run?.status)}

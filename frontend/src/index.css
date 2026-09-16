@@ -5062,6 +5062,15 @@ html[data-theme='light'] .send-button.ant-btn-primary:disabled {
 .workflow-step-card-head { display:flex; align-items:center; gap:8px; }
 .workflow-step-index { display:grid; place-items:center; width:20px; height:20px; flex:0 0 20px; border-radius:6px; color:var(--text-secondary); background:var(--surface-raised); font-size:10px; font-weight:700; }
 .workflow-step-key { width:118px; flex:0 0 118px; }
+.workflow-step-key-static { display:flex; flex:0 0 auto; align-items:center; gap:2px; }
+.workflow-step-key-static code { overflow:hidden; max-width:118px; color:var(--text-secondary); font-size:11px; text-overflow:ellipsis; white-space:nowrap; }
+.workflow-step-key-static .ant-btn-link { height:auto; padding:0 2px; font-size:11px; }
+.workflow-step-key-warning { margin:0; color:var(--text-muted); font-size:11px; line-height:1.7; }
+.workflow-step-tools { flex:0 0 auto; }
+.workflow-step-tool { display:inline-flex; }
+.workflow-editor-order { margin:-6px 0 12px; color:var(--text-secondary); font-size:11px; }
+.workflow-move-confirm p { margin:0 0 6px; }
+.workflow-move-confirm p:last-child { margin-bottom:0; }
 .workflow-step-name { flex:1 1 auto; min-width:0; }
 .workflow-step-card-foot { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }
 .workflow-step-upstreams { display:flex; flex:1 1 260px; align-items:center; gap:8px; min-width:0; color:var(--text-muted); font-size:11px; }
