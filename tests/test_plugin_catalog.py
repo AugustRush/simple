@@ -3036,9 +3036,12 @@ def test_inject_pending_interjections_drains_and_clears_in_place():
     """Mailbox entries become a user_interjection block; original list is
     cleared in place so the channel handler's next append starts fresh."""
     import time as _t
-    from agent.core.agent import BaseAgent, AgentContext
+    import agent as agent_module
 
-    ctx = AgentContext(system_prompt="sys")
+    ctx = agent_module.AgentContext(system_prompt="sys")
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
     pending = [
         {"text": "actually use ssh", "from_user": "alice",
          "arrived_at": _t.time(), "urgency": "normal"},
@@ -3046,7 +3049,7 @@ def test_inject_pending_interjections_drains_and_clears_in_place():
          "arrived_at": _t.time(), "urgency": "now"},
     ]
 
-    BaseAgent._inject_pending_interjections(ctx, pending)
+    agent._inject_pending_interjections(ctx, pending)
 
     assert pending == []  # cleared in place
     assert len(ctx.messages) == 1
@@ -3064,27 +3067,60 @@ def test_inject_pending_interjections_drains_and_clears_in_place():
 
 def test_inject_pending_interjections_skips_empty_mailbox():
     """No mailbox entries → no message appended."""
-    from agent.core.agent import BaseAgent, AgentContext
+    import agent as agent_module
 
-    ctx = AgentContext(system_prompt="sys")
-    BaseAgent._inject_pending_interjections(ctx, [])
+    ctx = agent_module.AgentContext(system_prompt="sys")
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent._inject_pending_interjections(ctx, [])
     assert ctx.messages == []
 
 
 def test_inject_skips_blank_text_entries():
     """Blank-text entries don't pollute the block."""
-    from agent.core.agent import BaseAgent, AgentContext
+    import agent as agent_module
 
-    ctx = AgentContext(system_prompt="sys")
+    ctx = agent_module.AgentContext(system_prompt="sys")
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
     pending = [
         {"text": "   ", "from_user": "", "urgency": "normal"},
         {"text": "real msg", "from_user": "", "urgency": "normal"},
     ]
-    BaseAgent._inject_pending_interjections(ctx, pending)
+    agent._inject_pending_interjections(ctx, pending)
     assert len(ctx.messages) == 1
     assert "real msg" in ctx.messages[0]["content"]
     # Blank entry produces no block
     assert ctx.messages[0]["content"].count("<user_interjection") == 1
+
+
+def test_interjection_counts_as_part_of_what_the_turn_was_asked():
+    """A tool may quote an interjection, so it has to be in the request text.
+
+    Someone who types an instruction while the turn is running has asked for
+    something: it is the same asker, in the same turn.  Leaving it out of
+    ``turn_request`` would make a creator refuse an instruction the user had
+    just given, which reads as the agent ignoring them.
+    """
+    import agent as agent_module
+
+    ctx = agent_module.AgentContext(system_prompt="sys")
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    registry.set_context("turn_request", "帮我看看这个仓库")
+
+    agent._inject_pending_interjections(
+        ctx,
+        [{"text": "顺便每天早上九点提醒我看盘", "from_user": "", "urgency": "normal"}],
+    )
+
+    request = registry.get_context("turn_request")
+    assert "帮我看看这个仓库" in request
+    assert "每天早上九点提醒我看盘" in request
 
 
 

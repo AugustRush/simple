@@ -2161,6 +2161,110 @@ def test_schedule_create_requires_a_signal_name(tmp_path):
     assert "error" in payload
 
 
+# ─── The words that asked, checked by the executor ──────────────────────────
+#
+# ``registry.call`` goes straight to the tool, so these drive the executor the
+# way the agent loop does -- which is the only path where the guard lives.
+
+
+def _run_through_executor(registry, name, inputs):
+    from agent.tools.executor import RegularToolExecutor
+
+    return json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run({"name": name, "input": inputs})
+        )
+    )
+
+
+def test_a_question_cannot_leave_a_task_behind(tmp_path):
+    """The bug this was written for, reproduced and refused.
+
+    A turn that asked how a process works offers no sentence that asks for a
+    task, so the call cannot quote its way past the guard and nothing is
+    written.  This is the whole point: no stray schedule outliving the turn.
+    """
+    from agent.scheduler import SchedulerStore
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    registry.set_context("turn_request", "订单都是如何接的，具体流程是什么")
+
+    payload = _run_through_executor(
+        registry,
+        "schedule_create",
+        {
+            "name": "订单流程",
+            "trigger_type": "once",
+            "at": "2026-04-20T10:00:00+08:00",
+            "message_text": "去核对一遍订单流程",
+            "intent": "用户想了解订单流程，所以建个任务",
+        },
+    )
+
+    assert payload["ok"] is False
+    assert "does not quote this turn's request" in payload["error"]
+    store = SchedulerStore()
+    try:
+        assert store.list_tasks() == []
+    finally:
+        store.close()
+
+
+def test_the_words_that_asked_are_kept_on_the_task(tmp_path):
+    """A task created from a request records that request on its own row."""
+    from agent.scheduler import SchedulerStore
+    import agent.shared as shared_module
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    registry.set_context("turn_request", "每天早上九点提醒我看盘，谢谢")
+
+    payload = _run_through_executor(
+        registry,
+        "schedule_create",
+        {
+            "name": "看盘",
+            "trigger_type": "daily",
+            "time_of_day": "09:00",
+            "message_text": "看盘",
+            "intent": "每天早上九点提醒我看盘",
+        },
+    )
+
+    assert payload["ok"] is True
+    store = SchedulerStore(db_path=Path(shared_module.SCHEDULER_DB_FILE))
+    try:
+        task = store.get_task(payload["task"]["id"])
+        assert task is not None
+        assert task.request_quote == "每天早上九点提醒我看盘"
+    finally:
+        store.close()
+
+
+def test_an_emission_nobody_asked_for_is_refused(tmp_path):
+    """Emitting wakes subscribers, so it is an action and needs an ask too."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    registry.set_context("turn_request", "report.ready 这个信号是干什么用的")
+
+    refused = _run_through_executor(
+        registry,
+        "emit_signal",
+        {"name": "report.ready", "intent": "用户问了这个信号，顺便发一下"},
+    )
+
+    assert refused["ok"] is False
+    assert "does not quote this turn's request" in refused["error"]
+
+    registry.set_context("turn_request", "把 report.ready 这个信号发出去")
+    allowed = _run_through_executor(
+        registry,
+        "emit_signal",
+        {"name": "report.ready", "intent": "把 report.ready 这个信号发出去"},
+    )
+
+    assert allowed["ok"] is True
+    assert allowed["name"] == "report.ready"
+
+
 def test_emit_signal_records_an_emission_and_names_its_subscribers(tmp_path):
     from agent.scheduler import SchedulerStore
     import agent.shared as shared_module

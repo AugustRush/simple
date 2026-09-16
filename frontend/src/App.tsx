@@ -244,6 +244,10 @@ interface ScheduleInfo {
   // both, so a task row can say where it belongs.
   workflow_id?: string
   step_key?: string
+  //: The words that asked for this task, quoted from whoever asked. Empty
+  //: means no sentence was recorded -- a row that predates the column, or a
+  //: task made by filling in the form -- never "nobody asked".
+  request_quote?: string
 }
 
 interface WorkflowStepInfo {
@@ -272,6 +276,8 @@ interface WorkflowInfo {
   name: string
   description?: string
   enabled?: boolean
+  //: The sentence that asked for this chain; its steps inherit it.
+  request_quote?: string
   created_at?: string
   updated_at?: string
   steps: WorkflowStepInfo[]
@@ -7090,6 +7096,15 @@ function App() {
                   {describeAcceptance(selectedSchedule.acceptance) && (
                     <div className="schedule-workspace schedule-acceptance">
                       <SafetyCertificateOutlined />判定依据：{describeAcceptance(selectedSchedule.acceptance)}
+                    </div>
+                  )}
+                  {/* Why this task exists, in the asker's own words.  Shown so
+                      a task that appeared without anyone asking for it can be
+                      noticed for what it is -- which is the whole reason the
+                      sentence is recorded. */}
+                  {String(selectedSchedule.request_quote || '').trim() && (
+                    <div className="schedule-workspace schedule-request-quote">
+                      <MessageOutlined />来自：{String(selectedSchedule.request_quote).trim()}
                     </div>
                   )}
                 </div>

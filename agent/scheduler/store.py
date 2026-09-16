@@ -145,7 +145,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 11
+    SCHEMA_VERSION = 12
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -196,6 +196,7 @@ class SchedulerStore:
                     selected_skills_json TEXT NOT NULL DEFAULT '[]',
                     permission_profile TEXT NOT NULL DEFAULT 'inherit',
                     acceptance_json TEXT NOT NULL DEFAULT '',
+                    request_quote TEXT NOT NULL DEFAULT '',
                     next_run_at TEXT,
                     lease_until TEXT,
                     active_run_id TEXT,
@@ -272,6 +273,7 @@ class SchedulerStore:
                     description TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL,
                     graph_json TEXT NOT NULL DEFAULT '{"steps": []}',
+                    request_quote TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -494,6 +496,43 @@ class SchedulerStore:
                             f"{name} {declaration}"
                         )
                 self._conn.execute("PRAGMA user_version = 11")
+            elif version == 12:
+                # The words that asked for the task, so a row can say why it
+                # exists long after the conversation is gone.
+                #
+                # No backfill, for the same reason the acceptance criterion
+                # above has none: a task created before this column existed was
+                # created without anyone having to produce the evidence, so
+                # there is no quote to put there.  Writing one from the task's
+                # own name would look exactly like the real thing and would be
+                # a lie about who asked.
+                task_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_tasks)"
+                    ).fetchall()
+                }
+                if "request_quote" not in task_columns:
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_tasks ADD COLUMN "
+                        "request_quote TEXT NOT NULL DEFAULT ''"
+                    )
+                # A workflow is asked for by a person too, and its steps are
+                # asked for only through it -- so the sentence that put the
+                # chain there is stored once, on the chain, and copied onto
+                # each step's task.  Reading a step row then answers "why does
+                # this exist" with the words that started the whole thing,
+                # rather than with the name of the step above it.
+                workflow_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(workflows)"
+                    ).fetchall()
+                }
+                if "request_quote" not in workflow_columns:
+                    self._conn.execute(
+                        "ALTER TABLE workflows ADD COLUMN "
+                        "request_quote TEXT NOT NULL DEFAULT ''"
+                    )
+                self._conn.execute("PRAGMA user_version = 12")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -524,6 +563,7 @@ class SchedulerStore:
             acceptance=Acceptance.from_json(row["acceptance_json"]),
             workflow_id=row["workflow_id"] or "",
             step_key=row["step_key"] or "",
+            request_quote=row["request_quote"] or "",
         )
 
     def _run_from_row(self, row: sqlite3.Row) -> TaskRun:
@@ -588,8 +628,8 @@ class SchedulerStore:
                     acceptance_json,
                     next_run_at, lease_until,
                     active_run_id, last_run_at, last_success_at, created_at, updated_at,
-                    workflow_id, step_key
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?)
+                    workflow_id, step_key, request_quote
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -615,6 +655,7 @@ class SchedulerStore:
                     _iso(created_at),
                     task.workflow_id,
                     task.step_key,
+                    str(getattr(task, "request_quote", "") or ""),
                 ),
             )
         created = self.get_task(task_id)
@@ -2574,6 +2615,7 @@ class SchedulerStore:
         return Workflow.from_graph(
             row["graph_json"],
             workflow_id=row["id"],
+            request_quote=row["request_quote"] or "",
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),
         )
@@ -2613,8 +2655,8 @@ class SchedulerStore:
                 """
                 INSERT INTO workflows (
                     id, name, description, enabled, graph_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    request_quote, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     workflow_id,
@@ -2622,6 +2664,7 @@ class SchedulerStore:
                     workflow.description,
                     1 if workflow.enabled else 0,
                     json.dumps(workflow.to_graph(), ensure_ascii=False),
+                    str(getattr(workflow, "request_quote", "") or ""),
                     _iso(created_at),
                     _iso(created_at),
                 ),
@@ -2666,6 +2709,11 @@ class SchedulerStore:
         self._validate_graph(workflow.steps)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
         with self._conn:
+            # `request_quote` is deliberately absent here.  It records who asked
+            # for the chain, and editing a step does not change that -- while a
+            # caller that rebuilds the graph from an edit form has no quote to
+            # send, so writing the column from `workflow` would blank the one
+            # piece of evidence the row holds about its own origin.
             self._conn.execute(
                 """
                 UPDATE workflows
@@ -2779,6 +2827,7 @@ class SchedulerStore:
         workflow_id: str,
         enabled: bool,
         workspace: str,
+        request_quote: str = "",
     ) -> NewScheduledTask:
         target = step.delivery_target
         if target is None:
@@ -2807,6 +2856,12 @@ class SchedulerStore:
             enabled=enabled,
             workflow_id=workflow_id,
             step_key=step.key,
+            # Nobody asked for this step by name -- the chain was asked for,
+            # and the step is how the chain runs.  So the step carries the
+            # chain's words rather than none: a step row that says "asked for
+            # by nobody" is indistinguishable from a task that appeared without
+            # being asked for, which is the one thing this must not look like.
+            request_quote=request_quote,
         )
 
     @_synchronized
@@ -2851,6 +2906,7 @@ class SchedulerStore:
                 workflow_id=workflow_id,
                 enabled=bool(workflow.enabled),
                 workspace=workspaces.get(key) or str(Path.cwd().resolve()),
+                request_quote=str(getattr(workflow, "request_quote", "") or ""),
             )
             if key in took_inherited:
                 inherited.append(key)

@@ -785,11 +785,28 @@ class BuiltinTools:
                 "which is how a step can be made to follow another task instead of a clock. "
                 "The run is unattended: set `permission_profile` to say what it may do "
                 "(inherit/read_only/workspace_write), and pass `workspace_root` when the "
-                "task should work in a directory other than the current session's."
+                "task should work in a directory other than the current session's. "
+                "The task outlives this conversation, so `intent` has to carry the "
+                "user's own words: it is checked against the request that commissioned "
+                "this turn, and a call whose intent cannot be found in it is refused."
             ),
             {
                 "type": "object",
                 "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Fill this in, or the call is refused. Quote the "
+                            "user, verbatim -- at least six characters copied "
+                            "from what they actually typed this turn, e.g. "
+                            "their sentence 「每天早上九点提醒我看盘」. "
+                            "It is matched against this turn's request, so a "
+                            "paraphrase, a translation, or a sentence about why "
+                            "the task would be useful is refused. If nothing in "
+                            "this turn asked for a task, do not call this at "
+                            "all: propose it in your reply and let the user ask."
+                        ),
+                    },
                     "name": {"type": "string", "description": "Short task name"},
                     "trigger_type": {
                         "type": "string",
@@ -963,11 +980,27 @@ class BuiltinTools:
                 "done, and a `verify_command` whenever that is mechanically checkable -- "
                 "that check is what decides whether the next step runs. The graph is "
                 "validated before anything is written: a cycle, a missing upstream, or a "
-                "step that can never be judged is refused with the step named."
+                "step that can never be judged is refused with the step named. "
+                "The chain outlives this conversation, so `intent` has to carry the "
+                "user's own words: it is checked against the request that commissioned "
+                "this turn, and a call whose intent cannot be found in it is refused."
             ),
             {
                 "type": "object",
                 "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Fill this in, or the call is refused. Quote the "
+                            "user, verbatim -- at least six characters copied "
+                            "from what they actually typed this turn, the "
+                            "sentence that asked for this chain. It is matched "
+                            "against this turn's request, so a paraphrase or a "
+                            "sentence about why the chain would be useful is "
+                            "refused. If nothing in this turn asked for one, do "
+                            "not call this at all: propose the chain in your reply."
+                        ),
+                    },
                     "name": {"type": "string", "description": "Short workflow name"},
                     "description": {
                         "type": "string",
@@ -1118,12 +1151,28 @@ class BuiltinTools:
                 "signal_name will run. Subscribe before you emit: a signal with nobody "
                 "waiting is recorded and then closed as unmatched, and it will not start a "
                 "run for a subscriber created afterwards. "
-                "Signals a task emits by itself (task:<id>:succeeded / :failed / :cancelled) "
-                "need no call. Call `list_signals` first to see which names are already in use."
+            "Signals a task emits by itself (task:<id>:succeeded / :failed / :cancelled) "
+            "need no call. Call `list_signals` first to see which names are already in use. "
+            "Emitting starts whatever is waiting on that name, so `intent` has to carry "
+            "the user's own words: it is checked against the request that commissioned "
+            "this turn, and a call whose intent cannot be found in it is refused."
             ),
             {
                 "type": "object",
                 "properties": {
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Fill this in, or the call is refused. Quote the "
+                            "user, verbatim -- at least six characters copied "
+                            "from what they actually typed this turn, e.g. "
+                            "「把 xhs.package.ready 这个信号发出去」. An emission "
+                            "wakes tasks, so it is an action rather than a note, "
+                            "and it is matched against this turn's request. If "
+                            "nothing in this turn asked for a signal, say what "
+                            "you would emit in your reply instead."
+                        ),
+                    },
                     "name": {
                         "type": "string",
                         "description": (
@@ -3252,6 +3301,7 @@ class BuiltinTools:
         workspace_root: Optional[str] = None,
         criteria: Optional[list[str]] = None,
         verify_command: Optional[str] = None,
+        intent: str = "",
     ) -> dict[str, Any]:
         trigger = self._schedule_trigger(
             trigger_type=trigger_type,
@@ -3354,6 +3404,13 @@ class BuiltinTools:
             workspace_root=str(task_workspace),
             permission_profile=profile.key,
             acceptance=acceptance,
+            # The words that were checked by the executor's quote test, kept on
+            # the row so the task can still answer "why am I here" long after
+            # the conversation that asked for it is gone.  The check and the
+            # record read the same string on purpose: a task saved with a quote
+            # nobody verified would be a claim about the past that nothing
+            # backs up.
+            request_quote=str(intent or "").strip(),
         )
         task = store.find_matching_task(new_task)
         existing = task is not None
@@ -3471,6 +3528,7 @@ class BuiltinTools:
         steps: list[dict[str, Any]],
         description: str = "",
         workspace_root: Optional[str] = None,
+        intent: str = "",
     ) -> dict[str, Any]:
         """Create a chain of tasks whose order is the graph, not a clock.
 
@@ -3605,6 +3663,10 @@ class BuiltinTools:
             name=str(name or "").strip(),
             description=str(description or "").strip(),
             steps=built,
+            # Checked by the executor's quote test before this ran; stored on the
+            # workflow row so every step under it can say which sentence in a
+            # conversation put the whole chain there.
+            request_quote=str(intent or "").strip(),
         )
         store = self._schedule_store()
         created = store.create_workflow(workflow)
@@ -3734,9 +3796,18 @@ class BuiltinTools:
         )
 
     def _emit_signal(
-        self, name: str, payload: Optional[dict[str, Any]] = None
+        self,
+        name: str,
+        payload: Optional[dict[str, Any]] = None,
+        intent: str = "",
     ) -> dict[str, Any]:
         """Record a signal so whoever is waiting on it runs.
+
+        ``intent`` is read by the executor's quote check, which refuses this
+        call unless it reproduces part of the request that commissioned the
+        turn.  It is deliberately not stored: an emission is an action that is
+        already over, unlike a task, which is a row that has to be able to
+        explain itself months later.
 
         Deliberately does *not* run the subscriber here.  Emitting and running
         are separate steps on purpose: this call may be made from inside a run

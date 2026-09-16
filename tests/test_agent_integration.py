@@ -433,6 +433,28 @@ def test_retrieved_context_cannot_close_its_untrusted_envelope():
     assert "&lt;tag&gt;" in ctx.system_prompt
 
 
+def test_each_turn_publishes_its_own_request_and_no_other():
+    """A turn cannot borrow the previous turn's authority.
+
+    The tools that have to prove they were asked read this value, so a leftover
+    would authorise a creator in a turn where nobody asked for anything -- the
+    exact case the check exists to refuse.
+    """
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    ctx = agent_module.AgentContext(system_prompt="system")
+
+    agent._prepare_turn(ctx, "每天早上九点提醒我看盘", ())
+    assert registry.get_context("turn_request") == "每天早上九点提醒我看盘"
+
+    agent._prepare_turn(ctx, "订单都是如何接的，具体流程是什么", ())
+    assert registry.get_context("turn_request") == "订单都是如何接的，具体流程是什么"
+
+
 def test_channel_runner_processes_unconsumed_pending_message_as_next_turn():
     from agent.channels.base import ChannelRunner, IncomingMessage
     from agent.runtime import RuntimeSessionState, TurnExecution, TurnResult
@@ -2043,7 +2065,10 @@ def test_send_message_stuck_response_sanitizes_intent_required_loop(monkeypatch)
     assert calls == 3
     assert result.error is None
     assert "内部工具安全规则" in result.content
-    assert "结构化 `intent`" in result.content
+    # It has to name the protocol and the way out of it -- without leaking the
+    # raw tool error, which is what this response exists to replace.
+    assert "`intent`" in result.content
+    assert "补齐" in result.content
     assert "Add a sentence" not in result.content
     assert "Intent required" not in result.content
 

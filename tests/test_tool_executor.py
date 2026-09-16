@@ -187,7 +187,257 @@ def test_regular_tool_executor_rejects_vague_shell_intent():
     assert payload["ok"] is False
     assert payload["intent_required"] is True
     assert "too vague" in payload["error"]
+
+
+# ─── requires_request: the call has to quote the words that asked for it ─────
+
+
+def _request_required_registry(tool_name="schedule_create"):
+    """A registry whose creator carries the real capability, with a spy tool.
+
+    The capability is looked up by (source, name) from the runtime's own table,
+    so this exercises the pairing the shipped product depends on rather than a
+    capability invented for the test.
+    """
+    registry = ToolRegistry()
+    called = []
+
+    async def creator(**kwargs):
+        called.append(kwargs)
+        return {"ok": True}
+
+    registry.register(
+        tool_name,
+        "Create something persistent",
+        {"type": "object", "properties": {}, "required": []},
+        creator,
+        source="builtin",
+    )
+    return registry, called
+
+
+def test_request_required_tool_is_refused_when_nothing_was_asked():
+    """A turn that asked for nothing authorises nothing.
+
+    This is the shape of the bug: a question about a process was answered by
+    building a task nobody had asked for.  There is no sentence to quote, so
+    the call is refused instead of made.
+    """
+    registry, called = _request_required_registry()
+    # The capability the product relies on is declared by the runtime's own
+    # table, read here rather than assumed, so a rename there fails this test
+    # instead of silently disabling the guard.
+    assert "requires_request" in registry.tool_capabilities("schedule_create")
+    registry.set_context("turn_request", "")
+
+    payload = json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run(
+                {
+                    "name": "schedule_create",
+                    "input": {
+                        "name": "看盘",
+                        "trigger_type": "daily",
+                        "intent": "每天早上九点提醒我看盘",
+                    },
+                }
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert "nothing in this turn asked" in payload["error"]
     assert called == []
+
+
+def test_request_required_tool_refuses_a_paraphrase_of_the_request():
+    """Explaining why the action would be useful is not the user asking.
+
+    The intent has to reproduce the asker's characters; a reason the agent
+    wrote itself is exactly what a refusal is for.
+    """
+    registry, called = _request_required_registry()
+    registry.set_context("turn_request", "订单都是如何接的，具体流程是什么")
+
+    payload = json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run(
+                {
+                    "name": "schedule_create",
+                    "input": {
+                        "name": "订单流程",
+                        "trigger_type": "daily",
+                        "intent": "用户想了解订单流程，所以建一个每天提醒的任务",
+                    },
+                }
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert "does not quote this turn's request" in payload["error"]
+    assert called == []
+
+
+def test_request_required_tool_refuses_an_intent_that_is_missing_entirely():
+    registry, called = _request_required_registry()
+    registry.set_context("turn_request", "每天早上九点提醒我看盘")
+
+    payload = json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run(
+                {"name": "schedule_create", "input": {"name": "看盘"}}
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    assert "intent required" in payload["error"]
+    assert called == []
+
+
+def test_request_required_tool_runs_when_the_intent_quotes_the_request():
+    registry, called = _request_required_registry()
+    registry.set_context("turn_request", "每天早上九点提醒我看盘，谢谢")
+
+    payload = json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run(
+                {
+                    "name": "schedule_create",
+                    "input": {
+                        "name": "看盘",
+                        "trigger_type": "daily",
+                        "intent": "每天早上九点提醒我看盘",
+                    },
+                }
+            )
+        )
+    )
+
+    assert payload == {"ok": True}
+    assert called == [
+        {"name": "看盘", "trigger_type": "daily", "intent": "每天早上九点提醒我看盘"}
+    ]
+
+
+def test_request_required_tool_accepts_a_quote_that_was_re_wrapped():
+    """Re-wrapping the quoted sentence is still quoting it.
+
+    Whitespace is collapsed before matching so a model that reformats the
+    user's line does not get refused for the formatting.
+    """
+    registry, called = _request_required_registry()
+    registry.set_context(
+        "turn_request", "每天早上九点提醒我看盘，\n    把结果发给我"
+    )
+
+    payload = json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run(
+                {
+                    "name": "schedule_create",
+                    "input": {
+                        "name": "看盘",
+                        "trigger_type": "daily",
+                        "intent": "每天早上九点提醒我看盘， 把结果发给我",
+                    },
+                }
+            )
+        )
+    )
+
+    assert payload == {"ok": True}
+    assert len(called) == 1
+
+
+def test_a_short_request_is_quotable_in_full():
+    """A one-word instruction has one word to quote.
+
+    Holding a three-character request to a six-character bar would make it
+    impossible to satisfy, so the bar is the request's own length.
+    """
+    registry, called = _request_required_registry()
+    registry.set_context("turn_request", "建个任务")
+
+    payload = json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run(
+                {
+                    "name": "schedule_create",
+                    "input": {
+                        "name": "任务",
+                        "trigger_type": "daily",
+                        "intent": "建个任务",
+                    },
+                }
+            )
+        )
+    )
+
+    assert payload == {"ok": True}
+    assert len(called) == 1
+
+
+def test_a_short_request_quoted_in_part_is_refused():
+    """Two characters of a four-character request are not the request."""
+    registry, called = _request_required_registry()
+    registry.set_context("turn_request", "建个任务")
+
+    payload = json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run(
+                {
+                    "name": "schedule_create",
+                    "input": {
+                        "name": "任务",
+                        "trigger_type": "daily",
+                        "intent": "建个",
+                    },
+                }
+            )
+        )
+    )
+
+    assert payload["ok"] is False
+    # The refusal names the bar it actually applied, not the general ceiling.
+    assert "at least 4 characters" in payload["error"]
+    assert called == []
+
+
+def test_tools_without_the_capability_do_not_need_a_request():
+    """The guard is opt-in per tool, and most tools are not opted in.
+
+    An empty ``turn_request`` -- a scheduled wake-up, an internal call -- must
+    not start refusing everything.
+    """
+    from agent.tools.runtime import ToolRegistry as _Registry
+
+    registry = _Registry()
+    called = []
+
+    async def writer(**kwargs):
+        called.append(kwargs)
+        return {"ok": True}
+
+    registry.register(
+        "write_file",
+        "Write a file",
+        {"type": "object", "properties": {}, "required": []},
+        writer,
+        source="builtin",
+    )
+
+    payload = json.loads(
+        asyncio.run(
+            RegularToolExecutor(registry).run(
+                {"name": "write_file", "input": {"path": "a.txt"}}
+            )
+        )
+    )
+
+    assert payload == {"ok": True}
+    assert called == [{"path": "a.txt"}]
 
 
 def test_regular_tool_executor_emits_running_progress_for_slow_tool():

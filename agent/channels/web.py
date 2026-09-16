@@ -286,6 +286,11 @@ def _scheduler_task_payload(
         # say where it belongs without the client holding the whole graph.
         "workflow_id": str(getattr(task, "workflow_id", "") or ""),
         "step_key": str(getattr(task, "step_key", "") or ""),
+        # The words that asked for this task.  Sent for the same reason the
+        # acceptance criterion above is: a task that appeared without anyone
+        # asking for it is what this field exists to make impossible to hide,
+        # and that only works if the answer is visible rather than only stored.
+        "request_quote": str(getattr(task, "request_quote", "") or ""),
         "unseen_attention": int(unseen_attention or 0),
         "active_run_id": task.active_run_id,
         # The client uses this to choose how soon to ask again, so it travels
@@ -357,6 +362,10 @@ def _workflow_payload(
         "name": workflow.name,
         "description": workflow.description,
         "enabled": bool(workflow.enabled),
+        # The sentence that asked for the chain, which its steps inherit.
+        # Sent here rather than repeated on every step because the chain is
+        # what was asked for -- the steps are how it runs.
+        "request_quote": str(getattr(workflow, "request_quote", "") or ""),
         "created_at": (
             workflow.created_at.isoformat() if workflow.created_at else None
         ),

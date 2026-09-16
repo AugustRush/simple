@@ -23,6 +23,35 @@ from agent.plugins.catalog import PostToolEvent, PreToolEvent
 # string is opaque); other write tools self-declare via structured params.
 _INTENT_REQUIRED_CAPABILITY = "requires_intent"
 
+#: The stronger one, for tools whose result outlives the conversation.
+#:
+#: ``requires_intent`` asks the caller to *say* why, and a caller can always
+#: say something.  This asks it to *quote*, and the quote is checked against
+#: the text that commissioned the turn, so an invented reason fails and the
+#: asker's own words pass.  It is here rather than in the tool because the
+#: thing being decided is "was this asked for", which no single tool can see.
+#:
+#: This exists because the alternative was tried and cannot work.  A keyword
+#: gate over the user's sentence was supposed to keep a task from being created
+#: unasked; it only decides *which schemas are sent*, while calls are dispatched
+#: by name against the whole registry and the system prompt lists every tool by
+#: name and description.  So a tool the gate hid was still a tool the model
+#: could call, and the gate was a token filter wearing a guard's uniform.
+_REQUEST_REQUIRED_CAPABILITY = "requires_request"
+
+#: Why the quote is not also listed in the tools' JSON ``required``: a schema
+#: rejection says "missing required property intent", which is true and useless
+#: -- the caller learns nothing about what to put there, and the check would
+#: then live in two places that disagree the moment either changes.  The field
+#: is described in the schema so it is filled in; the refusal happens here, in
+#: one place, in a sentence that says what to quote and what to do instead.
+
+#: How much of the request a quote has to reproduce to count as evidence of it
+#: rather than a summary of it.  Six characters of Chinese is already a clause;
+#: an English quote reaches the same bar in fewer words.  This is the ceiling,
+#: not the rule -- see :meth:`RegularToolExecutor._quote_bar`.
+_QUOTE_MIN_CHARS = 6
+
 _active_tool_progress: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "active_tool_progress",
     default=None,
@@ -291,16 +320,23 @@ class RegularToolExecutor:
         return ""
 
     def _check_intent(self, tool_name: str, inputs: dict) -> str:
-        """Return an error message if intent is undeclared, or "" if OK.
+        """Return an error message if this call has not earned the right to run.
 
-        A tool opts into intent enforcement by declaring the
-        ``requires_intent`` capability.  The check is generic — every such
-        tool must accept an ``intent`` / ``purpose`` / ``reason`` input
-        and the value must be a specific, non-vague phrase.
+        Two capabilities are checked here, and which one a tool declares is the
+        statement of what it costs to be wrong about it:
+
+        * ``requires_intent`` -- the caller must say what the call will do and
+          why, specifically.  A self-declaration, so it catches a call nobody
+          thought through, not a call nobody asked for.
+        * ``requires_request`` -- the caller must *quote* the words that asked
+          for it.  A refusal here means nobody asked, which is the moment to
+          propose the change in the reply instead of making it.
         """
         caps = self._registry.tool_capabilities(tool_name) if hasattr(
             self._registry, "tool_capabilities"
         ) else frozenset()
+        if _REQUEST_REQUIRED_CAPABILITY in caps:
+            return self._check_request(tool_name, inputs)
         if _INTENT_REQUIRED_CAPABILITY not in caps:
             return ""
         structured_intent = self._structured_intent(inputs)
@@ -314,6 +350,73 @@ class RegularToolExecutor:
             return (
                 f"{label} intent too vague: input.intent must describe the "
                 "specific purpose and expected outcome."
+            )
+        return ""
+
+    def _request_text(self) -> str:
+        """The words that commissioned this turn, published by the agent."""
+        getter = getattr(self._registry, "get_context", None)
+        if getter is None:
+            return ""
+        return str(getter("turn_request") or "")
+
+    @staticmethod
+    def _quote_bar(request: str) -> int:
+        """How much of *request* a quote has to reproduce to count as one.
+
+        Six characters, or the whole request when it is shorter -- a one-word
+        instruction has one word to quote, and demanding six would make it
+        unquotable.
+        """
+        return min(_QUOTE_MIN_CHARS, len(request))
+
+    @staticmethod
+    def _quotes_request(intent: str, request: str) -> bool:
+        """Whether *intent* reproduces a run of characters from *request*.
+
+        Verbatim is the one property a paraphrase cannot fake: it means the
+        caller read the words it is acting on rather than describing what it
+        thinks the user would want.  Whitespace is collapsed first, so
+        re-wrapping a sentence still counts as quoting it.
+        """
+        intent = " ".join(intent.split())
+        request = " ".join(request.split())
+        if not request:
+            return False
+        span = RegularToolExecutor._quote_bar(request)
+        if len(intent) < span:
+            return False
+        windows = {request[i : i + span] for i in range(len(request) - span + 1)}
+        return any(
+            intent[i : i + span] in windows
+            for i in range(len(intent) - span + 1)
+        )
+
+    def _check_request(self, tool_name: str, inputs: dict) -> str:
+        """Return an error unless this call quotes the request it acts on."""
+        label = tool_name[:1].upper() + tool_name[1:] if tool_name else "Tool"
+        intent = self._structured_intent(inputs)
+        request = self._request_text()
+        if not request:
+            return (
+                f"{label} refused: nothing in this turn asked for it, so there "
+                "is no request to quote. Say what you would create and let the "
+                "user ask for it, then call again quoting their words."
+            )
+        bar = self._quote_bar(request)
+        if not intent:
+            return (
+                f"{label} intent required: include input.intent quoting what "
+                f"asked for this -- at least {bar} characters of it, verbatim."
+            )
+        if not self._quotes_request(intent, request):
+            return (
+                f"{label} refused: input.intent does not quote this turn's "
+                f"request. Copy at least {bar} characters of what the user "
+                "actually said into input.intent -- explaining why the call "
+                "would be useful is not the same as the user asking for it, and "
+                "only the second one authorises this. If nobody asked, propose "
+                "it in your reply instead."
             )
         return ""
 

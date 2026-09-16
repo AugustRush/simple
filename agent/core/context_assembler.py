@@ -22,8 +22,16 @@ _WORKFLOW_TOOLS = {"workflow_create", "workflow_list", "workflow_delete"}
 #: permissive direction: a listing nobody needed costs tokens, while a creator
 #: nobody asked for costs a task that outlives the conversation.
 _SCHEDULED_WORK_READ_TOOLS = {"schedule_list", "workflow_list"}
-#: The half that *builds or destroys*.  Guarded by the request terms below:
-#: it ships only when the sentence asks for scheduled work to exist.
+#: The half that *builds or destroys*.  These are the schemas whose absence is
+#: worth the most tokens, so the request terms below decide whether they ride
+#: along -- but that decision is about **budget, not permission**.  The gate
+#: cannot be a guard and was never able to be one: calls are dispatched by name
+#: against the whole registry, and the system prompt names every tool to the
+#: model in the same turn, so a schema that was not sent is still a tool that
+#: can be called.  What actually refuses an unasked creation is the executor's
+#: ``requires_request`` check, which makes the call quote the words that asked
+#: for it.  Keeping the terms here only means a caller that *did* ask is not
+#: charged for the schemas, and one that did not is not invited by them.
 _SCHEDULED_WORK_WRITE_TOOLS = (
     _SCHEDULE_TOOLS | _WORKFLOW_TOOLS
 ) - _SCHEDULED_WORK_READ_TOOLS
@@ -240,9 +248,12 @@ class ContextAssembler:
 
         if _matches(query, _SCHEDULED_WORK_TERMS):
             selected |= _SCHEDULED_WORK_READ_TOOLS
-            # Shipping a creator is an invitation to build something, so it
-            # waits for the user to ask for it.  Reading the list is not an
-            # invitation: it is what answers the question.
+            # Sending a creator is an invitation to build something, so it is
+            # held back until the sentence looks like a request rather than a
+            # question -- reading the list is not an invitation, it is what
+            # answers the question.  This decides what the turn is *offered*;
+            # whether a creation is allowed is decided by the executor, which
+            # will refuse a creator call that cannot quote its request.
             asked = _asks_for(query, _SCHEDULED_WORK_VERBS) or (
                 _asks_for(query, _SCHEDULED_WORK_CADENCE)
                 and not _asks_for(query, _SCHEDULED_WORK_QUESTIONS)

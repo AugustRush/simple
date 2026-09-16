@@ -2177,10 +2177,15 @@ class BaseAgent:
                         "",
                         (
                             f"当前观察：模型连续尝试调用 `{tool_names or 'unknown'}`，"
-                            "但 shell 调用没有带合格的结构化 `intent`，所以工具被安全拦截。"
+                            "但这次调用没有满足该工具要求的 `intent`，所以被安全拦截。"
+                            "不同工具要求的不是同一件事：shell 要说明命令做什么、"
+                            "为什么必须运行；会留下长期产物的工具要逐字引用用户提出"
+                            "这个需求的原话——说明「为什么这样做有用」不算。"
                         ),
                         "",
-                        "合理的下一步是重新规划这一步：每个 shell 调用都应在 `intent` 里说明命令会做什么、为什么需要运行；如果目标本身不明确，我应该先向你确认，而不是继续空转。",
+                        "合理的下一步是重新规划这一步：按要求补齐 `intent`；如果用户"
+                        "其实并没有提出过这个需求，就应该把它作为建议说出来问他，"
+                        "而不是继续空转。",
                     ]
                 )
             reason_text = {
@@ -2225,15 +2230,18 @@ class BaseAgent:
                     "",
                     (
                         f"Current signal: the model repeatedly tried to call "
-                        f"`{tool_names or 'unknown'}` without a specific structured "
-                        "`intent` input, so the tool calls were blocked."
+                        f"`{tool_names or 'unknown'}` without satisfying the `intent` "
+                        "that tool requires, so the calls were blocked. The tools do not "
+                        "all ask for the same thing: `shell` wants to be told what the "
+                        "command does and why it must run, while a tool whose result "
+                        "outlives the turn wants the user's own words quoted verbatim -- "
+                        "explaining why the action would be useful is not a substitute."
                     ),
                     "",
                     (
-                        "The right next step is to re-plan this action: each shell "
-                        "call should include an `intent` explaining what the command "
-                        "does and why it is needed, or ask you for clarification if "
-                        "the goal is ambiguous."
+                        "The right next step is to re-plan this action: supply the "
+                        "`intent` it asks for, or -- if the user never actually asked for "
+                        "this -- propose it to them instead of retrying."
                     ),
                 ]
             )
@@ -2462,9 +2470,8 @@ class BaseAgent:
             return "same_batch_unproductive"
         return ""
 
-    @staticmethod
     def _inject_pending_interjections(
-        ctx: "AgentContext", pending: list[dict]
+        self, ctx: "AgentContext", pending: list[dict]
     ) -> None:
         """Drain the per-session mailbox into ctx.messages as a user_interjection.
 
@@ -2479,10 +2486,12 @@ class BaseAgent:
         if not drained:
             return
         blocks: list[str] = []
+        interjected: list[str] = []
         for entry in drained:
             text = str(entry.get("text", "") or "").strip()
             if not text:
                 continue
+            interjected.append(text)
             who = str(entry.get("from_user", "") or "user")
             urgency = str(entry.get("urgency", "normal") or "normal")
             arrived = entry.get("arrived_at")
@@ -2509,6 +2518,15 @@ class BaseAgent:
             "role": "user",
             "content": "\n\n".join(blocks) + footer,
         })
+        # An interjection is the user asking for something *during* this turn,
+        # so it belongs to what this turn was asked to do.  Leaving it out would
+        # make a tool refuse an instruction the user had just typed, which reads
+        # as the agent ignoring them.
+        earlier = str(self.registry.get_context("turn_request") or "")
+        addition = "\n".join(interjected)
+        self.registry.set_context(
+            "turn_request", f"{earlier}\n{addition}" if earlier else addition
+        )
 
     def _prepare_turn(
         self,
@@ -2523,6 +2541,13 @@ class BaseAgent:
         Caller is responsible for restoring ``ctx.system_prompt`` afterwards
         (send_message captures ``original_system`` before calling this).
         """
+        # What this turn was asked to do, in the asker's own words, published
+        # for the tools that have to prove they are answering it (see
+        # ``RegularToolExecutor._check_request``).  Overwritten unconditionally:
+        # a value left over from the previous turn would let this turn borrow
+        # that turn's authority, and the one case that must never pass is a turn
+        # where nobody asked for anything.
+        self.registry.set_context("turn_request", user_message)
         checkpoint_summary = str(
             ctx.metadata.get("_checkpoint_summary") or ""
         ).strip()

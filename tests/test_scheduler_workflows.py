@@ -2605,3 +2605,71 @@ def test_the_delete_tool_refuses_a_live_step_and_takes_an_orphan(tmp_path):
     finally:
         store.close()
 
+
+
+def test_a_chain_records_the_sentence_that_asked_for_it(tmp_path):
+    """A chain, asked for by one sentence, carries that sentence on every step.
+
+    A step is not asked for by name -- the chain is -- so the step rows quote
+    the chain's words.  A step that said "asked for by nobody" would be
+    indistinguishable from a task that appeared without being asked for, which
+    is the thing this column exists to tell apart.
+    """
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        created = tools._workflow_create(
+            "nightly report",
+            _chain_steps(),
+            intent="每天跑一遍收集、分析、发布这三步",
+        )
+        workflow = store.get_workflow(created["workflow"]["id"])
+        tasks = store.step_tasks(created["workflow"]["id"])
+
+        assert workflow is not None
+        assert workflow.request_quote == "每天跑一遍收集、分析、发布这三步"
+        assert sorted(tasks) == ["analyze", "collect", "publish"]
+        assert all(
+            task.request_quote == "每天跑一遍收集、分析、发布这三步"
+            for task in tasks.values()
+        )
+    finally:
+        store.close()
+
+
+def test_editing_a_chain_keeps_who_asked_for_it(tmp_path):
+    """Rewriting a step does not change who asked for the chain.
+
+    The edit form a caller rebuilds the graph from has no quote on it, so the
+    update path must not write the column: doing so would blank the only
+    evidence the chain has about its own origin.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(
+            Workflow(
+                name="nightly report",
+                steps=[step("collect", trigger=clock()), step("publish", depends_on=["collect"])],
+                request_quote="每天跑一遍收集和发布这两步",
+            )
+        )
+        edited = Workflow(
+            id=workflow.id,
+            name="nightly report (v2)",
+            steps=[
+                step("collect", trigger=clock(), name="收集（改）"),
+                step("publish", depends_on=["collect"]),
+            ],
+        )
+
+        store.update_workflow(workflow.id, edited)
+        reread = store.get_workflow(workflow.id)
+        tasks = store.step_tasks(workflow.id)
+
+        assert reread is not None
+        assert reread.name == "nightly report (v2)"
+        assert reread.request_quote == "每天跑一遍收集和发布这两步"
+        assert tasks["collect"].name == "收集（改）"
+        assert tasks["collect"].request_quote == "每天跑一遍收集和发布这两步"
+    finally:
+        store.close()

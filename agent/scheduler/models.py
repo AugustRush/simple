@@ -850,6 +850,23 @@ class NewScheduledTask:
     #: confused the two would quietly fold one into the other.
     workflow_id: str = ""
     step_key: str = ""
+    #: The words that asked for this task, quoted from whoever asked: the
+    #: user's own sentence in a conversation, or the prompt of the run that
+    #: created it.  Kept on the row for the same reason the acceptance
+    #: criterion is -- "why is this here" has to be answerable from the thing
+    #: itself, months later, by someone who was not in the room.
+    #:
+    #: Empty means *no sentence was recorded*, which is not the same as "nobody
+    #: asked": rows that predate this column never recorded one, a chain's steps
+    #: before the chain existed have none, and a task made by filling in the
+    #: interface form was asked for by a click rather than by a sentence.
+    #: Inventing a quote for any of those would fabricate evidence, so the
+    #: column stays empty and the reader is left with the truth.
+    #:
+    #: A workflow's steps carry the sentence that asked for the *chain*: no
+    #: person asked for one step by name, and a step that read "asked for by
+    #: nobody" would be indistinguishable from a task that appeared unasked.
+    request_quote: str = ""
 
 
 @dataclass
@@ -886,6 +903,10 @@ class ScheduledTask:
     #: consequences downstream when it finishes.
     workflow_id: str = ""
     step_key: str = ""
+    #: See :attr:`NewScheduledTask.request_quote`: the words that asked for
+    #: this task, carried through to the stored row so the answer to "why does
+    #: this exist" does not depend on anyone remembering.
+    request_quote: str = ""
 
 
 #: Terminal statuses that mean "a person should look at this".
@@ -1189,6 +1210,12 @@ class Workflow:
     id: str = ""
     description: str = ""
     enabled: bool = True
+    #: The words that asked for this chain, quoted from whoever asked for it.
+    #: Not part of :meth:`to_graph`: the graph is what the chain *is*, and this
+    #: is what put it there -- the same relationship ``created_at`` has to it.
+    #: Kept when the graph is edited, because rewriting a step does not change
+    #: who asked for the chain in the first place.
+    request_quote: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -1213,6 +1240,7 @@ class Workflow:
         raw: str,
         *,
         workflow_id: str = "",
+        request_quote: str = "",
         created_at: Optional[datetime] = None,
         updated_at: Optional[datetime] = None,
     ) -> "Workflow":
@@ -1230,6 +1258,7 @@ class Workflow:
             description=str(data.get("description", "")),
             enabled=bool(data.get("enabled", True)),
             steps=steps,
+            request_quote=str(request_quote or ""),
             created_at=created_at,
             updated_at=updated_at,
         )

@@ -173,6 +173,143 @@ def test_scheduler_store_migrates_v4_permission_profile(tmp_path):
     assert created.permission_profile == "inherit"
 
 
+def test_scheduler_store_migrates_v11_request_quote(tmp_path):
+    """A row that predates the requirement has no quote, and gets no invented one.
+
+    The columns have to appear on both tables, because a workflow is asked for
+    by a person just as a task is.  The old row is not backfilled: a quote made
+    up from the task's own name would look exactly like evidence of who asked,
+    which is the one thing the column must not contain falsely.
+    """
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    db_path = tmp_path / "scheduler.db"
+    legacy = SchedulerStore(db_path=db_path)
+    pre_existing = legacy.create_task(
+        NewScheduledTask(
+            name="pre-existing",
+            kind="message",
+            trigger=TriggerSpec.daily("09:00", "UTC"),
+            payload={"message_text": "hi"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+    legacy.close()
+
+    # Rewind to the shape the previous release left behind.
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.execute("ALTER TABLE scheduled_tasks DROP COLUMN request_quote")
+        connection.execute("ALTER TABLE workflows DROP COLUMN request_quote")
+        connection.execute("PRAGMA user_version = 11")
+        connection.commit()
+    finally:
+        connection.close()
+
+    store = SchedulerStore(db_path=db_path)
+    task_columns = {
+        row[1] for row in sqlite3.connect(db_path).execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    workflow_columns = {
+        row[1] for row in sqlite3.connect(db_path).execute(
+            "PRAGMA table_info(workflows)"
+        ).fetchall()
+    }
+    reread = store.get_task(pre_existing.id)
+    store.close()
+
+    assert "request_quote" in task_columns
+    assert "request_quote" in workflow_columns
+    assert reread is not None
+    assert reread.request_quote == ""
+
+
+def test_request_quote_round_trips_through_the_task_row(tmp_path):
+    """The words that asked for a task are readable from the task itself."""
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    created = store.create_task(
+        NewScheduledTask(
+            name="看盘",
+            kind="message",
+            trigger=TriggerSpec.daily("09:00", "UTC"),
+            payload={"message_text": "看盘"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            request_quote="每天早上九点提醒我看盘",
+        )
+    )
+    reread = store.get_task(created.id)
+    still_there = store._conn.execute(
+        "SELECT request_quote FROM scheduled_tasks WHERE id = ?", (created.id,)
+    ).fetchone()[0]
+    store.close()
+
+    assert created.request_quote == "每天早上九点提醒我看盘"
+    assert reread is not None
+    assert reread.request_quote == "每天早上九点提醒我看盘"
+    assert still_there == "每天早上九点提醒我看盘"
+
+
+def test_editing_a_task_does_not_erase_who_asked_for_it(tmp_path):
+    """An edit is a new definition of the same task, not a new task.
+
+    Update paths rebuild a ``NewScheduledTask`` from a form, and a form has no
+    quote on it.  Writing the column from that spec would blank the single
+    piece of evidence the row carries about its own origin.
+    """
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    created = store.create_task(
+        NewScheduledTask(
+            name="看盘",
+            kind="message",
+            trigger=TriggerSpec.daily("09:00", "UTC"),
+            payload={"message_text": "看盘"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            request_quote="每天早上九点提醒我看盘",
+        )
+    )
+    store.update_task(
+        created.id,
+        NewScheduledTask(
+            name="看盘（改）",
+            kind="message",
+            trigger=TriggerSpec.daily("10:00", "UTC"),
+            payload={"message_text": "看盘"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        ),
+    )
+    reread = store.get_task(created.id)
+    store.close()
+
+    assert reread is not None
+    assert reread.name == "看盘（改）"
+    assert reread.request_quote == "每天早上九点提醒我看盘"
+
+
 def test_scheduler_store_claims_due_task_and_creates_run(tmp_path):
     from agent.scheduler import (
         DeliveryTarget,

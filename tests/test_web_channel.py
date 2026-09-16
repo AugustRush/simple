@@ -3273,6 +3273,70 @@ def test_web_workflow_steps_report_liveness_the_same_way_their_tasks_do(
     assert "config_snapshot" not in steps["analyze"]["latest_run"]
 
 
+def test_web_schedule_payload_carries_the_words_that_asked(tmp_path, monkeypatch):
+    """The page can say why a task exists, from the task itself.
+
+    Storing the sentence is half of the point; the other half is being able to
+    see it.  A task nobody asked for can only be noticed if the words it claims
+    as its authority are readable next to it.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+        Workflow,
+        WorkflowStep,
+    )
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="看盘",
+            kind="message",
+            trigger=TriggerSpec.daily("09:00", "UTC"),
+            payload={"message_text": "看盘"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            request_quote="每天早上九点提醒我看盘",
+        )
+    )
+    workflow = store.create_workflow(
+        Workflow(
+            name="nightly",
+            steps=[
+                WorkflowStep(
+                    key="collect",
+                    name="collect",
+                    kind="message",
+                    payload={"message_text": "go"},
+                    trigger=TriggerSpec.daily("09:00", "UTC"),
+                    delivery_mode="standalone",
+                    delivery_target=DeliveryTarget.standalone(),
+                )
+            ],
+            request_quote="每天跑一次收集",
+        ),
+        now=datetime(2026, 9, 16, 0, 0, tzinfo=timezone.utc),
+    )
+    store.close()
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        listed = {
+            item["id"]: item for item in client.get("/api/schedules").json()["tasks"]
+        }
+        workflows = client.get("/api/workflows").json()["workflows"]
+
+    assert listed[task.id]["request_quote"] == "每天早上九点提醒我看盘"
+    assert workflows[0]["id"] == workflow.id
+    assert workflows[0]["request_quote"] == "每天跑一次收集"
+
+
 def test_web_schedule_list_leaves_the_run_snapshot_to_the_run_history(
     tmp_path, monkeypatch
 ):

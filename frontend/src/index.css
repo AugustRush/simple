@@ -4221,6 +4221,10 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
    deliberately held to a single ellipsised line. */
 .schedule-acceptance { max-width:620px; align-items:flex-start; white-space:normal; line-height:1.6; }
 .schedule-acceptance > .anticon { flex:0 0 auto; margin-top:2px; }
+/* The sentence the task was asked for with. Also a sentence, so it wraps for
+   the same reason the criterion above does. */
+.schedule-request-quote { max-width:620px; align-items:flex-start; white-space:normal; line-height:1.6; font-style:italic; }
+.schedule-request-quote > .anticon { flex:0 0 auto; margin-top:2px; font-style:normal; }
 .schedule-detail-tags { display:flex; flex-wrap:wrap; gap:6px; }
 .schedule-detail-tags .ant-tag { margin:0; }
 .schedule-detail-next { display:flex; flex:0 0 auto; flex-direction:column; align-items:flex-end; gap:4px; padding-top:2px; }

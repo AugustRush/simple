@@ -802,7 +802,13 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "for something to exist and keep running: a cadence "
                 "(「每天早上」), a reminder, or an explicit 「建一个 / 创建 / "
                 "拆成」. If you think a task would help but were not asked for "
-                "one, offer it in your reply and let the user say yes."
+                "one, offer it in your reply and let the user say yes. "
+                "The tools check this instead of taking your word for it: their "
+                "`intent` argument must quote, verbatim, the words that asked "
+                "for it, and a call whose intent cannot be found in this turn's "
+                "request is refused. So write the user's own sentence there — "
+                "a reason why the task would be useful reads as a paraphrase "
+                "and does not pass."
             )
         if "schedule_create" in builtin_names:
             lines.append(

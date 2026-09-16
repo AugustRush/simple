@@ -298,8 +298,29 @@ class ToolRegistry:
         ("builtin", "memory_write"): frozenset({"state_write"}),
         ("builtin", "set_identity"): frozenset({"state_write"}),
         ("builtin", "memory_clear"): frozenset({"state_write"}),
-        ("builtin", "schedule_create"): frozenset({"state_write"}),
+        ("builtin", "schedule_create"): frozenset({"state_write", "requires_request"}),
         ("builtin", "schedule_delete"): frozenset({"state_write"}),
+        # The workflow trio was missing from this table entirely, which read as
+        # "no capabilities" -- the same answer as a tool nobody had classified
+        # yet.  Classified here because `workflow_create` now has to carry the
+        # request requirement, and a group where half the entries exist is how
+        # the next reader concludes the other half was considered.
+        ("builtin", "workflow_list"): frozenset({"read"}),
+        ("builtin", "workflow_create"): frozenset({"state_write", "requires_request"}),
+        ("builtin", "workflow_delete"): frozenset({"state_write"}),
+        # Producing an action nobody asked for is what `requires_request`
+        # refuses, and emitting a signal is an action: it starts whatever
+        # subscribed to that name.  The stray emission that accompanied the
+        # unasked task this was written for is the same failure with a shorter
+        # blast radius, so it gets the same check.
+        #
+        # The deletes above do NOT get it, and that is a decision rather than an
+        # omission: creating something and answering a question by deleting
+        # something are not the same failure, because a delete cannot be an
+        # answer to "怎么用" the way a freshly built task can.  Marking a delete
+        # would also demand the user's words for tidying up after an edit, which
+        # is where the asker's own sentence is hardest to point at.
+        ("builtin", "emit_signal"): frozenset({"state_write", "requires_request"}),
         ("runtime:skill", "activate_skill"): frozenset({"read"}),
         ("runtime:skill", "list_skill_files"): frozenset({"read"}),
         ("runtime:skill", "read_skill_file"): frozenset({"read"}),
