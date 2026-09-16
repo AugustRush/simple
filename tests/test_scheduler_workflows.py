@@ -2172,3 +2172,290 @@ def test_an_automatic_retry_keeps_the_upstreams_the_run_was_told_about(tmp_path)
     finally:
         store.close()
 
+
+# ── 9. The tools that build a graph ─────────────────────────────────────────
+#
+# The tests above drive the store; the agent drives the tools.  A tool that
+# refuses what the store's validator would refuse is still not the same
+# guarantee as the validator itself: the tool decides *what to build* before
+# the store ever sees it, so a tool that quietly drops a field the validator
+# would have flagged hides the problem below the layer that answers for it.
+# These tests hold the tool to the same refusals, from the caller's side.
+
+
+def _chain_steps() -> list[dict]:
+    """A three-step chain, in the shape the ``workflow_create`` tool takes."""
+    return [
+        {
+            "key": "collect",
+            "name": "收集",
+            "action_type": "agent_task",
+            "instruction": "collect the numbers",
+            "trigger_type": "once",
+            "at": "2026-05-01T11:59:00+00:00",
+        },
+        {
+            "key": "analyze",
+            "name": "分析",
+            "action_type": "agent_task",
+            "instruction": "analyze the numbers",
+            "depends_on": ["collect"],
+        },
+        {
+            "key": "publish",
+            "name": "发布",
+            "action_type": "message",
+            "message_text": "the report is ready",
+            "depends_on": ["analyze"],
+        },
+    ]
+
+
+def test_workflow_create_materializes_each_step_as_a_task(tmp_path):
+    """The chain the tool answers with is the chain that actually exists.
+
+    Every step needs a task behind it -- a workflow row with no tasks looks
+    like a plan and runs nothing -- and each dependent step's trigger has to
+    name its upstreams' success, because "they finished" is a weaker promise
+    than "they worked".
+    """
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        result = tools._workflow_create("nightly report", _chain_steps())
+
+        assert result["ok"] is True
+        workflow = result["workflow"]
+        assert [item["key"] for item in workflow["steps"]] == [
+            "collect", "analyze", "publish",
+        ]
+        assert all(item["task_id"] for item in workflow["steps"])
+
+        tasks = store.step_tasks(workflow["id"])
+        assert set(tasks) == {"collect", "analyze", "publish"}
+        # The entry step keeps the trigger it was given.
+        assert tasks["collect"].trigger.trigger_type == "once"
+        # A dependent step waits on its upstream's *success*, and on all of
+        # them, not on "it stopped running".
+        assert tasks["analyze"].trigger.trigger_type == "signal"
+        assert tasks["analyze"].trigger.payload["names"] == [
+            task_signal_name(tasks["collect"].id, RUN_SUCCESS_STATUS)
+        ]
+        assert tasks["analyze"].trigger.payload["mode"] == "all"
+        assert tasks["publish"].trigger.payload["names"] == [
+            task_signal_name(tasks["analyze"].id, RUN_SUCCESS_STATUS)
+        ]
+    finally:
+        store.close()
+
+
+def test_workflow_create_refuses_a_dependent_step_that_also_names_a_trigger(
+    tmp_path,
+):
+    """The silent-drop regression: the field is refused, not discarded.
+
+    The graph validator refuses a step with both edges and a clock, but it
+    can only judge what the tool builds.  An earlier version of the tool
+    quietly discarded a dependent step's trigger fields and answered
+    ``ok=True``, so the validator never saw the contradiction: the caller
+    asked for "run this daily at 10" and got a step that runs at no
+    particular time, with nothing said about the difference.  That is why
+    this test drives the tool rather than the validator -- the validator's
+    own test cannot fail this way.
+    """
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        steps = _chain_steps()
+        steps[1]["trigger_type"] = "daily"
+        steps[1]["time_of_day"] = "10:00"
+
+        with pytest.raises(ValueError) as error:
+            tools._workflow_create("morning chain", steps)
+
+        # Both the step and the fields it should not have written are named,
+        # because "步骤「analyze」既有上游（collect）" is what tells the caller
+        # which of their steps to fix.
+        assert "步骤「analyze」" in str(error.value)
+        assert "触发方式由上游决定" in str(error.value)
+        # Refused before anything was written: a graph half-created is a
+        # plan in the database that runs part of itself.
+        assert store.list_workflows() == []
+        assert store.list_tasks() == []
+    finally:
+        store.close()
+
+
+def test_workflow_create_refuses_a_chain_with_no_entry_at_all(tmp_path):
+    """A step with neither a trigger nor an upstream has no answer to "when".
+
+    The tool could have defaulted it to something -- a clock, a signal --
+    but any default would be a schedule the caller never asked for, running
+    a prompt they did write.  Refusal is the honest answer.
+    """
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        steps = [
+            {
+                "key": "collect",
+                "action_type": "message",
+                "message_text": "the report is ready",
+            }
+        ]
+
+        with pytest.raises(ValueError) as error:
+            tools._workflow_create("orphan", steps)
+
+        assert "collect" in str(error.value)
+        assert "必须自带触发方式" in str(error.value)
+        assert store.list_workflows() == []
+        assert store.list_tasks() == []
+    finally:
+        store.close()
+
+
+def test_workflow_create_refuses_a_cycle_before_anything_is_written(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        # A pure ring: every step has an upstream, so no step is an entry and
+        # none carries a trigger.  Nothing about it contradicts itself; it
+        # simply never starts -- which is what the cycle check exists to say.
+        ring = [
+            {
+                "key": "collect",
+                "action_type": "message",
+                "message_text": "never",
+                "depends_on": ["publish"],
+            },
+            {
+                "key": "analyze",
+                "action_type": "message",
+                "message_text": "never",
+                "depends_on": ["collect"],
+            },
+            {
+                "key": "publish",
+                "action_type": "message",
+                "message_text": "never",
+                "depends_on": ["analyze"],
+            },
+        ]
+
+        with pytest.raises(ValueError) as error:
+            tools._workflow_create("ring", ring)
+
+        # The ring itself, not just the fact of one: "which steps" is the
+        # actionable part of the message.
+        assert "collect → publish → analyze → collect" in str(error.value)
+        assert store.list_workflows() == []
+        assert store.list_tasks() == []
+    finally:
+        store.close()
+
+
+def test_workflow_create_refuses_a_graph_with_no_steps(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        with pytest.raises(ValueError) as error:
+            tools._workflow_create("empty", [])
+        assert "至少要有一个步骤" in str(error.value)
+        assert store.list_workflows() == []
+    finally:
+        store.close()
+
+
+def test_workflow_create_carries_a_steps_acceptance_into_its_task(tmp_path):
+    """A criterion is part of the step, so it has to arrive with the task.
+
+    The response says it out loud for the same reason the store keeps it:
+    a criterion nobody was told about is indistinguishable from no
+    criterion, and the difference decides whether a failed run looks like a
+    bug or like the criterion doing its job.
+    """
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        steps = _chain_steps()
+        steps[1]["criteria"] = ["the numbers add up"]
+        steps[1]["verify_command"] = "true"
+
+        result = tools._workflow_create("checked chain", steps)
+
+        workflow = result["workflow"]
+        assert workflow["steps"][1]["acceptance"] == {
+            "criteria": ["the numbers add up"],
+            "verify_command": "true",
+        }
+        # And the task, not just the description of it.
+        tasks = store.step_tasks(workflow["id"])
+        assert tasks["analyze"].acceptance.criteria == ["the numbers add up"]
+        assert tasks["analyze"].acceptance.verify_command == "true"
+        # The other steps were not handed a criterion they never asked for.
+        assert tasks["collect"].acceptance.criteria == []
+        assert "判定成功的依据" in result["summary_text"]
+    finally:
+        store.close()
+
+
+def test_workflow_list_shows_the_steps_and_their_edges(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        created = tools._workflow_create("nightly report", _chain_steps())
+
+        listed = tools._workflow_list()
+
+        assert listed["ok"] is True
+        assert listed["count"] == 1
+        item = listed["items"][0]
+        assert item["id"] == created["workflow"]["id"]
+        assert item["name"] == "nightly report"
+        assert [(s["key"], s["depends_on"]) for s in item["steps"]] == [
+            ("collect", []),
+            ("analyze", ["collect"]),
+            ("publish", ["analyze"]),
+        ]
+    finally:
+        store.close()
+
+
+def test_workflow_delete_disables_the_steps_and_keeps_the_runs(tmp_path):
+    """Deleting a workflow stops it; it does not unrun it.
+
+    The tasks are disabled and the history stays, because somebody deleting
+    a chain is stopping it -- not asking to forget that it ran.  The run
+    rows are the record that outlives the graph.
+    """
+    store = make_store(tmp_path)
+    try:
+        tools = _handoff_tools(store, tmp_path)
+        created = tools._workflow_create("nightly report", _chain_steps())
+        workflow_id = created["workflow"]["id"]
+        tasks = store.step_tasks(workflow_id)
+        make_due(store, tasks["collect"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 4)
+        assert store.list_runs(tasks["collect"].id)
+
+        result = tools._workflow_delete(workflow_id)
+
+        assert result["ok"] is True
+        assert result["deleted"] is True
+        assert result["disabled_task_ids"] == sorted(
+            task.id for task in tasks.values()
+        )
+        assert store.list_workflows() == []
+        # The tasks still exist, but can no longer fire.
+        after = {task.id: task for task in store.list_tasks()}
+        assert all(
+            task.id in after and after[task.id].enabled is False
+            for task in tasks.values()
+        )
+        # The history was not taken with it.
+        assert store.list_runs(tasks["collect"].id)
+        assert store.list_runs(tasks["analyze"].id)
+    finally:
+        store.close()
+
