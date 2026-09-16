@@ -3298,12 +3298,20 @@ function App() {
 
   const loadScheduleRuns = useCallback(
     async (taskId: string, selectLatest = false, silent = false) => {
+      const path = `/api/schedules/${encodeURIComponent(taskId)}/runs?limit=50`
       try {
         if (!silent) setScheduleRunsLoading(true)
-        const resp = await api(
-          `/api/schedules/${encodeURIComponent(taskId)}/runs?limit=50`,
-        )
-        const data = await resp.json()
+        // Same split as the list: the timer's refresh reports failure through
+        // state, and the one a click caused reports it to the user. Without
+        // this the open drawer re-toasted every two seconds for as long as the
+        // gateway stayed down, which is the failure the flag exists to replace.
+        const data = silent
+          ? await refreshJson(path)
+          : await (await api(path)).json()
+        if (data === null) {
+          setSchedulerStale(true)
+          return
+        }
         const runs = Array.isArray(data.runs) ? data.runs as ScheduleRun[] : []
         setScheduleRuns(runs)
         setSelectedSchedule(current => current && current.id === taskId
@@ -3315,11 +3323,13 @@ function App() {
             ? current
             : runs[0]?.id || null
         })
+      } catch {
+        setSchedulerStale(true)
       } finally {
         if (!silent) setScheduleRunsLoading(false)
       }
     },
-    [api],
+    [api, refreshJson],
   )
 
   const openScheduleDetails = useCallback((task: ScheduleInfo) => {
@@ -3460,6 +3470,33 @@ function App() {
     return () => { cancelled = true }
   }, [api, scheduleDetailOpen, selectedSchedule?.id, selectedScheduleRun?.id, selectedScheduleRun?.status])
 
+  /** Whether anything on this page can change in the next few seconds.
+   *
+   * Two ways for that to be true: a run is in flight, or one is about to start.
+   * Both are read off data already in hand, so neither needs a request to stay
+   * true -- which is the point, because the old cadence was decided by the very
+   * thing it was deciding.
+   *
+   * The scheduler being up is part of the question, not a safety net. A run in
+   * flight is worth watching because it will finish, and it is the scheduler
+   * that finishes it: with the service not running, a lease left behind by a
+   * previous process never expires, `in_flight` stays true, and the page would
+   * ask every two seconds forever about something that cannot move.
+   */
+  const schedulerWatchful = useMemo(() => {
+    if (view !== 'schedules' || schedulerHealth.status !== 'online') return false
+    const inFlight =
+      schedules.some(task => task.in_flight === true)
+      || scheduleRuns.some(run => run.status === 'running' || run.status === 'queued')
+    if (inFlight) return true
+    const untilNext = msUntilNextRun(schedules)
+    return (
+      untilNext !== null
+      && untilNext <= SCHEDULE_WATCH_WINDOW_MS
+      && untilNext > -SCHEDULE_OVERDUE_GRACE_MS
+    )
+  }, [scheduleRuns, schedulerHealth.status, schedules, view])
+
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
   //
@@ -3469,21 +3506,15 @@ function App() {
   // and a task that fired on its own schedule while the page sat open was never
   // seen. The page could only observe the runs it had started itself.
   //
-  // The cadence is now chosen from two facts that need no request to stay true:
-  // whether something is in flight, and how soon the next thing is due. A
-  // signal-triggered step has no clock, so neither fact covers it -- which is
-  // exactly why the idle cadence has to exist rather than the timer stopping.
+  // The cadence now comes from `schedulerWatchful`, which is also why the timer
+  // survives a poll: it used to depend on `schedules`, so every response tore
+  // the interval down and rebuilt it, and the real period was the cadence plus
+  // a render plus a round trip. A signal-triggered step has no clock, so no
+  // predicate covers it -- which is why the idle cadence exists at all rather
+  // than the timer stopping when nothing is imminent.
   useEffect(() => {
     if (view !== 'schedules') return
-    const inFlight =
-      schedules.some(task => task.in_flight === true)
-      || scheduleRuns.some(run => run.status === 'running' || run.status === 'queued')
-    const untilNext = msUntilNextRun(schedules)
-    const imminent =
-      untilNext !== null
-      && untilNext <= SCHEDULE_WATCH_WINDOW_MS
-      && untilNext > -SCHEDULE_OVERDUE_GRACE_MS
-    const cadence = inFlight || imminent ? SCHEDULE_FAST_POLL_MS : SCHEDULE_IDLE_POLL_MS
+    const cadence = schedulerWatchful ? SCHEDULE_FAST_POLL_MS : SCHEDULE_IDLE_POLL_MS
     const refresh = () => {
       void loadSchedules(true)
       // The graph draws each step's liveness from the workflow payload, so a
@@ -3502,8 +3533,7 @@ function App() {
     loadSchedules,
     loadWorkflows,
     scheduleDetailOpen,
-    scheduleRuns,
-    schedules,
+    schedulerWatchful,
     selectedSchedule,
     view,
   ])
@@ -3511,17 +3541,15 @@ function App() {
   // A countdown that does not tick is a timestamp with extra words. One second
   // is worth it only while something is about to happen; the rest of the time
   // the label is in coarser units and ten is plenty. Both readers -- the next
-  // run and the freshness line -- want the same clock, so there is one.
+  // run and the freshness line -- want the same clock, so there is one, and it
+  // asks the same question the poll does.
   useEffect(() => {
     if (view !== 'schedules') return
-    const untilNext = msUntilNextRun(schedules)
-    const imminent =
-      untilNext !== null && Math.abs(untilNext) <= SCHEDULE_WATCH_WINDOW_MS
     const tick = () => setClock(Date.now())
     tick()
-    const timer = window.setInterval(tick, imminent ? 1000 : 10_000)
+    const timer = window.setInterval(tick, schedulerWatchful ? 1000 : 10_000)
     return () => window.clearInterval(timer)
-  }, [schedules, view])
+  }, [schedulerWatchful, view])
 
   useEffect(() => {
     if (view !== 'schedules') return
