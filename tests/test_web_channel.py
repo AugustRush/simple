@@ -3092,3 +3092,184 @@ def test_web_pick_directory_returns_the_os_dialogs_answer(tmp_path, monkeypatch)
         cancelled = client.post("/api/fs/pick-directory")
         assert cancelled.status_code == 200
         assert cancelled.json() == {"cancelled": True, "workspace_root": ""}
+
+
+# ── What the automation page is told about liveness ─────────────────────────
+#
+# The page chooses how soon to ask again from `in_flight`, so these tests are
+# about a request cadence, not about a colour.  The two halves that matter are
+# the case where a run is on its way but not yet claimed, and the case where
+# the list is polled often enough that its size is worth arguing about.
+
+
+def _two_step_workflow():
+    from agent.scheduler import TriggerSpec, Workflow, WorkflowStep
+
+    def step(key, *, depends_on=(), trigger=None):
+        return WorkflowStep(
+            key=key,
+            name=key,
+            kind="agent_prompt",
+            payload={"prompt": f"do {key}"},
+            depends_on=list(depends_on),
+            trigger=trigger,
+            workspace_root="",
+            timeout_seconds=600,
+            delivery_mode="standalone",
+        )
+
+    return Workflow(
+        name="nightly",
+        steps=[
+            step("collect", trigger=TriggerSpec.daily("09:00", "UTC")),
+            step("analyze", depends_on=["collect"]),
+        ],
+    )
+
+
+def test_web_schedule_list_calls_a_queued_run_in_flight(tmp_path, monkeypatch):
+    """A run woken by a signal is `queued`, and has no `active_run_id` yet.
+
+    Both fields the page could otherwise derive liveness from say "idle" in
+    that window: the task has no active run, and its latest run is queued
+    rather than running.  A client deriving it for itself therefore stops
+    polling for the whole of a run that was started by the step above it --
+    which is precisely the run somebody watching a workflow is looking at.
+    The answer travels as its own field so the two sides cannot disagree.
+    """
+    from datetime import datetime, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore, task_signal_name
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    now = datetime(2026, 9, 16, 0, 0, tzinfo=timezone.utc)
+    workflow = store.create_workflow(_two_step_workflow(), now=now)
+    tasks = store.step_tasks(workflow.id)
+    upstream, subscriber = tasks["collect"], tasks["analyze"]
+
+    # The upstream run finished and said so; the subscriber is woken and
+    # queued, and nothing has claimed it yet.
+    store.emit_signal(task_signal_name(upstream.id, "succeeded"), source="manual")
+    store.deliver_signals(now=now)
+    queued = store.latest_run(subscriber.id)
+    assert queued is not None and queued.status == "queued"
+    store.close()
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        listed = {
+            item["id"]: item for item in client.get("/api/schedules").json()["tasks"]
+        }
+
+    waiting = listed[subscriber.id]
+    # The two facts a client could derive this from, both saying "idle".
+    assert waiting["active_run_id"] is None
+    assert waiting["latest_run"]["status"] == "queued"
+    assert waiting["in_flight"] is True
+    # An entry step with no run at all is not in flight, so the field is not
+    # simply "true for everything".
+    assert listed[upstream.id]["in_flight"] is False
+
+
+def test_web_workflow_steps_report_liveness_the_same_way_their_tasks_do(
+    tmp_path, monkeypatch
+):
+    """The graph draws each step's liveness, and it draws it from here.
+
+    A step whose task is queued has to read as queued in the graph too, or the
+    picture and the list below it disagree about the same run.
+    """
+    from datetime import datetime, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore, task_signal_name
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    now = datetime(2026, 9, 16, 0, 0, tzinfo=timezone.utc)
+    workflow = store.create_workflow(_two_step_workflow(), now=now)
+    tasks = store.step_tasks(workflow.id)
+    store.emit_signal(task_signal_name(tasks["collect"].id, "succeeded"), source="manual")
+    store.deliver_signals(now=now)
+    store.close()
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        steps = {
+            step["key"]: step
+            for step in client.get("/api/workflows").json()["workflows"][0]["steps"]
+        }
+
+    assert steps["analyze"]["latest_run"]["status"] == "queued"
+    assert steps["analyze"]["in_flight"] is True
+    assert steps["collect"]["in_flight"] is False
+    # The graph is polled at the same cadence as the list, so its embedded runs
+    # are trimmed the same way. The queued run does carry a snapshot -- it
+    # records the signal that woke it -- and it is still not sent here.
+    assert "config_snapshot" not in steps["analyze"]["latest_run"]
+
+
+def test_web_schedule_list_leaves_the_run_snapshot_to_the_run_history(
+    tmp_path, monkeypatch
+):
+    """The list is polled every couple of seconds; the snapshot is not read.
+
+    Measured on the real database, `config_snapshot` was 3373 of the 12123
+    bytes of ``/api/schedules`` -- 28% of a payload fetched thirty times a
+    minute, and read by nothing on that page: the two places that do read it,
+    the cascade badge and the model line, are fed by the run history.  It is
+    also the field that grows without bound, because a step's snapshot carries
+    its upstreams' report previews.
+    """
+    from datetime import datetime, timedelta, timezone
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    scheduled_for = datetime(2026, 9, 16, 0, 0, tzinfo=timezone.utc)
+    task = store.create_task(
+        NewScheduledTask(
+            name="daily report",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once(scheduled_for, "UTC"),
+            payload={"prompt": "Summarise today"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        ),
+        now=scheduled_for - timedelta(hours=1),
+    )
+    claimed = store.claim_due_tasks(now=scheduled_for + timedelta(seconds=2))[0]
+    store.complete_run(
+        task.id,
+        claimed.run.id,
+        finished_at=scheduled_for + timedelta(seconds=5),
+        status="succeeded",
+        summary="done",
+    )
+    store.close()
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        listed = client.get("/api/schedules").json()["tasks"][0]
+        history = client.get(f"/api/schedules/{task.id}/runs").json()["runs"][0]
+
+    assert listed["latest_run"]["status"] == "succeeded"
+    assert "config_snapshot" not in listed["latest_run"]
+    # Everything else the page reads off a run is still there -- the field is
+    # dropped, not the run.
+    assert listed["latest_run"]["summary"] == "done"
+    assert listed["latest_run"]["id"] == claimed.run.id
+    # And the drawer, which is the one reader, is still served.
+    assert history["config_snapshot"]["task_id"] == task.id

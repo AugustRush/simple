@@ -838,6 +838,22 @@ def execution_snapshot(task: ScheduledTask) -> dict[str, Any]:
 #: the point of use, in the middle of the night, one step into a chain.
 STEP_KINDS: tuple[str, ...] = ("agent_prompt", "message", "system_job")
 
+#: The statuses a run occupies while it is still going to happen, or is
+#: happening.
+#:
+#: ``queued`` belongs here and that is the whole point of naming the pair: a
+#: run woken by a signal is written down as ``queued`` first and only claimed
+#: on a later scheduler tick, so for that window the task has no
+#: ``active_run_id`` at all.  Anything asking "is this task busy?" from
+#: ``active_run_id`` alone therefore answers no during exactly the window
+#: somebody watching a workflow is looking at.
+#:
+#: The complement of :data:`TERMINAL_RUN_STATUSES` would not do instead: a
+#: status invented later would land in it without anybody deciding that it
+#: means "in flight".
+RUN_IN_FLIGHT_STATUSES: tuple[str, ...] = ("queued", "running")
+
+
 #: The one terminal status that means "the step's work happened".
 #:
 #: ``cancelled`` and ``interrupted`` are terminal but are *not* success, and

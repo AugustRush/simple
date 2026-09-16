@@ -220,6 +220,12 @@ interface ScheduleInfo {
   delivery_mode?: string
   delivery_target?: { target_type?: string; payload?: Record<string, any> }
   active_run_id?: string | null
+  //: Whether a run is queued or running. The backend computes it because a
+  //: run woken by a signal is written down as `queued` and has no
+  //: active_run_id until a later tick claims it, so a client deriving this
+  //: from the two fields below answers "no" during the one window that
+  //: matters -- the one somebody watching a workflow is looking at.
+  in_flight?: boolean
   latest_run?: ScheduleRun | null
   model_override?: string | null
   workspace_root?: string
@@ -249,6 +255,9 @@ interface WorkflowStepInfo {
   task_id: string
   enabled?: boolean
   unseen_attention?: number
+  //: See ScheduleInfo.in_flight: the graph reads a step's liveness from this,
+  //: not from latest_run.status, or a queued step would draw as idle.
+  in_flight?: boolean
   latest_run?: ScheduleRun | null
 }
 
@@ -1374,9 +1383,17 @@ function scheduleTriggerLabel(task: ScheduleInfo, tasks: ScheduleInfo[] = []): s
   return '未设置计划'
 }
 
-function scheduleRunStatusLabel(status?: string): string {
+/** What a run's status reads as.
+ *
+ * `queued` needs the run as well as the status, because it means two different
+ * things: a run woken by a signal is queued until a later scheduler tick claims
+ * it, and a retry is queued until its backoff has elapsed. Both are "not
+ * running yet"; only one of them is waiting to try again, and calling the first
+ * one a retry is a lie about what the run is doing.
+ */
+function scheduleRunStatusLabel(status?: string, run?: ScheduleRun | null): string {
   if (status === 'running') return '执行中'
-  if (status === 'queued') return '等待重试'
+  if (status === 'queued') return run?.retry_of_run_id ? '等待重试' : '排队等待'
   if (status === 'succeeded') return '执行成功'
   if (status === 'failed') return '执行失败'
   if (status === 'interrupted') return '已中断'
@@ -1424,17 +1441,121 @@ function describeCascade(run: ScheduleRun): string | null {
   return `信号链第 ${depth + 1} 层`
 }
 
+/** How far a moment is from now, in the units a person would say it in.
+ *
+ * Returns null for a value that will not parse, so each caller can fall back
+ * to the absolute timestamp it already has rather than inventing a distance.
+ */
+function describeSpan(iso: string, now: number): { overdue: boolean; text: string } | null {
+  const at = Date.parse(iso)
+  if (Number.isNaN(at)) return null
+  const delta = at - now
+  const total = Math.round(Math.abs(delta) / 1000)
+  const overdue = delta < 0
+  if (total < 60) return { overdue, text: `${total} 秒` }
+  // Round once, to minutes, and decompose from that. Rounding the remainder
+  // separately is how 6h59m59s becomes "6 小时 60 分" -- a reading that is both
+  // wrong and impossible, and one that shows up for a full minute out of every
+  // hour on a seven-hour wait.
+  const minutes = Math.round(total / 60)
+  if (minutes < 60) return { overdue, text: `${minutes} 分钟` }
+  if (total < 86400) {
+    const hours = Math.floor(minutes / 60)
+    const rest = minutes % 60
+    return { overdue, text: rest > 0 ? `${hours} 小时 ${rest} 分` : `${hours} 小时` }
+  }
+  return { overdue, text: `${Math.floor(total / 86400)} 天` }
+}
+
+/** How long until a moment.
+ *
+ * The absolute time is not thrown away -- it is the tooltip and the detail
+ * drawer. It is just not the primary reading, because "2026-09-16 15:25" makes
+ * the reader do arithmetic against a clock they are not looking at, and the
+ * question actually being asked of a scheduler is "when, from now".
+ *
+ * Past due is its own wording, not a negative countdown: it means the
+ * scheduler is behind, which is a different thing to report than "nearly".
+ */
+function describeCountdown(iso: string, now: number): string {
+  const span = describeSpan(iso, now)
+  if (!span) return formatDateTime(iso)
+  return span.overdue ? `已逾期 ${span.text}` : `${span.text}后`
+}
+
+/** How long ago a moment was.
+ *
+ * Separate from :func:`describeCountdown` because a run that happened an hour
+ * ago is not an hour overdue. Sharing the wording would turn every task's
+ * normal history into something that reads like a warning.
+ */
+function describeElapsed(iso: string, now: number): string {
+  const span = describeSpan(iso, now)
+  if (!span) return formatDateTime(iso)
+  return span.overdue ? `${span.text}前` : `${span.text}后`
+}
+
 /** How a task's next run reads, or the honest alternative when there is none.
  *
  * "暂无后续执行" is right for a task whose schedule has run out and wrong for
  * one that is waiting on a signal: the second will run, and saying otherwise
  * invites deleting a task that is working exactly as asked.
  */
-function describeNextRun(task: ScheduleInfo): string {
-  if (task.next_run_at) return formatDateTime(task.next_run_at)
+function describeNextRun(task: ScheduleInfo, now: number = Date.now()): string {
+  if (task.next_run_at) return describeCountdown(task.next_run_at, now)
   if (task.trigger_type === 'signal') return '等待信号触发'
   return '暂无后续执行'
 }
+
+/** How current the page's data is, in the words a person would use.
+ *
+ * The point of saying it at all is to tell "nothing has changed" apart from "I
+ * can no longer reach the server". On a page whose numbers only move when
+ * something happens, those two look exactly alike.
+ */
+function describeFreshness(
+  stale: boolean,
+  refreshedAt: number | null,
+  now: number,
+): string {
+  if (stale) return '状态未更新 · 重试中'
+  if (!refreshedAt) return '正在获取状态'
+  const seconds = Math.max(0, Math.round((now - refreshedAt) / 1000))
+  if (seconds < 3) return '状态已同步'
+  if (seconds < 60) return `${seconds} 秒前同步`
+  return `${Math.round(seconds / 60)} 分钟前同步`
+}
+
+/** Milliseconds until the soonest scheduled run, or null if none is set.
+ *
+ * Only tasks that are switched on and carry a time count. A signal-triggered
+ * step has no clock to predict, which is the reason the idle cadence has to
+ * exist rather than the page going quiet when nothing is imminent.
+ */
+function msUntilNextRun(tasks: ScheduleInfo[], now: number = Date.now()): number | null {
+  let soonest: number | null = null
+  for (const task of tasks) {
+    if (!task.enabled || !task.next_run_at) continue
+    const at = Date.parse(task.next_run_at)
+    if (Number.isNaN(at)) continue
+    const delta = at - now
+    if (soonest === null || delta < soonest) soonest = delta
+  }
+  return soonest
+}
+
+//: How often the automation page asks the server again. A run that is happening
+//: is worth watching closely. Nothing else is worth watching that closely --
+//: but "not closely" must not mean "never", which is what it used to mean.
+const SCHEDULE_FAST_POLL_MS = 2000
+const SCHEDULE_IDLE_POLL_MS = 15000
+//: How close a run has to be before it is worth watching at the fast cadence.
+const SCHEDULE_WATCH_WINDOW_MS = 60_000
+//: How far past due a run can be and still count as imminent. Beyond this the
+//: scheduler is stuck rather than busy, and the health badge is what says so;
+//: holding the page at two seconds would only spend requests on a problem that
+//: polling cannot fix.
+const SCHEDULE_OVERDUE_GRACE_MS = 120_000
 
 function scheduleRunStatusIcon(status?: string) {
   if (status === 'running') return <LoadingOutlined spin />
@@ -1718,6 +1839,15 @@ function App() {
   const [schedulePreview, setSchedulePreview] = useState<string[]>([])
   const [schedulePreviewError, setSchedulePreviewError] = useState('')
   const [schedulerHealth, setSchedulerHealth] = useState<SchedulerHealth>({ status: 'offline' })
+  //: Whether the last background refresh reached the server, and when one last
+  //: did. Kept as state rather than inferred from the data, because data that
+  //: stopped arriving and data that stopped changing are indistinguishable.
+  const [schedulerStale, setSchedulerStale] = useState(false)
+  const [schedulerRefreshedAt, setSchedulerRefreshedAt] = useState<number | null>(null)
+  //: A clock for the two things on this page that are about the present moment
+  //: rather than about the data: how long until the next run, and how long ago
+  //: this was last refreshed. Neither can be read off the payload.
+  const [clock, setClock] = useState(() => Date.now())
   const [scheduleDetailOpen, setScheduleDetailOpen] = useState(false)
   const [selectedSchedule, setSelectedSchedule] = useState<ScheduleInfo | null>(null)
   const [scheduleRuns, setScheduleRuns] = useState<ScheduleRun[]>([])
@@ -1967,6 +2097,24 @@ function App() {
     },
     [apiHeaders, messageApi],
   )
+
+  /** A refresh nobody asked for: same request, but a failure goes to the
+   *  caller instead of to the user.
+   *
+   * `api` reports every failure with a toast, which is right when a person has
+   * just clicked something and wrong when a timer did it. A gateway that went
+   * away would otherwise produce one toast per tick, and -- worse -- the caller
+   * would never find out that the numbers on screen had stopped being current.
+   */
+  const refreshJson = useCallback(async (path: string) => {
+    try {
+      const resp = await fetch(path, { headers: apiHeaders() })
+      if (!resp.ok) return null
+      return await resp.json()
+    } catch {
+      return null
+    }
+  }, [apiHeaders])
 
   const loadSessions = useCallback(async () => {
     try {
@@ -2873,44 +3021,72 @@ function App() {
     }
   }, [api])
 
-  const loadSchedules = useCallback(async (silent = false) => {
-    try {
-      if (!silent) setLoadingView(true)
-      const resp = await api('/api/schedules')
-      const data = await resp.json()
-      setSchedules(data.tasks || [])
-      setPermissionProfiles(
-        Array.isArray(data.permission_profiles) ? data.permission_profiles : [],
+  const applySchedules = useCallback((data: any) => {
+    setSchedules(data.tasks || [])
+    setPermissionProfiles(
+      Array.isArray(data.permission_profiles) ? data.permission_profiles : [],
+    )
+    setUnseenFailures(Number(data.unseen_attention || 0))
+    setSelectedSchedule(current => {
+      if (!current) return current
+      const refreshed = (data.tasks || []).find(
+        (item: ScheduleInfo) => item.id === current.id,
       )
-      setUnseenFailures(Number(data.unseen_attention || 0))
-      setSelectedSchedule(current => {
-        if (!current) return current
-        const refreshed = (data.tasks || []).find(
-          (item: ScheduleInfo) => item.id === current.id,
-        )
-        return refreshed || current
-      })
+      return refreshed || current
+    })
+  }, [])
+
+  // `silent` means "this refresh was not asked for": the caller is the timer,
+  // so there is no spinner to show and no toast worth raising. It is also the
+  // path that has to report failure through state instead, because a silent
+  // failure would otherwise be invisible -- the page would go on showing the
+  // last numbers it managed to fetch and look exactly like a quiet afternoon.
+  const loadSchedules = useCallback(async (silent = false) => {
+    if (!silent) setLoadingView(true)
+    try {
+      const data = silent
+        ? await refreshJson('/api/schedules')
+        : await (await api('/api/schedules')).json()
+      if (data === null) {
+        setSchedulerStale(true)
+        return
+      }
+      applySchedules(data)
+      setSchedulerStale(false)
+      setSchedulerRefreshedAt(Date.now())
+    } catch {
+      // The shared helper has already said what went wrong. What matters here
+      // is that what is on screen is now older than it looks.
+      setSchedulerStale(true)
     } finally {
       if (!silent) setLoadingView(false)
     }
-  }, [api])
+  }, [api, applySchedules, refreshJson])
 
   const loadWorkflows = useCallback(async (silent = false) => {
+    if (!silent) setLoadingView(true)
     try {
-      if (!silent) setLoadingView(true)
-      const resp = await api('/api/workflows')
-      const data = await resp.json()
+      const data = silent
+        ? await refreshJson('/api/workflows')
+        : await (await api('/api/workflows')).json()
+      if (data === null) {
+        setSchedulerStale(true)
+        return
+      }
       setWorkflows(Array.isArray(data.workflows) ? data.workflows : [])
       if (Array.isArray(data.permission_profiles) && data.permission_profiles.length) {
         setPermissionProfiles(data.permission_profiles)
       }
+      setSchedulerStale(false)
+      setSchedulerRefreshedAt(Date.now())
     } catch {
-      // Surfaced by the api helper; an unreachable list must not read as
-      // "you have no workflows", so the last known one is left standing.
+      // An unreachable list must not read as "you have no workflows", so the
+      // last known one is left standing -- and marked as no longer trustworthy.
+      setSchedulerStale(true)
     } finally {
       if (!silent) setLoadingView(false)
     }
-  }, [api])
+  }, [api, refreshJson])
 
   const loadSchedulerHealth = useCallback(async () => {
     try {
@@ -3165,7 +3341,9 @@ function App() {
     return schedules.filter(task => {
       const latestStatus = task.latest_run?.status || ''
       const statusMatches = scheduleStatusFilter === 'all'
-        || (scheduleStatusFilter === 'running' && (!!task.active_run_id || latestStatus === 'running'))
+        // `in_flight` rather than a status test, so that a run sitting queued
+        // behind its upstream counts as running -- which is what it is doing.
+        || (scheduleStatusFilter === 'running' && task.in_flight === true)
         || (scheduleStatusFilter === 'failed' && latestStatus === 'failed')
         || (scheduleStatusFilter === 'paused' && task.enabled === false)
       if (!statusMatches) return false
@@ -3282,29 +3460,68 @@ function App() {
     return () => { cancelled = true }
   }, [api, scheduleDetailOpen, selectedSchedule?.id, selectedScheduleRun?.id, selectedScheduleRun?.status])
 
+  // How often to ask the server again -- and, more to the point, that it is
+  // asked at all.
+  //
+  // This used to be "poll every two seconds if the last response said a run was
+  // in flight". The only thing that could ever change that answer was the poll
+  // itself, so a page opened while nothing was running never started asking,
+  // and a task that fired on its own schedule while the page sat open was never
+  // seen. The page could only observe the runs it had started itself.
+  //
+  // The cadence is now chosen from two facts that need no request to stay true:
+  // whether something is in flight, and how soon the next thing is due. A
+  // signal-triggered step has no clock, so neither fact covers it -- which is
+  // exactly why the idle cadence has to exist rather than the timer stopping.
   useEffect(() => {
     if (view !== 'schedules') return
-    const hasRunningTask = schedules.some(task =>
-      !!task.active_run_id || task.latest_run?.status === 'running',
-    ) || scheduleRuns.some(run => run.status === 'running')
-    if (!hasRunningTask) return
+    const inFlight =
+      schedules.some(task => task.in_flight === true)
+      || scheduleRuns.some(run => run.status === 'running' || run.status === 'queued')
+    const untilNext = msUntilNextRun(schedules)
+    const imminent =
+      untilNext !== null
+      && untilNext <= SCHEDULE_WATCH_WINDOW_MS
+      && untilNext > -SCHEDULE_OVERDUE_GRACE_MS
+    const cadence = inFlight || imminent ? SCHEDULE_FAST_POLL_MS : SCHEDULE_IDLE_POLL_MS
     const refresh = () => {
       void loadSchedules(true)
+      // The graph draws each step's liveness from the workflow payload, so a
+      // running workflow watched from this tab has to refresh that too --
+      // otherwise the steps sit still while the run behind them moves.
+      if (automationTab === 'workflows') void loadWorkflows(true)
       if (scheduleDetailOpen && selectedSchedule) {
         void loadScheduleRuns(selectedSchedule.id, false, true)
       }
     }
-    const timer = window.setInterval(refresh, 2000)
+    const timer = window.setInterval(refresh, cadence)
     return () => window.clearInterval(timer)
   }, [
+    automationTab,
     loadScheduleRuns,
     loadSchedules,
+    loadWorkflows,
     scheduleDetailOpen,
     scheduleRuns,
     schedules,
     selectedSchedule,
     view,
   ])
+
+  // A countdown that does not tick is a timestamp with extra words. One second
+  // is worth it only while something is about to happen; the rest of the time
+  // the label is in coarser units and ten is plenty. Both readers -- the next
+  // run and the freshness line -- want the same clock, so there is one.
+  useEffect(() => {
+    if (view !== 'schedules') return
+    const untilNext = msUntilNextRun(schedules)
+    const imminent =
+      untilNext !== null && Math.abs(untilNext) <= SCHEDULE_WATCH_WINDOW_MS
+    const tick = () => setClock(Date.now())
+    tick()
+    const timer = window.setInterval(tick, imminent ? 1000 : 10_000)
+    return () => window.clearInterval(timer)
+  }, [schedules, view])
 
   useEffect(() => {
     if (view !== 'schedules') return
@@ -5979,7 +6196,7 @@ function App() {
                     )}
                     {step.latest_run && (
                       <span className={`workflow-step-status status-${step.latest_run.status}`}>
-                        {scheduleRunStatusLabel(step.latest_run.status)}
+                        {scheduleRunStatusLabel(step.latest_run.status, step.latest_run)}
                       </span>
                     )}
                     <Button
@@ -6010,6 +6227,17 @@ function App() {
             <span className={`scheduler-health ${schedulerHealth.status === 'online' ? 'online' : 'offline'}`}>
               <i />{schedulerHealth.status === 'online' ? '调度器在线' : '调度器离线'}
             </span>
+            <Tooltip
+              title={
+                schedulerRefreshedAt
+                  ? `最近一次同步：${formatDateTime(new Date(schedulerRefreshedAt).toISOString(), true)}`
+                  : '尚未取得状态'
+              }
+            >
+              <span className={`schedule-freshness ${schedulerStale ? 'stale' : 'live'}`}>
+                <i />{describeFreshness(schedulerStale, schedulerRefreshedAt, clock)}
+              </span>
+            </Tooltip>
           </div>
           <p>
             {automationTab === 'tasks'
@@ -6695,7 +6923,13 @@ function App() {
               </div>
               <div className="schedule-detail-next">
                 <small>下次执行</small>
-                <strong>{describeNextRun(selectedSchedule)}</strong>
+                <strong>{describeNextRun(selectedSchedule, clock)}</strong>
+                {/* The countdown answers "when, from now"; this answers "when",
+                    which is the question when the two of you disagree about
+                    what time it is. */}
+                {selectedSchedule.next_run_at && (
+                  <span>{formatDateTime(selectedSchedule.next_run_at, true)}</span>
+                )}
               </div>
             </div>
 
@@ -6731,7 +6965,7 @@ function App() {
                           {scheduleRunStatusIcon(run.status)}
                         </span>
                         <span className="schedule-run-item-main">
-                          <strong>{scheduleRunStatusLabel(run.status)}</strong>
+                          <strong>{scheduleRunStatusLabel(run.status, run)}</strong>
                           <small>{run.started_at ? formatDateTime(run.started_at, true) : '等待开始'}</small>
                         </span>
                         {run.needs_attention && (
@@ -6760,7 +6994,7 @@ function App() {
                         <div>
                           <span className={`schedule-run-status status-${selectedScheduleRun.status}`}>
                             {scheduleRunStatusIcon(selectedScheduleRun.status)}
-                            {scheduleRunStatusLabel(selectedScheduleRun.status)}
+                            {scheduleRunStatusLabel(selectedScheduleRun.status, selectedScheduleRun)}
                           </span>
                           <div
                             className="schedule-run-summary markdown"
@@ -6963,15 +7197,22 @@ function App() {
                 <div className="schedule-card-footer">
                   <span className={`schedule-run-status status-${latestRun?.status || 'pending'}`}>
                     {scheduleRunStatusIcon(latestRun?.status)}
-                    {scheduleRunStatusLabel(latestRun?.status)}
+                    {scheduleRunStatusLabel(latestRun?.status, latestRun)}
                   </span>
                   {latestRun?.duration_ms !== null && latestRun?.duration_ms !== undefined && (
                     <span>耗时 {formatScheduleDuration(latestRun.duration_ms)}</span>
                   )}
-                  <span>下次执行：{describeNextRun(task)}</span>
-                  {/* Same precision as 下次执行 beside it -- two timestamps on
-                      one line should not disagree about how much they know. */}
-                  {task.last_run_at && <span>上次执行：{formatDateTime(task.last_run_at)}</span>}
+                  {/* Both read as distances from now, so the two agree about
+                      what they are telling you. The exact times are one hover
+                      away rather than two lines of arithmetic apart. */}
+                  <span title={task.next_run_at ? formatDateTime(task.next_run_at, true) : undefined}>
+                    下次执行：{describeNextRun(task, clock)}
+                  </span>
+                  {task.last_run_at && (
+                    <span title={formatDateTime(task.last_run_at, true)}>
+                      上次执行：{describeElapsed(task.last_run_at, clock)}
+                    </span>
+                  )}
                   <Button type="text" size="small" icon={<FileTextOutlined />} className="schedule-card-detail-button">运行记录</Button>
                 </div>
               </Card>

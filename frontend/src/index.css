@@ -4094,6 +4094,15 @@ html[data-theme='dark'] .settings-save-button:disabled {
 .scheduler-health.online i { background:#43a675; box-shadow:0 0 0 3px rgba(67,166,117,.12); }
 .scheduler-health.offline { color:var(--red); }
 .scheduler-health.offline i { background:var(--red); }
+/* How current the numbers below are. It sits beside the health badge because
+   the two answer the two halves of the same question: whether the scheduler is
+   running, and whether this page is still hearing from it. */
+.schedule-freshness { display:inline-flex; align-items:center; gap:6px; color:var(--text-muted); font-size:10px; font-weight:600; }
+.schedule-freshness i { width:7px; height:7px; border-radius:50%; background:var(--text-muted); }
+.schedule-freshness.live { color:#2f7a57; }
+.schedule-freshness.live i { background:#43a675; }
+.schedule-freshness.stale { color:var(--amber, #b45309); }
+.schedule-freshness.stale i { background:var(--amber, #d97706); box-shadow:0 0 0 3px rgba(217,119,6,.14); }
 .schedule-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:14px; }
 .schedule-toolbar > .ant-input-affix-wrapper { width:min(360px, 100%); }
 .schedule-filter { display:flex; align-items:center; gap:2px; padding:3px; border:1px solid var(--border); border-radius:8px; background:var(--surface-raised); }
@@ -4205,6 +4214,7 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 .schedule-detail-next { display:flex; flex:0 0 auto; flex-direction:column; align-items:flex-end; gap:4px; padding-top:2px; }
 .schedule-detail-next small { color:var(--text-muted); font-size:10px; }
 .schedule-detail-next strong { color:var(--text-secondary); font-size:11px; font-weight:600; white-space:nowrap; }
+.schedule-detail-next span { color:var(--text-muted); font-size:10px; white-space:nowrap; }
 .schedule-detail-loading { display:flex; align-items:center; justify-content:center; gap:10px; min-height:260px; color:var(--text-muted); font-size:12px; }
 .schedule-runs-empty { padding:72px 20px; }
 .schedule-detail-grid { display:grid; grid-template-columns:260px minmax(0, 1fr); min-height:calc(100vh - 178px); }

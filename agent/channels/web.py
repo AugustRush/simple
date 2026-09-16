@@ -27,7 +27,11 @@ from agent.channels.base import Channel, IncomingMessage
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
 from agent.pathing import path_contains
-from agent.scheduler.models import parse_task_signal, run_needs_attention
+from agent.scheduler.models import (
+    RUN_IN_FLIGHT_STATUSES,
+    parse_task_signal,
+    run_needs_attention,
+)
 from agent.session_service import SessionService
 
 logger = logging.getLogger(__name__)
@@ -108,7 +112,31 @@ def _web_session_upload_dir(session_id: str) -> Path:
         return shared.AGENT_HOME / "web" / "sessions" / "unknown" / "uploads"
 
 
-def _scheduler_run_payload(run: Any) -> dict[str, Any]:
+def _task_in_flight(task: Any, latest_run: Any = None) -> bool:
+    """Whether this task has a run that is going to happen, or is happening.
+
+    Answered here rather than left to the client because the client uses it to
+    decide how often to ask again, and a client that re-derives it from
+    ``active_run_id`` gets it wrong for a signal-woken run: that run is written
+    down as ``queued`` and has no ``active_run_id`` until a later tick claims
+    it.  One definition, one place to be wrong.
+    """
+    if getattr(task, "active_run_id", None):
+        return True
+    return str(getattr(latest_run, "status", "") or "") in RUN_IN_FLIGHT_STATUSES
+
+
+def _scheduler_run_payload(run: Any, *, with_snapshot: bool = True) -> dict[str, Any]:
+    """One run, as the interface reads it.
+
+    *with_snapshot* is off for the copies embedded in a list: the run's config
+    snapshot is the largest field it has, it is read only by the run-detail
+    drawer, and that drawer is fed by the run-history endpoint rather than by
+    the list.  Sending it with every task on every poll is the difference
+    between a list payload that is mostly answer and one that is mostly a
+    field nobody looks at -- and it is the part that grows, because a step's
+    snapshot now carries its upstreams' report previews.
+    """
     output_path = str(getattr(run, "output_path", "") or "").strip()
     output_available = False
     if output_path:
@@ -121,7 +149,7 @@ def _scheduler_run_payload(run: Any) -> dict[str, Any]:
     duration_ms = None
     if started_at is not None and finished_at is not None:
         duration_ms = max(0, round((finished_at - started_at).total_seconds() * 1000))
-    return {
+    payload = {
         "id": str(getattr(run, "id", "") or ""),
         "task_id": str(getattr(run, "task_id", "") or ""),
         "status": str(getattr(run, "status", "") or ""),
@@ -149,7 +177,6 @@ def _scheduler_run_payload(run: Any) -> dict[str, Any]:
             else None
         ),
         "needs_attention": run_needs_attention(run),
-        "config_snapshot": dict(getattr(run, "config_snapshot", {}) or {}),
         "output_available": output_available,
         "output_url": (
             _scheduler_output_url(
@@ -161,6 +188,9 @@ def _scheduler_run_payload(run: Any) -> dict[str, Any]:
             else ""
         ),
     }
+    if with_snapshot:
+        payload["config_snapshot"] = dict(getattr(run, "config_snapshot", {}) or {})
+    return payload
 
 
 def _scheduler_output_url(task_id: str, run_id: str, output_path: str) -> str:
@@ -209,12 +239,19 @@ def _scheduler_task_payload(
         "step_key": str(getattr(task, "step_key", "") or ""),
         "unseen_attention": int(unseen_attention or 0),
         "active_run_id": task.active_run_id,
+        # The client uses this to choose how soon to ask again, so it travels
+        # as an answer rather than as the two fields it is derived from.
+        "in_flight": _task_in_flight(task, latest_run),
         "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
         "last_run_at": task.last_run_at.isoformat() if task.last_run_at else None,
         "last_success_at": (
             task.last_success_at.isoformat() if task.last_success_at else None
         ),
-        "latest_run": _scheduler_run_payload(latest_run) if latest_run else None,
+        "latest_run": (
+            _scheduler_run_payload(latest_run, with_snapshot=False)
+            if latest_run
+            else None
+        ),
     }
 
 
@@ -257,7 +294,12 @@ def _workflow_payload(
                 "task_id": task_id,
                 "enabled": bool(task.enabled) if task is not None else False,
                 "unseen_attention": unseen,
-                "latest_run": _scheduler_run_payload(latest) if latest else None,
+                "in_flight": _task_in_flight(task, latest) if task is not None else False,
+                "latest_run": (
+                    _scheduler_run_payload(latest, with_snapshot=False)
+                    if latest
+                    else None
+                ),
             }
         )
     return {
