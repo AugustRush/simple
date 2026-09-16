@@ -238,3 +238,174 @@ def test_list_skills_observes_installs_on_disk(tmp_path):
     _install_skill_on_disk(root, "late-skill")
 
     assert [b.id for b in catalog.list_skills()] == ["late-skill"]
+
+
+# --- the skill switch -------------------------------------------------------
+#
+# A built-in skill ships with the package, so there is no deleting one the
+# person does not want.  The switch is the only answer, and it has to be a
+# *decision about a bundle* rather than a property of it: the bundle stays
+# loaded so the screen that offers the switch can still find it, while every
+# surface the model can reach acts as if it were not there.
+
+
+def _catalog_with_switch(tmp_path, *skill_ids, skill_config=None) -> SkillCatalog:
+    root = tmp_path / "skills"
+    root.mkdir(parents=True, exist_ok=True)
+    for skill_id in skill_ids:
+        _install_skill_on_disk(root, skill_id)
+    catalog = SkillCatalog(
+        user_root=root,
+        builtin_root=tmp_path / "builtin",
+        skill_config=skill_config,
+    )
+    catalog.load_all()
+    return catalog
+
+
+def test_a_skill_is_on_until_someone_says_otherwise(tmp_path):
+    catalog = _catalog_with_switch(tmp_path, "review", skill_config={})
+
+    assert catalog.is_enabled("review") is True
+    assert catalog.get("review") is not None
+    assert [b.id for b in catalog.list_skills()] == ["review"]
+
+
+def test_a_config_written_before_the_switch_existed_reads_as_all_on(tmp_path):
+    """No "skills" section means nobody has an opinion, not "all off"."""
+    catalog = _catalog_with_switch(tmp_path, "review", skill_config=None)
+
+    assert catalog.is_enabled("review") is True
+    assert [b.id for b in catalog.list_skills()] == ["review"]
+
+
+def test_a_saved_switch_is_honoured_at_construction(tmp_path):
+    catalog = _catalog_with_switch(
+        tmp_path, "review", skill_config={"review": {"enabled": False}}
+    )
+
+    assert catalog.is_enabled("review") is False
+    assert catalog.get("review") is None
+    assert [b.id for b in catalog.list_all_skills()] == ["review"]
+
+
+def test_switching_a_skill_off_takes_it_out_of_the_model_s_reach(tmp_path):
+    catalog = _catalog_with_switch(tmp_path, "review", "other", skill_config={})
+    catalog.set_enabled("review", False)
+
+    assert catalog.get("review") is None
+    assert [b.id for b in catalog.list_skills()] == ["other"]
+    listing = "\n".join(catalog.summary_lines())
+    assert "- review " not in listing
+    assert "- other " in listing
+
+
+def test_a_switched_off_skill_stays_findable_for_the_screen_that_lists_it(tmp_path):
+    """Otherwise switching one off is a one-way door: nothing left to click."""
+    catalog = _catalog_with_switch(tmp_path, "review", skill_config={})
+    catalog.set_enabled("review", False)
+
+    assert [b.id for b in catalog.list_all_skills()] == ["review"]
+    bundle = catalog.find_any("review")
+    assert bundle is not None
+    assert catalog.is_enabled(bundle) is False
+
+
+def test_a_switched_off_skill_can_be_switched_back_on(tmp_path):
+    catalog = _catalog_with_switch(tmp_path, "review", skill_config={})
+
+    catalog.set_enabled("review", False)
+    assert catalog.get("review") is None
+
+    catalog.set_enabled("review", True)
+    assert catalog.get("review") is not None
+    assert [b.id for b in catalog.list_skills()] == ["review"]
+
+
+def test_switching_a_skill_off_asks_for_the_prompt_to_be_rebuilt(tmp_path):
+    """The switch has to land without restarting the agent.
+
+    The runtime recomposes the prompt whenever ``consume_dirty`` reports a
+    change, so marking the catalog dirty *is* the whole of taking effect.
+    """
+    catalog = _catalog_with_switch(tmp_path, "review", skill_config={})
+    assert catalog.consume_dirty() is False
+
+    catalog.set_enabled("review", False)
+
+    assert catalog.consume_dirty() is True
+    assert catalog.consume_dirty() is False
+
+
+def test_a_refusal_says_which_kind_of_missing_it_is(tmp_path):
+    """"not found" and "switched off" send the reader to different places."""
+    catalog = _catalog_with_switch(tmp_path, "review", skill_config={})
+    registry = ToolRegistry()
+    catalog.register_tools(registry)
+    catalog.set_enabled("review", False)
+
+    off = _call(registry, "activate_skill", {"skill_name": "review"})
+    assert off["ok"] is False
+    assert "review" in off["error"]
+    assert "switched off" in off["error"]
+
+    typo = _call(registry, "activate_skill", {"skill_name": "revieq"})
+    assert typo["ok"] is False
+    assert "not found" in typo["error"]
+
+
+def test_the_tools_that_read_a_bundle_refuse_a_switched_off_one(tmp_path):
+    catalog = _catalog_with_switch(tmp_path, "review", skill_config={})
+    registry = ToolRegistry()
+    catalog.register_tools(registry)
+    catalog.set_enabled("review", False)
+
+    files = _call(registry, "list_skill_files", {"skill_name": "review"})
+    assert files["ok"] is False
+    assert "switched off" in files["error"]
+
+    read = _call(registry, "read_skill_file", {"skill_name": "review", "path": "SKILL.md"})
+    assert read["ok"] is False
+    assert "switched off" in read["error"]
+
+
+def test_a_switched_off_skill_can_still_be_edited_and_deleted(tmp_path):
+    """Managing a skill and using it are different questions."""
+    catalog = _catalog_with_switch(tmp_path, "review", skill_config={})
+    registry = ToolRegistry()
+    catalog.register_tools(registry)
+    catalog.set_enabled("review", False)
+
+    renamed = _call(
+        registry,
+        "update_skill",
+        {"skill_id": "review", "description": "still editable"},
+    )
+    assert renamed["ok"] is True
+    assert catalog.find_any("review").description == "still editable"
+
+    removed = _call(registry, "delete_skill", {"skill_id": "review"})
+    assert removed["ok"] is True
+    assert catalog.find_any("review") is None
+
+
+def test_deleting_a_skill_throws_its_switch_away_with_it(tmp_path):
+    """An id can be reused; the new skill must not arrive already off."""
+    root = tmp_path / "skills"
+    root.mkdir(parents=True)
+    _install_skill_on_disk(root, "review")
+    switches: dict = {}
+    catalog = SkillCatalog(
+        user_root=root, builtin_root=tmp_path / "builtin", skill_config=switches
+    )
+    catalog.load_all()
+    registry = ToolRegistry()
+    catalog.register_tools(registry)
+    catalog.set_enabled("review", False)
+
+    _call(registry, "delete_skill", {"skill_id": "review"})
+    assert "review" not in switches
+
+    _install_skill_on_disk(root, "review", body="A different review.")
+    assert catalog.get("review") is not None
+    assert catalog.is_enabled("review") is True

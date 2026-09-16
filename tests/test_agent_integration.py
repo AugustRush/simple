@@ -5028,9 +5028,14 @@ def test_base_agent_runs_internal_parallel_orchestration_without_public_tool_exp
     assert "run_rendezvous_round" not in registry.list_tools()
 
 
-def test_remote_agent_skill_is_loaded_by_default(
-    monkeypatch, tmp_path
-):
+def test_every_builtin_skill_ships_and_is_loaded(monkeypatch, tmp_path):
+    """The shipped skills are the loaded skills, whatever they are.
+
+    Written against the directory rather than against a list of names: a test
+    that names one skill goes stale the moment that skill is deleted, and the
+    guarantee worth having is the general one -- every bundle in the package's
+    skills directory is discovered, attributed to the package, and read.
+    """
     import agent as agent_module
 
     cfg = _minimal_cfg()
@@ -5047,12 +5052,23 @@ def test_remote_agent_skill_is_loaded_by_default(
     monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
     components = agent_module._build_components(cfg)
-    bundle = components["skill_catalog"].get("remote-agent")
+    catalog = components["skill_catalog"]
 
-    assert bundle is not None
-    assert bundle is not None
-    assert bundle.source == "builtin"
-    assert "ssh" in bundle.body.lower()
+    shipped = {
+        path.parent.relative_to(agent_module.BUILTIN_SKILLS_DIR).as_posix()
+        for path in agent_module.BUILTIN_SKILLS_DIR.rglob("SKILL.md")
+    }
+    assert shipped, "the package ships no skills; this test would prove nothing"
+
+    loaded = {
+        bundle.id: bundle
+        for bundle in catalog.list_skills()
+        if bundle.source == "builtin"
+    }
+    assert set(loaded) == shipped
+    for bundle in loaded.values():
+        assert bundle.body.strip()
+        assert bundle.description.strip()
 
 
 def test_base_agent_runs_internal_pipeline_with_summary_only(monkeypatch):

@@ -178,6 +178,8 @@ interface SkillInfo {
   description?: string
   source?: string
   user_invocable?: boolean
+  /** False when the skill is switched off in config.json. */
+  enabled?: boolean
 }
 
 interface CommandInfo {
@@ -3962,6 +3964,24 @@ function App() {
     })
   }
 
+  const toggleSkill = async (skill: SkillInfo, enabled: boolean) => {
+    setSkills(prev =>
+      prev.map(item => (item.id === skill.id ? { ...item, enabled } : item)),
+    )
+    try {
+      await api(`/api/skills/${encodeURIComponent(skill.id)}/toggle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      messageApi.success(enabled ? '技能已启用' : '技能已停用')
+    } catch {
+      setSkills(prev =>
+        prev.map(item => (item.id === skill.id ? { ...item, enabled: !enabled } : item)),
+      )
+    }
+  }
+
   const deleteSchedule = (task: ScheduleInfo) => {
     confirmResourceDeletion('任务', task.name, async () => {
       await api(`/api/schedules/${encodeURIComponent(task.id)}`, { method: 'DELETE' })
@@ -5880,6 +5900,8 @@ function App() {
         </div>
         <div className="skills-summary">
           <span><strong>{skills.length}</strong> 全部</span>
+          <span><strong>{skills.filter(item => item.enabled !== false).length}</strong> 已启用</span>
+          <span><strong>{skills.filter(item => item.enabled === false).length}</strong> 已停用</span>
           <span><strong>{skills.filter(item => item.user_invocable).length}</strong> 可调用</span>
           <span><strong>{skills.filter(item => !item.user_invocable).length}</strong> 内部</span>
         </div>
@@ -5920,19 +5942,32 @@ function App() {
         <Empty description="暂无技能" className="page-empty" />
       ) : (
         <div className="skills-list">
-          {filteredSkills.map(item => (
-            <div className="skill-row" key={item.id}>
+          {filteredSkills.map(item => {
+            // A skill that is off stays in this list on purpose: it is the
+            // only place the switch can be found again, and the only place
+            // that says why the skill the model was asked about is missing
+            // from the turn it just took.
+            const enabled = item.enabled !== false
+            return (
+            <div className={`skill-row ${enabled ? '' : 'skill-row-disabled'}`} key={item.id}>
               <span className="skill-row-icon"><ApiOutlined /></span>
               <div className="skill-row-main">
                 <div className="skill-row-title">
                   <strong>{item.name || item.id}</strong>
                   <Tag>{item.user_invocable ? '可调用' : '内部'}</Tag>
+                  {!enabled && <Tag color="default">已停用</Tag>}
                 </div>
                 <div className="skill-row-id">{item.id}</div>
                 <p>{item.description || '暂无描述'}</p>
               </div>
               <div className="skill-row-side">
                 <span className="skill-source">{item.source || '未知来源'}</span>
+                <Switch
+                  size="small"
+                  checked={enabled}
+                  aria-label={`${enabled ? '停用' : '启用'} ${item.name || item.id}`}
+                  onChange={value => toggleSkill(item, value)}
+                />
                 <Button
                   type="text"
                   size="small"
@@ -5942,7 +5977,8 @@ function App() {
                 {item.source === 'user' && <Button type="text" danger size="small" icon={<DeleteOutlined />} onClick={() => deleteSkill(item)} />}
               </div>
             </div>
-          ))}
+            )
+          })}
         </div>
       )}
     </div>

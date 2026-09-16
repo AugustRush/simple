@@ -3333,3 +3333,112 @@ def test_web_schedule_list_leaves_the_run_snapshot_to_the_run_history(
     assert listed["latest_run"]["id"] == claimed.run.id
     # And the drawer, which is the one reader, is still served.
     assert history["config_snapshot"]["task_id"] == task.id
+
+
+def _write_user_skill(root, skill_id: str) -> None:
+    skill_dir = root / skill_id
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        f"name: {skill_id}\n"
+        f"description: {skill_id} helper\n"
+        "user-invocable: true\n"
+        "---\n"
+        "Instructions.\n",
+        encoding="utf-8",
+    )
+
+
+def _skill_catalog_home(tmp_path, monkeypatch):
+    """A catalog rooted in tmp_path, with config.json kept out of the real home."""
+    from agent import shared
+    from agent.skills.catalog import SkillCatalog
+
+    monkeypatch.setattr(shared, "CONFIG_FILE", tmp_path / "config.json")
+    root = tmp_path / "skills"
+    root.mkdir(parents=True, exist_ok=True)
+    catalog = SkillCatalog(user_root=root, builtin_root=tmp_path / "builtin")
+    catalog.load_all()
+    return catalog, root
+
+
+def test_web_skill_toggle_persists_and_applies_without_a_restart(tmp_path, monkeypatch):
+    """Switching a skill off is a config write the running process obeys.
+
+    The listing the settings page reads has to keep showing the skill --
+    it is the only place the switch can be found again -- while the catalog
+    the model asks stops answering for it.  A nested id is used on purpose:
+    the toggle route has to be reached through the greedy {skill_id:path}
+    converter.
+    """
+    import json
+    from starlette.testclient import TestClient
+
+    catalog, root = _skill_catalog_home(tmp_path, monkeypatch)
+    _write_user_skill(root, "group/review")
+
+    channel = _channel()
+    channel.bind_runtime({}, {"skill_catalog": catalog})
+
+    with TestClient(channel.app) as client:
+        listed = client.get("/api/skills").json()["skills"]
+        assert [(s["id"], s["enabled"]) for s in listed] == [("group/review", True)]
+
+        off = client.post(
+            "/api/skills/group/review/toggle", json={"enabled": False}
+        )
+        assert off.status_code == 200
+        assert off.json() == {"ok": True, "id": "group/review", "enabled": False}
+
+        # Already true for the process that answered, and asking for the
+        # prompt to be recomposed is how "already true" reaches the model.
+        assert catalog.get("group/review") is None
+        assert catalog.consume_dirty() is True
+
+        listed = client.get("/api/skills").json()["skills"]
+        assert [(s["id"], s["enabled"]) for s in listed] == [("group/review", False)]
+
+        stored = json.loads((tmp_path / "config.json").read_text())
+        assert stored["skills"]["group/review"]["enabled"] is False
+
+        # A skill that is off is still a skill somebody can switch back on.
+        on = client.post("/api/skills/group/review/toggle", json={"enabled": True})
+        assert on.status_code == 200
+        assert catalog.get("group/review") is not None
+
+
+def test_web_skill_toggle_rejects_an_unknown_skill(tmp_path, monkeypatch):
+    from starlette.testclient import TestClient
+
+    catalog, _ = _skill_catalog_home(tmp_path, monkeypatch)
+    channel = _channel()
+    channel.bind_runtime({}, {"skill_catalog": catalog})
+
+    with TestClient(channel.app) as client:
+        missing = client.post("/api/skills/nope/toggle", json={"enabled": False})
+        assert missing.status_code == 404
+        body = client.post("/api/skills/nope/toggle", json={})
+        assert body.status_code == 400
+
+
+def test_web_deleting_a_switched_off_skill_takes_its_switch_with_it(tmp_path, monkeypatch):
+    import json
+    from starlette.testclient import TestClient
+
+    catalog, root = _skill_catalog_home(tmp_path, monkeypatch)
+    _write_user_skill(root, "review")
+    catalog.set_enabled("review", False)
+
+    channel = _channel()
+    channel.bind_runtime({}, {"skill_catalog": catalog})
+
+    with TestClient(channel.app) as client:
+        assert client.post(
+            "/api/skills/review/toggle", json={"enabled": False}
+        ).status_code == 200
+        assert client.delete("/api/skills/review").status_code == 200
+
+    assert not (root / "review").exists()
+    # Nothing left behind to meet the next skill that calls itself "review".
+    stored = json.loads((tmp_path / "config.json").read_text())
+    assert "review" not in (stored.get("skills") or {})

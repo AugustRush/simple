@@ -142,10 +142,26 @@ def prepare_user_message_for_skills(
 
 
 class SkillCatalog:
-    """Load skill bundles from user and built-in skill directories."""
+    """Load skill bundles from user and built-in skill directories.
+
+    A skill can be switched off in ``config.json`` (``skills.<id>.enabled``).
+    The switch is a *decision about a bundle*, not a property of it: built-in
+    skills ship with the package and cannot be deleted, so the only thing a
+    person can do with one they do not want is decline it here.  A disabled
+    bundle stays loaded and stays listed -- it has to be findable in order to
+    be switched back on -- and is simply not discoverable: it leaves the
+    prompt's skill list, its slash command, and every lookup by name.
+
+    Absent means enabled.  A skill nobody has expressed an opinion about is
+    not silently disabled by a missing entry, which is also what makes every
+    config written before this setting existed read correctly.
+    """
 
     def __init__(
-        self, user_root: Optional[Path] = None, builtin_root: Optional[Path] = None
+        self,
+        user_root: Optional[Path] = None,
+        builtin_root: Optional[Path] = None,
+        skill_config: Optional[dict[str, Any]] = None,
     ):
         self.user_root = user_root or shared.SKILLS_DIR
         self.builtin_root = builtin_root or shared.BUILTIN_SKILLS_DIR
@@ -155,6 +171,7 @@ class SkillCatalog:
         self._dirty: bool = False
         self._prompt_generation: int = 0
         self._user_root_signature: Optional[tuple[float, int, int]] = None
+        self._skill_config = skill_config if isinstance(skill_config, dict) else {}
 
     def load_all(self) -> None:
         self.user_root.mkdir(parents=True, exist_ok=True)
@@ -292,10 +309,70 @@ class SkillCatalog:
         return False
 
     def get(self, skill_ref: str) -> Optional[SkillBundle]:
+        """The named bundle, unless it is switched off.
+
+        Lookups answer for the *usable* set, so every caller -- activation,
+        the tools that read a bundle's files, explicit requests -- refuses a
+        disabled skill without having to remember to ask.  The bundle is still
+        there; ``find_any`` is how a caller tells "there is no such skill"
+        from "there is, and it is off", which are different sentences.
+        """
         resolved = self.resolve_ref(skill_ref)
         if resolved is None:
             return None
         return self._skills.get(resolved)
+
+    def find_any(self, skill_ref: str) -> Optional[SkillBundle]:
+        """The named bundle whether or not it is enabled, or None."""
+        ref = str(skill_ref or "").strip()
+        if not ref:
+            return None
+        resolved = self._lookup_ref_any(ref)
+        if resolved is None:
+            self.refresh_if_stale()
+            resolved = self._lookup_ref_any(ref)
+        if resolved is None:
+            return None
+        return self._skills.get(resolved)
+
+    def is_enabled(self, bundle_or_id: Any) -> bool:
+        """Whether this bundle is switched on.
+
+        Takes either a bundle or an id because the two callers come from
+        different places: a listing walks bundles, a request has an id.
+        """
+        skill_id = (
+            bundle_or_id.id
+            if isinstance(bundle_or_id, SkillBundle)
+            else str(bundle_or_id or "")
+        )
+        entry = self._skill_config.get(skill_id)
+        if isinstance(entry, dict):
+            return bool(entry.get("enabled", True))
+        return True
+
+    def set_enabled(self, skill_id: str, enabled: bool) -> None:
+        """Switch a skill on or off, and make the change take effect now.
+
+        The value is kept in memory as well as returned to whoever writes it
+        to disk, so the running process answers with the new state before any
+        restart -- and ``invalidate`` is what makes the next turn recompose
+        the prompt instead of reusing the one built when the skill was off.
+        """
+        self._skill_config[skill_id] = {"enabled": bool(enabled)}
+        self.invalidate()
+
+    def forget(self, skill_id: str) -> None:
+        """Drop the switch recorded for a skill that no longer exists.
+
+        An id can come back -- a user recreates the skill, a plugin ships it
+        -- and it would then arrive already switched off, with nothing on
+        screen to explain why. The switch belongs to the bundle it was thrown
+        for, so it goes when the bundle does.
+        """
+        if skill_id in self._skill_config:
+            del self._skill_config[skill_id]
+            self.invalidate()
 
     def resolve_ref(self, skill_ref: str) -> Optional[str]:
         ref = skill_ref.strip()
@@ -310,15 +387,42 @@ class SkillCatalog:
             return self._lookup_ref(ref)
         return None
 
-    def _lookup_ref(self, ref: str) -> Optional[str]:
+    def _lookup_ref_any(self, ref: str) -> Optional[str]:
+        """Resolve a ref against everything loaded, switch or no switch."""
         if ref in self._skills:
             return ref
         return self._aliases.get(ref)
 
+    def _lookup_ref(self, ref: str) -> Optional[str]:
+        """Resolve a ref against the skills that can be used right now."""
+        found = self._lookup_ref_any(ref)
+        if found is None or not self.is_enabled(found):
+            return None
+        return found
+
     def list_skills(self) -> list[SkillBundle]:
-        # Every discovery surface (/skills, slash-command routing, the web
-        # skill list, the prompt listing) goes through here, so the disk
-        # check belongs here rather than at each caller.
+        """Every skill that can be used right now.
+
+        Every discovery surface (slash-command routing, the prompt listing,
+        the command list) goes through here, so the disk check belongs here
+        rather than at each caller -- and so does the switch: a surface that
+        had to remember to filter would be a surface that one day forgets.
+        ``list_all_skills`` is the way to see the switched-off ones.
+        """
+        self.refresh_if_stale()
+        return [
+            self._skills[key]
+            for key in sorted(self._skills)
+            if self.is_enabled(self._skills[key])
+        ]
+
+    def list_all_skills(self) -> list[SkillBundle]:
+        """Every skill on disk, switched off ones included.
+
+        For the screens that manage skills rather than use them: a skill that
+        cannot be found after being switched off could never be switched back
+        on, which is how a switch turns into a one-way door.
+        """
         self.refresh_if_stale()
         return [self._skills[key] for key in sorted(self._skills)]
 
@@ -350,20 +454,40 @@ class SkillCatalog:
             return f"plugin://{plugin_name}/{bundle.id}"
         return f"{bundle.source}://{bundle.id}"
 
+    def _unusable_reason(self, skill_name: str) -> str:
+        """Why this name cannot be used, as a sentence for the caller.
+
+        "not found" and "switched off" are different answers, and a refusal
+        that reports the first when the second is true sends the reader
+        hunting for a typo in a name that is spelled correctly.  Says which
+        switch to turn when it can, since the person who turned it off may
+        not be the person reading this.
+        """
+        bundle = self.find_any(skill_name)
+        if bundle is None:
+            return f"Skill '{skill_name}' not found"
+        return (
+            f"Skill '{bundle.id}' is switched off; "
+            "turn it back on in the skills list to use it"
+        )
+
     def register_tools(self, registry: ToolRegistry) -> None:
         self._registry = registry
 
         async def activate_skill(skill_name: str) -> dict[str, Any]:
             bundle = self.get(skill_name)
             if bundle is None:
-                available = list(self._skills.keys())
+                # Only the skills that could actually be activated are worth
+                # suggesting: offering a switched-off name answers the typo
+                # with a dead end.
+                available = [item.id for item in self.list_skills()]
                 query = skill_name.strip()
                 candidates = (
                     difflib.get_close_matches(query, available, n=8, cutoff=0.6)
                     if query
                     else []
                 )
-                error = f"Skill '{skill_name}' not found"
+                error = self._unusable_reason(skill_name)
                 if candidates:
                     error = f"{error}. Did you mean: {', '.join(candidates)}"
                 return {
@@ -381,7 +505,7 @@ class SkillCatalog:
         def list_skill_files(skill_name: str, path: str = "") -> dict[str, Any]:
             bundle = self.get(skill_name)
             if bundle is None:
-                return {"ok": False, "error": f"Skill '{skill_name}' not found"}
+                return {"ok": False, "error": self._unusable_reason(skill_name)}
             filter_dir: str | None = None
             if path:
                 rel_path = Path(path)
@@ -416,7 +540,7 @@ class SkillCatalog:
         def read_skill_file(skill_name: str, path: str) -> dict[str, Any]:
             bundle = self.get(skill_name)
             if bundle is None:
-                return {"ok": False, "error": f"Skill '{skill_name}' not found"}
+                return {"ok": False, "error": self._unusable_reason(skill_name)}
             rel_path = Path(path)
             if rel_path.is_absolute():
                 return {
@@ -588,7 +712,10 @@ class SkillCatalog:
             user_invocable: Optional[bool] = None,
             disable_model_invocation: Optional[bool] = None,
         ) -> dict[str, Any]:
-            bundle = self.get(skill_id)
+            # Management, not use: a skill switched off is still a skill
+            # somebody may want to edit, rename, or throw away.  Only the
+            # tools that *use* a bundle ask whether it is on.
+            bundle = self.find_any(skill_id)
             if bundle is None:
                 return {"ok": False, "error": f"Skill '{skill_id}' not found"}
             if bundle.source != "user":
@@ -633,7 +760,10 @@ class SkillCatalog:
                 # authored, so a truncating write can destroy it outright.
                 shared._atomic_write_text(skill_file, content)
                 self.reload()
-                updated = self.get(bundle.id)
+                # Reported back by the same rule the lookup used: this is the
+                # management answer, so an edit to a switched-off skill still
+                # describes the skill it just edited.
+                updated = self.find_any(bundle.id)
                 return {
                     "ok": True,
                     "skill_id": bundle.id,
@@ -651,7 +781,7 @@ class SkillCatalog:
                 return {"ok": False, "error": f"Failed to update skill: {e}"}
 
         def delete_skill(skill_id: str) -> dict[str, Any]:
-            bundle = self.get(skill_id)
+            bundle = self.find_any(skill_id)
             if bundle is None:
                 return {"ok": False, "error": f"Skill '{skill_id}' not found"}
             if bundle.source != "user":
@@ -662,6 +792,7 @@ class SkillCatalog:
             try:
                 bundle_dir = bundle.path
                 shutil.rmtree(bundle_dir)
+                self.forget(bundle.id)
                 self.reload()
                 return {
                     "ok": True,
@@ -675,7 +806,7 @@ class SkillCatalog:
         def write_skill_file(
             skill_name: str, path: str, content: str
         ) -> dict[str, Any]:
-            bundle = self.get(skill_name)
+            bundle = self.find_any(skill_name)
             if bundle is None:
                 return {"ok": False, "error": f"Skill '{skill_name}' not found"}
             if bundle.source != "user":

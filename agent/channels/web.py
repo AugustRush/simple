@@ -1161,7 +1161,11 @@ class WebChannel(Channel):
         skills: list[dict[str, Any]] = []
         catalog = self._components.get("skill_catalog")
         if catalog is not None:
-            list_skills = getattr(catalog, "list_skills", None)
+            # The listing that manages skills, not the one the model reads:
+            # a switched-off skill has to stay visible, otherwise the switch
+            # that turned it off could never be found again.
+            list_skills = getattr(catalog, "list_all_skills", None)
+            is_enabled = getattr(catalog, "is_enabled", None)
             if callable(list_skills):
                 try:
                     for bundle in list_skills():
@@ -1176,6 +1180,9 @@ class WebChannel(Channel):
                                 ),
                                 "disable_model_invocation": bool(
                                     getattr(bundle, "disable_model_invocation", False)
+                                ),
+                                "enabled": (
+                                    bool(is_enabled(bundle)) if callable(is_enabled) else True
                                 ),
                                 "path": str(getattr(bundle, "path", "") or ""),
                             }
@@ -2422,11 +2429,62 @@ class WebChannel(Channel):
             }
         )
 
+    async def _toggle_skill(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        if not isinstance(body, dict) or "enabled" not in body:
+            return JSONResponse({"error": "enabled is required"}, status_code=400)
+        desired = bool(body["enabled"])
+
+        catalog = self._components.get("skill_catalog")
+        if catalog is None:
+            return JSONResponse({"error": "skill catalog is not available"}, status_code=503)
+        skill_id = str(request.path_params["skill_id"])
+        # The switch is thrown on a skill that may well be off already, so the
+        # lookup has to see the ones that are off -- otherwise the only
+        # position a switch could not be moved from is "off".
+        bundle = catalog.find_any(skill_id)
+        if bundle is None:
+            return JSONResponse({"error": "skill not found"}, status_code=404)
+
+        from agent.config import load_config, save_config
+
+        cfg, _ = load_config()
+        skills_cfg = cfg.get("skills")
+        if not isinstance(skills_cfg, dict):
+            skills_cfg = {}
+            cfg["skills"] = skills_cfg
+        entry = skills_cfg.get(bundle.id)
+        if not isinstance(entry, dict):
+            entry = {}
+            skills_cfg[bundle.id] = entry
+        entry["enabled"] = desired
+        try:
+            save_config(cfg)
+        except Exception as exc:
+            return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
+
+        # Applied in memory too, and that is the whole of it. Unlike a plugin,
+        # whose tools and MCP servers have to be rebuilt, a skill switch only
+        # changes what the prompt says is available: marking the catalog dirty
+        # recomposes the prompt before the next turn, for sessions that are
+        # already open, without rebuilding their runtime underneath them.
+        catalog.set_enabled(bundle.id, desired)
+        return JSONResponse({"ok": True, "id": bundle.id, "enabled": desired})
+
     async def _delete_skill(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
         if not self._authorized(request): return JSONResponse({"error": "unauthorized"}, status_code=401)
         catalog = self._components.get("skill_catalog")
-        bundle = catalog.get(str(request.path_params["skill_id"])) if catalog is not None else None
+        # Management, so switched-off skills count: deleting one is how a
+        # person gets rid of a skill they turned off and no longer want.
+        bundle = catalog.find_any(str(request.path_params["skill_id"])) if catalog is not None else None
         if bundle is None: return JSONResponse({"error": "skill not found"}, status_code=404)
         if getattr(bundle, "source", "") != "user": return JSONResponse({"error": "内置技能不能删除"}, status_code=403)
         try:
@@ -2435,10 +2493,32 @@ class WebChannel(Channel):
             root = Path(getattr(catalog, "user_root", shared.SKILLS_DIR)).resolve()
             if root not in path.parents: return JSONResponse({"error": "invalid skill path"}, status_code=400)
             shutil.rmtree(path)
+            catalog.forget(bundle.id)
+            self._forget_skill_config(bundle.id)
             catalog.reload()
             self._components["config_revision"] = int(self._components.get("config_revision", 0)) + 1
             return JSONResponse({"ok": True, "id": bundle.id})
         except Exception as exc: return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @staticmethod
+    def _forget_skill_config(skill_id: str) -> None:
+        """Drop a deleted skill's switch from config.json.
+
+        The id can be reused by a skill created later, and a stale "off" entry
+        would meet it with a state nobody chose and nothing on screen to
+        explain. Best-effort: the directory is already gone, and failing to
+        tidy the config must not turn a completed deletion into an error.
+        """
+        from agent.config import load_config, save_config
+
+        try:
+            cfg, _ = load_config()
+            skills_cfg = cfg.get("skills")
+            if isinstance(skills_cfg, dict) and skill_id in skills_cfg:
+                del skills_cfg[skill_id]
+                save_config(cfg)
+        except Exception:
+            pass
 
     async def _delete_plugin(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -3479,6 +3559,14 @@ class WebChannel(Channel):
                 methods=["POST"],
             ),
             Route("/api/plugins/{plugin_name}", self._delete_plugin, methods=["DELETE"]),
+            # Before /api/skills/{skill_id:path}: the path converter is greedy,
+            # so the toggle has to be offered the path first or a skill named
+            # "x/toggle" would swallow it.
+            Route(
+                "/api/skills/{skill_id:path}/toggle",
+                self._toggle_skill,
+                methods=["POST"],
+            ),
             Route("/api/skills/{skill_id:path}", self._delete_skill, methods=["DELETE"]),
             Route("/api/schedules", self._schedules, methods=["GET"]),
             Route("/api/schedules", self._create_schedule, methods=["POST"]),

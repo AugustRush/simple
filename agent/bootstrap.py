@@ -575,7 +575,15 @@ async def _build_components_async(
     if tavily_api_key:
         registry.set_context("tavily_api_key", tavily_api_key)
 
-    skill_catalog = skill_catalog_cls(user_root=user_skills_dir)
+    skill_catalog = skill_catalog_cls(
+        user_root=user_skills_dir,
+        # The switches from config.json, so a skill turned off before this
+        # process started is off when it starts.  The rest of the file is
+        # irrelevant to the catalog, and a non-dict section reads as "no
+        # switches" rather than raising: a hand-edited config must not stop
+        # the agent from loading.
+        skill_config=cfg.get("skills"),
+    )
     skill_catalog.load_all()
     skill_catalog.register_tools(registry)
     user_tool_catalog = user_tool_catalog_cls(root=user_tools_dir)

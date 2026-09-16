@@ -203,6 +203,12 @@
       "enabled": false
     }
   },
+  "skills": {
+    "_readme": "Per-skill enable/disable. Use the skill id as key (the directory name, e.g. 'skill-manager'). Set enabled=false to switch a skill off without deleting it; it then leaves the prompt's skill list, its slash command and activate_skill. Absent means enabled.",
+    "_example_disabled": {
+      "enabled": false
+    }
+  },
   "user_tools": {
     "_readme": "Disabled by default because ~/.agent/tools/*.py is trusted Python code executed in-process during startup. Set enabled=true only for tools you trust.",
     "enabled": false

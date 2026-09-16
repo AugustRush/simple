@@ -803,7 +803,7 @@ uv run simple scheduler
 
 ```bash
 # Daily
-uv run simple schedule daily daily-summary \
+uv run simple schedule daily morning-recap \
   --time 09:00 --timezone Asia/Shanghai \
   --prompt "Summarize yesterday's progress"
 
@@ -1104,13 +1104,24 @@ User skills with the same ID override built-in or plugin-bundled skills.
 
 | Skill | Description |
 |---|---|
-| `daily-summary` | Generate structured daily/weekly summaries from context memory, session history, and scheduled tasks |
-| `remote-agent` | Delegate tasks to remote AI agents (Codex, Claude Code) on other machines via SSH |
+| `multi-agent-orchestration` | Plan and run several agents on one request |
 | `skill-manager` | Create, update, delete, and manage user skill bundles |
+
+Built-in skills ship with the package and cannot be deleted from the
+interface. Turn one off with the switch in the Skills view, or in
+`config.json`:
+
+```json
+{ "skills": { "skill-manager": { "enabled": false } } }
+```
+
+A skill that is off disappears from the prompt's skill list, from slash
+commands, and from `activate_skill`, which refuses it by name. It stays in
+the Skills view so it can be switched back on.
 
 ### Hot-reload
 
-After creating, updating, or deleting a skill, the catalog reloads automatically. The system prompt is recomposed before the next turn — no restart required.
+After creating, updating, or deleting a skill, the catalog reloads automatically. The system prompt is recomposed before the next turn — no restart required. Switching a skill on or off takes effect the same way: the next turn sees the change, and the switch itself is answered immediately.
 
 ## Plugins
 
@@ -1287,7 +1298,7 @@ server diagnostics cannot overwrite the interactive CLI input line.
 │   ├── security/       # Shell command blocking; sandbox/ = policy + per-OS backends
 │   ├── skills/         # SkillBundle, SkillCatalog, skill parsing, hot-reload
 │   ├── plugins/        # PluginCatalog, AgentPlugin protocol, HookResult, lifecycle
-│   ├── _builtin/       # Built-in plugins (evolution) and skills (daily-summary, etc.)
+│   ├── _builtin/       # Built-in plugins (evolution) and skills (skill-manager, etc.)
 │   ├── cli.py          # Typer CLI (interactive, gateway, scheduler, config, memory)
 │   ├── config.py       # Config loading, validation, ModelClientFactory, system prompt
 │   ├── bootstrap.py    # Component wiring from config

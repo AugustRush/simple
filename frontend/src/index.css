@@ -2099,6 +2099,14 @@ html[data-theme='light'] .settings-json {
   color: var(--text-muted);
 }
 
+/* A skill that is switched off stays in the list: the switch is the only way
+   back on. Dim the label so the row reads as inert, but leave the switch
+   itself at full contrast. */
+.skill-row-disabled .skill-row-icon,
+.skill-row-disabled .skill-row-main {
+  opacity: .55;
+}
+
 .card-kicker {
   color: var(--text-muted);
   font-size: 10px;

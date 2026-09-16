@@ -288,7 +288,7 @@ def _validate_config(cfg: dict) -> list[str]:
     known_sections = frozenset({
         "active_provider", "providers", "model", "max_tokens",
         "memory", "orchestration", "evolution", "scheduler", "audio",
-        "mcp_servers", "context", "plugins", "channels", "user_tools",
+        "mcp_servers", "context", "plugins", "skills", "channels", "user_tools",
         "system_prompt_file", "output_dir", "tavily_api_key",
         "assistant_identity", "shell_blocked_commands",
         "shell_allowed_commands",
