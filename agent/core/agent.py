@@ -13,7 +13,7 @@ import json
 import logging
 from pathlib import Path
 import time
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 
 import agent as agent_module
 from agent import shared
@@ -48,6 +48,9 @@ from agent.security.content_filter import (
     filter_tool_results,
     summarize_tool_result,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from agent.core.transport import ModelTransport
 
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
@@ -292,6 +295,7 @@ class BaseAgent:
         api_format: str = "anthropic",
         supports_vision: bool = False,
         context_window: int | None = None,
+        transport: Optional["ModelTransport"] = None,
     ):
         self.client = client
         self.registry = registry
@@ -304,8 +308,17 @@ class BaseAgent:
             if context_window is not None
             else shared.DEFAULT_CONTEXT_WINDOW
         )
-        from agent.core.transport import build_transport
-        self._transport = build_transport(api_format, client)
+        # The transport is the only place provider dispatch happens, so an
+        # agent that must route per-call model overrides — anything built
+        # from a multi-provider config — receives its RoutingTransport here
+        # rather than having one assigned after construction.  A post-hoc
+        # assignment is invisible to everything the constructor derives,
+        # sub-agents included, which is how a sub-agent came to hold a bare
+        # active-provider transport while running another provider's model.
+        if transport is None:
+            from agent.core.transport import build_transport
+            transport = build_transport(api_format, client)
+        self._transport: "ModelTransport" = transport
         self.context_assembler = ContextAssembler()
         self.context_manager: Optional[ContextManager] = None
         self.plugin_catalog: Optional["PluginCatalog"] = None
@@ -3477,6 +3490,13 @@ class BaseAgent:
                 ]
 
     def _create_sub_agent(self, sub_registry: "ToolRegistry") -> "BaseAgent":
+        # Inherit the parent's transport rather than building one from
+        # ``self.client``.  The transport carries the model → provider routing
+        # table, and a sub-agent runs on the very model this turn resolved, so
+        # rebuilding it here would pin the sub-agent to the active provider:
+        # a per-turn override naming another provider's model (the composer
+        # dropdown offers every provider's models) would be sent to the active
+        # provider's endpoint and rejected with a 400.
         sub_agent = BaseAgent(
             self.client,
             sub_registry,
@@ -3485,6 +3505,7 @@ class BaseAgent:
             api_format=self.api_format,
             supports_vision=self.supports_vision,
             context_window=self.context_window,
+            transport=self._transport,
         )
         sub_agent.context_manager = self._context_manager_for()
         sub_agent.max_parallel_agents = self.max_parallel_agents

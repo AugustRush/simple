@@ -36,20 +36,40 @@ class _RecordingAnthropicTransport(AnthropicTransport):
     def __init__(self) -> None:
         super().__init__(client=None)
         self.created: list[str] = []
+        self.streamed: list[str] = []
+        self.chatted: list[str] = []
 
     async def create(self, *, model, max_tokens, system, messages, tools):
         self.created.append(model)
         return {"stop_reason": "end_turn", "owner": "anthropic-like"}
+
+    async def stream(self, *, model, max_tokens, system, messages, tools, callback):
+        self.streamed.append(model)
+        return {"stop_reason": "end_turn", "owner": "anthropic-like"}, "anthropic-like"
+
+    async def simple_chat(self, *, model, max_tokens, system, prompt):
+        self.chatted.append(model)
+        return "anthropic-like"
 
 
 class _RecordingOpenAITransport(OpenAITransport):
     def __init__(self) -> None:
         super().__init__(client=None)
         self.created: list[str] = []
+        self.streamed: list[str] = []
+        self.chatted: list[str] = []
 
     async def create(self, *, model, max_tokens, system, messages, tools):
         self.created.append(model)
         return {"choices": [{"finish_reason": "stop"}], "owner": "openai-like"}
+
+    async def stream(self, *, model, max_tokens, system, messages, tools, callback):
+        self.streamed.append(model)
+        return {"choices": [{"finish_reason": "stop"}]}, "openai-like"
+
+    async def simple_chat(self, *, model, max_tokens, system, prompt):
+        self.chatted.append(model)
+        return "openai-like"
 
 
 def test_routed_create_dispatches_by_model_owner():
@@ -199,3 +219,79 @@ def test_build_routing_transport_shares_cached_clients_across_rebuilds():
     # A changed credential must build a fresh client, not reuse the stale one.
     build_routing_transport(cfg_for("k2"), "anthropic", None, factory, client_cache=cache)
     assert made == ["k1", "k2"]
+
+
+def test_agent_transport_is_injectable_and_defaults_to_the_client():
+    """The transport is a construction dependency, not a post-hoc assignment.
+
+    Omitting it must keep building from ``(api_format, client)`` — that is
+    how every single-provider agent is made.
+    """
+    import agent as agent_module
+
+    injected = _RecordingAnthropicTransport()
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="m",
+        api_format="anthropic",
+        transport=injected,
+    )
+    assert agent._transport is injected
+
+    defaulted = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="m", api_format="openai"
+    )
+    assert isinstance(defaulted._transport, OpenAITransport)
+    assert not isinstance(defaulted._transport, RoutingTransport)
+
+
+def test_sub_agent_dispatches_foreign_model_to_its_owning_provider():
+    """A sub-agent must inherit the parent's routing table, not rebuild one.
+
+    A sub-agent runs on the turn's effective model, and a per-turn override
+    may name any configured provider's model — the composer dropdown offers
+    them all.  When the sub-agent built its transport from the parent's
+    *client* it got a bare active-provider transport, so the foreign model id
+    was sent to the active provider's endpoint, which rejected it with a 400
+    ("The supported API model names are ..., but you passed ...").
+    """
+    import agent as agent_module
+    from agent.core.agent import _active_agent_context
+
+    active = _RecordingAnthropicTransport()
+    foreign = _RecordingOpenAITransport()
+    routing = RoutingTransport(active, {"glm-5.3-flash": foreign})
+
+    parent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="deepseek-flash",
+        api_format="anthropic",
+        transport=routing,
+    )
+    # The turn resolved a model owned by another provider.
+    token = _active_agent_context.set(
+        agent_module.AgentContext(
+            system_prompt="system",
+            metadata={"model_override": "glm-5.3-flash"},
+        )
+    )
+    try:
+        child = parent._create_sub_agent(agent_module.ToolRegistry())
+        assert child._transport is routing
+        # A sub-agent's own loop streams; the lightweight summariser chats.
+        asyncio.run(
+            child._transport.stream(
+                model=child.model, max_tokens=16, system="s",
+                messages=[], tools=[], callback=lambda _t: None,
+            )
+        )
+        asyncio.run(child._call_llm("hi", system="s"))
+    finally:
+        _active_agent_context.reset(token)
+
+    assert foreign.streamed == ["glm-5.3-flash"]
+    assert foreign.chatted == ["glm-5.3-flash"]
+    assert active.streamed == []
+    assert active.chatted == []

@@ -158,6 +158,13 @@ async def _build_web_session_components(
         exclude_source_prefixes=("runtime:spawn",),
     )
     global_agent = global_components["agent"]
+    # Same per-call model routing as the global agent: a session may switch to
+    # any configured provider's model. SDK clients are shared through the
+    # process-lifetime cache so per-session rebuilds (config hot-reload) do
+    # not leak a connection pool per session per provider.  Handed to the
+    # constructor so the session's sub-agents inherit the routing table too.
+    from agent.core.transport import build_routing_transport
+
     agent = BaseAgent(
         global_components["client"],
         registry,
@@ -166,19 +173,13 @@ async def _build_web_session_components(
         api_format=global_agent.api_format,
         supports_vision=global_agent.supports_vision,
         context_window=global_agent.context_window,
-    )
-    # Same per-call model routing as the global agent: a session may switch to
-    # any configured provider's model. SDK clients are shared through the
-    # process-lifetime cache so per-session rebuilds (config hot-reload) do
-    # not leak a connection pool per session per provider.
-    from agent.core.transport import build_routing_transport
-
-    agent._transport = build_routing_transport(
-        session_cfg,
-        global_agent.api_format,
-        global_components["client"],
-        client_factory=_provider_client_factory,
-        client_cache=provider_client_cache,
+        transport=build_routing_transport(
+            session_cfg,
+            global_agent.api_format,
+            global_components["client"],
+            client_factory=_provider_client_factory,
+            client_cache=provider_client_cache,
+        ),
     )
     for name in (
         "max_parallel_agents",
@@ -598,6 +599,18 @@ async def _build_components_async(
             f"{len(mcp_server_configs)} configured server(s)[/dim]"
         )
 
+    # Route per-call model overrides to the provider that owns the model, so
+    # the UI's model dropdown can offer every configured provider's models.
+    # The active provider stays the default; unknown model ids keep today's
+    # behavior (sent to the active client).  The transport is handed to the
+    # constructor rather than assigned afterwards so everything the agent
+    # derives — sub-agents above all — sees the routing table from the start.
+    from agent.core.transport import build_routing_transport
+
+    # Process-lifetime SDK client cache shared with every web session's
+    # routing transport, so per-session rebuilds do not leak one connection
+    # pool per session per provider.
+    provider_client_cache: dict = {}
     agent = BaseAgent(
         client,
         registry,
@@ -606,23 +619,13 @@ async def _build_components_async(
         api_format=api_format,
         supports_vision=supports_vision,
         context_window=context_window,
-    )
-    # Route per-call model overrides to the provider that owns the model, so
-    # the UI's model dropdown can offer every configured provider's models.
-    # The active provider stays the default; unknown model ids keep today's
-    # behavior (sent to the active client).
-    from agent.core.transport import build_routing_transport
-
-    # Process-lifetime SDK client cache shared with every web session's
-    # routing transport, so per-session rebuilds do not leak one connection
-    # pool per session per provider.
-    provider_client_cache: dict = {}
-    agent._transport = build_routing_transport(
-        cfg,
-        api_format,
-        client,
-        client_factory=_provider_client_factory,
-        client_cache=provider_client_cache,
+        transport=build_routing_transport(
+            cfg,
+            api_format,
+            client,
+            client_factory=_provider_client_factory,
+            client_cache=provider_client_cache,
+        ),
     )
     agent.max_parallel_agents = max(
         1,
