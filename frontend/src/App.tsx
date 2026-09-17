@@ -2396,6 +2396,13 @@ function App() {
   const pendingMessageIdRef = useRef<string | null>(null)
   const pendingModelRef = useRef<string | null>(null)
   const queuedMessagesRef = useRef<QueuedMessage[]>([])
+  // How many messages this client has put on the wire. A REST snapshot that
+  // started before the latest send can be answered before the server applied
+  // that message, so its "idle" describes a moment that predates the turn.
+  const messageSendSeqRef = useRef(0)
+  // Whether the previous state snapshot already reported idle. See
+  // applyStreamingSnapshot for why one idle reading is not enough.
+  const idleSnapshotSeenRef = useRef(false)
   const streamIdRef = useRef<string | null>(null)
   const messagesRef = useRef<Message[]>([])
   const loadMessagesRequestRef = useRef(0)
@@ -2565,9 +2572,41 @@ function App() {
     }
   }, [api])
 
+  // Both REST reads (``loadMessages`` and ``loadSessionState``) report whether
+  // a turn is running, and both used to write that straight onto isStreaming.
+  // The write is only safe when the answer is "a turn is running": that is
+  // what brings the stop button back when a session that is already working is
+  // reopened. The other direction can be stale -- a fetch started before the
+  // latest send can be answered before the server applied that message, and is
+  // then read as "nothing is running". Taking that at face value is how the
+  // stop button vanished right after the first message of a brand new session:
+  // the socket had only just opened, so the snapshot the send itself triggered
+  // was answered while the server still had nothing to report.
+  //
+  // So an idle snapshot retires the turn only when it cannot be stale -- no
+  // send since it started -- and only after a second consecutive idle reading.
+  // Two readings cannot both predate the same send, whereas one can.
+  const applyStreamingSnapshot = useCallback(
+    (turnRunning: boolean, sendSeq: number) => {
+      if (turnRunning) {
+        idleSnapshotSeenRef.current = false
+        setIsStreaming(true)
+        return
+      }
+      if (sendSeq !== messageSendSeqRef.current) return
+      if (idleSnapshotSeenRef.current) {
+        setIsStreaming(false)
+        return
+      }
+      idleSnapshotSeenRef.current = true
+    },
+    [],
+  )
+
   const loadMessages = useCallback(
     async (sid: string) => {
       const requestId = ++loadMessagesRequestRef.current
+      const sendSeq = messageSendSeqRef.current
       try {
         const stateRequest = api(`/api/sessions/${encodeURIComponent(sid)}/state`)
           .then(resp => resp.json() as Promise<SessionState>)
@@ -2641,7 +2680,7 @@ function App() {
         setMessages(merged)
         if (state) setSessionState(state)
         else setSessionState(null)
-        setIsStreaming(operationActive)
+        applyStreamingSnapshot(operationActive, sendSeq)
       } catch {
         if (
           requestId !== loadMessagesRequestRef.current ||
@@ -2653,10 +2692,11 @@ function App() {
         setMessages([])
       }
     },
-    [api, makeId, token],
+    [api, applyStreamingSnapshot, makeId, token],
   )
 
   const loadSessionState = useCallback(async (sid: string) => {
+    const sendSeq = messageSendSeqRef.current
     try {
       const resp = await api(`/api/sessions/${encodeURIComponent(sid)}/state`)
       const data = (await resp.json()) as SessionState
@@ -2681,16 +2721,20 @@ function App() {
         // Restoring a session while its agent is still working should bring
         // back the generating state (and stop button) even before the first
         // snapshot/chunk arrives on the newly opened socket.
-        setIsStreaming(String(data.operation_state || 'idle') !== 'idle')
+        applyStreamingSnapshot(
+          String(data.operation_state || 'idle') !== 'idle',
+          sendSeq,
+        )
       }
     } catch {
       if (activeSessionRef.current === sid) {
         setSessionState(null)
         setResumingTaskId(null)
+        idleSnapshotSeenRef.current = false
         setIsStreaming(false)
       }
     }
-  }, [api])
+  }, [api, applyStreamingSnapshot])
 
   const appendMessage = useCallback((next: Message) => {
     messagesRef.current = [...messagesRef.current, next]
@@ -2733,6 +2777,10 @@ function App() {
         if (pending) {
           pendingSendRef.current = null
           setIsStreaming(true)
+          // This send starts a turn the socket is about to narrate. Any state
+          // fetch already in flight predates it and must not retire it later.
+          messageSendSeqRef.current += 1
+          idleSnapshotSeenRef.current = false
           ws.send(JSON.stringify({
             type: 'message',
             message_id: pendingMessageIdRef.current || undefined,
@@ -3171,6 +3219,10 @@ function App() {
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) {
       setIsStreaming(true)
+      // Bumped before the send, so a state fetch already in flight predates
+      // this turn and is barred from retiring it when its answer arrives.
+      messageSendSeqRef.current += 1
+      idleSnapshotSeenRef.current = false
       ws.send(JSON.stringify({
         type: 'message',
         // The id travels with the message so the queue entry the server keeps
