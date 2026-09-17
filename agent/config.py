@@ -296,7 +296,16 @@ def _validate_config(cfg: dict) -> list[str]:
         "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
         "max_steps",
         "max_truncation_continuations", "file_access",
+        "web_proxy",
     })
+
+    # web_proxy: a proxy URL, or a word that turns proxying off.  Anything a
+    # bare string cannot express is a typo, and the fallback is the previous
+    # behaviour (read the environment) rather than a broken proxy URL.
+    web_proxy = cfg.get("web_proxy")
+    if web_proxy is not None:
+        if not isinstance(web_proxy, str) or not web_proxy.strip():
+            warnings.append("'web_proxy' must be a non-empty string (a proxy URL, or 'none' to disable)")
 
     allowed_commands = cfg.get("shell_allowed_commands")
     if allowed_commands is not None:
@@ -338,7 +347,11 @@ def _validate_config(cfg: dict) -> list[str]:
                 warnings.append("'permissions.shell_devices' must be a boolean")
 
     # ── Top-level unknown keys ────────────────────────────────────────────
+    # Keys starting with '_' are documentation companions by the example
+    # config's own convention (`_tavily_api_key_readme`), not settings.
     for key in cfg:
+        if key.startswith("_"):
+            continue
         if key not in known_sections:
             warnings.append(f"Unknown config key '{key}' — ignored")
 

@@ -1420,6 +1420,26 @@ def test_config_validation_accepts_only_known_permission_levels():
     assert _validate_config({"permissions": {"shell_level": "full"}}) == []
 
 
+def test_config_validation_accepts_web_proxy_and_rejects_a_bad_value():
+    from agent.config import _validate_config
+
+    assert _validate_config({"web_proxy": "http://127.0.0.1:7897"}) == []
+    # A word meaning "off" is a legitimate value, not a typo.
+    assert _validate_config({"web_proxy": "none"}) == []
+    assert any("web_proxy" in w for w in _validate_config({"web_proxy": 42}))
+    assert any("web_proxy" in w for w in _validate_config({"web_proxy": "   "}))
+
+
+def test_config_validation_ignores_underscore_documentation_keys():
+    """`_name_readme` companions ship in config.example.json by convention."""
+    from agent.config import _validate_config
+
+    assert _validate_config({"_tavily_api_key_readme": "text"}) == []
+    assert _validate_config({"_web_proxy_readme": "text"}) == []
+    # A real typo still warns.
+    assert any("web_proxyy" in w for w in _validate_config({"web_proxyy": "x"}))
+
+
 def test_permissions_status_shows_sandbox_mode(monkeypatch, tmp_path):
     from agent import shared as agent_shared
 

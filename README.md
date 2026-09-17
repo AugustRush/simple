@@ -494,6 +494,7 @@ Key config sections:
 | `evolution` | Enable/disable session scoring and rule learning |
 | `scheduler` | Poll/lease/concurrency settings |
 | `tavily_api_key` | Optional Tavily search API key |
+| `web_proxy` | Proxy for `web_fetch` (e.g. `http://127.0.0.1:7897`). Required on machines whose DNS returns reserved addresses — Clash's `enhanced-mode: fake-ip` does this, and the direct path refuses such answers by design. `null`/absent = read `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (honouring `no_proxy`); `none` = always connect directly. Credentials: `http://user:pass@host:port` |
 | `output_dir` | Override default `~/.agent/output` |
 | `file_access` | Startup-only workspace read/write policy plus resource limits for file tools (see [File access](#file-access)) |
 | `permissions.shell_level` | Default shell permission level: `ask`, `medium`, `high`, or `full` (see [Shell permissions](#shell-permissions)) |

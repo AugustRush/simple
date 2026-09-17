@@ -217,6 +217,8 @@
   "_system_prompt_file_readme": "null = use the built-in prompt. Set to an absolute path to load a custom system prompt from a .md or .txt file, e.g. '/Users/you/.agent/my_prompt.md'.",
   "tavily_api_key": "$TAVILY_API_KEY",
   "_tavily_api_key_readme": "Optional. Used by the built-in tavily_search tool. Can be a literal key or '$ENV_VAR'. Leave empty or null to disable Tavily-backed search.",
+  "web_proxy": null,
+  "_web_proxy_readme": "Optional. Proxy for web_fetch, e.g. 'http://127.0.0.1:7897'. Needed on machines whose DNS answers with reserved addresses (Clash's 'enhanced-mode: fake-ip' does this): the direct path refuses those, so a proxy is the only way to fetch. null/absent = read the standard HTTPS_PROXY/HTTP_PROXY/ALL_PROXY environment variables (honouring no_proxy). 'none' (or 'off'/'direct') = always connect directly, ignoring the environment. Credentials are supported: 'http://user:pass@host:port'.",
   "output_dir": null,
   "_output_dir_readme": "null = use default ~/.agent/output. Set to an absolute path to override. Supports ~ and $ENV expansion. All tool/MCP/skill outputs (screenshots, exports, temp files) go here. Subdirectories are created on demand.",
   "shell_allowed_commands": [],
