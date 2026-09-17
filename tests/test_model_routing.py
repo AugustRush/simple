@@ -8,7 +8,12 @@ not merely the active provider's client with a foreign model string.
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
+
+import pytest
 
 from agent.core.transport import (
     AnthropicTransport,
@@ -295,3 +300,129 @@ def test_sub_agent_dispatches_foreign_model_to_its_owning_provider():
     assert foreign.chatted == ["glm-5.3-flash"]
     assert active.streamed == []
     assert active.chatted == []
+
+
+def _serve_openai_provider() -> tuple[str, list[dict], ThreadingHTTPServer]:
+    """A local OpenAI-shaped endpoint: returns (base_url, received_bodies, server)."""
+    received: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            body = json.loads(raw)
+            received.append(body)
+            payload = json.dumps(
+                {
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": body.get("model", "unknown"),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "ack"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{server.server_address[1]}/v1", received, server
+
+
+def test_sub_agent_request_reaches_the_provider_that_owns_its_model():
+    """The reported failure, end to end: two providers, real SDK clients.
+
+    Two local servers stand in for two providers and real AsyncOpenAI clients
+    talk to them over real sockets, so this exercises the whole chain a
+    sub-agent's request travels — not just the transport object it holds.
+
+    Spawned under a foreign-provider model, the sub-agent must send that id to
+    the provider that owns it.  Before the fix it sent the foreign id to the
+    active provider, which answered
+
+        400 The supported API model names are ..., but you passed glm-5.3-flash.
+    """
+    import agent as agent_module
+    from agent.core.agent import _active_agent_context
+
+    openai = pytest.importorskip("openai")
+
+    active_url, active_seen, active_srv = _serve_openai_provider()
+    foreign_url, foreign_seen, foreign_srv = _serve_openai_provider()
+    try:
+        cfg = {
+            "active_provider": "deepseek",
+            "providers": {
+                "deepseek": {
+                    "api_format": "openai",
+                    "base_url": active_url,
+                    "api_key": "key-active",
+                    "models": ["deepseek-flash"],
+                },
+                "huoshan": {
+                    "api_format": "openai",
+                    "base_url": foreign_url,
+                    "api_key": "key-foreign",
+                    "models": ["glm-5.3-flash"],
+                },
+            },
+        }
+
+        def factory(provider_cfg: dict, api_format: str) -> Any:
+            return openai.AsyncOpenAI(
+                base_url=provider_cfg["base_url"],
+                api_key=provider_cfg["api_key"],
+                max_retries=0,
+            )
+
+        active_client = factory(cfg["providers"]["deepseek"], "openai")
+        parent = agent_module.BaseAgent(
+            active_client,
+            agent_module.ToolRegistry(),
+            model="deepseek-flash",
+            api_format="openai",
+            transport=build_routing_transport(cfg, "openai", active_client, factory),
+        )
+        parent._base_system_prompt = "You are a probe."
+        parent.sub_agent_timeout_seconds = 30
+        parent.sub_agent_retries = 0
+
+        token = _active_agent_context.set(
+            agent_module.AgentContext(
+                system_prompt="probe",
+                metadata={"model_override": "glm-5.3-flash"},
+            )
+        )
+        try:
+            payload = asyncio.run(
+                parent._execute_agent(
+                    role="researcher", task="say hi", capability_profile="read_only"
+                )
+            )
+        finally:
+            _active_agent_context.reset(token)
+    finally:
+        active_srv.shutdown()
+        active_srv.server_close()
+        foreign_srv.shutdown()
+        foreign_srv.server_close()
+
+    assert payload.get("ok") is True, payload.get("error")
+    assert [b.get("model") for b in foreign_seen] == ["glm-5.3-flash"]
+    assert active_seen == [], "the active provider must never see a foreign model id"
