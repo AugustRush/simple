@@ -1568,18 +1568,43 @@ html[data-theme='light'] .tool-trace-items {
   max-width: 920px;
 }
 
+/* The card's background, radius, blur and shadow are set by the shared
+ * `.session-card, .entity-card, .settings-card` rule further down; this only
+ * pins the border, which that rule does not touch.  A second full copy of the
+ * card appearance used to live here, and was overridden by the shared rule
+ * anyway -- so the card looked the way it did by accident. */
 .settings-card {
   border-color: var(--border);
-  background: var(--surface);
-  backdrop-filter: blur(18px) saturate(115%);
-  -webkit-backdrop-filter: blur(18px) saturate(115%);
-  box-shadow: 0 10px 30px rgba(0,0,0,.08);
 }
 
 .settings-hint {
   margin: 0 0 16px;
   color: var(--text-muted);
   font-size: 13px;
+}
+
+/* Marks a card whose control takes effect the moment it changes, so the
+ * difference from the cards behind the "保存设置" button is visible rather than
+ * something the user has to work out. */
+.settings-instant-tag {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+
+/* Same treatment as `.settings-view .ant-form-item-label > label`, so a label
+ * outside the Form does not look like a different design. */
+.settings-field-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .settings-json-card {
@@ -1914,7 +1939,10 @@ html[data-theme='light'] .settings-json {
   gap: 20px;
   max-width: 980px;
 }
-.settings-view .settings-card:nth-child(3),
+/* Wide cards say so themselves.  This used to be `.settings-card:nth-child(3)`,
+ * which meant the layout silently changed whenever a card was reordered or
+ * added -- the third card was wide because it happened to be third. */
+.settings-view .settings-card-wide,
 .settings-view .settings-json-card {
   grid-column: 1 / -1;
 }
@@ -1961,7 +1989,7 @@ html[data-theme='light'] .settings-json {
   .settings-view .settings-grid {
     grid-template-columns: minmax(0, 1fr);
   }
-  .settings-view .settings-card:nth-child(3),
+  .settings-view .settings-card-wide,
   .settings-view .settings-json-card {
     grid-column: auto;
   }
@@ -2419,6 +2447,17 @@ html[data-theme='light'] .settings-json {
 
 .save-state.dirty .save-state-dot {
   background: var(--amber);
+}
+
+/* A blocked save is not the same as pending edits: one is a state the user can
+ * leave, the other is a mistake to fix.  Different colour, so it reads that way
+ * rather than as "you have unsaved work". */
+.save-state.blocked {
+  color: var(--red);
+}
+
+.save-state.blocked .save-state-dot {
+  background: var(--red);
 }
 
 .json-status {

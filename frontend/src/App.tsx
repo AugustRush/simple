@@ -2407,7 +2407,17 @@ function App() {
   const conversationMarkerRefs = useRef<Record<string, HTMLButtonElement | null>>({})
   const hoverClearTimerRef = useRef<number | null>(null)
   const idRef = useRef(0)
-  const token = localStorage.getItem('agent_token') || ''
+  // The token lives in state, not in a `localStorage.getItem` read on every
+  // render, because everything derived from it -- the auth headers, the file
+  // and stream links -- has to be rebuilt when it changes.  Reading storage
+  // during render cannot announce a change, so the old code reloaded the whole
+  // page to make the new token visible, which threw away the conversation.
+  const [token, setToken] = useState(() => localStorage.getItem('agent_token') || '')
+  // What the box currently shows.  Separate from ``token`` so that half-typed
+  // credentials are not sent as headers before the user has finished: the
+  // applied token only moves when they press save.
+  const [tokenDraft, setTokenDraft] = useState(token)
+  const tokenDirty = tokenDraft.trim() !== token
 
   const scrollChatToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
     const container = chatScrollRef.current
@@ -4975,21 +4985,81 @@ function App() {
     } catch { /* surfaced */ }
   }
 
+  /** Fold the form's fields into a config object.
+   *
+   *  One definition, because two callers need it: saving, and the write-through
+   *  that keeps the JSON box showing what saving would send.  When the two were
+   *  computed separately the box disagreed with the form, and the form won at
+   *  save time -- so an edit made in the box could be discarded without a word.
+   */
+  const mergeSettingsForm = (base: any, values: any) => {
+    const cfg = { ...(base || {}) }
+    const provider = values.active_provider
+    cfg.active_provider = provider
+    if (provider) {
+      cfg.providers = { ...(cfg.providers || {}) }
+      cfg.providers[provider] = { ...(cfg.providers[provider] || {}) }
+      cfg.providers[provider].default_model = values.model
+      cfg.providers[provider].max_tokens = values.max_tokens
+    }
+    cfg.channels = { ...(cfg.channels || {}) }
+    cfg.channels.web = { ...(cfg.channels.web || {}), enabled: values.web_enabled }
+    cfg.channels.feishu = {
+      ...(cfg.channels.feishu || {}),
+      enabled: values.feishu_enabled,
+    }
+    return cfg
+  }
+
+  const handleSettingsFormChange = (changed: any, all: any) => {
+    let values = all
+    // A model and a max_tokens belong to one provider, so choosing a different
+    // provider has to change them.  Leaving the previous provider's model in
+    // the box meant save wrote it onto the newly chosen provider -- a config
+    // edit nobody made, in a provider nobody was looking at.
+    if (changed && 'active_provider' in changed) {
+      const provider = config?.providers?.[changed.active_provider] || {}
+      values = {
+        ...all,
+        model: provider.default_model ?? '',
+        max_tokens: provider.max_tokens ?? null,
+      }
+      form.setFieldsValue({
+        model: values.model,
+        max_tokens: values.max_tokens,
+      })
+    }
+    setSettingsDirty(true)
+    setConfigText(current => {
+      try {
+        return JSON.stringify(
+          mergeSettingsForm(JSON.parse(current || '{}'), values),
+          null,
+          2,
+        )
+      } catch {
+        // The box holds something unparseable, so the user is typing in it.
+        // Rewriting would destroy that; saving is blocked while it stays
+        // invalid, so nothing is lost behind their back either way.
+        return current
+      }
+    })
+  }
+
+  const applyToken = () => {
+    const next = tokenDraft.trim()
+    localStorage.setItem('agent_token', next)
+    // State, not a page reload: the headers and every link built from the
+    // token are rebuilt from this, and the conversation survives.
+    setToken(next)
+    setTokenDraft(next)
+    messageApi.success(next ? '令牌已保存' : '令牌已清除')
+  }
+
   const saveSettings = async () => {
     try {
       const values = await form.validateFields()
-      const cfg = JSON.parse(configText || '{}')
-      cfg.active_provider = values.active_provider
-      cfg.providers = cfg.providers || {}
-      cfg.providers[values.active_provider] =
-        cfg.providers[values.active_provider] || {}
-      cfg.providers[values.active_provider].default_model = values.model
-      cfg.providers[values.active_provider].max_tokens = values.max_tokens
-      cfg.channels = cfg.channels || {}
-      cfg.channels.web = cfg.channels.web || {}
-      cfg.channels.web.enabled = values.web_enabled
-      cfg.channels.feishu = cfg.channels.feishu || {}
-      cfg.channels.feishu.enabled = values.feishu_enabled
+      const cfg = mergeSettingsForm(JSON.parse(configText || '{}'), values)
 
       await api('/api/config', {
         method: 'POST',
@@ -5014,6 +5084,9 @@ function App() {
     const next = JSON.stringify(config || {}, null, 2)
     setConfigText(next)
     setSettingsDirty(false)
+    // Everything unsaved on this page, including the token box: "discard" that
+    // left one field behind would be the same surprise this page already had.
+    setTokenDraft(token)
     const providers = config?.providers || {}
     const active = providers[config?.active_provider] || {}
     form.setFieldsValue({
@@ -5033,6 +5106,31 @@ function App() {
       return { valid: false, label: 'JSON 格式有误' }
     }
   }, [configText])
+
+  /** Move to another view, asking first if the settings page has unsaved edits.
+   *
+   * Entering the settings view refetches the config and clears the dirty flag,
+   * so without this a click on any other nav item quietly threw the edits away
+   * -- and coming back showed the saved values, as though nothing had happened.
+   */
+  const navigateTo = (next: string) => {
+    if (next === view) return
+    if (view !== 'settings' || !(settingsDirty || tokenDirty)) {
+      setView(next)
+      return
+    }
+    Modal.confirm({
+      title: '放弃未保存的设置？',
+      content: '离开设置页会丢掉尚未保存的修改。',
+      okText: '放弃修改',
+      cancelText: '留在本页',
+      okButtonProps: { danger: true },
+      onOk: () => {
+        resetSettings()
+        setView(next)
+      },
+    })
+  }
 
   const filteredSessions = useMemo(() => {
     const query = sessionSearch.trim().toLowerCase()
@@ -8118,7 +8216,12 @@ function App() {
     </div>
   )
 
-  const renderSettings = () => (
+  const renderSettings = () => {
+    // "Unsaved" has to mean everything pending on this page, or the badge
+    // reassures the user about a token they have not applied yet.
+    const unsaved = settingsDirty || tokenDirty
+    const blocked = settingsDirty && !jsonStatus.valid
+    return (
     <div className="page-view settings-view">
       <div className="page-head settings-page-head">
         <div>
@@ -8127,11 +8230,24 @@ function App() {
           <p>配置访问权限、模型偏好与消息频道。</p>
         </div>
         <Space>
-          <span className={`save-state ${settingsDirty ? 'dirty' : ''}`}>
+          <span className={`save-state ${unsaved ? 'dirty' : ''} ${blocked ? 'blocked' : ''}`}>
             <span className="save-state-dot" />
-            {settingsDirty ? '有未保存更改' : '已同步'}
+            {blocked ? 'JSON 格式有误，无法保存' : unsaved ? '有未保存更改' : '已同步'}
           </span>
-          <Button className="settings-save-button" type="primary" icon={<CheckCircleFilled />} onClick={saveSettings} disabled={!settingsDirty}>
+          <Button
+            icon={<ReloadOutlined />}
+            onClick={resetSettings}
+            disabled={!unsaved}
+          >
+            放弃更改
+          </Button>
+          <Button
+            className="settings-save-button"
+            type="primary"
+            icon={<CheckCircleFilled />}
+            onClick={saveSettings}
+            disabled={!settingsDirty || !jsonStatus.valid}
+          >
             保存设置
           </Button>
         </Space>
@@ -8141,41 +8257,49 @@ function App() {
         <Skeleton active paragraph={{ rows: 10 }} />
       ) : (
         <div className="settings-grid">
-          <Card className="settings-card" title="访问令牌" extra={<span className="card-kicker">SECURITY</span>}>
+          <Card
+            className="settings-card"
+            title="访问令牌"
+            extra={
+              <span className="card-kicker">
+                SECURITY<span className="settings-instant-tag">即时生效</span>
+              </span>
+            }
+          >
             <p className="settings-hint">
               Web 频道默认只绑定本地地址，因此令牌通常可以为空。对外暴露端口时请填写鉴权令牌。
             </p>
             <Space.Compact style={{ width: '100%' }}>
               <Input.Password
-                defaultValue={token}
+                value={tokenDraft}
+                onChange={event => setTokenDraft(event.target.value)}
+                onPressEnter={applyToken}
                 placeholder="auth_token（可选）"
-                id="token-input"
               />
               <Button
                 type="primary"
                 className="settings-inline-save"
-                onClick={() => {
-                  const element = document.getElementById(
-                    'token-input',
-                  ) as HTMLInputElement | null
-                  localStorage.setItem(
-                    'agent_token',
-                    element?.value.trim() || '',
-                  )
-                  messageApi.success('令牌已保存，正在刷新…')
-                  setTimeout(() => location.reload(), 500)
-                }}
+                disabled={!tokenDirty}
+                onClick={applyToken}
               >
-                保存令牌
+                {tokenDirty ? '保存令牌' : '已保存'}
               </Button>
             </Space.Compact>
           </Card>
 
-          <Card className="settings-card" title="发送偏好" extra={<span className="card-kicker">UX</span>}>
+          <Card
+            className="settings-card"
+            title="发送偏好"
+            extra={
+              <span className="card-kicker">
+                UX<span className="settings-instant-tag">即时生效</span>
+              </span>
+            }
+          >
             <p className="settings-hint">
               修改发送快捷键。中文输入法用 Enter 上屏，切换成 Ctrl/Cmd + Enter 可避免误发送。
             </p>
-            <label style={{ display: 'block', marginBottom: 6, fontWeight: 500 }}>发送快捷键</label>
+            <label className="settings-field-label">发送快捷键</label>
             <Select
               value={sendShortcut}
               onChange={value => {
@@ -8191,8 +8315,8 @@ function App() {
             />
           </Card>
 
-          <Card className="settings-card" title="模型与频道" extra={<span className="card-kicker">RUNTIME</span>}>
-            <Form form={form} layout="vertical" onValuesChange={() => setSettingsDirty(true)}>
+          <Card className="settings-card settings-card-wide" title="模型与频道" extra={<span className="card-kicker">RUNTIME</span>}>
+            <Form form={form} layout="vertical" onValuesChange={handleSettingsFormChange}>
               <Row gutter={16}>
                 <Col xs={24} md={12}>
                   <Form.Item
@@ -8238,27 +8362,38 @@ function App() {
           </Card>
 
           <Card
-            className="settings-card settings-json-card"
+            className="settings-card settings-card-wide settings-json-card"
             title="高级 JSON"
-            extra={
-              <Space>
-                <Button
-                  icon={<ReloadOutlined />}
-                  onClick={resetSettings}
-                >
-                  恢复已加载配置
-                </Button>
-              </Space>
-            }
+            extra={<span className="card-kicker">RAW</span>}
           >
+            <p className="settings-hint">
+              表单里的修改会同步写进这里，这里能识别出的字段也会同步回表单，保存发送的就是这段文本。
+            </p>
             <div className={`json-status ${jsonStatus.valid ? 'valid' : 'invalid'}`}>
               <span className="json-status-dot" /> {jsonStatus.label}
             </div>
             <TextArea
               value={configText}
               onChange={event => {
-                setConfigText(event.target.value)
+                const next = event.target.value
+                setConfigText(next)
                 setSettingsDirty(true)
+                // Keep the form showing the same config.  Without this the two
+                // halves of the page disagreed, and only one of them was sent.
+                try {
+                  const parsed = JSON.parse(next || '{}')
+                  const active = (parsed.providers || {})[parsed.active_provider] || {}
+                  form.setFieldsValue({
+                    active_provider: parsed.active_provider,
+                    model: active.default_model,
+                    max_tokens: active.max_tokens,
+                    web_enabled: !!parsed.channels?.web?.enabled,
+                    feishu_enabled: !!parsed.channels?.feishu?.enabled,
+                  })
+                } catch {
+                  // Unparseable, so the user is mid-edit: the box is the source
+                  // of truth until it parses, and saving stays blocked.
+                }
               }}
               className="settings-json"
               spellCheck={false}
@@ -8267,7 +8402,8 @@ function App() {
         </div>
       )}
     </div>
-  )
+    )
+  }
 
   const renderCurrentView = () => {
     if (view === 'chat') return renderChat()
@@ -8352,7 +8488,7 @@ function App() {
               selectedKeys={[view]}
               items={navItems}
               onClick={event => {
-                setView(event.key)
+                navigateTo(event.key)
                 if (window.innerWidth <= 768) setCollapsed(true)
               }}
             />
@@ -8650,7 +8786,7 @@ function App() {
                 type="button"
                 key={item.key}
                 onClick={() => {
-                  setView(item.key)
+                  navigateTo(item.key)
                   setCommandPaletteOpen(false)
                   setPaletteQuery('')
                 }}
