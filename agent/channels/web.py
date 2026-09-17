@@ -28,6 +28,7 @@ from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
 from agent.pathing import path_contains
 from agent.scheduler.models import (
+    LOCAL_TIMEZONE,
     RUN_IN_FLIGHT_STATUSES,
     parse_task_signal,
     run_needs_attention,
@@ -1270,7 +1271,9 @@ class WebChannel(Channel):
                 getattr(getattr(existing, "trigger", None), "trigger_type", "once"),
             )
         ).lower()
-        timezone_name = str(body.get("timezone_name", "UTC")).strip() or "UTC"
+        # An omitted zone means the machine's own, not UTC: the browser sends
+        # its zone explicitly, so this only decides the case where nothing did.
+        timezone_name = str(body.get("timezone_name", LOCAL_TIMEZONE)).strip() or LOCAL_TIMEZONE
         if trigger_type == "once":
             trigger = TriggerSpec.once(body["at"], timezone_name)
             if trigger.initial_run_at() <= datetime.now(timezone.utc):

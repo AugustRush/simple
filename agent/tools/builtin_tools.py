@@ -22,6 +22,7 @@ from agent.core.output import OutputSink, _active_sink
 from agent.exec import ExecRequest, provider_from
 from agent.exec.subprocess import OUTPUT_MAX_BYTES
 from agent.pathing import path_contains, resolve_workspace_path
+from agent.scheduler.models import LOCAL_TIMEZONE
 from agent.security.network import fetch_public_http_url
 from agent.security.filesystem_sandbox import (
     SANDBOX_MODE_NONE,
@@ -847,8 +848,12 @@ class BuiltinTools:
                     },
                     "timezone_name": {
                         "type": "string",
-                        "description": "IANA timezone name like Asia/Shanghai",
-                        "default": "UTC",
+                        "description": (
+                            "IANA timezone name like Asia/Shanghai. Omit it to use "
+                            "the timezone this machine is already in -- a wall-clock "
+                            "time that names no zone means the local one, never UTC."
+                        ),
+                        "default": LOCAL_TIMEZONE,
                     },
                     "at": {
                         "type": "string",
@@ -1067,7 +1072,14 @@ class BuiltinTools:
                                 "time_of_day": {"type": "string", "description": "HH:MM"},
                                 "day_of_week": {"type": "string", "description": "mon|tue|...|sun"},
                                 "day_of_month": {"type": "integer", "description": "1-31"},
-                                "timezone_name": {"type": "string", "default": "UTC"},
+                                "timezone_name": {
+                                    "type": "string",
+                                    "default": LOCAL_TIMEZONE,
+                                    "description": (
+                                        "IANA timezone name. Omit to use this "
+                                        "machine's timezone."
+                                    ),
+                                },
                                 "workspace_root": {
                                     "type": "string",
                                     "description": "Overrides the workflow's folder for this step",
@@ -3288,7 +3300,7 @@ class BuiltinTools:
         message_text: Optional[str] = None,
         instruction: Optional[str] = None,
         job_name: Optional[str] = None,
-        timezone_name: str = "UTC",
+        timezone_name: str = LOCAL_TIMEZONE,
         at: Optional[str] = None,
         every: Optional[int] = None,
         unit: Optional[str] = None,
@@ -3608,7 +3620,9 @@ class BuiltinTools:
                 if trigger_type:
                     trigger = self._schedule_trigger(
                         trigger_type=trigger_type,
-                        timezone_name=str(raw.get("timezone_name") or "UTC"),
+                        timezone_name=str(
+                            raw.get("timezone_name") or LOCAL_TIMEZONE
+                        ),
                         at=raw.get("at"),
                         every=raw.get("every"),
                         unit=raw.get("unit"),

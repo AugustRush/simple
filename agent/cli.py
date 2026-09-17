@@ -34,7 +34,7 @@ from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.runtime.lock import AgentHomeBusyError, acquire_agent_home_lock
-from agent.scheduler.models import DEFAULT_SIGNAL_MAX_DEPTH
+from agent.scheduler.models import DEFAULT_SIGNAL_MAX_DEPTH, LOCAL_TIMEZONE
 from agent.scheduler.profiles import (
     apply_profile_to_config,
     describe_profile_for_prompt,
@@ -1599,7 +1599,9 @@ def config(
 def schedule_once(
     name: str = typer.Argument(..., help="Task name"),
     at: str = typer.Option(..., "--at", help="ISO datetime with timezone"),
-    timezone_name: str = typer.Option("UTC", "--timezone", help="IANA timezone name"),
+    timezone_name: str = typer.Option(
+        LOCAL_TIMEZONE, "--timezone", help="IANA timezone name; default is this machine's zone"
+    ),
     prompt: str = typer.Option(..., "--prompt", help="Prompt to run"),
     delivery_mode: str = typer.Option("standalone", "--delivery-mode"),
     chat_id: Optional[str] = typer.Option(None, "--chat-id"),
@@ -1634,7 +1636,9 @@ def schedule_interval(
     every: int = typer.Option(..., "--every", min=1),
     unit: str = typer.Option(..., "--unit", help="minutes|hours|days|weeks"),
     anchor_at: str = typer.Option(..., "--anchor-at", help="ISO datetime with timezone"),
-    timezone_name: str = typer.Option("UTC", "--timezone", help="IANA timezone name"),
+    timezone_name: str = typer.Option(
+        LOCAL_TIMEZONE, "--timezone", help="IANA timezone name; default is this machine's zone"
+    ),
     prompt: str = typer.Option(..., "--prompt", help="Prompt to run"),
     delivery_mode: str = typer.Option("standalone", "--delivery-mode"),
     chat_id: Optional[str] = typer.Option(None, "--chat-id"),
@@ -1667,7 +1671,9 @@ def schedule_interval(
 def schedule_daily(
     name: str = typer.Argument(..., help="Task name"),
     time_of_day: str = typer.Option(..., "--time", help="HH:MM local wall clock"),
-    timezone_name: str = typer.Option("UTC", "--timezone", help="IANA timezone name"),
+    timezone_name: str = typer.Option(
+        LOCAL_TIMEZONE, "--timezone", help="IANA timezone name; default is this machine's zone"
+    ),
     prompt: str = typer.Option(..., "--prompt", help="Prompt to run"),
     delivery_mode: str = typer.Option("standalone", "--delivery-mode"),
     chat_id: Optional[str] = typer.Option(None, "--chat-id"),
@@ -1701,7 +1707,9 @@ def schedule_weekly(
     name: str = typer.Argument(..., help="Task name"),
     day_of_week: str = typer.Option(..., "--day", help="mon|tue|..."),
     time_of_day: str = typer.Option(..., "--time", help="HH:MM local wall clock"),
-    timezone_name: str = typer.Option("UTC", "--timezone", help="IANA timezone name"),
+    timezone_name: str = typer.Option(
+        LOCAL_TIMEZONE, "--timezone", help="IANA timezone name; default is this machine's zone"
+    ),
     prompt: str = typer.Option(..., "--prompt", help="Prompt to run"),
     delivery_mode: str = typer.Option("standalone", "--delivery-mode"),
     chat_id: Optional[str] = typer.Option(None, "--chat-id"),

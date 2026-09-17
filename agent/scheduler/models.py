@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import calendar
 from datetime import datetime, time as dt_time, timedelta, timezone
 import json
+import os
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -56,6 +57,65 @@ def parse_datetime(value: str | datetime) -> datetime:
     return dt.astimezone(UTC)
 
 
+#: What to pass as a timezone when the caller named no zone.  It is not a zone
+#: itself -- it is the instruction to look one up -- so it must never reach
+#: ``ZoneInfo`` unresolved.
+LOCAL_TIMEZONE = "local"
+
+
+def local_timezone_name() -> str:
+    """The IANA name of this machine's own zone.
+
+    A wall-clock time that names no zone means the zone the person is in, so
+    this is the answer whenever a trigger's timezone is left unspecified.
+
+    ``datetime.now().astimezone().tzinfo`` is not usable for this: on macOS it
+    is a fixed offset named "CST", and ``ZoneInfo`` cannot be built from it --
+    which is the trap this function exists to avoid, because a zone that
+    silently becomes UTC turns "08:00" into 16:00 in Shanghai.  Both macOS and
+    Linux point ``/etc/localtime`` at a real entry under ``zoneinfo/``, so the
+    tail of that symlink is the name.  ``TZ`` wins when set, since an explicit
+    environment is a statement of intent.
+
+    Falls back to ``"UTC"`` only when no name can be resolved at all, which
+    means no ``zoneinfo`` database is reachable -- in that case UTC is the one
+    zone ``ZoneInfo`` can always build.
+    """
+    candidates = []
+    from_env = os.environ.get("TZ", "").strip()
+    if from_env:
+        candidates.append(from_env)
+    try:
+        link = os.path.realpath("/etc/localtime")
+    except OSError:
+        link = ""
+    _, marker, tail = link.partition("zoneinfo/")
+    if marker and tail:
+        candidates.append(tail)
+
+    for candidate in candidates:
+        try:
+            ZoneInfo(candidate)
+        except Exception:
+            continue
+        return candidate
+    return "UTC"
+
+
+def resolve_timezone_name(timezone_name: str | None) -> str:
+    """Turn "no zone given" into a zone.
+
+    ``""`` and ``LOCAL_TIMEZONE`` both mean the machine's own zone.  Anything
+    else is taken at its word, so an explicit ``"UTC"`` stays UTC -- someone
+    who asked for UTC meant UTC, and quietly moving their clock would be the
+    same bug in the other direction.
+    """
+    wanted = str(timezone_name or "").strip()
+    if not wanted or wanted.lower() == LOCAL_TIMEZONE:
+        return local_timezone_name()
+    return wanted
+
+
 def _parse_time_of_day(value: str) -> dt_time:
     hour_text, minute_text = str(value).split(":", 1)
     return dt_time(hour=int(hour_text), minute=int(minute_text))
@@ -72,7 +132,7 @@ def _advance_until_future(
 @dataclass
 class OnceTrigger:
     at: datetime
-    timezone_name: str = "UTC"
+    timezone_name: str = field(default_factory=local_timezone_name)
 
     def next_after(self, now: datetime) -> Optional[datetime]:
         candidate = self.at.astimezone(UTC)
@@ -87,7 +147,7 @@ class IntervalTrigger:
     every: int
     unit: str
     anchor_at: datetime
-    timezone_name: str = "UTC"
+    timezone_name: str = field(default_factory=local_timezone_name)
 
     def _step(self) -> timedelta:
         unit = self.unit.lower()
@@ -113,7 +173,7 @@ class IntervalTrigger:
 @dataclass
 class DailyTrigger:
     time_of_day: str
-    timezone_name: str = "UTC"
+    timezone_name: str = field(default_factory=local_timezone_name)
 
     def next_after(self, now: datetime) -> Optional[datetime]:
         tz = ZoneInfo(self.timezone_name)
@@ -141,7 +201,7 @@ class DailyTrigger:
 class WeeklyTrigger:
     day_of_week: str
     time_of_day: str
-    timezone_name: str = "UTC"
+    timezone_name: str = field(default_factory=local_timezone_name)
 
     def next_after(self, now: datetime) -> Optional[datetime]:
         tz = ZoneInfo(self.timezone_name)
@@ -171,7 +231,7 @@ class WeeklyTrigger:
 @dataclass
 class WeekdaysTrigger:
     time_of_day: str
-    timezone_name: str = "UTC"
+    timezone_name: str = field(default_factory=local_timezone_name)
 
     def next_after(self, now: datetime) -> Optional[datetime]:
         tz = ZoneInfo(self.timezone_name)
@@ -200,7 +260,7 @@ class WeekdaysTrigger:
 class MonthlyTrigger:
     day_of_month: int
     time_of_day: str
-    timezone_name: str = "UTC"
+    timezone_name: str = field(default_factory=local_timezone_name)
 
     def _candidate(self, year: int, month: int, tz: ZoneInfo) -> Optional[datetime]:
         day = int(self.day_of_month)
@@ -290,10 +350,15 @@ class TriggerSpec:
     payload: dict[str, Any]
 
     @classmethod
-    def once(cls, at: str | datetime, timezone_name: str) -> "TriggerSpec":
+    def once(
+        cls, at: str | datetime, timezone_name: str = LOCAL_TIMEZONE
+    ) -> "TriggerSpec":
         return cls(
             "once",
-            {"at": parse_datetime(at).isoformat(), "timezone_name": timezone_name},
+            {
+                "at": parse_datetime(at).isoformat(),
+                "timezone_name": resolve_timezone_name(timezone_name),
+            },
         )
 
     @classmethod
@@ -302,7 +367,7 @@ class TriggerSpec:
         every: int,
         unit: str,
         anchor_at: str | datetime,
-        timezone_name: str,
+        timezone_name: str = LOCAL_TIMEZONE,
     ) -> "TriggerSpec":
         return cls(
             "interval",
@@ -310,47 +375,63 @@ class TriggerSpec:
                 "every": int(every),
                 "unit": unit,
                 "anchor_at": parse_datetime(anchor_at).isoformat(),
-                "timezone_name": timezone_name,
+                "timezone_name": resolve_timezone_name(timezone_name),
             },
         )
 
     @classmethod
-    def daily(cls, time_of_day: str, timezone_name: str) -> "TriggerSpec":
+    def daily(
+        cls, time_of_day: str, timezone_name: str = LOCAL_TIMEZONE
+    ) -> "TriggerSpec":
         return cls(
             "daily",
-            {"time_of_day": time_of_day, "timezone_name": timezone_name},
+            {
+                "time_of_day": time_of_day,
+                "timezone_name": resolve_timezone_name(timezone_name),
+            },
         )
 
     @classmethod
     def weekly(
-        cls, day_of_week: str, time_of_day: str, timezone_name: str
+        cls,
+        day_of_week: str,
+        time_of_day: str,
+        timezone_name: str = LOCAL_TIMEZONE,
     ) -> "TriggerSpec":
         return cls(
             "weekly",
             {
                 "day_of_week": day_of_week,
                 "time_of_day": time_of_day,
-                "timezone_name": timezone_name,
+                "timezone_name": resolve_timezone_name(timezone_name),
             },
         )
 
     @classmethod
-    def weekdays(cls, time_of_day: str, timezone_name: str) -> "TriggerSpec":
+    def weekdays(
+        cls, time_of_day: str, timezone_name: str = LOCAL_TIMEZONE
+    ) -> "TriggerSpec":
         return cls(
             "weekdays",
-            {"time_of_day": time_of_day, "timezone_name": timezone_name},
+            {
+                "time_of_day": time_of_day,
+                "timezone_name": resolve_timezone_name(timezone_name),
+            },
         )
 
     @classmethod
     def monthly(
-        cls, day_of_month: int, time_of_day: str, timezone_name: str
+        cls,
+        day_of_month: int,
+        time_of_day: str,
+        timezone_name: str = LOCAL_TIMEZONE,
     ) -> "TriggerSpec":
         return cls(
             "monthly",
             {
                 "day_of_month": int(day_of_month),
                 "time_of_day": time_of_day,
-                "timezone_name": timezone_name,
+                "timezone_name": resolve_timezone_name(timezone_name),
             },
         )
 
@@ -385,36 +466,48 @@ class TriggerSpec:
         if self.trigger_type == "once":
             return OnceTrigger(
                 at=parse_datetime(self.payload["at"]),
-                timezone_name=self.payload.get("timezone_name", "UTC"),
+                timezone_name=resolve_timezone_name(
+                    self.payload.get("timezone_name")
+                ),
             )
         if self.trigger_type == "interval":
             return IntervalTrigger(
                 every=int(self.payload["every"]),
                 unit=str(self.payload["unit"]),
                 anchor_at=parse_datetime(self.payload["anchor_at"]),
-                timezone_name=self.payload.get("timezone_name", "UTC"),
+                timezone_name=resolve_timezone_name(
+                    self.payload.get("timezone_name")
+                ),
             )
         if self.trigger_type == "daily":
             return DailyTrigger(
                 time_of_day=str(self.payload["time_of_day"]),
-                timezone_name=self.payload.get("timezone_name", "UTC"),
+                timezone_name=resolve_timezone_name(
+                    self.payload.get("timezone_name")
+                ),
             )
         if self.trigger_type == "weekly":
             return WeeklyTrigger(
                 day_of_week=str(self.payload["day_of_week"]),
                 time_of_day=str(self.payload["time_of_day"]),
-                timezone_name=self.payload.get("timezone_name", "UTC"),
+                timezone_name=resolve_timezone_name(
+                    self.payload.get("timezone_name")
+                ),
             )
         if self.trigger_type == "weekdays":
             return WeekdaysTrigger(
                 time_of_day=str(self.payload["time_of_day"]),
-                timezone_name=self.payload.get("timezone_name", "UTC"),
+                timezone_name=resolve_timezone_name(
+                    self.payload.get("timezone_name")
+                ),
             )
         if self.trigger_type == "monthly":
             return MonthlyTrigger(
                 day_of_month=int(self.payload["day_of_month"]),
                 time_of_day=str(self.payload["time_of_day"]),
-                timezone_name=self.payload.get("timezone_name", "UTC"),
+                timezone_name=resolve_timezone_name(
+                    self.payload.get("timezone_name")
+                ),
             )
         if self.trigger_type == "signal":
             return SignalTrigger(

@@ -3688,3 +3688,44 @@ def test_web_deleting_a_switched_off_skill_takes_its_switch_with_it(tmp_path, mo
     # Nothing left behind to meet the next skill that calls itself "review".
     stored = json.loads((tmp_path / "config.json").read_text())
     assert "review" not in (stored.get("skills") or {})
+
+
+def test_web_a_schedule_with_no_timezone_is_read_in_the_machines_zone(
+    tmp_path, monkeypatch
+):
+    """The REST default is the local zone too, not UTC.
+
+    The browser always sends its own zone, so this decides the case where
+    something else posts a wall-clock time and leaves the zone out -- which
+    used to be stored as UTC and fire eight hours away from what was asked.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+    from agent.scheduler import SchedulerStore
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        created = client.post(
+            "/api/schedules",
+            json={
+                "name": "A股模拟盘每日结算",
+                "trigger_type": "weekdays",
+                "action_type": "agent_task",
+                "prompt": "结算模拟盘",
+                "time_of_day": "08:00",
+            },
+        )
+        assert created.status_code == 200, created.text
+        task_id = created.json()["task"]["id"]
+
+    store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+    try:
+        task = store.get_task(task_id)
+    finally:
+        store.close()
+
+    assert task.trigger.payload["timezone_name"] == "Asia/Shanghai"
