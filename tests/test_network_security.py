@@ -304,3 +304,289 @@ def test_redirect_to_a_private_address_is_rejected():
                 seen, "https://internal.example.com/admin"
             ),
         )
+
+
+# ── Proxy routing ───────────────────────────────────────────────────────────
+
+
+def test_parse_proxy_url_reads_host_port_and_credentials():
+    from agent.security.network import parse_proxy_url
+
+    plain = parse_proxy_url("http://127.0.0.1:7897")
+    assert (plain.host, plain.port) == ("127.0.0.1", 7897)
+    assert plain.authorization is None
+
+    authed = parse_proxy_url("http://user:p%40ss@proxy.example:3128")
+    assert (authed.host, authed.port) == ("proxy.example", 3128)
+    assert authed.username == "user"
+    assert authed.password == "p@ss"
+    assert authed.authorization.startswith("Basic ")
+
+    # A bare host:port is accepted; the scheme defaults to http.
+    assert parse_proxy_url("proxy.example:3128").port == 3128
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "socks5://127.0.0.1:1080",
+        "socks4://127.0.0.1:1080",
+        "http://host-without-port",
+        "not a url",
+    ],
+)
+def test_parse_proxy_url_rejects_unusable_values(raw):
+    """SOCKS is refused rather than misread: http.client cannot speak it."""
+    from agent.security.network import parse_proxy_url
+
+    assert parse_proxy_url(raw) is None
+
+
+def test_proxy_from_environment_picks_the_scheme_specific_variable():
+    from agent.security.network import proxy_from_environment
+
+    env = {
+        "https_proxy": "http://127.0.0.1:7897",
+        "http_proxy": "http://127.0.0.1:7899",
+        "all_proxy": "http://127.0.0.1:7898",
+    }
+    assert proxy_from_environment("https://example.com/", env).port == 7897
+    assert proxy_from_environment("http://example.com/", env).port == 7899
+    # all_proxy is the catch-all when no scheme-specific variable is set.
+    assert proxy_from_environment("https://e.com/", {"ALL_PROXY": "http://p:1"}).port == 1
+    assert proxy_from_environment("https://example.com/", {}) is None
+
+
+def test_proxy_from_environment_honours_no_proxy():
+    from agent.security.network import proxy_from_environment
+
+    env = {"https_proxy": "http://127.0.0.1:7897", "no_proxy": "internal.example, .corp"}
+    assert proxy_from_environment("https://internal.example/x", env) is None
+    assert proxy_from_environment("https://a.corp/x", env) is None
+    assert proxy_from_environment("https://public.example/x", env) is not None
+    assert proxy_from_environment("https://e.com/", {**env, "no_proxy": "*"}) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/",
+        "http://10.0.0.5/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://[::1]/",
+        "http://localhost/admin",
+        "http://foo.localhost/admin",
+        "http://router/",
+        "http://intranet/admin",
+        "http://printer.local/",
+        "http://db.internal/",
+    ],
+)
+def test_validate_proxy_target_rejects_local_destinations(url):
+    """A proxy will happily reach these, so the check moves to the name."""
+    from agent.security.network import UnsafeNetworkTarget, validate_proxy_target
+
+    with pytest.raises(UnsafeNetworkTarget):
+        validate_proxy_target(url)
+
+
+def test_validate_proxy_target_never_resolves_the_name():
+    """The point of the path: a fake-IP resolver must not be consulted at all.
+
+    Under Clash's ``enhanced-mode: fake-ip`` every name answers 198.18.x.x,
+    which the direct path correctly refuses.  A proxied fetch never asks.
+    """
+    from agent.security.network import validate_proxy_target
+
+    endpoint = validate_proxy_target("https://example.com/a?b=1")
+    assert (endpoint.scheme, endpoint.hostname, endpoint.port) == (
+        "https",
+        "example.com",
+        443,
+    )
+    assert endpoint.request_target == "/a?b=1"
+    assert endpoint.addresses == ()
+
+
+def test_validate_proxy_target_accepts_a_public_literal():
+    from agent.security.network import validate_proxy_target
+
+    assert validate_proxy_target("http://93.184.216.34/").hostname == "93.184.216.34"
+
+
+def _proxied_factory(seen, responses):
+    """A proxied connection factory that records instead of opening a socket."""
+
+    class _Conn:
+        def __init__(self, endpoint, proxy):
+            self.endpoint = endpoint
+            self.proxy = proxy
+            self.requests = []
+            self.closed = False
+
+        def request(self, method, target, headers=None):
+            self.requests.append((method, target, headers or {}))
+
+        def getresponse(self):
+            return next(responses)
+
+        def close(self):
+            self.closed = True
+
+    def factory(endpoint, proxy, timeout):
+        connection = _Conn(endpoint, proxy)
+        seen.append(connection)
+        return connection
+
+    return factory
+
+
+def test_fetch_through_a_proxy_never_resolves_the_target():
+    from agent.security.network import ProxyConfig, fetch_public_http_url
+
+    seen: list = []
+    result = fetch_public_http_url(
+        "https://example.com/x",
+        resolver=lambda *a, **k: pytest.fail("the proxy path must not resolve"),
+        connection_factory=lambda *a: pytest.fail("the direct path must not run"),
+        proxied_connection_factory=_proxied_factory(
+            seen, iter([_FakeResponse(200, body=b"ok")])
+        ),
+        proxy=ProxyConfig(host="127.0.0.1", port=7897),
+    )
+
+    assert result.body == b"ok"
+    assert len(seen) == 1
+    assert seen[0].proxy.port == 7897
+    # HTTPS carries only the path; the tunnel names the target.
+    assert seen[0].requests[0][1] == "/x"
+    assert seen[0].requests[0][2]["Host"] == "example.com"
+    assert seen[0].closed is True
+
+
+def test_plain_http_through_a_proxy_sends_the_absolute_uri():
+    from agent.security.network import ProxyConfig, fetch_public_http_url
+
+    seen: list = []
+    fetch_public_http_url(
+        "http://example.com/x?y=1",
+        connection_factory=lambda *a: pytest.fail("the direct path must not run"),
+        proxied_connection_factory=_proxied_factory(seen, iter([_FakeResponse(200)])),
+        proxy=ProxyConfig(host="127.0.0.1", port=7897),
+    )
+    assert seen[0].requests[0][1] == "http://example.com/x?y=1"
+    assert seen[0].requests[0][2]["Host"] == "example.com"
+
+
+def test_proxy_credentials_travel_to_the_proxy_on_plain_http():
+    from agent.security.network import ProxyConfig, fetch_public_http_url
+
+    seen: list = []
+    fetch_public_http_url(
+        "http://example.com/",
+        proxied_connection_factory=_proxied_factory(seen, iter([_FakeResponse(200)])),
+        proxy=ProxyConfig(host="127.0.0.1", port=7897, username="u", password="p"),
+    )
+    assert seen[0].requests[0][2]["Proxy-Authorization"].startswith("Basic ")
+
+
+def test_default_proxied_connection_tunnels_https_and_targets_the_proxy():
+    import http.client
+
+    from agent.security.network import (
+        ProxyConfig,
+        _default_proxied_connection_factory,
+        validate_proxy_target,
+    )
+
+    proxy = ProxyConfig(host="127.0.0.1", port=7897, username="u", password="p")
+
+    https = _default_proxied_connection_factory(
+        validate_proxy_target("https://example.com/"), proxy, 5
+    )
+    assert isinstance(https, http.client.HTTPSConnection)
+    assert (https.host, https.port) == ("127.0.0.1", 7897)
+    assert (https._tunnel_host, https._tunnel_port) == ("example.com", 443)
+    assert https._tunnel_headers["Proxy-Authorization"].startswith("Basic ")
+
+    plain = _default_proxied_connection_factory(
+        validate_proxy_target("http://example.com/"), proxy, 5
+    )
+    assert isinstance(plain, http.client.HTTPConnection)
+    assert (plain.host, plain.port) == ("127.0.0.1", 7897)
+
+
+def test_fetch_ignores_the_environment_unless_asked(monkeypatch):
+    """A security boundary must not change its destination from ambient config."""
+    from agent.security.network import fetch_public_http_url
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:7897")
+
+    seen: list = []
+    direct: list = []
+
+    def direct_factory(endpoint, address, timeout):
+        direct.append(endpoint.hostname)
+        return _FakeConnection(_FakeResponse(200))
+
+    fetch_public_http_url(
+        "https://example.com/",
+        resolver=_resolver_for("93.184.216.34"),
+        connection_factory=direct_factory,
+        proxied_connection_factory=_proxied_factory(seen, iter([])),
+    )
+    assert direct == ["example.com"]
+    assert seen == []
+
+    fetch_public_http_url(
+        "https://example.com/",
+        trust_env=True,
+        resolver=lambda *a, **k: pytest.fail("the proxy path must not resolve"),
+        connection_factory=lambda *a: pytest.fail("the direct path must not run"),
+        proxied_connection_factory=_proxied_factory(seen, iter([_FakeResponse(200)])),
+    )
+    assert len(seen) == 1
+
+
+def test_proxied_redirect_to_another_public_host_is_followed():
+    from agent.security.network import ProxyConfig, fetch_public_http_url
+
+    seen: list = []
+    responses = iter(
+        [
+            _FakeResponse(302, headers={"Location": "https://other.example.net/x"}),
+            _FakeResponse(200, body=b"done"),
+        ]
+    )
+    result = fetch_public_http_url(
+        "https://example.com/start",
+        proxied_connection_factory=_proxied_factory(seen, responses),
+        proxy=ProxyConfig(host="127.0.0.1", port=7897),
+    )
+    assert result.body == b"done"
+    assert result.final_url == "https://other.example.net/x"
+    assert [c.endpoint.hostname for c in seen] == ["example.com", "other.example.net"]
+
+
+def test_redirect_to_the_metadata_service_is_refused_on_the_proxy_path():
+    """The proxy path still refuses a server-chosen hop to a local address."""
+    from agent.security.network import ProxyConfig, UnsafeNetworkTarget, fetch_public_http_url
+
+    seen: list = []
+    responses = iter(
+        [
+            _FakeResponse(
+                302, headers={"Location": "http://169.254.169.254/latest/meta-data/"}
+            )
+        ]
+    )
+    with pytest.raises(UnsafeNetworkTarget):
+        fetch_public_http_url(
+            "https://example.com/start",
+            proxied_connection_factory=_proxied_factory(seen, responses),
+            proxy=ProxyConfig(host="127.0.0.1", port=7897),
+        )
+    assert len(seen) == 1, "the redirect must be refused before a second connection"

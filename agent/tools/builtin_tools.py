@@ -23,7 +23,11 @@ from agent.exec import ExecRequest, provider_from
 from agent.exec.subprocess import OUTPUT_MAX_BYTES
 from agent.pathing import path_contains, resolve_workspace_path
 from agent.scheduler.models import LOCAL_TIMEZONE
-from agent.security.network import fetch_public_http_url
+from agent.security.network import (
+    fetch_public_http_url,
+    parse_proxy_url,
+    proxy_from_environment,
+)
 from agent.security.filesystem_sandbox import (
     SANDBOX_MODE_NONE,
     SandboxUnavailableError,
@@ -54,6 +58,9 @@ _atomic_write_text = shared._atomic_write_text
 
 WEB_FETCH_MAX_BYTES = 512 * 1024
 WEB_FETCH_TIMEOUT = 20
+
+#: ``web_proxy`` values that mean "never proxy", overriding the environment.
+_WEB_PROXY_DISABLED = frozenset({"none", "off", "no", "direct", "disable", "disabled"})
 
 #: How much of an upstream step's output ``read_step_output`` hands back.
 #:
@@ -2106,13 +2113,44 @@ class BuiltinTools:
         raw = re.sub(r"\n{3,}", "\n\n", raw)
         return raw.strip()
 
-    @staticmethod
-    def _make_urllib_request(url: str, timeout: int = WEB_FETCH_TIMEOUT) -> bytes:
-        """Fetch *url* through the validated, address-pinned network boundary."""
+    def _web_proxy_for(self, url: str) -> tuple[Any, bool]:
+        """``(proxy, trust_env)`` for one fetch.
+
+        ``web_proxy`` in config wins outright: a proxy URL names the proxy to
+        use, and the words in ``_WEB_PROXY_DISABLED`` turn proxying off even
+        when the environment asks for one.  With no config value the standard
+        environment variables decide.
+
+        The network boundary deliberately does not read the environment on its
+        own — a security boundary must not change which address it dials
+        because of ambient configuration — so the choice is made here, where an
+        operator can also override it.
+        """
+        raw = self.registry.get_context("web_proxy", "")
+        if isinstance(raw, str) and raw.strip():
+            text = raw.strip()
+            if text.lower() in _WEB_PROXY_DISABLED:
+                return None, False
+            parsed = parse_proxy_url(text)
+            if parsed is not None:
+                return parsed, False
+        return None, True
+
+    def _make_urllib_request(self, url: str, timeout: int = WEB_FETCH_TIMEOUT) -> bytes:
+        """Fetch *url* through the validated network boundary.
+
+        Proxied when config or the environment names a proxy.  A machine behind
+        a fake-IP resolver needs this: every name answers with a reserved
+        address, which the direct path correctly refuses, so without the proxy
+        path nothing can be fetched at all.
+        """
+        proxy, trust_env = self._web_proxy_for(url)
         result = fetch_public_http_url(
             url,
             timeout=timeout,
             max_bytes=WEB_FETCH_MAX_BYTES,
+            proxy=proxy,
+            trust_env=trust_env,
             headers={
                 "User-Agent": WEB_USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",

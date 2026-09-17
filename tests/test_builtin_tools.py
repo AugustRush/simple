@@ -1462,6 +1462,35 @@ def test_web_fetch_uses_asyncio_to_thread(tmp_path, monkeypatch):
     assert called["args"] == ("https://example.com",)
 
 
+def test_web_proxy_config_overrides_the_environment(tmp_path, monkeypatch):
+    """`web_proxy` decides: a URL pins a proxy, a word disables proxying.
+
+    With no config value the environment decides, so a machine behind Clash
+    starts working without any config edit.
+    """
+    tools, registry, _ = make_builtin_tools(tmp_path)
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9999")
+
+    # No config: defer to the environment.
+    proxy, trust_env = tools._web_proxy_for("https://example.com/")
+    assert (proxy, trust_env) == (None, True)
+
+    # An explicit URL wins, and the environment is then not consulted.
+    registry.set_context("web_proxy", "http://127.0.0.1:7897")
+    proxy, trust_env = tools._web_proxy_for("https://example.com/")
+    assert (proxy.host, proxy.port, trust_env) == ("127.0.0.1", 7897, False)
+
+    # "none" forces direct connections even when the environment asks.
+    registry.set_context("web_proxy", "none")
+    assert tools._web_proxy_for("https://example.com/") == (None, False)
+
+    # An unusable value is not silently treated as "no proxy": the environment
+    # still applies, so a typo degrades to the previous behaviour.
+    registry.set_context("web_proxy", "socks5://127.0.0.1:1080")
+    proxy, trust_env = tools._web_proxy_for("https://example.com/")
+    assert (proxy, trust_env) == (None, True)
+
+
 def test_web_fetch_reports_download_progress(tmp_path, monkeypatch):
     from agent.core.output import EventCollector, _active_event_collector
     from agent.security.network import FetchResponse

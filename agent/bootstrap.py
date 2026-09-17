@@ -576,6 +576,14 @@ async def _build_components_async(
     if tavily_api_key:
         registry.set_context("tavily_api_key", tavily_api_key)
 
+    # web_fetch's egress proxy.  Unset means "read the standard environment
+    # variables"; a URL pins one; "none" forces direct connections.  This
+    # matters behind a fake-IP resolver (Clash's enhanced-mode: fake-ip), where
+    # every name answers with a reserved address that the direct path refuses.
+    web_proxy = cfg.get("web_proxy", "")
+    if isinstance(web_proxy, str) and web_proxy.strip():
+        registry.set_context("web_proxy", web_proxy.strip())
+
     skill_catalog = skill_catalog_cls(
         user_root=user_skills_dir,
         # The switches from config.json, so a skill turned off before this
