@@ -458,6 +458,7 @@ class WebOutputSink(OutputSink):
         self._attachments: list[str] = []
         self._queued_attachment_paths: set[str] = set()
         self._turn_complete_emitted = False
+        self._retired = False
         self._completion_event = asyncio.Event()
         self.on_attachment = on_attachment
         self._confirmation_handler = confirmation_handler
@@ -510,6 +511,24 @@ class WebOutputSink(OutputSink):
     @property
     def turn_complete_emitted(self) -> bool:
         return self._turn_complete_emitted
+
+    @property
+    def retired(self) -> bool:
+        """True once the queued message this sink carried was withdrawn."""
+        return self._retired
+
+    def retire_queued_message(self) -> None:
+        """Wake this sink's waiter without reporting a finished turn.
+
+        A message queued behind a running operation parks its own
+        ``process_message`` task on ``wait_for_completion``.  Withdrawing the
+        message has to release that task — but it must not emit
+        ``turn_complete``, which the client would read as the *current* turn
+        ending.  Marking the sink retired lets the delivery path tell "nothing
+        to report" apart from "still waiting".
+        """
+        self._retired = True
+        self._completion_event.set()
 
     @property
     def streaming_snapshot(self) -> dict[str, Any] | None:
@@ -3317,6 +3336,33 @@ class WebChannel(Channel):
         token.cancel("force")
         return JSONResponse({"ok": True, "cancelled": True})
 
+    async def _withdraw_queued_message(self, request: Any) -> Any:
+        """Take back one message that is still waiting in a session's queue.
+
+        The text is returned so the client can put it back in the composer
+        and send an edited version.  A message that was already folded into
+        the running turn is no longer in either queue, so it reports
+        ``withdrawn: false`` rather than pretending it was taken back — the
+        model has read it.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        session_id = request.path_params["session_id"]
+        message_id = request.path_params["message_id"]
+        state = self._sessions.get(session_id)
+        if state is None:
+            return JSONResponse({"ok": True, "withdrawn": False, "text": ""})
+        text = state.withdraw_queued(message_id)
+        return JSONResponse(
+            {
+                "ok": True,
+                "withdrawn": text is not None,
+                "text": text or "",
+            }
+        )
+
     async def _stream(self, websocket: Any) -> None:
         await websocket.accept()
         if not self._authorized(websocket):
@@ -3412,7 +3458,14 @@ class WebChannel(Channel):
                     final_operation_state = str(
                         getattr(final_state, "operation_state", "idle")
                     )
-                    if not sink.turn_complete_emitted and final_operation_state == "idle":
+                    # A retired sink means the queued message was withdrawn:
+                    # there is no turn to report, and the idle session we now
+                    # see is the *other* turn finishing, not this one.
+                    if (
+                        not sink.turn_complete_emitted
+                        and not sink.retired
+                        and final_operation_state == "idle"
+                    ):
                         sink.on_turn_complete("", [])
                         await sink.flush()
             finally:
@@ -3751,6 +3804,11 @@ class WebChannel(Channel):
                 "/api/sessions/{session_id}/cancel",
                 self._cancel_session,
                 methods=["POST"],
+            ),
+            Route(
+                "/api/sessions/{session_id}/queue/{message_id}",
+                self._withdraw_queued_message,
+                methods=["DELETE"],
             ),
             Route(
                 "/api/sessions/{session_id}/permissions",

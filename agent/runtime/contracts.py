@@ -7,7 +7,16 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Callable, Literal, Mapping, TypeAlias, TypeVar, overload
+from typing import (
+    Any,
+    Callable,
+    Literal,
+    Mapping,
+    Sequence,
+    TypeAlias,
+    TypeVar,
+    overload,
+)
 
 from agent.core.attachments import MessageAttachment
 from agent.core.output import (
@@ -114,6 +123,36 @@ class RuntimeComponents:
                 f"{expected_type.__name__}, got {type(value).__name__}"
             )
         return value
+
+
+def describe_queued_messages(
+    interjections: Sequence[Mapping[str, Any]],
+    restarts: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Describe waiting messages in the order they will actually run.
+
+    Interjections come first: they are folded into the turn running now,
+    while restarts only run once it ends.
+
+    Entries are described even when they carry no id.  The queue a reader is
+    shown has to match the queue that exists; a caller that can only act on
+    identified messages should say so about that entry rather than leave it
+    out and report a shorter queue than there is.
+    """
+
+    described: list[dict[str, Any]] = []
+    for kind, queue in (("interjection", interjections), ("restart", restarts)):
+        for entry in queue:
+            described.append(
+                {
+                    "id": str(entry.get("message_id") or ""),
+                    "text": str(entry.get("text") or ""),
+                    "kind": kind,
+                    "urgency": str(entry.get("urgency") or "normal"),
+                    "arrived_at": float(entry.get("arrived_at") or 0.0),
+                }
+            )
+    return described
 
 
 @dataclass(init=False)
@@ -248,6 +287,28 @@ class RuntimeSessionState:
     def record_turn(self, tool_calls: list[str]) -> None:
         self.tools_used.extend(tool_calls)
         self.turn_count += 1
+
+    def withdraw_queued(self, message_id: str) -> str | None:
+        """Remove one queued message by id and release the sink holding it.
+
+        Returns the withdrawn text, or None when neither queue still holds
+        that id.  A message already folded into the running turn is no longer
+        in a queue and cannot be withdrawn: the model has read it.
+        """
+
+        wanted = str(message_id or "").strip()
+        if not wanted:
+            return None
+        for queue in (self.pending_interjections, self.restart_queue):
+            for index, entry in enumerate(queue):
+                if str(entry.get("message_id") or "") != wanted:
+                    continue
+                del queue[index]
+                retire = getattr(entry.get("sink"), "retire_queued_message", None)
+                if callable(retire):
+                    retire()
+                return str(entry.get("text") or "")
+        return None
 
 
 class TurnRunner:

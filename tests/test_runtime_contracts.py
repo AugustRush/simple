@@ -199,6 +199,96 @@ def test_runtime_session_state_compatibility_alias_cannot_alias_restart_queue():
     assert state.pending_messages is not state.restart_queue
 
 
+class _StubSink:
+    """A sink that records being released after its message was withdrawn."""
+
+    def __init__(self) -> None:
+        self.retired = 0
+
+    def retire_queued_message(self) -> None:
+        self.retired += 1
+
+
+def _queued(message_id: str, text: str, sink: object | None = None) -> dict:
+    entry = {
+        "text": text,
+        "message_id": message_id,
+        "arrived_at": 1.0,
+        "urgency": "normal",
+    }
+    if sink is not None:
+        entry["sink"] = sink
+    return entry
+
+
+def test_withdrawing_a_queued_message_returns_its_text_and_removes_it():
+    state = RuntimeSessionState(ctx=object())
+    state.pending_interjections.append(_queued("msg-1", "please hurry"))
+    state.restart_queue.append(_queued("msg-2", "and then this"))
+
+    assert state.withdraw_queued("msg-1") == "please hurry"
+    assert state.pending_interjections == []
+    assert [entry["text"] for entry in state.restart_queue] == ["and then this"]
+
+
+def test_withdrawing_a_queued_message_releases_the_sink_holding_it():
+    sink = _StubSink()
+    state = RuntimeSessionState(ctx=object())
+    state.restart_queue.append(_queued("msg-1", "later", sink))
+
+    assert state.withdraw_queued("msg-1") == "later"
+    assert sink.retired == 1
+
+
+def test_a_message_the_turn_already_read_cannot_be_withdrawn():
+    sink = _StubSink()
+    state = RuntimeSessionState(ctx=object())
+    # The interjection was folded into the running turn, so the queue no
+    # longer holds it; only the message still waiting can come back.
+    state.restart_queue.append(_queued("msg-2", "still waiting", sink))
+
+    assert state.withdraw_queued("msg-1") is None
+    assert [entry["text"] for entry in state.restart_queue] == ["still waiting"]
+    assert sink.retired == 0
+
+
+def test_withdrawing_an_unknown_or_empty_id_changes_nothing():
+    state = RuntimeSessionState(ctx=object())
+    state.pending_interjections.append(_queued("msg-1", "keep me"))
+
+    assert state.withdraw_queued("") is None
+    assert state.withdraw_queued("nobody") is None
+    assert [entry["text"] for entry in state.pending_interjections] == ["keep me"]
+
+
+def test_describing_the_queue_puts_interjections_before_restarts():
+    from agent.runtime.contracts import describe_queued_messages
+
+    described = describe_queued_messages(
+        [_queued("msg-1", "urgent")],
+        [_queued("msg-2", "follow-up"), _queued("msg-3", "another")],
+    )
+
+    assert [(item["id"], item["kind"]) for item in described] == [
+        ("msg-1", "interjection"),
+        ("msg-2", "restart"),
+        ("msg-3", "restart"),
+    ]
+    assert [item["text"] for item in described] == ["urgent", "follow-up", "another"]
+
+
+def test_describing_the_queue_does_not_hide_an_entry_it_cannot_name():
+    from agent.runtime.contracts import describe_queued_messages
+
+    described = describe_queued_messages([{"text": "from another channel"}], [])
+
+    # The reader sees the queue that exists, not the part of it that happens
+    # to be addressable.
+    assert len(described) == 1
+    assert described[0]["id"] == ""
+    assert described[0]["text"] == "from another channel"
+
+
 def test_runtime_session_state_preserves_legacy_full_positional_constructor():
     ctx = object()
     tools_used = ["bash"]

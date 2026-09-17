@@ -2547,6 +2547,7 @@ class _CoordinatorSink:
         self.errors: list[str] = []
         self.attachments: list[object] = []
         self.drain_count = 0
+        self.retired = 0
 
     def on_status(self, text: str, *, level: str = "info") -> None:
         self.statuses.append((text, level))
@@ -2559,6 +2560,9 @@ class _CoordinatorSink:
 
     async def drain(self) -> None:
         self.drain_count += 1
+
+    def retire_queued_message(self) -> None:
+        self.retired += 1
 
 
 class _CoordinatorCore:
@@ -3004,6 +3008,120 @@ def test_active_non_interjection_command_queues_restart_fifo() -> None:
 
         assert [call.text for call in core.calls] == ["second", "third"]
         assert command_sink.statuses == [("command done", "info")]
+
+    asyncio.run(scenario())
+
+
+def test_a_queued_message_is_filed_under_the_id_its_submitter_used() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def block_first(turn_input, state, sink):
+            if turn_input.text == "first":
+                started.set()
+                await release.wait()
+
+        coordinator, _ = _coordinator(core=_CoordinatorCore(block_first))
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+        running = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await started.wait()
+        await coordinator.handle(
+            _turn("queued later", message_id="msg-42"), state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
+
+        # Without the submitter's own id on the entry, nothing downstream can
+        # point at one queued message and say "this one".
+        assert [entry["message_id"] for entry in state.pending_interjections] == [
+            "msg-42"
+        ]
+
+        release.set()
+        await running
+
+    asyncio.run(scenario())
+
+
+def test_a_withdrawn_message_never_reaches_the_model() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def block_first(turn_input, state, sink):
+            if turn_input.text == "first":
+                started.set()
+                await release.wait()
+
+        core = _CoordinatorCore(block_first)
+        coordinator, _ = _coordinator(core=core)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+        withdrawn_sink = _CoordinatorSink()
+
+        running = asyncio.create_task(
+            coordinator.handle(_turn("first"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await started.wait()
+        await coordinator.handle(
+            _turn("a typo I want back", message_id="msg-2"), state, withdrawn_sink
+        )  # type: ignore[arg-type]
+        await coordinator.handle(
+            _turn("keep me", message_id="msg-3"), state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
+
+        assert state.withdraw_queued("msg-2") == "a typo I want back"
+        assert [entry["text"] for entry in state.pending_interjections] == ["keep me"]
+        # The sink that was waiting on the withdrawn message is let go.
+        assert withdrawn_sink.retired == 1
+
+        release.set()
+        await running
+
+        assert [call.text for call in core.calls] == ["first", "keep me"]
+
+    asyncio.run(scenario())
+
+
+def test_a_withdrawn_restart_leaves_the_messages_behind_it_in_line() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_handler(request, context):
+            started.set()
+            await release.wait()
+            return CommandResult(response_text="command done")
+
+        router = CommandRouter(
+            core_commands=[CommandDescriptor("wait", blocking_handler)]
+        )
+        coordinator, core = _coordinator(router)
+        state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+
+        running = asyncio.create_task(
+            coordinator.handle(_turn("/wait"), state, _CoordinatorSink())  # type: ignore[arg-type]
+        )
+        await started.wait()
+        await coordinator.handle(
+            _turn("a typo I want back", message_id="msg-2"), state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
+        await coordinator.handle(
+            _turn("keep me", message_id="msg-3"), state, _CoordinatorSink()
+        )  # type: ignore[arg-type]
+
+        assert [entry["text"] for entry in state.restart_queue] == [
+            "a typo I want back",
+            "keep me",
+        ]
+        assert state.withdraw_queued("msg-2") == "a typo I want back"
+        assert [entry["text"] for entry in state.restart_queue] == ["keep me"]
+
+        release.set()
+        await running
+
+        assert [call.text for call in core.calls] == ["keep me"]
 
     asyncio.run(scenario())
 

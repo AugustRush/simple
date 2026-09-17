@@ -1107,11 +1107,16 @@ html[data-theme='light'] .tool-trace-items {
 }
 
 .message-queue-banner {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+}
+
+.message-queue-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-height: 32px;
-  padding: 0 10px;
+  min-height: 16px;
 }
 
 .message-queue-dot {
@@ -1122,7 +1127,37 @@ html[data-theme='light'] .tool-trace-items {
   background: var(--primary);
 }
 
+.message-queue-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 2px;
+}
+
+.message-queue-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.message-queue-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--text);
+}
+
+.message-queue-pending {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+}
+
 .message-queue-banner button {
+  flex: 0 0 auto;
   margin-left: auto;
   padding: 2px 4px;
   border: 0;

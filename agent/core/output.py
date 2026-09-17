@@ -355,6 +355,16 @@ class OutputSink(ABC):
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
         """Called once the model turn is fully resolved."""
 
+    def retire_queued_message(self) -> None:
+        """Release this sink because the message it carried was withdrawn.
+
+        A submission accepted into a session queue keeps its sink alive past
+        the call that submitted it, because that sink is what the queued
+        message will eventually stream into.  Withdrawing the message means
+        it will never run, so the sink has to be released here — and without
+        reporting a completed turn, because no turn happened.
+        """
+
     def on_tool_start(self, name: str, inputs: dict) -> None:
         """Called immediately before a tool is executed."""
 

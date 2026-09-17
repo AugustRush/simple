@@ -457,6 +457,14 @@ interface SessionTaskGuidance {
   artifacts?: string[]
 }
 
+interface QueuedQueueItem {
+  id: string
+  text: string
+  kind?: string
+  urgency?: string
+  arrived_at?: number
+}
+
 interface SessionState {
   session_id: string
   live?: boolean
@@ -465,6 +473,10 @@ interface SessionState {
     pending?: number
     interjections?: number
     restarts?: number
+    // The entries themselves. The count alone cannot say whether the message
+    // the reader is looking at is still really waiting, so it cannot decide
+    // whether taking it back is still possible.
+    items?: QueuedQueueItem[]
   }
   task?: SessionTaskGuidance | null
   workspace_root?: string
@@ -2381,6 +2393,7 @@ function App() {
   const currentModelRef = useRef(currentModel)
   const activeSessionRef = useRef<string | null>(null)
   const pendingSendRef = useRef<string | null>(null)
+  const pendingMessageIdRef = useRef<string | null>(null)
   const pendingModelRef = useRef<string | null>(null)
   const queuedMessagesRef = useRef<QueuedMessage[]>([])
   const streamIdRef = useRef<string | null>(null)
@@ -2712,9 +2725,11 @@ function App() {
           setIsStreaming(true)
           ws.send(JSON.stringify({
             type: 'message',
+            message_id: pendingMessageIdRef.current || undefined,
             text: pending,
             model: pendingModelRef.current,
           }))
+          pendingMessageIdRef.current = null
           pendingModelRef.current = null
         }
       }
@@ -3122,6 +3137,7 @@ function App() {
       try {
         setCreatingSession(true)
         pendingSendRef.current = text
+        pendingMessageIdRef.current = messageId
         pendingModelRef.current = currentModelRef.current
         const resp = await api('/api/sessions', { method: 'POST' })
         const data = await resp.json()
@@ -3133,6 +3149,7 @@ function App() {
         loadSessionState(sid)
       } catch {
         pendingSendRef.current = null
+        pendingMessageIdRef.current = null
         pendingModelRef.current = null
         setActivity('')
       } finally {
@@ -3146,6 +3163,10 @@ function App() {
       setIsStreaming(true)
       ws.send(JSON.stringify({
         type: 'message',
+        // The id travels with the message so the queue entry the server keeps
+        // behind the running turn can still be named later — that is what
+        // makes taking one message back possible.
+        message_id: messageId,
         text,
         model: currentModelRef.current,
         attachments,
@@ -3155,6 +3176,79 @@ function App() {
 
     messageApi.warning('连接已断开，正在重新连接…')
     connectWs(activeSession)
+  }
+
+  // What the queue really holds: the server's own list, plus anything just
+  // submitted that the server has not echoed back yet. Server entries win on
+  // id, so a message is never shown twice, and an entry that only exists
+  // locally is not offered for withdrawal — it may not have reached the queue
+  // yet, and reporting it as taken back would be a promise we cannot keep.
+  const queueView = (() => {
+    const items = sessionState?.queue?.items ?? []
+    const seen = new Set(items.map(item => item.id))
+    return [
+      ...items.map(item => ({
+        id: item.id,
+        text: item.text,
+        withdrawable: Boolean(item.id),
+      })),
+      ...queuedMessages
+        .filter(item => !seen.has(item.id))
+        .map(item => ({ id: item.id, text: item.text, withdrawable: false })),
+    ]
+  })()
+
+  const dropQueuedLocally = (messageId: string) => {
+    queuedMessagesRef.current = queuedMessagesRef.current.filter(
+      item => item.id !== messageId,
+    )
+    setQueuedMessages([...queuedMessagesRef.current])
+    messagesRef.current = messagesRef.current.filter(item => item.id !== messageId)
+    setMessages([...messagesRef.current])
+  }
+
+  // Returns the withdrawn text, or '' when the server no longer had it.
+  const withdrawOneQueued = async (messageId: string): Promise<string> => {
+    const sid = activeSessionRef.current
+    if (!sid) return ''
+    try {
+      const response = await api(
+        `/api/sessions/${encodeURIComponent(sid)}/queue/${encodeURIComponent(messageId)}`,
+        { method: 'DELETE' },
+      )
+      const data = await response.json().catch(() => ({}))
+      if (data?.withdrawn === false) return ''
+      dropQueuedLocally(messageId)
+      return String(data?.text || '')
+    } catch {
+      messageApi.warning('撤回失败，请重试')
+      return ''
+    }
+  }
+
+  const withdrawQueuedMessages = async (messageIds: string[]) => {
+    const sid = activeSessionRef.current
+    if (!sid) return
+    const restored: string[] = []
+    // Sequential on purpose: each withdrawal has to settle before the next,
+    // and the composer is only written once at the end. Restoring per call
+    // would let the last write win and silently drop the other messages.
+    for (const messageId of messageIds) {
+      const text = await withdrawOneQueued(messageId)
+      if (text) restored.push(text)
+    }
+    if (restored.length < messageIds.length) {
+      messageApi.warning('有消息已经开始处理，撤不回来了')
+    }
+    if (restored.length) {
+      // Hand the text back to the composer instead of editing it in place:
+      // once a message is on its way the honest undo is to take it out of the
+      // queue, because anything the model already read cannot be unread.
+      // Whatever is already typed in the composer is kept.
+      const taken = restored.join('\n')
+      setInput(input.trim() ? `${taken}\n${input}` : taken)
+    }
+    loadSessionState(sid)
   }
 
   const clearInterruptTimers = useCallback(() => {
@@ -5851,22 +5945,43 @@ function App() {
             </div>
           )
         })()}
-        {Math.max(
-          queuedMessages.length,
-          Number(sessionState?.queue?.pending || 0),
-        ) > 0 && (
+        {queueView.length > 0 && (
           <div className="message-queue-banner">
-            <span className="message-queue-dot" />
-            <span>
-              已排队 {Math.max(queuedMessages.length, Number(sessionState?.queue?.pending || 0))} 条消息，将按顺序处理
-            </span>
-            {queuedMessages.length > 0 && <button type="button" onClick={() => {
-              const ids = new Set(queuedMessages.map(item => item.id))
-              messagesRef.current = messagesRef.current.filter(item => !ids.has(item.id))
-              setMessages([...messagesRef.current])
-              queuedMessagesRef.current = []
-              setQueuedMessages([])
-            }}>清空</button>}
+            <div className="message-queue-head">
+              <span className="message-queue-dot" />
+              <span>已排队 {queueView.length} 条消息，将按顺序处理</span>
+              {queueView.some(item => item.withdrawable) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    void withdrawQueuedMessages(
+                      queueView.filter(item => item.withdrawable).map(item => item.id),
+                    )
+                  }}
+                >
+                  全部撤回
+                </button>
+              )}
+            </div>
+            <ul className="message-queue-list">
+              {queueView.map((item, index) => (
+                <li key={item.id || `queued-${index}`}>
+                  <span className="message-queue-text">
+                    {truncate(item.text, 60) || '（无文字内容）'}
+                  </span>
+                  {item.withdrawable ? (
+                    <button
+                      type="button"
+                      onClick={() => { void withdrawQueuedMessages([item.id]) }}
+                    >
+                      撤回
+                    </button>
+                  ) : (
+                    <span className="message-queue-pending">发送中…</span>
+                  )}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
         {sessionState?.task?.active_goal &&

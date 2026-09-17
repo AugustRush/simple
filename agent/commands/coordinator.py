@@ -59,6 +59,7 @@ def _is_chat_approval_message(text: str) -> bool:
 
 class _QueueEntry(TypedDict):
     text: str
+    message_id: str
     from_user: str
     arrived_at: float
     urgency: str
@@ -870,6 +871,10 @@ class CommandCoordinator:
     ) -> _QueueEntry:
         entry: _QueueEntry = {
             "text": turn_input.text,
+            # The id the submitter already knows this message by.  It is what
+            # lets a queue that outlives the submission call still be
+            # addressed per item, e.g. to withdraw one entry before it runs.
+            "message_id": str(turn_input.metadata.get("message_id") or ""),
             "from_user": str(
                 turn_input.metadata.get("user_id")
                 or turn_input.metadata.get("sender")

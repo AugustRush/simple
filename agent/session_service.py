@@ -366,7 +366,12 @@ class SessionService:
                 "session_id": "",
                 "live": False,
                 "operation_state": "idle",
-                "queue": {"pending": 0, "interjections": 0, "restarts": 0},
+                "queue": {
+                    "pending": 0,
+                    "interjections": 0,
+                    "restarts": 0,
+                    "items": [],
+                },
                 "task": None,
                 "workspace_root": "",
                 "workspace_status": "unset",
@@ -374,6 +379,8 @@ class SessionService:
             }
 
         live = self._live_states.get(clean)
+        from agent.runtime.contracts import describe_queued_messages
+
         live_ctx = getattr(live, "ctx", None) if live is not None else None
         live_metadata = getattr(live_ctx, "metadata", {}) if live_ctx is not None else {}
         persisted_workspace_meta: dict[str, Any] = {}
@@ -444,6 +451,11 @@ class SessionService:
                 "pending": len(interjections) + len(restarts),
                 "interjections": len(interjections),
                 "restarts": len(restarts),
+                # The entries themselves, not just how many there are: a
+                # queued message can be taken back only while the client can
+                # name it, and the count alone cannot tell the client whether
+                # the message it is showing is still really waiting.
+                "items": describe_queued_messages(interjections, restarts),
             },
             "task": task,
             "usage": usage,

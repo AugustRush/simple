@@ -114,13 +114,23 @@ def test_session_service_exposes_task_guidance_and_queue_state():
 
     live = SimpleNamespace(
         operation_state="active",
-        pending_interjections=[{"text": "urgent"}],
-        restart_queue=[{"text": "follow-up"}, {"text": "another"}],
+        pending_interjections=[{"text": "urgent", "message_id": "msg-1"}],
+        restart_queue=[
+            {"text": "follow-up", "message_id": "msg-2"},
+            {"text": "another", "message_id": "msg-3"},
+        ],
     )
     state = SessionService(store=Store(), live_states={"s-1": live}).get_session_state("s-1")
 
     assert state["operation_state"] == "active"
-    assert state["queue"] == {"pending": 3, "interjections": 1, "restarts": 2}
+    assert state["queue"]["pending"] == 3
+    assert state["queue"]["interjections"] == 1
+    assert state["queue"]["restarts"] == 2
+    assert [item["id"] for item in state["queue"]["items"]] == [
+        "msg-1",
+        "msg-2",
+        "msg-3",
+    ]
     assert state["task"]["active_goal"] == "finish the migration"
 
 
@@ -3729,3 +3739,95 @@ def test_web_a_schedule_with_no_timezone_is_read_in_the_machines_zone(
         store.close()
 
     assert task.trigger.payload["timezone_name"] == "Asia/Shanghai"
+
+
+def _queued_state(*, message_id: str, text: str, sink=None):
+    """A live session state holding one message still waiting in its queue."""
+    from agent.runtime import RuntimeSessionState
+
+    state = RuntimeSessionState(ctx=SimpleNamespace(metadata={}))
+    entry = {
+        "text": text,
+        "message_id": message_id,
+        "arrived_at": 1.0,
+        "urgency": "normal",
+    }
+    if sink is not None:
+        entry["sink"] = sink
+    state.restart_queue.append(entry)
+    return state
+
+
+def test_web_withdrawing_a_queued_message_hands_the_text_back():
+    from starlette.testclient import TestClient
+
+    state = _queued_state(message_id="msg-7", text="结算模拟盘")
+    channel = _channel()
+    channel.bind_runtime({"s-1": state}, {})
+
+    with TestClient(channel.app) as client:
+        listed = client.get("/api/sessions/s-1/state").json()
+        assert [item["id"] for item in listed["queue"]["items"]] == ["msg-7"]
+
+        withdrawn = client.delete("/api/sessions/s-1/queue/msg-7")
+        assert withdrawn.status_code == 200
+        assert withdrawn.json() == {"ok": True, "withdrawn": True, "text": "结算模拟盘"}
+
+        after = client.get("/api/sessions/s-1/state").json()
+
+    assert state.restart_queue == []
+    assert after["queue"]["pending"] == 0
+    assert after["queue"]["items"] == []
+
+
+def test_web_a_second_withdrawal_reports_the_message_is_already_gone():
+    from starlette.testclient import TestClient
+
+    state = _queued_state(message_id="msg-7", text="结算模拟盘")
+    channel = _channel()
+    channel.bind_runtime({"s-1": state}, {})
+
+    with TestClient(channel.app) as client:
+        assert client.delete("/api/sessions/s-1/queue/msg-7").json()["withdrawn"] is True
+        again = client.delete("/api/sessions/s-1/queue/msg-7")
+
+    assert again.status_code == 200
+    # Saying "taken back" twice would tell the reader it is safe to resend a
+    # message that is already on its way.
+    assert again.json() == {"ok": True, "withdrawn": False, "text": ""}
+
+
+def test_web_withdrawing_from_a_session_that_is_not_live_changes_nothing():
+    from starlette.testclient import TestClient
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+
+    with TestClient(channel.app) as client:
+        response = client.delete("/api/sessions/nobody/queue/msg-7")
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True, "withdrawn": False, "text": ""}
+
+
+def test_web_a_withdrawn_message_does_not_end_the_running_turn():
+    """Releasing the sink must not be mistaken for a finished turn.
+
+    The sink of a message queued behind a running turn is kept alive on
+    ``wait_for_completion``.  Waking it is what lets the withdrawal finish,
+    but a ``turn_complete`` event here would make the browser reset the turn
+    that is still running.
+    """
+    import asyncio
+
+    from agent.channels.web import WebOutputSink
+
+    sink = WebOutputSink(collect=True)
+    sink.mark_turn_start()
+    sink.retire_queued_message()
+
+    finished = asyncio.run(sink.wait_for_completion(timeout=1.0))
+
+    assert sink.retired is True
+    assert finished is False
+    assert [event for event in sink.events if event["type"] == "turn_complete"] == []
