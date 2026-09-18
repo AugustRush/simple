@@ -5632,7 +5632,7 @@ function App() {
         ? roleCount > 0 ? `${roleCount} 个代理已结束` : '已结束'
         : roleCount > 0 ? `${roleCount} 个代理已完成` : '已完成'
     return (
-      <div className={`subagent-note subagent-note-${tone}`}>
+      <div key={item.id} className={`subagent-note subagent-note-${tone}`}>
         <button
           type="button"
           className="subagent-note-head"
