@@ -950,11 +950,18 @@ const SUBAGENT_KIND_LABELS: Record<string, string> = {
 /** Kinds that end a batch; everything after them starts a fresh note. */
 const SUBAGENT_TERMINAL_KINDS = new Set(['batch_finished'])
 
+/**
+ * One log line for the strip, built from the event's own fields.
+ *
+ * ``evt.message`` is deliberately not used. The server renders it for a console
+ * (``Parallel batch running: 1/3 completed, 2 still running``) and for a
+ * sub-agent start it embeds the raw task text, so printing it put English
+ * sentences and literal ``**`` emphasis inside a Chinese panel.
+ * ``SUBAGENT_KIND_LABELS`` already names the same states in the UI's language.
+ */
 function subagentEventLine(evt: Record<string, unknown>): string {
-  const message = String(evt.message || '').trim()
-  if (message) return message
-  const role = String(evt.role || '').trim()
   const kind = String(evt.kind || '').trim()
+  const role = String(evt.role || '').trim()
   const label = SUBAGENT_KIND_LABELS[kind] || kind || '状态更新'
   return role ? `${role} · ${label}` : label
 }
@@ -987,9 +994,16 @@ function foldSubAgentEvent(
   const finished = note.finished || SUBAGENT_TERMINAL_KINDS.has(kind)
   const terminal = kind === 'agent_finished' || kind === 'agent_failed'
   const lastLog = note.logs[note.logs.length - 1]
+  // Progress heartbeats are not events. Their state is already the strip's
+  // counter, they repeat verbatim, and logging them would push the one line
+  // worth reading out of the strip.
+  const logs =
+    kind === 'batch_progress' || lastLog === line
+      ? note.logs
+      : [...note.logs, line]
   return {
     ...note,
-    logs: lastLog === line ? note.logs : [...note.logs, line],
+    logs,
     roles: role && !note.roles.includes(role) ? [...note.roles, role] : note.roles,
     doneRoles:
       terminal && role && !note.doneRoles.includes(role)
@@ -1015,6 +1029,27 @@ function subagentCounts(note: SubAgentNote): { done: number; total: number } {
     done: note.completed > 0 ? note.completed : note.doneRoles.length,
     total: note.total > 0 ? note.total : observed,
   }
+}
+
+/**
+ * The still-open sub-agent note for the turn in progress, or null.
+ *
+ * Deliberately not "the last row in the list". Every tool call appends a row --
+ * including the sub-agents' own, because they inherit the turn's output sink --
+ * so while a batch runs the last row is a tool row about as often as it is the
+ * note. Keying the fold on that made one batch open a fresh strip after every
+ * sub-agent tool call. A note never outlives its turn, so the search stops at
+ * the user message that opened it.
+ */
+function findOpenSubAgentNote(list: Message[]): Message | null {
+  for (let index = list.length - 1; index >= 0; index -= 1) {
+    const item = list[index]
+    if (item.role === 'user') return null
+    if (item.role === 'subagent' && item.subagent && !item.subagent.finished) {
+      return item
+    }
+  }
+  return null
 }
 
 function sealSubAgentNotes(list: Message[]): Message[] {
@@ -2987,14 +3022,13 @@ function App() {
         }
 
         if (evt.type === 'subagent_event') {
-          // Update the open note in place; only start a new one once the
+          // Update the turn's open note in place; only start a new one once the
           // previous batch has reported itself finished.
           const now = Date.now()
-          const list = messagesRef.current
-          const last = list[list.length - 1]
-          if (last && last.role === 'subagent' && last.subagent && !last.subagent.finished) {
-            updateMessage(last.id, {
-              subagent: foldSubAgentEvent(last.subagent, evt, now),
+          const open = findOpenSubAgentNote(messagesRef.current)
+          if (open && open.subagent) {
+            updateMessage(open.id, {
+              subagent: foldSubAgentEvent(open.subagent, evt, now),
             })
           } else {
             appendMessage({
@@ -5578,55 +5612,68 @@ function App() {
     )
   }
 
-  const renderMessage = (item: Message, traceSummary?: React.ReactNode) => {
+  /**
+   * One batch's progress strip.
+   *
+   * Rendered inside the assistant row it belongs to rather than as a row of its
+   * own: a full-width block landing after the reply reads as a second message
+   * from the agent, which is what it looked like when it was a sibling row.
+   */
+  const renderSubAgentNote = (item: Message) => {
+    const note = item.subagent as SubAgentNote
+    const { done, total } = subagentCounts(note)
+    const roleCount = Math.max(note.roles.length, note.doneRoles.length, note.total)
+    const seconds = Math.max(0, (note.endedAt - note.startedAt) / 1000)
+    const latest = note.logs[note.logs.length - 1] || ''
+    const tone = note.failed > 0 ? 'failed' : note.running ? 'running' : 'done'
+    const stateText = note.running
+      ? roleCount > 0 ? `${roleCount} 个代理运行中` : '正在运行'
+      : note.failed > 0
+        ? roleCount > 0 ? `${roleCount} 个代理已结束` : '已结束'
+        : roleCount > 0 ? `${roleCount} 个代理已完成` : '已完成'
+    return (
+      <div className={`subagent-note subagent-note-${tone}`}>
+        <button
+          type="button"
+          className="subagent-note-head"
+          aria-expanded={!!note.open}
+          onClick={() =>
+            updateMessage(item.id, { subagent: { ...note, open: !note.open } })
+          }
+        >
+          <span className="subagent-note-dot" />
+          <span className="subagent-note-title">子代理协作</span>
+          <span className="subagent-note-state">{stateText}</span>
+          {note.failed > 0 && (
+            <span className="subagent-note-failed">{note.failed} 个失败</span>
+          )}
+          {note.running && latest && (
+            <span className="subagent-note-latest">{latest}</span>
+          )}
+          <span className="subagent-note-metrics">
+            {note.running ? `${done}/${total || '?'}` : `${seconds.toFixed(1)}s`}
+          </span>
+          <DownOutlined className="subagent-note-chevron" rotate={note.open ? 180 : 0} />
+        </button>
+        {note.open && (
+          <ol className="subagent-note-logs">
+            {note.logs.map((line, index) => (
+              <li key={`${item.id}-${index}`}>{line}</li>
+            ))}
+          </ol>
+        )}
+      </div>
+    )
+  }
+
+  const renderMessage = (
+    item: Message,
+    traceSummary?: React.ReactNode,
+    subagentNotes?: Message[],
+  ) => {
     if (item.role === 'tool') return renderToolEvent(item)
 
-    if (item.role === 'subagent' && item.subagent) {
-      const note = item.subagent
-      const { done, total } = subagentCounts(note)
-      const roleCount = Math.max(note.roles.length, note.doneRoles.length, note.total)
-      const seconds = Math.max(0, (note.endedAt - note.startedAt) / 1000)
-      const latest = note.logs[note.logs.length - 1] || ''
-      const tone = note.failed > 0 ? 'failed' : note.running ? 'running' : 'done'
-      const stateText = note.running
-        ? roleCount > 0 ? `${roleCount} 个代理运行中` : '正在运行'
-        : note.failed > 0
-          ? roleCount > 0 ? `${roleCount} 个代理已结束` : '已结束'
-          : roleCount > 0 ? `${roleCount} 个代理已完成` : '已完成'
-      return (
-        <div key={item.id} className={`subagent-note subagent-note-${tone}`}>
-          <button
-            type="button"
-            className="subagent-note-head"
-            aria-expanded={!!note.open}
-            onClick={() =>
-              updateMessage(item.id, { subagent: { ...note, open: !note.open } })
-            }
-          >
-            <span className="subagent-note-dot" />
-            <span className="subagent-note-title">子代理协作</span>
-            <span className="subagent-note-state">{stateText}</span>
-            {note.failed > 0 && (
-              <span className="subagent-note-failed">{note.failed} 个失败</span>
-            )}
-            {note.running && latest && (
-              <span className="subagent-note-latest">{latest}</span>
-            )}
-            <span className="subagent-note-metrics">
-              {note.running ? `${done}/${total || '?'}` : `${seconds.toFixed(1)}s`}
-            </span>
-            <DownOutlined className="subagent-note-chevron" rotate={note.open ? 180 : 0} />
-          </button>
-          {note.open && (
-            <ol className="subagent-note-logs">
-              {note.logs.map((line, index) => (
-                <li key={`${item.id}-${index}`}>{line}</li>
-              ))}
-            </ol>
-          )}
-        </div>
-      )
-    }
+    if (item.role === 'subagent' && item.subagent) return renderSubAgentNote(item)
 
     if (item.role === 'command' || item.role === 'error') {
       return (
@@ -5659,6 +5706,11 @@ function App() {
             {item.streaming && <span className="message-streaming">正在生成</span>}
             {traceSummary}
           </div>
+          {!!subagentNotes?.length && (
+            <div className="message-subagents">
+              {subagentNotes.map(note => renderSubAgentNote(note))}
+            </div>
+          )}
           <div className={`bubble ${isUser ? 'bubble-user' : 'bubble-assistant'} ${item.attachments?.length ? 'bubble-with-attachments' : ''}`}>
             {item.attachments && item.attachments.length > 0 && (
               <div className="message-attachments">
@@ -5778,26 +5830,38 @@ function App() {
     let groupUser: Message | null = null
     let groupItems: Message[] = []
     let groupTools: Message[] = []
+    let groupNotes: Message[] = []
 
     const flushTurn = () => {
       if (groupUser) nodes.push(renderMessage(groupUser))
       let traceAttached = false
+      let notesAttached = false
       groupItems.forEach(item => {
         const shouldAttachTrace =
           !traceAttached && item.role === 'assistant' && groupTools.length > 0
+        // The strip belongs to the assistant row that produced it, so it is
+        // handed to that row rather than pushed as a row of its own.
+        const notes =
+          !notesAttached && item.role === 'assistant' ? groupNotes : undefined
+        if (notes?.length) notesAttached = true
         if (shouldAttachTrace) {
-          nodes.push(renderMessage(item, renderToolTraceContent(groupTools)))
+          nodes.push(renderMessage(item, renderToolTraceContent(groupTools), notes))
           traceAttached = true
         } else {
-          nodes.push(renderMessage(item))
+          nodes.push(renderMessage(item, undefined, notes))
         }
       })
       if (groupTools.length && !traceAttached) {
         nodes.push(renderToolTrace(groupTools))
       }
+      // A transcript can arrive without its assistant row (another tab's turn,
+      // or a restored session). The strip is the only record that a batch ran,
+      // so it must not disappear with the row it would have attached to.
+      if (!notesAttached) groupNotes.forEach(note => nodes.push(renderSubAgentNote(note)))
       groupUser = null
       groupItems = []
       groupTools = []
+      groupNotes = []
     }
 
     messages.forEach(item => {
@@ -5809,6 +5873,8 @@ function App() {
         // must appear in the chat stream, not hidden inside the collapsible
         // tool trace overlay. Regular tool-trace rows carry no ``link``.
         groupTools.push(item)
+      } else if (item.role === 'subagent' && item.subagent) {
+        groupNotes.push(item)
       } else {
         groupItems.push(item)
       }

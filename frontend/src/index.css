@@ -971,7 +971,21 @@ html[data-theme='light'] .tool-trace-items {
 /* Sub-agent telemetry. One strip per batch that updates in place, instead of a
    chat bubble per socket event: a 4-agent batch emits a dozen events, and at
    ~60px each (note row plus the conversation gap) that used to push hundreds
-   of pixels of near-identical lines through the scroll area. */
+   of pixels of near-identical lines through the scroll area.
+
+   The strip lives inside the assistant row it describes -- between the meta
+   line and the reply -- so it reads as that message's status. As a sibling row
+   it spanned the full chat width with no avatar, which made it look like a
+   second message from the agent. */
+.message-subagents {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-self: stretch;
+  width: 100%;
+  margin-bottom: 6px;
+}
+
 .subagent-note {
   align-self: stretch;
   width: 100%;
