@@ -1613,6 +1613,122 @@ html[data-theme='light'] .tool-trace-items {
   font-weight: 600;
 }
 
+/* Channel switches.
+ *
+ * These were two `md=8` form columns, which is a layout for a value you type:
+ * the name took one line, the control took the next, and a 44px switch then sat
+ * alone in a ~300px column with the rest of it empty -- floated in a
+ * control-height slot nothing else shared. A boolean is not a form field; it is
+ * a row you turn on. One row per channel: what it is on the left, whether it is
+ * on, on the right.
+ *
+ * The row reads its own state through `:has(.ant-switch-checked)` rather than a
+ * second copy of the value in JS, so the switch stays the only source of it. */
+.settings-channel-block {
+  margin-top: 4px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-channel-block-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+/* Inside a heading the label is one item of a row, not a stacked block. */
+.settings-channel-block-head .settings-field-label {
+  margin-bottom: 0;
+}
+
+.settings-channel-block-head small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* `auto-fit` rather than a breakpoint: two columns only while the card is
+ * actually wide enough for two. Tied to a viewport media query instead, the
+ * 769-1000px band (collapsed sider, so a narrow card) went back to two columns
+ * of 193px and wrapped each description onto three lines. */
+.settings-channels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 10px;
+}
+
+.settings-channel {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+  padding: 11px 13px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-hover);
+  transition: border-color .16s ease;
+}
+
+.settings-channel:has(.ant-switch-checked) {
+  border-color: var(--primary-border);
+}
+
+/* The clickable half of the row: the switch is deliberately not inside this, so
+   clicking its label cannot reach the switch twice. */
+.settings-channel-hit {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex: 1 1 auto;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.settings-channel-icon {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  border-radius: 7px;
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  font-size: 15px;
+}
+
+.settings-channel:has(.ant-switch-checked) .settings-channel-icon {
+  color: var(--text);
+}
+
+/* The name over the description, in the space the switch leaves. `min-width: 0`
+   is what lets a long description wrap instead of pushing the switch out. */
+.settings-channel-copy {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-channel-name {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* Secondary, not muted. The muted tone is tuned against the card, and this line
+ * sits one surface lighter than that (the row it is in has a fill) -- 11px
+ * `--text-muted` there measured 3.78:1 in dark, under the 4.5 the size needs.
+ * `.schedule-preview` is the same surface with the same answer. */
+.settings-channel-desc {
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .settings-json-card {
   grid-column: 1;
 }

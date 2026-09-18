@@ -8370,7 +8370,7 @@ function App() {
           <Card className="settings-card settings-card-wide" title="模型与频道" extra={<span className="card-kicker">RUNTIME</span>}>
             <Form form={form} layout="vertical" onValuesChange={handleSettingsFormChange}>
               <Row gutter={16}>
-                <Col xs={24} md={12}>
+                <Col xs={24} md={8}>
                   <Form.Item
                     name="active_provider"
                     label="Provider"
@@ -8384,7 +8384,7 @@ function App() {
                     />
                   </Form.Item>
                 </Col>
-                <Col xs={24} md={12}>
+                <Col xs={24} md={8}>
                   <Form.Item name="model" label="默认模型">
                     <Select
                       options={settingsModelOptions}
@@ -8399,17 +8399,55 @@ function App() {
                     <InputNumber min={1} style={{ width: '100%' }} />
                   </Form.Item>
                 </Col>
-                <Col xs={12} md={8}>
-                  <Form.Item name="web_enabled" valuePropName="checked" label="Web 频道">
-                    <Switch />
-                  </Form.Item>
-                </Col>
-                <Col xs={12} md={8}>
-                  <Form.Item name="feishu_enabled" valuePropName="checked" label="飞书频道">
-                    <Switch />
-                  </Form.Item>
-                </Col>
               </Row>
+
+              {/* A channel is a boolean, not a value you type, so it is not laid
+                  out like a form field. Two `md=8` columns put the name on one
+                  line and a 44px switch alone on the next, with the rest of the
+                  column empty; the switch floated in a control-height slot that
+                  nothing else was in. One row per channel instead: what it is on
+                  the left, whether it is on, on the right. */}
+              <section className="settings-channel-block">
+                <header className="settings-channel-block-head">
+                  <span className="settings-field-label">消息频道</span>
+                  <small>各自独立开关，随「保存设置」一起写入。</small>
+                </header>
+                <div className="settings-channels">
+                  {[
+                    {
+                      key: 'web_enabled',
+                      label: 'Web 频道',
+                      desc: '本页所在的 Web 服务，默认只绑本机',
+                      icon: <ApiOutlined />,
+                    },
+                    {
+                      key: 'feishu_enabled',
+                      label: '飞书频道',
+                      desc: '在飞书里收发消息，凭据在下方 JSON 里',
+                      icon: <MessageOutlined />,
+                    },
+                  ].map(channel => (
+                    <div className="settings-channel" key={channel.key}>
+                      {/* Everything except the switch is a `<label for>` onto
+                          it, so the whole row turns the channel on rather than
+                          just the 44px pill -- and the switch stays outside the
+                          label, so one click is one toggle. The switch keeps an
+                          `aria-label` so it is named even if that association is
+                          ever lost. */}
+                      <label className="settings-channel-hit" htmlFor={channel.key}>
+                        <span className="settings-channel-icon">{channel.icon}</span>
+                        <span className="settings-channel-copy">
+                          <span className="settings-channel-name">{channel.label}</span>
+                          <span className="settings-channel-desc">{channel.desc}</span>
+                        </span>
+                      </label>
+                      <Form.Item name={channel.key} valuePropName="checked" noStyle>
+                        <Switch aria-label={channel.label} />
+                      </Form.Item>
+                    </div>
+                  ))}
+                </div>
+              </section>
             </Form>
           </Card>
 
