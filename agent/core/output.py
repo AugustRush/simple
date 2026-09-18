@@ -352,6 +352,16 @@ class OutputSink(ABC):
     def on_stream_chunk(self, chunk: str) -> None:
         """Called for each streamed text token."""
 
+    def on_reasoning_chunk(self, chunk: str) -> None:
+        """Called for each streamed reasoning token, ahead of the answer.
+
+        A channel of its own rather than a flag on ``on_stream_chunk``: the two
+        go to different places.  The answer *is* the message; the reasoning is
+        a note above it that the reader opens on purpose, and it must never be
+        concatenated into the message or into what gets copied out.  Default is
+        a no-op, so a sink with nowhere to put it simply ignores it.
+        """
+
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
         """Called once the model turn is fully resolved."""
 
@@ -470,6 +480,16 @@ class OutputSink(ABC):
 
         self.on_stream_chunk(chunk)
 
+    def sync_reasoning_cb(self, chunk: str) -> None:
+        """Synchronous callback adapter for the turn's reasoning channel.
+
+        The pair of names stays parallel to ``sync_stream_cb`` so a sink opts
+        in the same way for both channels: implement the ``on_*`` method and the
+        adapter that the agent looks up by name does the rest.
+        """
+
+        self.on_reasoning_chunk(chunk)
+
 
 class CliOutputSink(OutputSink):
     """Rich-console implementation of OutputSink for the CLI channel."""
@@ -502,6 +522,7 @@ class CliOutputSink(OutputSink):
         # the text itself and this sink only supplies it.
         self._status_callback = status_callback
         self._streamed: list[str] = []
+        self._reasoning_open = False
         self._last_batch_progress_key: tuple[int, int] | None = None
         self._tool_count = 0
         self._tool_start_times: dict[str, float] = {}
@@ -592,9 +613,43 @@ class CliOutputSink(OutputSink):
         if self._line_open:
             self._console.print()
             self._line_open = False
+        self._close_reasoning_line()
+
+    def _close_reasoning_line(self) -> None:
+        """End the dim reasoning run, if one is open, on its own line.
+
+        Folded into ``_finish_open_line`` so that every printer — including the
+        ones an interrupted turn reaches, like ``on_error`` and ``on_status`` —
+        closes it.  ``on_stream_chunk`` calls this one directly instead, because
+        the answer continues on the same line and must not be ended first.
+        """
+        if not self._reasoning_open:
+            return
+        self._reasoning_open = False
+        self._console.print()
+
+    @_deferred_during_consent
+    def on_reasoning_chunk(self, chunk: str) -> None:
+        """Print the model's thinking dim, above the answer it belongs to.
+
+        The answer streams inline with no newline, so a reasoning run closes
+        its own line before the first answer token — otherwise the two would
+        interleave into one unreadable sentence.  Reasoning never enters
+        ``_streamed``: that list is how ``on_turn_complete`` decides whether the
+        answer still needs printing, and thinking is not the answer.
+        """
+        if not chunk:
+            return
+        if not self._reasoning_open:
+            self._stop_activity()
+            self._finish_open_line()
+            self._console.print("[dim]… 思考[/dim] ", end="")
+            self._reasoning_open = True
+        self._console.print(chunk, end="", markup=False, highlight=False, style="dim")
 
     @_deferred_during_consent
     def on_stream_chunk(self, chunk: str) -> None:
+        self._close_reasoning_line()
         self._stop_activity()
         self._streamed.append(chunk)
         if self._supports_stream_markdown():
@@ -636,6 +691,7 @@ class CliOutputSink(OutputSink):
 
     @_deferred_during_consent
     def on_tool_start(self, name: str, inputs: dict) -> None:
+        self._close_reasoning_line()
         self._stop_activity()
         self._finish_open_line()
         hint = _fmt_tool_inputs(name, inputs)

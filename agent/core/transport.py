@@ -43,6 +43,18 @@ _OPENAI_MESSAGE_RESERVED_FIELDS = frozenset(
 )
 _SKIP_OPENAI_EXTRA = object()
 
+#: Fields a provider may put reasoning *text* in, on a delta or a message.
+#: Gateways disagree on the name and agree on nothing else, so all the names
+#: seen in the wild are listed and the first non-empty one wins.  This is a
+#: read-only view: the same field also stays in the message history (see
+#: `_message_extras`), which the OpenAI tool loop is tested to depend on.
+_REASONING_EXTRA_FIELDS = ("reasoning_content", "reasoning", "thinking")
+
+#: Anthropic's own thinking levels, as token budgets.  The API rejects a budget
+#: below 1024 and requires it to stay under max_tokens, so the value is clamped
+#: per call rather than trusted from config.
+_ANTHROPIC_THINKING_BUDGETS = {"low": 1024, "medium": 4096, "high": 16384}
+
 
 @dataclass(frozen=True)
 class ModelEndpoint:
@@ -70,8 +82,50 @@ class ModelTransport(abc.ABC):
     #: Wire format this transport speaks; set by each implementation.
     api_format: str = ""
 
-    def __init__(self, client: Any) -> None:
+    #: How hard this provider's models should think, in our own vocabulary.
+    #: None means the config never said, and the provider keeps its own
+    #: default — which is why the attribute is read as "is not None" rather
+    #: than compared against a default word.
+    thinking_effort: Optional[str] = None
+
+    def __init__(self, client: Any, thinking_effort: Any = None) -> None:
         self.client = client
+        self.thinking_effort = shared.normalize_thinking_effort(thinking_effort)
+
+    # ── Reasoning ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _reasoning_text(message: Any) -> str:
+        """Reasoning text carried by a streamed delta or a finished message.
+
+        Read straight off the object because the field is provider-specific:
+        the SDK parks it in ``model_extra`` when the class does not declare it
+        and in the instance dict when a gateway over-declares it.
+        """
+        if message is None:
+            return ""
+        for container in (
+            getattr(message, "model_extra", None),
+            getattr(message, "__dict__", None),
+        ):
+            if not isinstance(container, dict):
+                continue
+            for key in _REASONING_EXTRA_FIELDS:
+                value = container.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return ""
+
+    @staticmethod
+    async def _emit_reasoning(
+        callback: Optional[Callable[[str], Any]], piece: str
+    ) -> None:
+        """Hand one reasoning fragment to *callback*, sync or async."""
+        if callback is None or not piece:
+            return
+        _r = callback(piece)
+        if inspect.isawaitable(_r):
+            await _r
 
     def endpoint_for(self, model: Optional[str] = None) -> ModelEndpoint:
         """The endpoint that owns *model*.
@@ -120,8 +174,16 @@ class ModelTransport(abc.ABC):
         messages: list[dict],
         tools: list[dict],
         callback: Callable[[str], Any],
+        reasoning_callback: Optional[Callable[[str], Any]] = None,
     ) -> tuple[Any, str]:
-        """Streaming completion; returns (final_response, collected_text)."""
+        """Streaming completion; returns (final_response, collected_text).
+
+        ``callback`` receives the *answer* text.  ``reasoning_callback`` — when
+        given — receives the model's thinking, which is a separate channel: the
+        caller shows it in a note above the reply and must never append it to
+        the answer.  Both may be sync or async, and a transport that cannot
+        stream reasoning progressively may deliver it in one piece.
+        """
 
     @abc.abstractmethod
     async def simple_chat(
@@ -224,6 +286,30 @@ class AnthropicTransport(ModelTransport):
     ) -> Any:
         return tools if tools else anthropic.NOT_GIVEN
 
+    def _thinking_kwarg(self, max_tokens: int) -> dict:
+        """``thinking=...`` for this provider's configured effort, if any.
+
+        Nothing is sent when the config has no opinion, so every existing
+        config keeps making exactly today's request.  A budget must stay under
+        ``max_tokens`` (the API rejects otherwise), and the clamp is what makes
+        ``high`` usable on a provider capped at a few thousand tokens.
+        """
+        effort = self.thinking_effort
+        if effort is None or effort == "off":
+            return {}
+        budget = _ANTHROPIC_THINKING_BUDGETS.get(effort, 1024)
+        budget = max(1024, min(budget, max(1024, int(max_tokens) - 1024)))
+        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+
+    @staticmethod
+    def _thinking_text(response: Any) -> str:
+        blocks = getattr(response, "content", None) or ()
+        return "".join(
+            getattr(block, "thinking", "") or ""
+            for block in blocks
+            if getattr(block, "type", "") == "thinking"
+        )
+
     async def create(self, *, model, max_tokens, system, messages, tools):
         return await self.client.messages.create(
             model=model,
@@ -231,9 +317,13 @@ class AnthropicTransport(ModelTransport):
             system=system,
             messages=messages,
             tools=self.convert_tools(tools),
+            **self._thinking_kwarg(max_tokens),
         )
 
-    async def stream(self, *, model, max_tokens, system, messages, tools, callback):
+    async def stream(
+        self, *, model, max_tokens, system, messages, tools, callback,
+        reasoning_callback=None,
+    ):
         collected: list[str] = []
         async with self.client.messages.stream(
             model=model,
@@ -241,13 +331,20 @@ class AnthropicTransport(ModelTransport):
             system=system,
             messages=messages,
             tools=self.convert_tools(tools),
+            **self._thinking_kwarg(max_tokens),
         ) as stream:
+            # ``text_stream`` yields answer text only, so the thinking blocks
+            # are read off the finished message instead.  That trades
+            # progressive thinking for leaving the verified text path exactly
+            # as it was; the SDK's raw-event iterator would stream both, but it
+            # would also have to replace this loop wholesale.
             async for text in stream.text_stream:
                 collected.append(text)
                 _r = callback(text)
                 if inspect.isawaitable(_r):
                     await _r
             response = await stream.get_final_message()
+        await self._emit_reasoning(reasoning_callback, self._thinking_text(response))
         return response, "".join(collected)
 
     async def simple_chat(self, *, model, max_tokens, system, prompt):
@@ -318,6 +415,14 @@ class AnthropicTransport(ModelTransport):
 class OpenAITransport(ModelTransport):
     api_format = "openai"
 
+    #: The wire word for "do not think" on an OpenAI-compatible gateway.
+    #: Measured against the active provider: `reasoning_effort: "none"` cut a
+    #: trivial turn's reasoning from ~180 characters to zero and its completion
+    #: from ~80 tokens to 1, while omitting the parameter left the model
+    #: thinking in full.  So "off" has to say this word to mean anything —
+    #: and a config that never mentions thinking still says nothing at all.
+    _NO_THINKING = "none"
+
     def convert_tools(
         self, tools: list[dict], model: Optional[str] = None
     ) -> Any:
@@ -341,6 +446,20 @@ class OpenAITransport(ModelTransport):
             messages
         )
 
+    def _reasoning_effort_kwarg(self) -> dict:
+        """``reasoning_effort=...`` for this provider's configured effort, if any.
+
+        A provider the config never spoke about sends nothing — the parameter
+        is non-standard, so a gateway that does not know it answers 400.  The
+        configured word goes over the wire unchanged, because the levels are
+        the provider's own; only "off" is translated, to the word that actually
+        silences the model rather than merely declining to ask.
+        """
+        effort = self.thinking_effort
+        if effort is None:
+            return {}
+        return {"reasoning_effort": self._NO_THINKING if effort == "off" else effort}
+
     def _create_kwargs(self, *, model, max_tokens, system, messages, tools, stream=False):
         kwargs: dict = dict(
             model=model,
@@ -352,6 +471,7 @@ class OpenAITransport(ModelTransport):
             kwargs["tools"] = api_tools
         if stream:
             kwargs["stream"] = True
+        kwargs.update(self._reasoning_effort_kwarg())
         return kwargs
 
     async def create(self, *, model, max_tokens, system, messages, tools):
@@ -362,7 +482,10 @@ class OpenAITransport(ModelTransport):
             )
         )
 
-    async def stream(self, *, model, max_tokens, system, messages, tools, callback):
+    async def stream(
+        self, *, model, max_tokens, system, messages, tools, callback,
+        reasoning_callback=None,
+    ):
         kwargs = self._create_kwargs(
             model=model, max_tokens=max_tokens,
             system=system, messages=messages, tools=tools, stream=True,
@@ -371,6 +494,18 @@ class OpenAITransport(ModelTransport):
         finish_reason = "stop"
         tool_calls_acc: dict[int, dict] = {}
         provider_extras_acc: dict[str, Any] = {}
+        # Reasoning is reported as often as the gateway produces it — one
+        # fragment per chunk, before the first answer token — so the UI can
+        # show it growing instead of dumping it at the end of the turn.
+        # Gateways disagree about whether a chunk carries the next fragment or
+        # everything so far.  A cumulative chunk is, by definition, *longer*
+        # than what has arrived and starts with it; anything else is the next
+        # fragment, including a chunk identical to the accumulation — which is
+        # just the same token twice, and must not be dropped.  Comparing
+        # against the previous fragment instead of the accumulation would
+        # swallow every token that extends its predecessor, which token streams
+        # do constantly.
+        accumulated_reasoning = ""
         # AsyncOpenAI.chat.completions.create() returns a coroutine that
         # awaits to an AsyncStream — must await before iterating.
         async for chunk in await self.client.chat.completions.create(**kwargs):
@@ -378,6 +513,19 @@ class OpenAITransport(ModelTransport):
                 continue
             choice = chunk.choices[0]
             delta = choice.delta
+            if reasoning_callback is not None:
+                seen = self._reasoning_text(delta)
+                if seen:
+                    if (
+                        len(seen) > len(accumulated_reasoning)
+                        and seen.startswith(accumulated_reasoning)
+                    ):
+                        piece = seen[len(accumulated_reasoning):]
+                        accumulated_reasoning = seen
+                    else:
+                        piece = seen
+                        accumulated_reasoning += seen
+                    await self._emit_reasoning(reasoning_callback, piece)
             if delta.content:
                 collected.append(delta.content)
                 _r = callback(delta.content)
@@ -686,12 +834,19 @@ class OpenAITransport(ModelTransport):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def build_transport(api_format: str, client: Any) -> ModelTransport:
-    """Single dispatch point — adding a provider here is the only place to edit."""
+def build_transport(
+    api_format: str, client: Any, thinking_effort: Any = None
+) -> ModelTransport:
+    """Single dispatch point — adding a provider here is the only place to edit.
+
+    ``thinking_effort`` is the provider's configured effort (see
+    ``shared.THINKING_EFFORTS``); omitted means "no opinion", which is what
+    keeps an unconfigured provider's requests byte-for-byte what they were.
+    """
     if api_format == "anthropic":
-        return AnthropicTransport(client)
+        return AnthropicTransport(client, thinking_effort)
     if api_format == "openai":
-        return OpenAITransport(client)
+        return OpenAITransport(client, thinking_effort)
     raise ValueError(f"unsupported api_format: {api_format!r}")
 
 
@@ -721,7 +876,7 @@ class RoutingTransport(ModelTransport):
         default: ModelTransport,
         routes: dict[str, ModelTransport],
     ) -> None:
-        super().__init__(default.client)
+        super().__init__(default.client, default.thinking_effort)
         self.default = default
         self.routes = routes
         # The format of an unrouted call, for callers that ask the transport
@@ -760,8 +915,11 @@ class RoutingTransport(ModelTransport):
         )
 
     async def stream(
-        self, *, model, max_tokens, system, messages, tools, callback
+        self, *, model, max_tokens, system, messages, tools, callback,
+        reasoning_callback=None,
     ):
+        # The routed transport carries its own provider's thinking effort, so
+        # the effort follows the model and never has to be passed alongside it.
         transport = self._for(model)
         return await transport.stream(
             model=model,
@@ -770,6 +928,7 @@ class RoutingTransport(ModelTransport):
             messages=messages,
             tools=tools,
             callback=callback,
+            reasoning_callback=reasoning_callback,
         )
 
     async def simple_chat(self, *, model, max_tokens, system, prompt):
@@ -847,6 +1006,26 @@ def _provider_models(provider_cfg: dict) -> list[str]:
     return models
 
 
+def provider_thinking_effort(provider_cfg: dict) -> str | None:
+    """The thinking effort one provider's config asks for, or None.
+
+    ``providers.<name>.thinking.effort`` — the setting belongs to the provider
+    because the wire parameter does: the word is the provider's own, and a
+    level that means "think more" on one gateway means a rejected request on
+    another.  Absent (or unrecognised) yields None, so a provider that was
+    never configured sends nothing.  The ``thinking`` block is a dict rather
+    than a bare string so later knobs have somewhere to live.
+    """
+    thinking = provider_cfg.get("thinking")
+    if isinstance(thinking, str):
+        # Tolerate the short form (`"thinking": "high"`) because it is the
+        # obvious thing to write and the intent is unambiguous.
+        return shared.normalize_thinking_effort(thinking)
+    if not isinstance(thinking, dict):
+        return None
+    return shared.normalize_thinking_effort(thinking.get("effort"))
+
+
 def routing_table(cfg: dict) -> dict[str, str]:
     """Model id → the provider that owns it.
 
@@ -914,7 +1093,12 @@ def build_routing_transport(
     """
     providers = cfg.get("providers", {}) or {}
     active = str(cfg.get("active_provider") or "")
-    default_transport = build_transport(default_format, default_client)
+    active_cfg = providers.get(active)
+    default_transport = build_transport(
+        default_format,
+        default_client,
+        provider_thinking_effort(active_cfg) if isinstance(active_cfg, dict) else None,
+    )
     routes: dict[str, ModelTransport] = {}
     transports: dict[str, ModelTransport] = {}
 
@@ -945,7 +1129,9 @@ def build_routing_transport(
             transport = transports.get(name)
             if transport is None:
                 transport = build_transport(
-                    api_format, _client_for(provider_cfg, api_format)
+                    api_format,
+                    _client_for(provider_cfg, api_format),
+                    provider_thinking_effort(provider_cfg),
                 )
                 transports[name] = transport
         routes[model] = transport

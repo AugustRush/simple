@@ -968,6 +968,101 @@ html[data-theme='light'] .tool-trace-items {
   border-color: color-mix(in srgb, var(--red) 22%, transparent);
 }
 
+/* The model's thinking, above the reply it produced.
+
+   One strip per turn, collapsed by default, carrying the same geometry as the
+   sub-agent strip below it so the two stack as one column of status. What
+   separates them is the rule: this one is marked with a left bar, because it
+   describes the model's own process rather than work handed to other agents.
+   The body is verbatim text in a pre-wrapped block -- thinking is raw model
+   output, so its newlines are structure and its asterisks are characters. */
+.thinking-note {
+  align-self: stretch;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 auto 2px;
+}
+
+.thinking-note-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 2px 6px 9px;
+  border: 0;
+  border-left: 2px solid var(--border-strong);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.thinking-note-head:hover {
+  color: var(--text);
+}
+
+.thinking-note-head:focus-visible {
+  outline: 2px solid var(--primary-border);
+  outline-offset: 1px;
+}
+
+.thinking-note-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.thinking-note-running .thinking-note-dot {
+  background: var(--primary);
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+.thinking-note-title {
+  flex: none;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.thinking-note-state {
+  flex: none;
+}
+
+.thinking-note-metrics {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.thinking-note-chevron {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.thinking-note-body {
+  max-height: 260px;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.7;
+  /* Long unbroken runs are common in reasoning (paths, tokens, digits), so
+     wrapping has to be allowed mid-word rather than overflowing the strip. */
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 /* Sub-agent telemetry. One strip per batch that updates in place, instead of a
    chat bubble per socket event: a 4-agent batch emits a dozen events, and at
    ~60px each (note row plus the conversation gap) that used to push hundreds
@@ -1030,7 +1125,7 @@ html[data-theme='light'] .tool-trace-items {
 
 .subagent-note-running .subagent-note-dot {
   background: var(--text-secondary);
-  animation: subagent-pulse 1.4s ease-in-out infinite;
+  animation: status-pulse 1.4s ease-in-out infinite;
 }
 
 .subagent-note-failed .subagent-note-dot {
@@ -1093,7 +1188,10 @@ html[data-theme='light'] .tool-trace-items {
   margin-top: 2px;
 }
 
-@keyframes subagent-pulse {
+/* Shared by both status strips -- the thinking note and the sub-agent note --
+   so it is named for what it says (something is still running) rather than for
+   whichever strip happened to need it first. */
+@keyframes status-pulse {
   0%,
   100% {
     opacity: 1;
@@ -1104,7 +1202,8 @@ html[data-theme='light'] .tool-trace-items {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .subagent-note-running .subagent-note-dot {
+  .subagent-note-running .subagent-note-dot,
+  .thinking-note-running .thinking-note-dot {
     animation: none;
   }
 }

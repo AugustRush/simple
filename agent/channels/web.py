@@ -468,6 +468,7 @@ class WebOutputSink(OutputSink):
         self._turn_started_at = 0.0
         self._attached_paths: set[str] = set()
         self.full_text = ""
+        self.reasoning_text = ""
         self._turn_started = False
         self._queue: Optional[asyncio.Queue[dict[str, Any] | None]] = None
         self._sender_task: Optional[asyncio.Task[Any]] = None
@@ -480,6 +481,18 @@ class WebOutputSink(OutputSink):
     def on_stream_chunk(self, chunk: str) -> None:
         self.full_text += chunk
         self._emit({"type": "stream_chunk", "chunk": chunk})
+
+    def on_reasoning_chunk(self, chunk: str) -> None:
+        """Stream the model's thinking, kept out of ``full_text``.
+
+        ``full_text`` is the message: it is what the reconnect snapshot
+        replays and what a turn is reported to have said.  Thinking is not
+        part of it, so it travels on its own event and its own accumulator.
+        """
+        if not chunk:
+            return
+        self.reasoning_text += chunk
+        self._emit({"type": "reasoning_chunk", "chunk": chunk})
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
         if full_text:
@@ -507,6 +520,9 @@ class WebOutputSink(OutputSink):
         self._attachments.clear()
         self._queued_attachment_paths.clear()
         self._attached_paths.clear()
+        # Per-turn like the text: a reused socket sink would otherwise replay
+        # the previous message's thinking onto this one.
+        self.reasoning_text = ""
 
     @property
     def turn_complete_emitted(self) -> bool:
@@ -544,7 +560,12 @@ class WebOutputSink(OutputSink):
         # when a browser switches back to this session.
         if not self._turn_started or self._turn_complete_emitted or not self.full_text:
             return None
-        return {"type": "stream_snapshot", "text": self.full_text}
+        snapshot = {"type": "stream_snapshot", "text": self.full_text}
+        if self.reasoning_text:
+            # Carried so a tab switch during a thinking-heavy turn brings the
+            # note back with the text, rather than emptying it mid-sentence.
+            snapshot["reasoning"] = self.reasoning_text
+        return snapshot
 
     def set_websocket(self, websocket: Any) -> None:
         """Route subsequent events to the currently selected browser tab."""

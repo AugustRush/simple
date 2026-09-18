@@ -2744,6 +2744,14 @@ class BaseAgent:
         stream_callback: Optional[Callable[[str], None]] = None,
         attachments: tuple[MessageAttachment, ...] = (),
     ) -> "AgentResult":
+        """Run one turn.
+
+        ``stream_callback`` receives the answer as it is produced.  The model's
+        thinking, when the provider produces any, goes to the turn's sink
+        instead (see ``_stream_response``): it is a sink capability rather than
+        a stream the caller asks for, so this signature did not have to grow a
+        second callback that every caller would then have to accept.
+        """
         # Capture original system prompt before any per-turn injections.
         original_system = ctx.system_prompt
         tool_calls_made: list[str] = []
@@ -3401,7 +3409,22 @@ class BaseAgent:
 
         ``callback`` may be a plain sync function or an async coroutine
         function; the transport handles both.
+
+        The model's thinking is routed to the turn's sink, read from the same
+        contextvar the tools use to reach it: the sink is the turn's output
+        contract, so it — not the caller — is what decides where thinking goes.
+        A sink with nowhere to put it inherits a no-op adapter and the channel
+        costs one call per fragment.
+
+        Sub-agents never reach this method, because they are never given a
+        stream callback.  That is also what keeps their thinking out of the
+        parent's note: several run at once, and their fragments interleaved
+        would read as one confused train of thought.
         """
+        sink = _active_sink.get()
+        reasoning_callback = (
+            getattr(sink, "sync_reasoning_cb", None) if sink is not None else None
+        )
         self._prepare_provider_context(ctx, tools)
         response, text = await self._transport.stream(
             model=self._effective_model(ctx),
@@ -3410,6 +3433,7 @@ class BaseAgent:
             messages=ctx.messages,
             tools=tools,
             callback=callback,
+            reasoning_callback=reasoning_callback,
         )
         self._observe_provider_usage(ctx, response)
         return response, text

@@ -381,6 +381,28 @@ def _validate_config(cfg: dict) -> list[str]:
             warnings.append(f"providers.{pname}.api_key: must be a string")
         if not isinstance(pcfg.get("default_model"), str) or not pcfg.get("default_model"):
             warnings.append(f"providers.{pname}.default_model: must be a non-empty string")
+        # Thinking effort is a word the provider has to recognise, so a typo
+        # must be reported rather than passed through: the level is sent to the
+        # API verbatim, and the API answers a wrong word with a 400 that names
+        # its own vocabulary — a confusing way to learn about a config typo.
+        thinking = pcfg.get("thinking")
+        if thinking is not None:
+            allowed = ", ".join(shared.THINKING_EFFORTS)
+            if isinstance(thinking, str):
+                effort = thinking
+            elif isinstance(thinking, dict):
+                effort = thinking.get("effort")
+            else:
+                effort = None
+                warnings.append(
+                    f"providers.{pname}.thinking: must be a dict like "
+                    f'{{"effort": "off"}} or one of {allowed}'
+                )
+            if effort is not None and shared.normalize_thinking_effort(effort) is None:
+                warnings.append(
+                    f"providers.{pname}.thinking.effort: must be one of "
+                    f"{allowed}, got '{effort}'"
+                )
 
     # ── Numeric range checks ───────────────────────────────────────────────
     def _check_int(key: str, min_val: int, max_val: int) -> None:

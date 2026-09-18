@@ -95,6 +95,31 @@ type ConfirmDecision = 'allow_once' | 'allow_session' | 'deny'
 type ConfirmRisk = 'high' | 'medium' | 'low'
 
 /**
+ * How hard the active provider should think, as offered on the settings page.
+ *
+ * The values are the server's vocabulary (`shared.THINKING_EFFORTS`); the
+ * empty one is what an untouched provider has, and it is not a level — it
+ * means the agent sends no thinking parameter at all, so the provider's own
+ * default stands. That is why it is first and why saving it removes the key
+ * rather than writing a word.
+ */
+const THINKING_EFFORT_OPTIONS = [
+  { value: '', label: '默认（不干预）' },
+  { value: 'off', label: '关闭' },
+  { value: 'low', label: '低' },
+  { value: 'medium', label: '中' },
+  { value: 'high', label: '高' },
+]
+
+/** The effort a provider's config already carries, or '' when it carries none. */
+const thinkingEffortOf = (provider: any): string => {
+  const thinking = provider?.thinking
+  if (typeof thinking === 'string') return thinking
+  const effort = thinking?.effort
+  return typeof effort === 'string' ? effort : ''
+}
+
+/**
  * Rolling state for one batch of sub-agent activity.
  *
  * Sub-agent progress is live telemetry, not conversation: a single batch emits
@@ -154,6 +179,18 @@ interface Message {
   toolState?: ToolState
   attachments?: AttachmentInfo[]
   subagent?: SubAgentNote
+  /**
+   * The model's thinking for this turn, streamed on its own channel.
+   *
+   * Deliberately not folded into `content`: thinking is not what the turn
+   * said, so it must stay out of the copy button and out of the message the
+   * turn is reported as having produced. Rendered as a collapsed note above
+   * the reply, and only while the page is open — the transcript the server
+   * replays carries replies, not thinking.
+   */
+  reasoning?: string
+  /** Set by the reader, not the server: the note starts collapsed. */
+  reasoningOpen?: boolean
 }
 
 interface AttachmentInfo {
@@ -2854,6 +2891,29 @@ function App() {
           return
         }
 
+        // Thinking arrives before the first answer token, so this is often what
+        // creates the assistant row — the same row `stream_chunk` will then
+        // fill. It does not touch `content`: the note is not the reply.
+        if (evt.type === 'reasoning_chunk') {
+          const chunk = String(evt.chunk || '')
+          if (!chunk) return
+          const existingId = streamIdRef.current
+          if (!existingId) {
+            const id = makeId()
+            streamIdRef.current = id
+            appendMessage({ id, role: 'assistant', content: '', streaming: true })
+          }
+          const current = messagesRef.current.find(
+            item => item.id === streamIdRef.current,
+          )
+          if (current) {
+            updateMessage(current.id, {
+              reasoning: (current.reasoning || '') + chunk,
+            })
+          }
+          return
+        }
+
         if (evt.type === 'stream_chunk') {
           const existingId = streamIdRef.current
           if (!existingId) {
@@ -2874,13 +2934,26 @@ function App() {
 
         if (evt.type === 'stream_snapshot') {
           const text = String(evt.text || '')
+          // A tab that comes back mid-turn gets the thinking too, so the note
+          // does not empty itself under the reader's cursor.
+          const reasoning = typeof evt.reasoning === 'string' ? evt.reasoning : undefined
           const existingId = streamIdRef.current
           if (existingId) {
-            updateMessage(existingId, { content: text, streaming: true })
+            updateMessage(existingId, {
+              content: text,
+              streaming: true,
+              ...(reasoning !== undefined ? { reasoning } : {}),
+            })
           } else {
             const id = makeId()
             streamIdRef.current = id
-            appendMessage({ id, role: 'assistant', content: text, streaming: true })
+            appendMessage({
+              id,
+              role: 'assistant',
+              content: text,
+              streaming: true,
+              ...(reasoning !== undefined ? { reasoning } : {}),
+            })
           }
           setIsStreaming(true)
           setActivity('正在生成…')
@@ -3070,7 +3143,12 @@ function App() {
           setResumingTaskId(null)
           setIsStreaming(false)
           // The turn is over, so the status line must not keep narrating work
-          // that stopped.
+          // that stopped. The row it was streaming into has to be told the same
+          // thing: a turn that failed while thinking would otherwise leave its
+          // typing dots and its thinking note pulsing for work nobody is doing.
+          if (streamIdRef.current) {
+            updateMessage(streamIdRef.current, { streaming: false })
+          }
           setActivity('')
           setConfirmReq(null)
           messagesRef.current = sealSubAgentNotes(messagesRef.current)
@@ -4182,6 +4260,7 @@ function App() {
         active_provider: cfg.active_provider,
         model: active.default_model,
         max_tokens: active.max_tokens,
+        thinking_effort: thinkingEffortOf(active),
         web_enabled: !!(cfg.channels?.web?.enabled),
         feishu_enabled: !!(cfg.channels?.feishu?.enabled),
       })
@@ -5084,9 +5163,22 @@ function App() {
     cfg.active_provider = provider
     if (provider) {
       cfg.providers = { ...(cfg.providers || {}) }
-      cfg.providers[provider] = { ...(cfg.providers[provider] || {}) }
-      cfg.providers[provider].default_model = values.model
-      cfg.providers[provider].max_tokens = values.max_tokens
+      const providerCfg = { ...(cfg.providers[provider] || {}) }
+      providerCfg.default_model = values.model
+      providerCfg.max_tokens = values.max_tokens
+      // Only ever one provider's thinking block, and only when a level was
+      // actually chosen. Clearing the field means "no opinion" -- which is a
+      // different request from any level, including 关闭 -- so the key is
+      // removed rather than written empty.
+      const effort = values.thinking_effort
+      if (effort) {
+        providerCfg.thinking = { ...(providerCfg.thinking || {}), effort }
+      } else if (providerCfg.thinking) {
+        const { effort: _cleared, ...rest } = providerCfg.thinking
+        if (Object.keys(rest).length) providerCfg.thinking = rest
+        else delete providerCfg.thinking
+      }
+      cfg.providers[provider] = providerCfg
     }
     cfg.channels = { ...(cfg.channels || {}) }
     cfg.channels.web = { ...(cfg.channels.web || {}), enabled: values.web_enabled }
@@ -5109,10 +5201,12 @@ function App() {
         ...all,
         model: provider.default_model ?? '',
         max_tokens: provider.max_tokens ?? null,
+        thinking_effort: thinkingEffortOf(provider),
       }
       form.setFieldsValue({
         model: values.model,
         max_tokens: values.max_tokens,
+        thinking_effort: values.thinking_effort,
       })
     }
     setSettingsDirty(true)
@@ -5179,6 +5273,7 @@ function App() {
       active_provider: config?.active_provider,
       model: active.default_model,
       max_tokens: active.max_tokens,
+      thinking_effort: thinkingEffortOf(active),
       web_enabled: !!config?.channels?.web?.enabled,
       feishu_enabled: !!config?.channels?.feishu?.enabled,
     })
@@ -5666,6 +5761,48 @@ function App() {
     )
   }
 
+  /**
+   * The model's thinking for one turn, collapsed above the reply.
+   *
+   * Collapsed by default because it is not what the reader came for; the strip
+   * still has to move while it streams, so the dot pulses and the count climbs
+   * even shut. Opening it shows the text as it arrives — rendered verbatim in
+   * a pre-wrapped block rather than through the markdown renderer, because
+   * thinking is raw model text (newlines and asterisks are structural to it,
+   * not formatting) and a half-finished markdown document would reflow on
+   * every token.
+   *
+   * Returns null rather than an empty strip: a provider that does not think
+   * must leave no trace in the transcript.
+   */
+  const renderReasoningNote = (item: Message) => {
+    const text = item.reasoning || ''
+    if (!text) return null
+    const running = !!item.streaming
+    return (
+      <div className={`thinking-note ${running ? 'thinking-note-running' : ''}`}>
+        <button
+          type="button"
+          className="thinking-note-head"
+          aria-expanded={!!item.reasoningOpen}
+          onClick={() =>
+            updateMessage(item.id, { reasoningOpen: !item.reasoningOpen })
+          }
+        >
+          <span className="thinking-note-dot" />
+          <span className="thinking-note-title">思考过程</span>
+          <span className="thinking-note-state">{running ? '思考中' : '已思考'}</span>
+          <span className="thinking-note-metrics">{text.length} 字</span>
+          <DownOutlined
+            className="thinking-note-chevron"
+            rotate={item.reasoningOpen ? 180 : 0}
+          />
+        </button>
+        {item.reasoningOpen && <div className="thinking-note-body">{text}</div>}
+      </div>
+    )
+  }
+
   const renderMessage = (
     item: Message,
     traceSummary?: React.ReactNode,
@@ -5706,6 +5843,7 @@ function App() {
             {item.streaming && <span className="message-streaming">正在生成</span>}
             {traceSummary}
           </div>
+          {!isUser && renderReasoningNote(item)}
           {!!subagentNotes?.length && (
             <div className="message-subagents">
               {subagentNotes.map(note => renderSubAgentNote(note))}
@@ -8436,7 +8574,7 @@ function App() {
           <Card className="settings-card settings-card-wide" title="模型与频道" extra={<span className="card-kicker">RUNTIME</span>}>
             <Form form={form} layout="vertical" onValuesChange={handleSettingsFormChange}>
               <Row gutter={16}>
-                <Col xs={24} md={8}>
+                <Col xs={24} md={6}>
                   <Form.Item
                     name="active_provider"
                     label="Provider"
@@ -8450,7 +8588,7 @@ function App() {
                     />
                   </Form.Item>
                 </Col>
-                <Col xs={24} md={8}>
+                <Col xs={24} md={6}>
                   <Form.Item name="model" label="默认模型">
                     <Select
                       options={settingsModelOptions}
@@ -8460,7 +8598,25 @@ function App() {
                     />
                   </Form.Item>
                 </Col>
-                <Col xs={24} md={8}>
+                {/* Thinking effort is a property of the provider, not of the
+                    model: the level is the provider's own word for it, so the
+                    same value means different requests to different groups. It
+                    sits inside this Row because this Row is what the form
+                    writes onto the selected provider. */}
+                <Col xs={24} md={6}>
+                  <Form.Item
+                    name="thinking_effort"
+                    label="思考强度"
+                    tooltip={
+                      '这个 Provider 的模型想多深。「默认（不干预）」不发送任何思考参数，'
+                      + '由服务商自己决定；「关闭」会明确要求不要思考；低/中/高逐级加深。'
+                      + '修改后随「保存设置」写入，对之后的新对话生效。'
+                    }
+                  >
+                    <Select options={THINKING_EFFORT_OPTIONS} />
+                  </Form.Item>
+                </Col>
+                <Col xs={24} md={6}>
                   <Form.Item name="max_tokens" label="Max tokens">
                     <InputNumber min={1} style={{ width: '100%' }} />
                   </Form.Item>
@@ -8543,6 +8699,7 @@ function App() {
                     active_provider: parsed.active_provider,
                     model: active.default_model,
                     max_tokens: active.max_tokens,
+                    thinking_effort: thinkingEffortOf(active),
                     web_enabled: !!parsed.channels?.web?.enabled,
                     feishu_enabled: !!parsed.channels?.feishu?.enabled,
                   })

@@ -2,7 +2,7 @@
   "_readme": "Copy this file to ~/.agent/config.json and fill in your API keys.",
   "active_provider": "anthropic",
   "providers": {
-    "_readme": "api_format must be 'anthropic' or 'openai'. supports_vision controls whether image attachments are sent directly to the model. api_key can be a literal value or '$ENV_VAR' to read from environment. context_window controls the input context limit used by message compaction. Set higher for models with larger context windows.",
+    "_readme": "api_format must be 'anthropic' or 'openai'. supports_vision controls whether image attachments are sent directly to the model. api_key can be a literal value or '$ENV_VAR' to read from environment. context_window controls the input context limit used by message compaction. Set higher for models with larger context windows. thinking.effort is optional and lives on the provider, not on the model, because the level is the provider's own word for it; see the deepseek block for what it accepts and what leaving it out does.",
     "anthropic": {
       "api_format": "anthropic",
       "supports_vision": true,
@@ -40,7 +40,8 @@
         "deepseek-reasoner"
       ],
       "max_tokens": 8192,
-      "context_window": 128000
+      "context_window": 128000,
+      "_thinking_readme": "No 'thinking' key here on purpose, because leaving it out is the default: this provider is then asked exactly what it was asked before, and any thinking it produces is still shown above the reply. Add \"thinking\": {\"effort\": \"low\"} (or \"medium\"/\"high\") to ask its reasoning models for that much effort, or \"off\" to ask them not to think at all."
     },
     "qwen": {
       "_readme": "Any OpenAI-compatible endpoint works — Qwen, Groq, Together, local vLLM, etc.",

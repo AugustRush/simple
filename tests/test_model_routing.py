@@ -50,7 +50,10 @@ class _RecordingAnthropicTransport(AnthropicTransport):
         self.created.append(model)
         return {"stop_reason": "end_turn", "owner": "anthropic-like"}
 
-    async def stream(self, *, model, max_tokens, system, messages, tools, callback):
+    async def stream(
+        self, *, model, max_tokens, system, messages, tools, callback,
+        reasoning_callback=None,
+    ):
         self.streamed.append(model)
         return {"stop_reason": "end_turn", "owner": "anthropic-like"}, "anthropic-like"
 
@@ -70,7 +73,10 @@ class _RecordingOpenAITransport(OpenAITransport):
         self.created.append(model)
         return {"choices": [{"finish_reason": "stop"}], "owner": "openai-like"}
 
-    async def stream(self, *, model, max_tokens, system, messages, tools, callback):
+    async def stream(
+        self, *, model, max_tokens, system, messages, tools, callback,
+        reasoning_callback=None,
+    ):
         self.streamed.append(model)
         return {"choices": [{"finish_reason": "stop"}]}, "openai-like"
 

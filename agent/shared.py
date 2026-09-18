@@ -152,6 +152,31 @@ USER_PLUGINS_DIR = AGENT_HOME / "plugins"
 DEFAULT_MODEL = "claude-opus-4-5"
 DEFAULT_MAX_TOKENS = 8192
 
+# ── Thinking effort ───────────────────────────────────────────────────────
+# Our own vocabulary for "how hard should the model think".  It lives here
+# rather than in a transport because three layers have to agree on it: config
+# validation, the settings page's options, and the transport that translates it
+# into whatever word the provider actually accepts (the OpenAI-compatible
+# gateway this was measured against takes none/minimal/low/medium/high/xhigh/
+# max).  The tuple is the contract; the translation is the transport's business.
+THINKING_EFFORTS = ("off", "low", "medium", "high")
+
+
+def normalize_thinking_effort(value: object) -> str | None:
+    """Our effort word for *value*, or None when the config has no opinion.
+
+    None is a real state, not a failure: it means "this provider was never
+    told", which is what every config without a `thinking` key says — and every
+    provider the agent ships with must keep saying it, because the wire
+    parameter that turns thinking off is not one every gateway knows.
+    A recognised word is returned lowercase; anything else (absent key, typo,
+    number) also has no opinion, and `_validate_config` names the accepted
+    words so the typo is visible rather than silently obeyed.
+    """
+    text = str(value or "").strip().lower()
+    return text if text in THINKING_EFFORTS else None
+
+
 # Default model input context window in tokens.  Used by the compaction
 # trigger to decide when working memory (ctx.messages) must be trimmed
 # before the next LLM call.  Override per-provider in config.json.
