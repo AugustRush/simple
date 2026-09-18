@@ -1,23 +1,33 @@
 # Simple — Personal AI Agent
 
-A personal AI agent with memory, tool calling, multi-agent orchestration, scheduling, skills, plugins, and multi-channel delivery.
+A personal AI agent with memory, tool calling, multi-agent orchestration,
+scheduled workflows judged by their own acceptance checks, skills, plugins, and
+multi-channel delivery.
 
 ## Requirements
 
 - Python 3.11+
 - [`uv`](https://docs.astral.sh/uv/)
 - At least one configured model provider
+- Node 18+ — only to build the React frontend; the packaged bundle is already in
+  the repo, so running the gateway needs no Node
 
-Supported providers:
+A provider is a **named entry in `providers`** — the name is yours. What decides
+how it is spoken to is its `api_format`, of which there are exactly two:
 
-| Provider | Format | Notes |
+| `api_format` | Client | Used for |
 |---|---|---|
-| Anthropic | `anthropic` | Native SDK, vision support |
-| OpenAI | `openai` | Native SDK, vision support |
-| DeepSeek | `openai` | OpenAI-compatible endpoint |
-| Ollama | `openai` | Local, no API key needed |
-| Qwen | `openai` | OpenAI-compatible endpoint |
-| Custom | `openai` | Any OpenAI-compatible `base_url` |
+| `anthropic` | `anthropic.AsyncAnthropic` | Anthropic API |
+| `openai` | `openai.AsyncOpenAI` | OpenAI, and any OpenAI-compatible `base_url` — DeepSeek, Qwen/DashScope, Groq, Together, vLLM, Ollama |
+
+The setup wizard writes five of them (`anthropic`, `openai`, `deepseek`,
+`ollama`, `other`), but those are just names it chose; anything that speaks the
+OpenAI wire format is one `providers.<your-name>` entry with a `base_url`.
+
+Per-provider keys: `api_format`, `api_key` (a literal, or `$ENV_VAR` to read the
+environment), `base_url`, `default_model`, `models` (the list `/model` offers),
+`supports_vision` (whether image attachments go to the model directly),
+`max_tokens`, `context_window` (the input limit compaction is measured against).
 
 ## Quick Start
 
@@ -36,12 +46,17 @@ The setup wizard guides you through provider selection, API key configuration, a
 | Capability | How |
 |---|---|
 | **Intent-before-action** | Write/shell tools require the assistant to declare what it will do before executing |
+| **Nothing gets created unasked** | Creators (`schedule_create`, `workflow_create`, `emit_signal`) must quote the user's own words from this turn, or the call is refused |
+| **Workflows** | Chain scheduled tasks into a graph, each step judged by its own acceptance check |
+| **Run outcomes** | `succeeded` / `failed` / `unverified` / `skipped` — "we could not tell" is not "it failed" |
+| **Signals** | `emit_signal` wakes whatever subscribed, so a step can follow another without a clock |
 | **Unified event stream** | Every tool call, hook, and lifecycle fact is a replayable `RuntimeEvent` |
 | **LLM retry** | Transient API errors (rate limit, 5xx) retried 3x with exponential backoff |
 | **Config validation** | Startup warnings for typos and invalid values — never blocks startup |
 | **Named sessions** | `--name prod` for isolated session data with shared config by default |
+| **One writer per agent home** | A second process on the same home is refused rather than allowed to corrupt it |
 | **Plugin hooks** | 8 lifecycle hooks: prompt submit, tool matchers, command hooks, continue loop |
-| **Vision** | Image attachments sent directly to vision-capable models (Anthropic, OpenAI) |
+| **Vision** | Image attachments sent straight to the model when the provider sets `supports_vision` |
 | **Graceful shutdown** | Feishu drains pending messages before closing WebSocket |
 
 ### Measuring retrieval quality
@@ -83,6 +98,12 @@ right-hand column. Treat it as an upper bound — the reformulations are
 authored, so it shows what the approach can reach, not what a given model
 will produce.
 
+The set also carries cases with **no** right answer, so the instrument is not
+one-directional: a run reports `false_positive_rate` and `avg_spurious_results`
+alongside recall. Both are currently 0.5, which is the honest number for two
+hand-written negatives and is the thing a "just return more candidates"
+change would move.
+
 `tests/test_retrieval_quality.py` guards the pinned baseline in CI. Re-pin
 with `--save-baseline` after an intentional change, and read the tag
 breakdown first.
@@ -121,6 +142,23 @@ are isolated worlds; cross-session interaction stays at the filesystem level
 (read another session's data when needed) rather than keeping multiple live
 working memories in one process.
 
+Two different things share the word "session", and they are not the same shape:
+
+| | Data home | Why |
+|---|---|---|
+| `--name prod` | `~/.agent-prod/` — a sibling of the default, picked by a person | Same machine, different worlds |
+| Web session `abc123` | `<agent home>/web/sessions/abc123/` — under the *active* home | A browser tab's isolation, kept where it belongs |
+
+**One live owner per agent home.** Several subsystems assume they are the only
+writer of that directory — the staging partition is keyed by session id and the
+CLI hardcodes one, memory index files and plugin approval state are
+read-modify-write with no cross-process coordination — so rather than audit
+every such site, the invariant is enforced at the entry points: a second
+process on the same home is refused instead of being allowed to corrupt it. Use
+`--name` (or `SIMPLE_AGENT_HOME=~/.agent-dev simple`) for a second instance;
+`SIMPLE_ALLOW_MULTI_INSTANCE=1` is the explicit opt-out when you know what you
+are doing.
+
 ### Feishu Gateway
 
 ```bash
@@ -155,10 +193,15 @@ The gateway can also serve an HTTP/WebSocket API for a browser frontend.  The
 web channel is just another channel, so it shares the same session machinery
 as Feishu (one conversation id per chat thread).
 
-The React source lives under `frontend/`. Development builds stay in
-`frontend/dist/`; they do not modify the Python package tree. To refresh the
-bundle embedded in a packaged release, run `npm run build:release` from that
-directory.
+The React source lives under `frontend/`. Development builds (`npm run build`)
+stay in `frontend/dist/` and do not modify the Python package tree.
+
+**The gateway serves the bundled copy, not your dev build.**
+`agent/_builtin/web/dist/` is the canonical asset and is checked in;
+`frontend/dist/` is gitignored and may be an older build, so it is never
+allowed to silently override the package after a restart. To serve the dev
+build while working on the frontend, set `SIMPLE_WEB_USE_SOURCE_DIST=1`. To
+refresh the bundle that ships, run `npm run build:release` from `frontend/`.
 
 ```bash
 # Install web dependency
@@ -180,11 +223,21 @@ Configure in `~/.agent/config.json`:
       "host": "127.0.0.1",
       "port": 8787,
       "auth_token": "",
-      "cors_origins": ["http://localhost:5173"]
+      "cors_origins": [],
+      "max_active_sessions": 16,
+      "session_idle_ttl_seconds": 900
     }
   }
 }
 ```
+
+Each Web session gets its own runtime home under `<agent home>/web/sessions/
+<session_id>`, with independent context, memory, skills and tools — not a
+`~/.agent-<id>` sibling. At most `max_active_sessions` are kept resident; when
+one is full the least-recently-active *idle* session is evicted, and its state
+is rebuilt from the provider checkpoint on the next message, so eviction costs
+a replay rather than the chat. `session_idle_ttl_seconds` evicts idle sessions
+eagerly. A session mid-turn is never evicted, under either limit.
 
 The gateway serves a built-in React + Ant Design UI at
 `http://127.0.0.1:8787/`:
@@ -195,30 +248,53 @@ uv run simple gateway
 # open http://127.0.0.1:8787/
 ```
 
-The React UI provides chat, session management, plugin/skill browsing, settings
-editing, command palette and streamed responses, all through the same
-`/api/...` endpoints.  Or use the API directly:
+The React UI has six views — 对话 (chat), 会话管理 (sessions), 插件 (plugins),
+技能 (skills), 自动化 (scheduled tasks and workflows) and 设置 (settings) —
+plus a command palette and streamed responses, all through the same `/api/...`
+endpoints.  Or use the API directly:
 
-| Method | Path | Description |
+| Area | Method Path | Description |
 |---|---|---|
-| GET | `/` | Built-in React UI |
-| GET | `/api/health` | Health check |
-| GET | `/api/commands` | Commands available in the web channel |
-| GET | `/api/config` / POST | Read masked config / save config |
-| GET | `/api/plugins` | List loaded plugins |
-| GET | `/api/skills` | List loaded skills |
-| GET | `/api/context` | Context-manager statistics |
-| GET | `/api/sessions` | List sessions in the current agent home |
-| POST | `/api/sessions` | Create a session id |
-| PATCH | `/api/sessions/{id}` | Rename a session (`{"title": "..."}`) |
-| DELETE | `/api/sessions/{id}` | Delete a session's durable history |
-| POST | `/api/sessions/{id}/reveal` | Reveal the session's isolated agent home in Finder/file manager |
-| POST | `/api/plugins/{name}/toggle` | Enable/disable a plugin (`{"enabled": true/false}`) |
-| GET | `/api/sessions/{id}/messages` | Recent messages for a session |
-| POST | `/api/sessions/{id}/messages` | Send a message (non-streaming) |
-| WS | `/api/sessions/{id}/stream` | Streaming events (`stream_chunk`, `tool_start`, `status`, `confirm_request`, `attachment`, `turn_complete`, …) |
-| GET | `/api/files?path=…&session_id=…` | Download a file owned by a session (its home: `output/`, `uploads/`, plus the workspace folder picked for it) |
-| GET | `/api/files?path=…&task_id=…&run_id=…` | Download the recorded output of a scheduled run |
+| UI | `GET /` | Built-in React UI |
+| UI | `GET /api/health` | Health check |
+| UI | `GET /api/commands` | Commands available in the web channel |
+| UI | `GET /api/context` | Context-manager statistics |
+| UI | `GET /api/scheduler/health` | Scheduler liveness |
+| Config | `GET /api/config`, `POST /api/config` | Read masked config / save config |
+| Sessions | `GET`, `POST`, `DELETE` `/api/sessions` | List (in the current agent home) / create an id / delete several |
+| Sessions | `PATCH`, `DELETE` `/api/sessions/{id}` | Rename (`{"title": "..."}`) / delete durable history |
+| Sessions | `GET /api/sessions/{id}/state` | Durable state for one session |
+| Sessions | `GET`, `POST` `/api/sessions/{id}/messages` | Recent messages / send one (non-streaming) |
+| Sessions | `POST /api/sessions/{id}/cancel` | Cancel the turn in flight |
+| Sessions | `DELETE /api/sessions/{id}/queue/{message_id}` | Take a queued message back before it runs |
+| Sessions | `POST /api/sessions/{id}/attachments` | Upload an attachment |
+| Sessions | `POST /api/sessions/{id}/workspace/pick` | Pick the session's project folder (an explicit read/write grant) |
+| Sessions | `POST /api/sessions/{id}/task-guidance/dismiss` | Dismiss the task-setup hint |
+| Sessions | `GET`, `PATCH` `/api/sessions/{id}/permissions` | Read / change this session's shell permission posture |
+| Sessions | `DELETE /api/sessions/{id}/approvals` | Drop this session's standing approvals |
+| Sessions | `POST /api/sessions/{id}/reveal` | Reveal the session's isolated agent home in Finder/file manager |
+| Sessions | `WS /api/sessions/{id}/stream` | Streaming events: `stream_chunk`, `stream_snapshot`, `tool_start`, `tool_progress`, `tool_end`, `tool_blocked`, `status`, `confirm_request`, `attachment`, `subagent_event`, `workspace_changed`, `notification`, `info`, `error`, `heartbeat`, `turn_complete` |
+| Files | `GET /api/files?path=…&session_id=…` | Download a file owned by a session (its home: `output/`, `uploads/`, plus the workspace folder picked for it) |
+| Files | `GET /api/files?path=…&task_id=…&run_id=…` | Download the recorded output of a scheduled run |
+| Files | `POST /api/fs/pick-directory` | Open the OS folder dialog |
+| Schedules | `GET`, `POST`, `PATCH` `/api/schedules` | List / create / edit several at once |
+| Schedules | `POST /api/schedules/preview` | Preview the next fire times for a spec |
+| Schedules | `GET`, `POST` `/api/schedules/attention` | Runs waiting for a person / acknowledge them |
+| Schedules | `GET`, `PUT`, `PATCH`, `DELETE` `/api/schedules/{task_id}` | One task |
+| Runs | `POST /api/schedules/{task_id}/run` | Run it now |
+| Runs | `GET /api/schedules/{task_id}/runs` | Run history |
+| Runs | `POST /api/schedules/{task_id}/runs/{run_id}/retry` | Retry one run |
+| Runs | `POST /api/schedules/{task_id}/runs/{run_id}/cancel` | Cancel one run |
+| Runs | `POST /api/schedules/{task_id}/runs/{run_id}/acknowledge` | Acknowledge an alert |
+| Runs | `GET /api/schedules/{task_id}/runs/{run_id}/output` | The run's recorded output |
+| Runs | `GET /api/schedules/{task_id}/runs/{run_id}/artifacts` | List the run's artifacts |
+| Runs | `GET /api/schedules/{task_id}/runs/{run_id}/artifacts/{path}` | Download one artifact |
+| Workflows | `GET`, `POST` `/api/workflows` | List the chains / create one |
+| Workflows | `PUT`, `DELETE` `/api/workflows/{workflow_id}` | Edit / delete a chain (its tasks are disabled, not erased) |
+| Signals | `GET /api/signals` | Emitted signal names and how many tasks wait on each |
+| Plugins | `GET /api/plugins`, `POST /api/plugins/{name}/toggle`, `DELETE /api/plugins/{name}` | List / enable-disable (`{"enabled": true/false}`) / uninstall |
+| Skills | `GET /api/skills`, `POST /api/skills/{id}/toggle`, `DELETE /api/skills/{id}` | List / switch off / delete |
+| Feishu | `GET /api/feishu/chats`, `POST /api/feishu/test` | List chats the bot can reach / send a test message |
 
 `path` alone is never enough: the request must name an owner so the gateway can
 prove the caller is entitled to the file. A request with no owner, an unknown
@@ -248,6 +324,11 @@ uv run simple schedule interval health-check \
   --anchor-at "2026-05-05T00:00:00+08:00" \
   --prompt "Verify all services are healthy"
 
+# Weekly, on the machine's own clock
+uv run simple schedule weekly report \
+  --day mon --time 09:00 \
+  --prompt "Summarize last week's progress"
+
 # Deliver to Feishu chat
 uv run simple schedule daily standup \
   --time 09:00 --timezone Asia/Shanghai \
@@ -258,8 +339,145 @@ uv run simple schedule daily standup \
 uv run simple schedule list
 uv run simple schedule show <task-id>
 uv run simple schedule pause <task-id>
+uv run simple schedule resume <task-id>
 uv run simple schedule delete <task-id>
 ```
+
+`--timezone` defaults to **this machine's zone**, never UTC — an unnamed zone
+means the one you are sitting in. Pass an IANA name (`Asia/Shanghai`) when the
+task has to fire at that hour regardless of where the machine is.
+
+The CLI covers `once`, `interval`, `daily` and `weekly`. The scheduler itself
+also understands `weekdays`, `monthly` and `signal` triggers; those, and chains
+of tasks, are built through [`workflow_create`](#workflows-a-chain-of-steps) or
+the Automation page.
+
+### Workflows: a chain of steps
+
+A workflow is a graph of scheduled tasks where each step runs only after the
+steps it depends on have **succeeded** — and "succeeded" is decided by that
+step's own acceptance check, not by whether the model replied.
+
+```text
+You: 帮我建一条流水线：先抓数据，再清洗，最后生成周报发我
+
+Agent: [workflow_create]
+       fetch    → 抓取原始数据     criteria: ["data/raw.csv 存在且非空"]
+       clean    → 清洗并落盘       depends_on: [fetch]
+                                   verify_command: "test -s data/clean.csv"
+       report   → 生成周报          depends_on: [clean]
+```
+
+```jsonc
+// the shape behind that call
+{
+  "intent": "帮我建一条流水线：先抓数据，再清洗，最后生成周报发我",  // the user's words, verbatim
+  "name": "weekly-report",
+  "steps": [
+    {"key": "fetch",  "name": "抓取原始数据", "action_type": "agent_task",
+     "instruction": "…", "trigger_type": "daily", "time_of_day": "06:00",
+     "criteria": ["data/raw.csv 存在且非空"]},
+    {"key": "clean",  "name": "清洗并落盘", "action_type": "agent_task",
+     "instruction": "…", "depends_on": ["fetch"],
+     "verify_command": "test -s data/clean.csv"},
+    {"key": "report", "name": "生成周报", "action_type": "agent_task",
+     "instruction": "…", "depends_on": ["clean"]}
+  ]
+}
+```
+
+Three things are load-bearing:
+
+- **`depends_on` is the trigger.** A step with upstreams must *not* carry a
+  `trigger_type` of its own — its upstreams are what start it. Only an entry
+  step (no upstreams) keeps a clock or a signal, which is why one graph can
+  start from a schedule, from a person, or from anything else the scheduler
+  already understands.
+- **`criteria` is the target; `verify_command` is the verdict.** They answer the
+  same question from opposite directions and neither replaces the other.
+  `criteria` (what has to be true) goes into the run's system prompt — a
+  scheduled run has nobody to ask, so a prompt with no stated target is judged
+  only by whether the model replied, which it always does. `verify_command` is
+  the machine-checkable half: a single low-risk command whose exit code decides,
+  run in the step's folder, and the steps below it run only if it passed. An
+  agent's opinion of its own work is not evidence, which is why the second half
+  exists at all.
+- **The graph is validated before anything is written.** A cycle, an upstream
+  that does not exist, or a step that can never be judged is refused *with the
+  step named*, while somebody can still read the error.
+
+`workflow_delete` stops the chain and disables the tasks it built rather than
+erasing them, so their run history stays readable. The leftovers are then
+ordinary tasks: `schedule_delete` removes any of them, and its history, when
+nobody needs to read it any more.
+
+The **自动化** page in the Web UI has a 工作流 tab showing the same graph, and
+its navigation entry carries a badge for runs that failed while the page was
+closed — the whole problem being a failure nobody was looking at. Behind it is
+`GET/POST/PUT/DELETE /api/workflows`.
+
+### What a run's status means
+
+Three questions are asked separately, because a field that answers two of them
+answers neither: **did it run**, **did the work achieve what it was for**, and
+**did the result arrive**.
+
+| Status | Means |
+|---|---|
+| `succeeded` | Judged, met the bar, and the result arrived |
+| `failed` | Judged and did not meet the bar — *or* the result did not arrive |
+| `unverified` | The bar could not be evaluated: it was refused, timed out, or failed to start |
+| `skipped` | Never started, because something above it in the chain failed |
+| `cancelled` / `interrupted` | Terminal, and deliberately not success |
+
+Two rules hold it together:
+
+- **Only one value means success.** `succeeded` is named explicitly and
+  everything else defaults to "did not succeed", so a status invented later
+  cannot accidentally read as a pass to the step below it.
+- **"We could not tell" is not "it failed".** A check that never ran is
+  evidence about the *check*. Calling it `failed` would stop every downstream
+  step, raise an alert, and record "the work was wrong" when the truth is "we
+  never looked" — so it gets its own status. Retries are opt-in
+  (`retry_policy.max_attempts`, default `1`), and when a task does opt in only
+  `failed` and `unverified` are retried: a `cancelled` run was cancelled on
+  purpose.
+
+A run can also carry the agent's own verdict on its work, and the combination
+is deliberately asymmetric: **either source can fail the run, and both must
+pass for it to pass.** An agent saying "done" is not evidence that a command
+which never executed would have agreed, so a self-report can only ever *lower*
+the verdict. That is what `report_outcome` is for — declaring that the job
+could not be done (*the data source is gone, a required file is missing, the
+inputs contradict each other*) instead of writing a plausible answer anyway.
+It records the run as failed with your reason, does not start the steps below
+it, and tells a person. It is never a way to report success.
+
+### Signals: following without a clock
+
+A signal is the other way to start a step. `emit_signal` announces that
+something happened — `report.ready`, or `task:<task_id>:succeeded` — and any
+task created with `trigger_type: signal` and that name runs. The
+`task:<id>:succeeded` / `:failed` / `:cancelled` family is emitted by the
+scheduler itself, so following a task needs no call at all.
+
+```text
+You: 抓完数据后通知下游
+
+Agent: [emit_signal name="report.ready" intent="抓完数据后通知下游"]
+```
+
+**Subscribe before you emit.** A signal with nobody waiting is recorded and
+closed as unmatched, and it will not start a run for a subscriber created
+afterwards. `list_signals` shows which names have been emitted recently and how
+many tasks are waiting on each, so a subscription can be matched to a real
+emission instead of a guess.
+
+A step that needs to read what an upstream step actually produced — not the
+one-line summary already in its context — uses `read_step_output`, addressing
+the step by its `key`. Only steps it depends on, directly or transitively, are
+readable, and only outputs the scheduler itself recorded, so it cannot be used
+to read arbitrary files.
 
 ### Creating a skill
 
@@ -446,6 +664,24 @@ You: /model              # list available models
 You: /model deepseek-chat  # switch session to DeepSeek
 ```
 
+`/model` is a plain model id, and the model **carries its client with it**: one
+table (`routing_table`, built from `providers`) decides which provider owns
+which model, each call is dispatched to that provider's transport, and anything
+absent from the table goes to the active provider. When the same model id
+appears under two providers the active one wins — which is also what the model
+dropdown offers, so the visible option and the routing agree.
+
+This matters beyond a dropdown: memory consolidation, the session-end flush,
+and the evolution engine make their own calls, and they resolve the same pair
+rather than pairing the active provider's client with whatever model the config
+named. A `context.consolidation.model` from another provider's group used to be
+posted to the active provider's endpoint and rejected with
+`400 The supported API model names are ...` — which is the shape of that bug,
+not of a bad model name.
+
+Sub-agents inherit the parent's routing table, so a sub-agent asked for a model
+from another group reaches its owner's endpoint too.
+
 ### Working with MCP tools
 
 ```json
@@ -483,16 +719,24 @@ Key config sections:
 | Section | Purpose |
 |---|---|
 | `active_provider` | Which provider to use |
-| `providers.<name>.*` | API key, format, base URL, model list, max tokens |
+| `providers.<name>.*` | `api_format`, `api_key`, `base_url`, `default_model`, `models`, `supports_vision`, `max_tokens`, `context_window` (see [Requirements](#requirements)) |
+| `model`, `max_tokens` | Top-level overrides for the active model and its output cap |
 | `context.storage` | LTM category cap, decay factor |
 | `context.consolidation` | Token ratio, keep-last-N, idle seconds, min messages |
-| `channels.feishu` | Feishu bot credentials (`app_id`, `app_secret`, `group_policy`, etc.) |
+| `memory` | Auto-tidy cadence: `tidy_interval_seconds`, `tidy_file_threshold` |
+| `max_steps` | Steps (one model request plus the tools it calls) allowed in one turn; default 200, max 500. `max_tool_call_iterations` is the older spelling of the same bound and is still accepted |
+| `max_truncation_continuations` | How many times a response truncated at the token cap may auto-continue; default 6 |
+| `llm_max_retries`, `llm_retry_base_delay` | Retry count and backoff base for transient API errors; default 3 and 1.0s |
+| `orchestration` | Sub-agent bounds: `max_parallel_agents`, `max_agents_per_turn` (0 derives it), `sub_agent_timeout_seconds`, `sub_agent_retries` |
+| `channels.feishu` | Feishu bot credentials and behaviour (`app_id`, `app_secret`, `encrypt_key`, `verification_token`, `allow_from`, `react_emoji`, `group_policy`, `streaming`) |
+| `channels.web` | Bind address, `auth_token`, `cors_origins`, `max_active_sessions`, `session_idle_ttl_seconds` (see [Web frontend](#web-frontend)) |
 | `audio.transcription_command` | External STT argv-style command template (`{path}`, `{language}` placeholders; shell operators are rejected) |
 | `mcp_servers` | MCP server definitions (name, command, args, env) |
 | `plugins` | Per-plugin enable/disable (`{"evolution": {"enabled": false}}`) |
+| `skills` | Per-skill enable/disable (`{"skill-manager": {"enabled": false}}`) |
 | `user_tools.enabled` | Trust every Python tool in `~/.agent/tools/*.py`. Off by default; individually approved tools load either way (see [Authoring user tools](#authoring-user-tools)) |
 | `evolution` | Enable/disable session scoring and rule learning |
-| `scheduler` | Poll/lease/concurrency settings |
+| `scheduler` | Poll/lease settings (`poll_seconds`, `lease_seconds`) |
 | `tavily_api_key` | Optional Tavily search API key |
 | `web_proxy` | Proxy for `web_fetch` (e.g. `http://127.0.0.1:7897`). Required on machines whose DNS returns reserved addresses — Clash's `enhanced-mode: fake-ip` does this, and the direct path refuses such answers by design. `null`/absent = read `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` (honouring `no_proxy`); `none` = always connect directly. Credentials: `http://user:pass@host:port` |
 | `output_dir` | Override default `~/.agent/output` |
@@ -502,8 +746,14 @@ Key config sections:
 | `permissions.shell_secret_paths` | Extra home-relative paths the sandboxed shell may neither read nor write (e.g. `[".ssh", ".docker", ".kube"]`); extends the built-in secret set |
 | `permissions.shell_devices` | Device/service access (Metal/IOKit) inside the sandbox; **default `true`** (set `false` for the strictest posture) |
 | `shell_allowed_commands` | Persistent shell allowlist that skips confirmation (see [Shell permissions](#shell-permissions)) |
+| `shell_blocked_commands` | Extra commands no permission level can run — the blacklist is not bypassable by raising the level |
 | `assistant_identity` | Deterministic assistant name/role for fact recall |
 | `system_prompt_file` | Load custom system prompt from `.md` or `.txt` |
+
+A key starting with `_` is a documentation companion, not a setting: the example
+config carries its explanation in `_<key>_readme` beside the value, and those
+keys are never reported as typos. Any other unknown key is warned about once at
+startup and ignored.
 
 ### File access
 
@@ -819,6 +1069,11 @@ uv run simple schedule interval health-check \
   --anchor-at "2026-05-03T00:00:00+08:00" \
   --prompt "Verify all services are healthy"
 
+# Weekly (`--time` and `--timezone` default to this machine's clock)
+uv run simple schedule weekly report \
+  --day mon --time 09:00 \
+  --prompt "Summarize last week's progress"
+
 # Manage
 uv run simple schedule list
 uv run simple schedule show <id>
@@ -826,6 +1081,10 @@ uv run simple schedule pause <id>
 uv run simple schedule resume <id>
 uv run simple schedule delete <id>
 ```
+
+The four CLI verbs cover `once`, `interval`, `daily` and `weekly`; the scheduler
+also understands `weekdays`, `monthly` and `signal`, and chains of tasks —
+see [Workflows](#workflows-a-chain-of-steps).
 
 ### Evolution
 
@@ -881,14 +1140,17 @@ falls back to the classic line-by-line prompt automatically.
 | `/help` | Show commands available in this channel |
 | `/memory` | Memory export summary |
 | `/context` | Long-term context statistics |
-| `/sessions` | List named sessions and recent scored history |
+| `/compact` | Compress this session's context, keeping long-term memory |
+| `/clear` (`/reset-context`) | Drop this session's context; long-term memory is untouched |
+| `/workspace [path]` (`/cwd`) | Show or change the session's working folder |
+| `/sessions` (`/history`) | List named sessions and recent scored history |
 | `/session <id>` | View session details by ID prefix |
 | `/tools` | List available tools |
 | `/skills` | List available skills |
 | `/plugins` | List loaded plugins |
 | `/model [name]` | Show or switch the session model |
-| `/permissions [level\|default <level>]` | Show or set the shell permission level |
-| `/auto-approve on\|off\|status` | Session shortcut for high-risk auto-approval |
+| `/permissions [<level>\|sandbox <mode>\|session <level>\|default …\|reset …]` | Show or set the shell permission level and sandbox mode |
+| `/auto-approve on\|off\|session on\|off\|status` | Shortcut for high-risk auto-approval |
 | `/allow <command>` | Add a command to the persistent shell allowlist |
 | `/deny <command>` | Remove a command from the persistent shell allowlist |
 | `/confirm <token>` | Approve one pending restricted shell command |
@@ -907,6 +1169,8 @@ falls back to the classic line-by-line prompt automatically.
 | `/` | Open the interactive command selection menu |
 | `Tab` | Complete the `/`-command currently being typed |
 | `/quit` (`/exit`, `/q`) | Exit the CLI |
+| `/open <path>` | Open a file or directory with the default app |
+| `/reveal <path>` (`/finder`) | Reveal a file in the system file manager |
 | `Ctrl+C` | Interrupt a blocking operation (force cancel) |
 
 ### Feishu only
@@ -952,14 +1216,25 @@ output sink.
 | Shell | `shell` |
 | Files | `read_file`, `write_file`, `edit_file`, `list_files`, `send_file` |
 | Media | `transcribe_audio` |
-| Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index`, `set_identity` |
-| Context | `context_retrieve` |
+| Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index`, `memory_clear`, `set_identity` |
+| Context | `context_retrieve`, `clear_context` |
 | Scheduling | `schedule_create`, `schedule_list`, `schedule_delete` |
+| Workflows | `workflow_create`, `workflow_list`, `workflow_delete` |
+| Signals | `emit_signal`, `list_signals` |
+| Runs | `read_step_output`, `report_outcome` |
 | Web | `web_search`, `web_fetch`, `tavily_search` |
 | Output | `clean_output` |
 | Orchestration | `spawn_agent` |
 | Skills | `activate_skill`, `list_skill_files`, `read_skill_file`, `create_skill`, `update_skill`, `delete_skill`, `write_skill_file` |
+| Plugins | `install_plugin`, `uninstall_plugin`, `list_installed_plugins` |
 | User tools | `create_tool`, `update_tool`, `delete_tool`, `list_tools`, `install_tool_dependency` |
+
+Three of these are gated on the request, not on the tool: `schedule_create`,
+`workflow_create` and `emit_signal` create something that outlives the
+conversation, so each must carry an `intent` quoting the user's own words from
+this turn (at least six characters, verbatim) and a call whose `intent` cannot
+be found in the request is refused. `read_step_output` and `report_outcome`
+only resolve inside a scheduled run.
 
 Also registered at runtime:
 
@@ -1075,6 +1350,12 @@ The agent supports four execution modes for sub-agent coordination:
 - `depends_on` must reference subtask IDs from the same batch
 - Rendezvous is bounded (default: 2 rounds)
 - Sub-agents inherit the parent context manager but do not recursively receive `spawn_agent`
+- Bounds come from `orchestration`: `max_parallel_agents` (3),
+  `max_agents_per_turn` (0 → derived from the parallel count), and a wall-clock
+  `sub_agent_timeout_seconds` that covers every retry attempt rather than each one
+- A `role` of the form `plugin:<plugin>:<agent>` resolves against a plugin's
+  `agents/` directory, and that definition's markdown body is prepended to the
+  sub-agent's system prompt — so a plugin can ship the roles it wants used
 
 ## Skills
 
@@ -1093,19 +1374,32 @@ disable-model-invocation: false
 Instructions for the agent when this skill is activated.
 ```
 
+`user-invocable: false` removes the slash command; `disable-model-invocation:
+true` stops the model activating it on its own. The built-in orchestration skill
+is the one bundle that uses both, because it is read as policy rather than
+activated — its `default-mode`, `parallel-keywords`, `pipeline-*-keywords`,
+`rendezvous-keywords` and `max-rendezvous-rounds` are what the planner runs on.
+
 ### Discovery order
 
-1. Built-in skills: `agent/_builtin/skills/`
-2. Plugin-bundled skills: declared via `plugin.json` `skills` field
-3. User skills: `~/.agent/skills/`
+Loaded in this order, into one catalog keyed by skill id:
 
-User skills with the same ID override built-in or plugin-bundled skills.
+1. Built-in skills: `agent/_builtin/skills/`
+2. User skills: `~/.agent/skills/`
+3. Plugin-bundled skills: declared via `plugin.json` `skills` field
+
+A user skill with the same id as a built-in **replaces** it, which is how you
+override a shipped skill. Plugin-bundled skills are namespaced under the
+plugin that ships them (`<plugin>:<id>`), so they cannot collide with a built-in
+or a user skill — and a bare leaf name like `code-review` is accepted as an
+alias only when exactly one non-plugin skill claims it, so activation stays
+unambiguous.
 
 ### Built-in skills
 
 | Skill | Description |
 |---|---|
-| `multi-agent-orchestration` | Plan and run several agents on one request |
+| `multi-agent-orchestration` | **Not an activatable skill.** The orchestration planner reads its frontmatter (`default-mode`, `parallel-keywords`, `max-rendezvous-rounds`, …) as the policy, which is why it is `user-invocable: false` and `disable-model-invocation: true`. Switch it off and planning falls back to plain `direct` |
 | `skill-manager` | Create, update, delete, and manage user skill bundles |
 
 Built-in skills ship with the package and cannot be deleted from the
@@ -1135,6 +1429,8 @@ my-plugin/
 ├── plugin.json       # Structured manifest (recommended)
 ├── __init__.py       # register() entry point (required)
 ├── skills/           # Bundled skills (declared in plugin.json)
+├── agents/           # Role definitions a sub-agent can be spawned as
+├── commands/         # Bundled slash commands
 └── .mcp.json         # Bundled MCP servers
 ```
 
@@ -1187,6 +1483,33 @@ my-plugin/
 - **`matcher`** — regex to scope hooks to specific tool names. No matcher = all tools.
 - **`timeout`** — per-hook override (default: 2s global).
 - **`type: "command"`** — external script hooks via stdin/stdout JSON. Exit code 2 = block.
+- **`${…}` substitution** — hook commands may use `${CLAUDE_PLUGIN_ROOT}`,
+  `${CLAUDE_PLUGIN_DATA}` and `${CLAUDE_PROJECT_DIR}` (with `CODEX_*` aliases),
+  each with an optional `:-default`.
+
+### Plugins written for Claude Code and Codex
+
+The loader also reads the other ecosystems' layouts, so a plugin does not have
+to be rewritten to be installed:
+
+- Any of `plugin.json`, `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`
+- `mcpServers` as well as `mcp_servers`
+- Skills default to the `skills/` subdirectory, so a Claude Code plugin needs no
+  manifest entry to expose them — and a directory with only `skills/`,
+  `commands/`, `agents/` or a `SKILL.md` is a plugin even with no manifest
+- `.claude-plugin/marketplace.json`, or Codex's root `marketplace.json` — local
+  relative sources are expanded; remote entries belong to the installer
+- `hooks/hooks.json`, and a `"hooks"` value that is a path string rather than an
+  inline block
+- PascalCase event names, normalized: `PreToolUse` → `on_pre_tool`, `Stop` →
+  `on_turn_end`, `SessionStart` → `on_session_start`, `UserPromptSubmit` →
+  `on_prompt_submit`, …
+
+**Read the last one carefully.** Only the eight hooks in the table above have a
+dispatcher. Every other name in that vocabulary — `Notification`, `PreCompact`,
+`SubagentStart`, `PermissionRequest` — is accepted, normalized, and then never
+fires. It fails silently in the direction of doing nothing, which is why it is
+worth knowing before you wonder why a hook never ran.
 
 ### Built-in plugins
 
@@ -1250,7 +1573,45 @@ Key properties:
   and `context_rolled_back` carrying the dropped roles and token estimate, so
   "never retrieved" stays distinguishable from "retrieved, then dropped"
 - **Intent-before-action**: write/shell tools require the assistant to declare intent first
+- **Request-before-creation**: the three creators (`schedule_create`,
+  `workflow_create`, `emit_signal`) must quote the user's words from the current
+  turn; both gates are capabilities on the tool (`requires_intent`,
+  `requires_request`), not per-tool branches
 - **LLM retry**: transient API errors (rate limits, 5xx) retried with exponential backoff
+
+### Which tool schemas a turn is offered
+
+The system prompt carries the **whole inventory** — every registered tool by
+name, description and source (`builtin` / `mcp` / `runtime`) — so the model can
+always answer "what can you do". What varies per turn is which *schemas* are
+sent alongside it. `ContextAssembler.select_tools` starts from the registry and
+holds back the groups whose schema is only worth its tokens when the sentence
+calls for it:
+
+| Held back by default | Opened by |
+|---|---|
+| `schedule_create`, `schedule_delete`, `workflow_create`, `workflow_delete` | Naming or describing scheduled work **and** asking for it |
+| `emit_signal` | A scheduled run, or an ask that names scheduled work |
+| `report_outcome` | Being inside a scheduled run — no sentence in a conversation makes it usable |
+| `memory_index`, `memory_clear` | `memory`, `remember`, `forget`, `记忆`, `记住`, `忘记`, `上下文` |
+| `install_plugin`, `create_tool`, `create_skill`, … | `plugin`, `skill`, `tool`, `插件`, `技能`, `工具` |
+| `spawn_agent` | `parallel`, `sub-agent`, `并行`, `子代理`, or an explicit orchestration request |
+| `tavily_search`, `transcribe_audio` | A research-shaped query; an audio attachment |
+
+Two details are decisions rather than omissions:
+
+- **Reading is not asking.** `schedule_list`/`workflow_list` open on a mention
+  — "我有哪些定时任务" and "你们的工作流怎么用" are both questions about the
+  feature and both want the list — while the creators additionally need a
+  cadence ("每天") or a make-a-thing verb applied to a feature that was named
+  ("帮我做一个流程"). Loose helpers like "帮我做" are deliberately *not* verbs:
+  they are how any job is asked for, which is exactly the sentence that once
+  got misread into building a task nobody asked for.
+- **This gate is budget, not permission.** Calls are dispatched by name against
+  the whole registry, so a schema that was not sent is still a tool that can be
+  called. What actually refuses an unasked creation is the executor's
+  `requires_request` check. The gate only means a caller that *did* ask is not
+  charged for the schemas, and one that did not is not invited by them.
 
 ## Memory & Context Architecture
 
@@ -1289,25 +1650,38 @@ server diagnostics cannot overwrite the interactive CLI input line.
 .
 ├── agent/
 │   ├── core/           # BaseAgent, AgentContext, OutputSink, RuntimeEvent, EventCollector
-│   ├── memory/         # LTMStore, MemoryPalace, ConsolidationEngine, StagingBuffer
-│   ├── tools/          # ToolRegistry, BuiltinTools, MCPClient, UserToolCatalog, executor
-│   ├── exec/           # SubprocessProvider seam: one place children are spawned
+│   │                   #   transport.py: per-format SDK transports + RoutingTransport
 │   ├── runtime/        # AgentCore, TurnInput, TurnResult, TurnExecution, TurnRunner
+│   │                   #   lock.py: one owner per agent home; heartbeat.py: telemetry
+│   ├── commands/       # CommandRouter, CommandDescriptor, built-in slash commands
+│   ├── memory/         # LTMStore, MemoryPalace, ConsolidationEngine, StagingBuffer
+│   ├── tools/          # ToolRegistry, BuiltinTools, executor, user tools + child runner
+│   ├── verification/   # The verdict vocabulary, and CommandVerifier (acceptance checks)
+│   ├── exec/           # SubprocessProvider seam: one place children are spawned
 │   ├── orchestration/  # OrchestrationPlanner, parallel/pipeline/rendezvous execution
-│   ├── channels/       # Channel ABC, CliChannel, ChannelRunner, Feishu/Lark channel
-│   ├── scheduler/      # SchedulerService, SchedulerStore, triggers, delivery
-│   ├── security/       # Shell command blocking; sandbox/ = policy + per-OS backends
+│   ├── ralph/          # Autonomous task loop: models, parser, service, store
+│   ├── channels/       # Channel ABC, CliChannel, ChannelRunner, Feishu/Lark, Web
+│   ├── scheduler/      # SchedulerService, SchedulerStore, models, runtime, delivery,
+│   │                   #   profiles (permission envelopes), unattended
+│   ├── security/       # Shell blocking, content filter, approvals,
+│   │                   #   network egress (web_fetch proxy);
+│   │                   #   sandbox/ = policy + per-OS backends + scratch dir
 │   ├── skills/         # SkillBundle, SkillCatalog, skill parsing, hot-reload
 │   ├── plugins/        # PluginCatalog, AgentPlugin protocol, HookResult, lifecycle
-│   ├── _builtin/       # Built-in plugins (evolution) and skills (skill-manager, etc.)
+│   ├── _builtin/       # Built-in plugin (evolution), skills, and the packaged web bundle
 │   ├── cli.py          # Typer CLI (interactive, gateway, scheduler, config, memory)
 │   ├── config.py       # Config loading, validation, ModelClientFactory, system prompt
 │   ├── bootstrap.py    # Component wiring from config
 │   ├── evolution.py    # Session scoring, prompt rewriting, tool generation
+│   ├── session_service.py, sessions.py  # Session listing/durability; --name discovery
+│   ├── lexical.py      # Lexical (BM25) scoring behind memory search
+│   ├── usage.py        # Provider-neutral token usage extraction
+│   ├── tui.py          # Full-screen interactive CLI layout
 │   ├── shared.py       # Paths, defaults, tracing, named-session support
 │   └── pathing.py      # Path resolution and workspace containment
-├── scripts/
-│   └── benchmark_memory.py
+├── frontend/           # React + Ant Design source; build:release writes the package bundle
+├── docs/superpowers/   # Design specs (specs/) and implementation plans (plans/)
+├── scripts/            # benchmark_memory.py, eval_retrieval.py
 ├── tests/
 ├── config.example.json
 ├── pyproject.toml
@@ -1335,4 +1709,19 @@ macOS detection ever breaks, those tests fail instead of quietly skipping while
 nothing is enforced. `tests/test_filesystem_sandbox.py` keeps what is genuinely
 seatbelt-specific: the generated `.sb` text and its cache key.
 
-Latest verification: `uv run pytest -q` → `1757 passed, 1 skipped`
+Latest verification: `uv run pytest -q` → `2286 collected`, **2268 passed**,
+1 skipped, 17 failed.
+
+The 17 are environment-bound, all of the same shape: they ask the OS to spawn a
+nested sandbox (or to read the agent home from inside one), which a host that
+forbids nesting `sandbox-exec` cannot do. The same 17 fail on every run here and
+none of them is about the change under test, which is what makes them usable as
+a baseline — diff the `FAILED` set against it rather than reading the pass count.
+
+If your shell cannot create directories under the system temp directory,
+pytest's `tmp_path` fixture errors out across the whole suite before a single
+test runs. Point `--basetemp` at a directory that already exists:
+
+```bash
+uv run pytest -q --basetemp=/tmp/pytest-simple
+```
