@@ -9,7 +9,11 @@
   --border-strong: rgba(255, 255, 255, 0.16);
   --text: #f2f2f3;
   --text-secondary: #b4b4b8;
-  --text-muted: #77777e;
+  /* Muted still has to be read. At #77777e it landed on 3.55:1 over a card
+   * (rgb(34,35,36)) and 4.25:1 over the page -- both under the 4.5:1 that the
+   * 10-13px text wearing it needs. Lifted until it clears that on the darker
+   * of the two surfaces. */
+  --text-muted: #8f8f97;
   --primary: #e4e4e7;
   --primary-soft: rgba(228, 228, 231, 0.08);
   --primary-border: rgba(228, 228, 231, 0.26);
@@ -32,7 +36,9 @@ html[data-theme='light'] {
   --border-strong: rgba(17, 18, 21, 0.18);
   --text: #18181b;
   --text-secondary: #52525b;
-  --text-muted: #85858d;
+  /* Same story in light: #85858d gave 3.56:1 on the card and 3.20:1 on the
+   * page. */
+  --text-muted: #666670;
   --primary: #27272a;
   --primary-soft: rgba(39, 39, 42, 0.065);
   --primary-border: rgba(39, 39, 42, 0.22);
@@ -1618,7 +1624,9 @@ html[data-theme='light'] .tool-trace-items {
   border-color: var(--border);
   font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
   font-size: 12px;
-  line-height: 1.6;
+  /* A `line-height` used to sit here. antd's own `.ant-input` rule is injected
+     after this sheet and won, so the box has always been drawn at antd's
+     1.5714 -- the declaration described a line box that was never rendered. */
 }
 
 html[data-theme='light'] .settings-json {
@@ -1901,38 +1909,54 @@ html[data-theme='light'] .settings-json {
   padding-bottom: 4px;
   border-bottom: 1px solid var(--border);
 }
-.settings-save-button,
-.settings-inline-save {
+/* Prefixing with `html[data-theme]` is not decoration: the theme rules above
+ * pick the primary button's *text* colour per theme (near-black in dark, near
+ * white in light) to suit a near-white/near-black `colorPrimary`, at a
+ * specificity of `html[data-theme='dark'] .ant-btn-primary`. These two buttons
+ * paint their own blue fill, so that text colour is wrong for them -- near
+ * black on #2563eb is 3.44:1. Matching the specificity and landing after it
+ * lets one white label serve both themes. */
+html[data-theme] .settings-save-button,
+html[data-theme] .settings-inline-save {
   color: #fff !important;
-  background: #3b82f6 !important;
-  border-color: #3b82f6 !important;
-  font-weight: 650;
-  box-shadow: 0 6px 14px rgba(59,130,246,.2);
-}
-.settings-save-button:hover:not(:disabled),
-.settings-inline-save:hover:not(:disabled) {
-  color: #fff !important;
+  /* #3b82f6 carried white text at 3.52:1 -- under the 4.5:1 the 14px label
+   * needs, on the one button on the page that is meant to be the loud one.
+   * #2563eb is 5.19:1, so the resting state is now the readable one and the
+   * hover/active steps below get darker from there. */
   background: #2563eb !important;
   border-color: #2563eb !important;
+  font-weight: 650;
+  box-shadow: 0 6px 14px rgba(37,99,235,.22);
 }
-/* Both buttons darkened #3b82f6 -> #2563eb on hover and then stopped, so a
- * press looked exactly like a hover. Same shape as `.brand-action`: an
- * `!important` hover with no `:active` to follow it. A third step, plus a dip,
- * makes the press legible -- the shadow shrinks at the same time, which is what
- * sells the movement. */
-.settings-save-button:active:not(:disabled),
-.settings-inline-save:active:not(:disabled) {
+html[data-theme] .settings-save-button:hover:not(:disabled),
+html[data-theme] .settings-inline-save:hover:not(:disabled) {
   color: #fff !important;
   background: #1d4ed8 !important;
   border-color: #1d4ed8 !important;
-  box-shadow: 0 2px 6px rgba(59,130,246,.28);
+}
+/* Both buttons darkened on hover and then stopped, so a press looked exactly
+ * like a hover. Same shape as `.brand-action`: an `!important` hover with no
+ * `:active` to follow it. A third step, plus a dip, makes the press legible --
+ * the shadow shrinks at the same time, which is what sells the movement. */
+html[data-theme] .settings-save-button:active:not(:disabled),
+html[data-theme] .settings-inline-save:active:not(:disabled) {
+  color: #fff !important;
+  background: #1e40af !important;
+  border-color: #1e40af !important;
+  box-shadow: 0 2px 6px rgba(30,64,175,.3);
   transform: translateY(1px);
 }
-.settings-save-button:disabled {
+/* Disabled is the usual state of both buttons -- there is nothing to save most
+ * of the time -- so it has to look like the state it is. Only the heading
+ * button had this treatment: 已保存 kept the blue fill from the rule above and
+ * sat next to a quiet input advertising an action that was not available. */
+.settings-save-button:disabled,
+.settings-inline-save:disabled {
   color: var(--text-muted) !important;
   background: var(--surface-raised) !important;
   border-color: var(--border) !important;
   box-shadow: none;
+  font-weight: 500;
 }
 .settings-view .settings-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2977,21 +3001,10 @@ html[data-theme='light'] .send-button.ant-btn-primary:disabled {
   -webkit-backdrop-filter: blur(18px);
 }
 
-.session-card,
-.entity-card,
-.settings-card {
-  border-radius: 12px;
-  background: var(--surface-raised);
-  box-shadow: none;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-}
-
-.session-card:hover,
-.entity-card:hover {
-  border-color: var(--border-strong);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
-}
+/* A second copy of the shared card appearance used to sit here -- same three
+ * selectors, radius 12px, no blur, no shadow. Every one of those five
+ * properties is set again by the later copy, so editing this one changed
+ * nothing on screen. The cards are described once, further down. */
 
 .session-card-active {
   background: var(--primary-soft);
@@ -3033,14 +3046,14 @@ html[data-theme='light'] .send-button.ant-btn-primary:disabled {
   border-bottom-color: var(--border);
 }
 
-.ant-input,
-.ant-input-affix-wrapper,
-.ant-select-selector,
-.ant-input-number,
-.ant-input-number-input {
-  border-radius: 8px !important;
-}
-
+/* Control geometry -- radius and height -- is the theme's to decide (see
+ * `borderRadius` / `controlHeight` in the ConfigProvider). It used to be
+ * re-declared here and again further down, both times with `!important`, which
+ * beat the geometry antd gives `Space.Compact`: the two halves of a compact row
+ * kept all four corners round and sat 6px apart in height, so every compact row
+ * in the app read as two separate pills crossing at the join. Pages that
+ * noticed patched it locally; the later duplicate is gone and this one no
+ * longer touches radius, so the framework's own seam is the one you see. */
 .ant-input-affix-wrapper,
 .ant-input-number,
 .ant-select-selector {
@@ -3462,15 +3475,13 @@ html[data-theme='light'] .global-search-modal .ant-modal-content {
   background: var(--surface-hover);
 }
 
-.ant-input,
-.ant-input-affix-wrapper,
-.ant-select-selector,
-.ant-input-number {
-  border-radius: 14px !important;
-}
-
-.ant-btn-default {
-  border-radius: 13px !important;
+/* One more compact-row scar: a focused control's ring is painted outside its
+ * own box, so the sibling drawn after it covered the ring at the seam -- a
+ * 3px bite out of the right edge of the ring on the token field. Lift whichever
+ * half has focus instead of letting the ring stop halfway. */
+.ant-space-compact > *:focus-within {
+  position: relative;
+  z-index: 2;
 }
 
 .ant-tag {
@@ -4092,15 +4103,19 @@ html[data-theme='light'] .app-main {
 
 /* Ant Design's theme-level `.ant-btn-primary` rule has higher specificity
  * than the generic disabled selector above. Override it explicitly so the
- * disabled "保存设置" button keeps readable text in both themes. */
-html[data-theme='light'] .settings-save-button:disabled {
+ * disabled buttons keep readable text in both themes. The inline 已保存 button
+ * is the same kind of button and sat disabled in the same way, so it gets the
+ * same treatment rather than its own. */
+html[data-theme='light'] .settings-save-button:disabled,
+html[data-theme='light'] .settings-inline-save:disabled {
   color: #5b6472 !important;
   background: #e8eaee !important;
   border-color: #d5d9e0 !important;
   opacity: 1;
 }
 
-html[data-theme='dark'] .settings-save-button:disabled {
+html[data-theme='dark'] .settings-save-button:disabled,
+html[data-theme='dark'] .settings-inline-save:disabled {
   color: #b7bac3 !important;
   background: #303036 !important;
   border-color: #484850 !important;
@@ -4207,32 +4222,11 @@ html[data-theme='dark'] .settings-save-button:disabled {
    button beside it. Let the compact do the sizing there instead: grow into
    whatever the button leaves. */
 .schedule-field .ant-space-compact .ant-select { width:auto; flex:1 1 auto; min-width:0; }
-/* antd's compact squares the *wrapper* at the seam -- `.ant-select` gets
-   border-radius: 0 and margin-right: -1px -- so its two halves read as one
-   control. But the box you actually see is `.ant-select-selector`, and the
-   global `border-radius: 14px !important` keeps all four of its corners round;
-   the button is the same story, from `.ant-btn-default`'s 13px. So the halves
-   stayed two separate pills overlapping by a single pixel, their borders
-   crossing at the join -- which reads as the button cutting into the select.
-   Square the inner boxes to match their wrappers, and give the outer corners
-   one radius instead of two. */
-.schedule-field .ant-space-compact > .ant-select:first-child .ant-select-selector {
-  border-radius:14px 0 0 14px !important;
-}
-.schedule-field .ant-space-compact > .ant-btn:last-child {
-  border-radius:0 14px 14px 0 !important;
-}
-/* ...and the two halves have to agree on *height* as well. `Space.Compact` is a
-   flex row, so any child with `height: auto` stretches to the tallest sibling --
-   which is how the 项目文件夹 row's input lines up with its 浏览… button.
-   `Button.controlHeight: 38` is the only control height this app raises (every
-   Select/Input/DatePicker stays at antd's 32), so the button is always the
-   tallest thing in a compact row. antd pins `.ant-select-single` to an explicit
-   32px, so the select is the one control that refuses to stretch and ends up 6px
-   shorter than the button beside it -- which reads as the button overhanging the
-   field it is supposed to be a suffix of. Let it stretch like the input does. */
-.schedule-field .ant-space-compact > .ant-select { height:auto; }
-.schedule-field .ant-space-compact > .ant-select .ant-select-selector { height:100%; }
+/* The radius and height patches that used to sit here squared the select and
+   the button at this page's compact seams by hand. They existed because the
+   global `!important` radius and the button-only 38px height broke antd's own
+   compact geometry; both are fixed where they were caused (the theme, and the
+   one radius rule above), so the seam here is now the framework's. */
 .schedule-action-picker { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:10px; }
 .schedule-action-picker button { display:flex; align-items:flex-start; gap:10px; min-height:68px; padding:12px; border:1px solid var(--border); border-radius:8px; color:var(--text-secondary); background:transparent; text-align:left; cursor:pointer; transition:border-color .16s ease, background-color .16s ease, color .16s ease; }
 .schedule-action-picker button:hover { border-color:var(--border-strong); background:var(--surface-hover); }

@@ -8482,6 +8482,12 @@ function App() {
           colorWarning: themeMode === 'dark' ? '#d6c7a3' : '#806f4b',
           colorError: themeMode === 'dark' ? '#f0a3a3' : '#a16262',
           borderRadius: 8,
+          // One control height for every control. Raising only `Button` to 38
+          // left Input/Select/InputNumber/DatePicker at antd's 32, so any row
+          // holding two of them disagreed about its own height -- and inside a
+          // `Space.Compact` the taller half overhung the shorter one it was
+          // supposed to join. Pages patched the rows they noticed.
+          controlHeight: 38,
           fontFamily:
             "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif",
         },
@@ -8490,9 +8496,6 @@ function App() {
             bodyBg: 'transparent',
             headerBg: 'transparent',
             siderBg: 'transparent',
-          },
-          Button: {
-            controlHeight: 38,
           },
           Card: {
             colorBorderSecondary: 'rgba(128, 128, 150, 0.14)',
