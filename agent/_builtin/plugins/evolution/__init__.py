@@ -53,6 +53,22 @@ def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _resolvable_endpoint(components: dict) -> bool:
+    """Whether *components* can name the provider that owns its model.
+
+    Building an engine needs the model *and* the client that serves it.  A
+    partial components dict — plugin discovery fires session_start with one —
+    has neither, and guessing the wire format from a default is how a call
+    ends up at the wrong group's endpoint.
+    """
+    agent = components.get("agent")
+    return (
+        agent is not None
+        and hasattr(agent, "endpoint_for")
+        and bool(components.get("model"))
+    )
+
+
 class EvolutionPlugin:
     """AgentPlugin implementation: wraps EvolutionEngine + new learning logic."""
 
@@ -91,15 +107,16 @@ class EvolutionPlugin:
         # _build_components_async) so tests that inject _FakeEvolution work
         # without modification.
         self._engine = components.get("evolution")
-        if self._engine is None:
+        if self._engine is None and _resolvable_endpoint(components):
             try:
                 import agent as _agent_mod
 
+                agent = components["agent"]
+                model = str(components["model"])
                 self._engine = _agent_mod.EvolutionEngine(
-                    components["client"],
-                    components["model"],
+                    agent.endpoint_for(model),
+                    model,
                     components["memory"],
-                    api_format=components.get("api_format", "anthropic"),
                 )
             except Exception as exc:
                 _console().print(

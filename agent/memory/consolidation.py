@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from agent import shared
 from agent.lexical import count_cjk_chars
 from agent.usage import extract_provider_usage
+
+if TYPE_CHECKING:
+    from agent.core.transport import ModelEndpoint
 
 from ._helpers import _new_id, _now
 from .models import ConsolidationResult, LTMEntry
@@ -294,14 +297,19 @@ class ConsolidationEngine:
     async def consolidate(
         self,
         messages: list[dict],
-        client: Any,
+        endpoint: "ModelEndpoint",
         model: str,
-        api_format: str = "anthropic",
         keep_last: Optional[int] = None,
         staging: Optional["StagingBuffer"] = None,
         project_scope: str = "",
     ) -> ConsolidationResult:
         """One sleep cycle: extract → classify → store → decay → compress.
+
+        ``endpoint`` carries the SDK client *and* the wire format together, so
+        a caller that names a model from one group cannot post it to another
+        group's client — see ``ModelEndpoint``.  ``consolidation.model`` may
+        name any configured group's model, which is how such a mismatch used
+        to reach the provider as a 400 listing the provider's own models.
 
         Source priority for LLM extraction:
           1. staging buffer (if non-empty) — full, clean conversation history
@@ -351,15 +359,15 @@ class ConsolidationEngine:
                 prompt = self._build_consolidation_prompt(
                     chunk_text, source_label, idx, len(conversation_chunks)
                 )
-                if api_format == "anthropic":
-                    resp = await client.messages.create(
+                if endpoint.api_format == "anthropic":
+                    resp = await endpoint.client.messages.create(
                         model=model,
                         max_tokens=self.output_tokens,
                         messages=[{"role": "user", "content": prompt}],
                     )
                     raw_responses.append(resp.content[0].text)
                 else:
-                    resp = await client.chat.completions.create(
+                    resp = await endpoint.client.chat.completions.create(
                         model=model,
                         max_tokens=self.output_tokens,
                         messages=[{"role": "user", "content": prompt}],

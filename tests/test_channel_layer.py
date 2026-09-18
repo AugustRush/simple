@@ -35,6 +35,31 @@ class CleanSkillCatalog:
         return False
 
 
+class _AgentWithRealRouting(agent_module.BaseAgent):
+    """A BaseAgent whose turn loop is stubbed, routing left real.
+
+    The runner resolves its background-consolidation model through the agent
+    (`consolidation_model` / `endpoint_for`), so those must behave like the
+    agent that actually serves the call.  A hand-written stub could agree
+    with itself while disagreeing with the real lookup — which is exactly the
+    mismatch this suite is here to catch.
+    """
+
+    def __init__(self, model: str = "fake-model", messages=None):
+        super().__init__(
+            client=object(),
+            registry=agent_module.ToolRegistry(),
+            model=model,
+            api_format="openai",
+        )
+        self._messages = messages
+
+    async def send_message(self, ctx, user_message, stream_callback=None):
+        if self._messages is not None:
+            ctx.messages = list(self._messages)
+        return agent_module.AgentResult(agent_id="agent", content="reply")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _fmt_tool_inputs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1388,13 +1413,13 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
         def __init__(
             self,
             ctx_mgr,
-            client,
+            endpoint,
             model,
-            api_format,
             poll_seconds=1.0,
-            client_factory=None,
         ):
             self.ctx_mgr = ctx_mgr
+            self.endpoint = endpoint
+            self.model = model
             self.started = False
             self.wake_calls = 0
             worker_instances.append(self)
@@ -1481,15 +1506,19 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
             return agent_module.AgentResult(agent_id="agent", content="reply")
 
     root_ctx_mgr = _RootContextManager()
+    ambient_client = object()
+    component_agent = _AgentWithRealRouting(
+        messages=[{"role": "user", "content": "history"}] * 4
+    )
     runner = ChannelRunner(
         channels=[],
         components={
-            "agent": _FakeAgent(),
+            "agent": component_agent,
             "skill_catalog": CleanSkillCatalog(),
             "plugin_catalog": None,
             "context_manager": root_ctx_mgr,
             "system_prompt": "system",
-            "client": object(),
+            "client": ambient_client,
             "model": "fake-model",
         },
         cfg={},
@@ -1510,6 +1539,10 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
     assert len(worker_instances) == 1
     assert worker_instances[0].started is True
     assert worker_instances[0].wake_calls == 1
+    # The worker's client must be the one that serves its model — resolved
+    # through the agent — not whichever client the components dict carries.
+    assert worker_instances[0].endpoint.client is component_agent.client
+    assert worker_instances[0].endpoint.client is not ambient_client
     assert root_ctx_mgr.spawned["chat-a"].enqueued == ["compact_triggered"]
 
 
@@ -1547,11 +1580,11 @@ def test_channel_runner_flushes_session_staging_on_exit():
             return True
 
     manager = _Manager()
+    component_agent = _AgentWithRealRouting()
     runner = ChannelRunner(
         channels=[],
         components={
-            "agent": SimpleNamespace(api_format="openai"),
-            "client": object(),
+            "agent": component_agent,
             "model": "fake-model",
             "plugin_catalog": None,
         },
@@ -1605,11 +1638,11 @@ def test_channel_runner_exit_timeout_retains_session_staging(caplog):
             raise TimeoutError
 
     manager = _Manager()
+    component_agent = _AgentWithRealRouting()
     runner = ChannelRunner(
         channels=[],
         components={
-            "agent": SimpleNamespace(api_format="openai"),
-            "client": object(),
+            "agent": component_agent,
             "model": "fake-model",
             "plugin_catalog": None,
         },

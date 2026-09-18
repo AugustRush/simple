@@ -374,8 +374,9 @@ def test_sleep_clears_staging(tmp_path):
     from agent import (
         LTMStore,
         ConsolidationEngine,
-        LocalRetriever,
         ContextManager,
+        LocalRetriever,
+        ModelEndpoint,
         StagingBuffer,
     )
 
@@ -385,11 +386,11 @@ def test_sleep_clears_staging(tmp_path):
         async def consolidate(
             self,
             messages,
-            client,
+            endpoint,
             model,
-            api_format="anthropic",
             keep_last=None,
             staging=None,
+            project_scope="",
         ):
             if staging:
                 staging.clear_all()
@@ -409,7 +410,7 @@ def test_sleep_clears_staging(tmp_path):
     assert ctx_mgr.staging.count() == 2
 
     messages = [{"role": "user", "content": "hello"}] * 2
-    asyncio.run(ctx_mgr.sleep(messages, client=None, model="x"))
+    asyncio.run(ctx_mgr.sleep(messages, ModelEndpoint(None, "openai"), "x"))
 
     assert ctx_mgr.staging.count() == 0
     assert ctx_mgr._needs_consolidation is False

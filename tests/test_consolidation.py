@@ -7,6 +7,17 @@ import time
 import pytest
 
 
+def _endpoint(api_format: str = "openai", client=None):
+    """The client and wire format a consolidation call runs on.
+
+    They travel together because the engine no longer accepts them apart:
+    naming a model and pointing at a client are one decision.
+    """
+    from agent import ModelEndpoint
+
+    return ModelEndpoint(client, api_format)
+
+
 def make_engine(tmp_path):
     from agent import LTMStore, ConsolidationEngine
 
@@ -1319,7 +1330,7 @@ def test_consolidate_includes_full_staging_text_before_clearing(tmp_path):
     client = _FakeClient()
     asyncio.run(
         engine.consolidate(
-            [], client, "fake-model", api_format="openai", staging=staging
+            [], _endpoint(client=client), "fake-model", staging=staging
         )
     )
 
@@ -1356,7 +1367,7 @@ def test_consolidation_can_bound_hidden_model_calls(tmp_path):
     staging.append("assistant", "z" * 3000 + " latest result")
     client = type("Client", (), {"chat": _Completions()})()
 
-    asyncio.run(engine.consolidate([], client, "memory-model", "openai", staging=staging))
+    asyncio.run(engine.consolidate([], _endpoint(client=client), "memory-model", staging=staging))
 
     assert len(client.chat.calls) == 2
     assert all(call["max_tokens"] == 256 for call in client.chat.calls)
@@ -1441,11 +1452,11 @@ def test_sleep_clears_dirty_flag(tmp_path, monkeypatch):
         async def consolidate(
             self,
             messages,
-            client,
+            endpoint,
             model,
-            api_format="anthropic",
             keep_last=None,
             staging=None,
+            project_scope="",
         ):
             return messages[-2:] if len(messages) > 2 else messages
 
@@ -1457,7 +1468,7 @@ def test_sleep_clears_dirty_flag(tmp_path, monkeypatch):
     assert ctx_mgr._needs_consolidation is True
 
     messages = [{"role": "user", "content": "hello"}] * 4
-    result = asyncio.run(ctx_mgr.sleep(messages, client=None, model="x"))
+    result = asyncio.run(ctx_mgr.sleep(messages, _endpoint(), "x"))
     assert ctx_mgr._needs_consolidation is False
     assert len(result) <= 4
 
@@ -1472,11 +1483,11 @@ def test_sleep_clears_dirty_flag_when_consolidation_raises(tmp_path):
         async def consolidate(
             self,
             messages,
-            client,
+            endpoint,
             model,
-            api_format="anthropic",
             keep_last=None,
             staging=None,
+            project_scope="",
         ):
             raise RuntimeError("boom")
 
@@ -1488,7 +1499,11 @@ def test_sleep_clears_dirty_flag_when_consolidation_raises(tmp_path):
     ctx_mgr.mark_activity()
 
     with pytest.raises(RuntimeError, match="boom"):
-        asyncio.run(ctx_mgr.sleep([{"role": "user", "content": "hello"}], None, "x"))
+        asyncio.run(
+            ctx_mgr.sleep(
+                [{"role": "user", "content": "hello"}], _endpoint(), "x"
+            )
+        )
 
     assert ctx_mgr._needs_consolidation is False
 
@@ -2294,9 +2309,8 @@ def test_consolidate_suppresses_messages_compressed_print_when_no_messages(
     asyncio.run(
         engine.consolidate(
             messages=[],
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             staging=staging,
         )
     )
@@ -2323,9 +2337,8 @@ def test_consolidate_does_not_print_messages_compressed_when_messages_empty(
     asyncio.run(
         engine.consolidate(
             messages=[],
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             staging=staging,
         )
     )
@@ -2352,9 +2365,8 @@ def test_consolidate_still_prints_messages_compressed_when_messages_present(
     asyncio.run(
         engine.consolidate(
             messages=messages,
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             staging=staging,
         )
     )

@@ -5,6 +5,18 @@ import threading
 import time
 
 
+def _endpoint(api_format: str = "openai"):
+    """A stand-in endpoint for tests whose consolidation never calls a model.
+
+    The worker's contract is to hand its endpoint to the context manager
+    untouched, so these tests only need the wire format to travel with the
+    client — the client itself is never used.
+    """
+    from agent import ModelEndpoint
+
+    return ModelEndpoint(client=None, api_format=api_format)
+
+
 def _build_context_manager(tmp_path):
     from agent import (
         ConsolidationEngine,
@@ -64,9 +76,8 @@ def test_background_worker_processes_queued_consolidation(tmp_path):
 
     async def run_once():
         await ctx_mgr.process_one_job(
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             extractor=lambda *_: [],
         )
 
@@ -94,9 +105,8 @@ def test_background_worker_stop_cancels_active_job_cleanly(capsys):
 
     worker = BackgroundMemoryWorker(
         _BlockingContextManager(),
-        client=None,
-        model="x",
-        api_format="openai",
+        _endpoint(),
+        "x",
         poll_seconds=10,
     )
     worker.start()
@@ -130,9 +140,8 @@ def test_process_one_job_materializes_resolved_fact_from_identity_entry(tmp_path
 
     async def run_once():
         await ctx_mgr.process_one_job(
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             extractor=lambda *_: [
                 LTMEntry(
                     id="assistant-identity",
@@ -174,9 +183,8 @@ def test_process_one_job_preserves_turns_appended_during_consolidation(tmp_path)
 
     async def run_once():
         await ctx_mgr.process_one_job(
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             extractor=extractor,
         )
 
@@ -208,9 +216,9 @@ def test_background_worker_processes_idle_staging_without_prequeued_job(tmp_path
     calls = []
 
     async def fake_process_one_job(
-        client, model, api_format="anthropic", extractor=None
+        endpoint, model, extractor=None
     ):
-        calls.append((model, api_format))
+        calls.append((model, endpoint.api_format))
         ctx_mgr.staging.clear_all()
         ctx_mgr._needs_consolidation = False
         return True
@@ -220,9 +228,8 @@ def test_background_worker_processes_idle_staging_without_prequeued_job(tmp_path
     async def run():
         worker = BackgroundMemoryWorker(
             ctx_mgr=ctx_mgr,
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             poll_seconds=0.01,
         )
         worker.start()
@@ -249,9 +256,8 @@ def test_background_worker_polls_while_main_thread_is_blocked(tmp_path):
     ctx_mgr = _FakeContextManager()
     worker = BackgroundMemoryWorker(
         ctx_mgr=ctx_mgr,
-        client=None,
+        endpoint=_endpoint(),
         model="x",
-        api_format="openai",
         poll_seconds=0.01,
     )
 
@@ -282,9 +288,8 @@ def test_background_worker_wake_drains_all_pending_jobs():
 
         async def process_one_job(
             self,
-            client,
+            endpoint,
             model,
-            api_format="anthropic",
             extractor=None,
         ):
             if self.pending <= 0:
@@ -296,9 +301,8 @@ def test_background_worker_wake_drains_all_pending_jobs():
     ctx_mgr = _FakeContextManager()
     worker = BackgroundMemoryWorker(
         ctx_mgr=ctx_mgr,
-        client=None,
+        endpoint=_endpoint(),
         model="x",
-        api_format="openai",
         poll_seconds=0.01,
     )
 
@@ -334,9 +338,9 @@ def test_background_worker_pool_uses_one_thread_for_multiple_sessions():
 
     first = _FakeContextManager()
     second = _FakeContextManager()
-    pool = BackgroundMemoryWorkerPool(client=None, poll_seconds=0.01)
-    pool.register("a", first, "model-a", "openai")
-    pool.register("b", second, "model-b", "openai")
+    pool = BackgroundMemoryWorkerPool(poll_seconds=0.01)
+    pool.register("a", first, "model-a", _endpoint())
+    pool.register("b", second, "model-b", _endpoint())
 
     async def run():
         pool.start()
@@ -359,9 +363,8 @@ def test_process_one_job_logs_reason_and_session_context(tmp_path, capsys):
 
     async def run_once():
         await ctx_mgr.process_one_job(
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             extractor=lambda *_: [],
         )
 
@@ -405,9 +408,8 @@ def test_process_one_job_reconstructs_sqlite_staging_from_job_metadata(tmp_path)
 
     async def run_once():
         return await ctx_mgr.process_one_job(
-            client=None,
+            endpoint=_endpoint(),
             model="x",
-            api_format="openai",
             extractor=extractor,
         )
 
@@ -430,9 +432,8 @@ def test_process_one_job_keeps_retry_signal_when_consolidation_fails(tmp_path):
     async def failing_consolidate(
         self,
         messages,
-        client,
+        endpoint,
         model,
-        api_format="anthropic",
         keep_last=None,
         staging=None,
     ):
@@ -442,9 +443,8 @@ def test_process_one_job_keeps_retry_signal_when_consolidation_fails(tmp_path):
     try:
         async def run_once():
             return await ctx_mgr.process_one_job(
-                client=None,
+                endpoint=_endpoint(),
                 model="x",
-                api_format="openai",
             )
 
         result = asyncio.run(run_once())
@@ -486,9 +486,9 @@ def test_background_worker_pool_slow_session_does_not_starve_others():
 
     slow = _FakeContextManager(delay=0.3)
     fast = _FakeContextManager(delay=0.0)
-    pool = BackgroundMemoryWorkerPool(client=None, poll_seconds=0.01)
-    pool.register("slow", slow, "model-a", "openai")
-    pool.register("fast", fast, "model-b", "openai")
+    pool = BackgroundMemoryWorkerPool(poll_seconds=0.01)
+    pool.register("slow", slow, "model-a", _endpoint())
+    pool.register("fast", fast, "model-b", _endpoint())
 
     async def run():
         pool.start()
@@ -530,9 +530,9 @@ def test_pool_wake_is_scoped_to_the_woken_session():
 
     woken = _FakeContextManager()
     gated = _FakeContextManager()
-    pool = BackgroundMemoryWorkerPool(client=None, poll_seconds=0.01)
-    pool.register("woken", woken, "model", "openai")
-    pool.register("gated", gated, "model", "openai")
+    pool = BackgroundMemoryWorkerPool(poll_seconds=0.01)
+    pool.register("woken", woken, "model", _endpoint())
+    pool.register("gated", gated, "model", _endpoint())
 
     async def run():
         pool.start()
@@ -574,8 +574,8 @@ def test_pooled_handle_wait_waits_out_inflight_job():
                 await asyncio.sleep(0.005)
             return True
 
-    pool = BackgroundMemoryWorkerPool(client=None, poll_seconds=0.01)
-    pool.register("s", _SlowContextManager(), "model", "openai")
+    pool = BackgroundMemoryWorkerPool(poll_seconds=0.01)
+    pool.register("s", _SlowContextManager(), "model", _endpoint())
     handle = PooledMemoryWorkerHandle(pool, "s")
 
     async def run():

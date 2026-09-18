@@ -2138,6 +2138,21 @@ def test_web_signals_endpoint_offers_names_and_shows_who_is_waiting(
     assert payload["waiting"] == []
 
 
+def _a_routable_model() -> str:
+    """A step model the workflow endpoint will accept.
+
+    A step's model is validated against the configured provider groups, so
+    the test asks the same config the endpoint asks rather than hardcoding an
+    id that only exists on one machine.
+    """
+    from agent.config import load_config
+    from agent.core.transport import routable_model_ids
+
+    ids = sorted(routable_model_ids(load_config()[0]))
+    assert ids, "no configured models to choose from"
+    return ids[0]
+
+
 def _workflow_body() -> dict:
     return {
         "name": "夜间报告",
@@ -2701,10 +2716,11 @@ def test_web_editing_a_workflow_keeps_the_fields_the_editor_never_shows(
     channel = _channel()
     channel.bind_runtime({}, {})
     with TestClient(channel.app) as client:
+        step_model = _a_routable_model()
         body = _workflow_body()
         body["steps"][1].update(
             {
-                "model_override": "deepseek-v4",
+                "model_override": step_model,
                 "selected_skills": ["pdf"],
                 "timeout_seconds": 900,
                 "context_policy": "task_history",
@@ -2745,7 +2761,7 @@ def test_web_editing_a_workflow_keeps_the_fields_the_editor_never_shows(
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
             task = store.get_task(after["analyze"]["task_id"])
-            assert task.model_override == "deepseek-v4"
+            assert task.model_override == step_model
             assert task.selected_skills == ["pdf"]
             assert task.timeout_seconds == 900
             assert task.context_policy == "task_history"
@@ -2768,9 +2784,10 @@ def test_web_a_field_sent_empty_is_cleared_not_kept(tmp_path, monkeypatch):
     channel = _channel()
     channel.bind_runtime({}, {})
     with TestClient(channel.app) as client:
+        step_model = _a_routable_model()
         body = _workflow_body()
         body["steps"][1].update(
-            {"model_override": "deepseek-v4", "selected_skills": ["pdf"]}
+            {"model_override": step_model, "selected_skills": ["pdf"]}
         )
         created = client.post("/api/workflows", json=body).json()["workflow"]
 

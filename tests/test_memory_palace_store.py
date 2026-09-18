@@ -241,13 +241,18 @@ def test_memory_palace_search_uses_structured_store_as_source_of_truth(tmp_path)
     assert "Prefers concise responses" in results[0]["snippet"]
 
 
-def test_memory_palace_tidy_accepts_generic_client_annotation():
+def test_memory_palace_tidy_takes_no_llm_client():
+    """tidy() is a store pass: no client, no model, nothing to mis-pair.
+
+    It used to accept ``(client, model)`` that it never passed to anyone,
+    which left callers free to hand it whichever provider's client happened
+    to be active.  Declining the parameters is what makes that unreachable.
+    """
     from agent import MemoryPalace
 
-    annotation = inspect.signature(MemoryPalace.tidy).parameters["client"].annotation
+    parameters = inspect.signature(MemoryPalace.tidy).parameters
 
-    assert annotation is not inspect._empty
-    assert "anthropic.AsyncAnthropic" not in str(annotation)
+    assert list(parameters) == ["self"]
 
 
 def test_memory_palace_force_tidy_marks_state_dirty(tmp_path):

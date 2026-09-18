@@ -5,31 +5,38 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import threading
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from agent import shared
 
 from .context import ContextManager
 
+if TYPE_CHECKING:
+    from agent.core.transport import ModelEndpoint
+
 
 class BackgroundMemoryWorker:
-    """Background thread that processes queued memory jobs during prompt idle time."""
+    """Background thread that processes queued memory jobs during prompt idle time.
+
+    The worker makes its own LLM calls, so it takes the *endpoint* that owns
+    its model — the client and the wire format together — rather than a bare
+    client plus a model id.  A consolidation model may name any configured
+    group's model; pairing one group's model with another group's client is
+    how a background job comes to be rejected with the provider's "the
+    supported API model names are ..." error.
+    """
 
     def __init__(
         self,
         ctx_mgr: ContextManager,
-        client: Any,
+        endpoint: "ModelEndpoint",
         model: str,
-        api_format: str,
         poll_seconds: float = 1.0,
-        client_factory: Optional[Callable[[], Any]] = None,
     ):
         self.ctx_mgr = ctx_mgr
-        self.client = client
+        self.endpoint = endpoint
         self.model = model
-        self.api_format = api_format
         self.poll_seconds = poll_seconds
-        self.client_factory = client_factory
         self._stop_event = threading.Event()
         # _wake_event lets callers interrupt the poll sleep and trigger an
         # immediate (idle-gate-bypassing) consolidation run without blocking
@@ -78,14 +85,10 @@ class BackgroundMemoryWorker:
         if self._thread:
             await asyncio.to_thread(self._thread.join)
 
-    async def _process_job(self, client: Any) -> bool:
+    async def _process_job(self) -> bool:
         loop = asyncio.get_running_loop()
         task = asyncio.create_task(
-            self.ctx_mgr.process_one_job(
-                client,
-                self.model,
-                api_format=self.api_format,
-            )
+            self.ctx_mgr.process_one_job(self.endpoint, self.model)
         )
         with self._state_lock:
             self._active_loop = loop
@@ -98,7 +101,6 @@ class BackgroundMemoryWorker:
                 self._active_task = None
 
     def _run(self) -> None:
-        client = self.client_factory() if self.client_factory else self.client
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -118,7 +120,7 @@ class BackgroundMemoryWorker:
                         )
                         if not should_run:
                             break
-                        processed = loop.run_until_complete(self._process_job(client))
+                        processed = loop.run_until_complete(self._process_job())
                         if not processed:
                             break
                         if not on_demand:
@@ -135,12 +137,9 @@ class BackgroundMemoryWorker:
                 # so that wake() can also cut the sleep short.
                 self._wake_event.wait(timeout=self.poll_seconds)
         finally:
-            aclose = getattr(client, "aclose", None)
-            if self.client_factory and callable(aclose):
-                try:
-                    loop.run_until_complete(aclose())
-                except Exception:
-                    pass
+            # The client belongs to the provider cache that built it, not to
+            # this thread: another worker or the agent itself may still be
+            # using it, so the worker never closes it.
             pending = asyncio.all_tasks(loop)
             for task in pending:
                 task.cancel()
@@ -150,19 +149,21 @@ class BackgroundMemoryWorker:
 
 
 class BackgroundMemoryWorkerPool:
-    """One bounded worker loop shared by many session context managers."""
+    """One bounded worker loop shared by many session context managers.
+
+    Each session registers the endpoint that owns *its* consolidation model,
+    so sessions on different providers' models each reach their own provider.
+    The pool owns no client: the clients come from the provider cache the
+    registrations were resolved against.
+    """
 
     def __init__(
         self,
-        client: Any,
         *,
-        client_factory: Optional[Callable[[], Any]] = None,
         poll_seconds: float = 1.0,
     ) -> None:
-        self.client = client
-        self.client_factory = client_factory
         self.poll_seconds = max(0.05, float(poll_seconds))
-        self._sessions: dict[str, tuple[ContextManager, str, str]] = {}
+        self._sessions: dict[str, tuple[ContextManager, str, "ModelEndpoint"]] = {}
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
@@ -191,10 +192,11 @@ class BackgroundMemoryWorkerPool:
         session_id: str,
         ctx_mgr: ContextManager,
         model: str,
-        api_format: str,
+        endpoint: "ModelEndpoint",
     ) -> None:
+        """Pair a session's consolidation with the endpoint that owns *model*."""
         with self._lock:
-            self._sessions[str(session_id)] = (ctx_mgr, str(model), str(api_format))
+            self._sessions[str(session_id)] = (ctx_mgr, str(model), endpoint)
         self._wake_event.set()
 
     def unregister(self, session_id: str) -> None:
@@ -239,13 +241,11 @@ class BackgroundMemoryWorkerPool:
                 idle_event = self._idle_event
             await asyncio.to_thread(idle_event.wait)
 
-    async def _process(self, item: tuple[ContextManager, str, str], client: Any) -> bool:
-        manager, model, api_format = item
-        return bool(
-            await manager.process_one_job(client, model, api_format=api_format)
-        )
+    async def _process(self, item: tuple[ContextManager, str, "ModelEndpoint"]) -> bool:
+        manager, model, endpoint = item
+        return bool(await manager.process_one_job(endpoint, model))
 
-    async def _drain_once(self, client: Any, woken_sessions: set[str]) -> bool:
+    async def _drain_once(self, woken_sessions: set[str]) -> bool:
         """Run one job per eligible session concurrently.
 
         Each ContextManager serializes its own jobs via _processing_job, and
@@ -269,7 +269,7 @@ class BackgroundMemoryWorkerPool:
         if not items:
             return False
         tasks = [
-            asyncio.ensure_future(self._process(item[1], client))
+            asyncio.ensure_future(self._process(item[1]))
             for item in items
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -286,7 +286,6 @@ class BackgroundMemoryWorkerPool:
         return made_progress
 
     def _run(self) -> None:
-        client = self.client_factory() if self.client_factory else self.client
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
@@ -303,7 +302,7 @@ class BackgroundMemoryWorkerPool:
                 made_progress = False
                 try:
                     made_progress = loop.run_until_complete(
-                        self._drain_once(client, woken)
+                        self._drain_once(woken)
                     )
                 except asyncio.CancelledError:
                     break
@@ -319,10 +318,6 @@ class BackgroundMemoryWorkerPool:
                     continue
                 self._wake_event.wait(timeout=self.poll_seconds)
         finally:
-            aclose = getattr(client, "aclose", None)
-            if self.client_factory and callable(aclose):
-                with contextlib.suppress(Exception):
-                    loop.run_until_complete(aclose())
             pending = asyncio.all_tasks(loop)
             for task in pending:
                 task.cancel()
@@ -332,7 +327,12 @@ class BackgroundMemoryWorkerPool:
 
 
 class PooledMemoryWorkerHandle:
-    """Per-session compatibility handle backed by a worker pool."""
+    """One session's view of a shared worker pool.
+
+    Exposes the same start/stop/wait/wake surface as
+    ``BackgroundMemoryWorker`` so a session does not care whether it owns a
+    private worker or a slot in the pool.
+    """
 
     def __init__(self, pool: BackgroundMemoryWorkerPool, session_id: str) -> None:
         self.pool = pool

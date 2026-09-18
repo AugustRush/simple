@@ -50,7 +50,7 @@ from agent.security.content_filter import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from agent.core.transport import ModelTransport
+    from agent.core.transport import ModelEndpoint, ModelTransport
 
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
 logger = logging.getLogger(__name__)
@@ -522,6 +522,34 @@ class BaseAgent:
         if not override.strip():
             raise ValueError("model override must not be blank")
         return override
+
+    def endpoint_for(self, model: Optional[str] = None) -> "ModelEndpoint":
+        """The client — and the wire format — that owns *model*.
+
+        Public because the background LLM consumers (memory consolidation, the
+        session-end flush, the evolution engine) need a client *for a model*
+        and used to reach for whichever client the process happened to hold.
+        Routing the lookup through the agent's transport is what stops them
+        pairing another group's model with the active provider's client.
+        """
+        return self._transport.endpoint_for(model)
+
+    def consolidation_model(self, cfg: dict) -> str:
+        """The model this agent's memory consolidation runs on.
+
+        ``context.consolidation.model`` may name any configured group's model
+        — the config docs suggest a cheaper one, and the cheapest model is
+        often in another group.  Every caller that starts a background
+        consolidation reads the model from here, so the worker, the
+        session-end flush and the manual tidy cannot disagree about it.
+        """
+        consolidation = (cfg.get("context") or {}).get("consolidation") or {}
+        configured = consolidation.get("model")
+        return str(configured or getattr(self, "model", "") or "")
+
+    def consolidation_endpoint(self, cfg: dict) -> "ModelEndpoint":
+        """The endpoint that owns the model ``consolidation_model`` returned."""
+        return self.endpoint_for(self.consolidation_model(cfg))
 
     def _plan_orchestration(
         self,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import time
-from typing import Any, Optional
+from typing import Optional
 
 import agent as agent_module
 from agent import shared
@@ -129,8 +129,12 @@ class MemoryPalace:
         self._last_tidy = 0
         self._files_since_tidy = self._tidy_threshold
 
-    async def tidy(self, client: Any, model: str):
-        """Local maintenance pass: apply retention and refresh JSONL export."""
+    async def tidy(self):
+        """Local maintenance pass: apply retention and refresh JSONL export.
+
+        Deliberately LLM-free — every step here is a store operation, so the
+        job takes no provider client and cannot be sent to the wrong group.
+        """
         shared.CONSOLE.print("[dim]Tidying memory palace...[/dim]")
         self.store.apply_retention()
         snapshot = self.store.maintenance_snapshot(limit=20)

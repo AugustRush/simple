@@ -884,7 +884,7 @@ async def _build_scheduler_service(
         if job_name == "memory_tidy":
             memory: MemoryPalace = components["memory"]
             memory.force_tidy()
-            await memory.tidy(components["client"], components["model"])
+            await memory.tidy()
             return ExecutionResult(
                 summary="memory tidied",
                 text_output="",
@@ -1100,28 +1100,24 @@ async def _interactive_loop_body(
     skill_catalog: SkillCatalog = components["skill_catalog"]
 
     ctx = AgentContext(system_prompt=system_prompt)
+    consolidation_cfg = (cfg.get("context") or {}).get("consolidation", {}) or {}
     # Incomplete-task guidance is persisted by the context manager. Completed
     # requests are not duplicated into the system prompt.
-    consolidation_cfg = cfg.get("context", {}).get("consolidation", {})
-    memory_model = str(
-        consolidation_cfg.get("model")
-        or components.get("model")
-        or getattr(agent, "model", "")
-    )
-    memory_worker = (
-        agent_module.BackgroundMemoryWorker(
+    # Consolidation may name any configured group's model, so the client it
+    # runs on is looked up *by that model* — see BaseAgent.endpoint_for.  The
+    # lookup runs only when there is a worker to spend it on, so a caller that
+    # brings no context manager needs no agent that can resolve models.
+    memory_worker = None
+    memory_model = ""
+    memory_endpoint = None
+    if ctx_mgr:
+        memory_model = agent.consolidation_model(cfg)
+        memory_endpoint = agent.endpoint_for(memory_model)
+        memory_worker = agent_module.BackgroundMemoryWorker(
             ctx_mgr,
-            components["client"],
+            memory_endpoint,
             memory_model,
-            agent.api_format,
-            client_factory=lambda: agent_module.ModelClientFactory.from_config(
-                cfg, announce=False
-            )[0],
         )
-        if ctx_mgr
-        else None
-    )
-    if memory_worker:
         memory_worker.start()
     state = RuntimeSessionState(
         ctx=ctx,
@@ -1293,9 +1289,8 @@ async def _interactive_loop_body(
                     ctx_mgr.enqueue_consolidation("session_end")
                     while ctx_mgr.pending_jobs():
                         processed = await ctx_mgr.process_one_job(
-                            components["client"],
+                            memory_endpoint,
                             memory_model,
-                            api_format=agent.api_format,
                         )
                         if not processed:
                             break
@@ -1931,7 +1926,7 @@ def memory_tidy():
         mem: MemoryPalace = components["memory"]
         mem.force_tidy()
         try:
-            await mem.tidy(components["client"], components["model"])
+            await mem.tidy()
         finally:
             await agent_module._close_components(components)
 

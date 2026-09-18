@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import abc
 import copy
+from dataclasses import dataclass
 import inspect
 import json
 from typing import Any, Callable, Optional
@@ -43,6 +44,21 @@ _OPENAI_MESSAGE_RESERVED_FIELDS = frozenset(
 _SKIP_OPENAI_EXTRA = object()
 
 
+@dataclass(frozen=True)
+class ModelEndpoint:
+    """The SDK client that owns a model, and the wire format it speaks.
+
+    The two travel together on purpose.  A caller that spells out a model id
+    but holds only a client is one careless pairing away from sending a
+    foreign model to the active provider's endpoint — which the provider
+    answers with a 400 naming its own models, and which reads like a bug in
+    the agent rather than a mismatch between a model and its group.
+    """
+
+    client: Any
+    api_format: str
+
+
 class ModelTransport(abc.ABC):
     """Format-specific dispatch contract for one LLM provider.
 
@@ -51,8 +67,21 @@ class ModelTransport(abc.ABC):
     instance state is the SDK client.
     """
 
+    #: Wire format this transport speaks; set by each implementation.
+    api_format: str = ""
+
     def __init__(self, client: Any) -> None:
         self.client = client
+
+    def endpoint_for(self, model: Optional[str] = None) -> ModelEndpoint:
+        """The endpoint that owns *model*.
+
+        One provider per transport, so every model resolves to this client.
+        ``RoutingTransport`` overrides this with the real model -> provider
+        lookup; callers that need a client *for a model* ask here rather than
+        pairing a model string with whichever client happens to be at hand.
+        """
+        return ModelEndpoint(self.client, self.api_format)
 
     # ── Tool/schema shaping ────────────────────────────────────────────
 
@@ -188,6 +217,8 @@ class ModelTransport(abc.ABC):
 
 
 class AnthropicTransport(ModelTransport):
+    api_format = "anthropic"
+
     def convert_tools(
         self, tools: list[dict], model: Optional[str] = None
     ) -> Any:
@@ -285,6 +316,8 @@ class AnthropicTransport(ModelTransport):
 
 
 class OpenAITransport(ModelTransport):
+    api_format = "openai"
+
     def convert_tools(
         self, tools: list[dict], model: Optional[str] = None
     ) -> Any:
@@ -691,11 +724,27 @@ class RoutingTransport(ModelTransport):
         super().__init__(default.client)
         self.default = default
         self.routes = routes
+        # The format of an unrouted call, for callers that ask the transport
+        # rather than a transport's endpoint.
+        self.api_format = default.api_format
 
     def _for(self, model: Optional[str]) -> ModelTransport:
         if model is None:
             return self.default
         return self.routes.get(model, self.default)
+
+    def endpoint_for(self, model: Optional[str] = None) -> ModelEndpoint:
+        """The client and format owned by *model*.
+
+        Background consumers (memory consolidation, session-end flushes, the
+        evolution engine) make their own LLM calls and historically paired the
+        active provider's client with whatever model the config named — so a
+        `consolidation.model` from another provider's group was posted to the
+        active provider's endpoint and rejected with the same 400 the agent
+        loop used to produce.  Asking the router resolves the pair instead.
+        """
+        transport = self._for(model)
+        return ModelEndpoint(transport.client, transport.api_format)
 
     def convert_tools(self, tools: list[dict], model: Optional[str] = None) -> Any:
         return self._for(model).convert_tools(tools)
@@ -773,39 +822,71 @@ class RoutingTransport(ModelTransport):
 def _provider_models(provider_cfg: dict) -> list[str]:
     """The model ids a provider offers.
 
-    Its ``models`` list, or its ``default_model`` alone when no list is
-    configured. Whitespace is stripped so the routing key, the validation
-    set, and the id sent to the provider are the same token.
+    Its ``models`` list, plus the model it declares as its own
+    ``default_model``.  The default is included even when a list exists: a
+    group that names a default it does not also list is still claiming that
+    model, and omitting it left the id out of the routing table — so a
+    selection or a config value naming it was sent to whichever provider
+    happened to be active instead of the one that declares it.  Whitespace is
+    stripped so the routing key, the validation set, and the id sent to the
+    provider are the same token.
     """
-    models = provider_cfg.get("models") or []
-    if not models and provider_cfg.get("default_model"):
-        models = [provider_cfg["default_model"]]
-    return [
+    declared = provider_cfg.get("models")
+    if isinstance(declared, str):
+        declared = [declared]
+    models = [
         model.strip()
-        for model in models
+        for model in (declared or [])
         if isinstance(model, str) and model.strip()
     ]
+    default = provider_cfg.get("default_model")
+    if isinstance(default, str) and default.strip():
+        stripped = default.strip()
+        if stripped not in models:
+            models.append(stripped)
+    return models
+
+
+def routing_table(cfg: dict) -> dict[str, str]:
+    """Model id → the provider that owns it.
+
+    The single definition of "which group does this model belong to".
+    ``build_routing_transport`` turns it into transports and
+    ``routable_model_ids`` re-exports its keys, so the set of ids a caller may
+    request and the set the router can dispatch are the same set by
+    construction — when they drifted, an id could pass validation and still be
+    posted to the wrong provider's endpoint.
+
+    The active provider wins a contested id: that is what the model dropdown
+    shows (its group is listed first) and which client the id should reach.
+    """
+    providers = cfg.get("providers")
+    if not isinstance(providers, dict):
+        return {}
+    active = str(cfg.get("active_provider") or "")
+    table: dict[str, str] = {}
+    for name, provider_cfg in providers.items():
+        if not isinstance(provider_cfg, dict):
+            continue
+        for model in _provider_models(provider_cfg):
+            if model in table and name != active:
+                continue
+            table[model] = name
+    return table
 
 
 def routable_model_ids(cfg: dict) -> set[str]:
     """Model ids a model_override may carry.
 
-    The composer dropdown offers every provider's models and the routing
-    table dispatches on the id, so this is the honest validation set: every
-    provider's models via the same definition the router uses, plus the
-    configured top-level ``model`` (which resolves to the active provider's
-    default anyway). Ambiguous ids belong to the active provider; the set
-    does not care about ownership.
+    Every id the routing table can dispatch, plus the configured top-level
+    ``model`` — which names the *active* provider's model, because that is
+    what the client factory resolves it to.  Anything else is an id no group
+    owns: requesting it could only reach the wrong endpoint.
     """
-    ids: set[str] = set()
+    ids: set[str] = set(routing_table(cfg))
     top_level = cfg.get("model")
     if isinstance(top_level, str) and top_level.strip():
         ids.add(top_level.strip())
-    providers = cfg.get("providers")
-    if isinstance(providers, dict):
-        for provider_cfg in providers.values():
-            if isinstance(provider_cfg, dict):
-                ids.update(_provider_models(provider_cfg))
     return ids
 
 
@@ -827,12 +908,15 @@ def build_routing_transport(
     config edit yields a fresh client instead of reusing a stale one. The
     active provider reuses ``default_client`` so its routed and default
     paths share one client.
+
+    The routes come from ``routing_table``: one transport per provider, no
+    second opinion about who owns a model.
     """
     providers = cfg.get("providers", {}) or {}
     active = str(cfg.get("active_provider") or "")
     default_transport = build_transport(default_format, default_client)
     routes: dict[str, ModelTransport] = {}
-    transports: dict[tuple[str, str], ModelTransport] = {}
+    transports: dict[str, ModelTransport] = {}
 
     def _client_for(provider_cfg: dict, api_format: str) -> Any:
         if client_cache is None:
@@ -848,11 +932,9 @@ def build_routing_transport(
             client_cache[key] = client
         return client
 
-    for name, provider_cfg in providers.items():
+    for model, name in routing_table(cfg).items():
+        provider_cfg = providers.get(name)
         if not isinstance(provider_cfg, dict):
-            continue
-        models = _provider_models(provider_cfg)
-        if not models:
             continue
         api_format = str(provider_cfg.get("api_format", "openai"))
         if name == active and api_format == default_format:
@@ -860,16 +942,11 @@ def build_routing_transport(
             # the very transport that handles unrouted calls.
             transport = default_transport
         else:
-            key = (name, api_format)
-            if key not in transports:
-                transports[key] = build_transport(
+            transport = transports.get(name)
+            if transport is None:
+                transport = build_transport(
                     api_format, _client_for(provider_cfg, api_format)
                 )
-            transport = transports[key]
-        for model in models:
-            # Active provider wins conflicts; iterate it last is not enough
-            # when it is not the last in the dict, so guard explicitly.
-            if model in routes and name != active:
-                continue
-            routes[model] = transport
+                transports[name] = transport
+        routes[model] = transport
     return RoutingTransport(default_transport, routes)

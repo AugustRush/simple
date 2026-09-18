@@ -248,6 +248,7 @@ from .core.agent import (
     BaseAgent,
     SubAgentProgressEvent,
 )
+from .core.transport import ModelEndpoint
 from .orchestration import SubtaskResult, SubtaskSpec
 
 

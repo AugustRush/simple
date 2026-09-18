@@ -9,10 +9,13 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from agent import shared
 from agent.lexical import lexical_terms
+
+if TYPE_CHECKING:
+    from agent.core.transport import ModelEndpoint
 
 from ._helpers import (
     _FACT_QUERY_PREDICATE_ALIASES,
@@ -1925,27 +1928,18 @@ class ContextManager:
     async def sleep(
         self,
         messages: list[dict],
-        client: Any,
+        endpoint: "ModelEndpoint",
         model: str,
-        api_format: str = "anthropic",
     ) -> list[dict]:
         """Run one sleep cycle (uses staging as source), then clear dirty flag."""
         try:
-            try:
-                result = await self.consolidation.consolidate(
-                    messages,
-                    client,
-                    model,
-                    api_format,
-                    staging=self.staging,
-                    project_scope=self.project_scope,
-                )
-            except TypeError as exc:
-                if "project_scope" not in str(exc):
-                    raise
-                result = await self.consolidation.consolidate(
-                    messages, client, model, api_format, staging=self.staging
-                )
+            result = await self.consolidation.consolidate(
+                messages,
+                endpoint,
+                model,
+                staging=self.staging,
+                project_scope=self.project_scope,
+            )
             return self._coerce_consolidation_result(result).compressed_messages
         finally:
             with self._lock:
@@ -1953,9 +1947,8 @@ class ContextManager:
 
     async def process_one_job(
         self,
-        client: Any,
+        endpoint: "ModelEndpoint",
         model: str,
-        api_format: str = "anthropic",
         extractor: Optional[Callable[..., list[Any]]] = None,
     ) -> bool:
         """Process one queued consolidation job without mutating working memory."""
@@ -2028,21 +2021,13 @@ class ContextManager:
                 return True
 
             try:
-                try:
-                    result = await self.consolidation.consolidate(
-                        [],
-                        client,
-                        model,
-                        api_format,
-                        staging=staging_buffer,
-                        project_scope=self.project_scope,
-                    )
-                except TypeError as exc:
-                    if "project_scope" not in str(exc):
-                        raise
-                    result = await self.consolidation.consolidate(
-                        [], client, model, api_format, staging=staging_buffer
-                    )
+                result = await self.consolidation.consolidate(
+                    [],
+                    endpoint,
+                    model,
+                    staging=staging_buffer,
+                    project_scope=self.project_scope,
+                )
             except Exception as exc:
                 _emit_consolidation("failed", reason="llm_extraction_error", error=str(exc))
                 shared.CONSOLE.print(f"[dim]Sleep extraction error: {exc}[/dim]")

@@ -20,6 +20,8 @@ from agent.core.transport import (
     OpenAITransport,
     RoutingTransport,
     build_routing_transport,
+    routable_model_ids,
+    routing_table,
 )
 
 
@@ -251,6 +253,157 @@ def test_agent_transport_is_injectable_and_defaults_to_the_client():
     assert not isinstance(defaulted._transport, RoutingTransport)
 
 
+def test_routing_table_is_the_one_definition_of_model_ownership():
+    """The ids a caller may request and the ids the router can dispatch agree.
+
+    Validation and dispatch used to derive their sets separately — one asked
+    the config for a provider's models, the other built its own table — so an
+    id could pass validation and still be handed to a provider that does not
+    serve it.
+    """
+    cfg = {
+        "active_provider": "deepseek",
+        "model": "deepseek-flash",
+        "providers": {
+            "deepseek": {
+                "api_format": "openai",
+                "default_model": "deepseek-flash",
+                "models": ["deepseek-flash", "deepseek-pro"],
+            },
+            "huoshan": {"api_format": "openai", "models": ["glm-5.3-flash"]},
+        },
+    }
+
+    table = routing_table(cfg)
+    assert table == {
+        "deepseek-flash": "deepseek",
+        "deepseek-pro": "deepseek",
+        "glm-5.3-flash": "huoshan",
+    }
+    # The top-level `model` names the active provider's model, so it is the
+    # only id a caller may request that is not itself a routing key.
+    assert routable_model_ids(cfg) == set(table) | {"deepseek-flash"}
+
+    routing = build_routing_transport(cfg, "openai", None, lambda *_a: object())
+    assert set(routing.routes) == set(table)
+
+
+def test_a_groups_default_model_is_routable_even_when_unlisted():
+    """A group that names a default it does not also list still owns it.
+
+    Omitting it left the id out of the routing table entirely, so a config
+    value or a model selection naming it went to whichever provider happened
+    to be active rather than the one that declares it.
+    """
+    cfg = {
+        "active_provider": "deepseek",
+        "providers": {
+            "deepseek": {"api_format": "openai", "models": ["deepseek-flash"]},
+            "qwen": {"api_format": "openai", "default_model": "qwen3.5-plus"},
+        },
+    }
+
+    assert routing_table(cfg)["qwen3.5-plus"] == "qwen"
+    assert "qwen3.5-plus" in routable_model_ids(cfg)
+
+    routing = build_routing_transport(cfg, "openai", None, lambda *_a: object())
+    assert "qwen3.5-plus" in routing.routes
+
+
+def test_endpoint_for_pairs_a_model_with_the_client_that_owns_it():
+    """Background consumers ask for a model's endpoint, not a client.
+
+    Memory consolidation, the session-end flush and the evolution engine make
+    their own LLM calls.  Each used to hold the active provider's client *and*
+    a model id from config, so naming a model from another group posted it to
+    the active provider.
+    """
+    import agent as agent_module
+
+    active_client = object()
+    foreign_client = object()
+    made: list[str] = []
+
+    def factory(provider_cfg: dict, api_format: str) -> Any:
+        made.append(str(provider_cfg.get("api_key")))
+        return foreign_client
+
+    cfg = {
+        "active_provider": "deepseek",
+        "providers": {
+            "deepseek": {
+                "api_format": "openai",
+                "api_key": "k-active",
+                "models": ["deepseek-flash"],
+            },
+            "huoshan": {
+                "api_format": "openai",
+                "api_key": "k-foreign",
+                "models": ["glm-5.3-flash"],
+            },
+        },
+    }
+    agent = agent_module.BaseAgent(
+        active_client,
+        agent_module.ToolRegistry(),
+        model="deepseek-flash",
+        api_format="openai",
+        transport=build_routing_transport(cfg, "openai", active_client, factory),
+    )
+
+    foreign = agent.endpoint_for("glm-5.3-flash")
+    assert foreign.client is foreign_client
+    assert foreign.api_format == "openai"
+    assert made == ["k-foreign"]
+
+    # The active provider's own model keeps its own client...
+    assert agent.endpoint_for("deepseek-flash").client is active_client
+    # ...and an id no group owns falls back the way an unrouted turn does.
+    assert agent.endpoint_for("no-such-model").client is active_client
+
+
+def test_consolidation_endpoint_reads_the_configured_model():
+    """The model a session consolidates with has exactly one definition.
+
+    ``context.consolidation.model`` may name another group's model; when it is
+    unset the session's own model is used.  The background worker and the
+    session-end flush both read it from here, so a flush cannot run on a
+    different model than the background passes did.
+    """
+    import agent as agent_module
+
+    active_client = object()
+    cfg = {
+        "active_provider": "deepseek",
+        "providers": {
+            "deepseek": {
+                "api_format": "openai",
+                "api_key": "k-active",
+                "models": ["deepseek-flash", "glm-5.3-flash"],
+            },
+        },
+    }
+    agent = agent_module.BaseAgent(
+        active_client,
+        agent_module.ToolRegistry(),
+        model="deepseek-flash",
+        api_format="openai",
+        transport=build_routing_transport(
+            cfg, "openai", active_client, lambda *_a: object()
+        ),
+    )
+
+    assert agent.consolidation_model({}) == "deepseek-flash"
+    assert agent.consolidation_model(
+        {"context": {"consolidation": {"model": "glm-5.3-flash"}}}
+    ) == "glm-5.3-flash"
+    endpoint = agent.consolidation_endpoint(
+        {"context": {"consolidation": {"model": "glm-5.3-flash"}}}
+    )
+    assert endpoint.client is active_client
+    assert endpoint.api_format == "openai"
+
+
 def test_sub_agent_dispatches_foreign_model_to_its_owning_provider():
     """A sub-agent must inherit the parent's routing table, not rebuild one.
 
@@ -425,4 +578,80 @@ def test_sub_agent_request_reaches_the_provider_that_owns_its_model():
 
     assert payload.get("ok") is True, payload.get("error")
     assert [b.get("model") for b in foreign_seen] == ["glm-5.3-flash"]
+    assert active_seen == [], "the active provider must never see a foreign model id"
+
+
+def test_consolidation_request_reaches_the_provider_that_owns_its_model(tmp_path):
+    """The reported failure for a background consumer, over real sockets.
+
+    ``context.consolidation.model`` is meant to name a cheaper model, and the
+    cheapest one often lives in another group.  The engine is handed the
+    endpoint resolved from that model, so consolidation must land on the
+    owning provider.  Before the fix the active provider saw the foreign id
+    and answered
+
+        400 The supported API model names are ..., but you passed glm-5.3-flash.
+    """
+    from agent import LTMStore, StagingBuffer
+    from agent.memory.consolidation import ConsolidationEngine
+
+    openai = pytest.importorskip("openai")
+    import agent as agent_module
+
+    active_url, active_seen, active_srv = _serve_openai_provider()
+    foreign_url, foreign_seen, foreign_srv = _serve_openai_provider()
+    try:
+        cfg = {
+            "active_provider": "deepseek",
+            "providers": {
+                "deepseek": {
+                    "api_format": "openai",
+                    "base_url": active_url,
+                    "api_key": "key-active",
+                    "models": ["deepseek-flash"],
+                },
+                "huoshan": {
+                    "api_format": "openai",
+                    "base_url": foreign_url,
+                    "api_key": "key-foreign",
+                    "models": ["glm-5.3-flash"],
+                },
+            },
+        }
+
+        def factory(provider_cfg: dict, api_format: str) -> Any:
+            return openai.AsyncOpenAI(
+                base_url=provider_cfg["base_url"],
+                api_key=provider_cfg["api_key"],
+                max_retries=0,
+            )
+
+        active_client = factory(cfg["providers"]["deepseek"], "openai")
+        parent = agent_module.BaseAgent(
+            active_client,
+            agent_module.ToolRegistry(),
+            model="deepseek-flash",
+            api_format="openai",
+            transport=build_routing_transport(cfg, "openai", active_client, factory),
+        )
+
+        staging = StagingBuffer(path=tmp_path / "staging.jsonl", session_id="s1")
+        staging.append("user", "we decided to prefer concise responses")
+        staging.append("assistant", "noted")
+
+        endpoint = parent.endpoint_for("glm-5.3-flash")
+        engine = ConsolidationEngine(
+            store=LTMStore(
+                context_dir=tmp_path / "context", memory_dir=tmp_path / "memory"
+            )
+        )
+        asyncio.run(engine.consolidate([], endpoint, "glm-5.3-flash", staging=staging))
+    finally:
+        active_srv.shutdown()
+        active_srv.server_close()
+        foreign_srv.shutdown()
+        foreign_srv.server_close()
+
+    assert foreign_seen, "the owning provider received nothing at all"
+    assert {b.get("model") for b in foreign_seen} == {"glm-5.3-flash"}
     assert active_seen == [], "the active provider must never see a foreign model id"

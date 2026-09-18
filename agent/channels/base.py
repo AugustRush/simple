@@ -136,42 +136,21 @@ class ChannelRunner:
 
         if session_ctx_mgr is None:
             return None
+        agent = components.get("agent")
+        if agent is None or not hasattr(agent, "endpoint_for"):
+            return None
+        cfg = components.get("cfg") or {}
+        model = agent.consolidation_model(cfg)
+        endpoint = agent.consolidation_endpoint(cfg)
+        session_id = getattr(session_ctx_mgr.staging, "session_id", "")
         pool = components.get("memory_worker_pool")
         if pool is not None:
-            consolidation_cfg = (
-                components.get("cfg", {}).get("context", {}).get("consolidation", {})
-            )
-            memory_model = str(consolidation_cfg.get("model") or components["model"])
-            pool.register(
-                getattr(session_ctx_mgr.staging, "session_id", ""),
-                session_ctx_mgr,
-                memory_model,
-                components["agent"].api_format,
-            )
-            handle = agent_module.PooledMemoryWorkerHandle(
-                pool, getattr(session_ctx_mgr.staging, "session_id", "")
-            )
+            pool.register(session_id, session_ctx_mgr, model, endpoint)
+            handle = agent_module.PooledMemoryWorkerHandle(pool, session_id)
             handle.start()
             return handle
-        if (
-            "client" not in components
-            or "model" not in components
-            or "agent" not in components
-            or not hasattr(components["agent"], "api_format")
-        ):
-            return None
-        consolidation_cfg = (
-            components.get("cfg", {}).get("context", {}).get("consolidation", {})
-        )
-        memory_model = str(consolidation_cfg.get("model") or components["model"])
         worker = agent_module.BackgroundMemoryWorker(
-            session_ctx_mgr,
-            components["client"],
-            memory_model,
-            components["agent"].api_format,
-            client_factory=lambda: agent_module.ModelClientFactory.from_config(
-                components.get("cfg", self._cfg), announce=False
-            )[0],
+            session_ctx_mgr, endpoint, model
         )
         worker.start()
         return worker
@@ -285,15 +264,11 @@ class ChannelRunner:
         memory_pool = None
         if components.get("use_memory_worker_pool"):
             pool_cls = getattr(agent_module, "BackgroundMemoryWorkerPool", None)
-            if pool_cls is not None and components.get("client") is not None:
+            if pool_cls is not None:
                 consolidation_cfg = (
                     components.get("cfg", {}).get("context", {}).get("consolidation", {})
                 )
                 memory_pool = pool_cls(
-                    components["client"],
-                    client_factory=lambda: agent_module.ModelClientFactory.from_config(
-                        components.get("cfg", self._cfg), announce=False
-                    )[0],
                     poll_seconds=float(consolidation_cfg.get("poll_seconds", 1.0) or 1.0),
                 )
                 components["memory_worker_pool"] = memory_pool
@@ -326,8 +301,15 @@ class ChannelRunner:
                 .get("consolidation", {})
                 .get("flush_on_session_end", False)
             )
+            agent = components.get("agent")
+            flush_model = (
+                agent.consolidation_model(components.get("cfg") or {})
+                if flush_on_end and agent is not None
+                else ""
+            )
+            flush_endpoint = agent.endpoint_for(flush_model) if flush_model else None
             for session in sessions.values():
-                if not flush_on_end:
+                if flush_endpoint is None:
                     continue
                 manager = session.context_manager
                 should_flush = getattr(manager, "should_session_end_sleep", None)
@@ -351,11 +333,7 @@ class ChannelRunner:
                     async with asyncio.timeout(flush_timeout):
                         enqueue("session_end")
                         while pending():
-                            processed = await process(
-                                components["client"],
-                                components["model"],
-                                api_format=components["agent"].api_format,
-                            )
+                            processed = await process(flush_endpoint, flush_model)
                             if not processed:
                                 break
                 except TimeoutError:

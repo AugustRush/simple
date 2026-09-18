@@ -116,6 +116,28 @@ class _CleanSkillCatalog:
 _CLEAN_SKILL_CATALOG = _CleanSkillCatalog()
 
 
+class _ModelResolvingAgent:
+    """The model lookups the interactive loop asks an agent for.
+
+    The loop builds its background memory worker *through* the agent
+    (`consolidation_model` / `endpoint_for`), because a consolidation model
+    may belong to a group other than the active one.  A double that stubs
+    only the turn loop therefore has to answer those two as well.
+    """
+
+    api_format = "openai"
+    max_tokens = 1024
+    model = "fake-model"
+
+    def consolidation_model(self, cfg):
+        consolidation = (cfg.get("context") or {}).get("consolidation") or {}
+        return str(consolidation.get("model") or self.model)
+
+    def endpoint_for(self, model=None):
+        import agent as agent_module
+
+        return agent_module.ModelEndpoint(self, self.api_format)
+
 
 def test_runtime_publishes_and_clears_user_id_per_turn():
     import agent.runtime.contracts as contracts
@@ -6865,7 +6887,7 @@ def test_memory_tidy_uses_force_tidy(monkeypatch):
         def force_tidy(self):
             calls["force_tidy"] += 1
 
-        async def tidy(self, client, model):
+        async def tidy(self):
             calls["tidy"] += 1
 
     async def fake_build_components_async(cfg):
@@ -7786,10 +7808,7 @@ def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
 ):
     import agent as agent_module
 
-    class _FakeAgent:
-        api_format = "openai"
-        max_tokens = 1024
-        model = "fake-model"
+    class _FakeAgent(_ModelResolvingAgent):
 
         async def send_message(self, ctx, user_message, stream_callback=None):
             return agent_module.AgentResult(agent_id="agent", content="explained only")
@@ -8184,10 +8203,8 @@ def test_interactive_loop_rejects_unknown_slash_before_agent_core(monkeypatch, t
     import agent as agent_module
     from agent.runtime import TurnExecution, TurnResult
 
-    class _FakeAgent:
-        api_format = "openai"
-        max_tokens = 1024
-        model = "fake-model"
+    class _FakeAgent(_ModelResolvingAgent):
+        """Only its attributes are needed: an unknown slash never reaches it."""
 
     class _FakeMemory:
         def read_index(self):
@@ -8884,10 +8901,7 @@ def test_interactive_loop_context_command_uses_dynamic_category_stats(
 ):
     import agent as agent_module
 
-    class _FakeAgent:
-        api_format = "openai"
-        max_tokens = 1024
-        model = "fake-model"
+    class _FakeAgent(_ModelResolvingAgent):
 
         async def send_message(self, ctx, user_message, stream_callback=None):
             return agent_module.AgentResult(agent_id="agent", content="unused")
@@ -8985,10 +8999,7 @@ def test_interactive_loop_context_command_uses_dynamic_category_stats(
 def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp_path):
     import agent as agent_module
 
-    class _FakeAgent:
-        api_format = "openai"
-        max_tokens = 1024
-        model = "fake-model"
+    class _FakeAgent(_ModelResolvingAgent):
 
         def __init__(self):
             self.ctx = None
@@ -9127,10 +9138,7 @@ def test_interactive_loop_queues_orphan_recovery_in_background(monkeypatch, tmp_
         encoding="utf-8",
     )
 
-    class _FakeAgent:
-        api_format = "openai"
-        max_tokens = 1024
-        model = "fake-model"
+    class _FakeAgent(_ModelResolvingAgent):
 
         async def send_message(self, ctx, user_message, stream_callback=None):
             return agent_module.AgentResult(agent_id="agent", content="unused")

@@ -5,13 +5,16 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import agent as agent_module
 from agent.config import _now
 from agent.memory.system import MemoryPalace
 from agent import shared
 from agent.tools.runtime import ToolRegistry
+
+if TYPE_CHECKING:
+    from agent.core.transport import ModelEndpoint
 
 DEFAULT_SYSTEM_PROMPT = agent_module.DEFAULT_SYSTEM_PROMPT
 
@@ -141,28 +144,30 @@ class EvolutionEngine:
 
     def __init__(
         self,
-        client: Any,
+        endpoint: "ModelEndpoint",
         model: str,
         memory: MemoryPalace,
-        api_format: str = "anthropic",
     ):
-        self.client = client
+        self.endpoint = endpoint
         self.model = model
         self.memory = memory
-        self.api_format = api_format
         shared.RL_DIR.mkdir(parents=True, exist_ok=True)
         shared.PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
 
     async def generate_text(self, prompt: str, max_tokens: int) -> str:
-        """Generate text via the configured LLM provider (public API for plugins)."""
-        if self.api_format == "anthropic":
-            response = await self.client.messages.create(
+        """Generate text via the configured LLM provider (public API for plugins).
+
+        The endpoint carries the client and the wire format together, so a
+        model named here cannot be posted to a client that does not serve it.
+        """
+        if self.endpoint.api_format == "anthropic":
+            response = await self.endpoint.client.messages.create(
                 model=self.model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
             return response.content[0].text
-        response = await self.client.chat.completions.create(
+        response = await self.endpoint.client.chat.completions.create(
             model=self.model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],

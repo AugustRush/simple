@@ -1687,7 +1687,13 @@ class WebChannel(Channel):
                 answered("permission_profile", "inherit") or "inherit"
             ),
             context_policy=str(answered("context_policy", "stateless") or "stateless"),
-            model_override=answered("model_override", None) or None,
+            # Validated exactly like a task's: a step is a task, and an id no
+            # provider group owns can only reach the wrong endpoint at run
+            # time -- where nothing re-checks it.  Accepting it here would put
+            # the failure a scheduled run away from the request that caused it.
+            model_override=self._resolve_model_override(
+                answered("model_override", None)
+            ),
             timeout_seconds=int(answered("timeout_seconds", 1800) or 1800),
             selected_skills=[
                 str(item).strip()

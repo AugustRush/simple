@@ -619,6 +619,13 @@ async def _build_components_async(
     # routing transport, so per-session rebuilds do not leak one connection
     # pool per session per provider.
     provider_client_cache: dict = {}
+    routing_transport = build_routing_transport(
+        cfg,
+        api_format,
+        client,
+        client_factory=_provider_client_factory,
+        client_cache=provider_client_cache,
+    )
     agent = BaseAgent(
         client,
         registry,
@@ -627,13 +634,7 @@ async def _build_components_async(
         api_format=api_format,
         supports_vision=supports_vision,
         context_window=context_window,
-        transport=build_routing_transport(
-            cfg,
-            api_format,
-            client,
-            client_factory=_provider_client_factory,
-            client_cache=provider_client_cache,
-        ),
+        transport=routing_transport,
     )
     agent.max_parallel_agents = max(
         1,
@@ -729,7 +730,7 @@ async def _build_components_async(
     # The evolution plugin (and the `evolve` CLI command) both check for None.
     evo_cfg = cfg.get("evolution", {})
     evolution: Optional[EvolutionEngine] = (
-        EvolutionEngine(client, model, memory, api_format=api_format)
+        EvolutionEngine(routing_transport.endpoint_for(model), model, memory)
         if evo_cfg.get("enabled", True)
         else None
     )
