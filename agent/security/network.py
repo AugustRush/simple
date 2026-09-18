@@ -161,11 +161,23 @@ def resolve_public_endpoint(
     if not answers:
         raise UnsafeNetworkTarget("network target resolved to no addresses")
 
-    addresses = {
-        _canonical_public_address(str(answer[4][0]))
-        for answer in answers
-        if len(answer) >= 5 and answer[4]
-    }
+    addresses: set[str] = set()
+    for answer in answers:
+        if len(answer) < 5 or not answer[4]:
+            continue
+        try:
+            addresses.add(_canonical_public_address(str(answer[4][0])))
+        except UnsafeNetworkTarget as exc:
+            # Name the host and the likely cause.  "not globally routable:
+            # 198.18.0.22" on its own reads as a broken network when it is
+            # usually a fake-IP resolver, which is a config problem with a
+            # one-line fix — worth saying in the message that reports it.
+            raise UnsafeNetworkTarget(
+                f"{exc} (resolved from '{endpoint.hostname}'; a resolver that "
+                "answers every name with a reserved address, such as Clash's "
+                "'enhanced-mode: fake-ip', cannot serve direct fetches — set "
+                "'web_proxy' in config.json or switch the resolver to redir-host)"
+            ) from exc
     if not addresses:
         raise UnsafeNetworkTarget("network target resolved to no usable addresses")
     ordered = tuple(

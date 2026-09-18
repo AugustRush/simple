@@ -45,6 +45,27 @@ def test_resolve_public_endpoint_rejects_mixed_dns_answers():
         resolve_public_endpoint("https://example.com/", resolver=resolver)
 
 
+def test_a_fake_ip_resolver_failure_names_the_cause_and_the_fix():
+    """The message that used to cost a debugging session.
+
+    "not globally routable: 198.18.0.22" on its own reads as a broken network.
+    It is usually Clash's `enhanced-mode: fake-ip` — a config problem with a
+    one-line fix — so the message has to say which host, the likely cause, and
+    what to change.
+    """
+    from agent.security.network import UnsafeNetworkTarget, resolve_public_endpoint
+
+    with pytest.raises(UnsafeNetworkTarget) as caught:
+        resolve_public_endpoint(
+            "https://example.com/", resolver=_resolver_for("198.18.0.22")
+        )
+    message = str(caught.value)
+    assert "198.18.0.22" in message, "the offending address"
+    assert "example.com" in message, "which host it came from"
+    assert "fake-ip" in message, "the likely cause"
+    assert "web_proxy" in message, "the fix"
+
+
 @pytest.mark.parametrize(
     "url",
     ["", "example.com", "file:///etc/passwd", "ftp://example.com/a", "http:///missing"],
