@@ -378,6 +378,57 @@ def _workflow_payload(
     }
 
 
+def _attention_payload(store: Any) -> dict[str, Any]:
+    """The number on the badge and the list behind it, from one query.
+
+    Sent together because they are the same fact at two sizes, and two facts
+    is what a badge that disagrees with its own page is.  ``attention_runs``
+    carries where each run came from -- the task, and the workflow and step
+    when it has one -- because a failure that belongs to a step of a deleted
+    workflow is otherwise a row with no home, which is how a count becomes
+    impossible to find.
+
+    The reason a run is asking is left to the client's own wording: the
+    sentence already exists there next to the status labels it quotes, and a
+    second copy here would be the thing that starts saying something else.
+    """
+    tasks = {task.id: task for task in store.list_tasks()}
+    workflows = {workflow.id: workflow for workflow in store.list_workflows()}
+    runs = store.unacknowledged_attention_runs()
+    items = []
+    for run in runs:
+        task = tasks.get(run.task_id)
+        workflow_id = str(getattr(task, "workflow_id", "") or "")
+        workflow = workflows.get(workflow_id)
+        items.append(
+            {
+                "run_id": run.id,
+                "task_id": run.task_id,
+                "task_name": getattr(task, "name", "") or run.task_id,
+                "workflow_id": workflow_id,
+                "workflow_name": workflow.name if workflow is not None else "",
+                # A step whose workflow is gone is not a step of nothing: it is
+                # a step of something nobody can open, and the list has to be
+                # able to say so rather than show a blank.
+                "workflow_deleted": bool(workflow_id) and workflow is None,
+                "step_key": str(getattr(task, "step_key", "") or ""),
+                "status": run.status,
+                "missed_count": int(getattr(run, "missed_count", 0) or 0),
+                "error": str(getattr(run, "error", "") or ""),
+                "started_at": (
+                    run.started_at.isoformat() if run.started_at else None
+                ),
+                "finished_at": (
+                    run.finished_at.isoformat() if run.finished_at else None
+                ),
+            }
+        )
+    return {
+        "unseen_attention": sum(store.unacknowledged_attention_counts().values()),
+        "attention_runs": items,
+    }
+
+
 def _scheduler_output_path(task_id: str, run: Any) -> Path | None:
     raw = str(getattr(run, "output_path", "") or "").strip()
     if not raw:
@@ -1931,8 +1982,10 @@ class WebChannel(Channel):
                     # Failures that finished while nobody was watching.  The
                     # scheduler runs precisely when no client is connected, so
                     # this has to be part of the data rather than a push event
-                    # that only reaches whoever happened to be looking.
-                    "unseen_attention": sum(unseen.values()),
+                    # that only reaches whoever happened to be looking.  The
+                    # runs come along so the page can point at them: a count
+                    # with nothing to click is the question this answers.
+                    **_attention_payload(store),
                 }
             )
         finally:
@@ -2415,21 +2468,26 @@ class WebChannel(Channel):
                 {
                     "ok": True,
                     "acknowledged": acknowledged,
-                    "unseen_attention": sum(
-                        store.unacknowledged_attention_counts().values()
-                    ),
+                    # Same payload as the poll, so the page that just cleared
+                    # one run shows the same list it would have fetched.
+                    **_attention_payload(store),
                 }
             )
         finally:
             store.close()
 
     async def _schedule_attention(self, request: Any) -> Any:
-        """Just the count, for a badge that is polled from every view.
+        """The count for a badge polled from every view, and the runs behind it.
 
         Separate from ``GET /api/schedules`` because the indicator has to work
         for someone who never opens the schedules page -- making them load
         every task and run just to find out whether anything failed would be
         the opposite of a notification.
+
+        The runs ride along rather than arriving on a second request, because
+        the two numbers that used to disagree were a count from here and a
+        list assembled somewhere else.  One payload cannot disagree with
+        itself, and at this poll rate the extra rows cost nothing.
         """
         from starlette.responses import JSONResponse
 
@@ -2439,13 +2497,7 @@ class WebChannel(Channel):
 
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
-            return JSONResponse(
-                {
-                    "unseen_attention": sum(
-                        store.unacknowledged_attention_counts().values()
-                    )
-                }
-            )
+            return JSONResponse(_attention_payload(store))
         finally:
             store.close()
 
@@ -2471,9 +2523,7 @@ class WebChannel(Channel):
                 {
                     "ok": True,
                     "cleared": cleared,
-                    "unseen_attention": sum(
-                        store.unacknowledged_attention_counts().values()
-                    ),
+                    **_attention_payload(store),
                 }
             )
         finally:

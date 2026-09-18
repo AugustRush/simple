@@ -423,6 +423,34 @@ interface ScheduleRun {
   config_snapshot?: Record<string, any>
 }
 
+/**
+ * One run that finished badly while nobody was looking.
+ *
+ * The badge on the navigation says a number; this is the row behind it. They
+ * are sent in the same payload for exactly that reason -- a count that has to
+ * be reconciled against a list fetched from somewhere else is a count nobody
+ * can check, which was the complaint.
+ *
+ * Only what a row needs to be recognised and reopened is carried. The task
+ * name and, when the run belongs to a step, the workflow and step are here
+ * because "which task" is the whole question: a failure whose workflow was
+ * deleted is otherwise a row belonging to nothing.
+ */
+interface AttentionRun {
+  run_id: string
+  task_id: string
+  task_name: string
+  workflow_id: string
+  workflow_name: string
+  workflow_deleted: boolean
+  step_key: string
+  status: string
+  missed_count: number
+  error: string
+  started_at?: string | null
+  finished_at?: string | null
+}
+
 interface SchedulerHealth {
   status: 'online' | 'offline' | string
   last_heartbeat?: string
@@ -1986,7 +2014,7 @@ function scheduleRunStatusIcon(status?: string) {
  * about it would be false -- and the point of the marker is that a person can
  * tell what happened without opening anything.
  */
-function scheduleRunAttentionReason(run: ScheduleRun): string {
+function scheduleRunAttentionReason(run: { status?: string; missed_count?: number }): string {
   const reasons: string[] = []
   const missed = run.missed_count || 0
   if (missed > 0) reasons.push(`本次运行前有 ${missed} 次计划未能执行`)
@@ -2287,6 +2315,11 @@ function App() {
   const [feishuTesting, setFeishuTesting] = useState(false)
   const [pickingDirectory, setPickingDirectory] = useState(false)
   const [unseenFailures, setUnseenFailures] = useState(0)
+  // The runs behind `unseenFailures`, from the same response. Kept as a pair
+  // because the badge and its list used to come from different places, which
+  // is how a number ended up on the navigation with nothing on the page that
+  // added up to it.
+  const [attentionRuns, setAttentionRuns] = useState<AttentionRun[]>([])
   const [permissionProfiles, setPermissionProfiles] = useState<PermissionProfileOption[]>([])
   const [scheduleQuery, setScheduleQuery] = useState('')
   const [scheduleStatusFilter, setScheduleStatusFilter] = useState('all')
@@ -2325,7 +2358,7 @@ function App() {
    * will refuse.  An empty list is only evidence once it is loaded evidence.
    */
   const [workflowsLoaded, setWorkflowsLoaded] = useState(false)
-  const [automationTab, setAutomationTab] = useState<'tasks' | 'workflows'>('tasks')
+  const [automationTab, setAutomationTab] = useState<'tasks' | 'workflows' | 'attention'>('tasks')
   const [workflowModalOpen, setWorkflowModalOpen] = useState(false)
   const [workflowSaving, setWorkflowSaving] = useState(false)
   const [workflowDraft, setWorkflowDraft] = useState<WorkflowDraft>(defaultWorkflowDraft)
@@ -3684,12 +3717,29 @@ function App() {
     }
   }, [api])
 
+  /**
+   * The one writer for the badge and the list behind it.
+   *
+   * Both come off the same response, which is the whole point: the count and
+   * the rows are read from one payload, so they cannot disagree. Every other
+   * place that used to set the count from its own response now refreshes
+   * through here instead -- two writers to one number is how it drifted.
+   */
+  const applyAttention = useCallback((data: any) => {
+    setUnseenFailures(Number(data?.unseen_attention || 0))
+    setAttentionRuns(
+      Array.isArray(data?.attention_runs)
+        ? (data.attention_runs as AttentionRun[])
+        : [],
+    )
+  }, [])
+
   const applySchedules = useCallback((data: any) => {
     setSchedules(data.tasks || [])
     setPermissionProfiles(
       Array.isArray(data.permission_profiles) ? data.permission_profiles : [],
     )
-    setUnseenFailures(Number(data.unseen_attention || 0))
+    applyAttention(data)
     setSelectedSchedule(current => {
       if (!current) return current
       const refreshed = (data.tasks || []).find(
@@ -3697,7 +3747,7 @@ function App() {
       )
       return refreshed || current
     })
-  }, [])
+  }, [applyAttention])
 
   // `silent` means "this refresh was not asked for": the caller is the timer,
   // so there is no spinner to show and no toast worth raising. It is also the
@@ -3843,12 +3893,12 @@ function App() {
     try {
       const resp = await api('/api/schedules/attention')
       const data = await resp.json()
-      setUnseenFailures(Number(data.unseen_attention || 0))
+      applyAttention(data)
     } catch {
       // A transport failure is not "no failures"; leave the last known count
       // alone rather than clearing a badge the user has not acted on.
     }
-  }, [api])
+  }, [api, applyAttention])
 
   /**
    * The step being edited, when the task editor was opened on one.
@@ -3961,7 +4011,11 @@ function App() {
   }, [apiHeaders, scheduleDraft, scheduleModalOpen, editingStep?.followsUpstreams])
 
   const loadScheduleRuns = useCallback(
-    async (taskId: string, selectLatest = false, silent = false) => {
+    // `focusRunId` is for opening a task on the run somebody was actually
+    // pointed at. Picking the newest instead would land them on a later,
+    // healthy run and the thing they came to see would be one click away in a
+    // list they now have to search.
+    async (taskId: string, selectLatest = false, silent = false, focusRunId?: string) => {
       const path = `/api/schedules/${encodeURIComponent(taskId)}/runs?limit=50`
       try {
         if (!silent) setScheduleRunsLoading(true)
@@ -3982,6 +4036,7 @@ function App() {
           ? { ...current, ...(data.task || {}) }
           : current)
         setSelectedScheduleRunId(current => {
+          if (focusRunId && runs.some(run => run.id === focusRunId)) return focusRunId
           if (selectLatest) return runs[0]?.id || null
           return current && runs.some(run => run.id === current)
             ? current
@@ -3996,13 +4051,13 @@ function App() {
     [api, refreshJson],
   )
 
-  const openScheduleDetails = useCallback((task: ScheduleInfo) => {
+  const openScheduleDetails = useCallback((task: ScheduleInfo, runId?: string) => {
     setSelectedSchedule(task)
     setScheduleDetailOpen(true)
     setScheduleRuns([])
-    setSelectedScheduleRunId(null)
+    setSelectedScheduleRunId(runId || null)
     setScheduleRunOutput(null)
-    void loadScheduleRuns(task.id, true)
+    void loadScheduleRuns(task.id, true, false, runId)
   }, [loadScheduleRuns])
 
   const selectedScheduleRun = useMemo(
@@ -4058,6 +4113,23 @@ function App() {
     () => workflows.reduce((sum, item) => sum + (item.unseen_attention || 0), 0),
     [workflows],
   )
+
+  /**
+   * Which run to open for a task that has something waiting.
+   *
+   * The count shown on a card is the task's own `unseen_attention` -- that is
+   * the number the task carries, and it stays right even when the list behind
+   * the badge is long enough to be capped. This map only answers "and which
+   * one", which the count cannot.
+   */
+  const attentionByTask = useMemo(() => {
+    const map = new Map<string, string>()
+    // Newest first, so the first run seen for a task is the one to open.
+    for (const run of attentionRuns) {
+      if (!map.has(run.task_id)) map.set(run.task_id, run.run_id)
+    }
+    return map
+  }, [attentionRuns])
 
   const permissionProfileOptions = useMemo(
     () => (permissionProfiles.length > 0 ? permissionProfiles : KNOWN_PERMISSION_PROFILES),
@@ -5086,25 +5158,29 @@ function App() {
   // Marking a failure as seen is what removes the badge, so it is applied to
   // local state right away: waiting for a refetch would leave the dot sitting
   // there after the click and the control would read as broken.
-  const acknowledgeScheduleRun = async (task: ScheduleInfo, run: ScheduleRun) => {
+  // Keyed by ids rather than by the objects, so a run can be acknowledged
+  // from a list that only knows where it came from -- the attention list holds
+  // ids, and asking it to first find the whole task definition would put a
+  // dependency between "clear this" and "the tasks are loaded".
+  const acknowledgeScheduleRun = async (taskId: string, runId: string) => {
     try {
       const resp = await api(
-        `/api/schedules/${encodeURIComponent(task.id)}/runs/${encodeURIComponent(run.id)}/acknowledge`,
+        `/api/schedules/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(runId)}/acknowledge`,
         { method: 'POST' },
       )
       const data = await resp.json()
       const consumed = data.acknowledged ? 1 : 0
-      setScheduleRuns(prev => prev.map(item => item.id === run.id
+      setScheduleRuns(prev => prev.map(item => item.id === runId
         ? { ...item, needs_attention: false, acknowledged_at: new Date().toISOString() }
         : item))
       const dropOne = (count?: number) => Math.max(0, (count || 0) - consumed)
-      setSchedules(prev => prev.map(item => item.id === task.id
+      setSchedules(prev => prev.map(item => item.id === taskId
         ? { ...item, unseen_attention: dropOne(item.unseen_attention) }
         : item))
-      setSelectedSchedule(current => current && current.id === task.id
+      setSelectedSchedule(current => current && current.id === taskId
         ? { ...current, unseen_attention: dropOne(current.unseen_attention) }
         : current)
-      setUnseenFailures(Number(data.unseen_attention || 0))
+      applyAttention(data)
     } catch { /* surfaced */ }
   }
 
@@ -5129,7 +5205,7 @@ function App() {
       setSelectedSchedule(current => current && zeroed(current)
         ? { ...current, unseen_attention: 0 }
         : current)
-      setUnseenFailures(Number(data.unseen_attention || 0))
+      applyAttention(data)
       if (data.cleared) messageApi.success(`已将 ${data.cleared} 次失败标记为已读`)
     } catch { /* surfaced */ }
   }
@@ -5313,6 +5389,19 @@ function App() {
     })
   }
 
+  /**
+   * Go straight to the runs that are waiting to be looked at.
+   *
+   * `navigateTo` alone is not enough: it returns early when the view is
+   * already the schedules page, which is exactly when the badge is most
+   * likely to be pressed -- someone is on the page and still cannot find what
+   * the number is talking about.
+   */
+  const openAttention = () => {
+    navigateTo('schedules')
+    setAutomationTab('attention')
+  }
+
   const filteredSessions = useMemo(() => {
     const query = sessionSearch.trim().toLowerCase()
     const filtered = sessions.filter(
@@ -5476,14 +5565,28 @@ function App() {
       icon: <ClockCircleOutlined />,
       // The badge lives on the navigation entry, not on the schedules page,
       // because the entire problem is a failure that finished while the page
-      // was closed.
+      // was closed -- and it is a button rather than a chip, because a number
+      // that says "two things need you" and then drops you on an unfiltered
+      // list of forty tasks has told you nothing you can act on. Pressing it
+      // opens the runs themselves.
       label: (
         <span className="nav-label">
           自动化
           {unseenFailures > 0 && (
-            <span className="nav-badge" aria-label={`${unseenFailures} 次运行失败未查看`}>
+            <button
+              type="button"
+              className="nav-badge"
+              aria-label={`${unseenFailures} 次运行需要查看，打开待处理列表`}
+              title={`${unseenFailures} 次运行需要查看`}
+              onClick={event => {
+                // The menu entry behind it would otherwise also fire and
+                // settle the tab back to whatever it was.
+                event.stopPropagation()
+                openAttention()
+              }}
+            >
               {unseenFailures > 99 ? '99+' : unseenFailures}
-            </span>
+            </button>
           )}
         </span>
       ),
@@ -7425,6 +7528,81 @@ function App() {
     </>
   )
 
+  /**
+   * The list the badge on the navigation is counting.
+   *
+   * Every row names the task, where the task came from, why the run is asking
+   * and what it said when it ended -- because a row that only says "failed"
+   * sends the person to the same hunt the badge did. "查看运行" opens the task's
+   * history already on that run, not on the newest one: the newest one is
+   * usually fine, which is the second half of why the run was hard to find.
+   */
+  const renderAttention = () => {
+    const rows = attentionRuns.map(run => {
+      const task = schedules.find(item => item.id === run.task_id)
+      const origin = run.workflow_name
+        ? `流程「${run.workflow_name}」${run.step_key ? ` · 步骤 ${run.step_key}` : ''}`
+        : run.workflow_deleted
+          // A step whose workflow is gone still has to be locatable, or the
+          // count that includes it is a count with a hole in it.
+          ? `原属的流程已删除${run.step_key ? ` · 步骤 ${run.step_key}` : ''}`
+          : '独立任务'
+      const when = run.finished_at || run.started_at
+      return (
+        <div className="schedule-attention-row" key={run.run_id}>
+          <span className={`schedule-run-status-icon status-${run.status}`}>
+            {scheduleRunStatusIcon(run.status)}
+          </span>
+          <div className="schedule-attention-main">
+            <strong>{run.task_name}</strong>
+            <span className="schedule-attention-origin">{origin}</span>
+            <span className="schedule-attention-reason">
+              {scheduleRunAttentionReason(run)}
+            </span>
+            {run.error && (
+              // Truncated by CSS rather than here: the message is the answer to
+              // "why", and cutting it in JS would hide the end of a long one.
+              <span className="schedule-attention-error">{run.error}</span>
+            )}
+          </div>
+          <span className="schedule-attention-time">
+            {when ? describeElapsed(when, clock) : ''}
+          </span>
+          <Space>
+            <Button
+              size="small"
+              icon={<FileTextOutlined />}
+              disabled={!task}
+              title={task ? undefined : '任务已被删除，只剩运行记录'}
+              onClick={() => task && openScheduleDetails(task, run.run_id)}
+            >
+              查看运行
+            </Button>
+            <Button
+              size="small"
+              icon={<CheckOutlined />}
+              onClick={() => acknowledgeScheduleRun(run.task_id, run.run_id)}
+            >
+              标记已读
+            </Button>
+          </Space>
+        </div>
+      )
+    })
+    return (
+      <div className="schedule-attention-list" aria-label="需要查看的运行">
+        {attentionRuns.length === 0 ? (
+          <Empty
+            description="没有需要查看的运行"
+            className="page-empty"
+          />
+        ) : (
+          rows
+        )}
+      </div>
+    )
+  }
+
   const renderSchedules = () => (
     <div className="page-view schedules-view">
       <div className="page-head schedule-page-head">
@@ -7449,7 +7627,9 @@ function App() {
           <p>
             {automationTab === 'tasks'
               ? '让 Agent 在指定时间执行，或等某个信号发生后接着执行。'
-              : '把几个任务串成一条链：上一步完成后，下一步才运行。'}
+              : automationTab === 'workflows'
+                ? '把几个任务串成一条链：上一步完成后，下一步才运行。'
+                : '这些运行结束得不好，或者中间有该跑却没跑成的次数，还没有人看过。'}
           </p>
         </div>
         <Space>
@@ -7463,12 +7643,45 @@ function App() {
               }}
             />
           </Tooltip>
-          {automationTab === 'tasks'
-            ? <Button type="primary" icon={<PlusOutlined />} onClick={openCreateSchedule}>新建任务</Button>
-            : <Button type="primary" icon={<PlusOutlined />} onClick={openCreateWorkflow}>新建流程</Button>}
+          {automationTab === 'tasks' && (
+            <Button type="primary" icon={<PlusOutlined />} onClick={openCreateSchedule}>新建任务</Button>
+          )}
+          {automationTab === 'workflows' && (
+            <Button type="primary" icon={<PlusOutlined />} onClick={openCreateWorkflow}>新建流程</Button>
+          )}
+          {/* Nothing to create from the attention list: it is a list of things
+              that already happened, and a "new" button here would suggest that
+              making another one is how you deal with these. */}
+          {automationTab === 'attention' && unseenFailures > 0 && (
+            <Tooltip title="把这些运行都标记为已查看">
+              <Button icon={<CheckOutlined />} onClick={() => clearScheduleAttention()}>
+                全部标记已读
+              </Button>
+            </Tooltip>
+          )}
         </Space>
       </div>
       <div className="schedule-tabs" role="tablist" aria-label="自动化视图">
+        {/* First, because the number on the navigation points here. Ordering it
+            after the two lists is what made the badge a dead end: the page it
+            opened on showed forty tasks for a count of two, and finding which
+            two meant opening them one at a time. */}
+        <button
+          type="button"
+          role="tab"
+          aria-selected={automationTab === 'attention'}
+          className={automationTab === 'attention' ? 'active' : ''}
+          onClick={() => setAutomationTab('attention')}
+        >
+          待处理
+          {unseenFailures > 0 && (
+            // The number the navigation badge is showing. Same payload, same
+            // total -- the two are meant to be read as one figure.
+            <span className="schedule-tab-badge" title={`${unseenFailures} 次运行需要查看`}>
+              {unseenFailures > 99 ? '99+' : unseenFailures}
+            </span>
+          )}
+        </button>
         <button
           type="button"
           role="tab"
@@ -7486,11 +7699,28 @@ function App() {
           onClick={() => setAutomationTab('workflows')}
         >
           流程
-          {workflowAttention > 0 && <span className="schedule-tab-badge">{workflowAttention}</span>}
+          {workflowAttention > 0 && (
+            // Scoped to this tab: attention belonging to a step of a workflow.
+            // A standalone task's failure is deliberately not counted here, and
+            // saying so is what keeps this from reading as a discrepancy
+            // against the 待处理 total.
+            <span className="schedule-tab-badge" title={`流程里有 ${workflowAttention} 次运行需要查看`}>
+              {workflowAttention}
+            </span>
+          )}
         </button>
       </div>
       <div className="schedule-toolbar">
-        {automationTab === 'tasks' ? (
+        {automationTab === 'attention' ? (
+          /* No search box: the list is the answer, not the place you go to
+             look for one, and filtering it would let a run be hidden from the
+             very count that is on the tab. */
+          <span className="schedule-attention-count">
+            {unseenFailures > 0
+              ? `${unseenFailures} 次运行需要查看`
+              : '没有需要查看的运行'}
+          </span>
+        ) : automationTab === 'tasks' ? (
           <Input
             allowClear
             prefix={<SearchOutlined />}
@@ -8231,7 +8461,7 @@ function App() {
                             size="small"
                             icon={<CheckOutlined />}
                             title={scheduleRunAttentionReason(selectedScheduleRun)}
-                            onClick={() => acknowledgeScheduleRun(selectedSchedule, selectedScheduleRun)}
+                            onClick={() => acknowledgeScheduleRun(selectedSchedule.id, selectedScheduleRun.id)}
                           >标记已读</Button>
                         )}
                         {selectedScheduleRun.status === 'running' && (
@@ -8347,7 +8577,7 @@ function App() {
           </div>
         )}
       </Drawer>
-      {automationTab === 'workflows' ? renderWorkflows() : (
+      {automationTab === 'attention' ? renderAttention() : automationTab === 'workflows' ? renderWorkflows() : (
       loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={schedules.length ? '没有符合条件的任务' : '暂无自动化任务'} className="page-empty" /> : (
         <div className="schedule-list">
           {filteredSchedules.map(task => {
@@ -8400,6 +8630,23 @@ function App() {
                       <strong>{task.name}</strong>
                       <span>{task.kind === 'agent_prompt' ? 'Agent 任务' : task.kind === 'message' ? '定时提醒' : '系统任务'}</span>
                     </div>
+                    {/* The same number the navigation badge is counting, put
+                        where the task is. Without it the count lived only on
+                        the nav and on nothing it was counting, so the two
+                        could never be checked against each other. */}
+                    {(task.unseen_attention || 0) > 0 && (
+                      <button
+                        type="button"
+                        className="schedule-card-attention"
+                        title={`${task.unseen_attention} 次运行需要查看`}
+                        onClick={event => {
+                          event.stopPropagation()
+                          openScheduleDetails(task, attentionByTask.get(task.id))
+                        }}
+                      >
+                        {task.unseen_attention} 条待查看
+                      </button>
+                    )}
                   </div>
                   <Space onClick={event => event.stopPropagation()}>
                     <Checkbox

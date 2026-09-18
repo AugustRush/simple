@@ -1617,6 +1617,34 @@ class SchedulerStore:
         return {row["task_id"]: int(row["total"]) for row in rows}
 
     @_synchronized
+    def unacknowledged_attention_runs(
+        self, limit: int = 200
+    ) -> list[TaskRun]:
+        """The runs nobody has looked at yet, newest first.
+
+        The list behind :meth:`unacknowledged_attention_counts`, and the two
+        are kept together on purpose: a badge that says a number and a page
+        that then lists a different set of runs is a number the person cannot
+        check, which is worse than no number.  Both read through
+        :meth:`_attention_clause`, so adding a status changes them together.
+
+        Capped because this is what a poll asks for.  The count stays the true
+        total rather than the size of what came back, so a capped list reads as
+        a truncated list instead of quietly lowering the number on the badge.
+        """
+        clause, params = self._attention_clause()
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM scheduled_task_runs
+            WHERE {clause} AND acknowledged_at IS NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            [*params, max(1, int(limit))],
+        ).fetchall()
+        return [self._run_from_row(row) for row in rows]
+
+    @_synchronized
     def acknowledge_run(
         self, task_id: str, run_id: str, now: Optional[datetime] = None
     ) -> bool:

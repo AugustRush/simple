@@ -23,12 +23,15 @@ from uuid import uuid4
 
 import pytest
 
+from agent.channels.web import _attention_payload
 from agent.scheduler import (
     ATTENTION_STATUSES,
     DeliveryTarget,
     NewScheduledTask,
     SchedulerStore,
     TriggerSpec,
+    Workflow,
+    WorkflowStep,
 )
 
 WHEN = datetime(2026, 4, 19, 1, 0, tzinfo=timezone.utc)
@@ -302,3 +305,218 @@ def test_upgrade_still_counts_failures_that_happen_afterwards(tmp_path):
     _run_to_terminal(upgraded, task, "failed")
 
     assert upgraded.unacknowledged_attention_counts() == {task.id: 1}
+
+
+# --- the list behind the count ---------------------------------------------
+#
+# The badge on the navigation used to be a number with nothing behind it: the
+# count walked every task, the workflows tab counted only the steps of
+# workflows that still existed, and the task list showed no count at all. A
+# badge saying two therefore pointed at a page where two could not be found.
+#
+# The fix is one question answered once -- `unacknowledged_attention_runs` is
+# the list, `unacknowledged_attention_counts` is the count, and the endpoint
+# sends them together. What follows pins that they stay the same fact.
+
+
+def test_the_list_agrees_with_the_count_task_by_task(tmp_path):
+    """Two queries over one clause is the arrangement that drifts.
+
+    This is the test that catches it: the badge's number and the rows behind it
+    have to be the same thing, or the number cannot be checked.
+    """
+    store = _store(tmp_path)
+    behind = _new_task(store, name="behind")
+    punctual = _new_task(store, name="punctual")
+
+    _run_to_terminal(store, behind, "failed")
+    _run_to_terminal(store, behind, "interrupted")
+    _run_to_terminal(store, punctual, "failed")
+
+    runs = store.unacknowledged_attention_runs()
+    by_task: dict[str, int] = {}
+    for run in runs:
+        by_task[run.task_id] = by_task.get(run.task_id, 0) + 1
+
+    assert store.unacknowledged_attention_counts() == {behind.id: 2, punctual.id: 1}
+    assert by_task == {behind.id: 2, punctual.id: 1}
+    assert len(runs) == 3
+
+
+def test_a_standalone_task_appears_in_the_list(tmp_path):
+    """The case that was invisible: a task belonging to no workflow.
+
+    Both of the runs waiting in a real database were standalone, and the
+    interface had nowhere to show them -- the workflows tab did not count them
+    and the task list did not mark them.
+    """
+    store = _store(tmp_path)
+    task = _new_task(store)
+    assert task.workflow_id == ""
+
+    run_id = _run_to_terminal(store, task, "failed")
+
+    runs = store.unacknowledged_attention_runs()
+
+    assert [run.id for run in runs] == [run_id]
+    assert runs[0].task_id == task.id
+    assert runs[0].status == "failed"
+    assert runs[0].error == "boom"
+
+
+def test_a_workflow_step_appears_in_the_list_too(tmp_path):
+    """Steps are not excluded: the list is the union, not a view of one tab."""
+    store = _store(tmp_path)
+    workflow = store.create_workflow(
+        Workflow(
+            name="nightly report",
+            steps=[
+                WorkflowStep(
+                    key="collect",
+                    kind="agent_prompt",
+                    name="collect",
+                    payload={"prompt": "collect"},
+                    depends_on=[],
+                    trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+                ),
+                WorkflowStep(
+                    key="analyze",
+                    kind="agent_prompt",
+                    name="analyze",
+                    payload={"prompt": "analyze"},
+                    depends_on=["collect"],
+                ),
+            ],
+        )
+    )
+    collect = store.step_tasks(workflow.id)["collect"]
+
+    claimed = store.claim_due_tasks(WHEN, lease_seconds=30)[0]
+    assert store.complete_run(
+        collect.id, claimed.run.id, finished_at=WHEN, status="failed", error="step blew up"
+    )
+
+    runs = store.unacknowledged_attention_runs()
+
+    assert [run.task_id for run in runs] == [collect.id]
+    assert store.unacknowledged_attention_counts() == {collect.id: 1}
+
+
+def test_newest_first_so_the_first_row_is_the_one_to_open(tmp_path):
+    """The interface opens the first run it finds for a task.
+
+    Were the order oldest first, "查看运行" would land on the stale one and the
+    person would be back to reading a history to find the recent failure.
+    """
+    store = _store(tmp_path)
+    task = _new_task(store)
+
+    older = _run_to_terminal(store, task, "failed", when=WHEN)
+    newer = _run_to_terminal(store, task, "failed", when=WHEN + timedelta(hours=1))
+
+    runs = store.unacknowledged_attention_runs()
+
+    assert [run.id for run in runs] == [newer, older]
+
+
+def test_acknowledging_takes_it_out_of_the_list(tmp_path):
+    store = _store(tmp_path)
+    task = _new_task(store)
+    run_id = _run_to_terminal(store, task, "failed")
+
+    assert len(store.unacknowledged_attention_runs()) == 1
+    assert store.acknowledge_run(task.id, run_id) is True
+    assert store.unacknowledged_attention_runs() == []
+    assert store.unacknowledged_attention_counts() == {}
+
+
+def test_the_cap_truncates_the_list_without_lowering_the_count(tmp_path):
+    """A capped list must not quietly become a smaller number.
+
+    The count is the promise the badge makes; the cap is only about how much
+    one response carries.
+    """
+    store = _store(tmp_path)
+    task = _new_task(store)
+    for _ in range(3):
+        _run_to_terminal(store, task, "failed")
+
+    assert len(store.unacknowledged_attention_runs(limit=2)) == 2
+    assert store.unacknowledged_attention_counts() == {task.id: 3}
+
+
+def test_the_payload_number_is_the_length_of_the_list_it_carries(tmp_path):
+    """One payload, so the badge and the rows cannot come from different places."""
+    store = _store(tmp_path)
+    task = _new_task(store)
+    run_id = _run_to_terminal(store, task, "failed")
+
+    payload = _attention_payload(store)
+
+    assert payload["unseen_attention"] == 1
+    assert len(payload["attention_runs"]) == 1
+    assert payload["attention_runs"][0]["run_id"] == run_id
+    assert payload["attention_runs"][0]["task_id"] == task.id
+
+
+def test_the_payload_names_the_task_so_the_row_can_be_recognised(tmp_path):
+    """A row that says only "failed" sends the reader back to hunting."""
+    store = _store(tmp_path)
+    task = _new_task(store, name="A股模拟盘每日结算")
+    _run_to_terminal(store, task, "failed")
+
+    item = _attention_payload(store)["attention_runs"][0]
+
+    assert item["task_name"] == "A股模拟盘每日结算"
+    assert item["error"] == "boom"
+    assert item["workflow_id"] == ""
+    assert item["workflow_name"] == ""
+    assert item["workflow_deleted"] is False
+
+
+def test_the_payload_says_when_the_workflow_is_gone(tmp_path):
+    """A step of a deleted workflow still has to be locatable.
+
+    Deleting a workflow leaves its steps behind on purpose -- their history is
+    the record that it ran -- and from that moment nothing owns them. A row
+    showing a blank origin would be a count with a hole in it, since the number
+    includes it.
+    """
+    store = _store(tmp_path)
+    workflow = store.create_workflow(
+        Workflow(
+            name="nightly report",
+            steps=[
+                WorkflowStep(
+                    key="collect",
+                    kind="agent_prompt",
+                    name="collect",
+                    payload={"prompt": "collect"},
+                    depends_on=[],
+                    trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+                ),
+            ],
+        )
+    )
+    collect = store.step_tasks(workflow.id)["collect"]
+    claimed = store.claim_due_tasks(WHEN, lease_seconds=30)[0]
+    store.complete_run(collect.id, claimed.run.id, finished_at=WHEN, status="failed")
+
+    store.delete_workflow(workflow.id)
+
+    item = _attention_payload(store)["attention_runs"][0]
+
+    assert item["run_id"] == claimed.run.id
+    assert item["workflow_id"] == workflow.id
+    assert item["workflow_name"] == ""
+    assert item["workflow_deleted"] is True
+
+
+def test_an_empty_payload_is_zero_and_no_rows(tmp_path):
+    store = _store(tmp_path)
+    _new_task(store)
+
+    payload = _attention_payload(store)
+
+    assert payload["unseen_attention"] == 0
+    assert payload["attention_runs"] == []

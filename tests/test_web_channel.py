@@ -1858,8 +1858,12 @@ def test_web_schedule_failure_is_announced_and_can_be_acknowledged(tmp_path, mon
         assert listed.json()["tasks"][0]["unseen_attention"] == 1
 
         # Readable without loading every task, which is what lets the badge be
-        # polled from a view that is not the schedules page.
-        assert client.get("/api/schedules/attention").json() == {"unseen_attention": 1}
+        # polled from a view that is not the schedules page -- and the rows come
+        # with it, because a count with nothing to click on is a count nobody
+        # can check.
+        polled = client.get("/api/schedules/attention").json()
+        assert polled["unseen_attention"] == 1
+        assert [item["run_id"] for item in polled["attention_runs"]] == [run_id]
 
         run = client.get(f"/api/schedules/{task_id}/runs").json()["runs"][0]
         assert run["id"] == run_id
@@ -1868,17 +1872,18 @@ def test_web_schedule_failure_is_announced_and_can_be_acknowledged(tmp_path, mon
 
         acked = client.post(f"/api/schedules/{task_id}/runs/{run_id}/acknowledge")
         assert acked.status_code == 200
-        assert acked.json() == {
-            "ok": True,
-            "acknowledged": True,
-            "unseen_attention": 0,
-        }
+        assert acked.json()["acknowledged"] is True
+        # The list the page is showing is corrected in the same answer, so the
+        # row disappears without a second round trip.
+        assert acked.json()["unseen_attention"] == 0
+        assert acked.json()["attention_runs"] == []
 
         # Clicking again is honest rather than pretending to do work.
         repeat = client.post(f"/api/schedules/{task_id}/runs/{run_id}/acknowledge")
         assert repeat.json()["acknowledged"] is False
 
-        assert client.get("/api/schedules/attention").json() == {"unseen_attention": 0}
+        assert client.get("/api/schedules/attention").json()["unseen_attention"] == 0
+        assert client.get("/api/schedules/attention").json()["attention_runs"] == []
         assert client.get("/api/schedules").json()["unseen_attention"] == 0
         after = client.get(f"/api/schedules/{task_id}/runs").json()["runs"][0]
         assert after["needs_attention"] is False
@@ -1901,14 +1906,32 @@ def test_web_schedule_attention_clears_one_task_or_all(tmp_path, monkeypatch):
     channel = _channel()
     channel.bind_runtime({}, {})
     with TestClient(channel.app) as client:
-        assert client.get("/api/schedules/attention").json() == {"unseen_attention": 2}
+        attention = client.get("/api/schedules/attention").json()
+        assert attention["unseen_attention"] == 2
+        # One row per run, so clearing one task leaves exactly one behind --
+        # the number and the list move together.
+        assert len(attention["attention_runs"]) == 2
 
         scoped = client.post("/api/schedules/attention", json={"task_id": first})
         assert scoped.status_code == 200
-        assert scoped.json() == {"ok": True, "cleared": 1, "unseen_attention": 1}
+        assert scoped.json() == {
+            "ok": True,
+            "cleared": 1,
+            "unseen_attention": 1,
+            "attention_runs": [
+                item
+                for item in attention["attention_runs"]
+                if item["task_id"] != first
+            ],
+        }
 
         everything = client.post("/api/schedules/attention", json={})
-        assert everything.json() == {"ok": True, "cleared": 1, "unseen_attention": 0}
+        assert everything.json() == {
+            "ok": True,
+            "cleared": 1,
+            "unseen_attention": 0,
+            "attention_runs": [],
+        }
 
         # Nothing left to clear, and it says so instead of claiming work.
         assert client.post("/api/schedules/attention").json()["cleared"] == 0
@@ -1998,11 +2021,19 @@ def test_web_reports_a_run_that_succeeded_over_a_skipped_schedule(tmp_path, monk
         # tests/test_scheduler_missed.py.
 
         # The task badge has to agree with the run it is pointing at.
-        assert client.get("/api/schedules").json()["tasks"][0]["unseen_attention"] == 1
+        listed = client.get("/api/schedules").json()
+        assert listed["tasks"][0]["unseen_attention"] == 1
+        # And the row behind the badge has to say why, since the run succeeded
+        # and nothing else on the screen mentions the gap.
+        assert listed["attention_runs"][0]["missed_count"] == 3
+        assert listed["attention_runs"][0]["status"] == "succeeded"
 
         acked = client.post(f"/api/schedules/{task_id}/runs/{run_id}/acknowledge")
         assert acked.json()["acknowledged"] is True
-        assert client.get("/api/schedules/attention").json() == {"unseen_attention": 0}
+        assert client.get("/api/schedules/attention").json() == {
+            "unseen_attention": 0,
+            "attention_runs": [],
+        }
 
 
 def test_web_create_signal_schedule(tmp_path, monkeypatch):

@@ -2840,20 +2840,50 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
   width: 100%;
 }
 
+/* It is a button, not a chip: pressing it opens the runs it is counting. A
+   number that only sits there is the dead end this replaced -- it said how
+   many things needed looking at and then left the finding to the reader. */
 .nav-badge {
   flex: 0 0 auto;
   min-width: 18px;
   height: 18px;
   padding: 0 6px;
+  border: 0;
   border-radius: 999px;
   color: var(--bg);
   background: var(--red);
+  font-family: inherit;
   font-size: 11px;
   font-weight: 600;
   line-height: 18px;
   text-align: center;
   font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: filter .15s ease;
 }
+.nav-badge:hover { filter: brightness(1.12); }
+.nav-badge:active { transform: scale(0.94); transition-duration: 0s; }
+
+/* ---- the badges in the light theme ----
+ *
+ * `color: var(--bg)` on `background: var(--red)` reads fine in the dark theme
+ * (9.43:1) and did not in the light one: #eef0f2 on #a16262 measured 4.14:1,
+ * under the 4.5:1 that 9-11px text needs. White on the same red is 4.73:1,
+ * which still leaves no room, so the badge's own background steps down to
+ * #8f5455 -- 5.89:1 -- and only on this element, because --red is also every
+ * failure border and hover in the file and darkening it there would change
+ * more than the thing being read.
+ *
+ * `.schedule-card-attention` is the same problem in the other direction: its
+ * text is --red on --red-soft, which composites to about 4.0:1 over a card.
+ * #7d4646 clears it at 6.22:1, and 5.35:1 even on the hover fill.
+ */
+html[data-theme='light'] .nav-badge,
+html[data-theme='light'] .schedule-tab-badge {
+  color: #ffffff;
+  background: #8f5455;
+}
+html[data-theme='light'] .schedule-card-attention { color: #7d4646; }
 
 .sider-actions {
   padding: 8px 12px 12px;
@@ -5319,6 +5349,36 @@ html[data-theme='light'] .send-button.ant-btn-primary:disabled {
 .schedule-tabs button:hover { color:var(--text-secondary); }
 .schedule-tabs button.active { color:var(--text); border-bottom-color:var(--primary-border); }
 .schedule-tab-badge { display:inline-grid; place-items:center; min-width:16px; height:16px; margin-left:6px; padding:0 4px; border-radius:999px; color:var(--bg); background:var(--red); font-size:9px; font-weight:700; vertical-align:middle; }
+
+/* ---- attention: the runs the badge is counting ----
+ *
+ * This list exists because the badge said a number and nothing on the page
+ * added up to it. A row therefore carries the answer, not a pointer to one:
+ * the task, where the task came from, why the run is asking, and what the run
+ * said when it ended. Sending someone to the task's history to go looking is
+ * the thing this replaces.
+ */
+.schedule-attention-list { display:grid; gap:8px; }
+.schedule-attention-row { display:flex; align-items:flex-start; gap:10px; min-width:0; padding:11px 13px; border:1px solid var(--border); border-left:2px solid var(--red); border-radius:8px; background:var(--surface); }
+.schedule-attention-row:hover { background:var(--surface-hover); }
+.schedule-attention-main { display:flex; flex:1 1 auto; min-width:0; flex-direction:column; gap:3px; }
+.schedule-attention-main strong { color:var(--text); font-size:12px; }
+/* Origin and reason are what make the row answerable without opening it. Both
+   are 11px, so both stay on --text-secondary: at --text-muted they measured
+   under 4.5:1 once the card's surface is composited under them. */
+.schedule-attention-origin { color:var(--text-secondary); font-size:11px; }
+.schedule-attention-reason { color:var(--text-secondary); font-size:11px; }
+/* The run's own words. Capped by lines rather than characters so a long path
+   or a stack line is cut where the eye can follow, not mid-token. */
+.schedule-attention-error { display:-webkit-box; overflow:hidden; -webkit-box-orient:vertical; -webkit-line-clamp:2; color:var(--text-muted); font-size:11px; line-height:1.6; overflow-wrap:anywhere; }
+.schedule-attention-time { flex:0 0 auto; align-self:center; color:var(--text-muted); font-size:11px; font-variant-numeric:tabular-nums; }
+.schedule-attention-count { color:var(--text-secondary); font-size:11px; }
+
+/* On a card, the same number the nav badge shows -- so the two can be checked
+   against each other, which was impossible while only one of them existed. */
+.schedule-card-attention { flex:0 0 auto; padding:2px 8px; border:0; border-radius:999px; margin-left:8px; color:var(--red); background:var(--red-soft); font-size:10px; font-weight:600; white-space:nowrap; cursor:pointer; transition:background .15s ease, color .15s ease; }
+.schedule-card-attention:hover { background:color-mix(in srgb, var(--red) 22%, transparent); }
+.schedule-card-attention:active { transform:scale(0.97); transition-duration:0s; }
 .schedule-step-origin { display:flex; align-items:center; gap:6px; margin-top:10px; color:var(--text-muted); font-size:10px; }
 .schedule-step-trigger-note { display:flex; align-items:flex-start; gap:8px; padding:11px 13px; border:1px solid var(--border); border-radius:8px; color:var(--text-secondary); background:var(--surface-hover); font-size:11px; line-height:1.6; }
 .schedule-step-trigger-note .anticon { margin-top:2px; color:var(--text-muted); }
