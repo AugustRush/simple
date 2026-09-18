@@ -1331,6 +1331,21 @@ The agent supports four execution modes for sub-agent coordination:
 | **pipeline** | Multiple calls with `depends_on` | Sequential stages with upstream→downstream data flow |
 | **rendezvous** | Multiple calls with `coordination_mode="rendezvous"` | Multi-round debate, cross-validation, consensus building |
 
+The mode is derived from the batch's own `spawn_agent` calls, in this order:
+an explicit `coordination_mode` on the calls wins; otherwise any `depends_on`
+makes it `pipeline`; otherwise more than one call makes it `parallel`; otherwise
+`direct`. The value is read per batch, not per call: as long as one call in the
+batch sets `coordination_mode`, that one value governs every call in it, and
+only a batch whose calls are all blank falls through to the `depends_on` and
+call-count rules. Two values that disagree, or a value outside `parallel` /
+`pipeline` / `rendezvous`, are rejected rather than resolved.
+
+Do not confuse this with the planner's own `mode`, which is a different
+vocabulary of two: `direct` when `spawn_agent` is unavailable, `explicit`
+otherwise. The planner never returns `pipeline` or `rendezvous` — those are
+reached only through the calls above — so a planner `mode` of `explicit` means
+"this turn may orchestrate", not "this turn is a pipeline".
+
 ### How to trigger each mode
 
 ```text
@@ -1347,7 +1362,14 @@ The agent supports four execution modes for sub-agent coordination:
 ### Constraints
 
 - Orchestration only happens within a single assistant turn
-- `depends_on` must reference subtask IDs from the same batch
+- The whole graph is validated before any child starts, and a bad graph fails the
+  turn instead of half-running. `depends_on` must name subtask IDs from the same
+  batch — unknown IDs, self-dependency, duplicate dependencies and cycles are all
+  refused. `parallel` and `rendezvous` batches may not declare `depends_on` at
+  all; `rendezvous` also refuses `early_exit`, because it is a bounded
+  convergence protocol rather than a winner-take-all fan-out
+- `capability_profile: "implementation"` without a `write_scope` is refused —
+  workspace writes are only ever enabled by naming the paths
 - Rendezvous is bounded (default: 2 rounds)
 - Sub-agents inherit the parent context manager but do not recursively receive `spawn_agent`
 - Bounds come from `orchestration`: `max_parallel_agents` (3),
@@ -1377,8 +1399,20 @@ Instructions for the agent when this skill is activated.
 `user-invocable: false` removes the slash command; `disable-model-invocation:
 true` stops the model activating it on its own. The built-in orchestration skill
 is the one bundle that uses both, because it is read as policy rather than
-activated — its `default-mode`, `parallel-keywords`, `pipeline-*-keywords`,
-`rendezvous-keywords` and `max-rendezvous-rounds` are what the planner runs on.
+activated.
+
+What its frontmatter actually does is narrower than the key names suggest, so
+read the three cases apart:
+
+- `max-rendezvous-rounds` is the only key with a hard effect — it caps how many
+  rendezvous rounds a batch may run.
+- `parallel-keywords`, the two `pipeline-*-keywords` lists, `pipeline-keywords`
+  and `rendezvous-keywords` are matched against the request and rendered into
+  one advisory sentence (`Advisory cues for this request: …`) inside the
+  `## Orchestration policy` block. They never choose the mode; they tell the
+  model which shape *may* fit, and the model still has to encode it.
+- `default-mode` is parsed into a field that nothing consults. The line the
+  SKILL.md declares (`default-mode: direct`) has no effect on any run.
 
 ### Discovery order
 
@@ -1399,7 +1433,7 @@ unambiguous.
 
 | Skill | Description |
 |---|---|
-| `multi-agent-orchestration` | **Not an activatable skill.** The orchestration planner reads its frontmatter (`default-mode`, `parallel-keywords`, `max-rendezvous-rounds`, …) as the policy, which is why it is `user-invocable: false` and `disable-model-invocation: true`. Switch it off and planning falls back to plain `direct` |
+| `multi-agent-orchestration` | **Not an activatable skill.** The orchestration planner reads its frontmatter (`parallel-keywords`, `max-rendezvous-rounds`, …) as policy, which is why it is `user-invocable: false` and `disable-model-invocation: true`. Switching it off leaves the planner on its built-in defaults — no advisory cue sentence, rendezvous capped at 2 — and every run still gets the base `## Orchestration policy` block. It does **not** change the mode, which is `explicit` whenever `spawn_agent` is available |
 | `skill-manager` | Create, update, delete, and manage user skill bundles |
 
 Built-in skills ship with the package and cannot be deleted from the
