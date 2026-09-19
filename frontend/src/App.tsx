@@ -2383,6 +2383,11 @@ function App() {
    */
   const [workflowsLoaded, setWorkflowsLoaded] = useState(false)
   const [automationTab, setAutomationTab] = useState<'tasks' | 'workflows' | 'attention'>('tasks')
+  // The merged page keeps two lists behind one navigation entry.  The tab is
+  // remembered across visits for the same reason the search strings are:
+  // someone who toggles a plugin off and comes back later is coming back for
+  // the list they left, not for a default.
+  const [extensionsTab, setExtensionsTab] = useState<'plugins' | 'skills'>('plugins')
   const [workflowModalOpen, setWorkflowModalOpen] = useState(false)
   const [workflowSaving, setWorkflowSaving] = useState(false)
   const [workflowDraft, setWorkflowDraft] = useState<WorkflowDraft>(defaultWorkflowDraft)
@@ -4384,8 +4389,13 @@ function App() {
   }, [loadSettings])
 
   useEffect(() => {
-    if (view === 'plugins') loadPlugins()
-    if (view === 'skills') loadSkills()
+    // Both lists load on entering the merged page: the counts on the tabs and
+    // the page subtitle are about both, and switching tabs is not a data
+    // event -- it is the same visit continuing.
+    if (view === 'extensions') {
+      loadPlugins()
+      loadSkills()
+    }
     if (view === 'schedules') {
       loadSchedules()
       loadWorkflows(true)
@@ -5594,8 +5604,10 @@ function App() {
   const navItems = [
     { key: 'chat', icon: <MessageOutlined />, label: '对话' },
     { key: 'sessions', icon: <FolderOpenOutlined />, label: '会话管理' },
-    { key: 'plugins', icon: <AppstoreOutlined />, label: '插件' },
-    { key: 'skills', icon: <ApiOutlined />, label: '技能' },
+    // One entry for both lists: plugins and skills answer the same question
+    // ("what can the agent do beyond its own tools?") and each list on its
+    // own is too short to justify a navigation slot of its own.
+    { key: 'extensions', icon: <AppstoreOutlined />, label: '扩展' },
     {
       key: 'schedules',
       icon: <ClockCircleOutlined />,
@@ -5627,7 +5639,10 @@ function App() {
         </span>
       ),
     },
-    { key: 'settings', icon: <SettingOutlined />, label: '设置' },
+    // Settings is deliberately absent from the main navigation: it is visited
+    // rarely and briefly, so it lives as a small entry in the sidebar footer
+    // next to the theme switch rather than taking a slot beside the pages
+    // someone visits every day.
   ]
 
   const pageMeta: Record<string, { title: string; subtitle: string }> = {
@@ -5641,13 +5656,12 @@ function App() {
       title: '会话管理',
       subtitle: `${sessions.length} 个会话，${sessions.filter(item => item.live).length} 个动态会话`,
     },
-    plugins: {
-      title: '插件',
-      subtitle: `${plugins.length} 个已加载插件`,
-    },
-    skills: {
-      title: '技能',
-      subtitle: `${skills.length} 个可用技能`,
+    // One meta for the merged page: the head the visitor sees is the page's,
+    // while each tab keeps its own counts where they already were -- the
+    // skills summary strip and the plugins search both belong to their lists.
+    extensions: {
+      title: '扩展',
+      subtitle: `${plugins.length} 个插件 · ${skills.length} 个技能`,
     },
     // Not "定时任务": the page now holds tasks that wait for a signal, and a
     // name that promises a time would be wrong for them. "自动化" is what the
@@ -6911,13 +6925,12 @@ function App() {
     </div>
   )
 
-  const renderPlugins = () => (
-    <div className="page-view plugins-view">
-      <div className="page-head">
-        <div>
-          <h2>{pageMeta.plugins.title}</h2>
-          <p>{pageMeta.plugins.subtitle}</p>
-        </div>
+  // The two bodies behind the merged 扩展 page.  Each keeps its own toolbar
+  // and its own empty state; what they lose is their separate page shells,
+  // which the tabs below the page head replace.
+  const renderPluginsBody = () => (
+    <>
+      <div className="list-toolbar">
         <Input
           prefix={<SearchOutlined />}
           placeholder="搜索插件"
@@ -6964,24 +6977,17 @@ function App() {
           ))}
         </Row>
       )}
-    </div>
+    </>
   )
 
-  const renderSkills = () => (
-    <div className="page-view skills-view">
-      <div className="page-head skills-head">
-        <div>
-          <div className="eyebrow">CAPABILITIES</div>
-          <h2>{pageMeta.skills.title}</h2>
-          <p>管理 Agent 可调用的能力，查看来源与调用范围。</p>
-        </div>
-        <div className="skills-summary">
-          <span><strong>{skills.length}</strong> 全部</span>
-          <span><strong>{skills.filter(item => item.enabled !== false).length}</strong> 已启用</span>
-          <span><strong>{skills.filter(item => item.enabled === false).length}</strong> 已停用</span>
-          <span><strong>{skills.filter(item => item.user_invocable).length}</strong> 可调用</span>
-          <span><strong>{skills.filter(item => !item.user_invocable).length}</strong> 内部</span>
-        </div>
+  const renderSkillsBody = () => (
+    <>
+      <div className="skills-summary">
+        <span><strong>{skills.length}</strong> 全部</span>
+        <span><strong>{skills.filter(item => item.enabled !== false).length}</strong> 已启用</span>
+        <span><strong>{skills.filter(item => item.enabled === false).length}</strong> 已停用</span>
+        <span><strong>{skills.filter(item => item.user_invocable).length}</strong> 可调用</span>
+        <span><strong>{skills.filter(item => !item.user_invocable).length}</strong> 内部</span>
       </div>
 
       <div className="skills-toolbar">
@@ -7058,6 +7064,42 @@ function App() {
           })}
         </div>
       )}
+    </>
+  )
+
+  const renderExtensions = () => (
+    <div className="page-view extensions-view">
+      <div className="page-head">
+        <div>
+          <div className="eyebrow">CAPABILITIES</div>
+          <h2>{pageMeta.extensions.title}</h2>
+          <p>插件给 Agent 增加新的能力入口，技能决定这些能力怎么被调用。</p>
+        </div>
+      </div>
+      {/* The same tab idiom as the 自动化 page, so the two multi-list pages
+          read as one family.  Counts sit on the tabs because that is where
+          the visitor decides which list they are about to see. */}
+      <div className="schedule-tabs extensions-tabs" role="tablist" aria-label="扩展视图">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={extensionsTab === 'plugins'}
+          className={extensionsTab === 'plugins' ? 'active' : ''}
+          onClick={() => setExtensionsTab('plugins')}
+        >
+          插件
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={extensionsTab === 'skills'}
+          className={extensionsTab === 'skills' ? 'active' : ''}
+          onClick={() => setExtensionsTab('skills')}
+        >
+          技能
+        </button>
+      </div>
+      {extensionsTab === 'plugins' ? renderPluginsBody() : renderSkillsBody()}
     </div>
   )
 
@@ -9008,8 +9050,7 @@ function App() {
   const renderCurrentView = () => {
     if (view === 'chat') return renderChat()
     if (view === 'sessions') return renderSessions()
-    if (view === 'plugins') return renderPlugins()
-    if (view === 'skills') return renderSkills()
+    if (view === 'extensions') return renderExtensions()
     if (view === 'schedules') return renderSchedules()
     if (view === 'settings') return renderSettings()
     return renderChat()
@@ -9233,6 +9274,20 @@ function App() {
               >
                 {themeMode === 'dark' ? '浅色模式' : '深色模式'}
               </Button>
+              {/* The settings entry, out of the main navigation by design: it
+                  sits beside the theme switch -- the two things a person
+                  touches once and then rarely -- rather than beside the pages
+                  they visit every day.  navigateTo keeps the unsaved-edits
+                  guard, so this small entry refuses to lose work exactly as
+                  the menu item it replaces did. */}
+              <Button
+                block
+                icon={<SettingOutlined />}
+                aria-current={view === 'settings' ? 'page' : undefined}
+                onClick={() => navigateTo('settings')}
+              >
+                设置
+              </Button>
             </div>
           </div>
         </Sider>
@@ -9398,6 +9453,21 @@ function App() {
                 {item.label}
               </button>
             ))}
+            {/* Settings lives in the sidebar footer, but the palette is the
+                keyboard's map of the app: leaving it out would make the one
+                navigation surface that cannot reach it. */}
+            <button
+              type="button"
+              key="settings"
+              onClick={() => {
+                navigateTo('settings')
+                setCommandPaletteOpen(false)
+                setPaletteQuery('')
+              }}
+            >
+              <SettingOutlined />
+              设置
+            </button>
           </div>
         </div>
       </Modal>

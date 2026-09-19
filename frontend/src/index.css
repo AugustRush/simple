@@ -2121,6 +2121,31 @@ html[data-theme='light'] .settings-json {
   align-items: center;
 }
 
+/* The merged 扩展 page: both list bodies keep the classes they had as pages,
+   so only the tab strip and the per-tab toolbars are new.  The tab margin
+   mirrors the 自动化 page's spacing so the two multi-list pages share one
+   rhythm. */
+.extensions-tabs {
+  margin-bottom: 16px;
+}
+.extensions-view .page-head {
+  margin-bottom: 0;
+}
+/* The plugins search row and the skills summary strip: toolbar-height rows
+   directly under the tabs, so switching lists does not jump the content. */
+.list-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 16px;
+}
+.list-toolbar .workspace-search {
+  flex: 0 1 320px;
+}
+.extensions-view .skills-summary {
+  justify-content: flex-end;
+  margin-bottom: 16px;
+}
+
 .skills-toolbar {
   margin-bottom: 20px;
   padding: 10px 12px;
@@ -3464,10 +3489,20 @@ html[data-theme='light'] .app-main {
   padding: 10px 14px 14px;
 }
 
-.sider-actions .ant-btn,
-.sider-footer .ant-btn {
+.sider-actions .ant-btn {
   height: 42px;
   border-radius: 14px !important;
+}
+
+/* The footer holds two side-by-side entries (theme, settings), so its buttons
+   are a notch smaller than the primary "new session" action above: two 42px
+   slabs at the bottom read as a second toolbar, which is not what a rarely
+   visited settings entry is meant to be. */
+.sider-footer .ant-btn {
+  height: 34px;
+  padding-inline: 8px;
+  border-radius: 10px !important;
+  font-size: 12px;
 }
 
 .session-panel {
