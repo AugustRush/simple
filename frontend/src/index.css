@@ -301,6 +301,31 @@ textarea {
   color: var(--text-muted);
 }
 
+/* The busy word beside the turn counts.  Running uses the same primary the
+   composer's activity dot pulses with, so "运行中" in the list and the dot
+   under it say the same thing in the same colour; queued is neutral, because
+   waiting is not progressing -- the difference is the whole message. */
+.session-status-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  vertical-align: 1px;
+}
+
+.session-status-badge.is-running {
+  color: var(--primary);
+  background: var(--primary-soft, rgba(128, 128, 150, 0.14));
+}
+
+.session-status-badge.is-queued {
+  color: var(--text-secondary);
+  background: rgba(128, 128, 150, 0.14);
+}
+
 .session-item .ant-btn {
   opacity: 0;
   transform: translateX(3px);

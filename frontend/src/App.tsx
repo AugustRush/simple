@@ -184,6 +184,13 @@ interface SessionInfo {
   live?: boolean
   turn_count?: number
   last_activity?: string
+  /**
+   * What the session is doing right now, as the server sees it: idle,
+   * active/cancelling (a turn is executing, or being interrupted), or
+   * queued (an idle session still holding messages in its restart queue).
+   * Absent means an older server that never sent one.
+   */
+  status?: 'idle' | 'active' | 'cancelling' | 'queued' | string
 }
 
 interface Message {
@@ -1007,6 +1014,19 @@ function confirmRisk(level?: string): ConfirmRisk {
  * the card came back, and every further click queued another interjection.
  */
 const TASK_INTERRUPTED_STATUSES = new Set(['cancelled', 'interrupted', 'failed'])
+
+// What the session list says a busy session is doing.  Only busy states get a
+// word: an idle session is the unremarkable case, and a badge saying "空闲"
+// on every row would make the badge on the busy one mean nothing.
+const SESSION_STATUS_LABELS: Record<string, string> = {
+  active: '运行中',
+  cancelling: '正在停止',
+  queued: '排队中',
+}
+
+/** A session's busy-state word, or '' when it is idle (or its server is old). */
+const sessionStatusOf = (item: SessionInfo): string =>
+  SESSION_STATUS_LABELS[String(item.status || 'idle')] || ''
 
 const TASK_STATUS_LABELS: Record<string, string> = {
   cancelled: '已取消',
@@ -3368,6 +3388,10 @@ function App() {
       queuedMessagesRef.current = [...queuedMessagesRef.current, queued]
       setQueuedMessages([...queuedMessagesRef.current])
       setActivity(`已排队 ${queuedMessagesRef.current.length} 条消息`)
+      // The server's restart queue grew, which is what the session list's
+      // 排队中 badge reads -- without this the badge appears only after some
+      // later list refresh happens to run.
+      void loadSessions()
     }
 
     if (!activeSession) {
@@ -3398,6 +3422,10 @@ function App() {
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) {
       setIsStreaming(true)
+      // The session list shows what each session is doing; a turn just began,
+      // so the badge beside this session is now stale.  Not awaited: the list
+      // is a side detail of sending, and waiting for it would delay the turn.
+      void loadSessions()
       // Bumped before the send, so a state fetch already in flight predates
       // this turn and is barred from retiring it when its answer arrives.
       messageSendSeqRef.current += 1
@@ -9175,7 +9203,7 @@ function App() {
                       }`}
                       role="button"
                       tabIndex={0}
-                      aria-label={`打开会话 ${item.title || '未命名会话'}`}
+                      aria-label={`打开会话 ${item.title || '未命名会话'}${sessionStatusOf(item) ? `（${sessionStatusOf(item)}）` : ''}`}
                       aria-current={item.session_id === activeSession ? 'true' : undefined}
                       onClick={event => handleSessionContainerClick(event, item.session_id)}
                       onKeyDown={event => {
@@ -9194,6 +9222,21 @@ function App() {
                           {item.title || '未命名会话'}
                         </div>
                         <div className="session-item-meta">
+                          {/* The busy word rides with the counts because that
+                              row is the session's "what is it doing" line; a
+                              badge in the title row would fight the rename
+                              affordance for the same pixels.  Only busy states
+                              show one — "空闲" on every row would drown out
+                              the one row it matters on. */}
+                          {sessionStatusOf(item) && (
+                            <span
+                              className={`session-status-badge ${
+                                item.status === 'queued' ? 'is-queued' : 'is-running'
+                              }`}
+                            >
+                              {sessionStatusOf(item)}
+                            </span>
+                          )}
                           {item.turn_count || 0} 轮 · {relativeTime(item.last_activity)}
                         </div>
                       </div>

@@ -86,6 +86,42 @@ def test_session_service_lists_live_and_durable_sessions():
     assert service.create_session()
 
 
+def test_session_service_reports_what_a_live_session_is_doing():
+    """The list is where a busy session says so, so the status follows the
+    runtime's own words: a turn running, one being stopped, and -- the case
+    ``operation_state`` alone cannot say -- a session whose turn is over but
+    which is still holding messages in its restart queue.
+
+    That last one is not idle: the visitor's second message was accepted and
+    will run, and a badge saying "排队中" is what tells them it was taken
+    rather than lost.
+    """
+    live = {
+        "running": SimpleNamespace(
+            turn_count=1, operation_state="active", restart_queue=[]
+        ),
+        "stopping": SimpleNamespace(
+            turn_count=1, operation_state="cancelling", restart_queue=[]
+        ),
+        "waiting": SimpleNamespace(
+            turn_count=1, operation_state="idle", restart_queue=[object()]
+        ),
+        "idle": SimpleNamespace(
+            turn_count=1, operation_state="idle", restart_queue=[]
+        ),
+    }
+    service = SessionService(live_states=live)
+
+    sessions = {item["session_id"]: item for item in service.list_sessions()}
+
+    assert sessions["running"]["status"] == "active"
+    assert sessions["stopping"]["status"] == "cancelling"
+    assert sessions["waiting"]["status"] == "queued"
+    # The unremarkable case stays unremarkable: an idle session with nothing
+    # queued reads as idle, and no badge is drawn for it.
+    assert sessions["idle"]["status"] == "idle"
+
+
 def test_session_service_tracks_live_mapping_after_empty_bind():
     live = {}
     service = SessionService(live_states=live)

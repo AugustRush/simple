@@ -321,6 +321,15 @@ class SessionService:
                 if activity > 0
                 else ""
             )
+            # ``operation_state`` only says whether a turn is executing, so a
+            # session holding queued work in its restart queue reads as idle.
+            # The queue is exactly what the list is asked about -- a badge
+            # saying "排队中" is what tells the visitor their second message
+            # was taken rather than lost -- so both facts go into the status.
+            status = str(getattr(state, "operation_state", "idle") or "idle")
+            restarts = getattr(state, "restart_queue", None)
+            if status == "idle" and restarts:
+                status = "queued"
             sessions.append(
                 {
                     "session_id": session_id,
@@ -328,7 +337,7 @@ class SessionService:
                     "turn_count": turn_count,
                     "live": True,
                     "title": titles.get(session_id, ""),
-                    "status": getattr(state, "operation_state", "idle"),
+                    "status": status,
                 }
             )
 
