@@ -155,6 +155,57 @@ class ChannelRunner:
         worker.start()
         return worker
 
+    def _recover_orphan_staging(self, components: dict, memory_pool: Any) -> int:
+        """Queue turns stranded by sessions that died before consolidating.
+
+        The gateway needs its own sweep: ``_interactive_loop`` runs this for the
+        CLI, but every other channel reaches this method instead, so a
+        ``serve``-only process never recovered anything.  That is exactly where
+        the stranded turns come from — Web sessions are evicted on an idle
+        timer, and eviction closes a session's staging without consolidating it.
+
+        Queuing alone is not enough.  Jobs land on the *base* context manager,
+        which nothing has registered with the worker pool, and the idle gate in
+        ``should_process_jobs`` refuses a manager whose ``idle_elapsed()`` is
+        still 0.  So the base manager is registered here and woken explicitly,
+        which is the one path that bypasses that gate.
+
+        Never fatal: a gateway must start even if recovery cannot.
+        """
+        import agent as agent_module
+
+        ctx_mgr = components.get("context_manager")
+        if ctx_mgr is None:
+            return 0
+        try:
+            recovered = agent_module.enqueue_orphan_staging_recovery(ctx_mgr)
+        except Exception:
+            logger.exception("orphan staging recovery failed to enqueue")
+            return 0
+        if not recovered:
+            return 0
+        agent = components.get("agent")
+        cfg = components.get("cfg") or {}
+        session_id = str(getattr(ctx_mgr.staging, "session_id", "") or "")
+        try:
+            model = agent.consolidation_model(cfg)
+            endpoint = agent.consolidation_endpoint(cfg)
+        except Exception:
+            logger.exception("orphan staging recovery found no consolidation model")
+            return recovered
+        if memory_pool is not None:
+            memory_pool.register(session_id, ctx_mgr, model, endpoint)
+            memory_pool.wake(session_id)
+        else:
+            worker = agent_module.BackgroundMemoryWorker(ctx_mgr, endpoint, model)
+            worker.start()
+            worker.wake()
+            components["orphan_recovery_worker"] = worker
+        logger.info(
+            "queued %d interrupted session(s) for memory recovery", recovered
+        )
+        return recovered
+
     @staticmethod
     def _log_runtime_event(event: RuntimeEvent) -> None:
         """Convert any RuntimeEvent into a structured interaction log.
@@ -273,6 +324,7 @@ class ChannelRunner:
                 )
                 components["memory_worker_pool"] = memory_pool
                 memory_pool.start()
+        self._recover_orphan_staging(components, memory_pool)
         plugin_catalog = components.get("plugin_catalog")
         if plugin_catalog:
             plugin_catalog.fire_session_start(components)
@@ -373,6 +425,12 @@ class ChannelRunner:
             if memory_pool is not None:
                 memory_pool.stop()
                 await memory_pool.wait()
+            # Only set when there was no pool to register recovery with; its
+            # thread outlives the channel otherwise.
+            recovery_worker = components.pop("orphan_recovery_worker", None)
+            if recovery_worker is not None:
+                recovery_worker.stop()
+                await recovery_worker.wait()
 
     def _make_message_handler(
         self, sessions: dict[str, RuntimeSessionState]

@@ -97,19 +97,37 @@ type ConfirmRisk = 'high' | 'medium' | 'low'
 /**
  * How hard the active provider should think, as offered on the settings page.
  *
- * The values are the server's vocabulary (`shared.THINKING_EFFORTS`); the
- * empty one is what an untouched provider has, and it is not a level — it
- * means the agent sends no thinking parameter at all, so the provider's own
- * default stands. That is why it is first and why saving it removes the key
- * rather than writing a word.
+ * The words themselves come from the server (`shared.THINKING_EFFORTS`,
+ * delivered with the config), so the page offers what this backend will
+ * validate. The empty one is ours and is not a level — it means the agent
+ * sends no thinking parameter at all, so the provider's own default stands.
+ * That is why it is first and why saving it removes the key rather than
+ * writing a word.
  */
-const THINKING_EFFORT_OPTIONS = [
-  { value: '', label: '默认（不干预）' },
-  { value: 'off', label: '关闭' },
-  { value: 'low', label: '低' },
-  { value: 'medium', label: '中' },
-  { value: 'high', label: '高' },
-]
+const THINKING_EFFORT_LABELS: Record<string, string> = {
+  off: '关闭',
+  low: '低',
+  medium: '中',
+  high: '高',
+}
+
+/** The default until /api/config answers; replaced by whatever it carries. */
+const DEFAULT_THINKING_EFFORTS = ['off', 'low', 'medium', 'high']
+
+const effortOptionsFrom = (efforts: unknown) => {
+  const words = Array.isArray(efforts) && efforts.length > 0
+    ? efforts.map(word => String(word))
+    : DEFAULT_THINKING_EFFORTS
+  return [
+    { value: '', label: '默认（不干预）' },
+    ...words.map(word => ({
+      value: word,
+      // A level the labels table has not met still has to be offered — the
+      // server just said it accepts the word — so it shows as itself.
+      label: THINKING_EFFORT_LABELS[word] || word,
+    })),
+  ]
+}
 
 /** The effort a provider's config already carries, or '' when it carries none. */
 const thinkingEffortOf = (provider: any): string => {
@@ -2320,6 +2338,12 @@ function App() {
   // is how a number ended up on the navigation with nothing on the page that
   // added up to it.
   const [attentionRuns, setAttentionRuns] = useState<AttentionRun[]>([])
+  // The run to open per task, from the same payload. The list is capped, so
+  // deriving this from its rows would leave a card whose count is showing
+  // with no run to click through to -- and falling back to the newest run is
+  // landing on the one that is usually fine, which is what the count was
+  // complaining about.
+  const [attentionLatestByTask, setAttentionLatestByTask] = useState<Record<string, string>>({})
   const [permissionProfiles, setPermissionProfiles] = useState<PermissionProfileOption[]>([])
   const [scheduleQuery, setScheduleQuery] = useState('')
   const [scheduleStatusFilter, setScheduleStatusFilter] = useState('all')
@@ -2474,6 +2498,11 @@ function App() {
   const [hoveredTurn, setHoveredTurn] = useState<{ id: string; top: number } | null>(null)
   const [hoveredTurnIndex, setHoveredTurnIndex] = useState<number | null>(null)
   const [settingsDirty, setSettingsDirty] = useState(false)
+  // What the settings page offers, as /api/config delivered it. State rather
+  // than a constant because it is the backend's list, not ours.
+  const [thinkingEffortOptions, setThinkingEffortOptions] = useState(
+    () => effortOptionsFrom(null),
+  )
   const [sendShortcut, setSendShortcut] = useState<'enter' | 'ctrl-enter'>(
     () => (localStorage.getItem('send_shortcut') === 'ctrl-enter' ? 'ctrl-enter' : 'enter'),
   )
@@ -3732,6 +3761,11 @@ function App() {
         ? (data.attention_runs as AttentionRun[])
         : [],
     )
+    setAttentionLatestByTask(
+      data && typeof data.latest_run_by_task === 'object' && data.latest_run_by_task
+        ? data.latest_run_by_task as Record<string, string>
+        : {},
+    )
   }, [])
 
   const applySchedules = useCallback((data: any) => {
@@ -4120,16 +4154,14 @@ function App() {
    * The count shown on a card is the task's own `unseen_attention` -- that is
    * the number the task carries, and it stays right even when the list behind
    * the badge is long enough to be capped. This map only answers "and which
-   * one", which the count cannot.
+   * one", which the count cannot -- and it comes from the server's snapshot
+   * rather than the capped list, so a task whose rows fell out of the list
+   * still opens on the run the count is about.
    */
-  const attentionByTask = useMemo(() => {
-    const map = new Map<string, string>()
-    // Newest first, so the first run seen for a task is the one to open.
-    for (const run of attentionRuns) {
-      if (!map.has(run.task_id)) map.set(run.task_id, run.run_id)
-    }
-    return map
-  }, [attentionRuns])
+  const attentionByTask = useMemo(
+    () => new Map(Object.entries(attentionLatestByTask)),
+    [attentionLatestByTask],
+  )
 
   const permissionProfileOptions = useMemo(
     () => (permissionProfiles.length > 0 ? permissionProfiles : KNOWN_PERMISSION_PROFILES),
@@ -4320,6 +4352,10 @@ function App() {
       setConfig(cfg)
       setConfigText(JSON.stringify(cfg, null, 2))
       setSettingsDirty(false)
+      // The levels on offer come from the same response as the config, so
+      // the page offers what this backend will validate -- a level added on
+      // the server shows up here without a second copy of the list here.
+      setThinkingEffortOptions(effortOptionsFrom(data.thinking_efforts))
 
       const providers = cfg.providers || {}
       const active = providers[cfg.active_provider] || {}
@@ -7538,8 +7574,12 @@ function App() {
    * usually fine, which is the second half of why the run was hard to find.
    */
   const renderAttention = () => {
+    // Looked up by id rather than found per row: the list is the badge's own
+    // length, and a find inside its map is the page re-scanning every task
+    // for every row on every poll.
+    const taskById = new Map(schedules.map(item => [item.id, item]))
     const rows = attentionRuns.map(run => {
-      const task = schedules.find(item => item.id === run.task_id)
+      const task = taskById.get(run.task_id)
       const origin = run.workflow_name
         ? `流程「${run.workflow_name}」${run.step_key ? ` · 步骤 ${run.step_key}` : ''}`
         : run.workflow_deleted
@@ -8860,7 +8900,7 @@ function App() {
                       + '修改后随「保存设置」写入，对之后的新对话生效。'
                     }
                   >
-                    <Select options={THINKING_EFFORT_OPTIONS} />
+                    <Select options={thinkingEffortOptions} />
                   </Form.Item>
                 </Col>
                 <Col xs={24} md={6}>

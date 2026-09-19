@@ -41,7 +41,7 @@
       ],
       "max_tokens": 8192,
       "context_window": 128000,
-      "_thinking_readme": "No 'thinking' key here on purpose, because leaving it out is the default: this provider is then asked exactly what it was asked before, and any thinking it produces is still shown above the reply. Add \"thinking\": {\"effort\": \"low\"} (or \"medium\"/\"high\") to ask its reasoning models for that much effort, or \"off\" to ask them not to think at all."
+      "_thinking_readme": "No 'thinking' key here on purpose, because leaving it out is the default: this provider is then asked exactly what it was asked before, and any thinking its models produce is still shown above the reply in an interactive turn (scheduled runs and sub-agents do not stream, so their thinking is recorded in history only). Add \"thinking\": {\"effort\": \"low\"} (or \"medium\"/\"high\") to ask its reasoning models for that much effort, or \"off\" to ask them not to think at all. A mixed group can set one model apart: \"thinking\": {\"models\": {\"deepseek-reasoner\": \"high\"}} overrides the provider's level for that model only, so the parameter reaches the model that understands it and not the one that would 400."
     },
     "qwen": {
       "_readme": "Any OpenAI-compatible endpoint works — Qwen, Groq, Together, local vLLM, etc.",

@@ -56,6 +56,48 @@ class StagingBuffer:
         self._lock = threading.RLock()
         self._count = self._load_count()
 
+    @staticmethod
+    def discover_sqlite_sessions(context_dir: Path) -> list[tuple[str, int]]:
+        """Return ``(session_id, staged_count)`` for every session with rows.
+
+        Orphan recovery needs to enumerate what is *in* the buffer, which for
+        the SQLite backend is not visible on the filesystem: one ``palace.db``
+        holds every session's turns partitioned by ``session_id``.  Without
+        this, a process that dies between staging and consolidation leaves rows
+        no later run can find — the JSONL-era ``glob("*.jsonl")`` scan sees
+        nothing, because the default backend stopped writing files.
+
+        Read-only and defensive: a missing database, or one predating the
+        ``staging_turns`` table, is an empty list rather than an error, because
+        a first run has nothing to recover and must still start.
+        """
+        db_path = Path(context_dir) / "palace.db"
+        if not db_path.is_file():
+            return []
+        try:
+            conn = sqlite3.connect(db_path)
+        except sqlite3.Error:
+            return []
+        try:
+            rows = conn.execute(
+                """
+                SELECT session_id, COUNT(*) AS count
+                FROM staging_turns
+                GROUP BY session_id
+                ORDER BY MIN(id) ASC
+                """
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        finally:
+            with contextlib.suppress(Exception):
+                conn.close()
+        return [
+            (str(row[0]), int(row[1]))
+            for row in rows
+            if str(row[0] or "").strip() and int(row[1]) > 0
+        ]
+
     def _connect(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
             with self._connection_lock:

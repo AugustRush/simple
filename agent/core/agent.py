@@ -207,7 +207,8 @@ _ = _TaskLocalContextStack  # publicly importable for any third-party caller
 
 
 class _StreamEmissionTracker:
-    """Wraps a stream callback and remembers whether text reached the user.
+    """Wraps a turn's stream callbacks and remembers whether anything reached
+    the user.
 
     Retrying an LLM call replays it from the beginning.  For a *streaming*
     call that means every chunk is pushed to the sink a second time, and
@@ -216,7 +217,12 @@ class _StreamEmissionTracker:
     error after the first chunk therefore has to surface as a failure rather
     than silently produce a doubled reply.
 
-    The wrapper is a plain callable, not a coroutine function, so it works
+    One flag covers both channels — the answer and the thinking — because
+    the sink cannot unsay either, and thinking is precisely the emission a
+    thinking-heavy turn has produced when it dies before the first answer
+    token.
+
+    The wrappers are plain callables, not coroutine functions, so they work
     for sync and async callbacks alike — transports await the *result* when
     it is awaitable rather than inspecting the callable.
     """
@@ -234,6 +240,14 @@ class _StreamEmissionTracker:
         if chunk:
             self.emitted = True
         return self._callback(chunk)
+
+    def wrap_reasoning(self, callback: Callable[[str], Any]) -> Callable[[str], Any]:
+        """The reasoning channel, counted against the same no-replay rule."""
+        def reasoning(chunk: str) -> Any:
+            if chunk:
+                self.emitted = True
+            return callback(chunk)
+        return reasoning
 
 
 @dataclass
@@ -1000,7 +1014,6 @@ class BaseAgent:
         *,
         index: int,
         orchestration_decision: OrchestrationDecision,
-        previous_spec: SubtaskSpec | None = None,
     ) -> SubtaskSpec:
         tool_input = tool_use.get("input", {})
         role = str(tool_input.get("role", "assistant") or "assistant")
@@ -1011,12 +1024,6 @@ class BaseAgent:
             or f"spawn-{index}"
         )
         depends_on = self._string_list(tool_input.get("depends_on"))
-        if (
-            orchestration_decision.mode == "pipeline"
-            and not depends_on
-            and previous_spec is not None
-        ):
-            depends_on = [previous_spec.id]
         explicit_profile = str(tool_input.get("capability_profile", "") or "").strip()
         return SubtaskSpec(
             id=spec_id,
@@ -1083,16 +1090,13 @@ class BaseAgent:
         orchestration_decision: OrchestrationDecision,
     ) -> tuple[list[str], dict[str, Any]]:
         specs: list[SubtaskSpec] = []
-        previous_spec: SubtaskSpec | None = None
         for index, (_result_index, tool_use) in enumerate(spawn_calls, start=1):
             spec = self._spawn_tool_use_to_spec(
                 tool_use,
                 index=index,
                 orchestration_decision=orchestration_decision,
-                previous_spec=previous_spec,
             )
             specs.append(spec)
-            previous_spec = spec
 
         run_id = shared._new_id()
         specs = [replace(spec, run_id=run_id) for spec in specs]
@@ -2883,12 +2887,29 @@ class BaseAgent:
                         # Graceful cancel waits for the call to finish naturally.
                         if stream_callback:
                             tracked_callback = _StreamEmissionTracker(stream_callback)
+                            # The reasoning channel is resolved here rather
+                            # than inside _stream_response so the tracker can
+                            # wrap it: reasoning arrives ahead of the first
+                            # answer token, so it is exactly the emission that
+                            # has to veto a replay.
+                            sink = _active_sink.get()
+                            raw_reasoning = (
+                                getattr(sink, "sync_reasoning_cb", None)
+                                if sink is not None
+                                else None
+                            )
+                            reasoning_callback = (
+                                tracked_callback.wrap_reasoning(raw_reasoning)
+                                if raw_reasoning is not None
+                                else None
+                            )
                             llm_task = asyncio.create_task(
                                 self._with_llm_retry(
                                     self._stream_response,
                                     ctx,
                                     tools,
                                     tracked_callback,
+                                    reasoning_callback,
                                     can_retry=tracked_callback.nothing_emitted,
                                 )
                             )
@@ -3404,27 +3425,21 @@ class BaseAgent:
         ctx: "AgentContext",
         tools: list[dict],
         callback: Callable[[str], Any],
+        reasoning_callback: Optional[Callable[[str], Any]] = None,
     ) -> tuple[Any, str]:
         """Stream response and return (full_response, collected_text).
 
         ``callback`` may be a plain sync function or an async coroutine
-        function; the transport handles both.
-
-        The model's thinking is routed to the turn's sink, read from the same
-        contextvar the tools use to reach it: the sink is the turn's output
-        contract, so it — not the caller — is what decides where thinking goes.
-        A sink with nowhere to put it inherits a no-op adapter and the channel
-        costs one call per fragment.
+        function; the transport handles both.  ``reasoning_callback`` is the
+        turn's sink channel for the model's thinking — resolved by the caller
+        (see ``send_message``), which needs it under the same emission
+        tracking as the answer, since a replay would double either.
 
         Sub-agents never reach this method, because they are never given a
         stream callback.  That is also what keeps their thinking out of the
         parent's note: several run at once, and their fragments interleaved
         would read as one confused train of thought.
         """
-        sink = _active_sink.get()
-        reasoning_callback = (
-            getattr(sink, "sync_reasoning_cb", None) if sink is not None else None
-        )
         self._prepare_provider_context(ctx, tools)
         response, text = await self._transport.stream(
             model=self._effective_model(ctx),

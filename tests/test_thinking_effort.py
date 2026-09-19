@@ -21,6 +21,7 @@ from agent.core.transport import (
     RoutingTransport,
     build_routing_transport,
     build_transport,
+    model_thinking_overrides,
     provider_thinking_effort,
 )
 
@@ -150,6 +151,22 @@ def test_anthropic_budget_is_clamped_under_max_tokens():
     for max_tokens in (2048, 4096, 16384):
         budget = transport._thinking_kwarg(max_tokens)["thinking"]["budget_tokens"]
         assert 1024 <= budget < max_tokens
+
+
+def test_anthropic_without_room_for_a_budget_sends_no_thinking():
+    """A budget must be >= 1024 and strictly < max_tokens.
+
+    A call capped at 1024 tokens has no legal budget at all, and sending an
+    impossible one is a guaranteed 400 -- so the effort is dropped for that
+    call rather than refused.
+    """
+    transport = build_transport("anthropic", object(), "high")
+    assert transport._thinking_kwarg(1024) == {}
+    assert transport._thinking_kwarg(512) == {}
+    # 1025 has exactly one legal budget: 1024.
+    assert transport._thinking_kwarg(1025) == {
+        "thinking": {"type": "enabled", "budget_tokens": 1024}
+    }
 
 
 @pytest.mark.parametrize("effort", [None, "off"])
@@ -341,6 +358,116 @@ def test_routing_gives_each_provider_its_own_effort():
     assert routing._for("unknown-model").thinking_effort == "high"
 
 
+# ── Per-model overrides ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "provider_cfg,expected",
+    [
+        ({}, {}),
+        ({"thinking": None}, {}),
+        ({"thinking": {}}, {}),
+        ({"thinking": {"models": None}}, {}),
+        ({"thinking": {"models": []}}, {}),
+        ({"thinking": {"models": {"m1": "high"}}}, {"m1": "high"}),
+        ({"thinking": {"models": {"m1": " HIGH "}}}, {"m1": "high"}),
+        ({"thinking": {"models": {"m1": "highest"}}}, {}),   # a typo is absent
+        ({"thinking": {"models": {"m1": None}}}, {}),        # so is "no opinion"
+        ({"thinking": {"models": {"m1": "high", "m2": "off"}}}, {"m1": "high", "m2": "off"}),
+    ],
+)
+def test_model_thinking_overrides_reads_the_models_block(provider_cfg, expected):
+    assert model_thinking_overrides(provider_cfg) == expected
+
+
+def test_a_model_override_wins_over_its_provider_for_that_model_only():
+    """A mixed group is the case the override exists for.
+
+    The provider's reasoning model asks for effort; the plain model beside it
+    would answer the same parameter with a 400.  The routing table already
+    knows which model is which, so the override is keyed by it.
+    """
+    cfg = {
+        "active_provider": "a",
+        "providers": {
+            "a": {
+                "api_format": "openai", "api_key": "k", "default_model": "plain",
+                "models": ["plain", "reasoner"],
+                "thinking": {
+                    "effort": "high",
+                    "models": {"reasoner": "low", "plain": "off"},
+                },
+            },
+        },
+    }
+    client = object()
+    routing = build_routing_transport(
+        cfg, "openai", client, client_factory=lambda *_: client, client_cache={}
+    )
+    assert routing.thinking_overrides == {"reasoner": "low", "plain": "off"}
+    # The owning transport keeps its provider effort for every model it has.
+    assert routing._for("reasoner").thinking_effort == "high"
+    # And the calls carry the override instead, without mutating the shared
+    # transport -- its other model keeps the provider's level.
+    assert routing._effort_override("reasoner") == "low"
+    assert routing._effort_override("plain") == "off"
+    assert routing._effort_override("unknown-model") is None
+    assert routing._effort_override(None) is None
+
+
+def test_a_model_override_reaches_the_openai_wire():
+    calls: list[dict] = []
+
+    async def _create(**kwargs):
+        calls.append(kwargs)
+
+    class _Client:
+        chat = types.SimpleNamespace(completions=types.SimpleNamespace(
+            create=_create
+        ))
+
+    cfg = {
+        "active_provider": "a",
+        "providers": {
+            "a": {
+                "api_format": "openai", "api_key": "k", "default_model": "plain",
+                "models": ["plain", "reasoner"],
+                "thinking": {"effort": "high", "models": {"plain": "off"}},
+            },
+        },
+    }
+    routing = build_routing_transport(
+        cfg, "openai", _Client(), client_factory=lambda *_: _Client(), client_cache={}
+    )
+    asyncio.run(routing.create(
+        model="plain", max_tokens=8, system="", messages=[], tools=[],
+    ))
+    asyncio.run(routing.create(
+        model="reasoner", max_tokens=8, system="", messages=[], tools=[],
+    ))
+    # The overridden model says "none"; its sibling still carries the
+    # provider's word.
+    assert calls[0]["reasoning_effort"] == "none"
+    assert calls[1]["reasoning_effort"] == "high"
+
+
+def test_config_validation_reports_a_bad_per_model_effort():
+    cfg = {
+        "active_provider": "p",
+        "providers": {
+            "p": {
+                "api_format": "openai", "api_key": "k", "default_model": "m",
+                "thinking": {"models": {"m": "high", "other": "louder"}},
+            },
+        },
+    }
+    warnings = [w for w in _validate_config(cfg) if "thinking" in w]
+    assert warnings == [
+        "providers.p.thinking.models.other: must be one of off, low, medium, "
+        "high, got 'louder'"
+    ]
+
+
 def test_routing_forwards_the_reasoning_callback():
     seen: dict = {}
 
@@ -349,7 +476,7 @@ def test_routing_forwards_the_reasoning_callback():
             super().__init__(object())
 
         async def stream(self, *, model, max_tokens, system, messages, tools,
-                         callback, reasoning_callback=None):
+                         callback, reasoning_callback=None, thinking_effort=None):
             seen["reasoning_callback"] = reasoning_callback
             return None, ""
 
@@ -390,8 +517,8 @@ def test_a_sink_without_the_hook_ignores_thinking():
     sink.on_reasoning_chunk("想")
 
 
-def test_stream_response_routes_thinking_to_the_turn_sink():
-    """The wire that lets the agent reach the sink without a new parameter."""
+def test_stream_response_forwards_the_reasoning_callback_it_is_given():
+    """``_stream_response`` is a pass-through; the caller resolves the sink."""
     from agent.core.agent import AgentContext, BaseAgent, ToolRegistry
 
     class _Transport:
@@ -399,7 +526,7 @@ def test_stream_response_routes_thinking_to_the_turn_sink():
             self.reasoning_callback = "NEVER SET"
 
         async def stream(self, *, model, max_tokens, system, messages, tools,
-                         callback, reasoning_callback=None):
+                         callback, reasoning_callback=None, thinking_effort=None):
             self.reasoning_callback = reasoning_callback
             return {"choices": [{"finish_reason": "stop"}]}, "answer"
 
@@ -408,22 +535,99 @@ def test_stream_response_routes_thinking_to_the_turn_sink():
     agent._transport = transport
     ctx = AgentContext(system_prompt="s", metadata={})
 
+    asyncio.run(agent._stream_response(ctx, [], lambda c: None))
+    assert transport.reasoning_callback is None
+
+    sink = _RecordingSink()
+    asyncio.run(agent._stream_response(ctx, [], lambda c: None, sink.sync_reasoning_cb))
+    assert callable(transport.reasoning_callback)
+    transport.reasoning_callback("想")
+    assert sink.think == ["想"]
+
+
+def test_send_message_routes_the_sinks_reasoning_channel(monkeypatch):
+    """``send_message`` owns the sink lookup, because it is what wraps the
+    channel in the emission tracker."""
+    import agent as agent_module
+    from agent.core.agent import AgentContext, BaseAgent, ToolRegistry
+
+    agent = BaseAgent(object(), ToolRegistry(), model="m", api_format="openai")
+    agent.llm_max_retries = 0
+    captured: dict = {}
+
+    async def fake_stream(ctx, tools, callback, reasoning_callback=None):
+        captured["reasoning"] = reasoning_callback
+        return (
+            agent_module._OAIResponse(
+                [agent_module._OAIChoice("stop", agent_module._OAIMsg("答", None))]
+            ),
+            "答",
+        )
+
+    monkeypatch.setattr(agent, "_stream_response", fake_stream)
+
     previous = output_module._active_sink.set(None)
     try:
-        asyncio.run(agent._stream_response(ctx, [], lambda c: None))
+        asyncio.run(agent.send_message(
+            AgentContext(system_prompt="s", metadata={}),
+            "hi",
+            stream_callback=lambda c: None,
+        ))
     finally:
         output_module._active_sink.reset(previous)
-    assert transport.reasoning_callback is None
+    assert captured["reasoning"] is None
 
     sink = _RecordingSink()
     previous = output_module._active_sink.set(sink)
     try:
-        asyncio.run(agent._stream_response(ctx, [], lambda c: None))
+        asyncio.run(agent.send_message(
+            AgentContext(system_prompt="s", metadata={}),
+            "hi",
+            stream_callback=lambda c: None,
+        ))
     finally:
         output_module._active_sink.reset(previous)
-    assert callable(transport.reasoning_callback)
-    transport.reasoning_callback("想")
+    assert callable(captured["reasoning"])
+    captured["reasoning"]("想")
     assert sink.think == ["想"]
+
+
+def test_streaming_retry_does_not_replay_reasoning_either(monkeypatch):
+    """Reasoning arrives ahead of the first answer token, so it is exactly
+    the emission a retry decision has to see.  A thinking-heavy turn that
+    died before its first answer token used to replay its whole thinking —
+    the tracker wrapped only the answer callback."""
+    import agent as agent_module
+    from agent.core.agent import AgentContext, BaseAgent, ToolRegistry
+
+    agent = BaseAgent(object(), ToolRegistry(), model="m", api_format="openai")
+    agent.llm_max_retries = 3
+    agent.llm_retry_base_delay = 0
+    attempts = 0
+
+    async def thinking_then_disconnect(ctx, tools, callback, reasoning_callback=None):
+        nonlocal attempts
+        attempts += 1
+        reasoning_callback("先想清楚")
+        raise ConnectionError("connection reset by peer")
+
+    monkeypatch.setattr(agent, "_stream_response", thinking_then_disconnect)
+
+    sink = _RecordingSink()
+    previous = output_module._active_sink.set(sink)
+    try:
+        result = asyncio.run(agent.send_message(
+            AgentContext(system_prompt="s", metadata={}),
+            "hi",
+            stream_callback=lambda c: None,
+        ))
+    finally:
+        output_module._active_sink.reset(previous)
+
+    # A replay would print the thinking a second time; sinks cannot unsay it.
+    assert attempts == 1
+    assert sink.think == ["先想清楚"]
+    assert result.error
 
 
 def test_cli_reasoning_stays_out_of_the_streamed_answer():

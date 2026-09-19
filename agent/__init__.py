@@ -224,6 +224,7 @@ from .memory.system import (
     ResolvedFact,
     SessionWorkingState,
     StagingBuffer,
+    enqueue_orphan_staging_recovery,
     normalize_memory_chapter,
 )
 from .skills.catalog import (

@@ -64,6 +64,7 @@ SessionEvent = agent_module.SessionEvent
 SkillCatalog = agent_module.SkillCatalog
 StagingBuffer = agent_module.StagingBuffer
 TriggerSpec = agent_module.TriggerSpec
+enqueue_orphan_staging_recovery = agent_module.enqueue_orphan_staging_recovery
 _build_gateway_channels = agent_module._build_gateway_channels
 
 app = typer.Typer(
@@ -1156,26 +1157,15 @@ async def _interactive_loop_body(
         )
     _set_cli_router(router)
 
-    # Queue orphaned staging files from previous sessions for background
-    # recovery. Doing this synchronously would block startup on a network model
-    # call before the user even sees the prompt.
+    # Queue staged turns left behind by sessions that died before consolidating
+    # them, for background recovery.  Doing this synchronously would block
+    # startup on a network model call before the user even sees the prompt.
     if ctx_mgr:
-        staging_dir = shared.STAGING_DIR
-        current_sid = ctx_mgr.staging.session_id
-        orphans = [
-            p
-            for p in staging_dir.glob("*.jsonl")
-            if p.stem != current_sid and p.stat().st_size > 0
-        ]
-        if orphans:
+        recovered = enqueue_orphan_staging_recovery(ctx_mgr)
+        if recovered:
             shared.CONSOLE.print(
-                f"[dim]Recovering {len(orphans)} interrupted session(s)…[/dim]"
+                f"[dim]Recovering {recovered} interrupted session(s)…[/dim]"
             )
-            for orphan_path in orphans:
-                ctx_mgr.enqueue_staging_job(
-                    "orphan_recovery",
-                    StagingBuffer(path=orphan_path, session_id=orphan_path.stem),
-                )
             if memory_worker:
                 memory_worker.wake()
 

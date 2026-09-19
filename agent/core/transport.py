@@ -286,19 +286,33 @@ class AnthropicTransport(ModelTransport):
     ) -> Any:
         return tools if tools else anthropic.NOT_GIVEN
 
-    def _thinking_kwarg(self, max_tokens: int) -> dict:
-        """``thinking=...`` for this provider's configured effort, if any.
+    def _thinking_kwarg(self, max_tokens: int, effort_override=None) -> dict:
+        """``thinking=...`` for this call's effort, if any.
 
-        Nothing is sent when the config has no opinion, so every existing
+        ``effort_override`` is a per-model effort replacing the provider's own
+        for this call (see ``RoutingTransport``); ``None`` means the call made
+        no override and the provider's configured effort stands.  Nothing is
+        sent when the effective effort is None or "off", so every existing
         config keeps making exactly today's request.  A budget must stay under
         ``max_tokens`` (the API rejects otherwise), and the clamp is what makes
         ``high`` usable on a provider capped at a few thousand tokens.
         """
-        effort = self.thinking_effort
+        effort = (
+            shared.normalize_thinking_effort(effort_override)
+            if effort_override is not None
+            else self.thinking_effort
+        )
         if effort is None or effort == "off":
             return {}
+        # The API demands a budget of at least 1024 *and strictly below*
+        # max_tokens.  A call with no such room (max_tokens <= 1024) would be
+        # a request that cannot be satisfied -- sent anyway it is a guaranteed
+        # 400 -- so the effort is dropped and the call goes out as a plain
+        # one rather than as a refusal.
+        if int(max_tokens) <= 1024:
+            return {}
         budget = _ANTHROPIC_THINKING_BUDGETS.get(effort, 1024)
-        budget = max(1024, min(budget, max(1024, int(max_tokens) - 1024)))
+        budget = max(1024, min(budget, int(max_tokens) - 1024))
         return {"thinking": {"type": "enabled", "budget_tokens": budget}}
 
     @staticmethod
@@ -310,19 +324,22 @@ class AnthropicTransport(ModelTransport):
             if getattr(block, "type", "") == "thinking"
         )
 
-    async def create(self, *, model, max_tokens, system, messages, tools):
+    async def create(
+        self, *, model, max_tokens, system, messages, tools,
+        thinking_effort=None,
+    ):
         return await self.client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=system,
             messages=messages,
             tools=self.convert_tools(tools),
-            **self._thinking_kwarg(max_tokens),
+            **self._thinking_kwarg(max_tokens, thinking_effort),
         )
 
     async def stream(
         self, *, model, max_tokens, system, messages, tools, callback,
-        reasoning_callback=None,
+        reasoning_callback=None, thinking_effort=None,
     ):
         collected: list[str] = []
         async with self.client.messages.stream(
@@ -331,7 +348,7 @@ class AnthropicTransport(ModelTransport):
             system=system,
             messages=messages,
             tools=self.convert_tools(tools),
-            **self._thinking_kwarg(max_tokens),
+            **self._thinking_kwarg(max_tokens, thinking_effort),
         ) as stream:
             # ``text_stream`` yields answer text only, so the thinking blocks
             # are read off the finished message instead.  That trades
@@ -446,21 +463,31 @@ class OpenAITransport(ModelTransport):
             messages
         )
 
-    def _reasoning_effort_kwarg(self) -> dict:
-        """``reasoning_effort=...`` for this provider's configured effort, if any.
+    def _reasoning_effort_kwarg(self, effort_override=None) -> dict:
+        """``reasoning_effort=...`` for this call's effort, if any.
 
-        A provider the config never spoke about sends nothing — the parameter
-        is non-standard, so a gateway that does not know it answers 400.  The
-        configured word goes over the wire unchanged, because the levels are
-        the provider's own; only "off" is translated, to the word that actually
-        silences the model rather than merely declining to ask.
+        ``effort_override`` is a per-model effort replacing the provider's own
+        for this call (see ``RoutingTransport``); ``None`` means the call made
+        no override and the configured effort stands.  A provider the config
+        never spoke about sends nothing — the parameter is non-standard, so a
+        gateway that does not know it answers 400.  The effective word goes
+        over the wire unchanged, because the levels are the provider's own;
+        only "off" is translated, to the word that actually silences the model
+        rather than merely declining to ask.
         """
-        effort = self.thinking_effort
+        effort = (
+            shared.normalize_thinking_effort(effort_override)
+            if effort_override is not None
+            else self.thinking_effort
+        )
         if effort is None:
             return {}
         return {"reasoning_effort": self._NO_THINKING if effort == "off" else effort}
 
-    def _create_kwargs(self, *, model, max_tokens, system, messages, tools, stream=False):
+    def _create_kwargs(
+        self, *, model, max_tokens, system, messages, tools, stream=False,
+        thinking_effort=None,
+    ):
         kwargs: dict = dict(
             model=model,
             max_tokens=max_tokens,
@@ -471,24 +498,29 @@ class OpenAITransport(ModelTransport):
             kwargs["tools"] = api_tools
         if stream:
             kwargs["stream"] = True
-        kwargs.update(self._reasoning_effort_kwarg())
+        kwargs.update(self._reasoning_effort_kwarg(thinking_effort))
         return kwargs
 
-    async def create(self, *, model, max_tokens, system, messages, tools):
+    async def create(
+        self, *, model, max_tokens, system, messages, tools,
+        thinking_effort=None,
+    ):
         return await self.client.chat.completions.create(
             **self._create_kwargs(
                 model=model, max_tokens=max_tokens,
                 system=system, messages=messages, tools=tools,
+                thinking_effort=thinking_effort,
             )
         )
 
     async def stream(
         self, *, model, max_tokens, system, messages, tools, callback,
-        reasoning_callback=None,
+        reasoning_callback=None, thinking_effort=None,
     ):
         kwargs = self._create_kwargs(
             model=model, max_tokens=max_tokens,
             system=system, messages=messages, tools=tools, stream=True,
+            thinking_effort=thinking_effort,
         )
         collected: list[str] = []
         finish_reason = "stop"
@@ -875,10 +907,16 @@ class RoutingTransport(ModelTransport):
         self,
         default: ModelTransport,
         routes: dict[str, ModelTransport],
+        thinking_overrides: Optional[dict[str, str]] = None,
     ) -> None:
         super().__init__(default.client, default.thinking_effort)
         self.default = default
         self.routes = routes
+        # A per-model effort wins over the owning provider's, keyed by model
+        # id — the same key the routes answer to.  Held here rather than in
+        # per-model transports because the effort is a property of the model
+        # within the group, not of a client.
+        self.thinking_overrides = dict(thinking_overrides or {})
         # The format of an unrouted call, for callers that ask the transport
         # rather than a transport's endpoint.
         self.api_format = default.api_format
@@ -887,6 +925,18 @@ class RoutingTransport(ModelTransport):
         if model is None:
             return self.default
         return self.routes.get(model, self.default)
+
+    def _effort_override(self, model: Optional[str]) -> Optional[str]:
+        """The effort this call carries, when a model was told to differ.
+
+        ``None`` means "no override": the transport that owns the model sends
+        the effort it was configured with.  An override replaces it for this
+        call only — the transport is shared by every model in its group, so
+        mutating it would change them all.
+        """
+        if model is None or model not in self.thinking_overrides:
+            return None
+        return self.thinking_overrides[model]
 
     def endpoint_for(self, model: Optional[str] = None) -> ModelEndpoint:
         """The client and format owned by *model*.
@@ -912,6 +962,7 @@ class RoutingTransport(ModelTransport):
             system=system,
             messages=messages,
             tools=tools,
+            thinking_effort=self._effort_override(model),
         )
 
     async def stream(
@@ -919,7 +970,9 @@ class RoutingTransport(ModelTransport):
         reasoning_callback=None,
     ):
         # The routed transport carries its own provider's thinking effort, so
-        # the effort follows the model and never has to be passed alongside it.
+        # the effort follows the model and never has to be passed alongside it
+        # -- except where a per-model override said otherwise, which arrives
+        # as an explicit effort for this call.
         transport = self._for(model)
         return await transport.stream(
             model=model,
@@ -929,6 +982,7 @@ class RoutingTransport(ModelTransport):
             tools=tools,
             callback=callback,
             reasoning_callback=reasoning_callback,
+            thinking_effort=self._effort_override(model),
         )
 
     async def simple_chat(self, *, model, max_tokens, system, prompt):
@@ -1026,6 +1080,29 @@ def provider_thinking_effort(provider_cfg: dict) -> str | None:
     return shared.normalize_thinking_effort(thinking.get("effort"))
 
 
+def model_thinking_overrides(provider_cfg: dict) -> dict[str, str]:
+    """Per-model efforts that win over the provider's own, keyed by model id.
+
+    ``providers.<name>.thinking.models`` — a provider's group is allowed to be
+    mixed (a reasoning model next to one that answers ``reasoning_effort``
+    with a 400), and the routing table already says which model is which.  The
+    values are normalised here, so an override that names no recognised word
+    is simply absent rather than a bad word travelling to the API.
+    """
+    thinking = provider_cfg.get("thinking")
+    if not isinstance(thinking, dict):
+        return {}
+    models = thinking.get("models")
+    if not isinstance(models, dict):
+        return {}
+    overrides: dict[str, str] = {}
+    for model, effort in models.items():
+        normalised = shared.normalize_thinking_effort(effort)
+        if normalised is not None:
+            overrides[str(model)] = normalised
+    return overrides
+
+
 def routing_table(cfg: dict) -> dict[str, str]:
     """Model id → the provider that owns it.
 
@@ -1116,10 +1193,17 @@ def build_routing_transport(
             client_cache[key] = client
         return client
 
+    overrides: dict[str, str] = {}
     for model, name in routing_table(cfg).items():
         provider_cfg = providers.get(name)
         if not isinstance(provider_cfg, dict):
             continue
+        # A model's own effort wins over its provider's, so a mixed group (a
+        # reasoning model next to one that 400s on the parameter) can be
+        # configured in one place.
+        model_override = model_thinking_overrides(provider_cfg).get(model)
+        if model_override is not None:
+            overrides[model] = model_override
         api_format = str(provider_cfg.get("api_format", "openai"))
         if name == active and api_format == default_format:
             # One instance for the active provider, so its models resolve to
@@ -1135,4 +1219,4 @@ def build_routing_transport(
                 )
                 transports[name] = transport
         routes[model] = transport
-    return RoutingTransport(default_transport, routes)
+    return RoutingTransport(default_transport, routes, overrides)

@@ -445,6 +445,129 @@ def test_the_cap_truncates_the_list_without_lowering_the_count(tmp_path):
     assert store.unacknowledged_attention_counts() == {task.id: 3}
 
 
+# The snapshot is one question answered once, under one lock: the total the
+# badge shows, the per-task counts the cards show, the rows behind both, and
+# the run to open per task all come out of the same query. What follows pins
+# that they stay one fact.
+
+
+def test_the_snapshot_adds_up_to_the_counts_it_carries(tmp_path):
+    """The number, the per-task counts, and the rows are one answer."""
+    store = _store(tmp_path)
+    behind = _new_task(store, name="behind")
+    punctual = _new_task(store, name="punctual")
+
+    # Distinct moments, so the ordering assertion is about the snapshot's
+    # own newest-first promise and not about tie-breaking on ids.
+    _run_to_terminal(store, behind, "failed", when=WHEN)
+    _run_to_terminal(store, behind, "interrupted", when=WHEN + timedelta(minutes=1))
+    _run_to_terminal(store, punctual, "failed", when=WHEN + timedelta(minutes=2))
+
+    snapshot = store.attention_snapshot()
+
+    assert snapshot["total"] == 3
+    assert snapshot["counts"] == {behind.id: 2, punctual.id: 1}
+    assert [run.task_id for run in snapshot["runs"]] == [
+        punctual.id, behind.id, behind.id,
+    ]
+    # Every task's count is the size of its own row set, checked from the
+    # snapshot itself rather than against a second query.
+    counted: dict[str, int] = {}
+    for run in snapshot["runs"]:
+        counted[run.task_id] = counted.get(run.task_id, 0) + 1
+    assert counted == snapshot["counts"]
+
+
+def test_the_snapshot_points_at_each_tasks_newest_waiting_run(tmp_path):
+    """``latest_by_task`` is the run "查看运行" should open.
+
+    Newest first, because the newest failure is the one the number is about;
+    and derived in the store rather than from whatever rows survived the cap,
+    because a task whose rows have all fallen out of a capped list still has
+    a count on its card -- and its click has to land somewhere better than
+    "the newest run, which is usually fine".
+    """
+    store = _store(tmp_path)
+    task = _new_task(store)
+    older = _run_to_terminal(store, task, "failed", when=WHEN)
+    newest = _run_to_terminal(store, task, "failed", when=WHEN + timedelta(hours=1))
+    other = _new_task(store, name="other")
+    other_run = _run_to_terminal(store, other, "failed", when=WHEN + timedelta(hours=2))
+
+    snapshot = store.attention_snapshot()
+
+    assert snapshot["latest_by_task"] == {task.id: newest, other.id: other_run}
+    assert older != newest
+
+    # The cap is where the client-side approximation broke: truncate the list
+    # below the number of runs and the map still knows every task's run.
+    capped = store.attention_snapshot(limit=2)
+    assert len(capped["runs"]) == 2
+    assert capped["total"] == 3
+    assert capped["latest_by_task"] == {task.id: newest, other.id: other_run}
+
+
+def test_the_cap_bounds_the_rows_without_hiding_a_task(tmp_path):
+    """The regression: a task can sit entirely below the cap.
+
+    The earlier cap test happened not to catch this -- both of its tasks had
+    their newest run inside the truncated window, so every task was still
+    mentioned by the rows that came back.  Give one task nothing but old runs
+    and it falls out of the list completely, which is where deriving the
+    counts from those rows went wrong: the card kept showing a number the
+    payload no longer explained, ``sum(counts)`` stopped matching ``total``,
+    and the click had no run to open.
+    """
+    store = _store(tmp_path)
+    forgotten = _new_task(store, name="forgotten")
+    forgotten_run = _run_to_terminal(store, forgotten, "failed", when=WHEN)
+    loud = _new_task(store, name="loud")
+    for minute in range(1, 4):
+        _run_to_terminal(
+            store, loud, "failed", when=WHEN + timedelta(minutes=minute)
+        )
+
+    # Three newest runs all belong to `loud`, so `forgotten` is not in `runs`.
+    snapshot = store.attention_snapshot(limit=3)
+
+    assert [run.task_id for run in snapshot["runs"]] == [loud.id] * 3
+    assert snapshot["counts"] == {loud.id: 3, forgotten.id: 1}
+    assert snapshot["total"] == 4
+    assert sum(snapshot["counts"].values()) == snapshot["total"]
+    assert snapshot["latest_by_task"][forgotten.id] == forgotten_run
+
+
+def test_the_snapshot_counts_agree_with_the_uncapped_query(tmp_path):
+    """One rule, two readers: the snapshot and the standalone count method.
+
+    They are the same question, and the endpoints mix them freely -- some read
+    ``counts`` from the snapshot, others still call the count method -- so a
+    disagreement between them would show up as a card whose number changes
+    depending on which endpoint last answered.
+    """
+    store = _store(tmp_path)
+    quiet = _new_task(store, name="quiet")
+    busy = _new_task(store, name="busy")
+    _run_to_terminal(store, quiet, "failed", when=WHEN)
+    for minute in range(1, 5):
+        _run_to_terminal(
+            store, busy, "interrupted", when=WHEN + timedelta(minutes=minute)
+        )
+
+    assert store.attention_snapshot(limit=1)["counts"] == (
+        store.unacknowledged_attention_counts()
+    )
+
+
+def test_the_snapshot_is_empty_when_nothing_waits(tmp_path):
+    store = _store(tmp_path)
+    _new_task(store)
+
+    snapshot = store.attention_snapshot()
+
+    assert snapshot == {"total": 0, "counts": {}, "runs": [], "latest_by_task": {}}
+
+
 def test_the_payload_number_is_the_length_of_the_list_it_carries(tmp_path):
     """One payload, so the badge and the rows cannot come from different places."""
     store = _store(tmp_path)

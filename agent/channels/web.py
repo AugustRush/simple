@@ -346,6 +346,10 @@ def _workflow_payload(
                 "workspace_root": step.workspace_root,
                 "permission_profile": step.permission_profile,
                 "acceptance": _acceptance_payload(getattr(step, "acceptance", None)),
+                # Sent back because a field that can be set and not read is a
+                # field the editor has to remember for itself -- and the next
+                # save, which resends what it was shown, would quietly reset it.
+                "retry_policy": dict(getattr(step, "retry_policy", None) or {}),
                 "timeout_seconds": int(step.timeout_seconds),
                 "task_id": task_id,
                 "enabled": bool(task.enabled) if task is not None else False,
@@ -378,25 +382,21 @@ def _workflow_payload(
     }
 
 
-def _attention_payload(store: Any) -> dict[str, Any]:
-    """The number on the badge and the list behind it, from one query.
+def _attention_rows(store: Any, snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """The snapshot's runs as rows a page can recognise and reopen.
 
-    Sent together because they are the same fact at two sizes, and two facts
-    is what a badge that disagrees with its own page is.  ``attention_runs``
-    carries where each run came from -- the task, and the workflow and step
-    when it has one -- because a failure that belongs to a step of a deleted
-    workflow is otherwise a row with no home, which is how a count becomes
-    impossible to find.
-
-    The reason a run is asking is left to the client's own wording: the
-    sentence already exists there next to the status labels it quotes, and a
-    second copy here would be the thing that starts saying something else.
+    Each row carries where the run came from -- the task, and the workflow
+    and step when it has one -- because a failure that belongs to a step of a
+    deleted workflow is otherwise a row with no home, which is how a count
+    becomes impossible to find.  The reason a run is asking is left to the
+    client's own wording: the sentence already exists there next to the
+    status labels it quotes, and a second copy here would be the thing that
+    starts saying something else.
     """
     tasks = {task.id: task for task in store.list_tasks()}
     workflows = {workflow.id: workflow for workflow in store.list_workflows()}
-    runs = store.unacknowledged_attention_runs()
     items = []
-    for run in runs:
+    for run in snapshot["runs"]:
         task = tasks.get(run.task_id)
         workflow_id = str(getattr(task, "workflow_id", "") or "")
         workflow = workflows.get(workflow_id)
@@ -423,9 +423,29 @@ def _attention_payload(store: Any) -> dict[str, Any]:
                 ),
             }
         )
+    return items
+
+
+def _attention_payload(store: Any) -> dict[str, Any]:
+    """The number on the badge and the list behind it, from one snapshot.
+
+    Sent together because they are the same fact at two sizes, and two facts
+    is what a badge that disagrees with its own page is.  The number and the
+    rows come out of the store's :meth:`attention_snapshot` — one query under
+    one lock — so a run finishing between two reads cannot make the payload
+    disagree with itself.
+
+    ``latest_run_by_task`` answers "which run do I open for this task" for
+    every task the count includes, including the ones whose rows fell out of
+    the capped list -- where the list's own first row would be missing and
+    the caller would be back to opening the newest run, the one that is
+    usually fine.
+    """
+    snapshot = store.attention_snapshot()
     return {
-        "unseen_attention": sum(store.unacknowledged_attention_counts().values()),
-        "attention_runs": items,
+        "unseen_attention": snapshot["total"],
+        "attention_runs": _attention_rows(store, snapshot),
+        "latest_run_by_task": snapshot["latest_by_task"],
     }
 
 
@@ -1197,10 +1217,18 @@ class WebChannel(Channel):
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         from agent.config import load_config
+        from agent.shared import THINKING_EFFORTS
 
         cfg, _ = load_config()
         masked = _mask_api_keys(cfg)
-        return JSONResponse({"config": masked})
+        # The efforts the settings page offers, sent for the same reason the
+        # permission profiles are: the page renders what this backend accepts
+        # instead of keeping its own copy of the set -- the two would drift
+        # the moment a level is added.
+        return JSONResponse({
+            "config": masked,
+            "thinking_efforts": list(THINKING_EFFORTS),
+        })
 
     async def _config_save(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -1485,7 +1513,7 @@ class WebChannel(Channel):
     def _schedule_from_body(
         self, body: dict[str, Any], existing: Any = None, *, keep_trigger: bool = False
     ):
-        from agent.scheduler import NewScheduledTask, TriggerSpec
+        from agent.scheduler import Acceptance, NewScheduledTask, TriggerSpec
         from agent.scheduler.profiles import PERMISSION_PROFILES
 
         name = str(body.get("name", getattr(existing, "name", ""))).strip()
@@ -1619,6 +1647,15 @@ class WebChannel(Channel):
             },
             selected_skills=selected_skills,
             permission_profile=permission_profile,
+            # Kept from what is stored, never read from the body.  No endpoint
+            # here can set a criterion, so a body cannot carry one -- but
+            # ``update_task`` writes this column on every save, so leaving it
+            # out does not mean "unchanged", it means the dataclass default is
+            # written over whatever was there.  Editing a step's name through
+            # the task editor would then delete the criterion its chain stops
+            # on, and the deletion would look like the step had never declared
+            # one.
+            acceptance=getattr(existing, "acceptance", None) or Acceptance(),
             # Membership is inherited, never taken from the body.  Which
             # workflow a task is a step of is decided by materialising that
             # workflow, so a request that could set it could also detach a step
@@ -1693,7 +1730,11 @@ class WebChannel(Channel):
         is an answer, an inherited one from ``borrowed_trigger`` is the next
         best thing, and only then does the step keep what it had.
         """
-        from agent.scheduler import WorkflowStep
+        from agent.scheduler import (
+            MAX_RETRY_ATTEMPTS,
+            MAX_RETRY_BACKOFF_SECONDS,
+            WorkflowStep,
+        )
 
         def answered(field_name: str, fallback: Any) -> Any:
             """The value for *field_name*: what the body said, else what was."""
@@ -1747,6 +1788,32 @@ class WebChannel(Channel):
         skills = answered("selected_skills", None)
         if skills is not None and not isinstance(skills, list):
             raise ValueError(f"步骤「{key}」的 selected_skills 必须是数组")
+        # Checked against the same bounds a task's is, and refused rather than
+        # clamped: a number that comes back different from the one that was
+        # sent is a silent disagreement about what this step will do when it
+        # fails.  The store clamps instead, because a graph written straight to
+        # it has nobody left to tell.
+        raw_retry = answered("retry_policy", None)
+        if raw_retry is not None and not isinstance(raw_retry, dict):
+            raise ValueError(f"步骤「{key}」的 retry_policy 必须是对象")
+        retry = dict(raw_retry or {})
+        try:
+            # No ``or`` fallbacks here: ``0 or 1`` is ``1``, and a
+            # max_attempts of 0 sent by the editor would slip through the
+            # range check below as the no-retry default instead of being
+            # refused.  The task-level check reads its fields the same way.
+            max_attempts = int(retry.get("max_attempts", 1))
+            backoff_seconds = int(retry.get("backoff_seconds", 30))
+        except (TypeError, ValueError):
+            raise ValueError(f"步骤「{key}」的 retry_policy 必须是整数")
+        if max_attempts < 1 or max_attempts > MAX_RETRY_ATTEMPTS:
+            raise ValueError(
+                f"步骤「{key}」的最大尝试次数必须在 1 到 {MAX_RETRY_ATTEMPTS} 之间"
+            )
+        if backoff_seconds < 0 or backoff_seconds > MAX_RETRY_BACKOFF_SECONDS:
+            raise ValueError(
+                f"步骤「{key}」的重试间隔必须在 0 到 {MAX_RETRY_BACKOFF_SECONDS} 秒之间"
+            )
         return WorkflowStep(
             key=key,
             name=given_name or key,
@@ -1772,6 +1839,10 @@ class WebChannel(Channel):
                 for item in (skills or [])
                 if str(item).strip()
             ],
+            retry_policy={
+                "max_attempts": max_attempts,
+                "backoff_seconds": backoff_seconds,
+            },
             delivery_mode=delivery_mode,
             delivery_target=delivery_target,
         )
@@ -1963,7 +2034,12 @@ class WebChannel(Channel):
 
         store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
         try:
-            unseen = store.unacknowledged_attention_counts()
+            # One snapshot for the whole response: the per-task counts on the
+            # cards, the badge number, and the rows behind it all read from
+            # the same query, so the page can add up its own rows and get the
+            # number the navigation is showing.
+            snapshot = store.attention_snapshot()
+            unseen = snapshot["counts"]
             tasks = []
             for task in store.list_tasks():
                 latest_run = store.latest_run(task.id)
@@ -1985,7 +2061,9 @@ class WebChannel(Channel):
                     # that only reaches whoever happened to be looking.  The
                     # runs come along so the page can point at them: a count
                     # with nothing to click is the question this answers.
-                    **_attention_payload(store),
+                    "unseen_attention": snapshot["total"],
+                    "attention_runs": _attention_rows(store, snapshot),
+                    "latest_run_by_task": snapshot["latest_by_task"],
                 }
             )
         finally:
@@ -2270,6 +2348,15 @@ class WebChannel(Channel):
                     model_override=task.model_override,
                     timeout_seconds=int(task.timeout_seconds),
                     selected_skills=list(task.selected_skills),
+                    # Both of these live on the task row as well as on the step,
+                    # so leaving them out does not merely fail to copy an edit
+                    # -- it writes the dataclass default over whatever the graph
+                    # said.  Editing a step's schedule would silently drop its
+                    # acceptance criterion, and with it the chain's reason to
+                    # stop at that step; and reset its retry policy to "give up
+                    # after one attempt".
+                    acceptance=task.acceptance,
+                    retry_policy=dict(task.retry_policy),
                     delivery_mode=task.delivery_mode,
                     delivery_target=task.delivery_target,
                 )

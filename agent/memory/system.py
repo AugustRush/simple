@@ -55,7 +55,7 @@ from .staging import StagingBuffer
 from .store import LTMStore
 from .retrieval import LocalRetriever
 from .consolidation import ConsolidationEngine
-from .context import ContextManager
+from .context import ContextManager, enqueue_orphan_staging_recovery
 from .worker import BackgroundMemoryWorker, BackgroundMemoryWorkerPool, PooledMemoryWorkerHandle
 from .palace import MemoryPalace
 

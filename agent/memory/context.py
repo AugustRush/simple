@@ -39,6 +39,63 @@ from .retrieval import LocalRetriever
 from .staging import StagingBuffer
 from .store import LTMStore
 
+def enqueue_orphan_staging_recovery(ctx_mgr: Any) -> int:
+    """Queue consolidation for turns stranded by sessions that never finished.
+
+    A process that dies between staging a turn and consolidating it leaves the
+    turn behind.  Nothing else ever collects it: staged rows are only deleted
+    by a successful consolidation or by an explicit ``/forget``, so without a
+    sweep at startup the turn is both invisible to memory and never reclaimed.
+
+    Both backends are scanned, because the interesting one is not on disk.  The
+    default backend is SQLite, where a session's turns are rows in the shared
+    ``palace.db`` partitioned by ``session_id`` — a filesystem scan sees
+    nothing at all.  The JSONL sweep stays for homes written by older versions.
+
+    Returns the number of interrupted sessions queued, for the caller to report.
+    """
+    enqueue = getattr(ctx_mgr, "enqueue_staging_job", None)
+    staging = getattr(ctx_mgr, "staging", None)
+    if not callable(enqueue) or staging is None:
+        return 0
+    current_sid = str(getattr(staging, "session_id", "") or "")
+    orphans: list[StagingBuffer] = []
+
+    # Only a SQLite-backed buffer names a database to scan.  A JSONL buffer
+    # (legacy homes, focused tests) has no shared partition to recover from,
+    # and falling back to the global context dir here would make this sweep
+    # reach into a home this manager was never pointed at.
+    context_dir = getattr(staging, "context_dir", None)
+    if context_dir is not None and getattr(staging, "_sqlite_backed", False):
+        for session_id, _count in StagingBuffer.discover_sqlite_sessions(context_dir):
+            if session_id != current_sid:
+                orphans.append(
+                    StagingBuffer(context_dir=context_dir, session_id=session_id)
+                )
+
+    try:
+        legacy_paths = sorted(shared.STAGING_DIR.glob("*.jsonl"))
+    except OSError:
+        legacy_paths = []
+    for path in legacy_paths:
+        try:
+            has_content = path.stat().st_size > 0
+        except OSError:
+            continue
+        if path.stem != current_sid and has_content:
+            orphans.append(StagingBuffer(path=path, session_id=path.stem))
+
+    for orphan in orphans:
+        enqueue("orphan_recovery", orphan)
+        # The queued job records the backend, context dir and session id, and
+        # ``_job_staging`` rebuilds a buffer from those when the worker picks
+        # the job up.  Holding these open until then would keep one SQLite
+        # connection per interrupted session alive for the whole run.
+        with shared._suppress_with_log("orphan staging close failed"):
+            orphan.close()
+    return len(orphans)
+
+
 class ContextManager:
     """Orchestrates LTM storage, retrieval, and consolidation.
 

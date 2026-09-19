@@ -414,3 +414,157 @@ def test_sleep_clears_staging(tmp_path):
 
     assert ctx_mgr.staging.count() == 0
     assert ctx_mgr._needs_consolidation is False
+
+
+# ── Orphan discovery (SQLite backend) ─────────────────────────────────────────
+
+
+def test_discover_sqlite_sessions_finds_every_partition(tmp_path):
+    """The SQLite backend keeps each session's turns in one shared database.
+
+    Nothing about a stranded session is visible on the filesystem, so this
+    query is the only way a later run can find turns an interrupted one left.
+    """
+    from agent import StagingBuffer
+
+    first = StagingBuffer(context_dir=tmp_path, session_id="alpha")
+    first.append("user", "one")
+    first.append("assistant", "two")
+    second = StagingBuffer(context_dir=tmp_path, session_id="beta")
+    second.append("user", "solo")
+    first.close()
+    second.close()
+
+    found = dict(StagingBuffer.discover_sqlite_sessions(tmp_path))
+
+    assert found == {"alpha": 2, "beta": 1}
+
+
+def test_discover_sqlite_sessions_skips_consolidated_partitions(tmp_path):
+    """A session whose turns were consumed is not an orphan any more."""
+    from agent import StagingBuffer
+
+    buf = StagingBuffer(context_dir=tmp_path, session_id="done")
+    buf.append("user", "hello")
+    buf.clear_all()
+    buf.close()
+
+    assert StagingBuffer.discover_sqlite_sessions(tmp_path) == []
+
+
+def test_discover_sqlite_sessions_tolerates_a_missing_database(tmp_path):
+    """A first run has nothing to recover and must still start."""
+    from agent import StagingBuffer
+
+    assert StagingBuffer.discover_sqlite_sessions(tmp_path / "absent") == []
+
+
+def test_discover_sqlite_sessions_tolerates_a_database_without_the_table(tmp_path):
+    """A home written before staging moved into SQLite has no such table."""
+    from agent import StagingBuffer
+
+    conn = sqlite3.connect(tmp_path / "palace.db")
+    conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    conn.commit()
+    conn.close()
+
+    assert StagingBuffer.discover_sqlite_sessions(tmp_path) == []
+
+
+# ── Orphan recovery enqueue ───────────────────────────────────────────────────
+
+
+class _RecordingManager:
+    """A ContextManager stand-in that records what recovery queued."""
+
+    def __init__(self, staging):
+        self.staging = staging
+        self.queued = []
+
+    def enqueue_staging_job(self, reason, staging):
+        self.queued.append((reason, staging.session_id))
+
+
+def test_orphan_recovery_queues_stranded_sqlite_sessions(tmp_path, monkeypatch):
+    """The regression this exists for: stranded rows had no collector at all.
+
+    Staged turns are only deleted by a successful consolidation, so a session
+    that dies in between leaves rows that no later run would ever look at.
+    """
+    from agent import StagingBuffer, enqueue_orphan_staging_recovery
+    from agent import shared
+
+    monkeypatch.setattr(shared, "STAGING_DIR", tmp_path / "_staging")
+
+    stranded = StagingBuffer(context_dir=tmp_path, session_id="stranded")
+    stranded.append("user", "never consolidated")
+    stranded.close()
+
+    current = StagingBuffer(context_dir=tmp_path, session_id="current")
+    manager = _RecordingManager(current)
+
+    assert enqueue_orphan_staging_recovery(manager) == 1
+    assert manager.queued == [("orphan_recovery", "stranded")]
+    current.close()
+
+
+def test_orphan_recovery_leaves_the_live_session_alone(tmp_path, monkeypatch):
+    """Consolidating the running session's own turns would race its writer."""
+    from agent import StagingBuffer, enqueue_orphan_staging_recovery
+    from agent import shared
+
+    monkeypatch.setattr(shared, "STAGING_DIR", tmp_path / "_staging")
+
+    current = StagingBuffer(context_dir=tmp_path, session_id="current")
+    current.append("user", "in flight")
+    manager = _RecordingManager(current)
+
+    assert enqueue_orphan_staging_recovery(manager) == 0
+    assert manager.queued == []
+    current.close()
+
+
+def test_orphan_recovery_still_collects_legacy_jsonl_files(tmp_path, monkeypatch):
+    """Homes written before the SQLite switch still have files to recover."""
+    from agent import StagingBuffer, enqueue_orphan_staging_recovery
+    from agent import shared
+
+    legacy_dir = tmp_path / "_staging"
+    legacy_dir.mkdir()
+    (legacy_dir / "old-session.jsonl").write_text(
+        '{"role":"user","content":"old turn","ts":"2026-04-13 00:00 UTC"}\n',
+        encoding="utf-8",
+    )
+    (legacy_dir / "empty-session.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setattr(shared, "STAGING_DIR", legacy_dir)
+
+    current = StagingBuffer(context_dir=tmp_path, session_id="current")
+    manager = _RecordingManager(current)
+
+    # The empty file is not a stranded turn, so it must not be queued.
+    assert enqueue_orphan_staging_recovery(manager) == 1
+    assert manager.queued == [("orphan_recovery", "old-session")]
+    current.close()
+
+
+def test_orphan_recovery_does_not_scan_a_db_for_a_jsonl_session(tmp_path, monkeypatch):
+    """A JSONL buffer names no database, so the sweep must not invent one.
+
+    Falling back to the global context dir here would make a test or a legacy
+    home reach into whatever palace.db the machine happens to have.
+    """
+    from agent import StagingBuffer, enqueue_orphan_staging_recovery
+    from agent import shared
+
+    monkeypatch.setattr(shared, "STAGING_DIR", tmp_path / "_staging")
+
+    # A populated database sitting in the same directory the JSONL buffer uses.
+    stranded = StagingBuffer(context_dir=tmp_path, session_id="stranded")
+    stranded.append("user", "rows in the shared db")
+    stranded.close()
+
+    jsonl = StagingBuffer(path=tmp_path / "current.jsonl", session_id="current")
+    manager = _RecordingManager(jsonl)
+
+    assert enqueue_orphan_staging_recovery(manager) == 0
+    assert manager.queued == []

@@ -1914,15 +1914,18 @@ def test_web_schedule_attention_clears_one_task_or_all(tmp_path, monkeypatch):
 
         scoped = client.post("/api/schedules/attention", json={"task_id": first})
         assert scoped.status_code == 200
+        remaining = [
+            item for item in attention["attention_runs"] if item["task_id"] != first
+        ]
         assert scoped.json() == {
             "ok": True,
             "cleared": 1,
             "unseen_attention": 1,
-            "attention_runs": [
-                item
-                for item in attention["attention_runs"]
-                if item["task_id"] != first
-            ],
+            "attention_runs": remaining,
+            # The map the cards click through, from the same snapshot: it
+            # points at the one run still waiting, and no longer names the
+            # task that was just cleared.
+            "latest_run_by_task": {remaining[0]["task_id"]: remaining[0]["run_id"]},
         }
 
         everything = client.post("/api/schedules/attention", json={})
@@ -1931,6 +1934,7 @@ def test_web_schedule_attention_clears_one_task_or_all(tmp_path, monkeypatch):
             "cleared": 1,
             "unseen_attention": 0,
             "attention_runs": [],
+            "latest_run_by_task": {},
         }
 
         # Nothing left to clear, and it says so instead of claiming work.
@@ -2033,6 +2037,7 @@ def test_web_reports_a_run_that_succeeded_over_a_skipped_schedule(tmp_path, monk
         assert client.get("/api/schedules/attention").json() == {
             "unseen_attention": 0,
             "attention_runs": [],
+            "latest_run_by_task": {},
         }
 
 
@@ -3059,6 +3064,126 @@ def test_web_editing_a_step_task_does_not_detach_it_from_its_workflow(
         }
         assert placed[analyze["task_id"]]["workflow_id"] == created["id"]
         assert placed[analyze["task_id"]]["step_key"] == "analyze"
+
+
+def test_web_a_steps_retry_policy_round_trips(tmp_path, monkeypatch):
+    """Settable on a step, sent back on the step, and still there after both
+    kinds of edit -- the graph's and the task's.
+
+    A field that can be set but not read back is one the editor cannot show,
+    and a field that a later save resets is one the editor lied about.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        body = _workflow_body()
+        body["steps"][1]["retry_policy"] = {
+            "max_attempts": 3,
+            "backoff_seconds": 5,
+        }
+        created = client.post("/api/workflows", json=body)
+        assert created.status_code == 200, created.text
+        steps = {item["key"]: item for item in created.json()["workflow"]["steps"]}
+        assert steps["analyze"]["retry_policy"] == {
+            "max_attempts": 3,
+            "backoff_seconds": 5,
+        }
+        # A step that said nothing gets the default, which is not to retry.
+        assert steps["collect"]["retry_policy"]["max_attempts"] == 1
+
+        # It reaches the task, which is the only place the retry path reads.
+        listed = {
+            item["id"]: item for item in client.get("/api/schedules").json()["tasks"]
+        }
+        assert listed[steps["analyze"]["task_id"]]["retry_policy"] == {
+            "max_attempts": 3,
+            "backoff_seconds": 5,
+        }
+
+        # A graph edit that never mentions it keeps it, like every other field
+        # the editor does not show.
+        graph_only = {
+            "name": "夜间报告",
+            "steps": [
+                {
+                    "key": item["key"],
+                    "name": item["name"],
+                    "kind": item["kind"],
+                    "payload": item["payload"],
+                    "depends_on": item["depends_on"],
+                }
+                for item in created.json()["workflow"]["steps"]
+            ],
+        }
+        resaved = client.put(
+            f"/api/workflows/{created.json()['workflow']['id']}", json=graph_only
+        )
+        assert resaved.status_code == 200, resaved.text
+        after = {item["key"]: item for item in resaved.json()["workflow"]["steps"]}
+        assert after["analyze"]["retry_policy"] == {
+            "max_attempts": 3,
+            "backoff_seconds": 5,
+        }
+
+        # And an edit of the step's *task*, which copies the task back over the
+        # step.  A field missing from that copy is not merely uncopied -- the
+        # step is rebuilt from the dataclass default, so the policy would reset
+        # to "give up after one attempt" because somebody renamed the step.
+        edited = client.put(
+            f"/api/schedules/{after['analyze']['task_id']}",
+            json=_step_edit_body(name="分析二", prompt="只改内容"),
+        )
+        assert edited.status_code == 200, edited.text
+        final = {
+            item["key"]: item
+            for item in client.get("/api/workflows").json()["workflows"][0]["steps"]
+        }
+        assert final["analyze"]["retry_policy"] == {
+            "max_attempts": 3,
+            "backoff_seconds": 5,
+        }
+
+
+def test_web_a_steps_retry_policy_is_checked_like_a_tasks(tmp_path, monkeypatch):
+    """Refused rather than clamped, and named by step.
+
+    A number that comes back different from the one that was sent is a silent
+    disagreement about what the step does when it fails, and a message that
+    does not say which step leaves the editor to guess.
+    """
+    from starlette.testclient import TestClient
+    from agent import shared
+
+    monkeypatch.setattr(shared, "SCHEDULER_DB_FILE", tmp_path / "scheduler.db")
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    with TestClient(channel.app) as client:
+        for policy in ({"max_attempts": 99}, {"max_attempts": 0}):
+            body = _workflow_body()
+            body["steps"][1]["retry_policy"] = policy
+            refused = client.post("/api/workflows", json=body)
+            assert refused.status_code == 400, refused.text
+            assert "analyze" in refused.json()["error"]
+
+        body = _workflow_body()
+        body["steps"][1]["retry_policy"] = {"backoff_seconds": 99999999}
+        refused = client.post("/api/workflows", json=body)
+        assert refused.status_code == 400, refused.text
+        assert "analyze" in refused.json()["error"]
+
+        body = _workflow_body()
+        body["steps"][1]["retry_policy"] = "not an object"
+        refused = client.post("/api/workflows", json=body)
+        assert refused.status_code == 400, refused.text
+
+        # Nothing was created by any of the refusals.
+        assert client.get("/api/workflows").json()["workflows"] == []
 
 
 def test_web_refuses_to_delete_or_pause_one_step_of_a_workflow(

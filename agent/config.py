@@ -403,6 +403,28 @@ def _validate_config(cfg: dict) -> list[str]:
                     f"providers.{pname}.thinking.effort: must be one of "
                     f"{allowed}, got '{effort}'"
                 )
+            # Per-model overrides get the same check, one warning per bad
+            # word, because each names a model the person can act on.
+            if isinstance(thinking, dict):
+                per_model = thinking.get("models")
+                if per_model is not None:
+                    if not isinstance(per_model, dict):
+                        warnings.append(
+                            f"providers.{pname}.thinking.models: must be a "
+                            f'mapping of model id to effort, like '
+                            f'{{"some-model": "high"}}'
+                        )
+                    else:
+                        for model, model_effort in per_model.items():
+                            if (
+                                shared.normalize_thinking_effort(model_effort)
+                                is None
+                            ):
+                                warnings.append(
+                                    f"providers.{pname}.thinking.models."
+                                    f"{model}: must be one of {allowed}, "
+                                    f"got '{model_effort}'"
+                                )
 
     # ── Numeric range checks ───────────────────────────────────────────────
     def _check_int(key: str, min_val: int, max_val: int) -> None:

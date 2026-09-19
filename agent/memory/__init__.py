@@ -19,7 +19,7 @@ single-module path; nothing here should import from it.
 
 from ._helpers import normalize_memory_chapter
 from .consolidation import ConsolidationEngine
-from .context import ContextManager
+from .context import ContextManager, enqueue_orphan_staging_recovery
 from .models import (
     AgentRuntimeEvent,
     ContextLimitError,
@@ -58,5 +58,6 @@ __all__ = [
     "ResolvedFact",
     "SessionWorkingState",
     "StagingBuffer",
+    "enqueue_orphan_staging_recovery",
     "normalize_memory_chapter",
 ]

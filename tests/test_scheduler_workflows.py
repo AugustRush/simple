@@ -36,6 +36,8 @@ from agent.scheduler import (
     DeliveryResult,
     DeliveryTarget,
     ExecutionResult,
+    MAX_RETRY_ATTEMPTS,
+    MAX_RETRY_BACKOFF_SECONDS,
     NewScheduledTask,
     RUN_SKIPPED_STATUS,
     RUN_SUCCESS_STATUS,
@@ -88,6 +90,7 @@ def step(
     workspace_root: str = "",
     timeout_seconds: int = 1800,
     delivery_mode: str = "standalone",
+    retry_policy: dict | None = None,
 ) -> WorkflowStep:
     body = payload
     if body is None:
@@ -104,6 +107,7 @@ def step(
         workspace_root=workspace_root,
         timeout_seconds=timeout_seconds,
         delivery_mode=delivery_mode,
+        **({"retry_policy": dict(retry_policy)} if retry_policy else {}),
     )
 
 
@@ -209,6 +213,146 @@ def test_an_entry_step_keeps_the_trigger_it_was_given(tmp_path):
         assert entry.next_run_at is not None
     finally:
         store.close()
+
+
+def test_a_steps_retry_policy_reaches_the_task_behind_it(tmp_path):
+    """A step that says "try twice" gets a task that tries twice.
+
+    The retry path reads this off the run's config snapshot, which is built
+    from the task row -- so a policy that stopped at the graph would leave the
+    step running with the no-retry default, and one flake would skip every
+    step below it.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(
+            Workflow(
+                name="flaky",
+                steps=[
+                    step("collect", trigger=clock()),
+                    step(
+                        "analyze",
+                        depends_on=["collect"],
+                        retry_policy={"max_attempts": 3, "backoff_seconds": 5},
+                    ),
+                ],
+            )
+        )
+        tasks = store.step_tasks(workflow.id)
+
+        assert tasks["analyze"].retry_policy == {
+            "max_attempts": 3,
+            "backoff_seconds": 5,
+        }
+        # A step that said nothing keeps the default, which is not to retry.
+        assert tasks["collect"].retry_policy["max_attempts"] == 1
+    finally:
+        store.close()
+
+
+def test_a_steps_retry_policy_survives_a_graph_edit(tmp_path):
+    """Re-materializing rebuilds every task from its step, so the policy has to
+    make the round trip through the stored graph as well as into the task."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(
+            Workflow(
+                name="flaky",
+                steps=[
+                    step("collect", trigger=clock()),
+                    step(
+                        "analyze",
+                        depends_on=["collect"],
+                        retry_policy={"max_attempts": 4, "backoff_seconds": 60},
+                    ),
+                ],
+            )
+        )
+        stored = store.get_workflow(workflow.id)
+        assert stored.step("analyze").retry_policy == {
+            "max_attempts": 4,
+            "backoff_seconds": 60,
+        }
+
+        store.materialize_workflow(workflow.id)
+        again = store.step_tasks(workflow.id)["analyze"]
+        assert again.retry_policy == {"max_attempts": 4, "backoff_seconds": 60}
+    finally:
+        store.close()
+
+
+def test_a_step_from_a_graph_written_before_retries_does_not_retry(tmp_path):
+    """An existing database has graphs with no such key.  Those steps have
+    never retried, so reading them as "do not retry" is what keeps an old
+    workflow behaving tomorrow the way it behaved yesterday."""
+    raw = json.dumps(
+        {
+            "name": "old",
+            "enabled": True,
+            "steps": [
+                {
+                    "key": "collect",
+                    "name": "collect",
+                    "kind": "agent_prompt",
+                    "payload": {"prompt": "do collect"},
+                    "depends_on": [],
+                    "trigger": clock().to_json(),
+                }
+            ],
+        }
+    )
+    restored = Workflow.from_graph(raw)
+
+    assert restored.step("collect").retry_policy == {
+        "max_attempts": 1,
+        "backoff_seconds": 30,
+    }
+
+
+def test_a_steps_retry_policy_is_clamped_rather_than_trusted(tmp_path):
+    """A graph can be written straight to the store by an agent, with nobody
+    left to report a bad number to.  An unbounded ``max_attempts`` is a step
+    that never gives up, and the chain below it waits on a step still trying."""
+    raw = json.dumps(
+        {
+            "name": "greedy",
+            "enabled": True,
+            "steps": [
+                {
+                    "key": "collect",
+                    "name": "collect",
+                    "kind": "agent_prompt",
+                    "payload": {"prompt": "do collect"},
+                    "depends_on": [],
+                    "trigger": clock().to_json(),
+                    "retry_policy": {
+                        "max_attempts": 9999,
+                        "backoff_seconds": 999999,
+                    },
+                },
+                {
+                    "key": "analyze",
+                    "name": "analyze",
+                    "kind": "agent_prompt",
+                    "payload": {"prompt": "do analyze"},
+                    "depends_on": ["collect"],
+                    "retry_policy": "not an object",
+                },
+            ],
+        }
+    )
+    restored = Workflow.from_graph(raw)
+
+    assert restored.step("collect").retry_policy == {
+        "max_attempts": MAX_RETRY_ATTEMPTS,
+        "backoff_seconds": MAX_RETRY_BACKOFF_SECONDS,
+    }
+    # Unreadable is the no-retry default, not a crash: a graph that cannot be
+    # read back is a workflow nobody can open or fix.
+    assert restored.step("analyze").retry_policy == {
+        "max_attempts": 1,
+        "backoff_seconds": 30,
+    }
 
 
 def test_a_dependent_step_waits_for_its_upstreams_success(tmp_path):
@@ -388,6 +532,67 @@ def test_a_refused_graph_never_becomes_tasks(tmp_path):
         store.close()
 
 
+def test_a_build_that_fails_partway_leaves_no_workflow(tmp_path, monkeypatch):
+    """A graph is only visible once every task behind it exists.
+
+    The failure is injected at the second step, so the first one's task has
+    already been written when it happens.  Committing the graph before the
+    build finished would leave a workflow that looks enabled, fires its head,
+    and then stops -- with the steps below it subscribed to nothing.
+    """
+    store = make_store(tmp_path)
+    try:
+        real = store._step_task_spec
+        calls: list[str] = []
+
+        def explode(step_obj, trigger, **kwargs):
+            calls.append(step_obj.key)
+            if len(calls) == 2:
+                raise RuntimeError("建任务时炸了")
+            return real(step_obj, trigger, **kwargs)
+
+        monkeypatch.setattr(store, "_step_task_spec", explode)
+        with pytest.raises(RuntimeError):
+            store.create_workflow(linear_workflow())
+        assert len(calls) == 2, "第一步应该已经建过了，失败才有意义"
+        assert store.list_workflows() == []
+        assert store.list_tasks() == []
+    finally:
+        store.close()
+
+
+def test_an_edit_that_fails_partway_leaves_the_old_graph_running(tmp_path, monkeypatch):
+    """Half a refresh is a graph whose steps disagree with their tasks."""
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        before = {key: task.id for key, task in store.step_tasks(workflow.id).items()}
+        stored_graph = store.get_workflow(workflow.id).to_graph()
+
+        def explode(step_obj, trigger, **kwargs):
+            raise RuntimeError("改任务时炸了")
+
+        monkeypatch.setattr(store, "_step_task_spec", explode)
+        with pytest.raises(RuntimeError):
+            store.update_workflow(
+                workflow.id,
+                Workflow(
+                    name="renamed",
+                    steps=[
+                        step("collect", trigger=clock()),
+                        step("analyze", depends_on=["collect"]),
+                        step("report", depends_on=["analyze"]),
+                    ],
+                ),
+            )
+        assert store.get_workflow(workflow.id).to_graph() == stored_graph
+        assert store.get_workflow(workflow.id).name == workflow.name
+        after = {key: task.id for key, task in store.step_tasks(workflow.id).items()}
+        assert after == before
+    finally:
+        store.close()
+
+
 # ── 3. Editing a graph does not rewire what it did not touch ───────────────
 
 
@@ -485,6 +690,44 @@ def test_deleting_a_workflow_keeps_what_it_ran(tmp_path):
         assert all(store.get_task(task_id).enabled is False for task_id in ids)
         # History is not tidied away with the graph.
         assert store.list_runs(tasks["collect"].id)
+    finally:
+        store.close()
+
+
+def test_deleting_a_workflow_takes_its_half_finished_joins(tmp_path):
+    """A round that was open when the graph went away must not close later.
+
+    Deleting a workflow leaves its steps behind, disabled.  A half-satisfied
+    join left with them is evidence from a graph nobody can open, and nothing
+    stops those tasks being switched back on one at a time -- a leftover step
+    is deletable and switchable precisely because its workflow is gone.  Turn
+    one arm of a fork back on, let it report, and the stale set completes a
+    round the other arm never took part in: the join runs on a report from
+    before the deletion, and reads output from a round that is over.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(workflow.id)
+        join_id = tasks["join"].id
+        left_signal = task_signal_name(tasks["left"].id, RUN_SUCCESS_STATUS)
+
+        # One arm of the fork reports, so the join is one name short.
+        store.emit_signal(left_signal, source="manual")
+        store.deliver_signals(now=NOW, limit=10)
+        assert store._satisfied_joins(join_id) == {left_signal}
+
+        store.delete_workflow(workflow.id)
+        assert store._satisfied_joins(join_id) == set()
+        assert store._join_arrivals(join_id) == {}
+
+        # The leftover steps can still be switched on individually, and that
+        # must not be enough to close the round the deletion interrupted.
+        store.set_enabled(join_id, True)
+        store.set_enabled(tasks["left"].id, True)
+        store.emit_signal(left_signal, source="manual")
+        store.deliver_signals(now=NOW, limit=10)
+        assert store.list_runs(join_id) == []
     finally:
         store.close()
 
@@ -1184,6 +1427,46 @@ def test_each_round_of_a_join_carries_only_that_rounds_arms(tmp_path):
                 "left",
                 "right",
             ]
+    finally:
+        store.close()
+
+
+def test_an_arrival_from_an_upstream_that_is_gone_does_not_reach_the_run(tmp_path):
+    """Editing a graph is what pulls a join's two halves apart.
+
+    ``satisfied`` was already intersected with the names the trigger waits
+    for; ``arrivals`` was not, so a payload from a step that used to be
+    upstream survived the edit and was handed to the run as an upstream
+    report.  The step below would read output from a round that was over,
+    produced by a step no longer above it.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(workflow.id)
+        join_id = tasks["join"].id
+        required = signal_names(store.get_task(join_id).trigger)
+        stale = "task:gone:succeeded"
+        store._conn.execute(
+            "INSERT INTO signal_joins "
+            "(task_id, satisfied_json, arrivals_json, updated_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                join_id,
+                json.dumps([stale]),
+                json.dumps({stale: {"step_key": "gone", "output_path": "/tmp/old"}}),
+                NOW.isoformat(),
+            ),
+        )
+        store._conn.commit()
+
+        make_due(store, tasks["start"].id)
+        run_rounds(make_handoff_service(store, tmp_path / "output"), 6)
+
+        snapshot = store.list_runs(join_id)[0].config_snapshot
+        names = [item["name"] for item in snapshot["signals"]]
+        assert stale not in names
+        assert sorted(names) == sorted(required)
     finally:
         store.close()
 

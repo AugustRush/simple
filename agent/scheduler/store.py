@@ -611,56 +611,69 @@ class SchedulerStore:
     def create_task(
         self, task: NewScheduledTask, now: Optional[datetime] = None
     ) -> ScheduledTask:
+        with self._immediate_transaction():
+            task_id = self._create_task_in_transaction(task, now=now)
+        created = self.get_task(task_id)
+        assert created is not None
+        return created
+
+    def _create_task_in_transaction(
+        self, task: NewScheduledTask, *, now: Optional[datetime] = None
+    ) -> str:
+        """Insert one task and return its id.  Caller owns the transaction.
+
+        Split out so that building the several tasks of a workflow can be one
+        transaction: a graph is stored together with the tasks behind it, and a
+        failure partway through must leave neither rather than a graph whose
+        last steps have nothing to run them.
+        """
         self._check_acceptance(task)
         created_at = (now or datetime.now(UTC)).astimezone(UTC)
         task_id = _new_id()
         next_run_at = task.trigger.initial_run_at(created_at)
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO scheduled_tasks (
-                    id, name, kind, enabled, trigger_json, payload_json,
-                    delivery_mode, delivery_target_json, model_override,
-                    overlap_policy, missed_run_policy, workspace_root,
-                    context_policy, timeout_seconds, retry_policy_json,
-                    selected_skills_json,
-                    permission_profile,
-                    acceptance_json,
-                    next_run_at, lease_until,
-                    active_run_id, last_run_at, last_success_at, created_at, updated_at,
-                    workflow_id, step_key, request_quote
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
-                """,
-                (
-                    task_id,
-                    task.name,
-                    task.kind,
-                    1 if task.enabled else 0,
-                    task.trigger.to_json(),
-                    json.dumps(task.payload, ensure_ascii=False),
-                    task.delivery_mode,
-                    task.delivery_target.to_json(),
-                    task.model_override,
-                    task.overlap_policy,
-                    task.missed_run_policy,
-                    task.workspace_root,
-                    task.context_policy,
-                    int(task.timeout_seconds),
-                    json.dumps(task.retry_policy, ensure_ascii=False),
-                    json.dumps(task.selected_skills, ensure_ascii=False),
-                    task.permission_profile,
-                    task.acceptance.to_json(),
-                    _iso(next_run_at),
-                    _iso(created_at),
-                    _iso(created_at),
-                    task.workflow_id,
-                    task.step_key,
-                    str(getattr(task, "request_quote", "") or ""),
-                ),
-            )
-        created = self.get_task(task_id)
-        assert created is not None
-        return created
+        self._conn.execute(
+            """
+            INSERT INTO scheduled_tasks (
+                id, name, kind, enabled, trigger_json, payload_json,
+                delivery_mode, delivery_target_json, model_override,
+                overlap_policy, missed_run_policy, workspace_root,
+                context_policy, timeout_seconds, retry_policy_json,
+                selected_skills_json,
+                permission_profile,
+                acceptance_json,
+                next_run_at, lease_until,
+                active_run_id, last_run_at, last_success_at, created_at, updated_at,
+                workflow_id, step_key, request_quote
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                task.name,
+                task.kind,
+                1 if task.enabled else 0,
+                task.trigger.to_json(),
+                json.dumps(task.payload, ensure_ascii=False),
+                task.delivery_mode,
+                task.delivery_target.to_json(),
+                task.model_override,
+                task.overlap_policy,
+                task.missed_run_policy,
+                task.workspace_root,
+                task.context_policy,
+                int(task.timeout_seconds),
+                json.dumps(task.retry_policy, ensure_ascii=False),
+                json.dumps(task.selected_skills, ensure_ascii=False),
+                task.permission_profile,
+                task.acceptance.to_json(),
+                _iso(next_run_at),
+                _iso(created_at),
+                _iso(created_at),
+                task.workflow_id,
+                task.step_key,
+                str(getattr(task, "request_quote", "") or ""),
+            ),
+        )
+        return task_id
 
     @_synchronized
     def find_matching_task(self, task: NewScheduledTask) -> Optional[ScheduledTask]:
@@ -1086,7 +1099,19 @@ class SchedulerStore:
         # this task is not subscribed to can never contribute to completing it.
         satisfied &= required
         missing = sorted(required - satisfied)
-        arrivals = self._join_arrivals(task.id)
+        # Filtered by the same set, for the same reason.  ``satisfied`` and
+        # ``arrivals`` are two halves of one answer -- which upstreams reported,
+        # and what they said -- so a name dropped from one has to leave the
+        # other too.  Editing a graph is what pulls them apart: a step whose
+        # upstreams changed keeps the old name's payload in this column, and
+        # `_take_join` hands it to the run as something an upstream produced.
+        # The step below would then be told about a report from a step that is
+        # no longer above it, and read output from a round that is over.
+        arrivals = {
+            name: payload
+            for name, payload in self._join_arrivals(task.id).items()
+            if name in required
+        }
         if emission.name in required:
             arrivals[emission.name] = dict(emission.payload)
         self._conn.execute(
@@ -1645,6 +1670,75 @@ class SchedulerStore:
         return [self._run_from_row(row) for row in rows]
 
     @_synchronized
+    def attention_snapshot(self, limit: int = 200) -> dict[str, Any]:
+        """The badge number, the rows behind it, and each task's newest
+        waiting run — as one answer, read under one lock.
+
+        The endpoints that serve attention send all of these together, and
+        the caller is invited to add up the rows and check them against the
+        number.  That invitation is only honest when all of it comes from one
+        snapshot: reading the count and the list through separate
+        :meth:`_synchronized` calls leaves a gap between them that the
+        scheduler thread writes through, and a number the page cannot
+        reproduce is the thing this exists to prevent.
+
+        Only ``runs`` is capped — that is what a poll asks for.  ``counts``,
+        ``total`` and ``latest_by_task`` are read without the cap, because
+        each answers a question about tasks the capped list never mentions.
+        A task whose rows all sort below the cap still shows a count on its
+        card, and clicking that count still has to land on a run; deriving
+        these three from the capped rows drops such a task outright, which
+        makes ``sum(counts)`` disagree with ``total`` and leaves the card
+        with nothing to open.  The cap bounds the payload, not the truth.
+
+        ``total`` is the sum of ``counts`` rather than its own aggregate, so
+        the badge number is arithmetically the per-task numbers beside it —
+        the one relationship the page is invited to check.
+        """
+        clause, params = self._attention_clause()
+        # One row per task, over every waiting run: the task's count and the
+        # id of its newest one.  Two narrow columns rather than the whole row,
+        # since this query exists to be exhaustive and the rows themselves are
+        # what the capped query below is for.
+        per_task = self._conn.execute(
+            f"""
+            SELECT task_id, id, task_total FROM (
+                SELECT task_id, id,
+                       COUNT(*) OVER (PARTITION BY task_id) AS task_total,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY task_id
+                           ORDER BY created_at DESC, id DESC
+                       ) AS task_rank
+                FROM scheduled_task_runs
+                WHERE {clause} AND acknowledged_at IS NULL
+            )
+            WHERE task_rank = 1
+            """,
+            params,
+        ).fetchall()
+        counts: dict[str, int] = {}
+        latest_by_task: dict[str, str] = {}
+        for row in per_task:
+            task_id = str(row["task_id"])
+            counts[task_id] = int(row["task_total"])
+            latest_by_task[task_id] = str(row["id"])
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM scheduled_task_runs
+            WHERE {clause} AND acknowledged_at IS NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            [*params, max(1, int(limit))],
+        ).fetchall()
+        return {
+            "total": sum(counts.values()),
+            "counts": counts,
+            "runs": [self._run_from_row(row) for row in rows],
+            "latest_by_task": latest_by_task,
+        }
+
+    @_synchronized
     def acknowledge_run(
         self, task_id: str, run_id: str, now: Optional[datetime] = None
     ) -> bool:
@@ -1705,49 +1799,94 @@ class SchedulerStore:
         *,
         now: Optional[datetime] = None,
     ) -> Optional[ScheduledTask]:
+        with self._immediate_transaction():
+            changed = self._update_task_in_transaction(task_id, task, now=now)
+        return self.get_task(task_id) if changed else None
+
+    def _update_task_in_transaction(
+        self,
+        task_id: str,
+        task: NewScheduledTask,
+        *,
+        now: Optional[datetime] = None,
+    ) -> bool:
+        """Rewrite one task.  False when there was no such row.
+
+        Caller owns the transaction, for the same reason
+        :meth:`_create_task_in_transaction` exists: refreshing a workflow
+        rewrites every one of its steps, and half a refresh is a graph whose
+        steps disagree with each other about what the graph says.
+        """
         self._check_acceptance(task)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
-        next_run_at = task.trigger.initial_run_at(updated_at)
-        with self._conn:
-            cursor = self._conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET name = ?, kind = ?, enabled = ?, trigger_json = ?,
-                    payload_json = ?, delivery_mode = ?, delivery_target_json = ?,
-                    model_override = ?, overlap_policy = ?, missed_run_policy = ?,
-                    workspace_root = ?, context_policy = ?, timeout_seconds = ?,
-                    retry_policy_json = ?, next_run_at = ?, updated_at = ?
-                    , selected_skills_json = ?, permission_profile = ?
-                    , acceptance_json = ?
-                    , workflow_id = ?, step_key = ?
-                WHERE id = ?
-                """,
-                (
-                    task.name,
-                    task.kind,
-                    1 if task.enabled else 0,
-                    task.trigger.to_json(),
-                    json.dumps(task.payload, ensure_ascii=False),
-                    task.delivery_mode,
-                    task.delivery_target.to_json(),
-                    task.model_override,
-                    task.overlap_policy,
-                    task.missed_run_policy,
-                    task.workspace_root,
-                    task.context_policy,
-                    int(task.timeout_seconds),
-                    json.dumps(task.retry_policy, ensure_ascii=False),
-                    _iso(next_run_at),
-                    _iso(updated_at),
-                    json.dumps(task.selected_skills, ensure_ascii=False),
-                    task.permission_profile,
-                    task.acceptance.to_json(),
-                    task.workflow_id,
-                    task.step_key,
-                    task_id,
-                ),
-            )
-        return self.get_task(task_id) if cursor.rowcount else None
+        trigger_json = task.trigger.to_json()
+        # Only a changed trigger gets a new schedule.  Recomputing it on every
+        # edit would make renaming a task -- or saving the workflow it is a
+        # step of, which rewrites every step -- push its next occurrence into
+        # the future, silently swallowing one that was already due.  What goes
+        # with it is worse than the run: an occurrence missed while the gateway
+        # was down is reported through ``missed_count``, and
+        # ``_attention_clause`` counts that as the *only* way such a gap is
+        # ever mentioned -- the run that resumes the schedule reports success.
+        # So an unrelated rename could erase the single trace of a daily report
+        # that has been missing for a week.
+        #
+        # A stored ``NULL`` is the exception: that is what disabling writes, so
+        # a task coming back on has no schedule to keep and needs one computed
+        # even though its trigger never changed.  Keeping the ``NULL`` would
+        # re-enable a task that can never fire again.
+        current = self._conn.execute(
+            "SELECT trigger_json, next_run_at FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        keeps_schedule = (
+            current is not None
+            and str(current["trigger_json"] or "") == trigger_json
+            and (current["next_run_at"] is not None or not task.enabled)
+        )
+        if keeps_schedule:
+            next_run_at = _dt(current["next_run_at"])
+        else:
+            next_run_at = task.trigger.initial_run_at(updated_at)
+        cursor = self._conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET name = ?, kind = ?, enabled = ?, trigger_json = ?,
+                payload_json = ?, delivery_mode = ?, delivery_target_json = ?,
+                model_override = ?, overlap_policy = ?, missed_run_policy = ?,
+                workspace_root = ?, context_policy = ?, timeout_seconds = ?,
+                retry_policy_json = ?, next_run_at = ?, updated_at = ?
+                , selected_skills_json = ?, permission_profile = ?
+                , acceptance_json = ?
+                , workflow_id = ?, step_key = ?
+            WHERE id = ?
+            """,
+            (
+                task.name,
+                task.kind,
+                1 if task.enabled else 0,
+                trigger_json,
+                json.dumps(task.payload, ensure_ascii=False),
+                task.delivery_mode,
+                task.delivery_target.to_json(),
+                task.model_override,
+                task.overlap_policy,
+                task.missed_run_policy,
+                task.workspace_root,
+                task.context_policy,
+                int(task.timeout_seconds),
+                json.dumps(task.retry_policy, ensure_ascii=False),
+                _iso(next_run_at),
+                _iso(updated_at),
+                json.dumps(task.selected_skills, ensure_ascii=False),
+                task.permission_profile,
+                task.acceptance.to_json(),
+                task.workflow_id,
+                task.step_key,
+                task_id,
+            ),
+        )
+        return bool(cursor.rowcount)
 
     def _upstream_reports_in_transaction(
         self, task: ScheduledTask
@@ -2671,14 +2810,17 @@ class SchedulerStore:
     ) -> Workflow:
         """Store a graph, then build the tasks it describes.
 
-        The two happen together on purpose.  A graph with no tasks behind it
-        is a drawing: it looks like a plan and runs nothing, and the person who
-        made it has no way to tell the difference from the outside.
+        The two happen together on purpose, and in one transaction.  A graph
+        with no tasks behind it is a drawing: it looks like a plan and runs
+        nothing, and the person who made it has no way to tell the difference
+        from the outside.  Committing the graph first would publish exactly that
+        drawing for as long as the build took, and leave it standing for good if
+        the build failed.
         """
         self._validate_graph(workflow.steps)
         created_at = (now or datetime.now(UTC)).astimezone(UTC)
         workflow_id = _new_id()
-        with self._conn:
+        with self._immediate_transaction():
             self._conn.execute(
                 """
                 INSERT INTO workflows (
@@ -2697,7 +2839,7 @@ class SchedulerStore:
                     _iso(created_at),
                 ),
             )
-        self.materialize_workflow(workflow_id, now=created_at)
+            self._materialize_workflow_in_transaction(workflow_id, now=created_at)
         stored = self.get_workflow(workflow_id)
         assert stored is not None
         return stored
@@ -2731,12 +2873,16 @@ class SchedulerStore:
         step's *task* and is copying that change back into the graph: the task
         is the newer of the two, and rebuilding it from the step that was
         copied from it would be a round trip that only risks losing something.
+
+        The new graph and the tasks rebuilt from it are one transaction, so an
+        edit that fails halfway leaves the previous version running rather than
+        a graph whose steps disagree with the tasks behind them.
         """
         if self.get_workflow(workflow_id) is None:
             return None
         self._validate_graph(workflow.steps)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
-        with self._conn:
+        with self._immediate_transaction():
             # `request_quote` is deliberately absent here.  It records who asked
             # for the chain, and editing a step does not change that -- while a
             # caller that rebuilds the graph from an edit form has no quote to
@@ -2758,8 +2904,10 @@ class SchedulerStore:
                     workflow_id,
                 ),
             )
-        if materialize:
-            self.materialize_workflow(workflow_id, now=updated_at)
+            if materialize:
+                self._materialize_workflow_in_transaction(
+                    workflow_id, now=updated_at
+                )
         return self.get_workflow(workflow_id)
 
     @_synchronized
@@ -2773,10 +2921,20 @@ class SchedulerStore:
         workflow did with it, and a workflow is exactly the kind of thing
         somebody deletes in order to stop it -- not in order to forget that it
         ran.  Disabling also stops any subscription they hold from firing.
+
+        A join that was part-way through its round does *not* keep that
+        progress.  Unlike the run history, a half-satisfied round is not a
+        record of something that happened -- it is an expectation about what
+        happens next, and the graph it was waiting on no longer exists.  Left
+        behind, it survives until somebody switches one of these orphaned
+        steps back on (which they may, since a step whose workflow is gone is
+        an ordinary task again), and then the first report from any one arm
+        finds the set already full and closes a round whose other arms are
+        still disabled and can never report.
         """
         now_dt = (now or datetime.now(UTC)).astimezone(UTC)
         disabled = [task.id for task in self.step_tasks(workflow_id).values()]
-        with self._conn:
+        with self._immediate_transaction():
             for task_id in disabled:
                 self._conn.execute(
                     """
@@ -2785,6 +2943,9 @@ class SchedulerStore:
                     WHERE id = ?
                     """,
                     (_iso(now_dt), task_id),
+                )
+                self._conn.execute(
+                    "DELETE FROM signal_joins WHERE task_id = ?", (task_id,)
                 )
             self._conn.execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
         return sorted(disabled)
@@ -2881,6 +3042,12 @@ class SchedulerStore:
             # the steps below it run, so losing it here would turn a chained
             # workflow back into a sequence of unrelated tasks.
             acceptance=step.acceptance,
+            # Carried through for the same reason, and it is the whole point of
+            # the field: `_enqueue_automatic_retry` reads this off the run's
+            # snapshot, so a step whose policy stopped here would be built with
+            # the no-retry default no matter what the graph said.  One flaky
+            # step in the middle of a chain would then skip every step below it.
+            retry_policy=dict(step.retry_policy),
             enabled=enabled,
             workflow_id=workflow_id,
             step_key=step.key,
@@ -2911,6 +3078,20 @@ class SchedulerStore:
         project folder from somewhere else -- an inheritance nobody can see is
         indistinguishable from a step about to run in the wrong place.
         """
+        with self._immediate_transaction():
+            return self._materialize_workflow_in_transaction(workflow_id, now=now)
+
+    def _materialize_workflow_in_transaction(
+        self, workflow_id: str, *, now: Optional[datetime] = None
+    ) -> dict[str, Any]:
+        """Body of :meth:`materialize_workflow`.  Caller owns the transaction.
+
+        Split out so that storing a graph and building the tasks behind it can
+        be one transaction rather than two.  The graph row is what makes a
+        workflow visible; committing it before its tasks exist leaves, for as
+        long as the build takes and forever if the build fails, exactly the
+        drawing that :meth:`create_workflow` exists to avoid.
+        """
         workflow = self.get_workflow(workflow_id)
         if workflow is None:
             raise ValueError(f"找不到 workflow：{workflow_id}")
@@ -2924,6 +3105,13 @@ class SchedulerStore:
         updated: list[str] = []
         inherited: list[str] = []
         task_id_by_key: dict[str, str] = {}
+        removed: list[str] = []
+        # One transaction for the whole graph.  The workflow row is written
+        # before any of its tasks exist, so a failure partway through this loop
+        # would leave a graph whose later steps have nothing to run them, while
+        # the steps that did get built are already subscribed to task ids the
+        # rest of the graph will never be told about.  A half-materialized
+        # workflow looks enabled and fires its head, then stops silently.
         for key in order:
             step = by_key[key]
             upstream_ids = [task_id_by_key[dep] for dep in step.depends_on]
@@ -2940,30 +3128,28 @@ class SchedulerStore:
                 inherited.append(key)
             current = existing.get(key)
             if current is None:
-                task = self.create_task(spec, now=now_dt)
-                created.append(task.id)
+                task_id = self._create_task_in_transaction(spec, now=now_dt)
+                created.append(task_id)
             else:
-                refreshed = self.update_task(current.id, spec, now=now_dt)
-                task = refreshed or current
-                updated.append(task.id)
-            task_id_by_key[key] = task.id
+                self._update_task_in_transaction(current.id, spec, now=now_dt)
+                task_id = current.id
+                updated.append(task_id)
+            task_id_by_key[key] = task_id
 
         # A step that is no longer in the graph must stop running.  Its task
         # and its history stay; what goes is its ability to fire.
-        removed: list[str] = []
         for key, task in existing.items():
             if key in task_id_by_key:
                 continue
             if task.enabled:
-                with self._conn:
-                    self._conn.execute(
-                        """
-                        UPDATE scheduled_tasks
-                        SET enabled = 0, next_run_at = NULL, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (_iso(now_dt), task.id),
-                    )
+                self._conn.execute(
+                    """
+                    UPDATE scheduled_tasks
+                    SET enabled = 0, next_run_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (_iso(now_dt), task.id),
+                )
             removed.append(key)
 
         return {

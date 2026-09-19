@@ -9536,7 +9536,7 @@ def test_streaming_retry_does_not_replay_text_already_shown(monkeypatch):
     attempts = 0
     shown: list[str] = []
 
-    async def failing_stream(ctx, tools, callback):
+    async def failing_stream(ctx, tools, callback, reasoning_callback=None):
         nonlocal attempts
         attempts += 1
         callback("你好，我在")
@@ -9565,7 +9565,7 @@ def test_streaming_retries_when_nothing_was_streamed_yet(monkeypatch):
     attempts = 0
     shown: list[str] = []
 
-    async def flaky_stream(ctx, tools, callback):
+    async def flaky_stream(ctx, tools, callback, reasoning_callback=None):
         nonlocal attempts
         attempts += 1
         if attempts == 1:

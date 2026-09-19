@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -1915,3 +1916,128 @@ def test_channel_runner_eviction_loses_race_against_turn_claim():
         assert "chat-a" in sessions
 
     asyncio.run(_run())
+
+
+class _PoolSpy:
+    """A worker pool stand-in that records registrations and wakes."""
+
+    def __init__(self):
+        self.registered = []
+        self.woken = []
+
+    def register(self, session_id, ctx_mgr, model, endpoint):
+        self.registered.append((session_id, model, endpoint))
+
+    def wake(self, session_id):
+        self.woken.append(session_id)
+
+
+class _RecoveryAgent:
+    def consolidation_model(self, _cfg):
+        return "cheap-model"
+
+    def consolidation_endpoint(self, _cfg):
+        return "endpoint-for-cheap-model"
+
+
+def _recovery_runner(components):
+    return ChannelRunner(channels=[], components=components, cfg={})
+
+
+def test_gateway_recovery_registers_and_wakes_the_base_manager(monkeypatch):
+    """Queuing alone is inert, so the wake is the half that does the work.
+
+    Recovery jobs land on the base context manager, which nothing registers
+    with the worker pool.  Its ``idle_elapsed()`` is 0 on a fresh process, and
+    ``should_process_jobs`` gates on ``idle_elapsed() >= idle_seconds``, so an
+    unregistered, un-woken manager holds the jobs forever.
+    """
+    monkeypatch.setattr(
+        agent_module, "enqueue_orphan_staging_recovery", lambda _mgr: 3
+    )
+    ctx_mgr = SimpleNamespace(staging=SimpleNamespace(session_id="base-session"))
+    pool = _PoolSpy()
+    runner = _recovery_runner(
+        {"context_manager": ctx_mgr, "agent": _RecoveryAgent(), "cfg": {}}
+    )
+
+    assert runner._recover_orphan_staging(runner._components, pool) == 3
+    assert pool.registered == [
+        ("base-session", "cheap-model", "endpoint-for-cheap-model")
+    ]
+    assert pool.woken == ["base-session"]
+
+
+def test_gateway_recovery_skips_the_pool_when_nothing_was_stranded(monkeypatch):
+    """A clean home must not register the base manager for consolidation."""
+    monkeypatch.setattr(
+        agent_module, "enqueue_orphan_staging_recovery", lambda _mgr: 0
+    )
+    pool = _PoolSpy()
+    runner = _recovery_runner(
+        {
+            "context_manager": SimpleNamespace(
+                staging=SimpleNamespace(session_id="base-session")
+            ),
+            "agent": _RecoveryAgent(),
+            "cfg": {},
+        }
+    )
+
+    assert runner._recover_orphan_staging(runner._components, pool) == 0
+    assert pool.registered == []
+    assert pool.woken == []
+
+
+def test_gateway_recovery_falls_back_to_a_standalone_worker(monkeypatch):
+    """Channels without a pool still need someone to drain the jobs."""
+    monkeypatch.setattr(
+        agent_module, "enqueue_orphan_staging_recovery", lambda _mgr: 2
+    )
+    started: list[str] = []
+
+    class _Worker:
+        def __init__(self, ctx_mgr, endpoint, model):
+            self.args = (ctx_mgr, endpoint, model)
+
+        def start(self):
+            started.append("start")
+
+        def wake(self):
+            started.append("wake")
+
+    monkeypatch.setattr(agent_module, "BackgroundMemoryWorker", _Worker)
+    components = {
+        "context_manager": SimpleNamespace(
+            staging=SimpleNamespace(session_id="base-session")
+        ),
+        "agent": _RecoveryAgent(),
+        "cfg": {},
+    }
+    runner = _recovery_runner(components)
+
+    assert runner._recover_orphan_staging(components, None) == 2
+    assert started == ["start", "wake"]
+    # Kept on components so channel teardown can stop the thread it started.
+    assert isinstance(components["orphan_recovery_worker"], _Worker)
+
+
+def test_gateway_recovery_never_blocks_startup(monkeypatch):
+    """A gateway must come up even when recovery cannot run at all."""
+    def _boom(_mgr):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(agent_module, "enqueue_orphan_staging_recovery", _boom)
+    pool = _PoolSpy()
+    runner = _recovery_runner(
+        {
+            "context_manager": SimpleNamespace(
+                staging=SimpleNamespace(session_id="base-session")
+            ),
+            "agent": _RecoveryAgent(),
+            "cfg": {},
+        }
+    )
+
+    assert runner._recover_orphan_staging(runner._components, pool) == 0
+    assert pool.registered == []

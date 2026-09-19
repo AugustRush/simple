@@ -796,6 +796,13 @@ MAX_ACCEPTANCE_CRITERIA = 20
 MAX_ACCEPTANCE_CRITERION_CHARS = 500
 MAX_VERIFY_COMMAND_CHARS = 2000
 
+#: Bounds on a retry policy, in one place so that every way of writing one
+#: agrees.  The API checked these itself and nothing else did, which left a
+#: policy written straight into the store unbounded: a step that never gives up
+#: is a chain that waits forever for it.
+MAX_RETRY_ATTEMPTS = 5
+MAX_RETRY_BACKOFF_SECONDS = 86400
+
 
 @dataclass
 class Acceptance:
@@ -1179,6 +1186,41 @@ RUN_UNVERIFIED_STATUS = "unverified"
 RETRYABLE_RUN_STATUSES: tuple[str, ...] = ("failed", RUN_UNVERIFIED_STATUS)
 
 
+#: The no-retry default, spelled out once.  A fresh copy per call because it is
+#: handed to a step that may then be edited.
+def _default_retry_policy() -> dict[str, Any]:
+    return {"max_attempts": 1, "backoff_seconds": 30}
+
+
+def _step_retry_policy(raw: Any) -> dict[str, Any]:
+    """A step's retry policy, read from a stored graph.
+
+    Anything unreadable becomes the no-retry default rather than raising.  A
+    graph written before this field existed has no key at all, and that is the
+    common case rather than an error -- those steps have never retried, so
+    reading them as "do not retry" is what keeps an old workflow behaving the
+    way it already behaved.
+
+    The two numbers are clamped to the same bounds the API enforces, because a
+    graph can also be written by an agent calling the store directly.  An
+    unbounded ``max_attempts`` is a step that never gives up, and the chain
+    below it waits forever for a step that is still trying.
+    """
+    data = raw if isinstance(raw, dict) else {}
+    try:
+        attempts = int(data.get("max_attempts", 1) or 1)
+    except (TypeError, ValueError):
+        attempts = 1
+    try:
+        backoff = int(data.get("backoff_seconds", 30) or 0)
+    except (TypeError, ValueError):
+        backoff = 30
+    return {
+        "max_attempts": min(MAX_RETRY_ATTEMPTS, max(1, attempts)),
+        "backoff_seconds": min(MAX_RETRY_BACKOFF_SECONDS, max(0, backoff)),
+    }
+
+
 @dataclass
 class WorkflowStep:
     """One step of a workflow: a task, plus what has to finish before it runs.
@@ -1218,6 +1260,19 @@ class WorkflowStep:
     acceptance: Acceptance = field(default_factory=Acceptance)
     delivery_mode: str = "standalone"
     delivery_target: Optional[DeliveryTarget] = None
+    #: How many times this step's work is retried before the run is called
+    #: failed, and how long to wait between attempts.  Carried on the step for
+    #: the same reason ``acceptance`` is: a failed step stops every step below
+    #: it, so "try twice before giving up" is a statement about the chain, not
+    #: about one task.  Without it every step of every workflow is built with
+    #: ``max_attempts=1`` and a flake in the middle of a chain takes the rest of
+    #: the chain down with it -- while the identical task created on its own can
+    #: be told to retry.
+    #:
+    #: ``overlap_policy`` and ``missed_run_policy`` are deliberately *not* here.
+    #: Nothing reads them (see the note above :class:`NewScheduledTask`), so a
+    #: step that carried them would offer a choice the runtime does not honour.
+    retry_policy: dict[str, Any] = field(default_factory=_default_retry_policy)
 
     def is_entry(self) -> bool:
         return not self.depends_on
@@ -1237,6 +1292,7 @@ class WorkflowStep:
             "timeout_seconds": int(self.timeout_seconds),
             "selected_skills": list(self.selected_skills),
             "acceptance": self.acceptance.to_dict(),
+            "retry_policy": dict(self.retry_policy),
             "delivery_mode": self.delivery_mode,
             "delivery_target": (
                 self.delivery_target.to_json()
@@ -1277,6 +1333,11 @@ class WorkflowStep:
                 if str(item).strip()
             ],
             acceptance=Acceptance.from_dict(data.get("acceptance")),
+            # A graph stored before this field existed has no such key, and
+            # reads back as the no-retry default -- which is what those steps
+            # have always done, so an old workflow behaves tomorrow the way it
+            # behaved yesterday.
+            retry_policy=_step_retry_policy(data.get("retry_policy")),
             delivery_mode=str(data.get("delivery_mode", "standalone") or "standalone"),
             delivery_target=(
                 DeliveryTarget.from_json(raw_target)
