@@ -874,6 +874,28 @@ class Acceptance:
             return cls()
 
 
+def acceptance_payload(acceptance: Optional["Acceptance"]) -> dict[str, Any]:
+    """What a task or step is judged by, always as an object.
+
+    Always present and always an object -- possibly with an empty ``criteria``
+    and an empty ``verify_command`` -- so a reader can take the fields without
+    checking whether the key exists.  "Nothing was declared" is a value here,
+    not an absence, and that difference is why this is not the ``None`` the
+    callers happen to be holding.
+
+    One definition for the interface and for the agent's own tools: both read
+    a task's criterion, and a criterion that grows a field has to reach every
+    reader of it.
+    """
+    to_dict = getattr(acceptance, "to_dict", None)
+    data = dict(to_dict()) if callable(to_dict) else {}
+    criteria = data.get("criteria")
+    return {
+        "criteria": [str(item) for item in criteria] if isinstance(criteria, list) else [],
+        "verify_command": str(data.get("verify_command") or ""),
+    }
+
+
 def validate_acceptance(
     acceptance: Optional["Acceptance"],
     *,

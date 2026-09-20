@@ -87,6 +87,102 @@ TAVILY_SEARCH_URL = "https://api.tavily.com/search"
 WEB_USER_AGENT = (
     "Mozilla/5.0 (compatible; PersonalAgent/1.0; +https://github.com/your/agent)"
 )
+#: How much of a failed run's text a tool result carries.
+#:
+#: The reason is what a caller acts on, and the whole of it -- along with the
+#: text the run produced -- is on disk at ``output_path``.  A log pasted into
+#: the context in full buys nothing and can cost the run its window, so every
+#: free-text field here is clipped and says so.
+RUN_REASON_CHARS = 700
+RUN_SUMMARY_CHARS = 400
+RUN_TAIL_CHARS = 400
+
+
+def _clip(text: Any, limit: int) -> str:
+    """*text*, cut to *limit* characters with the cut made visible.
+
+    Silent truncation is worse than none: a reason that ends mid-sentence reads
+    as the whole reason, and the caller stops looking.
+    """
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[:limit] + f"…（共 {len(value)} 字，此处截断）"
+
+
+def _run_outcome(run: Any) -> Optional[dict[str, Any]]:
+    """How one run ended, in the three fields a list can carry.
+
+    ``status`` and ``verdict`` travel separately because they are not the same
+    question: status says whether the run happened, verdict says whether what
+    it produced met the bar the task was given.  A run can end cleanly having
+    produced something that does not do the job, and collapsing the two is what
+    makes a useless answer read as a success.
+    """
+    if run is None:
+        return None
+    finished_at = getattr(run, "finished_at", None)
+    return {
+        "status": str(getattr(run, "status", "") or ""),
+        "verdict": str(getattr(run, "verdict", "") or ""),
+        "finished_at": finished_at.isoformat() if finished_at else None,
+    }
+
+
+def _run_detail(run: Any) -> dict[str, Any]:
+    """One run, with the reason it ended that way.
+
+    Every field the run row has that answers "why", and nothing that answers
+    "what exactly did it write" -- that question is the file itself, at
+    ``output_path``.
+    """
+    started_at = getattr(run, "started_at", None)
+    finished_at = getattr(run, "finished_at", None)
+    duration_ms = None
+    if started_at is not None and finished_at is not None:
+        duration_ms = max(0, round((finished_at - started_at).total_seconds() * 1000))
+    scheduled_for = getattr(run, "scheduled_for", None)
+    output_path = str(getattr(run, "output_path", "") or "").strip()
+    output_available = False
+    if output_path:
+        try:
+            output_available = Path(output_path).expanduser().is_file()
+        except OSError:
+            output_available = False
+    verification = getattr(run, "verification", None)
+    from agent.verification import verification_payload
+
+    raw_verification = verification_payload(verification)
+    verification_dict = None
+    if raw_verification is not None:
+        verification_dict = {
+            "status": str(raw_verification.get("status") or ""),
+            "exit_code": raw_verification.get("exit_code"),
+            "error": raw_verification.get("error"),
+            "stderr_tail": _clip(raw_verification.get("stderr_tail"), RUN_TAIL_CHARS),
+            "stdout_tail": _clip(raw_verification.get("stdout_tail"), RUN_TAIL_CHARS),
+        }
+    from agent.scheduler import run_needs_attention
+
+    return {
+        "run_id": str(getattr(run, "id", "") or ""),
+        "status": str(getattr(run, "status", "") or ""),
+        "verdict": str(getattr(run, "verdict", "") or ""),
+        "scheduled_for": scheduled_for.isoformat() if scheduled_for else None,
+        "started_at": started_at.isoformat() if started_at else None,
+        "finished_at": finished_at.isoformat() if finished_at else None,
+        "duration_ms": duration_ms,
+        "attempt": int(getattr(run, "attempt", 1) or 1),
+        "trigger_source": str(getattr(run, "trigger_source", "schedule") or "schedule"),
+        "missed_count": int(getattr(run, "missed_count", 0) or 0),
+        "needs_attention": run_needs_attention(run),
+        "acknowledged": bool(getattr(run, "acknowledged_at", None)),
+        "error": _clip(getattr(run, "error", ""), RUN_REASON_CHARS),
+        "summary": _clip(getattr(run, "summary", ""), RUN_SUMMARY_CHARS),
+        "output_path": output_path,
+        "output_available": output_available,
+        "verification": verification_dict,
+    }
 
 
 def _workflow_ancestors(steps, key: str) -> set[str]:
@@ -946,6 +1042,41 @@ class BuiltinTools:
             "List persistent scheduled tasks.",
             {"type": "object", "properties": {}, "required": []},
             self._schedule_list,
+            source="builtin",
+        )
+
+        r.register(
+            "schedule_runs",
+            (
+                "Read a scheduled task's run history -- when each run happened, "
+                "whether it succeeded, and, when it did not, why. Use it after "
+                "schedule_create or workflow_create to find out what actually "
+                "happened, and whenever the user asks whether a task ran, whether "
+                "it worked, or what went wrong with it. A scheduled run happens "
+                "with nobody watching and its outcome exists nowhere else, so this "
+                "is the only way to tell a task that has been succeeding from one "
+                "that has failed every night since it was made. Returns the run's "
+                "`error` and the acceptance check's own result; a run's full text "
+                "is at the `output_path` it returns."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": (
+                            "The task's id, from schedule_list or workflow_list."
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many recent runs to return (default 10, max 50).",
+                        "default": 10,
+                    },
+                },
+                "required": ["task_id"],
+            },
+            self._schedule_runs,
             source="builtin",
         )
 
@@ -3521,8 +3652,21 @@ class BuiltinTools:
         scheduled task, and creating each step of a workflow.  A workflow whose
         steps understood ``action_type`` differently from a standalone task
         would be a second dialect of the same language.
+
+        The content field names the action when ``action_type`` is left out:
+        a step carrying ``instruction`` is an agent task, one carrying
+        ``message_text`` is a message.  A workflow step has no ``prompt`` to
+        fall back on, so defaulting to message regardless refused the obvious
+        spelling -- ``instruction`` alone -- with a complaint about a field its
+        author never used, and the chain was never built.
         """
-        normalized = str(action_type or "message").strip().lower()
+        normalized = str(action_type or "").strip().lower()
+        if not normalized and not str(message_text or "").strip():
+            if str(instruction or "").strip():
+                normalized = "agent_task"
+            elif str(job_name or "").strip():
+                normalized = "system_job"
+        normalized = normalized or "message"
         if normalized == "message":
             text = str(message_text or prompt).strip()
             if not text:
@@ -3541,6 +3685,20 @@ class BuiltinTools:
         raise ValueError(f"Unsupported action_type '{action_type}'")
 
     def _schedule_list(self) -> dict[str, Any]:
+        """Every task, with how its last run ended.
+
+        The outcome travels with the task because a scheduled task is created
+        in one conversation and then runs in none.  Without it this list cannot
+        tell a task that has been succeeding every night from one that has
+        failed every night since the day it was made, and the two answers are
+        identical -- which is how a chain the agent built can be broken from
+        the first night and never once be noticed.
+
+        ``workflow_id``/``step_key`` are here for the same reason: from the
+        task table a step and a standalone task look alike, and the difference
+        is what says who owns the definition (a step cannot be deleted or
+        retriggered on its own) and where to look when it stops.
+        """
         store = self._schedule_store()
         tasks = store.list_tasks()
         return self._ok(
@@ -3553,9 +3711,69 @@ class BuiltinTools:
                     "delivery_mode": task.delivery_mode,
                     "next_run_at": task.next_run_at.isoformat() if task.next_run_at else None,
                     "enabled": task.enabled,
+                    "workflow_id": str(getattr(task, "workflow_id", "") or ""),
+                    "step_key": str(getattr(task, "step_key", "") or ""),
+                    "last_run": _run_outcome(store.latest_run(task.id)),
                 }
                 for task in tasks
             ],
+        )
+
+    def _schedule_runs(self, task_id: str, limit: int = 10) -> dict[str, Any]:
+        """What a task's runs actually did, newest first.
+
+        The other half of ``schedule_create``.  An unattended run happens when
+        nobody is watching, and where it ended up exists in exactly one place:
+        the run history.  ``schedule_list`` can only say the task exists, so
+        without this tool the agent builds work it can never observe -- it
+        cannot tell a chain that ran cleanly from one that has never once
+        completed, cannot say why a step stopped, and cannot fix either.
+
+        Addressed by task id, which the two list tools hand out.  The run's
+        ``error`` is where the reason is, and it is truncated: the whole of it,
+        and the text the run produced, are on disk at ``output_path`` -- read
+        that for anything longer than a reason.
+
+        ``acceptance`` is echoed because it is usually the answer.  The most
+        common way a run fails is that the criterion it was given cannot be
+        satisfied -- a verify command naming a file that step never writes --
+        and that is a defect in the definition rather than in the work, so it
+        has to be fixable by editing the task rather than by retrying it.
+        """
+        wanted = str(task_id or "").strip()
+        if not wanted:
+            return self._error(
+                "task_id 不能为空；用 schedule_list 或 workflow_list 里的 id。"
+            )
+        store = self._schedule_store()
+        task = store.get_task(wanted)
+        if task is None:
+            return self._error(
+                f"没有 id 为「{wanted}」的任务。用 schedule_list 看现有任务。"
+            )
+
+        runs = store.list_runs(task.id)
+        kept = list(reversed(runs))[: max(1, min(int(limit or 10), 50))]
+        from agent.scheduler import acceptance_payload
+
+        return self._ok(
+            task={
+                "id": task.id,
+                "name": task.name,
+                "enabled": task.enabled,
+                "workflow_id": str(getattr(task, "workflow_id", "") or ""),
+                "step_key": str(getattr(task, "step_key", "") or ""),
+                "workspace_root": task.workspace_root,
+                "acceptance": acceptance_payload(getattr(task, "acceptance", None)),
+            },
+            run_count=len(runs),
+            returned=len(kept),
+            runs=[_run_detail(run) for run in kept],
+            note=(
+                f"这个任务共有 {len(runs)} 次运行，只返回最近 {len(kept)} 次。"
+                if len(runs) > len(kept)
+                else ""
+            ),
         )
 
     def _schedule_delete(self, task_id: str) -> dict[str, Any]:
@@ -3776,28 +3994,49 @@ class BuiltinTools:
         return "\n".join(lines)
 
     def _workflow_list(self) -> dict[str, Any]:
+        """Every chain, with each step's task and how its last run ended.
+
+        The graph alone is a drawing.  What a caller needs after building one --
+        or after being told a chain exists -- is which step is where it is
+        supposed to be: a step that has never run, a step whose last run failed,
+        and a step that is waiting on an upstream all look identical from the
+        shape of the graph, and the difference is the whole of the answer to
+        "is this working".
+
+        ``task_id`` travels with each step because the run history is keyed by
+        it: without it, "why did step three stop" is a question with no way to
+        ask it.
+        """
         store = self._schedule_store()
         workflows = store.list_workflows()
-        return self._ok(
-            count=len(workflows),
-            items=[
+        items = []
+        for workflow in workflows:
+            step_tasks = store.step_tasks(workflow.id)
+            steps = []
+            for step in workflow.steps:
+                task = step_tasks.get(step.key)
+                steps.append(
+                    {
+                        "key": step.key,
+                        "name": step.name,
+                        "depends_on": list(step.depends_on),
+                        "enabled": bool(task.enabled) if task is not None else False,
+                        "task_id": task.id if task is not None else "",
+                        "last_run": _run_outcome(
+                            store.latest_run(task.id) if task is not None else None
+                        ),
+                    }
+                )
+            items.append(
                 {
                     "id": workflow.id,
                     "name": workflow.name,
                     "description": workflow.description,
                     "enabled": workflow.enabled,
-                    "steps": [
-                        {
-                            "key": step.key,
-                            "name": step.name,
-                            "depends_on": list(step.depends_on),
-                        }
-                        for step in workflow.steps
-                    ],
+                    "steps": steps,
                 }
-                for workflow in workflows
-            ],
-        )
+            )
+        return self._ok(count=len(items), items=items)
 
     def _workflow_delete(self, workflow_id: str) -> dict[str, Any]:
         """Stop a workflow, keeping the record that it ran.

@@ -887,6 +887,18 @@ def _render_static_prompt(inputs: _StaticPromptInputs) -> str:
                 "having done its job, and a task with no criterion is judged "
                 "only on whether its result was delivered."
             )
+        if "schedule_runs" in builtin_names:
+            lines.append(
+                "A scheduled task runs with nobody watching, so read back what "
+                "it did: `schedule_runs` gives each run's outcome and, when it "
+                "failed, the reason. Use it after creating a task or a "
+                "workflow, and whenever the user says one of them failed or "
+                "did not produce anything. When the reason is the criterion "
+                "itself — a `verify_command` naming a file no step writes, a "
+                "path that never exists — the defect is in the definition: fix "
+                "the task. Retrying cannot change a check that was impossible "
+                "the first time."
+            )
         if "workflow_create" in builtin_names:
             lines.append(
                 "When a request is really several jobs in an order — fetch, "

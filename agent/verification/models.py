@@ -205,6 +205,21 @@ class VerificationResult:
             ) from exc
 
 
+def verification_payload(result: VerificationResult | None) -> dict[str, Any] | None:
+    """A verification result as a reader outside this package reads it.
+
+    ``None`` rather than an empty object when there was no check, because "no
+    check was declared" and "a check ran and reported nothing" are different
+    facts and the readers say different things about them.  Otherwise the
+    model's own ``to_dict`` -- one definition of the fields, so a field added
+    to a result reaches the interface and the agent's tools together.
+    """
+    to_dict = getattr(result, "to_dict", None)
+    if not callable(to_dict):
+        return None
+    return dict(to_dict())
+
+
 def encode_verification(result: VerificationResult | None) -> str:
     """Store a verification result as JSON, or "" when there was none."""
     if result is None:

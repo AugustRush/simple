@@ -285,6 +285,7 @@ class ToolRegistry:
         ("builtin", "memory_index"): frozenset({"read"}),
         ("builtin", "context_retrieve"): frozenset({"read"}),
         ("builtin", "schedule_list"): frozenset({"read"}),
+        ("builtin", "schedule_runs"): frozenset({"read"}),
         ("builtin", "web_search"): frozenset({"read"}),
         ("builtin", "web_fetch"): frozenset({"read"}),
         ("builtin", "tavily_search"): frozenset({"read"}),

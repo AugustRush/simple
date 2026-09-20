@@ -2370,3 +2370,412 @@ def test_list_signals_shows_a_subscription_nobody_has_emitted_yet(tmp_path):
     assert payload["waiting_on_unemitted"] == [
         {"name": "never.emitted", "subscriber_count": 1}
     ]
+
+
+# --- Reading back what a scheduled run did -----------------------------------
+#
+# ``schedule_create`` and ``workflow_create`` are how a chain gets built, and
+# an unattended run happens with nobody watching: the only record of where it
+# ended up is the run history.  A tool that creates work but cannot observe it
+# leaves the agent building chains it can never find out about -- it cannot
+# tell a task that has been succeeding every night from one that has failed
+# every night since the day it was made, and it cannot say why a step stopped.
+# These tests pin the answering half of that pair.
+
+
+def _record_run(
+    db_path,
+    task_id,
+    *,
+    status="failed",
+    summary="",
+    error="",
+    output_path="",
+    verdict="",
+    verification=None,
+    at=None,
+):
+    """Drive one run through the store's real claim/finish path."""
+    from datetime import datetime, timedelta, timezone
+
+    from agent.scheduler import SchedulerStore
+
+    now = at or datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    store = SchedulerStore(db_path=Path(db_path))
+    try:
+        claimed = store.claim_task_now(task_id, now=now)
+        assert claimed is not None
+        finished = store.complete_run(
+            task_id,
+            claimed.run.id,
+            finished_at=now + timedelta(minutes=1),
+            status=status,
+            summary=summary,
+            error=error,
+            output_path=output_path,
+            verdict=verdict,
+            verification=verification,
+        )
+        assert finished is True
+        return claimed.run.id
+    finally:
+        store.close()
+
+
+def _create_workflow(registry, steps, **overrides):
+    payload = {"name": "chain", "steps": steps, "intent": "建一条链"}
+    payload.update(overrides)
+    return json.loads(asyncio.run(registry.call("workflow_create", payload)))
+
+
+def test_schedule_list_carries_how_the_last_run_ended(tmp_path):
+    """A task that has never run and a task that failed are not the same answer.
+
+    Both read as "the task exists" from the task row alone, and that is the
+    one thing the caller already knew.
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    never = _create_scheduled_task(registry, name="never-ran")
+    broken = _create_scheduled_task(registry, name="broken")
+    _record_run(
+        broken["task"]["db_path"], broken["task"]["id"], status="failed", error="炸了"
+    )
+
+    payload = json.loads(asyncio.run(registry.call("schedule_list", {})))
+    items = {item["name"]: item for item in payload["items"]}
+
+    assert items["never-ran"]["last_run"] is None
+    assert items["broken"]["last_run"]["status"] == "failed"
+
+
+def test_schedule_list_says_which_tasks_are_workflow_steps(tmp_path):
+    """From the task table a step and a standalone task look alike.
+
+    The difference is what says who owns the definition -- and a step left
+    behind by a deleted workflow has to still be recognisable as one.
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    standalone = _create_scheduled_task(registry, name="standalone")
+    created = _create_workflow(
+        registry,
+        [{"key": "collect", "name": "收集", "trigger_type": "once",
+          "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+          "instruction": "收集数据"}],
+    )
+    workflow_id = created["workflow"]["id"]
+    step_task_id = created["workflow"]["steps"][0]["task_id"]
+
+    payload = json.loads(asyncio.run(registry.call("schedule_list", {})))
+    items = {item["id"]: item for item in payload["items"]}
+
+    assert items[standalone["task"]["id"]]["workflow_id"] == ""
+    assert items[standalone["task"]["id"]]["step_key"] == ""
+    assert items[step_task_id]["workflow_id"] == workflow_id
+    assert items[step_task_id]["step_key"] == "collect"
+
+
+def test_schedule_runs_reports_the_reason_a_run_failed(tmp_path):
+    """The tool's whole job: say how it ended and, when it went wrong, why."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(registry, name="nightly")
+    _record_run(
+        created["task"]["db_path"],
+        created["task"]["id"],
+        status="failed",
+        verdict="failed",
+        error="第 3 行：找不到文件 report.md",
+        summary="写了一半",
+    )
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call("schedule_runs", {"task_id": created["task"]["id"]})
+        )
+    )
+
+    assert payload["ok"] is True
+    assert payload["run_count"] == 1
+    run = payload["runs"][0]
+    assert run["status"] == "failed"
+    assert run["verdict"] == "failed"
+    assert "找不到文件 report.md" in run["error"]
+    assert run["summary"] == "写了一半"
+
+
+def test_schedule_runs_carries_the_checks_own_result(tmp_path):
+    """A verify command's exit code and stderr are the evidence, not a story."""
+    from agent.verification import VerificationResult, VerificationStatus
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(registry, name="verified")
+    _record_run(
+        created["task"]["db_path"],
+        created["task"]["id"],
+        status="failed",
+        verdict="failed",
+        verification=VerificationResult(
+            status=VerificationStatus.FAILED,
+            exit_code=1,
+            stderr_tail="grep: report.md: No such file or directory",
+        ),
+    )
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call("schedule_runs", {"task_id": created["task"]["id"]})
+        )
+    )
+
+    verification = payload["runs"][0]["verification"]
+    assert verification["status"] == "failed"
+    assert verification["exit_code"] == 1
+    assert "No such file or directory" in verification["stderr_tail"]
+
+
+def test_schedule_runs_leaves_a_check_that_never_ran_as_no_check(tmp_path):
+    """None rather than an empty object: "no check" is itself the answer."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(registry, name="unchecked")
+    _record_run(created["task"]["db_path"], created["task"]["id"], status="succeeded")
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call("schedule_runs", {"task_id": created["task"]["id"]})
+        )
+    )
+
+    assert payload["runs"][0]["verification"] is None
+
+
+def test_schedule_runs_hands_back_the_acceptance_it_was_judged_against(tmp_path):
+    """Echoed because it is usually the answer.
+
+    The commonest way a run fails is that the criterion it was given cannot be
+    satisfied -- a verify command naming a file the step never writes -- which
+    is a defect in the definition, fixable by editing the task and not by
+    retrying it.  Reading the reason without the bar it was measured against
+    leaves the caller unable to tell the two apart.
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(
+        registry,
+        name="judged",
+        criteria=["报告里要有结论一章"],
+        verify_command="grep -q 结论 report.md",
+    )
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call("schedule_runs", {"task_id": created["task"]["id"]})
+        )
+    )
+
+    acceptance = payload["task"]["acceptance"]
+    assert acceptance["criteria"] == ["报告里要有结论一章"]
+    assert acceptance["verify_command"] == "grep -q 结论 report.md"
+
+
+def test_schedule_runs_says_whether_the_output_file_is_still_there(tmp_path):
+    """The path is a promise; ``output_available`` is whether it still holds.
+
+    A tool that only names the file sends the caller to a path that may not
+    exist, and "the file is gone" reads as "I could not read it".
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(registry, name="produced")
+    kept = tmp_path / "kept.md"
+    kept.write_text("内容", encoding="utf-8")
+
+    payload_db = created["task"]["db_path"]
+    task_id = created["task"]["id"]
+    _record_run(payload_db, task_id, status="succeeded", output_path=str(kept))
+    _record_run(
+        payload_db, task_id, status="succeeded", output_path=str(tmp_path / "gone.md")
+    )
+
+    payload = json.loads(
+        asyncio.run(registry.call("schedule_runs", {"task_id": task_id}))
+    )
+    by_path = {run["output_path"]: run for run in payload["runs"]}
+
+    assert by_path[str(kept)]["output_available"] is True
+    assert by_path[str(tmp_path / "gone.md")]["output_available"] is False
+
+
+def test_schedule_runs_clips_a_reason_that_would_flood_the_window(tmp_path):
+    """A truncated reason must say it was truncated.
+
+    A reason that ends mid-sentence reads as the whole reason, and the caller
+    stops looking -- with the rest of it sitting on disk unread.
+    """
+    from agent.tools.builtin_tools import RUN_REASON_CHARS
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(registry, name="chatty")
+    long_error = "啊" * (RUN_REASON_CHARS + 500)
+    _record_run(
+        created["task"]["db_path"], created["task"]["id"], error=long_error
+    )
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call("schedule_runs", {"task_id": created["task"]["id"]})
+        )
+    )
+    error = payload["runs"][0]["error"]
+
+    assert error.startswith("啊" * RUN_REASON_CHARS)
+    assert "截断" in error
+    assert str(len(long_error)) in error
+
+
+def test_schedule_runs_keeps_the_newest_runs_and_says_what_it_left_out(tmp_path):
+    """A capped list has to admit it is capped, or it reads as the whole story."""
+    from datetime import datetime, timedelta, timezone
+
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(registry, name="busy")
+    base = datetime(2026, 5, 1, 12, 0, tzinfo=timezone.utc)
+    for index in range(3):
+        _record_run(
+            created["task"]["db_path"],
+            created["task"]["id"],
+            status="succeeded",
+            summary=f"第 {index} 次",
+            at=base + timedelta(hours=index),
+        )
+
+    payload = json.loads(
+        asyncio.run(
+            registry.call(
+                "schedule_runs", {"task_id": created["task"]["id"], "limit": 2}
+            )
+        )
+    )
+
+    assert payload["run_count"] == 3
+    assert payload["returned"] == 2
+    assert payload["runs"][0]["summary"] == "第 2 次"
+    assert "最近 2 次" in payload["note"]
+
+
+def test_schedule_runs_refuses_an_id_that_is_not_a_task_and_says_where_to_look(tmp_path):
+    """An id from the wrong place is the likeliest way to call this wrong."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = json.loads(
+        asyncio.run(registry.call("schedule_runs", {"task_id": "nope"}))
+    )
+
+    assert payload["ok"] is False
+    assert "schedule_list" in payload["error"]
+
+
+def test_schedule_runs_needs_a_task_id(tmp_path):
+    """The id is the addressing scheme; without one there is nothing to read."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = json.loads(asyncio.run(registry.call("schedule_runs", {"task_id": ""})))
+
+    assert payload["ok"] is False
+    assert "task_id" in payload["error"]
+
+
+def test_workflow_list_names_the_task_behind_each_step_and_how_it_ended(tmp_path):
+    """The graph alone is a drawing.
+
+    Which step is where it is supposed to be -- never run, failed, waiting on
+    an upstream -- is invisible in the shape of the graph, and it is the whole
+    answer to "is this chain working".  ``task_id`` travels with each step
+    because the run history is keyed by it: without it, "why did step three
+    stop" is a question with no way to ask it.
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_workflow(
+        registry,
+        [
+            {"key": "collect", "name": "收集", "trigger_type": "once",
+             "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+             "instruction": "收集"},
+            {"key": "publish", "name": "发布", "depends_on": ["collect"],
+             "instruction": "发布"},
+        ],
+    )
+    workflow = created["workflow"]
+    step_tasks = {step["key"]: step["task_id"] for step in workflow["steps"]}
+    _record_run(
+        workflow["db_path"], step_tasks["collect"], status="failed", error="上游炸了"
+    )
+    # A second chain, made but never run, so that all three states are in one
+    # answer: failed, skipped, and not-yet.
+    idle = _create_workflow(
+        registry,
+        [{"key": "alone", "name": "没人跑过", "trigger_type": "once",
+          "at": "2026-04-21T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+          "instruction": "独自跑"}],
+        name="idle",
+    )["workflow"]
+
+    payload = json.loads(asyncio.run(registry.call("workflow_list", {})))
+    item = next(row for row in payload["items"] if row["id"] == workflow["id"])
+    steps = {step["key"]: step for step in item["steps"]}
+
+    assert steps["collect"]["task_id"] == step_tasks["collect"]
+    assert steps["collect"]["last_run"]["status"] == "failed"
+    # And the step below it, which is the part the graph alone cannot show:
+    # a failed step settles its descendants in the same transaction, so they
+    # read as skipped -- not as "waiting its turn", which is what a step with
+    # no run at all looks like and is the wrong thing to go and debug.
+    assert steps["publish"]["last_run"]["status"] == "skipped"
+    idle_item = next(row for row in payload["items"] if row["id"] == idle["id"])
+    assert idle_item["steps"][0]["last_run"] is None
+
+
+def test_schedule_runs_is_registered_as_a_read_tool(tmp_path):
+    """Reading history is not an action, so it must not need a turn request.
+
+    Classified as an action it would be refused in exactly the turn where the
+    agent has just found out something broke and needs to look -- which is the
+    turn this tool exists for.
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    assert registry.tool_capabilities("schedule_runs") == frozenset({"read"})
+
+
+def test_a_workflow_step_written_with_an_instruction_is_an_agent_task(tmp_path):
+    """The obvious spelling of a step, versus the whole chain being refused.
+
+    Unlike ``schedule_create`` a step has no ``prompt`` to fall back on, so a
+    caller who filled in ``instruction`` -- the field the schema documents for
+    agent steps -- and left ``action_type`` to its default was told that a
+    field it had never used was missing, and the chain was never built at all.
+    The content field names the action; the default only decides the case
+    where nothing was supplied.
+    """
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    created = _create_workflow(
+        registry,
+        [{"key": "collect", "name": "收集", "trigger_type": "once",
+          "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+          "instruction": "收集数据"}],
+    )
+
+    assert created["ok"] is True
+    assert created["workflow"]["steps"][0]["kind"] == "agent_prompt"
+
+
+def test_a_step_that_gave_a_literal_message_is_still_a_message(tmp_path):
+    """Inference reads the field that was supplied, not the one that was not."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    created = _create_workflow(
+        registry,
+        [{"key": "ping", "name": "提醒", "trigger_type": "once",
+          "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+          "message_text": "该开会了"}],
+    )
+
+    assert created["ok"] is True
+    assert created["workflow"]["steps"][0]["kind"] == "message"

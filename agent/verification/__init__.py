@@ -24,6 +24,7 @@ from .models import (
     decode_verification,
     encode_verification,
     verdict_for,
+    verification_payload,
 )
 from .verify import (
     DEFAULT_VERIFY_TIMEOUT_SECONDS,
@@ -51,4 +52,5 @@ __all__ = [
     "decode_verification",
     "encode_verification",
     "verdict_for",
+    "verification_payload",
 ]
