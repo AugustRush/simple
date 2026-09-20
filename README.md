@@ -1,8 +1,8 @@
 # Simple — Personal AI Agent
 
 A personal AI agent with memory, tool calling, multi-agent orchestration,
-scheduled workflows judged by their own acceptance checks, skills, plugins, and
-multi-channel delivery.
+scheduled workflows judged by their own acceptance checks and by the work
+products they declare, skills, plugins, and multi-channel delivery.
 
 ## Requirements
 
@@ -48,6 +48,7 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **Intent-before-action** | Write/shell tools require the assistant to declare what it will do before executing |
 | **Nothing gets created unasked** | Creators (`schedule_create`, `workflow_create`, `emit_signal`) must quote the user's own words from this turn, or the call is refused |
 | **Workflows** | Chain scheduled tasks into a graph, each step judged by its own acceptance check |
+| **Declared work products** | `produces` names the files a task has to leave behind: the run is told where to write, the steps below are handed what actually exists, and a promised file that is missing fails the run on its own |
 | **Run outcomes** | `succeeded` / `failed` / `unverified` / `skipped` — "we could not tell" is not "it failed" |
 | **Signals** | `emit_signal` wakes whatever subscribed, so a step can follow another without a clock |
 | **Unified event stream** | Every tool call, hook, and lifecycle fact is a replayable `RuntimeEvent` |
@@ -356,16 +357,18 @@ the Automation page.
 
 A workflow is a graph of scheduled tasks where each step runs only after the
 steps it depends on have **succeeded** — and "succeeded" is decided by that
-step's own acceptance check, not by whether the model replied.
+step's own acceptance check and by the files it declared it would produce, not
+by whether the model replied.
 
 ```text
 You: 帮我建一条流水线：先抓数据，再清洗，最后生成周报发我
 
 Agent: [workflow_create]
-       fetch    → 抓取原始数据     criteria: ["data/raw.csv 存在且非空"]
+       fetch    → 抓取原始数据     produces: ["data/raw.csv"]
        clean    → 清洗并落盘       depends_on: [fetch]
-                                   verify_command: "test -s data/clean.csv"
+                                   produces: ["data/clean.csv"]
        report   → 生成周报          depends_on: [clean]
+                                   produces: ["reports/weekly.md"]
 ```
 
 ```jsonc
@@ -376,12 +379,13 @@ Agent: [workflow_create]
   "steps": [
     {"key": "fetch",  "name": "抓取原始数据", "action_type": "agent_task",
      "instruction": "…", "trigger_type": "daily", "time_of_day": "06:00",
-     "criteria": ["data/raw.csv 存在且非空"]},
+     "produces": ["data/raw.csv"]},
     {"key": "clean",  "name": "清洗并落盘", "action_type": "agent_task",
      "instruction": "…", "depends_on": ["fetch"],
-     "verify_command": "test -s data/clean.csv"},
+     "produces": ["data/clean.csv"]},
     {"key": "report", "name": "生成周报", "action_type": "agent_task",
-     "instruction": "…", "depends_on": ["clean"]}
+     "instruction": "…", "depends_on": ["clean"],
+     "produces": ["reports/weekly.md"]}
   ]
 }
 ```
@@ -393,18 +397,27 @@ Three things are load-bearing:
   step (no upstreams) keeps a clock or a signal, which is why one graph can
   start from a schedule, from a person, or from anything else the scheduler
   already understands.
-- **`criteria` is the target; `verify_command` is the verdict.** They answer the
-  same question from opposite directions and neither replaces the other.
+- **`produces` is the work product; `criteria` is the target;
+  `verify_command` is the verdict.** `produces` names the files the step has to
+  leave behind, as paths relative to its folder — the path *is* the name, which
+  is why there is no separate one to drift. Declaring them is what tells the run
+  where to write instead of leaving it to guess, what hands the steps below the
+  resolved absolute paths of the files that exist, and what turns "the file is
+  there" into a check nobody has to write: a declared file that is missing when
+  the step ends fails that step on its own, and the steps below it do not run.
   `criteria` (what has to be true) goes into the run's system prompt — a
   scheduled run has nobody to ask, so a prompt with no stated target is judged
   only by whether the model replied, which it always does. `verify_command` is
   the machine-checkable half: a single low-risk command whose exit code decides,
   run in the step's folder, and the steps below it run only if it passed. An
-  agent's opinion of its own work is not evidence, which is why the second half
-  exists at all.
+  agent's opinion of its own work is not evidence, which is why that half exists
+  at all. Nothing is inferred across them: a task that declares no products does
+  not grow an implicit "check that the products exist", and a file being present
+  is not a claim about its contents.
 - **The graph is validated before anything is written.** A cycle, an upstream
-  that does not exist, or a step that can never be judged is refused *with the
-  step named*, while somebody can still read the error.
+  that does not exist, a product path outside the folder, or a step that can
+  never be judged is refused *with the step named*, while somebody can still
+  read the error.
 
 `workflow_delete` stops the chain and disables the tasks it built rather than
 erasing them, so their run history stays readable. The leftovers are then
@@ -1218,7 +1231,7 @@ output sink.
 | Media | `transcribe_audio` |
 | Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index`, `memory_clear`, `set_identity` |
 | Context | `context_retrieve`, `clear_context` |
-| Scheduling | `schedule_create`, `schedule_list`, `schedule_delete` |
+| Scheduling | `schedule_create`, `schedule_list`, `schedule_runs`, `schedule_delete` |
 | Workflows | `workflow_create`, `workflow_list`, `workflow_delete` |
 | Signals | `emit_signal`, `list_signals` |
 | Runs | `read_step_output`, `report_outcome` |
@@ -1235,6 +1248,14 @@ conversation, so each must carry an `intent` quoting the user's own words from
 this turn (at least six characters, verbatim) and a call whose `intent` cannot
 be found in the request is refused. `read_step_output` and `report_outcome`
 only resolve inside a scheduled run.
+
+`schedule_create` and `workflow_create` are also how a task declares what it
+has to produce (`produces`), and `schedule_list`, `workflow_list` and
+`schedule_runs` are how that declaration is read back: the creation half and
+the observation half are one pair, because a task is created in a conversation
+and then runs in none. A task the agent built that has been failing every night
+since the day it was made looks exactly like one that has been succeeding, from
+the task row alone — `schedule_runs` is the only place the difference exists.
 
 Also registered at runtime:
 
