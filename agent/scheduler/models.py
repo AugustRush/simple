@@ -796,6 +796,12 @@ MAX_ACCEPTANCE_CRITERIA = 20
 MAX_ACCEPTANCE_CRITERION_CHARS = 500
 MAX_VERIFY_COMMAND_CHARS = 2000
 
+#: Bounds on a declared product.  Bounded for the same reason the criteria are:
+#: every declared path is carried into the run's prompt and into every
+#: downstream run's report, so an unbounded list is paid for on every hop.
+MAX_PRODUCTS = 20
+MAX_PRODUCT_PATH_CHARS = 300
+
 #: Bounds on a retry policy, in one place so that every way of writing one
 #: agrees.  The API checked these itself and nothing else did, which left a
 #: policy written straight into the store unbounded: a step that never gives up
@@ -942,6 +948,229 @@ def validate_acceptance(
         raise ValueError(f"{label}的{reason}")
 
 
+def normalize_products(raw: Any) -> list[str]:
+    """A declared product list, cleaned into the shape the store writes.
+
+    A product is named by its path inside the task's workspace and by nothing
+    else.  Giving it a separate name as well would put two identities on one
+    artifact, and two identities drift -- which is why a run's ``error`` is not
+    also copied into a ``reason`` field.
+    """
+    items = raw if isinstance(raw, (list, tuple)) else []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+    return cleaned
+
+
+def product_path_problem(path: str) -> Optional[str]:
+    """Why *path* cannot be a declared product, or ``None`` when it can."""
+    raw = str(path or "").strip()
+    if not raw:
+        return "产物路径不能为空"
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        return f"产物路径「{raw}」是绝对路径；产物要按项目文件夹里的相对路径声明"
+    if any(part == ".." for part in candidate.parts):
+        return f"产物路径「{raw}」用 .. 走出了项目文件夹"
+    if raw.endswith("/") or raw.endswith("\\"):
+        return f"产物路径「{raw}」是个目录；产物是文件，目录交给它下面的文件声明"
+    return None
+
+
+def validate_products(
+    produces: Any, *, label: str = "任务"
+) -> None:
+    """Refuse a product declaration that could never be checked.
+
+    Called where a task is written rather than where it runs, for the same
+    reason :func:`validate_acceptance` is: the alternative is finding out at
+    3am, from a run whose declared products never existed.
+
+    The rule with teeth is that a product has to be *inside* the workspace.  An
+    absolute path, or one that walks out with ``..``, would make the scheduler
+    vouch for a file it has no business reaching -- and would hand the
+    downstream run, which is told the resolved absolute path, somewhere the
+    declaring task's own permission profile would never have let it write.
+    """
+    cleaned = normalize_products(produces)
+    if len(cleaned) > MAX_PRODUCTS:
+        raise ValueError(
+            f"{label}声明的产物最多 {MAX_PRODUCTS} 个，当前 {len(cleaned)} 个"
+        )
+    for path in cleaned:
+        if len(path) > MAX_PRODUCT_PATH_CHARS:
+            raise ValueError(
+                f"{label}有一个产物路径超过 {MAX_PRODUCT_PATH_CHARS} 个字符"
+            )
+        problem = product_path_problem(path)
+        if problem is not None:
+            raise ValueError(f"{label}的{problem}")
+
+
+def resolve_product_path(workspace_root: str, path: str) -> Path:
+    """Where a declared product lives, as an absolute path."""
+    return Path(workspace_root or ".").expanduser() / str(path or "").strip()
+
+
+def product_report(workspace_root: str, produces: Any) -> list[dict[str, Any]]:
+    """What the declared products actually are, as of right now.
+
+    Recorded when a run ends rather than derived whenever somebody asks,
+    because the question is "did this run leave behind the thing it promised"
+    and the answer changes the moment something overwrites or deletes the file.
+    The same reason the verdict is recorded rather than recomputed: both are
+    statements about the moment the run ended.
+
+    A product is a *file*.  A directory is not one: an empty directory would
+    satisfy an existence check while containing nothing, so "the folder is
+    there" must not be able to pass for "the work is there".
+    """
+    report: list[dict[str, Any]] = []
+    for path in normalize_products(produces):
+        absolute = resolve_product_path(workspace_root, path)
+        exists = False
+        size = 0
+        try:
+            if absolute.is_file():
+                exists = True
+                size = int(absolute.stat().st_size)
+        except OSError:
+            exists = False
+        report.append(
+            {"path": path, "absolute": str(absolute), "exists": exists, "bytes": size}
+        )
+    return report
+
+
+def missing_products(products: Any) -> list[str]:
+    """The declared paths a report says were not there."""
+    return [
+        str(item.get("path") or "")
+        for item in products_payload(products)
+        if not item["exists"]
+    ]
+
+
+def acceptance_for_run(task: Any, run: Any) -> Acceptance:
+    """The criterion one execution is judged by.
+
+    Read from the run's own snapshot rather than from the task, because that is
+    what makes the judgement stable: editing a task while one of its runs is in
+    flight must not change what that run is measured against halfway through.
+
+    Lives here rather than in the runtime because two callers need the same
+    answer -- the thing that judges the run, and the prompt that tells the run
+    what it is aiming at.  Two resolutions of one question is how a run ends up
+    being judged by a criterion it was never shown.
+    """
+    snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+    raw = snapshot.get("acceptance")
+    if raw is None:
+        return getattr(task, "acceptance", None) or Acceptance()
+    return Acceptance.from_dict(raw)
+
+
+def produces_for_run(task: Any, run: Any) -> list[str]:
+    """The files one execution was told to leave behind.
+
+    Same source and same argument as :func:`acceptance_for_run`.  A snapshot
+    from before this field existed carries no key at all and falls back to the
+    task, which is the right answer for it: a run that was never told about
+    products has none to be held to.
+    """
+    snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+    raw = snapshot.get("produces")
+    if raw is None:
+        return declared_products(task)
+    return normalize_products(raw)
+
+
+def declared_products(record: Any) -> list[str]:
+    """The products a task or step promises, whatever shape the reader holds.
+
+    Written because "no promise" arrives in three forms -- an empty list, a
+    missing attribute on something older, and ``None`` -- and every reader that
+    spelled that out itself would be a fourth place for the answer to differ.
+    """
+    return normalize_products(getattr(record, "produces", None))
+
+
+def products_for_handoff(declares: Any, report: Any) -> dict[str, Any]:
+    """What one run's products are worth to whoever runs next.
+
+    Three things are being kept apart here, and collapsing any two of them is
+    the failure this exists to prevent:
+
+    * what the task *promised* -- read off the task row, and edited with it;
+    * what the run *left* -- the report recorded when it finished;
+    * whether those agree, which is the only thing that makes either of them
+      mean anything to a downstream step.
+
+    A promised product with no file behind it is not handed over as an address.
+    Handing over ``/w/report.md`` when there is no such file is how a step ends
+    up reading somebody else's older file, or nothing at all, while the record
+    says the upstream was fine -- so the paths that did not resolve are named
+    as missing instead, which is a thing the reader can act on.
+
+    An address is resolved by the producing run and carried verbatim, rather
+    than re-derived here from the declaring task's workspace.  That is what
+    makes a step whose folder changed since still point at the file that was
+    actually written.
+    """
+    declared = normalize_products(declares)
+    recorded = {item["path"]: item for item in products_payload(report)}
+    present: list[dict[str, Any]] = []
+    absent: list[str] = []
+    for path in declared:
+        entry = recorded.get(path)
+        if entry is not None and entry["exists"]:
+            present.append(
+                {
+                    "path": path,
+                    "absolute": entry["absolute"],
+                    "bytes": entry["bytes"],
+                }
+            )
+        else:
+            absent.append(path)
+    return {"products": present, "products_missing": absent}
+
+
+def products_payload(raw: Any) -> list[dict[str, Any]]:
+    """A stored product report as a reader outside this package reads it.
+
+    Defensive for the same reason :meth:`Acceptance.from_json` is: the value
+    rides beside a run that already happened, and a corrupt column must not
+    make that run's history unreadable.  "No products recorded" is the honest
+    reading of a blob nobody can parse -- which is also exactly what a run from
+    before this column existed really has.
+    """
+    if not isinstance(raw, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "").strip()
+        if not path:
+            continue
+        items.append(
+            {
+                "path": path,
+                "absolute": str(entry.get("absolute") or ""),
+                "exists": bool(entry.get("exists")),
+                "bytes": int(entry.get("bytes") or 0),
+            }
+        )
+    return items
+
+
 @dataclass
 class NewScheduledTask:
     name: str
@@ -966,6 +1195,17 @@ class NewScheduledTask:
     #: Empty means nothing was declared, which is not the same as having been
     #: judged and passing -- see :class:`Acceptance`.
     acceptance: Acceptance = field(default_factory=Acceptance)
+    #: The files this task promises to leave in its workspace, as paths relative
+    #: to ``workspace_root``.
+    #:
+    #: The other half of the contract, and the half that was missing: a task
+    #: whose work is "produce this file" had no way to say so, so the path it
+    #: writes to existed only in prose -- or, worse, only inside a
+    #: ``verify_command`` that checked a file the run was never told about.
+    #: Declared here, one path serves three readers that all used to guess:
+    #: the run is told where to write, the downstream is handed the address,
+    #: and "the file is there and not empty" becomes a check nobody writes.
+    produces: list[str] = field(default_factory=list)
     #: Set only when the task is one step of a workflow.  Part of the task's
     #: *identity* rather than of its behaviour: an identical definition created
     #: on its own is a different thing from a step, and deduplication that
@@ -1018,6 +1258,10 @@ class ScheduledTask:
     created_at: datetime
     updated_at: datetime
     acceptance: Acceptance = field(default_factory=Acceptance)
+    #: The files this run was told to leave behind, read off the task.  An old
+    #: row reads back as the empty list, which is what it had: no task before
+    #: this column existed was ever told to produce anything.
+    produces: list[str] = field(default_factory=list)
     #: Which workflow this task is a step of, and which step.  Empty for a
     #: standalone task -- most tasks are, and a task does not have to belong to
     #: anything to be scheduled.  Kept on the task rather than looked up from
@@ -1092,6 +1336,14 @@ class TaskRun:
     #: can show the exit code and the tail of what the check said.  ``None``
     #: when no criterion was declared.
     verification: Optional[VerificationResult] = None
+    #: What the declared products actually were when this run ended: one entry
+    #: per declared path, with whether the file was there and how big it was.
+    #:
+    #: Empty means nothing was declared, which is not the same as "declared and
+    #: produced nothing" -- the same distinction the verdict makes.  It is
+    #: recorded rather than recomputed on demand because the question is about
+    #: this run, and the file may have been overwritten or deleted since.
+    products: list[dict[str, Any]] = field(default_factory=list)
     config_snapshot: dict[str, Any] = field(default_factory=dict)
     trigger_source: str = "schedule"
     attempt: int = 1
@@ -1130,6 +1382,11 @@ def execution_snapshot(task: ScheduledTask) -> dict[str, Any]:
         # the task at completion time would let an edit made mid-run change
         # what an already-running execution is judged against.
         "acceptance": task.acceptance.to_dict(),
+        # Carried for the same reason, and it is the same kind of statement:
+        # the products a run is *told* to leave are part of what it was asked
+        # to do, so an edit made while it is running must not change the
+        # contract the run is being held to halfway through.
+        "produces": list(getattr(task, "produces", []) or []),
         "delivery_mode": task.delivery_mode,
         "delivery_target": {
             "target_type": task.delivery_target.target_type,
@@ -1280,6 +1537,14 @@ class WorkflowStep:
     #: step runs only when its upstreams *succeeded*, so this is what decides
     #: whether the chain continues or stops here.
     acceptance: Acceptance = field(default_factory=Acceptance)
+    #: The files this step promises to leave in its workspace, as paths
+    #: relative to its ``workspace_root``.
+    #:
+    #: On the step for the same reason ``acceptance`` is: what a step produces
+    #: is what the steps below it need, so it is a statement about the chain
+    #: rather than about one run.  The graph's edges say *when* the next step
+    #: runs; these say *what* it can count on being there.
+    produces: list[str] = field(default_factory=list)
     delivery_mode: str = "standalone"
     delivery_target: Optional[DeliveryTarget] = None
     #: How many times this step's work is retried before the run is called
@@ -1314,6 +1579,7 @@ class WorkflowStep:
             "timeout_seconds": int(self.timeout_seconds),
             "selected_skills": list(self.selected_skills),
             "acceptance": self.acceptance.to_dict(),
+            "produces": list(self.produces),
             "retry_policy": dict(self.retry_policy),
             "delivery_mode": self.delivery_mode,
             "delivery_target": (
@@ -1355,6 +1621,11 @@ class WorkflowStep:
                 if str(item).strip()
             ],
             acceptance=Acceptance.from_dict(data.get("acceptance")),
+            # A graph stored before this field existed has no such key and
+            # reads back as the empty list, which is what those steps had: no
+            # step was ever told to produce anything, so backfilling one would
+            # be inventing a promise nobody made.
+            produces=normalize_products(data.get("produces")),
             # A graph stored before this field existed has no such key, and
             # reads back as the no-retry default -- which is what those steps
             # have always done, so an old workflow behaves tomorrow the way it

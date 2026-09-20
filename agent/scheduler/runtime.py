@@ -11,6 +11,7 @@ from agent import shared
 from agent.verification import (
     VERDICT_FAILED,
     VERDICT_NONE,
+    VERDICT_PASSED,
     VERDICT_UNKNOWN,
     CommandVerifier,
     VerificationResult,
@@ -26,7 +27,13 @@ from .models import (
     DeliveryResult,
     DeliveryTarget,
     ExecutionResult,
+    acceptance_for_run,
+    declared_products,
     describe_missed_occurrences,
+    missing_products,
+    normalize_products,
+    product_report,
+    produces_for_run,
 )
 from .store import SchedulerStore
 
@@ -290,6 +297,11 @@ class SchedulerService:
             finished_at=now(),
             status="interrupted",
             error=reason,
+            # Observed like every other ending, so a reader never has to ask
+            # which terminal states recorded their products and which did not.
+            # Nothing is judged here either: an interrupted run has no verdict,
+            # because the scheduler stopped being able to say what happened.
+            products=self._measure_products(task, run),
         )
 
     async def _enqueue_automatic_retry(self, task, run, finished_at: datetime) -> None:
@@ -323,32 +335,74 @@ class SchedulerService:
     def _acceptance_for(self, task, run) -> Acceptance:
         """The criterion this execution is judged by.
 
-        Read from the run's own snapshot rather than from the task, because
-        that is what makes the judgement stable: editing a task while one of
-        its runs is in flight must not change what that run is measured
-        against halfway through.
+        Thin, and kept only because the name is what the judgement code below
+        reads as.  The resolution itself is shared with the prompt that tells
+        the run what it is aiming at -- see :func:`acceptance_for_run`.
         """
+        return acceptance_for_run(task, run)
+
+    def _measure_products(self, task, run) -> list[dict]:
+        """What the declared products actually are, on disk, right now.
+
+        Measured when a run ends and not when somebody asks, because this is a
+        statement about *this* run: the file may have been overwritten or
+        deleted since, and "was it there when the work finished" is the only
+        version of the question that can be answered later.
+        """
+        declares = produces_for_run(task, run)
+        if not declares:
+            return []
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})
-        raw = snapshot.get("acceptance")
-        if raw is None:
-            return getattr(task, "acceptance", None) or Acceptance()
-        return Acceptance.from_dict(raw)
+        workspace = str(
+            snapshot.get("workspace_root")
+            or getattr(task, "workspace_root", "")
+            or ""
+        ).strip()
+        return product_report(workspace or str(Path.cwd()), declares)
 
     async def _evaluate_acceptance(
-        self, task, run, result: ExecutionResult
-    ) -> tuple[str, Optional[VerificationResult]]:
+        self, task, run, result: ExecutionResult, products: Any = None
+    ) -> tuple[str, Optional[VerificationResult], str]:
         """Decide what the work was worth, from every source that has a say.
 
-        Two sources, and the rule between them is asymmetric: either can fail
-        the run, and both must pass for it to pass.  A self-report is weaker
-        evidence than a command, so it can only ever *lower* the verdict -- an
-        agent saying "done" must never stand in for a check that could not run.
+        Three sources, and the rule between them is asymmetric: any one can
+        fail the run, and all must pass for it to pass.  A self-report is
+        weaker evidence than a command, so it can only ever *lower* the verdict
+        -- an agent saying "done" must never stand in for a check that could
+        not run.
+
+        A declared product that is not there is the strongest of the three and
+        the only one that is neither a claim nor a command: it is a file that
+        was promised and is absent.  The check is symmetric, because a
+        declaration is a *bar*: every promised file being present is that bar
+        being met, and a run whose products were checked and found must not
+        report "nothing was judged" -- which is what an empty verdict means.
+        ``products`` is the report, so it is empty only when nothing was
+        declared, which is the one case that really does have nothing to say.
+        Nothing is inferred beyond that: no products declared is *not* an
+        implicit "check that the products exist".
+
+        Returns the verdict, the command's own result (``None`` when no command
+        was declared), and a sentence naming any product that was promised and
+        not found.  The sentence is returned rather than logged so that it
+        lands in the run's ``error`` beside the other reasons, which is where
+        somebody reading a failure will look for it.
         """
         acceptance = self._acceptance_for(task, run)
         self_verdict = str(getattr(result, "self_report_verdict", "") or "")
+        missing = missing_products(products)
+        if not products:
+            products_verdict = ""
+        elif missing:
+            products_verdict = VERDICT_FAILED
+        else:
+            products_verdict = VERDICT_PASSED
+        products_error = ""
+        if missing:
+            products_error = "声明的产物没有产出：" + "、".join(missing)
         command = str(acceptance.verify_command or "").strip()
         if not command:
-            return combine_verdicts(self_verdict), None
+            return combine_verdicts(self_verdict, products_verdict), None, products_error
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})
         workspace = str(
             snapshot.get("workspace_root") or getattr(task, "workspace_root", "") or ""
@@ -361,7 +415,11 @@ class SchedulerService:
             output_dir=shared.DEFAULT_OUTPUT_DIR,
         )
         verification = await verifier.verify(command)
-        return combine_verdicts(self_verdict, verification.verdict), verification
+        return (
+            combine_verdicts(self_verdict, verification.verdict, products_verdict),
+            verification,
+            products_error,
+        )
 
     @staticmethod
     def _status_for(verdict: str, delivered: bool) -> str:
@@ -466,7 +524,10 @@ class SchedulerService:
                 successful_delivery = True
             if not successful_delivery and not delivery_error:
                 delivery_error = f"unexpected delivery status: {delivery_status or 'empty'}"
-            verdict, verification = await self._evaluate_acceptance(task, run, result)
+            products = self._measure_products(task, run)
+            verdict, verification, products_error = await self._evaluate_acceptance(
+                task, run, result, products
+            )
             status = self._status_for(verdict, successful_delivery)
             # Every reason this run is not a clean success, kept together
             # rather than reduced to one.  A run can be wrong in more than one
@@ -477,6 +538,7 @@ class SchedulerService:
                 for part in (
                     str(getattr(result, "self_report_reason", "") or "").strip(),
                     verification.diagnostic() if verification is not None else "",
+                    products_error,
                     delivery_error,
                 )
                 if part
@@ -504,6 +566,7 @@ class SchedulerService:
                 delivery_status=delivery_status,
                 verdict=verdict,
                 verification=verification,
+                products=products,
             )
             if status in RETRYABLE_RUN_STATUSES:
                 await self._enqueue_automatic_retry(task, run, finished_at)
@@ -517,6 +580,7 @@ class SchedulerService:
                     status="cancelled",
                     error="cancelled by user",
                     output_path=result.output_path if result is not None else "",
+                    products=self._measure_products(task, run),
                 )
             else:
                 await self._store_call(
@@ -543,6 +607,15 @@ class SchedulerService:
                 status=status,
                 error=str(exc),
                 output_path=result.output_path if result is not None else "",
+                # Recorded here too, and this is the path the "why did nothing
+                # come out of it" question is usually asked about: a timeout is
+                # how a run that got most of the way there ends, and the
+                # difference between "it wrote nothing" and "it wrote the CSV
+                # and never got to the report" is the whole diagnosis.  Not
+                # judged, only observed -- a failed run has no verdict to
+                # lower, and the products it did leave are not handed to
+                # anybody, because nothing downstream runs on a failure.
+                products=self._measure_products(task, run),
             )
             if status in RETRYABLE_RUN_STATUSES:
                 await self._enqueue_automatic_retry(task, run, finished_at)

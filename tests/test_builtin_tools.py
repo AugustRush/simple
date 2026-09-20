@@ -2393,6 +2393,7 @@ def _record_run(
     output_path="",
     verdict="",
     verification=None,
+    products=None,
     at=None,
 ):
     """Drive one run through the store's real claim/finish path."""
@@ -2415,6 +2416,7 @@ def _record_run(
             output_path=output_path,
             verdict=verdict,
             verification=verification,
+            products=products,
         )
         assert finished is True
         return claimed.run.id
@@ -2779,3 +2781,208 @@ def test_a_step_that_gave_a_literal_message_is_still_a_message(tmp_path):
 
     assert created["ok"] is True
     assert created["workflow"]["steps"][0]["kind"] == "message"
+
+# ---------------------------------------------------------------------------
+# The other half of the contract: what a task promises to leave behind.
+#
+# A task could say what *done* meant but not what *work product* it owed, so
+# the path a run had to write existed only in prose -- or, worse, only inside
+# the ``verify_command`` that checked a file the run had never been told
+# about.  ``produces`` is the declaration; these tests pin the four places a
+# caller meets it: creation echoes it, the lists carry it, the run history
+# says whether it was met, and a path outside the workspace is refused at the
+# moment it is written rather than at 3am.
+# ---------------------------------------------------------------------------
+
+
+def test_schedule_create_stores_the_declared_products_and_says_them_out_loud(tmp_path):
+    """Echoed for the same reason the acceptance envelope is: the list is what
+    the run will be *told* to write, so a declaration the caller cannot see is
+    a run writing files somewhere nobody asked for."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(registry, produces=["out/report.md", "notes.md"])
+    task = _stored_task(payload)
+
+    assert payload["task"]["produces"] == ["out/report.md", "notes.md"]
+    assert task.produces == ["out/report.md", "notes.md"]
+    assert "out/report.md" in payload["summary_text"]
+    # And the *stored* list, not the raw argument -- so a caller that passed a
+    # path twice sees one entry, which is what the run will be held to.
+    again = _create_scheduled_task(registry, name="other", produces=["a.md", " a.md "])
+    assert again["task"]["produces"] == ["a.md"]
+
+
+def test_schedule_create_refuses_a_product_outside_the_workspace(tmp_path):
+    """Refused while somebody is looking at it, not discovered at 3am."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    for bad in ("/etc/passwd", "../elsewhere.md", "out/"):
+        payload = _create_scheduled_task(registry, name=f"bad-{len(bad)}", produces=[bad])
+        assert payload["ok"] is False, bad
+        assert "产物" in payload["error"], bad
+
+
+def test_schedule_create_without_products_does_not_grow_an_empty_section(tmp_path):
+    """The majority case must read exactly as it did before this existed."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    payload = _create_scheduled_task(registry)
+
+    assert payload["task"]["produces"] == []
+    assert "产出" not in payload["summary_text"]
+
+
+def test_schedule_list_carries_what_each_task_promises_to_produce(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    _create_scheduled_task(registry, name="makes-a-file", produces=["out/report.md"])
+    _create_scheduled_task(registry, name="makes-nothing")
+
+    payload = json.loads(asyncio.run(registry.call("schedule_list", {})))
+    items = {item["name"]: item for item in payload["items"]}
+
+    assert items["makes-a-file"]["produces"] == ["out/report.md"]
+    assert items["makes-nothing"]["produces"] == []
+
+
+def test_schedule_runs_says_which_declared_products_were_actually_produced(tmp_path):
+    """The declaration and the measurement, both, because neither answers the
+    question alone: an empty list with an empty declaration means the task
+    never promised anything, and an empty list with a declaration means the
+    work did not produce it -- and "declared nothing" must not be able to read
+    as "produced nothing"."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(registry, name="nightly", produces=["out/report.md"])
+    _record_run(
+        created["task"]["db_path"],
+        created["task"]["id"],
+        status="failed",
+        verdict="failed",
+        error="声明的产物没有产出：out/report.md",
+        products=[{"path": "out/report.md", "absolute": "/w/out/report.md", "exists": False, "bytes": 0}],
+    )
+
+    payload = json.loads(
+        asyncio.run(registry.call("schedule_runs", {"task_id": created["task"]["id"]}))
+    )
+
+    # The task block carries the promise...
+    assert payload["task"]["produces"] == ["out/report.md"]
+    # ...and the run carries what was measured against it.  A promised path
+    # with no file behind it is *missing*, not an entry in ``products``: one
+    # question, one answer, in the same shape the step below is handed.
+    run = payload["runs"][0]
+    assert run["products"] == []
+    assert run["products_missing"] == ["out/report.md"]
+
+
+def test_schedule_runs_reports_a_produced_file_with_its_address_and_size(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    created = _create_scheduled_task(registry, name="nightly", produces=["out/report.md"])
+    _record_run(
+        created["task"]["db_path"],
+        created["task"]["id"],
+        status="succeeded",
+        verdict="passed",
+        products=[
+            {
+                "path": "out/report.md",
+                "absolute": "/w/out/report.md",
+                "exists": True,
+                "bytes": 64,
+            }
+        ],
+    )
+
+    payload = json.loads(
+        asyncio.run(registry.call("schedule_runs", {"task_id": created["task"]["id"]}))
+    )
+
+    assert payload["runs"][0]["products"] == [
+        {"path": "out/report.md", "absolute": "/w/out/report.md", "bytes": 64}
+    ]
+    assert payload["runs"][0]["products_missing"] == []
+
+
+def test_schedule_runs_separates_declaring_nothing_from_producing_nothing(tmp_path):
+    """Two runs, one task that promised a file and did not write it, one that
+    never promised anything.  Both have an empty product list; only one has a
+    missing entry, and that is the difference a reader acts on."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    promised = _create_scheduled_task(registry, name="promised", produces=["a.md"])
+    silent = _create_scheduled_task(registry, name="silent")
+    for created in (promised, silent):
+        _record_run(created["task"]["db_path"], created["task"]["id"], status="succeeded")
+
+    def runs_of(created):
+        return json.loads(
+            asyncio.run(registry.call("schedule_runs", {"task_id": created["task"]["id"]}))
+        )
+
+    promised_run = runs_of(promised)["runs"][0]
+    silent_run = runs_of(silent)["runs"][0]
+
+    assert promised_run["products"] == [] and silent_run["products"] == []
+    assert promised_run["products_missing"] == ["a.md"]
+    assert silent_run["products_missing"] == []
+
+
+def test_a_step_declares_its_products_and_the_chain_says_so(tmp_path):
+    """A step's products are the same declaration as a task's, because a step
+    *is* a task -- a second dialect of the same language is how two callers
+    come to disagree about what "done" means."""
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    created = _create_workflow(
+        registry,
+        [
+            {"key": "collect", "name": "收集", "trigger_type": "once",
+             "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+             "instruction": "收集数据", "produces": ["raw.json"]},
+            {"key": "analyze", "name": "分析", "depends_on": ["collect"],
+             "instruction": "分析", "criteria": ["the summary exists"],
+             "produces": ["summary.md"]},
+        ],
+    )
+
+    assert created["ok"] is True
+    steps = {step["key"]: step for step in created["workflow"]["steps"]}
+    assert steps["collect"]["produces"] == ["raw.json"]
+    assert steps["analyze"]["produces"] == ["summary.md"]
+    # Named per step, because a chain has many and "a product is missing" does
+    # not say which step to go and look at.
+    assert "产出文件：raw.json" in created["summary_text"]
+    assert "产出文件：summary.md" in created["summary_text"]
+
+
+def test_workflow_list_carries_each_step_s_products(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+    _create_workflow(
+        registry,
+        [
+            {"key": "collect", "name": "收集", "trigger_type": "once",
+             "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+             "instruction": "收集数据", "produces": ["raw.json"]},
+        ],
+    )
+
+    payload = json.loads(asyncio.run(registry.call("workflow_list", {})))
+    step = payload["items"][0]["steps"][0]
+
+    assert step["produces"] == ["raw.json"]
+
+
+def test_workflow_create_refuses_a_step_product_outside_the_workspace(tmp_path):
+    _tools, registry, _workspace = make_builtin_tools(tmp_path)
+
+    created = _create_workflow(
+        registry,
+        [
+            {"key": "collect", "name": "收集", "trigger_type": "once",
+             "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+             "instruction": "收集数据", "produces": ["/etc/passwd"]},
+        ],
+    )
+
+    assert created["ok"] is False
+    assert "产物" in created["error"]

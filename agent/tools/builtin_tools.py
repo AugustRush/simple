@@ -22,7 +22,7 @@ from agent.core.output import OutputSink, _active_sink
 from agent.exec import ExecRequest, provider_from
 from agent.exec.subprocess import OUTPUT_MAX_BYTES
 from agent.pathing import path_contains, resolve_workspace_path
-from agent.scheduler.models import LOCAL_TIMEZONE
+from agent.scheduler.models import LOCAL_TIMEZONE, normalize_products
 from agent.security.network import (
     fetch_public_http_url,
     parse_proxy_url,
@@ -163,6 +163,23 @@ def _run_detail(run: Any) -> dict[str, Any]:
             "stdout_tail": _clip(raw_verification.get("stdout_tail"), RUN_TAIL_CHARS),
         }
     from agent.scheduler import run_needs_attention
+    from agent.scheduler.models import products_for_handoff, products_payload
+
+    # What this run was told to leave behind, read off its own snapshot -- the
+    # same source the runtime measured against, so the declaration reported
+    # here is the one the run was actually held to and not the task's current
+    # one.  A run from before this existed carries no key and declares nothing,
+    # which is the right answer for it.
+    #
+    # The two halves are separated by ``products_for_handoff`` rather than by
+    # filtering the report here: a path that was promised and has no file
+    # behind it must read as *missing*, and deriving that from the report alone
+    # would let a declaration with no measurement read as "nothing was
+    # missing".  Same shape the step below is handed, for the same reason.
+    snapshot = dict(getattr(run, "config_snapshot", {}) or {})
+    handoff = products_for_handoff(
+        snapshot.get("produces"), products_payload(getattr(run, "products", None))
+    )
 
     return {
         "run_id": str(getattr(run, "id", "") or ""),
@@ -182,6 +199,14 @@ def _run_detail(run: Any) -> dict[str, Any]:
         "output_path": output_path,
         "output_available": output_available,
         "verification": verification_dict,
+        # What the run was asked to leave behind and what was actually there
+        # when it ended.  Both, because neither answers the question alone: an
+        # empty list with an empty declaration means the task never promised
+        # anything, and an empty list with a declaration means the work did not
+        # produce it -- and "declared nothing" must not be able to read as
+        # "produced nothing".
+        "products": handoff["products"],
+        "products_missing": handoff["products_missing"],
     }
 
 
@@ -1030,6 +1055,23 @@ class BuiltinTools:
                             "be run is refused here, while you can still fix it."
                         ),
                     },
+                    "produces": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "The files this task has to leave behind, as paths "
+                            "relative to the project folder -- e.g. report.md or "
+                            "state/equity.csv. Fill this in whenever the work's "
+                            "product is a file: it is the only way the run is told "
+                            "where to write (until now the path existed only in "
+                            "prose, or only inside verify_command, checking a file "
+                            "the run was never told about), it is what a downstream "
+                            "task is handed, and a declared file that is missing "
+                            "when the run ends fails the run on its own. Must be "
+                            "relative and inside the folder: no absolute paths, no "
+                            "'..'. Omit for a task whose only output is its answer."
+                        ),
+                    },
                 },
                 "required": ["name", "trigger_type"],
             },
@@ -1173,7 +1215,14 @@ class BuiltinTools:
                                 "name": {"type": "string", "description": "Short step name"},
                                 "action_type": {
                                     "type": "string",
-                                    "description": "one of: message, agent_task, system_job",
+                                    "description": (
+                                        "one of: message, agent_task, system_job. "
+                                        "Inferred from the content field when left "
+                                        "out -- `instruction` makes it an agent "
+                                        "task, `message_text` a message, "
+                                        "`job_name` a system job -- so filling in "
+                                        "only one of those is enough."
+                                    ),
                                 },
                                 "instruction": {
                                     "type": "string",
@@ -1247,8 +1296,28 @@ class BuiltinTools:
                                         "`rm`, or inline interpreters."
                                     ),
                                 },
+                                "produces": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": (
+                                        "The files this step has to leave behind, as "
+                                        "paths relative to its project folder. Declare "
+                                        "them on the step that writes them: the run is "
+                                        "then told where to write instead of guessing, "
+                                        "and the steps below are handed the resolved "
+                                        "absolute paths of the ones that exist. A "
+                                        "declared file that is missing when the step "
+                                        "ends fails that step, so the steps below it do "
+                                        "not run on nothing."
+                                    ),
+                                },
                             },
-                            "required": ["key", "name", "action_type"],
+                            # `action_type` is deliberately not required: the
+                            # content field names the action, and requiring the
+                            # label as well refused the obvious spelling of a
+                            # step with a complaint about a field its author
+                            # never used -- see ``_action_payload``.
+                            "required": ["key", "name"],
                         },
                     },
                 },
@@ -3482,6 +3551,7 @@ class BuiltinTools:
         workspace_root: Optional[str] = None,
         criteria: Optional[list[str]] = None,
         verify_command: Optional[str] = None,
+        produces: Optional[list[str]] = None,
         intent: str = "",
     ) -> dict[str, Any]:
         trigger = self._schedule_trigger(
@@ -3585,6 +3655,7 @@ class BuiltinTools:
             workspace_root=str(task_workspace),
             permission_profile=profile.key,
             acceptance=acceptance,
+            produces=normalize_products(produces),
             # The words that were checked by the executor's quote test, kept on
             # the row so the task can still answer "why am I here" long after
             # the conversation that asked for it is gone.  The check and the
@@ -3609,14 +3680,35 @@ class BuiltinTools:
                 "permission_profile": task.permission_profile,
                 "workspace_root": task.workspace_root,
                 "acceptance": task.acceptance.to_dict(),
+                # Echoed for the same reason the envelope is, and it carries
+                # more: the caller that wrote these paths needs to see the
+                # stored list, because that list is what the run will be told
+                # to write and what a downstream step will be handed.
+                "produces": list(task.produces),
                 "db_path": str(shared.SCHEDULER_DB_FILE),
                 "existing": existing,
             },
             summary_text=(
                 f"{summary_text}\n运行权限：{profile.label}；项目文件夹：{task_workspace}"
+                f"{self._describe_products(task.produces)}"
                 f"{self._describe_acceptance(task.acceptance)}"
             ),
         )
+
+    @staticmethod
+    def _describe_products(produces: Any) -> str:
+        """What this task promises to leave behind, in one line for the user.
+
+        Said out loud for the same reason the criterion is, and with one more:
+        these paths are what the run will be *told* to write, so a declaration
+        the caller cannot see is a run writing files somewhere nobody asked
+        for -- or, when it is wrong, a task that fails every night against a
+        path that was never going to exist.
+        """
+        declared = normalize_products(produces)
+        if not declared:
+            return ""
+        return "\n这次运行要产出的文件：" + "、".join(declared)
 
     @staticmethod
     def _describe_acceptance(acceptance: Any) -> str:
@@ -3713,6 +3805,7 @@ class BuiltinTools:
                     "enabled": task.enabled,
                     "workflow_id": str(getattr(task, "workflow_id", "") or ""),
                     "step_key": str(getattr(task, "step_key", "") or ""),
+                    "produces": list(getattr(task, "produces", []) or []),
                     "last_run": _run_outcome(store.latest_run(task.id)),
                 }
                 for task in tasks
@@ -3764,6 +3857,7 @@ class BuiltinTools:
                 "workflow_id": str(getattr(task, "workflow_id", "") or ""),
                 "step_key": str(getattr(task, "step_key", "") or ""),
                 "workspace_root": task.workspace_root,
+                "produces": list(getattr(task, "produces", []) or []),
                 "acceptance": acceptance_payload(getattr(task, "acceptance", None)),
             },
             run_count=len(runs),
@@ -3924,6 +4018,7 @@ class BuiltinTools:
                         ],
                         verify_command=str(raw.get("verify_command") or "").strip(),
                     ),
+                    produces=normalize_products(raw.get("produces")),
                     delivery_mode=mode,
                     delivery_target=target,
                 )
@@ -3962,6 +4057,7 @@ class BuiltinTools:
                         "workspace_root": step.workspace_root,
                         "permission_profile": step.permission_profile,
                         "acceptance": step.acceptance.to_dict(),
+                        "produces": list(step.produces),
                     }
                     for step in created.steps
                 ],
@@ -3984,6 +4080,13 @@ class BuiltinTools:
             upstreams = "、".join(str(item) for item in step.depends_on)
             when = f"在 {upstreams} 成功后运行" if upstreams else "按自身触发方式运行"
             lines.append(f"- {step.key}（{step.name}）：{when}")
+            declared = normalize_products(getattr(step, "produces", None))
+            if declared:
+                # Said here for the same reason the criterion below is: these
+                # paths are what the step will be *told* to write, so a
+                # declaration the caller cannot see is a step that fails every
+                # night against a path it was never asked about.
+                lines.append(f"  产出文件：{'、'.join(declared)}")
             criteria = list(getattr(step.acceptance, "criteria", []) or [])
             command = str(getattr(step.acceptance, "verify_command", "") or "").strip()
             if criteria or command:
@@ -4022,6 +4125,7 @@ class BuiltinTools:
                         "depends_on": list(step.depends_on),
                         "enabled": bool(task.enabled) if task is not None else False,
                         "task_id": task.id if task is not None else "",
+                        "produces": list(getattr(step, "produces", []) or []),
                         "last_run": _run_outcome(
                             store.latest_run(task.id) if task is not None else None
                         ),

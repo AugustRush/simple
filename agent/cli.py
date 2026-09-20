@@ -34,7 +34,13 @@ from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.runtime.lock import AgentHomeBusyError, acquire_agent_home_lock
-from agent.scheduler.models import DEFAULT_SIGNAL_MAX_DEPTH, LOCAL_TIMEZONE
+from agent.scheduler.models import (
+    DEFAULT_SIGNAL_MAX_DEPTH,
+    LOCAL_TIMEZONE,
+    acceptance_for_run,
+    produces_for_run,
+    resolve_product_path,
+)
 from agent.scheduler.profiles import (
     apply_profile_to_config,
     describe_profile_for_prompt,
@@ -554,6 +560,60 @@ def _scheduler_print_task_table(tasks: list) -> None:
     shared.CONSOLE.print(table)
 
 
+def _describe_run_contract(
+    *, acceptance: Any, produces: Any, workspace: Path
+) -> str:
+    """What this run has to leave behind, and what "done" is going to mean.
+
+    The terms the run is held to, said out loud.  Both halves were being kept
+    from it.  The criterion was written by whoever commissioned the task,
+    stored on the task, and used to judge the run afterwards -- and never once
+    shown to the run, so a task whose success turned on one specific sentence
+    spent its whole budget aiming at a target it had not been given.  The
+    products did not exist anywhere at all: the path a task had to write
+    existed only in prose, or, worse, only inside the ``verify_command`` that
+    checked a file the run was never told about.
+
+    Paths are given absolute for the same reason the downstream step is handed
+    them absolute: one resolution, so the two cannot disagree about where the
+    file was supposed to go.
+
+    Says nothing when neither half was declared, so an ordinary task does not
+    grow a section about a contract it does not have.
+    """
+    lines: list[str] = []
+    # Already normalized by ``produces_for_run``, which is the one place that
+    # decides what a task's declaration is.
+    declared = list(produces or [])
+    if declared:
+        lines.append(
+            "This run has to leave these files behind, at exactly these paths. "
+            "They are resolved against the project folder you are working in:"
+        )
+        for path in declared:
+            lines.append(f"- {resolve_product_path(str(workspace), path)}")
+        lines.append(
+            "A declared file that is not there when this run ends is recorded as "
+            "a failure, whatever else the run managed to do."
+        )
+    criteria = list(getattr(acceptance, "criteria", []) or [])
+    command = str(getattr(acceptance, "verify_command", "") or "").strip()
+    if criteria or command:
+        if lines:
+            lines.append("")
+        lines.append(
+            "This run is judged when it ends, and work that does not meet this is "
+            "recorded as a failure even when it is delivered:"
+        )
+        for item in criteria:
+            lines.append(f"- {item}")
+        if command:
+            lines.append(
+                f"- A command run in the project folder has to exit 0: {command}"
+            )
+    return "\n".join(lines)
+
+
 def _describe_upstream_results(snapshot: dict) -> str:
     """What the steps above this run produced, as a prompt block.
 
@@ -633,6 +693,36 @@ def _describe_upstream_results(snapshot: dict) -> str:
                 f" ({size} bytes)" if isinstance(size, int) and size > 0 else ""
             )
             lines.append(f"  full output: {output_path}{measured}")
+        # The files the upstream promised and delivered, which is not the same
+        # as where its answer went: a step can report perfectly and still not
+        # have written the CSV the step below needs.  Absolute paths, resolved
+        # by the run that wrote them, so a folder that changed since does not
+        # send this step looking in the wrong place.
+        produced = payload.get("products")
+        if isinstance(produced, list):
+            for entry in produced:
+                if not isinstance(entry, dict):
+                    continue
+                address = str(entry.get("absolute") or entry.get("path") or "").strip()
+                if not address:
+                    continue
+                size = entry.get("bytes")
+                measured = (
+                    f" ({size} bytes)" if isinstance(size, int) and size > 0 else ""
+                )
+                lines.append(f"  produced 「{entry.get('path')}」: {address}{measured}")
+        # Named, and named as *missing*, rather than left out.  A path that was
+        # promised and is not there is the one thing this block must not stay
+        # quiet about: the step below would go looking, find an older round's
+        # file, and believe it is this round's.
+        unproduced = payload.get("products_missing")
+        if isinstance(unproduced, list) and unproduced:
+            listed = "、".join(str(item) for item in unproduced if str(item).strip())
+            if listed:
+                lines.append(
+                    f"  declared but NOT produced: {listed} -- if you find a file "
+                    "at one of those paths it is from an earlier round, not this one."
+                )
     if not lines:
         return ""
     return (
@@ -771,6 +861,18 @@ async def _build_scheduler_service(
             # wall one refused call at a time: a run that keeps re-asking for
             # the same approval spends its whole budget on a refusal.
             system_prompt += "\n\n" + describe_profile_for_prompt(profile)
+            # The terms of this task, and they belong *above* the line below
+            # rather than with the data: the criterion and the products are the
+            # same for every run of a given task, so they stay part of the one
+            # cacheable prefix.  Only what the upstreams produced changes per
+            # round.
+            contract = _describe_run_contract(
+                acceptance=acceptance_for_run(task, run),
+                produces=produces_for_run(task, run),
+                workspace=workspace,
+            )
+            if contract:
+                system_prompt += "\n\n" + contract
             # What the steps above produced, and last.  The position is the
             # point: everything above this line is the same for every run of
             # this task, so it stays one cacheable prefix, and data belongs

@@ -28,15 +28,23 @@ from .models import (
     Workflow,
     WorkflowStep,
     decode_verification,
+    declared_products,
     encode_verification,
     execution_snapshot,
+    missing_products,
+    normalize_products,
     parse_task_signal,
+    product_report,
+    products_for_handoff,
+    products_payload,
+    resolve_product_path,
     signal_mode,
     signal_names,
     step_trigger_spec,
     subscribes_to,
     task_signal_name,
     validate_acceptance,
+    validate_products,
     validate_workflow_graph,
     workflow_downstream_steps,
     workflow_step_order,
@@ -80,6 +88,8 @@ def _run_report_payload(
     step_key: str = "",
     summary: str = "",
     output_path: str = "",
+    declares: Any = None,
+    products: Any = None,
 ) -> dict[str, Any]:
     """One run's report, in the shape every reader of it expects.
 
@@ -88,6 +98,15 @@ def _run_report_payload(
     step told one thing when a signal woke it and another when somebody
     started it by hand is a step whose behaviour depends on how it started,
     which is exactly the distinction the handoff is supposed to erase.
+
+    ``products`` is the address of what the run promised to leave behind --
+    the half of the handoff that used to be missing.  ``output_path`` says
+    where the run's *answer* went; these say where the *files* it produced
+    are, and they are different things: a report can be generated and stored
+    without the CSV anybody downstream wanted ever being written.  Paths that
+    were promised but are not there travel as ``products_missing`` rather than
+    as addresses, because handing over a path with no file behind it is how a
+    downstream step reads an older round's work and believes it is this one's.
     """
     payload: dict[str, Any] = {
         "task_id": task_id,
@@ -109,6 +128,11 @@ def _run_report_payload(
         size = _output_byte_count(str(output_path))
         if size:
             payload["output_bytes"] = size
+    handoff = products_for_handoff(declares, products)
+    if handoff["products"]:
+        payload["products"] = handoff["products"]
+    if handoff["products_missing"]:
+        payload["products_missing"] = handoff["products_missing"]
     return payload
 
 
@@ -145,7 +169,7 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 12
+    SCHEMA_VERSION = 13
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -533,6 +557,40 @@ class SchedulerStore:
                         "request_quote TEXT NOT NULL DEFAULT ''"
                     )
                 self._conn.execute("PRAGMA user_version = 12")
+            elif version == 13:
+                # What a task promises to leave behind, and what a run actually
+                # left.  Two columns because they are two different statements:
+                # the first is the contract and is edited with the task, the
+                # second is an observation about one execution and is never
+                # edited by anybody.
+                #
+                # No backfill, for the reason the columns before these have
+                # none.  A task written before this existed was written without
+                # anyone having to say what it produces, so there is nothing to
+                # put there -- and inventing a path from the task's name would
+                # look exactly like a declaration, and be a promise the task
+                # never made.
+                task_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_tasks)"
+                    ).fetchall()
+                }
+                if "produces_json" not in task_columns:
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_tasks ADD COLUMN "
+                        "produces_json TEXT NOT NULL DEFAULT '[]'"
+                    )
+                run_columns = {
+                    row[1] for row in self._conn.execute(
+                        "PRAGMA table_info(scheduled_task_runs)"
+                    ).fetchall()
+                }
+                if "products_json" not in run_columns:
+                    self._conn.execute(
+                        "ALTER TABLE scheduled_task_runs ADD COLUMN "
+                        "products_json TEXT NOT NULL DEFAULT '[]'"
+                    )
+                self._conn.execute("PRAGMA user_version = 13")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
@@ -561,6 +619,7 @@ class SchedulerStore:
             created_at=_dt(row["created_at"]) or datetime.now(UTC),
             updated_at=_dt(row["updated_at"]) or datetime.now(UTC),
             acceptance=Acceptance.from_json(row["acceptance_json"]),
+            produces=normalize_products(json.loads(row["produces_json"] or "[]")),
             workflow_id=row["workflow_id"] or "",
             step_key=row["step_key"] or "",
             request_quote=row["request_quote"] or "",
@@ -580,6 +639,7 @@ class SchedulerStore:
             delivery_status=row["delivery_status"],
             verdict=row["verdict"] or "",
             verification=decode_verification(row["verification_json"]),
+            products=products_payload(json.loads(row["products_json"] or "[]")),
             config_snapshot=json.loads(row["config_snapshot_json"]),
             trigger_source=row["trigger_source"],
             attempt=int(row["attempt"]),
@@ -607,6 +667,23 @@ class SchedulerStore:
             label=f"任务「{getattr(task, 'name', '')}」",
         )
 
+    def _check_products(self, task: NewScheduledTask) -> None:
+        """Refuse a product this task could never be held to.
+
+        Same moment and same argument as :meth:`_check_acceptance`: a
+        declaration whose only failure mode is a run at 3am that quietly
+        produces nothing is worth refusing while somebody is watching.
+
+        The check is on the *shape* of the paths.  Whether the task can
+        actually write there is a question for its permission profile, which
+        refuses at run time -- and answering it here as well would be a second
+        opinion about the same thing, the one that drifts.
+        """
+        validate_products(
+            getattr(task, "produces", None),
+            label=f"任务「{getattr(task, 'name', '')}」",
+        )
+
     @_synchronized
     def create_task(
         self, task: NewScheduledTask, now: Optional[datetime] = None
@@ -628,6 +705,7 @@ class SchedulerStore:
         last steps have nothing to run them.
         """
         self._check_acceptance(task)
+        self._check_products(task)
         created_at = (now or datetime.now(UTC)).astimezone(UTC)
         task_id = _new_id()
         next_run_at = task.trigger.initial_run_at(created_at)
@@ -641,10 +719,11 @@ class SchedulerStore:
                 selected_skills_json,
                 permission_profile,
                 acceptance_json,
+                produces_json,
                 next_run_at, lease_until,
                 active_run_id, last_run_at, last_success_at, created_at, updated_at,
                 workflow_id, step_key, request_quote
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -665,6 +744,7 @@ class SchedulerStore:
                 json.dumps(task.selected_skills, ensure_ascii=False),
                 task.permission_profile,
                 task.acceptance.to_json(),
+                json.dumps(declared_products(task), ensure_ascii=False),
                 _iso(next_run_at),
                 _iso(created_at),
                 _iso(created_at),
@@ -700,6 +780,7 @@ class SchedulerStore:
               AND selected_skills_json = ?
               AND permission_profile = ?
               AND acceptance_json = ?
+              AND produces_json = ?
               AND workflow_id = ?
               AND step_key = ?
             ORDER BY created_at ASC
@@ -730,6 +811,12 @@ class SchedulerStore:
                 # -- reporting success while the criterion the caller just
                 # stated is silently discarded.
                 task.acceptance.to_json(),
+                # Part of the identity for the same reason the criterion above
+                # is: two tasks that disagree about what they leave behind are
+                # two different tasks, and folding them together would answer
+                # "also write this report" with the task that writes the other
+                # one -- while reporting success.
+                json.dumps(declared_products(task), ensure_ascii=False),
                 task.workflow_id,
                 task.step_key,
             ),
@@ -1569,8 +1656,16 @@ class SchedulerStore:
         parent = snapshot.get("signal")
         parent = parent if isinstance(parent, dict) else {}
         task_row = self._conn.execute(
-            "SELECT name, workflow_id, step_key FROM scheduled_tasks WHERE id = ?",
+            "SELECT name, workflow_id, step_key, produces_json "
+            "FROM scheduled_tasks WHERE id = ?",
             (task_id,),
+        ).fetchone()
+        # The run's own record of what it left behind, written by
+        # ``complete_run`` earlier in this same transaction -- so what the
+        # signal carries and what the run history says cannot disagree.
+        products_row = self._conn.execute(
+            "SELECT products_json FROM scheduled_task_runs WHERE id = ?",
+            (run_id,),
         ).fetchone()
         payload = _run_report_payload(
             task_id=task_id,
@@ -1583,6 +1678,16 @@ class SchedulerStore:
             step_key=str(task_row["step_key"] or "") if task_row is not None else "",
             summary=summary,
             output_path=str(output_path or ""),
+            declares=(
+                json.loads(task_row["produces_json"] or "[]")
+                if task_row is not None
+                else []
+            ),
+            products=(
+                json.loads(products_row["products_json"] or "[]")
+                if products_row is not None
+                else []
+            ),
         )
         self._insert_emission(
             task_signal_name(task_id, status),
@@ -1818,6 +1923,7 @@ class SchedulerStore:
         steps disagree with each other about what the graph says.
         """
         self._check_acceptance(task)
+        self._check_products(task)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
         trigger_json = task.trigger.to_json()
         # Only a changed trigger gets a new schedule.  Recomputing it on every
@@ -1858,6 +1964,7 @@ class SchedulerStore:
                 retry_policy_json = ?, next_run_at = ?, updated_at = ?
                 , selected_skills_json = ?, permission_profile = ?
                 , acceptance_json = ?
+                , produces_json = ?
                 , workflow_id = ?, step_key = ?
             WHERE id = ?
             """,
@@ -1881,6 +1988,11 @@ class SchedulerStore:
                 json.dumps(task.selected_skills, ensure_ascii=False),
                 task.permission_profile,
                 task.acceptance.to_json(),
+                # Rewritten with the definition, so a step whose promised
+                # products were edited starts promising the new ones -- and,
+                # because the contract travels on the run's snapshot, whatever
+                # is already in flight keeps the promise it was started with.
+                json.dumps(declared_products(task), ensure_ascii=False),
                 task.workflow_id,
                 task.step_key,
                 task_id,
@@ -1943,6 +2055,14 @@ class SchedulerStore:
                 step_key=str(upstream["step_key"] or ""),
                 summary=str(latest["summary"] or ""),
                 output_path=str(latest["output_path"] or ""),
+                # The upstream's declared products and what its run actually
+                # left, both read here so that a step started by hand is told
+                # exactly what one woken by a signal is told.  Reading only the
+                # emission's copy would make "what can I count on" depend on
+                # how the run started, which is what this method exists to
+                # stop.
+                declares=json.loads(upstream["produces_json"] or "[]"),
+                products=json.loads(latest["products_json"] or "[]"),
             )
         return arrivals
 
@@ -2609,6 +2729,7 @@ class SchedulerStore:
         delivery_status: str = "",
         verdict: str = "",
         verification: Any = None,
+        products: Any = None,
     ) -> bool:
         finished_at = finished_at.astimezone(UTC)
         with self._immediate_transaction():
@@ -2644,6 +2765,7 @@ class SchedulerStore:
                 UPDATE scheduled_task_runs
                 SET status = ?, summary = ?, error = ?, output_path = ?,
                     delivery_status = ?, verdict = ?, verification_json = ?,
+                    products_json = ?,
                     finished_at = ?, updated_at = ?
                 WHERE id = ? AND task_id = ? AND status = 'running'
                 """,
@@ -2655,6 +2777,7 @@ class SchedulerStore:
                     delivery_status,
                     verdict,
                     encode_verification(verification),
+                    json.dumps(products_payload(products), ensure_ascii=False),
                     _iso(finished_at),
                     _iso(finished_at),
                     run_id,
@@ -3042,6 +3165,12 @@ class SchedulerStore:
             # the steps below it run, so losing it here would turn a chained
             # workflow back into a sequence of unrelated tasks.
             acceptance=step.acceptance,
+            # And what it promises to leave behind, carried through for the
+            # same reason: the graph's edges say when the next step runs, and
+            # these say what it can count on being there when it does.  A step
+            # that lost this here would be a step whose promise reached the
+            # graph and never reached the run that has to keep it.
+            produces=list(step.produces),
             # Carried through for the same reason, and it is the whole point of
             # the field: `_enqueue_automatic_retry` reads this off the run's
             # snapshot, so a step whose policy stopped here would be built with
