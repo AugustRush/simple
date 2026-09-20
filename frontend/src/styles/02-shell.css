@@ -1,0 +1,238 @@
+/* App shell: the sidebar, the navigation rail and the main layout/header. */
+
+/* Sidebar */
+.app-sider {
+  position: relative;
+  z-index: 10;
+  background: var(--bg-soft) !important;
+  backdrop-filter: blur(24px) saturate(120%);
+  -webkit-backdrop-filter: blur(24px) saturate(120%);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+
+.app-sider .ant-layout-sider-children {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 18px 16px 14px;
+}
+
+.brand-logo {
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--bg);
+  background: var(--primary);
+  box-shadow: 0 8px 20px rgba(0,0,0,.18);
+  font-size: 18px;
+  flex: 0 0 auto;
+}
+
+.brand-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+
+.brand-copy strong {
+  font-size: 16px;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+}
+
+.brand-copy span {
+  font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-top: 3px;
+}
+
+.sider-nav {
+  flex: 0 0 auto;
+  padding: 0 12px 6px;
+}
+
+.sider-nav .ant-menu {
+  border: none !important;
+  background: transparent !important;
+}
+
+.sider-nav .ant-menu-item {
+  border-radius: 7px;
+  font-weight: 500;
+}
+
+.sider-nav .ant-menu-item-selected {
+  background: var(--primary-soft) !important;
+  color: var(--text) !important;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.sider-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 6px 16px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sider-actions .ant-btn {
+  font-weight: 600;
+}
+
+.session-panel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 12px 16px;
+}
+
+.session-panel-label {
+  padding: 10px 8px 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.session-panel-label.sub {
+  color: var(--primary);
+  opacity: 0.8;
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 52px;
+  padding: 8px 9px;
+  margin-bottom: 3px;
+  border: 1px solid transparent;
+  border-radius: 11px;
+  cursor: pointer;
+  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease;
+}
+
+.session-item:hover {
+  background: var(--surface-hover);
+}
+
+.session-item.active {
+  background: var(--primary-soft);
+  border-color: var(--primary-border);
+}
+
+.session-item.active .session-item-title {
+  color: var(--text);
+}
+
+.session-item-status {
+  display: grid;
+  place-items: center;
+  width: 12px;
+  flex: 0 0 auto;
+}
+
+.session-item-status span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.session-item-status span.live {
+  background: var(--green);
+  box-shadow: 0 0 0 4px var(--green-soft);
+}
+
+.session-item-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  transition: color 0.16s ease;
+}
+
+.session-item-meta {
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* The busy word beside the turn counts.  Running uses the same primary the
+   composer's activity dot pulses with, so "运行中" in the list and the dot
+   under it say the same thing in the same colour; queued is neutral, because
+   waiting is not progressing -- the difference is the whole message. */
+.session-status-badge {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  vertical-align: 1px;
+}
+
+.session-status-badge.is-running {
+  color: var(--primary);
+  background: var(--primary-soft, rgba(128, 128, 150, 0.14));
+}
+
+.session-status-badge.is-queued {
+  color: var(--text-secondary);
+  background: rgba(128, 128, 150, 0.14);
+}
+
+.session-item .ant-btn {
+  opacity: 0;
+  transform: translateX(3px);
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+
+.session-item:hover .ant-btn,
+.session-item.active .ant-btn {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.sider-footer {
+  flex: 0 0 auto;
+  padding: 10px 12px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.sider-footer-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sider-footer-row .ant-btn {
+  color: var(--text-secondary);
+  border-color: var(--border);
+}

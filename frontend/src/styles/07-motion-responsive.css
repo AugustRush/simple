@@ -1,0 +1,176 @@
+/* Shared animations and the small-screen responsive pass. */
+
+/* Animations */
+@keyframes message-in {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes typing-bounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.45;
+  }
+  30% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+}
+
+@keyframes trace-pop {
+  from { opacity: 0; transform: translateY(-4px) scale(.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .app-sider:not(.ant-layout-sider-collapsed) {
+    position: fixed !important;
+    inset: 0 auto 0 0;
+    z-index: 100;
+    width: 280px !important;
+    max-width: 280px !important;
+    min-width: 280px !important;
+    height: 100vh;
+    box-shadow: 16px 0 36px rgba(0, 0, 0, 0.2);
+  }
+
+  .mobile-sider-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    background: rgba(0, 0, 0, 0.32);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+
+  .mobile-sider-backdrop.visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .app-header {
+    padding: 0 12px !important;
+  }
+
+  .model-tag {
+    display: none;
+  }
+
+  .page-title {
+    font-size: 14px;
+  }
+
+  .page-subtitle {
+    max-width: 48vw;
+  }
+
+  .header-right {
+    gap: 7px;
+  }
+
+  .chat-inner {
+    width: calc(100% - 24px);
+    padding-top: 18px;
+  }
+
+  .message-stack {
+    max-width: 84%;
+  }
+
+  .message-avatar {
+    display: none;
+  }
+
+  .composer-wrap {
+    padding: 0 10px 10px;
+  }
+
+  .page-view {
+    padding: 20px 14px 30px;
+  }
+
+  .page-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .page-head .ant-space,
+  .page-head .ant-input {
+    width: 100% !important;
+  }
+}
+
+/* Header controls: align the hit area with the icon and keep the title from
+ * stealing clicks when the sidebar toggle is used. */
+.app-header .header-menu {
+  width: 40px !important;
+  height: 40px !important;
+  margin: 0 2px 0 -4px;
+  padding: 0 !important;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.app-header .header-menu .anticon {
+  font-size: 18px;
+}
+/* The sidebar toggle was the one header control with no interaction styling of
+ * its own, so it fell back to antd's defaults: a 4% hover and a 15% press. Its
+ * neighbour `.brand-action` -- same header, same shape, same job -- uses the
+ * app's own tokens. Measured side by side, hover was rgba(0,0,0,.04) against
+ * rgba(17,18,21,.067). Same header, two vocabularies. */
+.app-header .header-menu:hover {
+  background: var(--surface-hover) !important;
+}
+.app-header .header-menu:active {
+  background: var(--primary-soft) !important;
+  transform: scale(.92);
+}
+
+/* Shared workspace search control. */
+.workspace-search {
+  width: 280px;
+  height: 40px;
+}
+.workspace-search.ant-input-affix-wrapper {
+  padding-inline: 12px;
+  border-color: var(--border-strong) !important;
+  background: var(--surface) !important;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.02);
+}
+.workspace-search.ant-input-affix-wrapper:focus,
+.workspace-search.ant-input-affix-wrapper-focused {
+  border-color: var(--primary-border) !important;
+  box-shadow: 0 0 0 3px var(--primary-soft) !important;
+}
+.workspace-search .ant-input-prefix {
+  color: var(--text-muted);
+  margin-inline-end: 8px;
+}
+
+.plugins-view .page-head {
+  align-items: center;
+}

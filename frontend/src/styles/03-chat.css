@@ -1,0 +1,879 @@
+/* Chat view: the conversation pane, message rows, tool events and sub-agent telemetry. */
+
+/* Main layout and header */
+.app-main {
+  min-width: 0;
+  background: transparent;
+}
+
+.app-header {
+  height: 64px !important;
+  padding: 0 24px !important;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: var(--surface) !important;
+  backdrop-filter: blur(24px) saturate(120%);
+  -webkit-backdrop-filter: blur(24px) saturate(120%);
+  border-bottom: 1px solid var(--border);
+}
+
+.header-left,
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.header-left {
+  flex: 1;
+}
+
+.header-menu {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 auto;
+}
+
+.page-title {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.page-subtitle {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.2;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-content {
+  height: calc(100vh - 64px);
+  overflow: hidden;
+}
+
+/* Chat view */
+.chat-view {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+/* Wraps only the message pane so .conversation-indicator bounds itself
+   against the composer in pure CSS — banners or composer resizing need
+   no JS height tracking. */
+.chat-scroll-area {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* Programmatic scrolling chooses its own behavior. Keeping this off avoids
+     queuing a smooth animation for every streaming token. */
+  scroll-behavior: auto;
+}
+
+.chat-inner {
+  width: min(820px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 30px 0 36px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+.chat-empty {
+  min-height: 62vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.chat-empty-orbit {
+  width: 92px;
+  height: 92px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--primary-soft);
+  border: 1px solid var(--primary-border);
+}
+
+.chat-empty-core {
+  width: 62px;
+  height: 62px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--primary);
+  font-size: 28px;
+}
+
+.chat-empty h2 {
+  margin: 20px 0 6px;
+  font-size: 24px;
+  letter-spacing: -0.03em;
+}
+
+.chat-empty p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 20px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  color: var(--text-secondary);
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.chat-empty-suggestions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+/* Message rows */
+.message-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  animation: message-in 0.22s ease both;
+}
+
+.message-row-user {
+  justify-content: flex-end;
+}
+
+.message-row-assistant {
+  justify-content: flex-start;
+}
+
+.message-avatar {
+  flex: 0 0 auto;
+  margin-top: 20px;
+  border: 1px solid var(--border);
+}
+
+.message-avatar.assistant {
+  color: #fff;
+  background: var(--primary);
+}
+
+.message-avatar.user {
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.message-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  max-width: min(620px, 78%);
+}
+
+.message-row-assistant .message-stack {
+  width: min(620px, 78%);
+}
+
+.message-row-user .message-stack {
+  align-items: flex-end;
+}
+
+.message-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 4px 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.message-meta-trace {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 12px;
+}
+
+.message-author {
+  white-space: nowrap;
+}
+
+.message-meta-trace .tool-trace {
+  width: auto;
+  min-width: 0;
+  max-width: 340px;
+  margin: 0;
+}
+
+.message-meta-trace .tool-trace-items {
+  left: 0;
+  right: auto;
+  min-width: 0;
+  max-width: min(360px, calc(100vw - 48px));
+  z-index: 40;
+}
+
+.message-streaming {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--primary);
+}
+
+.message-streaming::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--primary);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+.bubble {
+  padding: 12px 15px;
+  border-radius: 12px;
+  line-height: 1.65;
+  font-size: 14px;
+  word-break: break-word;
+}
+
+.bubble-user {
+  background: var(--primary);
+  color: #111113;
+  box-shadow: 0 10px 24px rgba(0,0,0,.16);
+  border-bottom-right-radius: 5px;
+}
+
+.bubble-assistant {
+  color: var(--text);
+  background: var(--surface-raised);
+  backdrop-filter: blur(18px) saturate(115%);
+  -webkit-backdrop-filter: blur(18px) saturate(115%);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 5px;
+}
+
+.message-copy {
+  margin-top: 5px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.markdown > :first-child {
+  margin-top: 0;
+}
+
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown p {
+  margin: 0 0 10px;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: 0 0 8px;
+  line-height: 1.3;
+  font-weight: 700;
+}
+
+.markdown h1 {
+  font-size: 22px;
+}
+
+.markdown h2 {
+  font-size: 19px;
+}
+
+.markdown h3 {
+  font-size: 17px;
+}
+
+.markdown h4 {
+  font-size: 15px;
+}
+
+.markdown ul {
+  margin: 0 0 10px;
+  padding-left: 20px;
+}
+
+.markdown li {
+  margin: 3px 0;
+}
+
+.markdown code {
+  padding: 2px 5px;
+  border-radius: 5px;
+  color: var(--primary);
+  background: var(--primary-soft);
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.9em;
+}
+
+.bubble-user .markdown code {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.markdown a {
+  color: var(--primary);
+  text-decoration: none;
+  border-bottom: 1px solid currentColor;
+}
+
+.bubble-user .markdown a {
+  color: #fff;
+}
+
+.code-block {
+  margin: 12px 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #0c0e14;
+  color: #e5e7eb;
+}
+
+html[data-theme='light'] .code-block {
+  background: #111827;
+  color: #e5e7eb;
+}
+
+.code-block-head {
+  padding: 7px 12px;
+  border-bottom: 1px solid var(--border);
+  color: #9ca3af;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+}
+
+.code-block pre {
+  margin: 0;
+  padding: 12px;
+  overflow-x: hidden;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.code-block code {
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: inherit;
+  overflow-wrap: inherit;
+  word-break: inherit;
+}
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 6px;
+}
+
+.typing-dots i {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  animation: typing-bounce 1.2s infinite ease-in-out;
+}
+
+.typing-dots i:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.typing-dots i:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+/* Tool events and system notes */
+.tool-trace {
+  position: relative;
+  width: min(680px, 90%);
+  margin: 0;
+  z-index: 4;
+}
+
+.tool-trace-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 0;
+  border: 0;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.tool-trace-summary:hover {
+  color: var(--text);
+}
+
+.tool-trace-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  /* The marks flex and the label does not, because the label carries the
+     exact step count and the marks are now a summary of it. The budget in
+     App.tsx keeps both inside the box; hiding overflow is the backstop that
+     stops the row from breaking again if that budget ever grows. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tool-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--text-muted);
+  opacity: 0.7;
+}
+
+.tool-dot.running {
+  background: var(--primary);
+}
+
+.tool-dot.done {
+  background: var(--green);
+}
+
+.tool-dot.blocked {
+  background: var(--red);
+}
+
+.tool-dot.interrupted,
+.tool-event-dot.interrupted {
+  background: var(--amber);
+}
+
+.tool-trace-label {
+  /* Grows to push the chevron to the trailing edge, but never shrinks: the
+     step count is the one part of this row that has to stay readable. */
+  flex: 1 0 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.tool-trace-chevron {
+  flex: 0 0 auto;
+  align-self: center;
+  color: var(--text-muted);
+  font-size: 12px;
+  transition: transform 0.2s ease, color 0.2s ease;
+}
+
+.tool-trace-summary:hover .tool-trace-chevron {
+  color: var(--text);
+}
+
+.tool-trace-expanded .tool-trace-chevron {
+  transform: rotate(180deg);
+}
+
+.tool-trace-items {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: absolute;
+  top: calc(100% + 10px);
+  left: 0;
+  width: min(430px, calc(100vw - 48px));
+  min-width: 0;
+  max-width: min(430px, calc(100vw - 48px));
+  max-height: min(330px, 42vh);
+  overflow-y: auto;
+  margin-top: 0;
+  padding: 12px 14px;
+  border: 1px solid #e5e7eb;
+  border-radius: 20px;
+  background: #fff;
+  color: #1f2937;
+  box-shadow: 0 18px 45px rgba(15, 23, 42, 0.16);
+  animation: trace-pop .16s ease both;
+  z-index: 40;
+}
+
+html[data-theme='light'] .tool-trace-items {
+  background: #fff;
+}
+
+.message-meta-trace .tool-trace-items {
+  left: 0;
+  right: auto;
+}
+
+.tool-event {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 20px;
+  color: var(--text-secondary);
+  animation: message-in 0.22s ease both;
+}
+
+.tool-event-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 0;
+  background: var(--text-muted);
+  flex: 0 0 auto;
+}
+
+.tool-event-dot.running {
+  background: var(--primary);
+}
+
+.tool-event-dot.done {
+  background: var(--green);
+}
+
+.tool-event-dot.blocked {
+  background: var(--red);
+}
+
+.tool-event-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tool-event-state {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.tool-event-details {
+  flex-basis: 100%;
+  width: 100%;
+  padding: 2px 0 0 15px;
+  color: var(--text-muted);
+}
+
+.tool-event-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.tool-event-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+  color: var(--primary);
+  font-size: 11px;
+}
+
+.system-note {
+  align-self: stretch;
+  max-width: min(680px, 100%);
+  margin: 0 auto;
+  padding: 9px 12px;
+  border-radius: 12px;
+  color: var(--text-secondary);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.system-note-error {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: color-mix(in srgb, var(--red) 22%, transparent);
+}
+
+/* The model's thinking, above the reply it produced.
+
+   One strip per turn, collapsed by default, carrying the same geometry as the
+   sub-agent strip below it so the two stack as one column of status. What
+   separates them is the rule: this one is marked with a left bar, because it
+   describes the model's own process rather than work handed to other agents.
+   The body is verbatim text in a pre-wrapped block -- thinking is raw model
+   output, so its newlines are structure and its asterisks are characters. */
+.thinking-note {
+  align-self: stretch;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 auto 2px;
+}
+
+.thinking-note-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 2px 6px 9px;
+  border: 0;
+  border-left: 2px solid var(--border-strong);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.thinking-note-head:hover {
+  color: var(--text);
+}
+
+.thinking-note-head:focus-visible {
+  outline: 2px solid var(--primary-border);
+  outline-offset: 1px;
+}
+
+.thinking-note-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.thinking-note-running .thinking-note-dot {
+  background: var(--primary);
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+.thinking-note-title {
+  flex: none;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.thinking-note-state {
+  flex: none;
+}
+
+.thinking-note-metrics {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.thinking-note-chevron {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.thinking-note-body {
+  max-height: 260px;
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.7;
+  /* Long unbroken runs are common in reasoning (paths, tokens, digits), so
+     wrapping has to be allowed mid-word rather than overflowing the strip. */
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* Sub-agent telemetry. One strip per batch that updates in place, instead of a
+   chat bubble per socket event: a 4-agent batch emits a dozen events, and at
+   ~60px each (note row plus the conversation gap) that used to push hundreds
+   of pixels of near-identical lines through the scroll area.
+
+   The strip lives inside the assistant row it describes -- between the meta
+   line and the reply -- so it reads as that message's status. As a sibling row
+   it spanned the full chat width with no avatar, which made it look like a
+   second message from the agent. */
+.message-subagents {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-self: stretch;
+  width: 100%;
+  margin-bottom: 6px;
+}
+
+.subagent-note {
+  align-self: stretch;
+  width: 100%;
+  max-width: 100%;
+  margin: 0 auto;
+}
+
+.subagent-note-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 2px;
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.subagent-note-head:hover {
+  color: var(--text);
+}
+
+.subagent-note-head:focus-visible {
+  outline: 2px solid var(--primary-border);
+  outline-offset: 1px;
+}
+
+.subagent-note-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.subagent-note-running .subagent-note-dot {
+  background: var(--text-secondary);
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+.subagent-note-failed .subagent-note-dot {
+  background: var(--red);
+}
+
+.subagent-note-title {
+  flex: none;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.subagent-note-state,
+.subagent-note-failed {
+  flex: none;
+}
+
+.subagent-note-failed {
+  color: var(--red);
+}
+
+/* The only shrinkable segment: the live log line trims itself with an ellipsis
+   so the strip can never wrap into a second row. */
+.subagent-note-latest {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-note-metrics {
+  flex: none;
+  margin-left: auto;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.subagent-note-chevron {
+  flex: none;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.subagent-note-logs {
+  max-height: 220px;
+  margin: 6px 0 0;
+  padding: 8px 10px 8px 26px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  line-height: 1.75;
+}
+
+.subagent-note-logs li + li {
+  margin-top: 2px;
+}
+
+/* Shared by both status strips -- the thinking note and the sub-agent note --
+   so it is named for what it says (something is still running) rather than for
+   whichever strip happened to need it first. */
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .subagent-note-running .subagent-note-dot,
+  .thinking-note-running .thinking-note-dot {
+    animation: none;
+  }
+}

@@ -1,0 +1,335 @@
+/* The merged extensions page and the skills/settings workspace rows. */
+
+/* The merged 扩展 page: both list bodies keep the classes they had as pages,
+   so only the tab strip and the per-tab toolbars are new.  The tab margin
+   mirrors the 自动化 page's spacing so the two multi-list pages share one
+   rhythm. */
+.extensions-tabs {
+  margin-bottom: 16px;
+}
+.extensions-view .page-head {
+  margin-bottom: 0;
+}
+/* The plugins search row and the skills summary strip: toolbar-height rows
+   directly under the tabs, so switching lists does not jump the content. */
+.list-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 16px;
+}
+.list-toolbar .workspace-search {
+  flex: 0 1 320px;
+}
+.extensions-view .skills-summary {
+  justify-content: flex-end;
+  margin-bottom: 16px;
+}
+
+.skills-toolbar {
+  margin-bottom: 20px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+.skills-toolbar .workspace-search {
+  flex: 0 1 320px;
+}
+
+/* Settings page hierarchy and button contrast. */
+.settings-page-head {
+  align-items: center !important;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border);
+}
+/* Prefixing with `html[data-theme]` is not decoration: the theme rules above
+ * pick the primary button's *text* colour per theme (near-black in dark, near
+ * white in light) to suit a near-white/near-black `colorPrimary`, at a
+ * specificity of `html[data-theme='dark'] .ant-btn-primary`. These two buttons
+ * paint their own blue fill, so that text colour is wrong for them -- near
+ * black on #2563eb is 3.44:1. Matching the specificity and landing after it
+ * lets one white label serve both themes. */
+html[data-theme] .settings-save-button,
+html[data-theme] .settings-inline-save {
+  color: #fff !important;
+  /* #3b82f6 carried white text at 3.52:1 -- under the 4.5:1 the 14px label
+   * needs, on the one button on the page that is meant to be the loud one.
+   * #2563eb is 5.19:1, so the resting state is now the readable one and the
+   * hover/active steps below get darker from there. */
+  background: #2563eb !important;
+  border-color: #2563eb !important;
+  font-weight: 650;
+  box-shadow: 0 6px 14px rgba(37,99,235,.22);
+}
+html[data-theme] .settings-save-button:hover:not(:disabled),
+html[data-theme] .settings-inline-save:hover:not(:disabled) {
+  color: #fff !important;
+  background: #1d4ed8 !important;
+  border-color: #1d4ed8 !important;
+}
+/* Both buttons darkened on hover and then stopped, so a press looked exactly
+ * like a hover. Same shape as `.brand-action`: an `!important` hover with no
+ * `:active` to follow it. A third step, plus a dip, makes the press legible --
+ * the shadow shrinks at the same time, which is what sells the movement. */
+html[data-theme] .settings-save-button:active:not(:disabled),
+html[data-theme] .settings-inline-save:active:not(:disabled) {
+  color: #fff !important;
+  background: #1e40af !important;
+  border-color: #1e40af !important;
+  box-shadow: 0 2px 6px rgba(30,64,175,.3);
+  transform: translateY(1px);
+}
+/* Disabled is the usual state of both buttons -- there is nothing to save most
+ * of the time -- so it has to look like the state it is. Only the heading
+ * button had this treatment: 已保存 kept the blue fill from the rule above and
+ * sat next to a quiet input advertising an action that was not available. */
+.settings-save-button:disabled,
+.settings-inline-save:disabled {
+  color: var(--text-muted) !important;
+  background: var(--surface-raised) !important;
+  border-color: var(--border) !important;
+  box-shadow: none;
+  font-weight: 500;
+}
+.settings-view .settings-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+  max-width: 980px;
+}
+/* Wide cards say so themselves.  This used to be `.settings-card:nth-child(3)`,
+ * which meant the layout silently changed whenever a card was reordered or
+ * added -- the third card was wide because it happened to be third. */
+.settings-view .settings-card-wide,
+.settings-view .settings-json-card {
+  grid-column: 1 / -1;
+}
+.settings-view .settings-card {
+  overflow: hidden;
+}
+.settings-view .ant-card-head-title {
+  font-size: 14px;
+  font-weight: 650;
+}
+.settings-view .ant-form-item {
+  margin-bottom: 18px;
+}
+.settings-view .ant-form-item-label > label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+.settings-view .settings-hint {
+  max-width: 760px;
+  line-height: 1.65;
+}
+
+@media (max-width: 768px) {
+  .workspace-search {
+    width: 100%;
+  }
+  .plugins-view .page-head {
+    align-items: stretch;
+  }
+  .skills-toolbar .workspace-search {
+    flex-basis: auto;
+  }
+  .settings-page-head {
+    align-items: flex-start !important;
+  }
+  .settings-page-head > .ant-space {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .settings-save-button {
+    flex: 0 0 auto;
+  }
+  .settings-view .settings-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-view .settings-card-wide,
+  .settings-view .settings-json-card {
+    grid-column: auto;
+  }
+}
+
+/* Skills and settings workspace */
+.eyebrow {
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .12em;
+}
+
+.skills-head {
+  align-items: flex-end;
+}
+
+.skills-summary {
+  display: flex;
+  gap: 22px;
+  padding-bottom: 2px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.skills-summary span {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  white-space: nowrap;
+}
+
+.skills-summary strong {
+  color: var(--text);
+  font-size: 18px;
+  font-weight: 650;
+}
+
+.skills-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.segmented-control {
+  display: inline-flex;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.segmented-control button {
+  min-width: 58px;
+  height: 28px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.segmented-control button:hover {
+  color: var(--text-secondary);
+}
+
+.segmented-control button.active {
+  color: var(--text);
+  background: var(--surface-raised);
+  box-shadow: 0 1px 2px rgba(0,0,0,.16);
+}
+
+.skills-search {
+  width: 280px;
+}
+
+.skills-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+}
+
+.skill-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  gap: 13px;
+  align-items: center;
+  min-height: 104px;
+  padding: 16px 8px;
+  border-bottom: 1px solid var(--border);
+  transition: background .16s ease;
+}
+
+.skill-row:hover {
+  background: var(--surface-hover);
+}
+
+.skill-row-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: var(--surface);
+}
+
+.skill-row-main {
+  min-width: 0;
+}
+
+.skill-row-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.skill-row-title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.skill-row-id {
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 11px;
+}
+
+.skill-row-main p {
+  margin: 8px 0 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-row-side {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.skill-source {
+  max-width: 180px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-row-side .ant-btn {
+  color: var(--text-muted);
+}
+
+/* A skill that is switched off stays in the list: the switch is the only way
+   back on. Dim the label so the row reads as inert, but leave the switch
+   itself at full contrast. */
+.skill-row-disabled .skill-row-icon,
+.skill-row-disabled .skill-row-main {
+  opacity: .55;
+}
+
+.card-kicker {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .1em;
+}

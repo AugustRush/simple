@@ -1,0 +1,121 @@
+/* Design tokens: the two theme palettes and the CSS variables every other partial reads. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0e0e0f;
+  --bg-soft: #151516;
+  --surface: #1b1b1d;
+  --surface-raised: #222225;
+  --surface-hover: rgba(255, 255, 255, 0.06);
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --text: #f2f2f3;
+  --text-secondary: #b4b4b8;
+  /* Muted still has to be read. At #77777e it landed on 3.55:1 over a card
+   * (rgb(34,35,36)) and 4.25:1 over the page -- both under the 4.5:1 that the
+   * 10-13px text wearing it needs. Lifted until it clears that on the darker
+   * of the two surfaces. */
+  --text-muted: #8f8f97;
+  --primary: #e4e4e7;
+  --primary-soft: rgba(228, 228, 231, 0.08);
+  --primary-border: rgba(228, 228, 231, 0.26);
+  --green: #d4d4d8;
+  --green-soft: rgba(212, 212, 216, 0.12);
+  --red: #f0a3a3;
+  --red-soft: rgba(240, 163, 163, 0.12);
+  --amber: #d6c7a3;
+  --shadow: 0 14px 34px rgba(0, 0, 0, 0.2);
+}
+
+html[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f7f7f6;
+  --bg-soft: #efefed;
+  --surface: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-hover: rgba(17, 18, 21, 0.045);
+  --border: rgba(17, 18, 21, 0.1);
+  --border-strong: rgba(17, 18, 21, 0.18);
+  --text: #18181b;
+  --text-secondary: #52525b;
+  /* Same story in light: #85858d gave 3.56:1 on the card and 3.20:1 on the
+   * page. */
+  --text-muted: #666670;
+  --primary: #27272a;
+  --primary-soft: rgba(39, 39, 42, 0.065);
+  --primary-border: rgba(39, 39, 42, 0.22);
+  --green: #52525b;
+  --green-soft: rgba(82, 82, 91, 0.1);
+  --red: #a16262;
+  --red-soft: rgba(161, 98, 98, 0.1);
+  --amber: #806f4b;
+  --shadow: 0 14px 34px rgba(39, 39, 42, 0.1);
+}
+
+html[data-theme='dark'] .ant-btn-primary {
+  color: #18181b !important;
+}
+
+html[data-theme='light'] .ant-btn-primary {
+  color: #fafafa !important;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+    'PingFang SC', 'Microsoft YaHei', sans-serif;
+  background: var(--bg);
+  background-image: none;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+::selection {
+  background: var(--primary);
+  color: #fff;
+}
+
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 150, 0.24);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 150, 0.38);
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.app-shell {
+  height: 100vh;
+  overflow: hidden;
+  background: transparent;
+}

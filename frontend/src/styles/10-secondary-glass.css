@@ -1,0 +1,565 @@
+/* Secondary view controls and the refined glass surface system. */
+
+/* Secondary views and shared controls */
+.brand-logo {
+  box-shadow: none;
+}
+
+.sider-actions {
+  gap: 8px;
+  border-bottom-color: var(--border);
+}
+
+.session-item {
+  min-height: 48px;
+  border-radius: 8px;
+}
+
+.command-popover,
+.command-palette-modal .ant-modal-content {
+  background: var(--surface-raised);
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+/* A second copy of the shared card appearance used to sit here -- same three
+ * selectors, radius 12px, no blur, no shadow. Every one of those five
+ * properties is set again by the later copy, so editing this one changed
+ * nothing on screen. The cards are described once, further down. */
+
+.session-card-active {
+  background: var(--primary-soft);
+  border-color: var(--primary-border);
+}
+
+.entity-icon {
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+}
+
+.entity-icon.skill {
+  background: transparent;
+}
+
+.system-note {
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.page-view {
+  padding-top: 30px;
+}
+
+.page-head {
+  margin-bottom: 26px;
+}
+
+.page-head h2 {
+  font-size: 21px;
+  letter-spacing: -0.02em;
+}
+
+.ant-card .ant-card-head {
+  min-height: 52px;
+  border-bottom-color: var(--border);
+}
+
+/* Control geometry -- radius and height -- is the theme's to decide (see
+ * `borderRadius` / `controlHeight` in the ConfigProvider). It used to be
+ * re-declared here and again further down, both times with `!important`, which
+ * beat the geometry antd gives `Space.Compact`: the two halves of a compact row
+ * kept all four corners round and sat 6px apart in height, so every compact row
+ * in the app read as two separate pills crossing at the join. Pages that
+ * noticed patched it locally; the later duplicate is gone and this one no
+ * longer touches radius, so the framework's own seam is the one you see. */
+.ant-input-affix-wrapper,
+.ant-input-number,
+.ant-select-selector {
+  background: var(--surface) !important;
+  border-color: var(--border) !important;
+}
+
+.ant-input-affix-wrapper:focus,
+.ant-input-affix-wrapper-focused,
+.ant-input:focus,
+.ant-select-focused .ant-select-selector {
+  border-color: var(--border-strong) !important;
+  box-shadow: 0 0 0 2px var(--primary-soft) !important;
+}
+
+.ant-btn-default {
+  background: var(--surface) !important;
+  border-color: var(--border) !important;
+}
+
+.ant-btn-default:hover {
+  border-color: var(--border-strong) !important;
+  color: var(--text) !important;
+}
+
+.ant-tag {
+  border-color: var(--border) !important;
+  background: var(--primary-soft) !important;
+  color: var(--text-secondary) !important;
+}
+
+@media (max-width: 768px) {
+  .chat-inner {
+    padding-top: 20px;
+  }
+
+  .page-view {
+    padding-top: 22px;
+  }
+}
+
+/* Refined glass system: one quiet shell, generous radii, crisp contrast. */
+:root {
+  --bg: #101112;
+  --bg-soft: rgba(23, 24, 26, 0.82);
+  --surface: rgba(255, 255, 255, 0.055);
+  --surface-raised: rgba(255, 255, 255, 0.075);
+  --surface-hover: rgba(255, 255, 255, 0.085);
+  --border: rgba(255, 255, 255, 0.105);
+  --border-strong: rgba(255, 255, 255, 0.18);
+  --primary: #f4f4f5;
+  --primary-soft: rgba(244, 244, 245, 0.105);
+  --primary-border: rgba(244, 244, 245, 0.28);
+  --shadow: 0 24px 70px rgba(0, 0, 0, 0.26);
+}
+
+html[data-theme='light'] {
+  --bg: #eef0f2;
+  --bg-soft: rgba(255, 255, 255, 0.72);
+  --surface: rgba(255, 255, 255, 0.62);
+  --surface-raised: rgba(255, 255, 255, 0.78);
+  --surface-hover: rgba(17, 18, 21, 0.065);
+  --border: rgba(17, 18, 21, 0.11);
+  --border-strong: rgba(17, 18, 21, 0.2);
+  --primary: #202124;
+  --primary-soft: rgba(32, 33, 36, 0.08);
+  --primary-border: rgba(32, 33, 36, 0.2);
+  --shadow: 0 24px 70px rgba(32, 33, 36, 0.12);
+}
+
+body {
+  background: var(--bg);
+  background-image:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.026), transparent 42%),
+    linear-gradient(315deg, rgba(255, 255, 255, 0.018), transparent 56%);
+}
+
+html[data-theme='light'] body {
+  background-image:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.58), transparent 44%),
+    linear-gradient(315deg, rgba(17, 18, 21, 0.035), transparent 58%);
+}
+
+.app-shell {
+  gap: 12px;
+  padding: 12px;
+  background: transparent;
+}
+
+.app-sider,
+.app-main {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 26px;
+}
+
+.app-sider {
+  background: var(--bg-soft) !important;
+  backdrop-filter: blur(28px) saturate(135%);
+  -webkit-backdrop-filter: blur(28px) saturate(135%);
+  box-shadow: var(--shadow);
+}
+
+.app-main {
+  min-height: 0;
+  background: rgba(13, 14, 16, 0.68);
+  backdrop-filter: blur(22px) saturate(125%);
+  -webkit-backdrop-filter: blur(22px) saturate(125%);
+}
+
+html[data-theme='light'] .app-main {
+  background: rgba(255, 255, 255, 0.46);
+}
+
+.brand {
+  padding: 18px 16px 14px;
+}
+
+.brand-logo {
+  width: 38px;
+  height: 38px;
+  border-radius: 14px;
+  color: var(--bg);
+  background: var(--primary);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+}
+
+.brand-action,
+.header-menu {
+  border-radius: 12px !important;
+}
+
+.sider-nav {
+  padding-inline: 12px;
+}
+
+.sider-nav .ant-menu-item {
+  height: 42px;
+  margin-block: 4px;
+  border-radius: 14px;
+}
+
+.sider-nav .ant-menu-item-selected {
+  background: var(--surface-raised) !important;
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
+.sider-actions {
+  padding: 10px 14px 14px;
+}
+
+.sider-actions .ant-btn {
+  height: 42px;
+  border-radius: 14px !important;
+}
+
+/* The footer holds two side-by-side entries (theme, settings), so its buttons
+   are a notch smaller than the primary "new session" action above: two 42px
+   slabs at the bottom read as a second toolbar, which is not what a rarely
+   visited settings entry is meant to be. */
+.sider-footer .ant-btn {
+  height: 34px;
+  padding-inline: 8px;
+  border-radius: 10px !important;
+  font-size: 12px;
+}
+
+.session-panel {
+  padding-inline: 12px;
+}
+
+.session-item {
+  min-height: 54px;
+  margin-bottom: 4px;
+  padding: 9px 10px;
+  border-radius: 16px;
+}
+
+.session-item.active {
+  background: var(--primary-soft);
+  border-color: var(--primary-border);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.025);
+}
+
+.sider-footer {
+  padding: 12px 14px 16px;
+}
+
+.app-header {
+  height: 68px !important;
+  padding-inline: 24px !important;
+  background: rgba(16, 17, 18, 0.5) !important;
+  backdrop-filter: blur(24px) saturate(125%);
+  -webkit-backdrop-filter: blur(24px) saturate(125%);
+  border-bottom-color: var(--border);
+}
+
+html[data-theme='light'] .app-header {
+  background: rgba(255, 255, 255, 0.42) !important;
+}
+
+.app-content {
+  height: calc(100vh - 68px);
+}
+
+.page-view {
+  padding: 34px 32px 44px;
+}
+
+.page-head h2 {
+  font-size: 24px;
+  letter-spacing: -0.03em;
+}
+
+.chat-inner {
+  width: min(820px, calc(100% - 48px));
+  padding-block: 42px 52px;
+  gap: 32px;
+}
+
+.chat-empty-mark {
+  width: 50px;
+  height: 50px;
+  border-radius: 17px;
+  background: var(--surface-raised);
+  box-shadow: inset 0 0 0 1px var(--border), 0 12px 28px rgba(0, 0, 0, 0.16);
+}
+
+.chat-empty h2 {
+  font-size: 27px;
+}
+
+.chat-empty-suggestions .ant-btn {
+  border-radius: 999px;
+  border-color: var(--border);
+  background: var(--surface) !important;
+  transition: background .18s ease, border-color .18s ease, transform .18s ease;
+}
+
+.chat-empty-suggestions .ant-btn:hover {
+  transform: translateY(-1px);
+  border-color: var(--border-strong);
+  background: var(--surface-hover) !important;
+}
+/* The chips lifted on hover and had nothing for the press, so the `!important`
+ * hover held them at the lifted position while the button was down. They now
+ * land and dim, which is the same lift-then-land the send button uses. */
+.chat-empty-suggestions .ant-btn:active {
+  transform: translateY(0) scale(.98);
+  border-color: var(--border-strong);
+  background: var(--primary-soft) !important;
+}
+
+.bubble-user {
+  padding: 12px 17px;
+  border-radius: 20px 20px 6px 20px;
+  color: #161719;
+  background: #f1f1f2;
+  border-color: rgba(255, 255, 255, 0.3);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18);
+}
+
+html[data-theme='light'] .bubble-user {
+  color: #161719;
+  background: #e7e8ea;
+  border-color: rgba(17, 18, 21, 0.08);
+}
+
+.bubble-user .markdown,
+.bubble-user .markdown p,
+.bubble-user .markdown li,
+.bubble-user .markdown strong,
+.bubble-user .markdown em,
+.bubble-user .markdown a {
+  color: inherit;
+}
+
+.bubble-assistant {
+  padding: 12px 17px;
+  border-radius: 20px 20px 20px 6px;
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(20px) saturate(125%);
+  -webkit-backdrop-filter: blur(20px) saturate(125%);
+}
+
+.code-block {
+  border-radius: 14px;
+}
+
+.composer-wrap {
+  padding: 0 24px 22px;
+  background: linear-gradient(to top, var(--bg) 78%, transparent);
+}
+
+.composer {
+  width: min(820px, 100%);
+  padding: 12px 14px 10px;
+  border-radius: 22px;
+  border-color: var(--border-strong);
+  background: rgba(30, 31, 34, 0.76);
+  backdrop-filter: blur(26px) saturate(135%);
+  -webkit-backdrop-filter: blur(26px) saturate(135%);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.24);
+}
+
+html[data-theme='light'] .composer {
+  background: rgba(255, 255, 255, 0.76);
+}
+
+.composer:focus-within {
+  border-color: var(--primary-border);
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.24), 0 0 0 3px var(--primary-soft);
+}
+
+.composer .ant-input {
+  min-height: 38px;
+  padding: 6px 5px 11px;
+}
+
+.composer-footer {
+  min-height: 38px;
+  margin-top: 3px;
+  padding-top: 8px;
+}
+
+.send-button {
+  min-width: 78px;
+  height: 38px !important;
+  border-radius: 13px !important;
+  font-weight: 650;
+}
+
+.send-button.ant-btn-primary:not(:disabled) {
+  color: #17181a !important;
+  background: #f1f1f2 !important;
+  border-color: #f1f1f2 !important;
+}
+
+/* The `.send-button.ant-btn-primary:not(:disabled):hover` rule that used to sit
+   here is gone on purpose. It was an older generation: its `background` and
+   `border-color` were already dead, because the identical selector further down
+   (the one that also sets `color` and `filter`) overrides both. But it also set
+   `transform: translateY(-1px)` at specificity (0,4,0), which outranked the
+   intended `.send-button:not(:disabled):active { transform: translateY(0)
+   scale(.96) }` at (0,3,0). While a mouse button is held the element matches
+   `:hover` *and* `:active`, so the hover won and the send button -- the most
+   pressed control in the app -- never appeared to press. The lift now comes
+   from the lower-specificity hover rule, and `:active` finally wins. */
+
+.send-button.ant-btn-primary:disabled {
+  color: var(--text-secondary) !important;
+  background: var(--surface-raised) !important;
+  border-color: var(--border-strong) !important;
+}
+
+.model-select .ant-select-selector {
+  border-radius: 12px !important;
+}
+
+.command-popover,
+.command-palette-modal .ant-modal-content,
+.global-search-modal .ant-modal-content {
+  border-radius: 24px;
+  background: rgba(28, 29, 32, 0.82);
+  backdrop-filter: blur(28px) saturate(135%);
+  -webkit-backdrop-filter: blur(28px) saturate(135%);
+  box-shadow: var(--shadow);
+}
+
+html[data-theme='light'] .command-popover,
+html[data-theme='light'] .command-palette-modal .ant-modal-content,
+html[data-theme='light'] .global-search-modal .ant-modal-content {
+  background: rgba(255, 255, 255, 0.84);
+}
+
+.command-item,
+.global-search-item {
+  border-radius: 14px;
+}
+
+.current-session-panel {
+  border-radius: 18px;
+  background: var(--surface);
+}
+
+.session-card,
+.entity-card,
+.settings-card {
+  border-radius: 20px;
+  background: var(--surface-raised);
+  backdrop-filter: blur(18px) saturate(125%);
+  -webkit-backdrop-filter: blur(18px) saturate(125%);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.1);
+}
+
+.session-card:hover,
+.entity-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.15);
+}
+
+.entity-icon,
+.skill-row-icon {
+  border-radius: 13px;
+}
+
+.segmented-control {
+  padding: 4px;
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.segmented-control button {
+  height: 32px;
+  border-radius: 10px;
+}
+
+.skill-row {
+  border-radius: 16px;
+  border-bottom-color: transparent;
+  transition: background .18s ease, transform .18s ease;
+}
+
+.skill-row:hover {
+  transform: translateX(2px);
+  background: var(--surface-hover);
+}
+
+/* One more compact-row scar: a focused control's ring is painted outside its
+ * own box, so the sibling drawn after it covered the ring at the seam -- a
+ * 3px bite out of the right edge of the ring on the token field. Lift whichever
+ * half has focus instead of letting the ring stop halfway. */
+.ant-space-compact > *:focus-within {
+  position: relative;
+  z-index: 2;
+}
+
+.ant-tag {
+  border-radius: 999px !important;
+}
+
+@media (max-width: 768px) {
+  .app-shell {
+    gap: 0;
+    padding: 0;
+  }
+
+  .app-sider,
+  .app-main {
+    border-radius: 0;
+    border: 0;
+  }
+
+  .app-header {
+    height: 58px !important;
+    padding-inline: 14px !important;
+  }
+
+  .app-content {
+    height: calc(100vh - 58px);
+  }
+
+  .chat-inner {
+    width: calc(100% - 24px);
+    padding-top: 26px;
+  }
+
+  .composer-wrap {
+    padding: 0 10px 12px;
+  }
+
+  .composer {
+    border-radius: 19px;
+  }
+
+  .send-button {
+    min-width: 66px;
+  }
+
+  .page-view {
+    padding: 24px 16px 34px;
+  }
+}

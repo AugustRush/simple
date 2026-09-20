@@ -1,0 +1,84 @@
+/* Tool-approval bar and the command palette. */
+
+/* Tool approval bar — replaces the blocking modal. Lives in the composer
+ * stack (see the .approval-bar block at the end of this file for the layout),
+ * so the conversation stays readable while a decision is pending. */
+
+/* Command palette */
+.command-palette-modal .ant-modal-content {
+  padding: 10px;
+  border-radius: 16px;
+  background: var(--surface-raised);
+  backdrop-filter: blur(24px) saturate(120%);
+  -webkit-backdrop-filter: blur(24px) saturate(120%);
+  box-shadow: var(--shadow);
+  border: 1px solid var(--border);
+}
+
+.command-palette-modal .ant-modal-body {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.command-palette {
+  color: var(--text);
+}
+
+.command-palette-search {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 13px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.command-palette-search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  background: transparent;
+  font-size: 14px;
+}
+
+.command-palette-search input::placeholder {
+  color: var(--text-muted);
+}
+
+.command-palette-section {
+  padding: 13px 12px 6px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.palette-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 12px 12px;
+}
+
+.palette-nav button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: var(--surface);
+  cursor: pointer;
+  font-size: 12px;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.palette-nav button:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}

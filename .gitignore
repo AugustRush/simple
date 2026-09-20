@@ -11,6 +11,8 @@ frontend/dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+# Vite's temporary bundled config, written next to vite.config.ts on every build
+frontend/vite.config.ts.timestamp-*.mjs
 
 # Local test and browser artifacts
 .playwright-cli/
