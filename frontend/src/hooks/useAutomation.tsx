@@ -414,9 +414,34 @@ export function useAutomation(deps: Deps) {
     [schedules, selectedScheduleRun],
   )
 
+  /**
+   * The tasks tab's list.
+   *
+   * Tasks, not "rows in the task table". A step of a workflow is a task in the
+   * table and is not one on this page: its trigger comes from its upstreams,
+   * its switch is rewritten from the workflow's on the next save, and it can
+   * be neither deleted nor retried on its own. Listed beside the tasks that
+   * really are independent, it reads as one of them -- two different things
+   * behind identical cards, which is what "步骤拆在任务里，显示混乱" was. A chain
+   * is read on the workflow tab, where every step already has its own entry
+   * and a graph to see it in, so nothing here becomes unreachable.
+   *
+   * The one exception is a step whose workflow was deleted. Nothing owns it
+   * any more, no save will rewrite it, and this list is the last place it can
+   * be seen and removed -- which is why the exception exists rather than a
+   * flat "hide everything with a workflow_id". That answer needs the graph, so
+   * a step stays hidden until the graphs have arrived: before that every step
+   * would look orphaned and the list would flicker.
+   */
   const filteredSchedules = useMemo(() => {
     const query = scheduleQuery.trim().toLowerCase()
+    const liveWorkflows = workflowsLoaded
+      ? new Set(workflows.map(flow => flow.id))
+      : null
     return schedules.filter(task => {
+      if (task.workflow_id && (!liveWorkflows || liveWorkflows.has(task.workflow_id))) {
+        return false
+      }
       const latestStatus = task.latest_run?.status || ''
       const statusMatches = scheduleStatusFilter === 'all'
         // `in_flight` rather than a status test, so that a run sitting queued
@@ -434,7 +459,7 @@ export function useAutomation(deps: Deps) {
       const content = `${task.name} ${triggerText} ${task.workspace_root || ''} ${task.payload?.prompt || task.payload?.message_text || ''}`.toLowerCase()
       return content.includes(query)
     })
-  }, [scheduleQuery, scheduleStatusFilter, schedules])
+  }, [scheduleQuery, scheduleStatusFilter, schedules, workflows, workflowsLoaded])
 
   const filteredWorkflows = useMemo(() => {
     const query = workflowQuery.trim().toLowerCase()
@@ -485,20 +510,39 @@ export function useAutomation(deps: Deps) {
     permissionProfileOptions.find(item => item.key === key)?.label || key || '继承全局权限'
   ), [permissionProfileOptions])
 
+  /**
+   * The run the drawer is showing, reduced to the four values that decide
+   * whether its output has to be read again.
+   *
+   * Ids and statuses rather than the task and run objects they come from. Both
+   * writers of `selectedSchedule` -- the list refresh and the silent run
+   * refresh -- store a freshly parsed copy on every poll, and the run list
+   * hands back a new array of new runs just as often; so an object in this
+   * effect's dependency list announces a change once a poll about a run whose
+   * output was written once and cannot change afterwards. Keyed that way, the
+   * drawer re-read the file and blanked the whole block to a spinner on every
+   * tick, which is what "完整输出一直在刷新" was: two requests a poll, one per
+   * state write, and four visible flickers a minute for a file nobody touched.
+   */
+  const openTaskId = selectedSchedule?.id || ''
+  const openRunId = selectedScheduleRun?.id || ''
+  const openRunStatus = selectedScheduleRun?.status || ''
+  const openRunHasOutput = selectedScheduleRun?.output_available === true
+
   useEffect(() => {
-    if (!scheduleDetailOpen || !selectedSchedule || !selectedScheduleRun) {
+    if (!scheduleDetailOpen || !openTaskId || !openRunId) {
       setScheduleRunOutput(null)
       setScheduleOutputLoading(false)
       return
     }
-    if (selectedScheduleRun.status === 'running') {
+    if (openRunStatus === 'running') {
       setScheduleRunOutput(null)
       setScheduleOutputLoading(false)
       return
     }
-    if (!selectedScheduleRun.output_available) {
+    if (!openRunHasOutput) {
       setScheduleRunOutput({
-        run_id: selectedScheduleRun.id,
+        run_id: openRunId,
         available: false,
         content: '',
       })
@@ -508,8 +552,8 @@ export function useAutomation(deps: Deps) {
     let cancelled = false
     setScheduleOutputLoading(true)
     api(
-      `/api/schedules/${encodeURIComponent(selectedSchedule.id)}` +
-      `/runs/${encodeURIComponent(selectedScheduleRun.id)}/output`,
+      `/api/schedules/${encodeURIComponent(openTaskId)}` +
+      `/runs/${encodeURIComponent(openRunId)}/output`,
     )
       .then(resp => resp.json())
       .then(data => {
@@ -527,10 +571,10 @@ export function useAutomation(deps: Deps) {
   }, [
     api,
     scheduleDetailOpen,
-    selectedSchedule,
-    selectedScheduleRun?.id,
-    selectedScheduleRun?.output_available,
-    selectedScheduleRun?.status,
+    openTaskId,
+    openRunId,
+    openRunStatus,
+    openRunHasOutput,
   ])
 
   useEffect(() => {

@@ -523,31 +523,38 @@ function App() {
 
           <div className="sider-footer">
             <div className="sider-footer-row">
-              <Button
-                block
-                icon={themeMode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
-                onClick={() => {
-                  const next = themeMode === 'dark' ? 'light' : 'dark'
-                  setThemeMode(next)
-                  localStorage.setItem('agent_theme', next)
-                }}
-              >
-                {themeMode === 'dark' ? '浅色模式' : '深色模式'}
-              </Button>
+              {/* Icon-only, at their natural size.  These two are a footer of
+                  utilities rather than a page, and a word beside each icon
+                  made two half-width buttons out of two 38px targets -- a
+                  label a person reads once, and the footer spends the width
+                  of the whole column on it.  The label is not dropped: it
+                  moves into the tooltip and into the accessible name, since
+                  an icon on its own is a picture, not a label. */}
+              <Tooltip title={themeMode === 'dark' ? '切到浅色模式' : '切到深色模式'}>
+                <Button
+                  icon={themeMode === 'dark' ? <SunOutlined /> : <MoonOutlined />}
+                  aria-label={themeMode === 'dark' ? '切到浅色模式' : '切到深色模式'}
+                  onClick={() => {
+                    const next = themeMode === 'dark' ? 'light' : 'dark'
+                    setThemeMode(next)
+                    localStorage.setItem('agent_theme', next)
+                  }}
+                />
+              </Tooltip>
               {/* The settings entry, out of the main navigation by design: it
                   sits beside the theme switch -- the two things a person
                   touches once and then rarely -- rather than beside the pages
                   they visit every day.  navigateTo keeps the unsaved-edits
                   guard, so this small entry refuses to lose work exactly as
                   the menu item it replaces did. */}
-              <Button
-                block
-                icon={<SettingOutlined />}
-                aria-current={view === 'settings' ? 'page' : undefined}
-                onClick={() => navigateTo('settings')}
-              >
-                设置
-              </Button>
+              <Tooltip title="设置">
+                <Button
+                  icon={<SettingOutlined />}
+                  aria-label="设置"
+                  aria-current={view === 'settings' ? 'page' : undefined}
+                  onClick={() => navigateTo('settings')}
+                />
+              </Tooltip>
             </div>
           </div>
         </Sider>

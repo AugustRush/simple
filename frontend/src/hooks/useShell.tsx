@@ -25,9 +25,14 @@ export function useShell(deps: Deps) {
   // The cadence now comes from `schedulerWatchful`, which is also why the timer
   // survives a poll: it used to depend on `schedules`, so every response tore
   // the interval down and rebuilt it, and the real period was the cadence plus
-  // a render plus a round trip. A signal-triggered step has no clock, so no
-  // predicate covers it -- which is why the idle cadence exists at all rather
-  // than the timer stopping when nothing is imminent.
+  // a render plus a round trip. The open drawer is the same mistake one level
+  // down -- its task is re-stored as a freshly parsed copy on every poll, so
+  // the drawer is named by id here and the interval outlives the poll. A
+  // signal-triggered step has no clock, so no predicate covers it -- which is
+  // why the idle cadence exists at all rather than the timer stopping when
+  // nothing is imminent.
+  const selectedScheduleId = selectedSchedule?.id || ''
+
   useEffect(() => {
     if (view !== 'schedules') return
     const cadence = schedulerWatchful ? SCHEDULE_FAST_POLL_MS : SCHEDULE_IDLE_POLL_MS
@@ -37,8 +42,8 @@ export function useShell(deps: Deps) {
       // running workflow watched from this tab has to refresh that too --
       // otherwise the steps sit still while the run behind them moves.
       if (automationTab === 'workflows') void loadWorkflows(true)
-      if (scheduleDetailOpen && selectedSchedule) {
-        void loadScheduleRuns(selectedSchedule.id, false, true)
+      if (scheduleDetailOpen && selectedScheduleId) {
+        void loadScheduleRuns(selectedScheduleId, false, true)
       }
     }
     const timer = window.setInterval(refresh, cadence)
@@ -50,7 +55,7 @@ export function useShell(deps: Deps) {
     loadWorkflows,
     scheduleDetailOpen,
     schedulerWatchful,
-    selectedSchedule,
+    selectedScheduleId,
     view,
   ])
 

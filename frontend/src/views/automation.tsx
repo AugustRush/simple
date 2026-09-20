@@ -1635,7 +1635,7 @@ export function createAutomationView(ctx: AppCtx) {
         )}
       </Drawer>
       {automationTab === 'attention' ? renderAttention() : automationTab === 'workflows' ? renderWorkflows() : (
-      loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={schedules.length ? '没有符合条件的任务' : '暂无自动化任务'} className="page-empty" /> : (
+      loadingView ? <Skeleton active paragraph={{ rows: 6 }} /> : filteredSchedules.length === 0 ? <Empty description={scheduleQuery.trim() || scheduleStatusFilter !== 'all' ? '没有符合条件的任务' : '还没有独立任务。流程里的步骤在「流程」页签里。'} className="page-empty" /> : (
         <div className="schedule-list">
           {filteredSchedules.map(task => {
             const description = task.kind === 'agent_prompt'
@@ -1644,25 +1644,16 @@ export function createAutomationView(ctx: AppCtx) {
                 ? task.payload?.job_name
                 : task.payload?.message_text
             const latestRun = task.latest_run
-            // A step of a workflow is a task like any other, so it is listed
-            // like one -- but two of the controls here would be wrong on it.
-            // Deleting it would leave the steps below subscribed to a signal
-            // nobody emits, and its own switch is rewritten from the
-            // workflow's on the next save. The workflow card is where both
-            // belong, so this card says where it comes from instead.
-            //
-            // That reasoning holds only while the workflow exists. Deleting a
-            // workflow leaves its steps behind on purpose -- their run history
-            // is the record that it ran -- and from that moment nothing owns
-            // them: no save will rewrite them and no graph knows they are
-            // steps. They are ordinary disabled tasks, and the only thing left
-            // to do with one is delete it, which used to be refused by a
-            // pointer to a workflow nobody could open.
-            const owningWorkflow = task.workflow_id
-              ? workflows.find(item => item.id === task.workflow_id)
-              : undefined
-            const orphanedStep = !!task.workflow_id && workflowsLoaded && !owningWorkflow
-            const isStep = !!task.workflow_id && !orphanedStep
+            // A step of a live workflow never reaches this list -- the filter
+            // that builds it is what decides that -- so a task that still
+            // carries a workflow_id here is exactly a step whose workflow is
+            // gone. Deleting a workflow leaves its steps behind on purpose:
+            // their run history is the record that it ran. From that moment
+            // nothing owns them -- no save will rewrite them and no graph
+            // knows they are steps -- so they are ordinary disabled tasks, and
+            // the only thing left to do with one is delete it. That deletion
+            // used to be refused by a pointer to a workflow nobody could open.
+            const orphanedStep = !!task.workflow_id
             return (
               <Card
                 key={task.id}
@@ -1713,36 +1704,17 @@ export function createAutomationView(ctx: AppCtx) {
                         ? [...prev, task.id]
                         : prev.filter(id => id !== task.id))}
                     />
-                    {!isStep && (
-                      <Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} />
-                    )}
+                    <Switch size="small" checked={task.enabled !== false} onChange={value => toggleSchedule(task, value)} />
                     <Tooltip title={schedulerHealth.status === 'online' ? '立即运行' : '调度器离线'}><Button type="text" icon={<ThunderboltOutlined />} aria-label={`立即运行 ${task.name}`} disabled={schedulerHealth.status !== 'online' || !!task.active_run_id} onClick={() => runScheduleNow(task)} /></Tooltip>
-                    <Tooltip title={isStep ? '编辑这一步的内容' : '编辑'}><Button type="text" icon={<EditOutlined />} aria-label={`编辑 ${task.name}`} onClick={() => openEditSchedule(task)} /></Tooltip>
-                    {isStep ? (
-                      <Tooltip title="这一步属于一个流程，请到流程里删除它">
-                        <Button
-                          type="text"
-                          icon={<ApartmentOutlined />}
-                          aria-label={`查看 ${task.name} 所属的流程`}
-                          onClick={() => {
-                            setWorkflowQuery('')
-                            setAutomationTab('workflows')
-                          }}
-                        >流程</Button>
-                      </Tooltip>
-                    ) : (
-                      <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button>
-                    )}
+                    <Tooltip title="编辑"><Button type="text" icon={<EditOutlined />} aria-label={`编辑 ${task.name}`} onClick={() => openEditSchedule(task)} /></Tooltip>
+                    <Button danger type="text" icon={<DeleteOutlined />} onClick={() => deleteSchedule(task)}>删除</Button>
                   </Space>
                 </div>
-                {isStep || orphanedStep ? (
+                {orphanedStep ? (
                   <div className="schedule-step-origin">
                     <ApartmentOutlined />
                     <span>
-                      {isStep
-                        ? `流程「${owningWorkflow?.name || '未知'}」`
-                        : '原属的流程已删除'}
-                      {task.step_key ? ` · 步骤 ${task.step_key}` : ''}
+                      原属的流程已删除{task.step_key ? ` · 步骤 ${task.step_key}` : ''}
                     </span>
                   </div>
                 ) : null}
