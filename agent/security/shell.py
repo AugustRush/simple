@@ -616,7 +616,96 @@ def _is_env_assignment(token: str) -> bool:
     return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*=.*$", token))
 
 
+def _skip_env_wrapper(tokens: list[str], idx: int) -> int:
+    """Advance past an ``env`` invocation, returning the next token's index.
+
+    ``env -S`` / ``--split-string`` expands one word into several, so this may
+    rewrite ``tokens`` in place; the returned index refers to the rewritten list.
+    """
+    idx += 1
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token == "--":
+            return idx + 1
+        if _is_env_assignment(token):
+            idx += 1
+            continue
+        if token == "--split-string":
+            if idx + 1 < len(tokens):
+                split_tokens = _parse_command_tokens(tokens[idx + 1])
+                tokens[idx : idx + 2] = split_tokens
+                continue
+            idx += 1
+            continue
+        if token.startswith("--split-string="):
+            split_tokens = _parse_command_tokens(token.partition("=")[2])
+            tokens[idx : idx + 1] = split_tokens
+            continue
+        if token.startswith("--"):
+            idx += 1
+            if token in {"--chdir", "--unset"} and idx < len(tokens):
+                idx += 1
+            continue
+        if token.startswith("-") and token != "-":
+            option_chars = token[1:]
+            value_option = min(
+                (
+                    (option_chars.index(option), option)
+                    for option in "CSu"
+                    if option in option_chars
+                ),
+                default=None,
+            )
+            if value_option is None:
+                idx += 1
+                continue
+
+            value_option_index, option = value_option
+            attached_value = option_chars[value_option_index + 1 :]
+            if option == "S":
+                if attached_value:
+                    split_tokens = _parse_command_tokens(attached_value)
+                    tokens[idx : idx + 1] = split_tokens
+                elif idx + 1 < len(tokens):
+                    split_tokens = _parse_command_tokens(tokens[idx + 1])
+                    tokens[idx : idx + 2] = split_tokens
+                else:
+                    idx += 1
+                continue
+
+            idx += 1 if attached_value else 2
+            continue
+        break
+    return idx
+
+
+# Options that consume the word after them, so the wrapper skipper must step
+# over two tokens rather than one.
+_SUDO_VALUE_OPTIONS = frozenset({
+    "-g", "--group", "-h", "--host", "-p", "--prompt",
+    "-R", "--chroot", "-r", "--role", "-t", "--type",
+    "-u", "--user",
+})
+
+
+def _skip_sudo_wrapper(tokens: list[str], idx: int) -> int:
+    """Advance past a ``sudo`` invocation and its options."""
+    idx += 1
+    while idx < len(tokens):
+        token = tokens[idx]
+        if token == "--":
+            return idx + 1
+        if token.startswith("-"):
+            idx += 1
+            if token in _SUDO_VALUE_OPTIONS and idx < len(tokens):
+                idx += 1
+            continue
+        break
+    return idx
+
+
 def _resolve_effective_command_index(tokens: list[str]) -> Optional[int]:
+    """Index of the word that actually runs, past any `env`/`sudo` wrapper."""
     idx = 0
     while idx < len(tokens):
         token = tokens[idx]
@@ -626,93 +715,11 @@ def _resolve_effective_command_index(tokens: list[str]) -> Optional[int]:
 
         cmd = os.path.basename(token.strip().lstrip("./"))
         if cmd == "env":
-            idx += 1
-            while idx < len(tokens):
-                token = tokens[idx]
-                if token == "--":
-                    idx += 1
-                    break
-                if _is_env_assignment(token):
-                    idx += 1
-                    continue
-                if token == "--split-string":
-                    if idx + 1 < len(tokens):
-                        split_tokens = _parse_command_tokens(tokens[idx + 1])
-                        tokens[idx : idx + 2] = split_tokens
-                        continue
-                    idx += 1
-                    continue
-                if token.startswith("--split-string="):
-                    split_tokens = _parse_command_tokens(token.partition("=")[2])
-                    tokens[idx : idx + 1] = split_tokens
-                    continue
-                if token.startswith("--"):
-                    idx += 1
-                    if token in {"--chdir", "--unset"} and idx < len(tokens):
-                        idx += 1
-                    continue
-                if token.startswith("-") and token != "-":
-                    option_chars = token[1:]
-                    value_option = min(
-                        (
-                            (option_chars.index(option), option)
-                            for option in "CSu"
-                            if option in option_chars
-                        ),
-                        default=None,
-                    )
-                    if value_option is None:
-                        idx += 1
-                        continue
-
-                    value_option_index, option = value_option
-                    attached_value = option_chars[value_option_index + 1 :]
-                    if option == "S":
-                        if attached_value:
-                            split_tokens = _parse_command_tokens(attached_value)
-                            tokens[idx : idx + 1] = split_tokens
-                        elif idx + 1 < len(tokens):
-                            split_tokens = _parse_command_tokens(tokens[idx + 1])
-                            tokens[idx : idx + 2] = split_tokens
-                        else:
-                            idx += 1
-                        continue
-
-                    idx += 1 if attached_value else 2
-                    continue
-                break
+            idx = _skip_env_wrapper(tokens, idx)
             continue
-
         if cmd == "sudo":
-            idx += 1
-            while idx < len(tokens):
-                token = tokens[idx]
-                if token == "--":
-                    idx += 1
-                    break
-                if token.startswith("-"):
-                    idx += 1
-                    if token in {
-                        "-g",
-                        "--group",
-                        "-h",
-                        "--host",
-                        "-p",
-                        "--prompt",
-                        "-R",
-                        "--chroot",
-                        "-r",
-                        "--role",
-                        "-t",
-                        "--type",
-                        "-u",
-                        "--user",
-                    } and idx < len(tokens):
-                        idx += 1
-                    continue
-                break
+            idx = _skip_sudo_wrapper(tokens, idx)
             continue
-
         return idx
     return None
 
