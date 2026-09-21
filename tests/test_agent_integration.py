@@ -8993,7 +8993,23 @@ def test_interactive_loop_context_command_uses_dynamic_category_stats(
         "model": "fake-model",
     }
 
+    rendered: list[str] = []
+
+    class _RecordingSink(cli_module.CliOutputSink):
+        def on_status(self, text, **kwargs):
+            rendered.append(str(text))
+
+    monkeypatch.setattr(cli_module, "CliOutputSink", _RecordingSink)
+
     asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
+
+    # The report has to be built from the live stats(), not from a cached
+    # snapshot: the fake reports 2 dynamic categories out of 15, 14 entries,
+    # and names two categories.
+    report = "\n".join(rendered)
+    assert "Dynamic Categories: 2/15" in report
+    assert "Total Entries: 14" in report
+    assert "identity, projects" in report
 
 
 def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp_path):
