@@ -168,6 +168,317 @@ def _dt(value: Optional[str]) -> Optional[datetime]:
     return dt.astimezone(UTC)
 
 
+def _migrate_to_1(conn: sqlite3.Connection) -> None:
+    pass
+
+
+def _migrate_to_2(conn: sqlite3.Connection) -> None:
+    task_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    run_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_task_runs)"
+        ).fetchall()
+    }
+    additions = {
+        "workspace_root": "TEXT NOT NULL DEFAULT ''",
+        "context_policy": "TEXT NOT NULL DEFAULT 'stateless'",
+        "timeout_seconds": "INTEGER NOT NULL DEFAULT 1800",
+        "retry_policy_json": (
+            "TEXT NOT NULL DEFAULT "
+            "'{\"max_attempts\": 1, \"backoff_seconds\": 30}'"
+        ),
+    }
+    for name, declaration in additions.items():
+        if name not in task_columns:
+            conn.execute(
+                f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}"
+            )
+    run_additions = {
+        "config_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
+        "trigger_source": "TEXT NOT NULL DEFAULT 'schedule'",
+        "attempt": "INTEGER NOT NULL DEFAULT 1",
+        "cancel_requested_at": "TEXT",
+    }
+    for name, declaration in run_additions.items():
+        if name not in run_columns:
+            conn.execute(
+                f"ALTER TABLE scheduled_task_runs ADD COLUMN {name} {declaration}"
+            )
+
+
+def _migrate_to_3(conn: sqlite3.Connection) -> None:
+    run_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_task_runs)"
+        ).fetchall()
+    }
+    if "retry_of_run_id" not in run_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_task_runs ADD COLUMN "
+            "retry_of_run_id TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_queued "
+        "ON scheduled_task_runs(status, started_at)"
+    )
+
+
+def _migrate_to_4(conn: sqlite3.Connection) -> None:
+    task_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    if "selected_skills_json" not in task_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN "
+            "selected_skills_json TEXT NOT NULL DEFAULT '[]'"
+        )
+
+
+def _migrate_to_5(conn: sqlite3.Connection) -> None:
+    task_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    if "permission_profile" not in task_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN "
+            "permission_profile TEXT NOT NULL DEFAULT 'inherit'"
+        )
+
+
+def _migrate_to_6(conn: sqlite3.Connection) -> None:
+    run_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_task_runs)"
+        ).fetchall()
+    }
+    if "acknowledged_at" not in run_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_task_runs ADD COLUMN "
+            "acknowledged_at TEXT"
+        )
+        # Runs that predate this column were already reported
+        # through the run list, which is how the user found out
+        # about them.  Backfilling finished runs as seen keeps the
+        # new counter from announcing a backlog of history on the
+        # first launch after the upgrade.
+        conn.execute(
+            "UPDATE scheduled_task_runs SET acknowledged_at = finished_at "
+            "WHERE finished_at IS NOT NULL"
+        )
+
+
+def _migrate_to_7(conn: sqlite3.Connection) -> None:
+    run_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_task_runs)"
+        ).fetchall()
+    }
+    if "missed_count" not in run_columns:
+        # No backfill: the column is not derivable after the fact,
+        # and inventing a zero for history would claim those runs
+        # were preceded by nothing missed.  Older runs simply
+        # record nothing, which is what we actually know.
+        conn.execute(
+            "ALTER TABLE scheduled_task_runs ADD COLUMN "
+            "missed_count INTEGER NOT NULL DEFAULT 0"
+        )
+
+
+def _migrate_to_8(conn: sqlite3.Connection) -> None:
+    # The table itself is created by the DDL above (IF NOT EXISTS),
+    # which is what an existing database picks up on reopen.  The
+    # version bump records that signals exist; there is nothing to
+    # backfill, because a repository of emissions that were never
+    # made is empty, not zero-filled.
+    pass
+
+
+def _migrate_to_9(conn: sqlite3.Connection) -> None:
+    task_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    # Which workflow and which step a task was materialised from.
+    # On the task rather than in the graph, because the graph is
+    # edited as one document while the task is what actually runs;
+    # a stale graph must not be able to lose track of a live task.
+    # Defaults to empty, which is what every task that predates
+    # workflows is -- a standalone task, not a member of anything.
+    additions = {
+        "workflow_id": "TEXT NOT NULL DEFAULT ''",
+        "step_key": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, declaration in additions.items():
+        if name not in task_columns:
+            conn.execute(
+                f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}"
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_workflow "
+        "ON scheduled_tasks(workflow_id, step_key)"
+    )
+    # signal_joins and workflows are created by the DDL above;
+    # nothing to backfill for either.  A join's satisfied set starts
+    # empty by definition, and a workflow nobody has authored is
+    # absent rather than an empty row.
+
+
+def _migrate_to_10(conn: sqlite3.Connection) -> None:
+    # A join used to remember only *which* upstreams had reported --
+    # which is all it needs to decide when to run, and exactly what
+    # it needs to lose their results.  The payloads are kept now, so
+    # a step with several upstreams is told about all of them
+    # instead of only whichever one happened to finish last.
+    # Existing rows start empty, which reads as "this arrival
+    # carried nothing", the honest answer for a round that was
+    # recorded before there was anywhere to put it.
+    join_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(signal_joins)"
+        ).fetchall()
+    }
+    if "arrivals_json" not in join_columns:
+        conn.execute(
+            "ALTER TABLE signal_joins ADD COLUMN "
+            "arrivals_json TEXT NOT NULL DEFAULT '{}'"
+        )
+
+
+def _migrate_to_11(conn: sqlite3.Connection) -> None:
+    # What the work had to be true for, and what was concluded.
+    #
+    # No backfill, and the empty defaults are the correct reading
+    # of every existing row rather than a placeholder: a task that
+    # never declared an acceptance criterion has not been judged,
+    # which is a different statement from having been judged and
+    # passed.  Backfilling a pass would invent a verdict nobody
+    # ever reached.
+    task_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    if "acceptance_json" not in task_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN "
+            "acceptance_json TEXT NOT NULL DEFAULT ''"
+        )
+    run_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_task_runs)"
+        ).fetchall()
+    }
+    for name, declaration in (
+        ("verdict", "TEXT NOT NULL DEFAULT ''"),
+        ("verification_json", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in run_columns:
+            conn.execute(
+                f"ALTER TABLE scheduled_task_runs ADD COLUMN "
+                f"{name} {declaration}"
+            )
+
+
+def _migrate_to_12(conn: sqlite3.Connection) -> None:
+    # The words that asked for the task, so a row can say why it
+    # exists long after the conversation is gone.
+    #
+    # No backfill, for the same reason the acceptance criterion
+    # above has none: a task created before this column existed was
+    # created without anyone having to produce the evidence, so
+    # there is no quote to put there.  Writing one from the task's
+    # own name would look exactly like the real thing and would be
+    # a lie about who asked.
+    task_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    if "request_quote" not in task_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN "
+            "request_quote TEXT NOT NULL DEFAULT ''"
+        )
+    # A workflow is asked for by a person too, and its steps are
+    # asked for only through it -- so the sentence that put the
+    # chain there is stored once, on the chain, and copied onto
+    # each step's task.  Reading a step row then answers "why does
+    # this exist" with the words that started the whole thing,
+    # rather than with the name of the step above it.
+    workflow_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(workflows)"
+        ).fetchall()
+    }
+    if "request_quote" not in workflow_columns:
+        conn.execute(
+            "ALTER TABLE workflows ADD COLUMN "
+            "request_quote TEXT NOT NULL DEFAULT ''"
+        )
+
+
+def _migrate_to_13(conn: sqlite3.Connection) -> None:
+    # What a task promises to leave behind, and what a run actually
+    # left.  Two columns because they are two different statements:
+    # the first is the contract and is edited with the task, the
+    # second is an observation about one execution and is never
+    # edited by anybody.
+    #
+    # No backfill, for the reason the columns before these have
+    # none.  A task written before this existed was written without
+    # anyone having to say what it produces, so there is nothing to
+    # put there -- and inventing a path from the task's name would
+    # look exactly like a declaration, and be a promise the task
+    # never made.
+    task_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_tasks)"
+        ).fetchall()
+    }
+    if "produces_json" not in task_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_tasks ADD COLUMN "
+            "produces_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    run_columns = {
+        row[1] for row in conn.execute(
+            "PRAGMA table_info(scheduled_task_runs)"
+        ).fetchall()
+    }
+    if "products_json" not in run_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_task_runs ADD COLUMN "
+            "products_json TEXT NOT NULL DEFAULT '[]'"
+        )
+
+# One entry per schema version.  The driver walks them in order and owns
+# the version bump, so a step only has to do the work.
+_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    1: _migrate_to_1,
+    2: _migrate_to_2,
+    3: _migrate_to_3,
+    4: _migrate_to_4,
+    5: _migrate_to_5,
+    6: _migrate_to_6,
+    7: _migrate_to_7,
+    8: _migrate_to_8,
+    9: _migrate_to_9,
+    10: _migrate_to_10,
+    11: _migrate_to_11,
+    12: _migrate_to_12,
+    13: _migrate_to_13,
+}
+
+
 class SchedulerStore:
     SCHEMA_VERSION = 13
 
@@ -310,287 +621,19 @@ class SchedulerStore:
                 self._migrate_schema(current_version, self.SCHEMA_VERSION)
 
     def _migrate_schema(self, current_version: int, target_version: int) -> None:
-        version = int(current_version)
-        while version < target_version:
-            version += 1
-            if version == 1:
-                self._conn.execute("PRAGMA user_version = 1")
-            elif version == 2:
-                task_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_tasks)"
-                    ).fetchall()
-                }
-                run_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_task_runs)"
-                    ).fetchall()
-                }
-                additions = {
-                    "workspace_root": "TEXT NOT NULL DEFAULT ''",
-                    "context_policy": "TEXT NOT NULL DEFAULT 'stateless'",
-                    "timeout_seconds": "INTEGER NOT NULL DEFAULT 1800",
-                    "retry_policy_json": (
-                        "TEXT NOT NULL DEFAULT "
-                        "'{\"max_attempts\": 1, \"backoff_seconds\": 30}'"
-                    ),
-                }
-                for name, declaration in additions.items():
-                    if name not in task_columns:
-                        self._conn.execute(
-                            f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}"
-                        )
-                run_additions = {
-                    "config_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
-                    "trigger_source": "TEXT NOT NULL DEFAULT 'schedule'",
-                    "attempt": "INTEGER NOT NULL DEFAULT 1",
-                    "cancel_requested_at": "TEXT",
-                }
-                for name, declaration in run_additions.items():
-                    if name not in run_columns:
-                        self._conn.execute(
-                            f"ALTER TABLE scheduled_task_runs ADD COLUMN {name} {declaration}"
-                        )
-                self._conn.execute("PRAGMA user_version = 2")
-            elif version == 3:
-                run_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_task_runs)"
-                    ).fetchall()
-                }
-                if "retry_of_run_id" not in run_columns:
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_task_runs ADD COLUMN "
-                        "retry_of_run_id TEXT NOT NULL DEFAULT ''"
-                    )
-                self._conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_queued "
-                    "ON scheduled_task_runs(status, started_at)"
+        """Apply every migration between two versions, oldest step first.
+
+        The steps live in ``_MIGRATIONS`` and only do the work; the version
+        bump belongs here, so a step cannot forget it or record a wrong number.
+        """
+        for version in range(int(current_version) + 1, target_version + 1):
+            step = _MIGRATIONS.get(version)
+            if step is None:
+                raise RuntimeError(
+                    f"no scheduler migration for schema version {version}"
                 )
-                self._conn.execute("PRAGMA user_version = 3")
-            elif version == 4:
-                task_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_tasks)"
-                    ).fetchall()
-                }
-                if "selected_skills_json" not in task_columns:
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_tasks ADD COLUMN "
-                        "selected_skills_json TEXT NOT NULL DEFAULT '[]'"
-                    )
-                self._conn.execute("PRAGMA user_version = 4")
-            elif version == 5:
-                task_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_tasks)"
-                    ).fetchall()
-                }
-                if "permission_profile" not in task_columns:
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_tasks ADD COLUMN "
-                        "permission_profile TEXT NOT NULL DEFAULT 'inherit'"
-                    )
-                self._conn.execute("PRAGMA user_version = 5")
-            elif version == 6:
-                run_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_task_runs)"
-                    ).fetchall()
-                }
-                if "acknowledged_at" not in run_columns:
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_task_runs ADD COLUMN "
-                        "acknowledged_at TEXT"
-                    )
-                    # Runs that predate this column were already reported
-                    # through the run list, which is how the user found out
-                    # about them.  Backfilling finished runs as seen keeps the
-                    # new counter from announcing a backlog of history on the
-                    # first launch after the upgrade.
-                    self._conn.execute(
-                        "UPDATE scheduled_task_runs SET acknowledged_at = finished_at "
-                        "WHERE finished_at IS NOT NULL"
-                    )
-                self._conn.execute("PRAGMA user_version = 6")
-            elif version == 7:
-                run_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_task_runs)"
-                    ).fetchall()
-                }
-                if "missed_count" not in run_columns:
-                    # No backfill: the column is not derivable after the fact,
-                    # and inventing a zero for history would claim those runs
-                    # were preceded by nothing missed.  Older runs simply
-                    # record nothing, which is what we actually know.
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_task_runs ADD COLUMN "
-                        "missed_count INTEGER NOT NULL DEFAULT 0"
-                    )
-                self._conn.execute("PRAGMA user_version = 7")
-            elif version == 8:
-                # The table itself is created by the DDL above (IF NOT EXISTS),
-                # which is what an existing database picks up on reopen.  The
-                # version bump records that signals exist; there is nothing to
-                # backfill, because a repository of emissions that were never
-                # made is empty, not zero-filled.
-                self._conn.execute("PRAGMA user_version = 8")
-            elif version == 9:
-                task_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_tasks)"
-                    ).fetchall()
-                }
-                # Which workflow and which step a task was materialised from.
-                # On the task rather than in the graph, because the graph is
-                # edited as one document while the task is what actually runs;
-                # a stale graph must not be able to lose track of a live task.
-                # Defaults to empty, which is what every task that predates
-                # workflows is -- a standalone task, not a member of anything.
-                additions = {
-                    "workflow_id": "TEXT NOT NULL DEFAULT ''",
-                    "step_key": "TEXT NOT NULL DEFAULT ''",
-                }
-                for name, declaration in additions.items():
-                    if name not in task_columns:
-                        self._conn.execute(
-                            f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}"
-                        )
-                self._conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_workflow "
-                    "ON scheduled_tasks(workflow_id, step_key)"
-                )
-                # signal_joins and workflows are created by the DDL above;
-                # nothing to backfill for either.  A join's satisfied set starts
-                # empty by definition, and a workflow nobody has authored is
-                # absent rather than an empty row.
-                self._conn.execute("PRAGMA user_version = 9")
-            elif version == 10:
-                # A join used to remember only *which* upstreams had reported --
-                # which is all it needs to decide when to run, and exactly what
-                # it needs to lose their results.  The payloads are kept now, so
-                # a step with several upstreams is told about all of them
-                # instead of only whichever one happened to finish last.
-                # Existing rows start empty, which reads as "this arrival
-                # carried nothing", the honest answer for a round that was
-                # recorded before there was anywhere to put it.
-                join_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(signal_joins)"
-                    ).fetchall()
-                }
-                if "arrivals_json" not in join_columns:
-                    self._conn.execute(
-                        "ALTER TABLE signal_joins ADD COLUMN "
-                        "arrivals_json TEXT NOT NULL DEFAULT '{}'"
-                    )
-                self._conn.execute("PRAGMA user_version = 10")
-            elif version == 11:
-                # What the work had to be true for, and what was concluded.
-                #
-                # No backfill, and the empty defaults are the correct reading
-                # of every existing row rather than a placeholder: a task that
-                # never declared an acceptance criterion has not been judged,
-                # which is a different statement from having been judged and
-                # passed.  Backfilling a pass would invent a verdict nobody
-                # ever reached.
-                task_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_tasks)"
-                    ).fetchall()
-                }
-                if "acceptance_json" not in task_columns:
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_tasks ADD COLUMN "
-                        "acceptance_json TEXT NOT NULL DEFAULT ''"
-                    )
-                run_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_task_runs)"
-                    ).fetchall()
-                }
-                for name, declaration in (
-                    ("verdict", "TEXT NOT NULL DEFAULT ''"),
-                    ("verification_json", "TEXT NOT NULL DEFAULT ''"),
-                ):
-                    if name not in run_columns:
-                        self._conn.execute(
-                            f"ALTER TABLE scheduled_task_runs ADD COLUMN "
-                            f"{name} {declaration}"
-                        )
-                self._conn.execute("PRAGMA user_version = 11")
-            elif version == 12:
-                # The words that asked for the task, so a row can say why it
-                # exists long after the conversation is gone.
-                #
-                # No backfill, for the same reason the acceptance criterion
-                # above has none: a task created before this column existed was
-                # created without anyone having to produce the evidence, so
-                # there is no quote to put there.  Writing one from the task's
-                # own name would look exactly like the real thing and would be
-                # a lie about who asked.
-                task_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_tasks)"
-                    ).fetchall()
-                }
-                if "request_quote" not in task_columns:
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_tasks ADD COLUMN "
-                        "request_quote TEXT NOT NULL DEFAULT ''"
-                    )
-                # A workflow is asked for by a person too, and its steps are
-                # asked for only through it -- so the sentence that put the
-                # chain there is stored once, on the chain, and copied onto
-                # each step's task.  Reading a step row then answers "why does
-                # this exist" with the words that started the whole thing,
-                # rather than with the name of the step above it.
-                workflow_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(workflows)"
-                    ).fetchall()
-                }
-                if "request_quote" not in workflow_columns:
-                    self._conn.execute(
-                        "ALTER TABLE workflows ADD COLUMN "
-                        "request_quote TEXT NOT NULL DEFAULT ''"
-                    )
-                self._conn.execute("PRAGMA user_version = 12")
-            elif version == 13:
-                # What a task promises to leave behind, and what a run actually
-                # left.  Two columns because they are two different statements:
-                # the first is the contract and is edited with the task, the
-                # second is an observation about one execution and is never
-                # edited by anybody.
-                #
-                # No backfill, for the reason the columns before these have
-                # none.  A task written before this existed was written without
-                # anyone having to say what it produces, so there is nothing to
-                # put there -- and inventing a path from the task's name would
-                # look exactly like a declaration, and be a promise the task
-                # never made.
-                task_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_tasks)"
-                    ).fetchall()
-                }
-                if "produces_json" not in task_columns:
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_tasks ADD COLUMN "
-                        "produces_json TEXT NOT NULL DEFAULT '[]'"
-                    )
-                run_columns = {
-                    row[1] for row in self._conn.execute(
-                        "PRAGMA table_info(scheduled_task_runs)"
-                    ).fetchall()
-                }
-                if "products_json" not in run_columns:
-                    self._conn.execute(
-                        "ALTER TABLE scheduled_task_runs ADD COLUMN "
-                        "products_json TEXT NOT NULL DEFAULT '[]'"
-                    )
-                self._conn.execute("PRAGMA user_version = 13")
+            step(self._conn)
+            self._conn.execute(f"PRAGMA user_version = {version}")
 
     def _task_from_row(self, row: sqlite3.Row) -> ScheduledTask:
         return ScheduledTask(
