@@ -8,7 +8,9 @@ Plugin lifecycle
    real LLM client/model/memory that were resolved by _build_components_async.
 3. ``on_turn_end(event)`` runs CorrectionDetector; logs failures; calls
    ``record_application`` for every active rule so the feedback loop closes;
-   triggers async rule extraction when the failure threshold is met.
+   triggers async rule extraction when the failure threshold is met.  An
+   extracted rule that restates one already retired is logged and dropped
+   instead of re-added -- see ``RuleStore.is_repeat_of_retired``.
 4. ``on_session_end(event)`` calls EvolutionEngine.score_session() and
    prints the score exactly as before.
 5. ``compose_system_prompt(current_prompt)`` appends active behavioral rules
@@ -467,18 +469,28 @@ class EvolutionPlugin:
             rule_text = await self._engine.generate_text(prompt, max_tokens=100)
             rule_text = rule_text.strip().strip('"').strip("'")
             if self._is_safe_behavior_rule(rule_text):
-                pre_correction_rate = min(
-                    1.0,
-                    len(recent_failures) / max(_RULE_EXTRACTION_THRESHOLD, 1),
-                )
-                self._rule_store.add_rule(
-                    rule_text,
-                    source_failures=[f["id"] for f in recent_failures],
-                    pre_correction_rate=pre_correction_rate,
-                )
-                _console().print(
-                    f"[dim]New behavioral rule learned: {rule_text[:80]}[/dim]"
-                )
+                if self._rule_store.is_repeat_of_retired(rule_text):
+                    # A rule that lost its evaluation is not a new candidate.
+                    # Re-proposing it would spend another extraction round to
+                    # re-learn that it does not hold here, and would reset its
+                    # counters so the verdict could never be reached again.
+                    _console().print(
+                        "[dim]Evolution plugin: rule was already retired, "
+                        f"not re-proposing: {rule_text[:80]}[/dim]"
+                    )
+                else:
+                    pre_correction_rate = min(
+                        1.0,
+                        len(recent_failures) / max(_RULE_EXTRACTION_THRESHOLD, 1),
+                    )
+                    self._rule_store.add_rule(
+                        rule_text,
+                        source_failures=[f["id"] for f in recent_failures],
+                        pre_correction_rate=pre_correction_rate,
+                    )
+                    _console().print(
+                        f"[dim]New behavioral rule learned: {rule_text[:80]}[/dim]"
+                    )
             elif rule_text:
                 _console().print(
                     f"[dim]Evolution plugin: rejected unsafe rule: {rule_text[:80]}[/dim]"

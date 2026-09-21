@@ -1462,6 +1462,47 @@ def test_evolution_plugin_rejects_prompt_injection_rule_text(tmp_path, monkeypat
     assert store._load() == []
 
 
+def test_evolution_plugin_does_not_re_propose_a_retired_rule(tmp_path, monkeypatch):
+    """A rule that already lost its evaluation is not a new candidate.
+
+    Re-adding it would spend another extraction round to re-learn that it does
+    not hold here, and would reset the counters its verdict was computed from,
+    so the verdict could never be reached again.
+    """
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    import agent._builtin.plugins.evolution.rules as rules_mod
+    from agent import shared as _shared
+
+    monkeypatch.setattr(_shared, "RL_DIR", tmp_path)
+    store = rules_mod.RuleStore(rules_file=tmp_path / "rules.jsonl")
+    retired = store.add_rule("Always inspect failing output before patching.", [])
+    for _ in range(rules_mod.EVAL_THRESHOLD):
+        store.record_application(retired.id, was_corrected=True)
+    assert store._load()[0].status == "retired"
+
+    class _FakeEngine:
+        async def generate_text(self, prompt, max_tokens):
+            return "Always inspect failing output before patching."
+
+    evo_plugin = EvolutionPlugin()
+    evo_plugin._engine = _FakeEngine()
+    evo_plugin._rule_store = store
+    evo_plugin._pending_failures = [
+        {"id": "f1", "user_correction": "No, inspect logs", "context_summary": "ok"},
+        {"id": "f2", "user_correction": "Wrong, read error", "context_summary": "ok"},
+        {"id": "f3", "user_correction": "No, check pytest", "context_summary": "ok"},
+    ]
+
+    asyncio.run(evo_plugin._try_extract_rule())
+
+    rules = store._load()
+    assert len(rules) == 1, "the retired rule must not be re-added"
+    assert rules[0].status == "retired"
+    assert rules[0].applications == rules_mod.EVAL_THRESHOLD
+    # The failures are consumed either way, so the next round is not stuck.
+    assert evo_plugin._pending_failures == []
+
+
 def test_evolution_plugin_records_applications_only_for_related_rules(tmp_path):
     from agent import TurnEvent
     from agent._builtin.plugins.evolution import EvolutionPlugin

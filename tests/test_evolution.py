@@ -556,3 +556,131 @@ def test_rule_store_logs_when_it_drops_an_unreadable_rule_line(tmp_path, caplog)
 
     assert [r.id for r in loaded] == [good.id]
     assert "unreadable rule line" in caplog.text
+
+
+def test_rule_store_records_the_verdict_and_its_evidence(tmp_path):
+    """A rule that loses its evaluation has to stay legible afterwards.
+
+    The counters survive the flip, so the rates can be recomputed -- but the
+    *decision* cannot: which threshold applied, and which side of it the rule
+    landed on, are known only at that instant.
+    """
+    import json
+
+    from agent._builtin.plugins.evolution.rules import (
+        EVAL_THRESHOLD,
+        IMPROVEMENT_DELTA,
+        RuleStore,
+    )
+
+    store = RuleStore(rules_file=tmp_path / "rules.jsonl")
+    rule = store.add_rule(
+        "Always greet the user by name",
+        source_failures=["f1"],
+        pre_correction_rate=0.9,
+    )
+    for _ in range(EVAL_THRESHOLD):
+        store.record_application(rule.id, was_corrected=True)
+
+    lines = (
+        (tmp_path / "rule-decisions.jsonl").read_text(encoding="utf-8").splitlines()
+    )
+    # One line per verdict, not per application.
+    assert len(lines) == 1
+    entry = json.loads(lines[0])
+    assert entry["rule_id"] == rule.id
+    assert entry["from"] == "probation"
+    assert entry["to"] == "retired"
+    assert entry["applications"] == EVAL_THRESHOLD
+    assert entry["corrections_after"] == EVAL_THRESHOLD
+    assert entry["pre_correction_rate"] == 0.9
+    assert entry["post_correction_rate"] == 1.0
+    assert entry["improvement"] == -0.1
+    assert entry["required_improvement"] == IMPROVEMENT_DELTA
+    assert entry["source_failures"] == ["f1"]
+
+
+def test_rule_store_records_a_promotion_too(tmp_path):
+    import json
+
+    from agent._builtin.plugins.evolution.rules import EVAL_THRESHOLD, RuleStore
+
+    store = RuleStore(rules_file=tmp_path / "rules.jsonl")
+    rule = store.add_rule(
+        "Never edit a file without showing the diff", [], pre_correction_rate=0.9
+    )
+    for _ in range(EVAL_THRESHOLD):
+        store.record_application(rule.id, was_corrected=False)
+
+    entry = json.loads(
+        (tmp_path / "rule-decisions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[-1]
+    )
+    assert entry["to"] == "active"
+    assert entry["rule_id"] == rule.id
+    assert entry["improvement"] == 0.9
+
+
+def test_rule_store_keeps_the_rule_when_the_audit_log_cannot_be_written(
+    tmp_path, caplog
+):
+    """The counters are the primary record; the log only explains them.
+
+    Losing the explanation is worth reporting, but not worth losing the
+    verdict over.
+    """
+    import logging
+
+    from agent._builtin.plugins.evolution.rules import EVAL_THRESHOLD, RuleStore
+
+    store = RuleStore(rules_file=tmp_path / "rules.jsonl")
+    rule = store.add_rule("Ask before deleting anything", [], pre_correction_rate=1.0)
+    # A directory where the log file should be: every append fails.
+    (tmp_path / "rule-decisions.jsonl").mkdir()
+
+    with caplog.at_level(logging.WARNING, logger="agent"):
+        for _ in range(EVAL_THRESHOLD):
+            store.record_application(rule.id, was_corrected=True)
+
+    reloaded = [r for r in store._load() if r.id == rule.id][0]
+    assert reloaded.status == "retired"
+    assert "could not append rule decision" in caplog.text
+
+
+def test_is_repeat_of_retired_catches_restatements_not_new_rules():
+    from agent._builtin.plugins.evolution.rules import is_repeat_of_retired
+
+    retired = ["Always greet the user by name"]
+
+    assert is_repeat_of_retired("Always greet the user by name", retired) is True
+    assert is_repeat_of_retired("always greet the user by name.", retired) is True
+    assert is_repeat_of_retired("Always greet the user by their name", retired) is True
+
+    assert (
+        is_repeat_of_retired("Never delete a file without asking first", retired)
+        is False
+    )
+    assert is_repeat_of_retired("", retired) is False
+    assert is_repeat_of_retired("Anything at all", []) is False
+
+
+def test_rule_store_exposes_only_retired_rules_to_the_proposer(tmp_path):
+    from agent._builtin.plugins.evolution.rules import EVAL_THRESHOLD, RuleStore
+
+    store = RuleStore(rules_file=tmp_path / "rules.jsonl")
+    rejected = store.add_rule(
+        "Always greet the user by name", [], pre_correction_rate=1.0
+    )
+    accepted = store.add_rule(
+        "Never edit a file without showing the diff", [], pre_correction_rate=1.0
+    )
+    for _ in range(EVAL_THRESHOLD):
+        store.record_application(rejected.id, was_corrected=True)
+        store.record_application(accepted.id, was_corrected=False)
+
+    # Still on disk rather than deleted -- that is what makes it usable as
+    # evidence about what does not work here.
+    assert store.retired_rule_texts() == ["Always greet the user by name"]
+    assert store.is_repeat_of_retired("Always greet the user by name") is True
+    assert store.is_repeat_of_retired("Never edit a file without showing the diff") is False
