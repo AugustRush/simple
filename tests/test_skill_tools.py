@@ -64,6 +64,78 @@ def test_list_skill_files_accepts_optional_path_filter(tmp_path):
     assert dot["files"] == whole["files"]
 
 
+def test_skill_file_tools_accept_a_bundle_beneath_a_symlinked_root(tmp_path):
+    """A resolved child must be compared with its resolved bundle root.
+
+    On macOS ``/var`` itself is a symlink to ``/private/var``.  The old guard
+    resolved the requested child but not ``bundle.path``, so a perfectly local
+    file appeared outside its own bundle.  Test all three guarded operations:
+    list, read, and write.
+    """
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    linked_root = tmp_path / "linked"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+
+    registry = ToolRegistry()
+    catalog = _catalog_with_files(linked_root, "demo", ["scripts/a.py"])
+    catalog.register_tools(registry)
+
+    listed = _call(
+        registry,
+        "list_skill_files",
+        {"skill_name": "demo", "path": "scripts"},
+    )
+    assert listed["ok"] is True
+    assert listed["files"] == ["scripts/a.py"]
+
+    read = _call(
+        registry,
+        "read_skill_file",
+        {"skill_name": "demo", "path": "scripts/a.py"},
+    )
+    assert read["ok"] is True
+    assert read["content"] == "data"
+
+    written = _call(
+        registry,
+        "write_skill_file",
+        {"skill_name": "demo", "path": "scripts/a.py", "content": "updated"},
+    )
+    assert written["ok"] is True
+    assert (real_root / "skills" / "demo" / "scripts" / "a.py").read_text() == "updated"
+
+
+def test_skill_file_tools_still_refuse_a_link_that_points_outside(tmp_path):
+    """Resolving the bundle root must not cost the containment guarantee.
+
+    The guard exists so a path inside a bundle cannot reach the filesystem
+    outside it.  Resolving both sides is what keeps that true when the escape
+    is a symlink rather than a ``../``: the link resolves to its target, which
+    is outside the root, and is refused.
+    """
+    registry = ToolRegistry()
+    catalog = _catalog_with_files(tmp_path, "demo", [])
+    catalog.register_tools(registry)
+
+    outside = tmp_path / "outside-secret.txt"
+    outside.write_text("do not read me", encoding="utf-8")
+    (tmp_path / "skills" / "demo" / "escape").symlink_to(outside)
+
+    read = _call(registry, "read_skill_file", {"skill_name": "demo", "path": "escape"})
+    assert read["ok"] is False
+    assert "escapes" in read["error"]
+
+    written = _call(
+        registry,
+        "write_skill_file",
+        {"skill_name": "demo", "path": "escape", "content": "clobbered"},
+    )
+    assert written["ok"] is False
+    assert "escapes" in written["error"]
+    assert outside.read_text(encoding="utf-8") == "do not read me"
+
+
 def test_list_skill_files_rejects_escapes_and_unknown_fields(tmp_path):
     registry = ToolRegistry()
     catalog = _catalog_with_files(tmp_path, "demo", ["a.txt"])
@@ -409,3 +481,96 @@ def test_deleting_a_skill_throws_its_switch_away_with_it(tmp_path):
     _install_skill_on_disk(root, "review", body="A different review.")
     assert catalog.get("review") is not None
     assert catalog.is_enabled("review") is True
+
+
+def test_update_skill_archives_the_version_it_replaces(tmp_path):
+    """An edit is a hypothesis about what the skill should say, and a
+    hypothesis needs a way back -- otherwise a change that made the skill worse
+    is indistinguishable from one that made it better, because the evidence it
+    was worse is gone."""
+    registry = ToolRegistry()
+    catalog = _catalog_with_files(tmp_path, "demo", [])
+    catalog.register_tools(registry)
+
+    skill_dir = tmp_path / "skills" / "demo"
+    before = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+
+    updated = _call(
+        registry,
+        "update_skill",
+        {"skill_id": "demo", "instructions": "Revised instructions."},
+    )
+    assert updated["ok"] is True
+    archived = updated["archived"]
+    assert archived is not None
+    # The whole file, frontmatter included -- that is what a restore puts back.
+    assert (skill_dir / archived).read_text(encoding="utf-8") == before
+    assert "Revised instructions." in (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+
+
+def test_archived_versions_are_history_not_supporting_material(tmp_path):
+    """Offering an old SKILL.md beside the live instructions would invite the
+    model to follow the version it was just handed a replacement for."""
+    registry = ToolRegistry()
+    catalog = _catalog_with_files(tmp_path, "demo", [])
+    catalog.register_tools(registry)
+
+    archived = _call(
+        registry,
+        "update_skill",
+        {"skill_id": "demo", "instructions": "Revised instructions."},
+    )["archived"]
+
+    bundle = catalog.find_any("demo")
+    assert bundle.supporting_files == []
+    assert bundle.versions == [archived]
+    assert archived not in catalog.activation_text("demo", explicit=True)
+
+    # Reachable on demand, though, or there would be no way back.
+    listed = _call(registry, "list_skill_files", {"skill_name": "demo"})
+    assert listed["files"] == []
+    assert listed["versions"] == [archived]
+    read = _call(registry, "read_skill_file", {"skill_name": "demo", "path": archived})
+    assert read["ok"] is True
+    assert "Instructions." in read["content"]
+
+    payload = _call(registry, "activate_skill", {"skill_name": "demo"})
+    assert payload["skill"]["versions"] == [archived]
+    assert "rollback" in payload["hints"]
+
+
+def test_update_skill_keeps_every_version_it_replaces(tmp_path):
+    registry = ToolRegistry()
+    catalog = _catalog_with_files(tmp_path, "demo", [])
+    catalog.register_tools(registry)
+
+    for index in range(3):
+        _call(
+            registry,
+            "update_skill",
+            {"skill_id": "demo", "instructions": f"Body {index}"},
+        )
+
+    versions = catalog.find_any("demo").versions
+    assert len(versions) == 3
+    assert versions == sorted(versions), "oldest first"
+    # _datestamp() is second-resolution, so three edits in one second collide
+    # unless the name is disambiguated.
+    assert len(set(versions)) == 3
+
+
+def test_archived_versions_are_not_loaded_as_separate_skills(tmp_path):
+    """The loader matches the exact name SKILL.md, so history must not
+    reappear as a bundle of its own."""
+    registry = ToolRegistry()
+    catalog = _catalog_with_files(tmp_path, "demo", [])
+    catalog.register_tools(registry)
+    for index in range(3):
+        _call(
+            registry,
+            "update_skill",
+            {"skill_id": "demo", "instructions": f"Body {index}"},
+        )
+
+    assert [bundle.id for bundle in catalog.list_all_skills()] == ["demo"]
+    assert catalog.find_any("SKILL.md") is None

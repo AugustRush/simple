@@ -17,6 +17,40 @@ from agent.tools.runtime import ToolRegistry
 def _datestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
+
+#: A superseded SKILL.md is archived beside the live one as ``SKILL.md.<stamp>``.
+#: The prefix is load-bearing twice over: the loader matches the *exact* name
+#: ``SKILL.md``, so an archive is never mistaken for a second skill; and
+#: ``_read_bundle`` files it under ``versions`` rather than ``supporting_files``,
+#: so it is not advertised in the prompt as material to go and read.
+_SKILL_VERSION_PREFIX = "SKILL.md."
+
+
+def _is_skill_version(leaf_name: str) -> bool:
+    """Whether *leaf_name* is an archived SKILL.md, not the live entrypoint."""
+    return (
+        leaf_name.startswith(_SKILL_VERSION_PREFIX)
+        and len(leaf_name) > len(_SKILL_VERSION_PREFIX)
+    )
+
+
+def _resolve_within_bundle(bundle_root: Path, rel_path: Path) -> Optional[Path]:
+    """Resolve *rel_path* only when it stays beneath the resolved bundle root.
+
+    Resolve both sides of the containment test.  Resolving only the child makes
+    every valid file look like an escape when the bundle root itself sits below
+    a symlink -- on macOS the ordinary ``/var`` → ``/private/var`` alias is
+    enough to trigger it.  Resolving the child also keeps the original security
+    property: an in-bundle symlink that points outside still resolves outside
+    and is rejected.
+    """
+    root = bundle_root.resolve(strict=False)
+    target = (root / rel_path).resolve(strict=False)
+    if target == root or root in target.parents:
+        return target
+    return None
+
+
 @dataclass
 class SkillBundle:
     id: str
@@ -27,6 +61,11 @@ class SkillBundle:
     body: str
     metadata: dict[str, Any] = field(default_factory=dict)
     supporting_files: list[str] = field(default_factory=list)
+    #: Superseded copies of SKILL.md, newest last.  Kept apart from
+    #: ``supporting_files`` because the two are read differently: supporting
+    #: files are advertised in the injected prompt, while versions are history
+    #: the model should only see when it asks to roll one back.
+    versions: list[str] = field(default_factory=list)
     user_invocable: bool = True
     disable_model_invocation: bool = False
 
@@ -250,11 +289,20 @@ class SkillCatalog:
             plugin_name = source.split(":", 1)[1]
             if plugin_name and not bundle_id.startswith(f"{plugin_name}:"):
                 bundle_id = f"{plugin_name}:{bundle_id}"
-        supporting_files = sorted(
+        supporting_files: list[str] = []
+        versions: list[str] = []
+        for path in sorted(
             p.relative_to(bundle_dir).as_posix()
             for p in bundle_dir.rglob("*")
-            if p.is_file() and p.name != "SKILL.md"
-        )
+            if p.is_file()
+        ):
+            leaf = path.rsplit("/", 1)[-1]
+            if leaf == "SKILL.md":
+                continue
+            if _is_skill_version(leaf):
+                versions.append(path)
+            else:
+                supporting_files.append(path)
         return SkillBundle(
             id=bundle_id,
             name=str(metadata.get("name") or bundle_dir.name),
@@ -264,11 +312,44 @@ class SkillCatalog:
             body=body,
             metadata=metadata,
             supporting_files=supporting_files,
+            versions=versions,
             user_invocable=bool(metadata.get("user-invocable", True)),
             disable_model_invocation=bool(
                 metadata.get("disable-model-invocation", False)
             ),
         )
+
+    def _archive_skill_md(self, skill_file: Path) -> Optional[str]:
+        """Copy the live SKILL.md aside so the coming update stays reversible.
+
+        Returns the archive's name inside the bundle, or ``None`` if it could
+        not be written.  The copy is the whole file -- frontmatter included --
+        because that is what a restore has to put back.
+
+        Failure is reported and tolerated rather than raised: the write that
+        follows is atomic, so the skill itself cannot be corrupted, and
+        refusing the edit would block a user from fixing their own skill over a
+        missing backup.  ``versions`` in the result is where the caller sees
+        that it did not happen.
+        """
+        try:
+            stamp = _datestamp()
+            archive = skill_file.with_name(f"{_SKILL_VERSION_PREFIX}{stamp}")
+            # _datestamp() is second-resolution, so two edits within one second
+            # would collide and the second would silently consume the first.
+            suffix = 1
+            while archive.exists():
+                archive = skill_file.with_name(
+                    f"{_SKILL_VERSION_PREFIX}{stamp}_{suffix}"
+                )
+                suffix += 1
+            shutil.copy2(skill_file, archive)
+            return archive.name
+        except Exception as e:
+            shared.CONSOLE.print(
+                f"[yellow]Could not archive {skill_file.name} before update: {e}[/yellow]"
+            )
+            return None
 
     def _rebuild_aliases(self) -> None:
         self._aliases.clear()
@@ -515,26 +596,32 @@ class SkillCatalog:
                         "error": "Skill file paths must be relative to the skill bundle",
                     }
                 if rel_path.as_posix() not in (".", ""):
-                    target = (bundle.path / rel_path).resolve(strict=False)
-                    if target != bundle.path and bundle.path not in target.parents:
+                    target = _resolve_within_bundle(bundle.path, rel_path)
+                    if target is None:
                         return {
                             "ok": False,
                             "error": "Requested path escapes the skill bundle",
                         }
                     filter_dir = rel_path.as_posix().rstrip("/")
-            files = [
-                supporting
-                for supporting in bundle.supporting_files
-                if filter_dir is None
-                or supporting == filter_dir
-                or supporting.startswith(filter_dir + "/")
-            ]
+
+            def _visible(name: str) -> bool:
+                return (
+                    filter_dir is None
+                    or name == filter_dir
+                    or name.startswith(filter_dir + "/")
+                )
+
+            # Archived versions are reported separately from supporting files:
+            # both are readable, but only one of them is material the skill
+            # wants followed, and a caller listing a bundle should be able to
+            # tell which is which.
             return {
                 "ok": True,
                 "skill": bundle.id,
                 "bundle_root": self._bundle_root_label(bundle),
                 "path": filter_dir or ".",
-                "files": files,
+                "files": [name for name in bundle.supporting_files if _visible(name)],
+                "versions": [name for name in bundle.versions if _visible(name)],
             }
 
         def read_skill_file(skill_name: str, path: str) -> dict[str, Any]:
@@ -547,8 +634,8 @@ class SkillCatalog:
                     "ok": False,
                     "error": "Skill file paths must be relative to the skill bundle",
                 }
-            target = (bundle.path / rel_path).resolve(strict=False)
-            if target != bundle.path and bundle.path not in target.parents:
+            target = _resolve_within_bundle(bundle.path, rel_path)
+            if target is None:
                 return {"ok": False, "error": "Requested path escapes the skill bundle"}
             if not target.exists() or not target.is_file():
                 return {"ok": False, "error": f"Skill file '{path}' not found"}
@@ -756,6 +843,12 @@ class SkillCatalog:
                     user_invocable=final_user_inv,
                     disable_model_invocation=final_disable_model,
                 )
+                # Keep the version being replaced.  An edit is a hypothesis
+                # about what the skill should say, and a hypothesis needs a way
+                # back: without this, a change that makes the skill worse is
+                # indistinguishable from one that makes it better, because the
+                # evidence it was worse is gone.
+                archived = self._archive_skill_md(skill_file)
                 # Durable primitive: this overwrites a skill the user may have
                 # authored, so a truncating write can destroy it outright.
                 shared._atomic_write_text(skill_file, content)
@@ -768,11 +861,13 @@ class SkillCatalog:
                     "ok": True,
                     "skill_id": bundle.id,
                     "path": str(bundle.path),
+                    "archived": archived,
                     "message": f"Skill '{bundle.id}' updated successfully",
                     "skill": {
                         "id": updated.id,
                         "name": updated.name,
                         "description": updated.description,
+                        "versions": updated.versions,
                     }
                     if updated
                     else None,
@@ -820,8 +915,8 @@ class SkillCatalog:
                     "ok": False,
                     "error": "Skill file paths must be relative to the skill bundle",
                 }
-            target = (bundle.path / rel_path).resolve(strict=False)
-            if target != bundle.path and bundle.path not in target.parents:
+            target = _resolve_within_bundle(bundle.path, rel_path)
+            if target is None:
                 return {"ok": False, "error": "Requested path escapes the skill bundle"}
             if target.name == "SKILL.md":
                 return {
@@ -885,7 +980,12 @@ class SkillCatalog:
 
         registry.register(
             "update_skill",
-            "Update an existing user skill's metadata or instructions. Only user skills can be modified.",
+            (
+                "Update an existing user skill's metadata or instructions. Only "
+                "user skills can be modified. The SKILL.md being replaced is "
+                "archived inside the bundle first, so an edit can be undone by "
+                "reading the archived version and passing its instructions back."
+            ),
             {
                 "type": "object",
                 "properties": {
@@ -978,6 +1078,7 @@ class SkillCatalog:
                 "bundle_root": self._bundle_root_label(bundle),
                 "instructions": bundle.body,
                 "supporting_files": bundle.supporting_files,
+                "versions": bundle.versions,
                 "metadata": bundle.metadata,
             },
             "hints": {
@@ -988,6 +1089,12 @@ class SkillCatalog:
                 ),
             },
         }
+        if bundle.versions:
+            payload["hints"]["rollback"] = (
+                "Superseded versions of SKILL.md are kept in this bundle, oldest "
+                f"first. Read one with `read_skill_file` (e.g. `{bundle.versions[-1]}`) "
+                "and restore it by passing its instructions back to `update_skill`."
+            )
         output_dir = registry.get_context("output_dir") if registry else None
         if output_dir:
             payload["hints"]["output_dir"] = (
