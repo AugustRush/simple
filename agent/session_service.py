@@ -110,6 +110,268 @@ class _WebSessionRegistry:
         ]
 
 
+def _turn_ids(turns: Any) -> set[str]:
+    """The message ids of ``turns``, used to re-attach legacy events."""
+    return {
+        str(getattr(turn, "message_id", "") or "").strip()
+        for turn in turns or ()
+        if str(getattr(turn, "message_id", "") or "").strip()
+    }
+
+
+def _messages_from_turns(
+    turns: Any,
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Build the conversational rows from durable turns.
+
+    Returns the rows plus the input-attachment paths that were seen, because
+    the event merge below uses them to suppress legacy ``attachment`` events
+    that would otherwise render the same file a second time as an output.
+    """
+    messages: list[dict[str, Any]] = []
+    assistants_by_reply: dict[str, dict[str, Any]] = {}
+    persisted_attachment_paths: set[str] = set()
+    for turn in turns or ():
+        role = str(getattr(turn, "role", "") or "")
+        content = str(getattr(turn, "content", "") or "").strip()
+        reply_to_id = str(getattr(turn, "reply_to_id", "") or "").strip()
+        metadata = getattr(turn, "metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        attachments: list[dict[str, Any]] = []
+        if role == "user" and isinstance(metadata.get("attachments"), list):
+            for raw in metadata["attachments"][:12]:
+                if not isinstance(raw, dict):
+                    continue
+                path = str(raw.get("path") or "").strip()
+                if not path:
+                    continue
+                persisted_attachment_paths.add(path)
+                attachments.append(
+                    {
+                        "id": str(raw.get("id") or Path(path).name),
+                        "filename": str(raw.get("filename") or Path(path).name),
+                        "mime_type": str(raw.get("mime_type") or "application/octet-stream"),
+                        "kind": str(raw.get("kind") or "unknown"),
+                        "path": path,
+                        "size_bytes": raw.get("size_bytes"),
+                    }
+                )
+        if role in ("user", "assistant") and (content or attachments):
+            if role == "assistant" and reply_to_id in assistants_by_reply:
+                previous = assistants_by_reply[reply_to_id]
+                previous_content = str(previous.get("content") or "").strip()
+                if content and content != previous_content:
+                    if content.startswith(previous_content):
+                        previous["content"] = content
+                    elif not previous_content.startswith(content):
+                        previous["content"] = f"{previous_content}\n\n{content}"
+                continue
+            item = {
+                "role": role,
+                "content": content,
+                "created_at": str(getattr(turn, "created_at", "") or ""),
+                "message_id": str(getattr(turn, "message_id", "") or ""),
+                "reply_to_id": reply_to_id,
+            }
+            if attachments:
+                item["attachments"] = attachments
+            messages.append(item)
+            if role == "assistant" and reply_to_id:
+                assistants_by_reply[reply_to_id] = item
+    return messages, persisted_attachment_paths
+
+
+def _append_durable_event_rows(
+    messages: list[dict[str, Any]],
+    *,
+    target_store: Any,
+    session_id: str,
+    limit: int,
+    turn_ids: set[str],
+    persisted_attachment_paths: set[str],
+    is_live: bool,
+) -> None:
+    """Rehydrate the durable tool/attachment rows into ``messages``.
+
+    Tool output is emitted as a live event, not as a conversation turn, so the
+    transcript alone cannot rebuild the trace.  One compact row is appended per
+    operation (and per output attachment), in event order.
+    """
+    get_events = getattr(target_store, "recent_agent_events", None)
+    if not callable(get_events):
+        return
+    try:
+        events = get_events(session_id=session_id, limit=max(100, limit * 8))
+    except Exception:
+        events = []
+    # Recover events written by pre-fix Web runtimes under a factory
+    # staging session id. Turn ids are globally unique and still tie
+    # those events to the correct conversation.
+    get_events_for_turns = getattr(
+        target_store, "recent_agent_events_for_turns", None
+    )
+    if callable(get_events_for_turns) and turn_ids:
+        try:
+            legacy_events = get_events_for_turns(
+                turn_ids=turn_ids,
+                limit=max(100, limit * 8),
+            )
+            seen_event_ids = {
+                int(getattr(event, "id", 0) or 0) for event in events
+            }
+            events.extend(
+                event
+                for event in legacy_events
+                if int(getattr(event, "id", 0) or 0) not in seen_event_ids
+            )
+            events.sort(key=lambda event: int(getattr(event, "id", 0) or 0))
+        except Exception:
+            pass
+    tools: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    terminal_turns: set[str] = set()
+    seen_output_attachments: set[tuple[str, str]] = set()
+    for event in events or ():
+        event_type = str(getattr(event, "event_type", "") or "")
+        event_turn_id = str(getattr(event, "turn_id", "") or "")
+        if event_type in {
+            "turn_response_delivered",
+            "turn_failed",
+            "turn_error_reported",
+            "turn_interrupted",
+        } and event_turn_id:
+            terminal_turns.add(event_turn_id)
+        payload = getattr(event, "payload", {})
+        if not isinstance(payload, dict):
+            payload = {}
+        if event_type == "attachment":
+            attachment_path = str(payload.get("path") or "")
+            # Input attachments now live on the durable user turn.
+            # Suppress equivalent legacy events so a refresh does not
+            # render the same file again as an output attachment.
+            if attachment_path in persisted_attachment_paths:
+                continue
+            attachment_key = (event_turn_id, attachment_path)
+            if attachment_key in seen_output_attachments:
+                continue
+            seen_output_attachments.add(attachment_key)
+            messages.append(
+                {
+                    "role": "tool",
+                    "content": str(payload.get("name") or payload.get("path") or ""),
+                    "tool": "attachment",
+                    "toolState": "done",
+                    "created_at": str(getattr(event, "created_at", "") or ""),
+                    "turn_id": str(getattr(event, "turn_id", "") or ""),
+                    "link": "/api/files?path="
+                    + quote(attachment_path, safe=""),
+                }
+            )
+            continue
+        if event_type not in {"tool_started", "tool_progress", "tool_completed", "tool_failed"}:
+            continue
+        operation_id = str(payload.get("operation_id") or "")
+        if not operation_id:
+            operation_id = f"event-{getattr(event, 'id', len(order))}"
+        item = tools.get(operation_id)
+        if item is None:
+            item = {
+                "role": "tool",
+                "content": "",
+                "tool": str(payload.get("tool_name") or "tool"),
+                "toolState": "running",
+                "created_at": str(getattr(event, "created_at", "") or ""),
+                "turn_id": str(getattr(event, "turn_id", "") or ""),
+            }
+            tools[operation_id] = item
+            order.append(operation_id)
+        if event_type == "tool_progress":
+            detail = payload.get("detail") or payload.get("message") or payload.get("progress")
+            if detail is not None:
+                item["content"] = str(detail)[:220]
+        elif event_type == "tool_completed":
+            item["toolState"] = "done" if payload.get("ok", True) else "blocked"
+            item["content"] = str(payload.get("result_preview") or item.get("content") or "")[:220]
+        elif event_type == "tool_failed":
+            item["toolState"] = "blocked"
+            item["content"] = str(payload.get("result_preview") or item.get("content") or "执行失败")[:220]
+    # A process restart can leave the last tool_started event without
+    # a terminal event. It is unsafe to present that operation as
+    # completed (or to replay it automatically), so expose an
+    # explicit recoverable state to the UI. Live sessions keep the
+    # running state because their worker may still be active.
+    if not is_live:
+        for item in tools.values():
+            if item.get("toolState") == "running":
+                item["toolState"] = "interrupted"
+    else:
+        for item in tools.values():
+            if (
+                item.get("toolState") == "running"
+                and str(item.get("turn_id") or "") in terminal_turns
+            ):
+                item["toolState"] = "interrupted"
+    messages.extend(tools[key] for key in order)
+
+
+def _order_display_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Interleave tool rows into the transcript, then drop bookkeeping fields.
+
+    Older runtime/attachment events may not have recorded a ``turn_id``.  They
+    are still durable, but previously all of them were appended at the very end
+    of the transcript after a restart.  Recover a sensible placement from the
+    event timestamp by attaching each orphan to the most recent user turn that
+    had already started.
+    """
+    turns_only = [item for item in messages if item.get("role") in ("user", "assistant")]
+    tools_only = [item for item in messages if item.get("role") == "tool"]
+
+    user_turns = [
+        item
+        for item in turns_only
+        if item.get("role") == "user" and item.get("message_id")
+    ]
+    for tool in tools_only:
+        if str(tool.get("turn_id") or ""):
+            continue
+        tool_created = str(tool.get("created_at") or "")
+        candidate = ""
+        for user in user_turns:
+            user_created = str(user.get("created_at") or "")
+            if not tool_created or not user_created or user_created <= tool_created:
+                candidate = str(user.get("message_id") or "")
+            else:
+                break
+        if not candidate and user_turns:
+            candidate = str(user_turns[-1].get("message_id") or "")
+        if candidate:
+            tool["turn_id"] = candidate
+
+    tools_by_turn: dict[str, list[dict[str, Any]]] = {}
+    for item in tools_only:
+        tools_by_turn.setdefault(str(item.get("turn_id") or ""), []).append(item)
+    ordered: list[dict[str, Any]] = []
+    for item in turns_only:
+        ordered.append(item)
+        if item.get("role") == "user":
+            message_id = str(item.get("message_id") or "")
+            if message_id:
+                ordered.extend(tools_by_turn.pop(message_id, []))
+    # Older events may not have a turn id; retain them at the end rather
+    # than dropping durable trace history.
+    for leftovers in tools_by_turn.values():
+        ordered.extend(leftovers)
+    for item in ordered:
+        item.pop("created_at", None)
+        item.pop("message_id", None)
+        item.pop("reply_to_id", None)
+        item.pop("turn_id", None)
+    return ordered
+
+
 class SessionService:
     """Read/query sessions for one agent home.
 
@@ -750,230 +1012,17 @@ class SessionService:
             turns = get_turns(session_id=session_id, limit=limit)
         except Exception:
             return []
-        turn_ids = {
-            str(getattr(turn, "message_id", "") or "").strip()
-            for turn in turns or ()
-            if str(getattr(turn, "message_id", "") or "").strip()
-        }
-        messages: list[dict[str, Any]] = []
-        assistants_by_reply: dict[str, dict[str, Any]] = {}
-        persisted_attachment_paths: set[str] = set()
-        for turn in turns or ():
-            role = str(getattr(turn, "role", "") or "")
-            content = str(getattr(turn, "content", "") or "").strip()
-            reply_to_id = str(getattr(turn, "reply_to_id", "") or "").strip()
-            metadata = getattr(turn, "metadata", {})
-            if not isinstance(metadata, dict):
-                metadata = {}
-            attachments: list[dict[str, Any]] = []
-            if role == "user" and isinstance(metadata.get("attachments"), list):
-                for raw in metadata["attachments"][:12]:
-                    if not isinstance(raw, dict):
-                        continue
-                    path = str(raw.get("path") or "").strip()
-                    if not path:
-                        continue
-                    persisted_attachment_paths.add(path)
-                    attachments.append(
-                        {
-                            "id": str(raw.get("id") or Path(path).name),
-                            "filename": str(raw.get("filename") or Path(path).name),
-                            "mime_type": str(raw.get("mime_type") or "application/octet-stream"),
-                            "kind": str(raw.get("kind") or "unknown"),
-                            "path": path,
-                            "size_bytes": raw.get("size_bytes"),
-                        }
-                    )
-            if role in ("user", "assistant") and (content or attachments):
-                if role == "assistant" and reply_to_id in assistants_by_reply:
-                    previous = assistants_by_reply[reply_to_id]
-                    previous_content = str(previous.get("content") or "").strip()
-                    if content and content != previous_content:
-                        if content.startswith(previous_content):
-                            previous["content"] = content
-                        elif not previous_content.startswith(content):
-                            previous["content"] = f"{previous_content}\n\n{content}"
-                    continue
-                item = {
-                    "role": role,
-                    "content": content,
-                    "created_at": str(getattr(turn, "created_at", "") or ""),
-                    "message_id": str(getattr(turn, "message_id", "") or ""),
-                    "reply_to_id": reply_to_id,
-                }
-                if attachments:
-                    item["attachments"] = attachments
-                messages.append(item)
-                if role == "assistant" and reply_to_id:
-                    assistants_by_reply[reply_to_id] = item
-
-        # Tool output is emitted as a live event, not as a conversation turn.
-        # Rehydrate one compact tool row per operation so the UI can rebuild
-        # the trace without changing the conversational transcript itself.
-        get_events = getattr(target_store, "recent_agent_events", None)
-        if callable(get_events):
-            try:
-                events = get_events(session_id=session_id, limit=max(100, limit * 8))
-            except Exception:
-                events = []
-            # Recover events written by pre-fix Web runtimes under a factory
-            # staging session id. Turn ids are globally unique and still tie
-            # those events to the correct conversation.
-            get_events_for_turns = getattr(
-                target_store, "recent_agent_events_for_turns", None
-            )
-            if callable(get_events_for_turns) and turn_ids:
-                try:
-                    legacy_events = get_events_for_turns(
-                        turn_ids=turn_ids,
-                        limit=max(100, limit * 8),
-                    )
-                    seen_event_ids = {
-                        int(getattr(event, "id", 0) or 0) for event in events
-                    }
-                    events.extend(
-                        event
-                        for event in legacy_events
-                        if int(getattr(event, "id", 0) or 0) not in seen_event_ids
-                    )
-                    events.sort(key=lambda event: int(getattr(event, "id", 0) or 0))
-                except Exception:
-                    pass
-            tools: dict[str, dict[str, Any]] = {}
-            order: list[str] = []
-            terminal_turns: set[str] = set()
-            seen_output_attachments: set[tuple[str, str]] = set()
-            for event in events or ():
-                event_type = str(getattr(event, "event_type", "") or "")
-                event_turn_id = str(getattr(event, "turn_id", "") or "")
-                if event_type in {
-                    "turn_response_delivered",
-                    "turn_failed",
-                    "turn_error_reported",
-                    "turn_interrupted",
-                } and event_turn_id:
-                    terminal_turns.add(event_turn_id)
-                payload = getattr(event, "payload", {})
-                if not isinstance(payload, dict):
-                    payload = {}
-                if event_type == "attachment":
-                    attachment_path = str(payload.get("path") or "")
-                    # Input attachments now live on the durable user turn.
-                    # Suppress equivalent legacy events so a refresh does not
-                    # render the same file again as an output attachment.
-                    if attachment_path in persisted_attachment_paths:
-                        continue
-                    attachment_key = (event_turn_id, attachment_path)
-                    if attachment_key in seen_output_attachments:
-                        continue
-                    seen_output_attachments.add(attachment_key)
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "content": str(payload.get("name") or payload.get("path") or ""),
-                            "tool": "attachment",
-                            "toolState": "done",
-                            "created_at": str(getattr(event, "created_at", "") or ""),
-                            "turn_id": str(getattr(event, "turn_id", "") or ""),
-                            "link": "/api/files?path="
-                            + quote(attachment_path, safe=""),
-                        }
-                    )
-                    continue
-                if event_type not in {"tool_started", "tool_progress", "tool_completed", "tool_failed"}:
-                    continue
-                operation_id = str(payload.get("operation_id") or "")
-                if not operation_id:
-                    operation_id = f"event-{getattr(event, 'id', len(order))}"
-                item = tools.get(operation_id)
-                if item is None:
-                    item = {
-                        "role": "tool",
-                        "content": "",
-                        "tool": str(payload.get("tool_name") or "tool"),
-                        "toolState": "running",
-                        "created_at": str(getattr(event, "created_at", "") or ""),
-                        "turn_id": str(getattr(event, "turn_id", "") or ""),
-                    }
-                    tools[operation_id] = item
-                    order.append(operation_id)
-                if event_type == "tool_progress":
-                    detail = payload.get("detail") or payload.get("message") or payload.get("progress")
-                    if detail is not None:
-                        item["content"] = str(detail)[:220]
-                elif event_type == "tool_completed":
-                    item["toolState"] = "done" if payload.get("ok", True) else "blocked"
-                    item["content"] = str(payload.get("result_preview") or item.get("content") or "")[:220]
-                elif event_type == "tool_failed":
-                    item["toolState"] = "blocked"
-                    item["content"] = str(payload.get("result_preview") or item.get("content") or "执行失败")[:220]
-            # A process restart can leave the last tool_started event without
-            # a terminal event. It is unsafe to present that operation as
-            # completed (or to replay it automatically), so expose an
-            # explicit recoverable state to the UI. Live sessions keep the
-            # running state because their worker may still be active.
-            if session_id not in self._live_states:
-                for item in tools.values():
-                    if item.get("toolState") == "running":
-                        item["toolState"] = "interrupted"
-            else:
-                for item in tools.values():
-                    if (
-                        item.get("toolState") == "running"
-                        and str(item.get("turn_id") or "") in terminal_turns
-                    ):
-                        item["toolState"] = "interrupted"
-            messages.extend(tools[key] for key in order)
-
-        turns_only = [item for item in messages if item.get("role") in ("user", "assistant")]
-        tools_only = [item for item in messages if item.get("role") == "tool"]
-
-        # Older runtime/attachment events may not have recorded a ``turn_id``.
-        # They are still durable, but previously all of them were appended at
-        # the very end of the transcript after a restart.  Recover a sensible
-        # placement from the event timestamp by attaching each orphan to the
-        # most recent user turn that had already started.
-        user_turns = [
-            item
-            for item in turns_only
-            if item.get("role") == "user" and item.get("message_id")
-        ]
-        for tool in tools_only:
-            if str(tool.get("turn_id") or ""):
-                continue
-            tool_created = str(tool.get("created_at") or "")
-            candidate = ""
-            for user in user_turns:
-                user_created = str(user.get("created_at") or "")
-                if not tool_created or not user_created or user_created <= tool_created:
-                    candidate = str(user.get("message_id") or "")
-                else:
-                    break
-            if not candidate and user_turns:
-                candidate = str(user_turns[-1].get("message_id") or "")
-            if candidate:
-                tool["turn_id"] = candidate
-
-        tools_by_turn: dict[str, list[dict[str, Any]]] = {}
-        for item in tools_only:
-            tools_by_turn.setdefault(str(item.get("turn_id") or ""), []).append(item)
-        ordered: list[dict[str, Any]] = []
-        for item in turns_only:
-            ordered.append(item)
-            if item.get("role") == "user":
-                message_id = str(item.get("message_id") or "")
-                if message_id:
-                    ordered.extend(tools_by_turn.pop(message_id, []))
-        # Older events may not have a turn id; retain them at the end rather
-        # than dropping durable trace history.
-        for leftovers in tools_by_turn.values():
-            ordered.extend(leftovers)
-        for item in ordered:
-            item.pop("created_at", None)
-            item.pop("message_id", None)
-            item.pop("reply_to_id", None)
-            item.pop("turn_id", None)
-        return ordered
+        messages, persisted_attachment_paths = _messages_from_turns(turns)
+        _append_durable_event_rows(
+            messages,
+            target_store=target_store,
+            session_id=session_id,
+            limit=limit,
+            turn_ids=_turn_ids(turns),
+            persisted_attachment_paths=persisted_attachment_paths,
+            is_live=session_id in self._live_states,
+        )
+        return _order_display_messages(messages)
 
     def session_data_path(self, session_id: str) -> Optional[Path]:
         """Materialize and return a Finder-friendly file for one session.
