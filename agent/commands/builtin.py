@@ -9,7 +9,7 @@ from pathlib import Path
 import secrets
 import stat
 import sys
-from typing import Any, Mapping
+from typing import Any, Mapping, NamedTuple, Optional
 
 from agent import shared
 
@@ -1176,7 +1176,6 @@ async def _auto_approve_handler(
         ShellAuthorizationScope,
         shell_session_auto_approve_disable,
         shell_session_auto_approve_enable,
-        shell_session_permission_clear,
         shell_session_permission_get,
     )
 
@@ -1188,13 +1187,7 @@ async def _auto_approve_handler(
     )
     arg = request.args.strip().casefold()
     if arg in ("on", "1", "yes", "true", "开启"):
-        _save_config_shell_permission_level("medium")
-        shell_session_permission_clear(scope)
-        if registry is not None:
-            try:
-                registry.set_context("shell_permission_level", "medium")
-            except Exception:
-                pass
+        _apply_shell_default("level", "medium", scope, registry)
         return CommandResult(
             response_text=(
                 "已开启高危自动放行并持久化为默认（重启后保留，"
@@ -1203,13 +1196,7 @@ async def _auto_approve_handler(
             )
         )
     if arg in ("off", "0", "no", "false", "关闭"):
-        _save_config_shell_permission_level("ask")
-        shell_session_permission_clear(scope)
-        if registry is not None:
-            try:
-                registry.set_context("shell_permission_level", "ask")
-            except Exception:
-                pass
+        _apply_shell_default("level", "ask", scope, registry)
         return CommandResult(
             response_text=(
                 "已关闭自动放行并持久化为默认（重启后保留）："
@@ -1236,7 +1223,7 @@ async def _auto_approve_handler(
             )
         return _error("Usage: /auto-approve session on|off")
     if arg in ("status", "?", ""):
-        config_level = _config_shell_permission_level()
+        config_level = _config_shell_default("level")
         session_level = shell_session_permission_get(scope)
         effective_level = session_level or config_level
         state = "开启" if effective_level in ("medium", "high", "full") else "关闭"
@@ -1262,70 +1249,92 @@ def _permission_level_label(level: str) -> str:
     return labels.get(level, level)
 
 
-def _config_shell_permission_level() -> str:
+class _ShellDefault(NamedTuple):
+    """One persisted shell default, and the session override it feeds.
+
+    ``config_key`` names the field under ``permissions`` in the config file,
+    ``context_key`` the registry context a running turn reads, ``builtin`` the
+    value that applies once the stored one is cleared, and ``session_clear``
+    the ``agent.security.shell`` function that drops this session's override.
+    """
+
+    config_key: str
+    context_key: str
+    builtin: str
+    session_clear: str
+
+
+# The two shell defaults are one mechanism wearing two names, so they share a
+# table: a third one costs a row here, not another four functions.
+_SHELL_DEFAULTS = {
+    "level": _ShellDefault(
+        "shell_level",
+        "shell_permission_level",
+        "ask",
+        "shell_session_permission_clear",
+    ),
+    "sandbox": _ShellDefault(
+        "shell_sandbox",
+        "shell_sandbox_mode",
+        "read_all",
+        "shell_session_sandbox_clear",
+    ),
+}
+
+
+def _config_shell_default(kind: str) -> str:
+    """Read a persisted shell default, falling back to the built-in value."""
     import agent as agent_module
 
+    default = _SHELL_DEFAULTS[kind]
     cfg, _first_run = agent_module.load_config()
     permissions = cfg.get("permissions") or {}
-    return str(permissions.get("shell_level", "ask") or "ask")
+    return str(permissions.get(default.config_key, default.builtin) or default.builtin)
 
 
-def _config_shell_sandbox_mode() -> str:
+def _apply_shell_default(
+    kind: str,
+    value: Optional[str],
+    scope: Any,
+    registry: Any,
+) -> None:
+    """Persist a shell default and make it live for this session.
+
+    ``value=None`` clears the stored default so the built-in one applies again.
+    Either way the per-session override is dropped, because the point of
+    setting a default is that it should take effect now, not next session.
+    """
     import agent as agent_module
+    from agent.security import shell as shell_module
 
-    cfg, _first_run = agent_module.load_config()
-    permissions = cfg.get("permissions") or {}
-    return str(permissions.get("shell_sandbox", "read_all") or "read_all")
-
-
-def _save_config_shell_permission_level(level: str) -> None:
-    import agent as agent_module
-
+    default = _SHELL_DEFAULTS[kind]
     cfg, _first_run = agent_module.load_config()
     permissions = cfg.get("permissions")
     if not isinstance(permissions, dict):
         permissions = {}
+    if value is None:
+        # A key that is already absent is the desired state, so leave the file
+        # alone — but still drop the session override below.
+        if default.config_key in permissions:
+            del permissions[default.config_key]
+            if permissions:
+                cfg["permissions"] = permissions
+            else:
+                cfg.pop("permissions", None)
+            agent_module.save_config(cfg)
+    else:
+        permissions[default.config_key] = value
         cfg["permissions"] = permissions
-    permissions["shell_level"] = level
-    agent_module.save_config(cfg)
+        agent_module.save_config(cfg)
 
-
-def _save_config_shell_sandbox_mode(mode: str) -> None:
-    import agent as agent_module
-
-    cfg, _first_run = agent_module.load_config()
-    permissions = cfg.get("permissions")
-    if not isinstance(permissions, dict):
-        permissions = {}
-        cfg["permissions"] = permissions
-    permissions["shell_sandbox"] = mode
-    agent_module.save_config(cfg)
-
-
-def _clear_config_shell_permission_level() -> None:
-    import agent as agent_module
-
-    cfg, _first_run = agent_module.load_config()
-    permissions = cfg.get("permissions")
-    if not isinstance(permissions, dict) or "shell_level" not in permissions:
-        return
-    del permissions["shell_level"]
-    if not permissions:
-        cfg.pop("permissions", None)
-    agent_module.save_config(cfg)
-
-
-def _clear_config_shell_sandbox_mode() -> None:
-    import agent as agent_module
-
-    cfg, _first_run = agent_module.load_config()
-    permissions = cfg.get("permissions")
-    if not isinstance(permissions, dict) or "shell_sandbox" not in permissions:
-        return
-    del permissions["shell_sandbox"]
-    if not permissions:
-        cfg.pop("permissions", None)
-    agent_module.save_config(cfg)
+    getattr(shell_module, default.session_clear)(scope)
+    if registry is not None:
+        try:
+            registry.set_context(
+                default.context_key, default.builtin if value is None else value
+            )
+        except Exception:
+            pass
 
 
 def _sandbox_mode_label(mode: str) -> str:
@@ -1344,10 +1353,8 @@ async def _permissions_handler(
         PERMISSION_LEVELS,
         ShellAuthorizationScope,
         shell_effective_permission_level,
-        shell_session_permission_clear,
         shell_session_permission_get,
         shell_session_permission_set,
-        shell_session_sandbox_clear,
         shell_session_sandbox_get,
         shell_session_sandbox_set,
     )
@@ -1365,8 +1372,8 @@ async def _permissions_handler(
         context.channel_name,
         str(context.metadata.get("user_id") or ""),
     )
-    config_level = _config_shell_permission_level()
-    config_sandbox = _config_shell_sandbox_mode()
+    config_level = _config_shell_default("level")
+    config_sandbox = _config_shell_default("sandbox")
     session_level = shell_session_permission_get(scope)
     effective_level = session_level or config_level
     session_sandbox = shell_session_sandbox_get(scope)
@@ -1527,13 +1534,7 @@ async def _permissions_handler(
                 "沙箱模式 `none` 需要权限等级 `full`；请先设置 "
                 "/permissions full。"
             )
-        _save_config_shell_sandbox_mode(mode)
-        shell_session_sandbox_clear(scope)
-        if registry is not None:
-            try:
-                registry.set_context("shell_sandbox_mode", mode)
-            except Exception:
-                pass
+        _apply_shell_default("sandbox", mode, scope, registry)
         return CommandResult(
             response_text=(
                 f"已把默认沙箱模式持久化为 `{mode}`（立即生效，"
@@ -1563,13 +1564,7 @@ async def _permissions_handler(
                     "沙箱模式 `none` 需要权限等级 `full`；请先设置 "
                     "/permissions default full。"
                 )
-            _save_config_shell_sandbox_mode(mode)
-            shell_session_sandbox_clear(scope)
-            if registry is not None:
-                try:
-                    registry.set_context("shell_sandbox_mode", mode)
-                except Exception:
-                    pass
+            _apply_shell_default("sandbox", mode, scope, registry)
             return CommandResult(
                 response_text=(
                     f"已把默认沙箱模式持久化为 `{mode}`（重启后保留，"
@@ -1583,13 +1578,7 @@ async def _permissions_handler(
                 f"{'|'.join(PERMISSION_LEVELS)} | sandbox "
                 f"{'|'.join(SANDBOX_MODES)}"
             )
-        shell_session_permission_clear(scope)
-        _save_config_shell_permission_level(level)
-        if registry is not None:
-            try:
-                registry.set_context("shell_permission_level", level)
-            except Exception:
-                pass
+        _apply_shell_default("level", level, scope, registry)
         return CommandResult(
             response_text=(
                 f"已把默认权限等级持久化为 `{level}`（重启后保留，"
@@ -1603,22 +1592,10 @@ async def _permissions_handler(
             return _error("Usage: /permissions reset [level|sandbox]")
         restored = []
         if target in ("", "all", "level"):
-            _clear_config_shell_permission_level()
-            shell_session_permission_clear(scope)
-            if registry is not None:
-                try:
-                    registry.set_context("shell_permission_level", "ask")
-                except Exception:
-                    pass
+            _apply_shell_default("level", None, scope, registry)
             restored.append("权限等级 `ask`")
         if target in ("", "all", "sandbox"):
-            _clear_config_shell_sandbox_mode()
-            shell_session_sandbox_clear(scope)
-            if registry is not None:
-                try:
-                    registry.set_context("shell_sandbox_mode", "read_all")
-                except Exception:
-                    pass
+            _apply_shell_default("sandbox", None, scope, registry)
             restored.append("沙箱模式 `read_all`")
         return CommandResult(
             response_text=(
@@ -1634,13 +1611,7 @@ async def _permissions_handler(
             f"Usage: /permissions {'|'.join(PERMISSION_LEVELS)} | session "
             f"{'|'.join(PERMISSION_LEVELS)} | sandbox <mode> | default ... | reset"
         )
-    _save_config_shell_permission_level(level)
-    shell_session_permission_clear(scope)
-    if registry is not None:
-        try:
-            registry.set_context("shell_permission_level", level)
-        except Exception:
-            pass
+    _apply_shell_default("level", level, scope, registry)
     return CommandResult(
         response_text=(
             f"已把权限等级持久化为 `{level}`（立即生效，重启后保留，"
