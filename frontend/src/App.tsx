@@ -6,10 +6,10 @@ import React from 'react'
 import 'dayjs/locale/zh-cn'
 import './index.css'
 import type { AppCtx } from './app/AppCtx'
-import { createChatView } from './views/chat'
-import { createSessionsView } from './views/sessions'
-import { createExtensionsView } from './views/extensions'
-import { createAutomationView } from './views/automation'
+import { renderChat } from './views/chat'
+import { renderSessions } from './views/sessions'
+import { renderExtensions } from './views/extensions'
+import { renderSchedules } from './views/automation'
 import { createSettingsView } from './views/settings'
 import { relativeTime } from './lib/format'
 import { sessionStatusOf } from './lib/tools'
@@ -281,23 +281,15 @@ function App() {
     setSettingsDirty,
   }
 
-  const { renderChat } = createChatView(ctx)
-
-  const { renderSessions } = createSessionsView(ctx)
-
-  const { renderExtensions } = createExtensionsView(ctx)
-
-  const { renderSchedules } = createAutomationView(ctx)
-
   const { renderSettings } = createSettingsView(ctx)
 
   const renderCurrentView = () => {
-    if (view === 'chat') return renderChat()
-    if (view === 'sessions') return renderSessions()
-    if (view === 'extensions') return renderExtensions()
-    if (view === 'schedules') return renderSchedules()
+    if (view === 'chat') return renderChat(ctx)
+    if (view === 'sessions') return renderSessions(ctx)
+    if (view === 'extensions') return renderExtensions(ctx)
+    if (view === 'schedules') return renderSchedules(ctx)
     if (view === 'settings') return renderSettings()
-    return renderChat()
+    return renderChat(ctx)
   }
 
   const currentMeta = pageMeta[view] || pageMeta.chat

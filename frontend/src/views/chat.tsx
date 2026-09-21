@@ -30,7 +30,7 @@ import { createPortal } from 'react-dom'
 
 const { TextArea } = Input
 
-export function createChatView(ctx: AppCtx) {
+export function renderChat(ctx: AppCtx) {
   const { activateTurnIndex, activeSession, activity, approvalCommandRef, chatScrollRef, commandIndex, commandItemRefs, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissTaskGuidance, expandedTraces, fileInputRef, filteredCommands, handleChatScroll, handleComposerKeyDown, handleFilesSelected, handleModelChange, handleRailMouseMove, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, keepTurnSummary, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
 
@@ -422,7 +422,7 @@ export function createChatView(ctx: AppCtx) {
     return nodes
   }
 
-  const renderChat = () => (
+  return (
     <div className="chat-view">
       {/* .chat-scroll-area spans only the message pane, so the conversation
        * rail is bounded by the composer in pure CSS — no JS height tracking
@@ -940,5 +940,4 @@ export function createChatView(ctx: AppCtx) {
       </div>
     </div>
   )
-  return { renderChat }
 }

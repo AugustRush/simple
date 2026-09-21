@@ -189,6 +189,30 @@ class ModelClientFactory:
     """Build the right async API client from provider config."""
 
     @staticmethod
+    def active_model_and_tokens(cfg: dict) -> tuple[str, int]:
+        """The (model, output budget) ``cfg`` names for its active provider.
+
+        Split out of :meth:`from_config` because a caller that already has a
+        client still needs these two numbers, and reading them anywhere else
+        would be a second answer to "which model does this config name".  The
+        web session runtime is exactly that caller: it is rebuilt from the
+        config on disk while its SDK client comes from the process's shared
+        provider cache, so it takes the client from the routing transport and
+        the model from here.  Skipping this is how a config edit ends up
+        applied to the routing table but not to the id the session sends.
+        """
+        providers = cfg.get("providers", {})
+        active_name = cfg.get("active_provider", "anthropic")
+        provider_cfg = providers.get(active_name, {}) or {}
+        model = cfg.get("model") or provider_cfg.get(
+            "default_model", shared.DEFAULT_MODEL
+        )
+        max_tokens = cfg.get("max_tokens") or provider_cfg.get(
+            "max_tokens", shared.DEFAULT_MAX_TOKENS
+        )
+        return str(model), int(max_tokens)
+
+    @staticmethod
     def from_config(cfg: dict, announce: bool = True) -> tuple[Any, str, int]:
         """
         Returns (client, active_model, max_tokens).
@@ -213,10 +237,7 @@ class ModelClientFactory:
         api_format = provider_cfg.get("api_format", "openai")
         raw_key = provider_cfg.get("api_key", "")
         base_url = provider_cfg.get("base_url", None)
-        model = cfg.get("model") or provider_cfg.get("default_model", shared.DEFAULT_MODEL)
-        max_tokens = cfg.get("max_tokens") or provider_cfg.get(
-            "max_tokens", shared.DEFAULT_MAX_TOKENS
-        )
+        model, max_tokens = ModelClientFactory.active_model_and_tokens(cfg)
 
         # Resolve api key:
         #   "$ENV_VAR" → read from environment (optional fallback)

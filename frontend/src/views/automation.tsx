@@ -85,7 +85,7 @@ import dayjs from 'dayjs'
 
 const { TextArea } = Input
 
-export function createAutomationView(ctx: AppCtx) {
+export function renderSchedules(ctx: AppCtx) {
   const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, clock, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadFeishuChats, loadingView, loadScheduleRuns, loadSchedules, loadWorkflows, modelOptions, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, pickDirectory, pickingDirectory, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, schedulerHealth, schedulerRefreshedAt, schedulerStale, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, schedules, scheduleSaving, scheduleStatusFilter, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, sendFeishuTest, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, skills, toggleSchedule, toggleWorkflow, token, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflows, workflowSaving } = ctx
 
 
@@ -660,7 +660,7 @@ export function createAutomationView(ctx: AppCtx) {
     </>
   )
 
-  const renderSchedules = () => (
+  return (
     <div className="page-view schedules-view">
       <div className="page-head schedule-page-head">
         <div>
@@ -1747,5 +1747,4 @@ export function createAutomationView(ctx: AppCtx) {
       ))}
     </div>
   )
-  return { renderSchedules }
 }

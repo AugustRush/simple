@@ -1074,10 +1074,16 @@ def test_web_session_runtime_uses_global_resources_and_session_output(tmp_path, 
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
     class _Registry:
-        def __init__(self): self.context = {}
+        def __init__(self):
+            self.context = {}
+
         def fork(self, context, **_kwargs):
-            child = _Registry(); child.context.update(context); return child
-        def set_context(self, key, value): self.context[key] = value
+            child = _Registry()
+            child.context.update(context)
+            return child
+
+        def set_context(self, key, value):
+            self.context[key] = value
 
     class _Agent:
         api_format = "openai"
@@ -1094,8 +1100,11 @@ def test_web_session_runtime_uses_global_resources_and_session_output(tmp_path, 
         llm_max_retries = 1
         llm_retry_base_delay = 0.1
         content_filter = object()
-        def __init__(self, *_args, **_kwargs): pass
-        def register_spawn_capability(self, *_args, **_kwargs): pass
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def register_spawn_capability(self, *_args, **_kwargs):
+            pass
 
     monkeypatch.setattr(bootstrap, "BaseAgent", _Agent)
     monkeypatch.setattr(bootstrap, "_compose_system_prompt", lambda *_a, **_k: "session prompt")
@@ -1140,20 +1149,38 @@ def test_web_session_runtime_restores_selected_workspace_write_grant(tmp_path, m
         encoding="utf-8",
     )
     class _Registry:
-        def __init__(self): self.context = {}
+        def __init__(self):
+            self.context = {}
+
         def fork(self, context, **_kwargs):
-            child = _Registry(); child.context.update(context); return child
-        def set_context(self, key, value): self.context[key] = value
+            child = _Registry()
+            child.context.update(context)
+            return child
+
+        def set_context(self, key, value):
+            self.context[key] = value
 
     class _Agent:
-        api_format = "openai"; supports_vision = False; context_window = 10000
-        max_parallel_agents = 2; sub_agent_timeout_seconds = 30; sub_agent_retries = 0
-        max_agents_per_turn = 2; max_tool_call_iterations = 8
-        max_truncation_continuations = 1; max_rendezvous_rounds = 2
-        result_content_max_chars = 1000; llm_max_retries = 1; llm_retry_base_delay = 0.1
+        api_format = "openai"
+        supports_vision = False
+        context_window = 10000
+        max_parallel_agents = 2
+        sub_agent_timeout_seconds = 30
+        sub_agent_retries = 0
+        max_agents_per_turn = 2
+        max_tool_call_iterations = 8
+        max_truncation_continuations = 1
+        max_rendezvous_rounds = 2
+        result_content_max_chars = 1000
+        llm_max_retries = 1
+        llm_retry_base_delay = 0.1
         content_filter = object()
-        def __init__(self, *_args, **_kwargs): pass
-        def register_spawn_capability(self, *_args, **_kwargs): pass
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def register_spawn_capability(self, *_args, **_kwargs):
+            pass
 
     monkeypatch.setattr(bootstrap, "BaseAgent", _Agent)
     monkeypatch.setattr(bootstrap, "_compose_system_prompt", lambda *_a, **_k: "session prompt")
@@ -4040,3 +4067,170 @@ def test_web_a_withdrawn_message_does_not_end_the_running_turn():
     assert sink.retired is True
     assert finished is False
     assert [event for event in sink.events if event["type"] == "turn_complete"] == []
+
+
+def test_a_session_rebuilt_after_a_provider_switch_does_not_inherit_the_old_client(
+    tmp_path, monkeypatch
+):
+    """The reported failure, at the call site that caused it.
+
+    A web session runtime is rebuilt from the config on disk, and that is how
+    a config edit reaches subsequent turns — but the SDK client it inherits
+    from the process's global components was built when the process started.
+    Editing ``active_provider`` between the two used to leave the session
+    half-built: a routing table for the new provider over the old provider's
+    client, which then answered the model id of a group it does not serve —
+
+        400 The supported API model names are ..., but you passed <模型>
+
+    so a session keeps its client, its model and its routing table on one
+    config generation.  Readings: the client is the new group's, the recorded
+    provider says so, and no model of the new group resolves to the client
+    that was handed in.
+    """
+    import asyncio
+    from pathlib import Path
+    from agent import shared
+    import agent.bootstrap as bootstrap
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(shared, "AGENT_HOME", tmp_path / ".agent")
+
+    class _Registry:
+        def __init__(self):
+            self.context = {}
+
+        def fork(self, context, **_kwargs):
+            child = _Registry()
+            child.context.update(context)
+            return child
+
+        def set_context(self, key, value):
+            self.context[key] = value
+
+    class _Client:
+        def __init__(self, provider):
+            self.provider = provider
+            self.base_url = f"https://{provider}.example/v1"
+
+    class _Agent:
+        api_format = "openai"
+        supports_vision = False
+        context_window = 10000
+        max_parallel_agents = 2
+        sub_agent_timeout_seconds = 30
+        sub_agent_retries = 0
+        max_agents_per_turn = 2
+        max_tool_call_iterations = 8
+        max_truncation_continuations = 1
+        max_rendezvous_rounds = 2
+        result_content_max_chars = 1000
+        llm_max_retries = 1
+        llm_retry_base_delay = 0.1
+        content_filter = object()
+
+        def __init__(self, client=None, _registry=None, **kwargs):
+            self.client = client
+            self.model = kwargs.get("model")
+            self.max_tokens = kwargs.get("max_tokens")
+            self.supports_vision = kwargs.get("supports_vision", False)
+            self.context_window = kwargs.get("context_window")
+            # The process's own agent is built with an api_format; this stub is
+            # built with no kwargs, so it must not read back as ``None`` — the
+            # session hands this value to the routing transport as "the format
+            # that goes with the inherited client".
+            self.api_format = kwargs.get("api_format") or "openai"
+            self.transport = kwargs.get("transport")
+
+        def register_spawn_capability(self, *_args, **_kwargs):
+            pass
+
+    monkeypatch.setattr(bootstrap, "BaseAgent", _Agent)
+    monkeypatch.setattr(
+        bootstrap, "_compose_system_prompt", lambda *_a, **_k: "session prompt"
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_provider_client_factory",
+        lambda provider_cfg, api_format: _Client(provider_cfg["name"]),
+    )
+
+    # What the process holds: a client built while deepseek was active.
+    inherited = _Client("deepseek")
+    global_components = {
+        "registry": _Registry(),
+        "agent": _Agent(),
+        "client": inherited,
+        # Recorded beside the client by `_build_components_async`.
+        "client_provider": "deepseek",
+        "client_cache_key": (
+            "k-deepseek",
+            "https://deepseek.example/v1",
+            "openai",
+        ),
+        "model": "deepseek-flash",
+        "max_tokens": 64000,
+        "base_system_prompt": "base",
+        "context_manager": object(),
+        "workspace_root": tmp_path / "workspace",
+        "skill_catalog": object(),
+        "plugin_catalog": object(),
+    }
+    # ...and the config on disk now names another provider.
+    session_cfg = {
+        "active_provider": "huoshan",
+        "providers": {
+            "deepseek": {
+                "name": "deepseek",
+                "api_format": "openai",
+                "api_key": "k-deepseek",
+                "base_url": "https://deepseek.example/v1",
+                "default_model": "deepseek-flash",
+                "models": ["deepseek-flash"],
+            },
+            "huoshan": {
+                "name": "huoshan",
+                "api_format": "openai",
+                "api_key": "k-huoshan",
+                "base_url": "https://huoshan.example/v1",
+                "default_model": "glm-5.3-flash",
+                "models": ["glm-5.3-flash", "glm-5.3"],
+                "supports_vision": True,
+                "context_window": 50000,
+                "max_tokens": 50000,
+            },
+        },
+    }
+
+    result = asyncio.run(
+        bootstrap._build_web_session_components("sid123", session_cfg, global_components)
+    )
+
+    assert result["client"] is not inherited, (
+        "the session kept the client of the provider that was active at "
+        "process start"
+    )
+    assert result["client"].provider == "huoshan"
+    assert result["client_provider"] == "huoshan"
+    assert result["model"] == "glm-5.3-flash", "the model must come from the same config"
+    # The process-start value (64000, deepseek's) must not survive the rebuild.
+    # The newly active provider asks for its whole context as output, so the
+    # same safety reserve used at process bootstrap must also be applied here.
+    # Read on the agent as well as on the recorded dict, because the agent is
+    # what sends.
+    assert result["max_tokens"] != global_components["max_tokens"], (
+        "the session inherited the process-start max_tokens"
+    )
+    assert result["max_tokens"] == 45000
+    assert result["agent"].model == result["model"]
+    assert result["agent"].max_tokens == result["max_tokens"]
+    assert result["agent"].supports_vision is True
+    assert result["agent"].context_window == 50000
+    assert result["registry"].context["supports_vision"] is True
+
+    transport = result["agent"].transport
+    assert transport.endpoint_for("glm-5.3-flash").client is result["client"]
+    # The other group must not be dragged onto the active provider's client
+    # either — that is the same 400 seen from the other side.
+    assert transport.endpoint_for("deepseek-flash").client is not result["client"]
+    assert transport.endpoint_for("deepseek-flash").client.provider == "deepseek"

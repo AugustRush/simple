@@ -365,7 +365,7 @@ class AnthropicTransport(ModelTransport):
         return response, "".join(collected)
 
     async def simple_chat(self, *, model, max_tokens, system, prompt):
-        with shared._suppress_with_log(f"anthropic.simple_chat failed; returning None"):
+        with shared._suppress_with_log("anthropic.simple_chat failed; returning None"):
             resp = await self.client.messages.create(
                 model=model,
                 max_tokens=max_tokens,
@@ -1146,12 +1146,48 @@ def routable_model_ids(cfg: dict) -> set[str]:
     return ids
 
 
+def provider_client_cache_key(
+    provider_cfg: dict, api_format: str
+) -> tuple[str, str, str]:
+    """The identity of one SDK client: who it talks to, and how.
+
+    Credentials *and* base_url, so a config edit that changes either yields a
+    fresh client rather than reusing a stale connection.  Its own function
+    because both the routing loop and the default-client resolution below
+    must agree about when two providers are the same client.
+    """
+    return (
+        str(provider_cfg.get("api_key", "") or ""),
+        str(provider_cfg.get("base_url", "") or ""),
+        api_format,
+    )
+
+
+def _client_for_provider(
+    provider_cfg: dict,
+    api_format: str,
+    client_factory: Callable[[dict, str], Any],
+    client_cache: Optional[dict[tuple[str, str, str], Any]],
+) -> Any:
+    """The one client for this provider, building it on first use."""
+    if client_cache is None:
+        return client_factory(provider_cfg, api_format)
+    key = provider_client_cache_key(provider_cfg, api_format)
+    client = client_cache.get(key)
+    if client is None:
+        client = client_factory(provider_cfg, api_format)
+        client_cache[key] = client
+    return client
+
+
 def build_routing_transport(
     cfg: dict,
     default_format: str,
     default_client: Any,
     client_factory: Callable[[dict, str], Any],
     client_cache: Optional[dict[tuple[str, str, str], Any]] = None,
+    *,
+    default_client_cache_key: Optional[tuple[str, str, str]] = None,
 ) -> RoutingTransport:
     """Build a RoutingTransport from provider config.
 
@@ -1165,33 +1201,74 @@ def build_routing_transport(
     active provider reuses ``default_client`` so its routed and default
     paths share one client.
 
+    ``default_client_cache_key`` records the provider configuration that
+    built ``default_client``.  The active provider's models are routed through
+    the default transport, so trusting a client built from an older endpoint,
+    credential, or wire format posts, say,
+    ``glm-5.3-flash`` to whichever endpoint happened to be active when the
+    client was built:
+
+        400 The supported API model names are ..., but you passed glm-5.3-flash.
+
+    That is reachable without anyone lying: a web session runtime is rebuilt
+    from the config on disk, but the client it inherits was built when the
+    process started, and editing provider settings in between leaves the two
+    generations disagreeing.  Comparing the complete client identity lets
+    this function detect it and build the client for the config it was given —
+    through the same cache, so the process still holds one client per
+    provider rather than one per session.  Omitted, the client is trusted as
+    before, which is what the process's own build (client and cfg from the
+    same call) passes.
+
     The routes come from ``routing_table``: one transport per provider, no
     second opinion about who owns a model.
     """
     providers = cfg.get("providers", {}) or {}
     active = str(cfg.get("active_provider") or "")
     active_cfg = providers.get(active)
+    if not isinstance(active_cfg, dict):
+        active_cfg = None
+    active_format = (
+        str(active_cfg.get("api_format") or default_format)
+        if active_cfg is not None
+        else default_format
+    )
+    active_cache_key = (
+        provider_client_cache_key(active_cfg, active_format)
+        if active_cfg is not None
+        else None
+    )
+
+    if client_cache is not None:
+        # Keep the inherited client under the identity that actually built it.
+        # The process bootstrap omits the identity because its client and cfg
+        # were resolved together, so the active key is the honest fallback.
+        inherited_key = default_client_cache_key or active_cache_key
+        if default_client is not None and inherited_key is not None:
+            client_cache.setdefault(inherited_key, default_client)
+
+    if (
+        default_client_cache_key is not None
+        and default_client_cache_key != active_cache_key
+        and active_cfg is not None
+    ):
+        default_format = active_format
+        default_client = _client_for_provider(
+            active_cfg, default_format, client_factory, client_cache
+        )
+
     default_transport = build_transport(
         default_format,
         default_client,
-        provider_thinking_effort(active_cfg) if isinstance(active_cfg, dict) else None,
+        provider_thinking_effort(active_cfg) if active_cfg else None,
     )
     routes: dict[str, ModelTransport] = {}
     transports: dict[str, ModelTransport] = {}
 
     def _client_for(provider_cfg: dict, api_format: str) -> Any:
-        if client_cache is None:
-            return client_factory(provider_cfg, api_format)
-        key = (
-            str(provider_cfg.get("api_key", "") or ""),
-            str(provider_cfg.get("base_url", "") or ""),
-            api_format,
+        return _client_for_provider(
+            provider_cfg, api_format, client_factory, client_cache
         )
-        client = client_cache.get(key)
-        if client is None:
-            client = client_factory(provider_cfg, api_format)
-            client_cache[key] = client
-        return client
 
     overrides: dict[str, str] = {}
     for model, name in routing_table(cfg).items():

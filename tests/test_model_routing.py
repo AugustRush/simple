@@ -20,6 +20,7 @@ from agent.core.transport import (
     OpenAITransport,
     RoutingTransport,
     build_routing_transport,
+    provider_client_cache_key,
     routable_model_ids,
     routing_table,
 )
@@ -663,3 +664,333 @@ def test_consolidation_request_reaches_the_provider_that_owns_its_model(tmp_path
     assert foreign_seen, "the owning provider received nothing at all"
     assert {b.get("model") for b in foreign_seen} == {"glm-5.3-flash"}
     assert active_seen == [], "the active provider must never see a foreign model id"
+
+
+class _TaggedClient:
+    """A stand-in SDK client that remembers which provider built it."""
+
+    def __init__(self, tag: str, base_url: str) -> None:
+        self.tag = tag
+        self.base_url = base_url
+
+    def __repr__(self) -> str:  # pragma: no cover - failure messages only
+        return f"<client {self.tag}>"
+
+
+def _two_group_cfg(active: str) -> tuple[dict, callable]:
+    """deepseek's group and huoshan's, with *active* naming which is current."""
+    cfg = {
+        "active_provider": active,
+        "providers": {
+            "deepseek": {
+                "api_format": "openai",
+                "base_url": "https://api.deepseek.com",
+                "api_key": "key-deepseek",
+                "default_model": "deepseek-flash",
+                "models": ["deepseek-flash"],
+                "max_tokens": 64000,
+            },
+            "huoshan": {
+                "api_format": "openai",
+                "base_url": "https://ark.cn-beijing.volces.com/api/coding/v3",
+                "api_key": "key-huoshan",
+                "default_model": "glm-5.3-flash",
+                "models": ["glm-5.3-flash", "glm-5.3"],
+                "max_tokens": 32768,
+            },
+        },
+    }
+
+    def factory(provider_cfg: dict, api_format: str) -> Any:
+        name = "huoshan" if "huoshan" in str(provider_cfg.get("api_key")) else "deepseek"
+        return _TaggedClient(name, provider_cfg["base_url"])
+
+    return cfg, factory
+
+
+def test_a_client_from_an_earlier_config_generation_is_not_trusted():
+    """The reported failure: a web session rebuilt after ``active_provider`` moved.
+
+    ``_build_web_session_components`` re-reads the config on disk (that is how
+    a config edit reaches subsequent turns) and hands the process's SDK client
+    to ``build_routing_transport`` as the default.  The two agree only until
+    somebody edits ``active_provider``: the routing table then maps the *new*
+    active provider's models onto the default transport, which is holding the
+    *old* active provider's client.  The user saw
+
+        400 The supported API model names are deepseek-flash, deepseek-v4-pro,
+        but you passed glm-5.3-flash.
+
+    Naming where the inherited client came from is what lets the transport
+    refuse it, so this pins that the model reaches the group that owns it.
+    """
+    cfg, factory = _two_group_cfg(active="huoshan")
+    stale = _TaggedClient("deepseek", "https://api.deepseek.com")
+
+    routing = build_routing_transport(
+        cfg,
+        "openai",
+        stale,
+        factory,
+        client_cache={},
+        default_client_cache_key=provider_client_cache_key(
+            cfg["providers"]["deepseek"], "openai"
+        ),
+    )
+
+    for model in ("glm-5.3-flash", "glm-5.3"):
+        endpoint = routing.endpoint_for(model)
+        assert endpoint.client is not stale, (
+            f"{model} was routed through the client of a provider that does "
+            f"not own it"
+        )
+        assert endpoint.client.tag == "huoshan"
+    # The other group still resolves through the factory rather than being
+    # dragged along with the default.
+    assert routing.endpoint_for("deepseek-flash").client.tag == "deepseek"
+
+
+def test_an_in_place_endpoint_edit_replaces_the_inherited_client():
+    """Provider names are not client identities; endpoints can change in place."""
+    cfg, factory = _two_group_cfg(active="huoshan")
+    old_cfg = dict(cfg["providers"]["huoshan"])
+    stale = _TaggedClient("huoshan-old", "https://old.example/v1")
+    cfg["providers"]["huoshan"] = {
+        **old_cfg,
+        "api_key": "key-huoshan-new",
+        "base_url": "https://new.example/v1",
+    }
+
+    routing = build_routing_transport(
+        cfg,
+        "openai",
+        stale,
+        factory,
+        client_cache={},
+        default_client_cache_key=provider_client_cache_key(old_cfg, "openai"),
+    )
+
+    current = routing.endpoint_for("glm-5.3-flash").client
+    assert current is not stale
+    assert current.base_url == "https://new.example/v1"
+
+
+def test_a_switch_does_not_duplicate_the_retired_providers_client():
+    """The guard must refuse the client, not throw the cache away.
+
+    What the process holds is the cache its startup build filled, so a session
+    rebuilt after ``active_provider`` moved still finds the retired provider's
+    client filed under the provider it belongs to.  The new active provider
+    needs a client built for it; the retired one has to keep the client the
+    process already has, or every session leaves behind another connection
+    pool for a provider nobody switched to.
+    """
+    stale = _TaggedClient("deepseek", "https://api.deepseek.com")
+    cache: dict[Any, Any] = {}
+    # The startup build: active provider's client, seeded into the cache.
+    started, factory = _two_group_cfg(active="deepseek")
+    started_transport = build_routing_transport(
+        started, "openai", stale, factory, client_cache=cache
+    )
+    assert started_transport.endpoint_for("deepseek-flash").client is stale
+
+    # The rebuild: same cache, same client handed in, config moved on.
+    cfg, _ = _two_group_cfg(active="huoshan")
+    routing = build_routing_transport(
+        cfg,
+        "openai",
+        stale,
+        factory,
+        client_cache=cache,
+        default_client_cache_key=provider_client_cache_key(
+            started["providers"]["deepseek"], "openai"
+        ),
+    )
+
+    assert routing.endpoint_for("glm-5.3-flash").client is not stale
+    assert routing.endpoint_for("glm-5.3-flash").client.tag == "huoshan"
+    assert routing.endpoint_for("deepseek-flash").client is stale, (
+        "the retired group's client was rebuilt instead of reused"
+    )
+    assert len(cache) == 2, cache
+
+
+def test_a_client_built_from_this_config_is_still_reused():
+    """The honest case must not pay for the guard: one client, not two.
+
+    When the recorded provider *is* this config's active provider, the caller's
+    client is the right one, and it is reused — the point of the cache is that
+    a provider has one client for the process lifetime, and rebuilding the
+    process's own client per session would trade this bug for a connection
+    pool per session.
+    """
+    cfg, factory = _two_group_cfg(active="huoshan")
+    mine = _TaggedClient("huoshan", cfg["providers"]["huoshan"]["base_url"])
+    cache: dict[Any, Any] = {}
+
+    routing = build_routing_transport(
+        cfg,
+        "openai",
+        mine,
+        factory,
+        client_cache=cache,
+        default_client_cache_key=provider_client_cache_key(
+            cfg["providers"]["huoshan"], "openai"
+        ),
+    )
+
+    assert routing.endpoint_for("glm-5.3-flash").client is mine
+    assert routing.endpoint_for(None).client is mine
+    # Exactly one client per provider in the two groups.
+    assert len(cache) == 2, cache
+    # A second session — what a config_revision bump does — adds nothing.
+    build_routing_transport(
+        cfg,
+        "openai",
+        mine,
+        factory,
+        client_cache=cache,
+        default_client_cache_key=provider_client_cache_key(
+            cfg["providers"]["huoshan"], "openai"
+        ),
+    )
+    assert len(cache) == 2, "a rebuilt session must not build another client"
+
+
+def test_a_rebuilt_session_sends_the_new_active_providers_model_to_it():
+    """The same thing over real sockets, through the real SDK client.
+
+    A turn on the newly-active provider's model must reach *that* provider's
+    endpoint.  Before the fix the inherited client answered the 400 that
+    started this: a local server standing in for the old provider receives
+    nothing at all.
+    """
+    openai = pytest.importorskip("openai")
+
+    old_url, old_seen, old_srv = _serve_openai_provider()
+    new_url, new_seen, new_srv = _serve_openai_provider()
+    try:
+        cfg = {
+            "active_provider": "huoshan",
+            "providers": {
+                "deepseek": {
+                    "api_format": "openai",
+                    "base_url": old_url,
+                    "api_key": "key-deepseek",
+                    "default_model": "deepseek-flash",
+                    "models": ["deepseek-flash"],
+                },
+                "huoshan": {
+                    "api_format": "openai",
+                    "base_url": new_url,
+                    "api_key": "key-huoshan",
+                    "default_model": "glm-5.3-flash",
+                    "models": ["glm-5.3-flash"],
+                },
+            },
+        }
+
+        def factory(provider_cfg: dict, api_format: str) -> Any:
+            return openai.AsyncOpenAI(
+                base_url=provider_cfg["base_url"],
+                api_key=provider_cfg["api_key"],
+                max_retries=0,
+            )
+
+        # What the process still holds from an earlier start.
+        inherited = openai.AsyncOpenAI(
+            base_url=old_url, api_key="key-deepseek", max_retries=0
+        )
+        routing = build_routing_transport(
+            cfg,
+            "openai",
+            inherited,
+            factory,
+            client_cache={},
+            default_client_cache_key=provider_client_cache_key(
+                cfg["providers"]["deepseek"], "openai"
+            ),
+        )
+
+        asyncio.run(
+            routing.create(
+                model="glm-5.3-flash",
+                max_tokens=16,
+                system="probe",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+            )
+        )
+    finally:
+        old_srv.shutdown()
+        old_srv.server_close()
+        new_srv.shutdown()
+        new_srv.server_close()
+
+    assert [b.get("model") for b in new_seen] == ["glm-5.3-flash"]
+    assert old_seen == [], "the provider that was active at start-up saw the id"
+
+
+def test_the_session_model_follows_the_config_it_is_rebuilt_against():
+    """``active_model_and_tokens`` is the one answer to "which model here".
+
+    A session's routing table is built from the config on disk, so its default
+    model has to be read from that same config.  Taking it from the process's
+    globals leaves a session whose routes are new but whose model is old — and
+    once the retired group is dropped from the config, that id belongs to
+    nobody, which is the same 400 one step later.
+    """
+    pytest.importorskip("openai")
+
+    from agent.config import ModelClientFactory
+
+    as_deepseek, _ = _two_group_cfg(active="deepseek")
+    as_huoshan, _ = _two_group_cfg(active="huoshan")
+
+    assert ModelClientFactory.active_model_and_tokens(as_deepseek) == (
+        "deepseek-flash",
+        64000,
+    )
+    assert ModelClientFactory.active_model_and_tokens(as_huoshan) == (
+        "glm-5.3-flash",
+        32768,
+    )
+    # A top-level ``model`` still outranks the group's default, which is the
+    # rule ``from_config`` has always applied — pinned here so splitting the
+    # resolution out of it cannot quietly change the answer.
+    pinned = {**as_huoshan, "model": "glm-5.3"}
+    assert ModelClientFactory.active_model_and_tokens(pinned)[0] == "glm-5.3"
+
+    # And it agrees with what the single client factory resolves, so the two
+    # cannot drift into different answers.
+    _client, from_config_model, from_config_tokens = ModelClientFactory.from_config(
+        as_huoshan, announce=False
+    )
+    assert ModelClientFactory.active_model_and_tokens(as_huoshan) == (
+        from_config_model,
+        from_config_tokens,
+    )
+
+
+def test_the_model_named_by_a_config_is_the_groups_default_even_when_unlisted():
+    """A group's ``default_model`` need not appear in its ``models`` list.
+
+    The real config has one such group, and reading the model off the ``models``
+    list instead of the group would send an id no group owns.
+    """
+    from agent.config import ModelClientFactory
+
+    cfg = {
+        "active_provider": "huoshan",
+        "providers": {
+            "huoshan": {
+                "api_format": "openai",
+                "default_model": "glm-5.3-flash",
+                "models": ["glm-5.3"],
+            }
+        },
+    }
+
+    model, tokens = ModelClientFactory.active_model_and_tokens(cfg)
+    assert model == "glm-5.3-flash"
+    assert tokens > 0

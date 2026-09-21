@@ -10,7 +10,7 @@ import {
 } from '@ant-design/icons'
 import { Button, Card, Col, Empty, Input, Row, Skeleton, Switch, Tag } from 'antd'
 
-export function createExtensionsView(ctx: AppCtx) {
+export function renderExtensions(ctx: AppCtx) {
   const { copyMessage, deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, loadingView, pageMeta, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skills, skillSearch, togglePlugin, toggleSkill } = ctx
 
 
@@ -156,7 +156,7 @@ export function createExtensionsView(ctx: AppCtx) {
     </>
   )
 
-  const renderExtensions = () => (
+  return (
     <div className="page-view extensions-view">
       <div className="page-head">
         <div>
@@ -191,5 +191,4 @@ export function createExtensionsView(ctx: AppCtx) {
       {extensionsTab === 'plugins' ? renderPluginsBody() : renderSkillsBody()}
     </div>
   )
-  return { renderExtensions }
 }

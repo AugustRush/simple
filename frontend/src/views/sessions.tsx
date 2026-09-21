@@ -27,11 +27,11 @@ import {
   Typography,
 } from 'antd'
 
-export function createSessionsView(ctx: AppCtx) {
+export function renderSessions(ctx: AppCtx) {
   const { activeSession, allFilteredSessionsSelected, deleteSelectedSessions, deleteSession, filteredSessions, handleSessionContainerClick, loadingSessions, pageMeta, pendingDeleteSessionId, renameSession, revealSession, selectedSessionIds, sessionSearch, setPendingDeleteSessionId, setSelectedSessionIds, setSessionSearch } = ctx
 
 
-  const renderSessions = () => (
+  return (
     <div className="page-view">
       <div className="page-head">
         <div>
@@ -188,5 +188,4 @@ export function createSessionsView(ctx: AppCtx) {
       )}
     </div>
   )
-  return { renderSessions }
 }

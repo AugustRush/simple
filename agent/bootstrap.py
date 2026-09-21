@@ -33,6 +33,36 @@ BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
 
 
+def _active_context_window(cfg: dict) -> int | None:
+    """Resolve the active provider's configured context window."""
+    providers = cfg.get("providers", {})
+    active_name = cfg.get("active_provider", "anthropic")
+    provider_cfg = (
+        providers.get(active_name, {}) if isinstance(providers, dict) else {}
+    )
+    raw = cfg.get("context_window") or provider_cfg.get("context_window")
+    return int(raw) if raw is not None else None
+
+
+def _reserve_input_context(
+    max_tokens: int,
+    context_window: int | None,
+    *,
+    announce: bool = False,
+) -> int:
+    """Keep the output cap from consuming the provider's whole context."""
+    if context_window is None or max_tokens < context_window:
+        return max_tokens
+    reserve = max(4096, min(16384, context_window // 10))
+    adjusted = max(1, context_window - reserve)
+    if announce and adjusted < max_tokens:
+        shared.CONSOLE.print(
+            f"[yellow]max_tokens={max_tokens} equals context_window={context_window}; "
+            f"using {adjusted} to reserve input context[/yellow]"
+        )
+    return min(max_tokens, adjusted)
+
+
 def _project_memory_scope(workspace_root: Path) -> str:
     canonical = str(workspace_root.expanduser().resolve(strict=False))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
@@ -163,23 +193,68 @@ async def _build_web_session_components(
     # process-lifetime cache so per-session rebuilds (config hot-reload) do
     # not leak a connection pool per session per provider.  Handed to the
     # constructor so the session's sub-agents inherit the routing table too.
-    from agent.core.transport import build_routing_transport
+    #
+    # ``session_cfg`` is the config on disk *now* (that is why the session is
+    # being rebuilt at all), while the client below was built when the process
+    # started.  Those agree only as long as nobody edited ``active_provider``
+    # in between, and the routing table is built from the config on disk — so
+    # left unguarded, a provider switch routes the *new* provider's models
+    # (and its default model, taken from ``active_model_and_tokens`` below)
+    # through the *old* provider's client, which answers
+    #
+    #     400 The supported API model names are ..., but you passed <模型>
+    #
+    # Recording the inherited client's endpoint/credential/format identity
+    # lets the transport detect that and take the client for the config it was
+    # given, from the same shared cache. ``global_agent.api_format`` stays the
+    # caller's word for the inherited client: when its identity matches, the
+    # two travel together; when it does not, the transport rebuilds both from
+    # the current config. The client and format the session actually ends up
+    # with are read back off the transport rather than resolved a second time.
+    from agent.core.transport import (
+        build_routing_transport,
+        provider_client_cache_key,
+    )
 
-    agent = BaseAgent(
+    session_transport = build_routing_transport(
+        session_cfg,
+        global_agent.api_format,
         global_components["client"],
+        client_factory=_provider_client_factory,
+        client_cache=provider_client_cache,
+        # ``None`` when it was never recorded (a hand-built components dict),
+        # which means "trust it" — the same behaviour as before.  The process
+        # bootstrap records the endpoint/credential/format identity beside
+        # the client so an in-place provider edit is detected too.
+        default_client_cache_key=global_components.get("client_cache_key"),
+    )
+    session_model, session_max_tokens = ModelClientFactory.active_model_and_tokens(
+        session_cfg
+    )
+    session_context_window = _active_context_window(session_cfg)
+    session_max_tokens = _reserve_input_context(
+        session_max_tokens, session_context_window
+    )
+    session_provider = str(session_cfg.get("active_provider") or "")
+    session_supports_vision = provider_supports_vision(
+        session_cfg, session_provider
+    )
+    registry.set_context("supports_vision", session_supports_vision)
+    session_provider_cfg = (session_cfg.get("providers") or {}).get(
+        session_provider, {}
+    )
+    session_client_cache_key = provider_client_cache_key(
+        session_provider_cfg, session_transport.api_format
+    )
+    agent = BaseAgent(
+        session_transport.default.client,
         registry,
-        model=global_components["model"],
-        max_tokens=global_components["max_tokens"],
-        api_format=global_agent.api_format,
-        supports_vision=global_agent.supports_vision,
-        context_window=global_agent.context_window,
-        transport=build_routing_transport(
-            session_cfg,
-            global_agent.api_format,
-            global_components["client"],
-            client_factory=_provider_client_factory,
-            client_cache=provider_client_cache,
-        ),
+        model=session_model,
+        max_tokens=session_max_tokens,
+        api_format=session_transport.api_format,
+        supports_vision=session_supports_vision,
+        context_window=session_context_window,
+        transport=session_transport,
     )
     for name in (
         "max_parallel_agents",
@@ -212,6 +287,16 @@ async def _build_web_session_components(
     session_components.update(
         {
             "cfg": session_cfg,
+            # The client, the provider it belongs to and the model all come
+            # from ``session_transport`` / ``session_cfg`` above rather than
+            # from the global components: a session is built against the
+            # config on disk, and inheriting any of these would leave it
+            # half-built against the config the process started with.
+            "client": session_transport.default.client,
+            "client_provider": session_provider,
+            "client_cache_key": session_client_cache_key,
+            "model": session_model,
+            "max_tokens": session_max_tokens,
             "registry": registry,
             "agent": agent,
             "system_prompt": system_prompt,
@@ -344,36 +429,16 @@ async def _build_components_async(
             announce=False,
         )
 
-    # Resolve context_window from provider config, falling back to the
-    # DEFAULT_CONTEXT_WINDOW constant.  Follows the same resolution order
-    # as max_tokens: top-level cfg key overrides provider-level key.
-    providers = cfg.get("providers", {})
-    active_name = cfg.get("active_provider", "anthropic")
-    provider_cfg = providers.get(active_name, {})
-    context_window = (
-        cfg.get("context_window")
-        or provider_cfg.get("context_window")
-    )
-    if context_window is not None:
-        context_window = int(context_window)
+    # Record the human-readable provider name beside the client; the exact
+    # endpoint/credential/format identity is recorded after the transport is
+    # built, so web-session rebuilds can decide whether this client is current.
+    client_provider = str(cfg.get("active_provider") or "")
 
-    # ``max_tokens`` is an output budget, so it cannot consume the entire
-    # provider context window: system instructions, tool schemas, and the
-    # user's conversation also need room.  A provider config that sets both
-    # values to the same number otherwise makes every turn fail before the
-    # request is sent (especially visible when a historical web session is
-    # lazily re-created after a restart). Keep the configured value when it is
-    # safe, otherwise reserve a bounded input slice automatically.
-    if context_window is not None and max_tokens >= context_window:
-        reserve = max(4096, min(16384, context_window // 10))
-        adjusted = max(1, context_window - reserve)
-        if adjusted < max_tokens:
-            if announce:
-                console.print(
-                    f"[yellow]max_tokens={max_tokens} equals context_window={context_window}; "
-                    f"using {adjusted} to reserve input context[/yellow]"
-                )
-            max_tokens = adjusted
+    providers = cfg.get("providers", {})
+    context_window = _active_context_window(cfg)
+    max_tokens = _reserve_input_context(
+        max_tokens, context_window, announce=announce
+    )
 
     system_prompt = _load_system_prompt(cfg, prompts_dir=prompts_dir)
 
@@ -613,7 +678,10 @@ async def _build_components_async(
     # behavior (sent to the active client).  The transport is handed to the
     # constructor rather than assigned afterwards so everything the agent
     # derives — sub-agents above all — sees the routing table from the start.
-    from agent.core.transport import build_routing_transport
+    from agent.core.transport import (
+        build_routing_transport,
+        provider_client_cache_key,
+    )
 
     # Process-lifetime SDK client cache shared with every web session's
     # routing transport, so per-session rebuilds do not leak one connection
@@ -625,6 +693,9 @@ async def _build_components_async(
         client,
         client_factory=_provider_client_factory,
         client_cache=provider_client_cache,
+    )
+    client_cache_key = provider_client_cache_key(
+        (providers or {}).get(client_provider, {}), api_format
     )
     agent = BaseAgent(
         client,
@@ -745,6 +816,8 @@ async def _build_components_async(
     # on_session_start(); the dict is updated in-place after discover_and_load.
     _partial_components: dict = {
         "client": client,
+        "client_provider": client_provider,
+        "client_cache_key": client_cache_key,
         "model": model,
         "api_format": api_format,
         "memory": memory,
