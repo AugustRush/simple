@@ -1436,8 +1436,19 @@ def test_config_validation_ignores_underscore_documentation_keys():
 
     assert _validate_config({"_tavily_api_key_readme": "text"}) == []
     assert _validate_config({"_web_proxy_readme": "text"}) == []
+    # The convention holds one level down too: `providers._readme` sits beside
+    # the real providers, so it must not be read as a provider name.
+    assert _validate_config({"providers": {"_readme": "text"}}) == []
     # A real typo still warns.
     assert any("web_proxyy" in w for w in _validate_config({"web_proxyy": "x"}))
+
+
+def test_shipped_example_config_validates_without_warnings():
+    """config.example.json is the file users copy, so it must be warning-free."""
+    from agent.config import _validate_config
+
+    example_path = Path(__file__).resolve().parents[1] / "config.example.json"
+    assert _validate_config(json.loads(example_path.read_text())) == []
 
 
 def test_permissions_status_shows_sandbox_mode(monkeypatch, tmp_path):

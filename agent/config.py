@@ -369,6 +369,10 @@ def _validate_config(cfg: dict) -> list[str]:
 
     # ── Validate each provider ─────────────────────────────────────────────
     for pname, pcfg in providers.items():
+        # `_readme` companions sit beside the real providers in the example
+        # config, the same convention the top-level unknown-key check honours.
+        if pname.startswith("_"):
+            continue
         if not isinstance(pcfg, dict):
             warnings.append(f"providers.{pname}: must be a dict, got {type(pcfg).__name__}")
             continue
@@ -468,9 +472,6 @@ def _validate_config(cfg: dict) -> list[str]:
 
     scheduler = cfg.get("scheduler", {})
     if isinstance(scheduler, dict):
-        _check_int("scheduler.poll_seconds", 1, 3600) if "poll_seconds" in scheduler else None
-        _check_int("scheduler.lease_seconds", 1, 3600) if "lease_seconds" in scheduler else None
-        # Check inline
         for skey, smin in (
             ("poll_seconds", 1),
             ("lease_seconds", 10),
