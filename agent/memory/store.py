@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent import shared
 from agent.lexical import LATIN_TOKEN_RE
@@ -1748,14 +1748,24 @@ class LTMStore:
             ),
         )
 
-    def read_fact_assertions(
+    def _read_facts(
         self,
+        table: str,
+        order_by: str,
+        to_row: Callable[[sqlite3.Row], Any],
         *,
         subject: Optional[str] = None,
         predicate: Optional[str] = None,
         scope: Optional[str] = None,
-    ) -> list[FactAssertion]:
-        sql = "SELECT * FROM fact_assertions WHERE 1 = 1"
+    ) -> list[Any]:
+        """Filter one fact table by the three optional keys and read it back.
+
+        Both fact tables carry the same ``subject``/``predicate``/``scope``
+        triple and normalize it the same way, so the query lives here once and
+        each caller supplies only what actually differs.  ``table`` and
+        ``order_by`` are literals from this module, never caller input.
+        """
+        sql = f"SELECT * FROM {table} WHERE 1 = 1"
         params: list[Any] = []
         if subject is not None:
             sql += " AND subject = ?"
@@ -1766,10 +1776,26 @@ class LTMStore:
         if scope is not None:
             sql += " AND scope = ?"
             params.append(_normalize_fact_part(scope, "global"))
-        sql += " ORDER BY created_at ASC, id ASC"
+        sql += f" ORDER BY {order_by}"
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_fact_assertion(row) for row in rows]
+        return [to_row(row) for row in rows]
+
+    def read_fact_assertions(
+        self,
+        *,
+        subject: Optional[str] = None,
+        predicate: Optional[str] = None,
+        scope: Optional[str] = None,
+    ) -> list[FactAssertion]:
+        return self._read_facts(
+            "fact_assertions",
+            "created_at ASC, id ASC",
+            self._row_to_fact_assertion,
+            subject=subject,
+            predicate=predicate,
+            scope=scope,
+        )
 
     def resolve_fact(
         self,
@@ -1896,21 +1922,14 @@ class LTMStore:
         predicate: Optional[str] = None,
         scope: Optional[str] = None,
     ) -> list[ResolvedFact]:
-        sql = "SELECT * FROM resolved_facts WHERE 1 = 1"
-        params: list[Any] = []
-        if subject is not None:
-            sql += " AND subject = ?"
-            params.append(_normalize_fact_part(subject))
-        if predicate is not None:
-            sql += " AND predicate = ?"
-            params.append(_normalize_fact_part(predicate))
-        if scope is not None:
-            sql += " AND scope = ?"
-            params.append(_normalize_fact_part(scope, "global"))
-        sql += " ORDER BY subject ASC, predicate ASC, scope ASC"
-        with self._connect() as conn:
-            rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_resolved_fact(row) for row in rows]
+        return self._read_facts(
+            "resolved_facts",
+            "subject ASC, predicate ASC, scope ASC",
+            self._row_to_resolved_fact,
+            subject=subject,
+            predicate=predicate,
+            scope=scope,
+        )
 
     def has_conflicted_fact(
         self,
