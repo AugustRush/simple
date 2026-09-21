@@ -6,28 +6,20 @@ import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from functools import partial
-import html
 import json
 import os
 from pathlib import Path
 import re
-import shlex
-import signal
 import subprocess
 import threading
-import time
 import traceback
-import urllib.request
 from typing import Any, Callable, Optional
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from zoneinfo import ZoneInfo
 
 import mcp
 
 from agent import shared
-from agent.core.output import OutputSink, _active_sink
-from agent.pathing import path_contains, resolve_workspace_path
+from agent.core.output import _active_sink
 from agent.tools import user_tools
 
 _active_schedule_target: contextvars.ContextVar[Optional[dict[str, Any]]] = (

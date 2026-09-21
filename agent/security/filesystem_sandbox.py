@@ -38,13 +38,6 @@ from agent.security.sandbox.backends.seatbelt import (
     _DEVICE_SANDBOX_RULES,
     profile_for_request as _macos_seatbelt_profile,
 )
-from agent.security.sandbox.policy import (
-    _AUTOSTART_HOME_SUBDIRS,
-    _AUTOSTART_SYSTEM_DIRS,
-    _PROTECTED_HOME_SUBDIRS,
-    _SECRET_HOME_SUBDIRS,
-)
-from agent.security.sandbox.scratch import _SCRATCH_MAX_AGE_SECONDS
 
 __all__ = [
     "PathRule",

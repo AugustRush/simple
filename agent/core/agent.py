@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import contextvars
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -879,31 +878,12 @@ class BaseAgent:
         )
 
     @staticmethod
-    def _with_expected_output_contract(task: str, expected_output: str) -> str:
-        if not expected_output:
-            return task
-        return BaseAgent._append_named_block(
-            task,
-            "Expected output contract:",
-            [expected_output, *contracts.DELIVERABLE_INSTRUCTIONS],
-        )
-
-    @staticmethod
     def _mapping_dict(value: Any) -> dict[str, Any]:
         return contracts.mapping_dict(value)
 
     @staticmethod
     def _normalize_output_contract(output_contract: dict[str, Any] | None) -> dict[str, Any]:
         return contracts.OutputContract.parse(output_contract).to_dict()
-
-    @staticmethod
-    def _output_contract_requires_deliverable(
-        expected_output: str,
-        output_contract: dict[str, Any] | None,
-    ) -> bool:
-        return contracts.OutputContract.parse(
-            output_contract
-        ).requires_deliverable(expected_output)
 
     @classmethod
     def _with_output_contract(
@@ -920,10 +900,6 @@ class BaseAgent:
             "Expected output contract:",
             contracts.contract_instructions(expected_output, contract),
         )
-
-    @staticmethod
-    def _extract_deliverable_block(content: str) -> str | None:
-        return contracts.extract_deliverable(content)
 
     def _resolve_output_contract_path(self, raw_path: str) -> Path:
         output_dir_str = self.registry.get_context("output_dir")
@@ -2137,33 +2113,6 @@ class BaseAgent:
             unproductive=unproductive,
             intent_required=all(outcome.intent_required for outcome in outcomes),
         )
-
-    @classmethod
-    def _tool_results_look_unproductive(cls, results: list[str]) -> bool:
-        return cls._classify_tool_results(results).unproductive
-
-    @staticmethod
-    def _tool_results_are_intent_required(results: list[str]) -> bool:
-        if not results:
-            return False
-        for raw_result in results:
-            raw_text = str(raw_result or "")
-            try:
-                payload = json.loads(raw_text)
-            except Exception:
-                lower = raw_text.lower()
-                if "intent required" in lower or "intent declaration too vague" in lower:
-                    continue
-                return False
-            if isinstance(payload, dict) and payload.get("intent_required") is True:
-                continue
-            if (
-                isinstance(payload, dict)
-                and "intent" in str(payload.get("error", "")).lower()
-            ):
-                continue
-            return False
-        return True
 
     _looks_like_chinese = staticmethod(shared._looks_like_chinese)
 

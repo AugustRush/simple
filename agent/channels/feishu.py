@@ -42,7 +42,6 @@ import inspect
 import json
 import logging
 import mimetypes
-import os
 import random
 import re
 import threading
@@ -53,7 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
-from agent import _active_sink, _fmt_tool_inputs, shared
+from agent import _fmt_tool_inputs, shared
 from agent.channels import Channel, IncomingMessage
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core import OutputSink, SubAgentProgressEvent

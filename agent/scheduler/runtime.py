@@ -10,7 +10,6 @@ from typing import Any, Awaitable, Callable, Optional
 from agent import shared
 from agent.verification import (
     VERDICT_FAILED,
-    VERDICT_NONE,
     VERDICT_PASSED,
     VERDICT_UNKNOWN,
     CommandVerifier,
@@ -28,10 +27,8 @@ from .models import (
     DeliveryTarget,
     ExecutionResult,
     acceptance_for_run,
-    declared_products,
     describe_missed_occurrences,
     missing_products,
-    normalize_products,
     product_report,
     produces_for_run,
 )

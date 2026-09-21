@@ -1322,25 +1322,6 @@ class ContextManager:
         return "\n".join(lines) if len(lines) > 2 else ""
 
     @staticmethod
-    def _working_state_terms(state: dict[str, Any]) -> set[str]:
-        parts: list[str] = []
-        for key in ("active_goal", "progress"):
-            value = str(state.get(key, "") or "").strip()
-            if value:
-                parts.append(value)
-        artifacts = state.get("artifacts")
-        if isinstance(artifacts, list):
-            parts.extend(str(item or "").strip() for item in artifacts)
-        recent_turns = state.get("recent_turns")
-        if isinstance(recent_turns, list):
-            for turn in recent_turns:
-                if isinstance(turn, dict):
-                    content = str(turn.get("content", "") or "").strip()
-                    if content:
-                        parts.append(content)
-        return set(_lexical_terms(" ".join(parts)))
-
-    @staticmethod
     def _weighted_term_overlap(
         query_terms: set[str],
         value: Any,

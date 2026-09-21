@@ -26,7 +26,6 @@ from agent.scheduler.models import LOCAL_TIMEZONE, normalize_products
 from agent.security.network import (
     fetch_public_http_url,
     parse_proxy_url,
-    proxy_from_environment,
 )
 from agent.security.filesystem_sandbox import (
     SANDBOX_MODE_NONE,
@@ -3062,12 +3061,6 @@ class BuiltinTools:
     def _path_is_inside_workspace(self, path: Path) -> bool:
         return path_contains(
             self._active_workspace_root(),
-            path.expanduser().resolve(strict=False),
-        )
-
-    def _path_is_inside_output_dir(self, path: Path) -> bool:
-        return path_contains(
-            self._process_output_dir(),
             path.expanduser().resolve(strict=False),
         )
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from agent import shared
 from agent.lexical import count_cjk_chars
@@ -156,15 +156,6 @@ class ConsolidationEngine:
     # still override the cap; the estimate itself now lives in the free
     # function above, which takes it as a parameter.
     MAX_IMAGE_TOKENS = MAX_IMAGE_TOKENS
-
-    @classmethod
-    def _non_text_block_tokens(
-        cls, block: dict, count_text: Callable[[str], int]
-    ) -> int:
-        """Cost of a non-text content block under the provider's price model."""
-        return non_text_block_tokens(
-            block, count_text, max_image_tokens=cls.MAX_IMAGE_TOKENS
-        )
 
     def estimate_tokens(self, messages: list[dict]) -> int:
         """Token estimate with CJK-awareness, using this engine's settings.

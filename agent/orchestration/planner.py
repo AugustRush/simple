@@ -60,10 +60,6 @@ class OrchestrationPlanner:
             return tuple(str(item) for item in value if str(item).strip())
         return (str(value),)
 
-    @staticmethod
-    def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
-        return any(keyword.lower() in text for keyword in keywords)
-
     def decide(
         self,
         user_message: str,

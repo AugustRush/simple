@@ -8,7 +8,6 @@ import logging
 import os
 from pathlib import Path
 import signal
-import subprocess
 import sys
 from typing import Any, Callable, Optional, Sequence
 

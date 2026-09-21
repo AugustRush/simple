@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 # ── HIGH confidence: a single match is strong enough ──────────────────────────
 _HIGH_PATTERNS: list[re.Pattern[str]] = [

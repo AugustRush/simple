@@ -9,7 +9,6 @@ import re
 import shutil
 from typing import Any, Optional
 
-import agent as agent_module
 from agent import shared
 from agent.tools.runtime import ToolRegistry
 

@@ -10,7 +10,6 @@ import uuid
 
 from agent import shared
 from agent.core.output import (
-    _active_assistant_text,
     _active_event_collector,
     _active_sink,
     _consent_pending,
