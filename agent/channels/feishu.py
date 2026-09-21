@@ -965,9 +965,6 @@ class FeishuOutputSink(OutputSink):
             self._stream_flush_pending = False
             self._stream_flush_pending = False
 
-    async def _finalize_progress_async(self) -> None:
-        self._progress_flush_pending = False
-
     async def _send_response_async(self, text: str) -> None:
         """Send the final response using the optimal Feishu message format."""
         started_at = time.perf_counter()

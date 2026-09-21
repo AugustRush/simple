@@ -334,9 +334,6 @@ class SignalTrigger:
         """
         return self.names[0] if self.names else ""
 
-    def needs_all(self) -> bool:
-        return self.mode == SIGNAL_MODE_ALL
-
     def next_after(self, now: datetime) -> Optional[datetime]:
         return None
 
@@ -833,9 +830,6 @@ class Acceptance:
 
     criteria: list[str] = field(default_factory=list)
     verify_command: str = ""
-
-    def is_declared(self) -> bool:
-        return bool(self.criteria) or bool(self.verify_command.strip())
 
     def to_dict(self) -> dict[str, Any]:
         return {

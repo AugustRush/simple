@@ -1487,11 +1487,6 @@ class ContextManager:
             "candidates": candidates,
         }
 
-    def _should_include_working_state(self, state: dict[str, Any], query: str) -> bool:
-        if not isinstance(state, dict) or not state:
-            return False
-        return self._select_working_state(state, query) is not None
-
     def working_state_context(self, query: str = "") -> str:
         snapshot = self.store.load_session_working_state(self.staging.session_id)
         if snapshot is None:

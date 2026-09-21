@@ -1349,27 +1349,6 @@ class LTMStore:
         ordered = sorted(rows_by_id.values(), key=lambda row: int(row["id"]))
         return [self._row_to_conversation_turn(row) for row in ordered[-limit * 2 :]]
 
-    def has_conversation_message(
-        self,
-        *,
-        session_id: str,
-        message_id: str,
-        role: str = "user",
-    ) -> bool:
-        clean_message_id = str(message_id or "").strip()
-        if not clean_message_id:
-            return False
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM conversation_turns
-                WHERE session_id = ? AND role = ? AND message_id = ?
-                LIMIT 1
-                """,
-                (str(session_id or "").strip() or "default", role, clean_message_id),
-            ).fetchone()
-        return row is not None
-
     def load_session_working_state(
         self,
         session_id: str,

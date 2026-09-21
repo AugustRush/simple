@@ -716,28 +716,6 @@ class SessionService:
         callback = getattr(self, "_session_runtime_cleanup", None)
         return callback if callable(callback) else None
 
-    def delete_sessions(self, session_ids: Any) -> dict[str, Any]:
-        """Delete multiple sessions and report individual failures.
-
-        Each id is processed independently so one stale/broken session does not
-        prevent the remaining selected sessions from being removed.
-        """
-        if not isinstance(session_ids, (list, tuple, set)):
-            return {"deleted": [], "failed": []}
-        deleted: list[str] = []
-        failed: list[str] = []
-        seen: set[str] = set()
-        for raw in session_ids:
-            clean = str(raw or "").strip()
-            if not clean or clean in seen:
-                continue
-            seen.add(clean)
-            if self.delete_session(clean):
-                deleted.append(clean)
-            else:
-                failed.append(clean)
-        return {"deleted": deleted, "failed": failed}
-
     async def delete_sessions_async(self, session_ids: Any) -> dict[str, Any]:
         """Asynchronously clean and delete multiple isolated sessions."""
         if not isinstance(session_ids, (list, tuple, set)):

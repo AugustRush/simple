@@ -506,10 +506,6 @@ class BaseAgent:
             )
         )
 
-    def set_model(self, model: str) -> None:
-        """Switch the model used for subsequent calls."""
-        self.model = model
-
     def current_context(self) -> Optional["AgentContext"]:
         return _active_agent_context.get()
 
@@ -1341,10 +1337,6 @@ class BaseAgent:
         )
 
     # ── Format-aware API helpers ──────────────────────────────────────────
-
-    def _tools_for_api(self, tools: list[dict], ctx: "AgentContext") -> Any:
-        """Convert tools to the format of the provider this turn will use."""
-        return self._transport.convert_tools(tools, model=self._effective_model(ctx))
 
     async def _create(
         self,
