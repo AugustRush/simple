@@ -469,6 +469,96 @@ def _read_mcp_json(plugin_dir: Path, plugin_name: str | None = None) -> list[dic
     return out
 
 
+def _read_plugin_hooks(
+    plugin_dir: Path, plugin_name: str, hooks_cfg: Any
+) -> tuple[dict[str, list[dict]], dict[str, re.Pattern], dict[str, float]]:
+    """Collect a manifest's hooks, their matchers and their timeouts.
+
+    ``hooks`` may be a path, a list of paths, or an inline block; the three
+    forms merge into one ``{hook_name: [entries]}`` mapping.
+    """
+    raw_hooks: dict[str, list[dict]] = {}
+    if isinstance(hooks_cfg, str):
+        # Path string: "hooks": "./hooks/hooks.json" or "./my-hooks.json"
+        _merge_hooks_from_file(plugin_dir, hooks_cfg, raw_hooks)
+    elif isinstance(hooks_cfg, list):
+        # Array of paths: "hooks": ["./a.json", "./b.json"]
+        for hook_path in hooks_cfg:
+            if isinstance(hook_path, str):
+                _merge_hooks_from_file(plugin_dir, hook_path, raw_hooks)
+    elif isinstance(hooks_cfg, dict):
+        _merge_hooks_block(plugin_name, hooks_cfg, raw_hooks)
+    hook_matchers: dict[str, re.Pattern] = {}
+    hook_timeouts: dict[str, float] = {}
+    for hook_name, entries in raw_hooks.items():
+        for entry in entries:
+            if isinstance(entry.get("timeout"), (int, float)):
+                hook_timeouts[hook_name] = max(0.0, _safe_float(entry["timeout"], 60.0))
+            matcher = str(entry.get("matcher", "") or "").strip()
+            if matcher and matcher != "*":
+                try:
+                    hook_matchers[hook_name] = re.compile(matcher)
+                except re.error:
+                    pass
+    return raw_hooks, hook_matchers, hook_timeouts
+def _normalize_mcp_servers(plugin_dir: Path, data: dict, plugin_env: dict) -> list[dict]:
+    """Normalise a manifest's ``mcp_servers`` into a list of server dicts.
+
+    Accepts ``mcp_servers`` (snake_case) or ``mcpServers`` (camelCase), and a
+    dict, a single path, or a list of paths/dicts.  Claude Code's marketplace
+    block is a dict keyed by server name, so each key becomes the canonical name.
+    Plugin variables are substituted into every server, and the plugin's own
+    env wins over a server's on a collision.
+    """
+    mcp = data.get("mcp_servers")
+    if mcp is None:
+        mcp = data.get("mcpServers", [])
+    if isinstance(mcp, dict):
+        mcp = [{"name": k, **(v if isinstance(v, dict) else {})}
+               for k, v in mcp.items()]
+    elif isinstance(mcp, str):
+        mcp_path = plugin_dir / mcp
+        if mcp_path.exists():
+            mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
+            if isinstance(mcp, dict):
+                servers = mcp.get("mcpServers", mcp)
+                if isinstance(servers, dict):
+                    mcp = [
+                        {"name": k, **(v if isinstance(v, dict) else {})}
+                        for k, v in servers.items()
+                    ]
+                else:
+                    mcp = [mcp]
+        else:
+            mcp = []
+    elif isinstance(mcp, list):
+        normalized_mcp = []
+        for item in mcp:
+            if isinstance(item, str):
+                mcp_path = plugin_dir / item
+                if not mcp_path.exists():
+                    continue
+                loaded = json.loads(mcp_path.read_text(encoding="utf-8"))
+                servers = loaded.get("mcpServers", loaded) if isinstance(loaded, dict) else {}
+                if isinstance(servers, dict):
+                    normalized_mcp.extend(
+                        {"name": k, **(v if isinstance(v, dict) else {})}
+                        for k, v in servers.items()
+                    )
+            elif isinstance(item, dict):
+                normalized_mcp.append(item)
+        mcp = normalized_mcp
+    if not isinstance(mcp, list):
+        return []
+    substituted_mcp = []
+    for item in mcp:
+        if not isinstance(item, dict):
+            continue
+        normalized = _substitute_plugin_vars(item, plugin_env)
+        server_env = dict(normalized.get("env", {}) or {})
+        normalized["env"] = {**plugin_env, **server_env}
+        substituted_mcp.append(normalized)
+    return substituted_mcp
 def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
     """Read plugin.json from a plugin directory.  Returns None if absent.
 
@@ -513,81 +603,10 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
         data = json.loads(pj.read_text(encoding="utf-8"))
         plugin_name = str(data.get("name", plugin_dir.name) or plugin_dir.name)
         plugin_env = _plugin_substitution_env(plugin_dir, plugin_name)
-        mcp = data.get("mcp_servers")
-        if mcp is None:
-            mcp = data.get("mcpServers", [])
-        if isinstance(mcp, dict):
-            # Claude Code marketplace ``mcpServers`` block is a dict
-            # keyed by server name.  Flatten into a list while
-            # preserving the key as the canonical name.
-            mcp = [{"name": k, **(v if isinstance(v, dict) else {})}
-                   for k, v in mcp.items()]
-        elif isinstance(mcp, str):
-            mcp_path = plugin_dir / mcp
-            if mcp_path.exists():
-                mcp = json.loads(mcp_path.read_text(encoding="utf-8"))
-                if isinstance(mcp, dict):
-                    servers = mcp.get("mcpServers", mcp)
-                    if isinstance(servers, dict):
-                        mcp = [
-                            {"name": k, **(v if isinstance(v, dict) else {})}
-                            for k, v in servers.items()
-                        ]
-                    else:
-                        mcp = [mcp]
-            else:
-                mcp = []
-        elif isinstance(mcp, list):
-            normalized_mcp = []
-            for item in mcp:
-                if isinstance(item, str):
-                    mcp_path = plugin_dir / item
-                    if not mcp_path.exists():
-                        continue
-                    loaded = json.loads(mcp_path.read_text(encoding="utf-8"))
-                    servers = loaded.get("mcpServers", loaded) if isinstance(loaded, dict) else {}
-                    if isinstance(servers, dict):
-                        normalized_mcp.extend(
-                            {"name": k, **(v if isinstance(v, dict) else {})}
-                            for k, v in servers.items()
-                        )
-                elif isinstance(item, dict):
-                    normalized_mcp.append(item)
-            mcp = normalized_mcp
-        if isinstance(mcp, list):
-            substituted_mcp = []
-            for item in mcp:
-                if not isinstance(item, dict):
-                    continue
-                normalized = _substitute_plugin_vars(item, plugin_env)
-                server_env = dict(normalized.get("env", {}) or {})
-                normalized["env"] = {**plugin_env, **server_env}
-                substituted_mcp.append(normalized)
-            mcp = substituted_mcp
-        raw_hooks: dict[str, list[dict]] = {}
-        hook_matchers: dict[str, re.Pattern] = {}
-        hook_timeouts: dict[str, float] = {}
-        hooks_cfg = data.get("hooks")
-        if isinstance(hooks_cfg, str):
-            # Path string: "hooks": "./hooks/hooks.json" or "./my-hooks.json"
-            _merge_hooks_from_file(plugin_dir, hooks_cfg, raw_hooks)
-        elif isinstance(hooks_cfg, list):
-            # Array of paths: "hooks": ["./a.json", "./b.json"]
-            for hook_path in hooks_cfg:
-                if isinstance(hook_path, str):
-                    _merge_hooks_from_file(plugin_dir, hook_path, raw_hooks)
-        elif isinstance(hooks_cfg, dict):
-            _merge_hooks_block(plugin_name, hooks_cfg, raw_hooks)
-        for hook_name, entries in raw_hooks.items():
-            for entry in entries:
-                if isinstance(entry.get("timeout"), (int, float)):
-                    hook_timeouts[hook_name] = max(0.0, _safe_float(entry["timeout"], 60.0))
-                matcher = str(entry.get("matcher", "") or "").strip()
-                if matcher and matcher != "*":
-                    try:
-                        hook_matchers[hook_name] = re.compile(matcher)
-                    except re.error:
-                        pass
+        mcp = _normalize_mcp_servers(plugin_dir, data, plugin_env)
+        raw_hooks, hook_matchers, hook_timeouts = _read_plugin_hooks(
+            plugin_dir, plugin_name, data.get("hooks")
+        )
         # Skills path defaults to ``skills`` subdir when not declared and
         # the directory exists — matches Claude Code's convention-over-config.
         skills_field = _as_path_list(data.get("skills"))
@@ -609,7 +628,7 @@ def _read_plugin_json(plugin_dir: Path) -> Optional[PluginMeta]:
             skills=skills_field,
             commands=commands_field,
             agents=agents_field,
-            mcp_servers=mcp if isinstance(mcp, list) else [],
+            mcp_servers=mcp,
             hooks_config=raw_hooks,
             hook_matchers=hook_matchers,
             hook_timeouts=hook_timeouts,
