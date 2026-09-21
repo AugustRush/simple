@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +59,25 @@ UTC = timezone.utc
 NOW = datetime(2026, 5, 1, 12, 0, tzinfo=UTC)
 
 
+def _remove_tree(path: Path) -> None:
+    """Dispose of a scratch tree without caring what happened while we walked.
+
+    The obvious loop -- ``child.unlink() if child.is_file() else child.rmdir()``
+    -- reads "not a file" as "a directory", and re-tests it per child rather
+    than against the walk that found it.  A file that disappears in between
+    therefore falls into the ``rmdir`` branch and raises ``FileNotFoundError``
+    on a path that is gone.  The palace leaves a SQLite ``-wal`` beside its
+    database and removes it on a clean close, so the entry that vanishes is the
+    normal case, not an exotic one; it turned the teardown of whichever test
+    happened to lose the race into an ``ERROR`` that looked like a regression
+    and reproduced roughly once in three full runs.
+
+    ``rmtree`` also gets the nesting right, which the sort-based walk only
+    approximated.
+    """
+    shutil.rmtree(path, ignore_errors=True)
+
+
 @pytest.fixture
 def tmp_path():
     """A scratch directory rooted at ``/tmp``.
@@ -70,9 +90,31 @@ def tmp_path():
     path = Path("/tmp") / f"simple-workflows-test-{uuid4().hex}"
     path.mkdir(parents=True, exist_ok=True)
     yield path
-    for child in sorted(path.rglob("*"), reverse=True):
-        child.unlink() if child.is_file() else child.rmdir()
-    path.rmdir()
+    _remove_tree(path)
+
+
+def test_scratch_cleanup_survives_a_path_that_is_already_gone(tmp_path):
+    """Teardown must not raise over a path that is no longer there.
+
+    The palace's SQLite ``-wal`` disappears on a clean close, so an entry the
+    walk saw can be missing by the time the removal reaches it.  Reading "no
+    longer a file" as "a directory" then called ``rmdir`` on a vanished path,
+    which pytest reports as ``ERROR at teardown`` and reads as a regression.
+    """
+    target = tmp_path / "scratch"
+    (target / "context").mkdir(parents=True)
+    (target / "context" / "palace.db").write_text("db", encoding="utf-8")
+    wal = target / "context" / "palace.db-wal"
+    wal.write_text("wal", encoding="utf-8")
+
+    # Gone before the removal gets to it -- the shape of the original failure.
+    wal.unlink()
+    _remove_tree(target)
+    assert not target.exists()
+
+    # Cleaning up a tree that is already gone is not an error either.
+    _remove_tree(target)
+    assert not target.exists()
 
 
 def make_store(tmp_path: Path) -> SchedulerStore:
