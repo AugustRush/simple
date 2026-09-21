@@ -278,35 +278,32 @@ class ModelClientFactory:
         return result
 
 
-def _validate_config(cfg: dict) -> list[str]:
-    """Validate config.json structure and types. Returns list of warning messages.
+_KNOWN_SECTIONS = frozenset({
+    "active_provider", "providers", "model", "max_tokens",
+    "memory", "orchestration", "evolution", "scheduler", "audio",
+    "mcp_servers", "context", "plugins", "skills", "channels", "user_tools",
+    "system_prompt_file", "output_dir", "tavily_api_key",
+    "assistant_identity", "shell_blocked_commands",
+    "shell_allowed_commands",
+    "permissions",
+    "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
+    "max_steps",
+    "max_truncation_continuations", "file_access",
+    "web_proxy",
+})
 
-    Does NOT abort — warnings are printed but the agent still starts with
-    best-effort defaults so a typo doesn't brick the agent.
-    """
-    warnings: list[str] = []
-    known_sections = frozenset({
-        "active_provider", "providers", "model", "max_tokens",
-        "memory", "orchestration", "evolution", "scheduler", "audio",
-        "mcp_servers", "context", "plugins", "skills", "channels", "user_tools",
-        "system_prompt_file", "output_dir", "tavily_api_key",
-        "assistant_identity", "shell_blocked_commands",
-        "shell_allowed_commands",
-        "permissions",
-        "llm_max_retries", "llm_retry_base_delay", "max_tool_call_iterations",
-        "max_steps",
-        "max_truncation_continuations", "file_access",
-        "web_proxy",
-    })
 
-    # web_proxy: a proxy URL, or a word that turns proxying off.  Anything a
-    # bare string cannot express is a typo, and the fallback is the previous
-    # behaviour (read the environment) rather than a broken proxy URL.
+def _check_web_proxy(cfg: dict, warnings: list[str]) -> None:
+    # A proxy URL, or a word that turns proxying off.  Anything a bare string
+    # cannot express is a typo, and the fallback is the previous behaviour
+    # (read the environment) rather than a broken proxy URL.
     web_proxy = cfg.get("web_proxy")
     if web_proxy is not None:
         if not isinstance(web_proxy, str) or not web_proxy.strip():
             warnings.append("'web_proxy' must be a non-empty string (a proxy URL, or 'none' to disable)")
 
+
+def _check_shell_allowed_commands(cfg: dict, warnings: list[str]) -> None:
     allowed_commands = cfg.get("shell_allowed_commands")
     if allowed_commands is not None:
         if not isinstance(allowed_commands, list) or not all(
@@ -316,50 +313,58 @@ def _validate_config(cfg: dict) -> list[str]:
                 "'shell_allowed_commands' must be a list of non-empty command strings"
             )
 
+
+def _check_permissions(cfg: dict, warnings: list[str]) -> None:
     permissions_cfg = cfg.get("permissions")
-    if permissions_cfg is not None:
-        if not isinstance(permissions_cfg, dict):
-            warnings.append("'permissions' must be a dict")
-        else:
-            from agent.security.shell import PERMISSION_LEVELS
+    if permissions_cfg is None:
+        return
+    if not isinstance(permissions_cfg, dict):
+        warnings.append("'permissions' must be a dict")
+        return
+    from agent.security.shell import PERMISSION_LEVELS
 
-            shell_level = permissions_cfg.get("shell_level", "ask")
-            if shell_level not in PERMISSION_LEVELS:
-                warnings.append(
-                    f"'permissions.shell_level' must be one of "
-                    f"{', '.join(PERMISSION_LEVELS)}, got '{shell_level}'"
-                )
-            from agent.security.filesystem_sandbox import SANDBOX_MODES
+    shell_level = permissions_cfg.get("shell_level", "ask")
+    if shell_level not in PERMISSION_LEVELS:
+        warnings.append(
+            f"'permissions.shell_level' must be one of "
+            f"{', '.join(PERMISSION_LEVELS)}, got '{shell_level}'"
+        )
+    from agent.security.filesystem_sandbox import SANDBOX_MODES
 
-            sandbox_mode = permissions_cfg.get("shell_sandbox", "read_all")
-            if sandbox_mode not in SANDBOX_MODES:
-                warnings.append(
-                    f"'permissions.shell_sandbox' must be one of "
-                    f"{', '.join(SANDBOX_MODES)}, got '{sandbox_mode}'"
-                )
-            elif sandbox_mode == "none" and shell_level != "full":
-                warnings.append(
-                    "'permissions.shell_sandbox' 'none' requires "
-                    "'permissions.shell_level' 'full'; falling back to 'read_all'"
-                )
-            shell_devices = permissions_cfg.get("shell_devices", True)
-            if not isinstance(shell_devices, bool):
-                warnings.append("'permissions.shell_devices' must be a boolean")
+    sandbox_mode = permissions_cfg.get("shell_sandbox", "read_all")
+    if sandbox_mode not in SANDBOX_MODES:
+        warnings.append(
+            f"'permissions.shell_sandbox' must be one of "
+            f"{', '.join(SANDBOX_MODES)}, got '{sandbox_mode}'"
+        )
+    elif sandbox_mode == "none" and shell_level != "full":
+        warnings.append(
+            "'permissions.shell_sandbox' 'none' requires "
+            "'permissions.shell_level' 'full'; falling back to 'read_all'"
+        )
+    shell_devices = permissions_cfg.get("shell_devices", True)
+    if not isinstance(shell_devices, bool):
+        warnings.append("'permissions.shell_devices' must be a boolean")
 
-    # ── Top-level unknown keys ────────────────────────────────────────────
+
+def _check_unknown_keys(cfg: dict, warnings: list[str]) -> None:
     # Keys starting with '_' are documentation companions by the example
     # config's own convention (`_tavily_api_key_readme`), not settings.
     for key in cfg:
         if key.startswith("_"):
             continue
-        if key not in known_sections:
+        if key not in _KNOWN_SECTIONS:
             warnings.append(f"Unknown config key '{key}' — ignored")
 
-    # ── active_provider must reference a real provider ─────────────────────
+
+def _check_active_provider(cfg: dict, warnings: list[str]) -> None:
     active = cfg.get("active_provider", "")
     providers = cfg.get("providers", {})
     if not isinstance(providers, dict):
         warnings.append("'providers' must be a dict")
+        # Deliberately keeps going with an empty mapping: a bad `providers`
+        # reports both that it is not a dict *and* that `active_provider`
+        # cannot be found in it.
         providers = {}
     if active and active not in providers:
         warnings.append(
@@ -367,7 +372,61 @@ def _validate_config(cfg: dict) -> list[str]:
             f"Available: {', '.join(providers.keys()) or '(none)'}"
         )
 
-    # ── Validate each provider ─────────────────────────────────────────────
+
+def _check_thinking(pname: str, pcfg: dict, warnings: list[str]) -> None:
+    """Validate one provider's thinking-effort settings.
+
+    Thinking effort is a word the provider has to recognise, so a typo must be
+    reported rather than passed through: the level is sent to the API verbatim,
+    and the API answers a wrong word with a 400 that names its own vocabulary —
+    a confusing way to learn about a config typo.
+    """
+    thinking = pcfg.get("thinking")
+    if thinking is None:
+        return
+    allowed = ", ".join(shared.THINKING_EFFORTS)
+    if isinstance(thinking, str):
+        effort = thinking
+    elif isinstance(thinking, dict):
+        effort = thinking.get("effort")
+    else:
+        effort = None
+        warnings.append(
+            f"providers.{pname}.thinking: must be a dict like "
+            f'{{"effort": "off"}} or one of {allowed}'
+        )
+    if effort is not None and shared.normalize_thinking_effort(effort) is None:
+        warnings.append(
+            f"providers.{pname}.thinking.effort: must be one of "
+            f"{allowed}, got '{effort}'"
+        )
+    # Per-model overrides get the same check, one warning per bad word,
+    # because each names a model the person can act on.
+    if not isinstance(thinking, dict):
+        return
+    per_model = thinking.get("models")
+    if per_model is None:
+        return
+    if not isinstance(per_model, dict):
+        warnings.append(
+            f"providers.{pname}.thinking.models: must be a "
+            f'mapping of model id to effort, like '
+            f'{{"some-model": "high"}}'
+        )
+        return
+    for model, model_effort in per_model.items():
+        if shared.normalize_thinking_effort(model_effort) is None:
+            warnings.append(
+                f"providers.{pname}.thinking.models."
+                f"{model}: must be one of {allowed}, "
+                f"got '{model_effort}'"
+            )
+
+
+def _check_providers(cfg: dict, warnings: list[str]) -> None:
+    providers = cfg.get("providers", {})
+    if not isinstance(providers, dict):
+        providers = {}
     for pname, pcfg in providers.items():
         # `_readme` companions sit beside the real providers in the example
         # config, the same convention the top-level unknown-key check honours.
@@ -385,52 +444,10 @@ def _validate_config(cfg: dict) -> list[str]:
             warnings.append(f"providers.{pname}.api_key: must be a string")
         if not isinstance(pcfg.get("default_model"), str) or not pcfg.get("default_model"):
             warnings.append(f"providers.{pname}.default_model: must be a non-empty string")
-        # Thinking effort is a word the provider has to recognise, so a typo
-        # must be reported rather than passed through: the level is sent to the
-        # API verbatim, and the API answers a wrong word with a 400 that names
-        # its own vocabulary — a confusing way to learn about a config typo.
-        thinking = pcfg.get("thinking")
-        if thinking is not None:
-            allowed = ", ".join(shared.THINKING_EFFORTS)
-            if isinstance(thinking, str):
-                effort = thinking
-            elif isinstance(thinking, dict):
-                effort = thinking.get("effort")
-            else:
-                effort = None
-                warnings.append(
-                    f"providers.{pname}.thinking: must be a dict like "
-                    f'{{"effort": "off"}} or one of {allowed}'
-                )
-            if effort is not None and shared.normalize_thinking_effort(effort) is None:
-                warnings.append(
-                    f"providers.{pname}.thinking.effort: must be one of "
-                    f"{allowed}, got '{effort}'"
-                )
-            # Per-model overrides get the same check, one warning per bad
-            # word, because each names a model the person can act on.
-            if isinstance(thinking, dict):
-                per_model = thinking.get("models")
-                if per_model is not None:
-                    if not isinstance(per_model, dict):
-                        warnings.append(
-                            f"providers.{pname}.thinking.models: must be a "
-                            f'mapping of model id to effort, like '
-                            f'{{"some-model": "high"}}'
-                        )
-                    else:
-                        for model, model_effort in per_model.items():
-                            if (
-                                shared.normalize_thinking_effort(model_effort)
-                                is None
-                            ):
-                                warnings.append(
-                                    f"providers.{pname}.thinking.models."
-                                    f"{model}: must be one of {allowed}, "
-                                    f"got '{model_effort}'"
-                                )
+        _check_thinking(pname, pcfg, warnings)
 
-    # ── Numeric range checks ───────────────────────────────────────────────
+
+def _check_numeric_ranges(cfg: dict, warnings: list[str]) -> None:
     def _check_int(key: str, min_val: int, max_val: int) -> None:
         val = cfg.get(key)
         if val is not None:
@@ -470,25 +487,29 @@ def _validate_config(cfg: dict) -> list[str]:
     _check_int("llm_max_retries", 0, 20)
     _check_float("llm_retry_base_delay", 0.1)
 
-    scheduler = cfg.get("scheduler", {})
-    if isinstance(scheduler, dict):
-        for skey, smin in (
-            ("poll_seconds", 1),
-            ("lease_seconds", 10),
-            # Zero is allowed and means "the first hop only": a signal emitted
-            # by a task is refused, but a signal a person or a clock raises
-            # still runs its subscribers.  Anything below zero is a mistake.
-            ("signal_max_depth", 0),
-        ):
-            sv = scheduler.get(skey)
-            if sv is not None:
-                try:
-                    if int(sv) < smin:
-                        warnings.append(f"scheduler.{skey}: must be >= {smin}")
-                except (TypeError, ValueError):
-                    warnings.append(f"scheduler.{skey}: must be an integer")
 
-    # ── channels section ───────────────────────────────────────────────────
+def _check_scheduler(cfg: dict, warnings: list[str]) -> None:
+    scheduler = cfg.get("scheduler", {})
+    if not isinstance(scheduler, dict):
+        return
+    for skey, smin in (
+        ("poll_seconds", 1),
+        ("lease_seconds", 10),
+        # Zero is allowed and means "the first hop only": a signal emitted
+        # by a task is refused, but a signal a person or a clock raises
+        # still runs its subscribers.  Anything below zero is a mistake.
+        ("signal_max_depth", 0),
+    ):
+        sv = scheduler.get(skey)
+        if sv is not None:
+            try:
+                if int(sv) < smin:
+                    warnings.append(f"scheduler.{skey}: must be >= {smin}")
+            except (TypeError, ValueError):
+                warnings.append(f"scheduler.{skey}: must be an integer")
+
+
+def _check_channels(cfg: dict, warnings: list[str]) -> None:
     channels = cfg.get("channels", {})
     if isinstance(channels, dict):
         feishu = channels.get("feishu", {})
@@ -498,6 +519,31 @@ def _validate_config(cfg: dict) -> list[str]:
                     "channels.feishu is enabled but app_id or app_secret is missing"
                 )
 
+
+# The order here is the order warnings are reported in.  The sections are
+# otherwise independent, so adding one is a one-line change.
+_SECTION_CHECKS = (
+    _check_web_proxy,
+    _check_shell_allowed_commands,
+    _check_permissions,
+    _check_unknown_keys,
+    _check_active_provider,
+    _check_providers,
+    _check_numeric_ranges,
+    _check_scheduler,
+    _check_channels,
+)
+
+
+def _validate_config(cfg: dict) -> list[str]:
+    """Validate config.json structure and types. Returns list of warning messages.
+
+    Does NOT abort — warnings are printed but the agent still starts with
+    best-effort defaults so a typo doesn't brick the agent.
+    """
+    warnings: list[str] = []
+    for check in _SECTION_CHECKS:
+        check(cfg, warnings)
     return warnings
 
 
