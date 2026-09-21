@@ -202,10 +202,6 @@ Default to direct — don't over-orchestrate.
 Save important facts, decisions, and learnings to memory so they persist across sessions.
 """
 
-TOOL_DEFAULT_MAX_READ_BYTES = 64 * 1024
-TOOL_DEFAULT_MAX_WRITE_BYTES = 256 * 1024
-TOOL_DEFAULT_MAX_LIST_RESULTS = 100
-
 from .memory.system import (
     AgentRuntimeEvent,
     BackgroundMemoryWorker,
