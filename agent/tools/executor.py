@@ -268,20 +268,6 @@ class RegularToolExecutor:
                     return call_task.result()
             raise asyncio.TimeoutError
 
-    async def _emit_heartbeats(
-        self,
-        *,
-        operation_id: str,
-        tool_name: str,
-        started_at: float,
-        done: asyncio.Event,
-    ) -> None:
-        """Deprecated: heartbeat ticks are now emitted inline by
-        ``_await_tool_result``'s wait loop — no extra task per call.
-        Kept as a no-op so any external monkey-patching test still works.
-        """
-        await done.wait()
-
     @staticmethod
     def _intent_text_is_specific(intent: str) -> bool:
         text = str(intent or "").strip()
@@ -489,7 +475,6 @@ class RegularToolExecutor:
             "last_progress_at": started_at,
             "explicit_progress_count": 0,
         }
-        done = asyncio.Event()
         progress_token = _active_tool_progress.set(
             self._progress_reporter(
                 operation_id=operation_id,
@@ -527,7 +512,6 @@ class RegularToolExecutor:
             )
         finally:
             _active_tool_progress.reset(progress_token)
-            done.set()  # signals the deprecated _emit_heartbeats shim
 
         duration_ms = (time.monotonic() - started_at) * 1000
         try:
