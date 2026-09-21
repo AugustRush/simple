@@ -16,11 +16,38 @@ _MANAGEMENT_TOOLS = {
     "install_tool_dependency", "create_skill", "update_skill",
     "delete_skill", "write_skill_file",
 }
-_SCHEDULE_TOOLS = {"schedule_create", "schedule_list", "schedule_delete"}
-_WORKFLOW_TOOLS = {"workflow_create", "workflow_list", "workflow_delete"}
+_SCHEDULE_TOOLS = {
+    "schedule_create",
+    "schedule_list",
+    "schedule_delete",
+    # The maintenance half: changing, pausing, starting and stopping a task
+    # that already exists.  Held back with the creators rather than shipped on
+    # every turn, because their schemas are the largest in the group --
+    # `schedule_update` names twenty fields, each with a sentence explaining it
+    # -- and that cost is paid on every turn of every conversation, while what
+    # they can change is a task the sentence has to have named anyway: an edit
+    # is addressed by an id that came from `schedule_list` or `schedule_runs`.
+    "schedule_update",
+    "schedule_set_enabled",
+    "schedule_run",
+    "schedule_cancel",
+}
+_WORKFLOW_TOOLS = {
+    "workflow_create",
+    "workflow_list",
+    "workflow_delete",
+    "workflow_update",
+}
 #: The half of the two groups that only *looks*.  Cheaper to get wrong in the
 #: permissive direction: a listing nobody needed costs tokens, while a creator
 #: nobody asked for costs a task that outlives the conversation.
+#:
+#: `schedule_runs` is deliberately not in here, and so is not held back at all.
+#: It answers "did the thing I asked for actually run", which is a question
+#: about *this* feature but phrased in the user's own words -- asking whether
+#: yesterday's report went through names neither a cadence nor the word 定时 --
+#: and an observation tool that is not there when the question arrives is one
+#: the caller cannot use.
 _SCHEDULED_WORK_READ_TOOLS = {"schedule_list", "workflow_list"}
 #: The half that *builds or destroys*.  These are the schemas whose absence is
 #: worth the most tokens, so the request terms below decide whether they ride

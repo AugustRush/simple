@@ -40,8 +40,9 @@ ALL_GROUPS = _tools(
 #: sentence opened.
 SCHEDULED_WORK_TOOLS = _tools(
     "read_file",
-    "schedule_list", "schedule_create", "schedule_delete",
-    "workflow_list", "workflow_create", "workflow_delete",
+    "schedule_list", "schedule_create", "schedule_delete", "schedule_runs",
+    "schedule_update", "schedule_set_enabled", "schedule_run", "schedule_cancel",
+    "workflow_list", "workflow_create", "workflow_delete", "workflow_update",
     "emit_signal",
 )
 
@@ -213,6 +214,43 @@ def test_emitting_a_signal_needs_a_request_but_a_run_keeps_it():
     assert "emit_signal" not in _scheduled("看看信号有哪些")
     assert "emit_signal" in _scheduled("把 xhs.package.ready 这个信号发出去")
     assert "emit_signal" in _scheduled("做点事", scheduled_run=True)
+
+
+_MUTATORS = {
+    "schedule_update",
+    "schedule_set_enabled",
+    "schedule_run",
+    "schedule_cancel",
+    "workflow_update",
+}
+
+
+@pytest.mark.parametrize("query", _QUESTIONS_ABOUT_SCHEDULED_WORK)
+def test_a_question_about_scheduled_work_ships_no_mutator(query: str):
+    """Changing a task is an action too, and held back for the same reason.
+
+    It cannot create anything, but it can change or stop something, and the
+    schemas are the largest in the group -- twenty fields for
+    ``schedule_update`` alone -- so they cost on every turn of every
+    conversation rather than only on the turns that could use them.
+    """
+    assert not (_MUTATORS & _scheduled(query))
+
+
+@pytest.mark.parametrize("query", _REQUESTS_FOR_SCHEDULED_WORK)
+def test_a_request_for_scheduled_work_ships_the_mutators(query: str):
+    assert _MUTATORS <= _scheduled(query)
+
+
+def test_the_run_history_is_never_withheld():
+    """It answers "did it actually run", in words that name no cadence.
+
+    Asking whether yesterday's report went through is a question about this
+    feature phrased entirely in the user's own terms, and an observation tool
+    that is not there when the question arrives is one nobody can use.
+    """
+    for query in ("昨天的日报跑成功了吗", "那个任务到底跑了没有", "换个大模型"):
+        assert "schedule_runs" in _scheduled(query)
 
 
 def test_ascii_request_verbs_respect_word_boundaries():

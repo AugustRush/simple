@@ -136,6 +136,48 @@ def _run_report_payload(
     return payload
 
 
+#: The columns that decide whether two rows describe the same task.
+#:
+#: One list, because this question is asked in two places and two lists that
+#: have to agree eventually do not.  ``find_matching_task`` asks it when a
+#: create might be a repeat of something already there; the scheduler asks it
+#: on every tick, through ``disable_duplicate_enabled_tasks``.  When they
+#: disagreed -- by ``acceptance_json`` and ``produces_json`` -- the tick
+#: disabled a task that creation had just treated as distinct: two tasks
+#: disagreeing about what "done" means, or about which files they leave
+#: behind, were folded into one and the later one switched off, which is the
+#: opposite of what the create path had promised the caller.
+#:
+#: ``enabled`` is deliberately absent: both readers filter on it first (the
+#: create path because it compares against the switch it is creating with, the
+#: sweep because it only ever looks at switched-on rows), so including it here
+#: would compare the same thing twice in one place and not at all in the other.
+#:
+#: ``overlap_policy`` and ``missed_run_policy`` are in here for the reason
+#: spelled out above their defaults in ``models``: identity only.
+_TASK_IDENTITY_COLUMNS: tuple[str, ...] = (
+    "name",
+    "kind",
+    "trigger_json",
+    "payload_json",
+    "delivery_mode",
+    "delivery_target_json",
+    "model_override",
+    "overlap_policy",
+    "missed_run_policy",
+    "workspace_root",
+    "context_policy",
+    "timeout_seconds",
+    "retry_policy_json",
+    "selected_skills_json",
+    "permission_profile",
+    "acceptance_json",
+    "produces_json",
+    "workflow_id",
+    "step_key",
+)
+
+
 _F = TypeVar("_F", bound=Callable)
 
 
@@ -798,71 +840,70 @@ class SchedulerStore:
         )
         return task_id
 
+    @staticmethod
+    def _identity_values(task: NewScheduledTask) -> tuple[Any, ...]:
+        """*task*'s identity columns, in ``_TASK_IDENTITY_COLUMNS`` order.
+
+        Positional against the column list on purpose: a named mapping would
+        let a new column be added to one half and silently default to nothing
+        in the other, which is how the two lists this replaces drifted apart.
+        """
+        return (
+            task.name,
+            task.kind,
+            task.trigger.to_json(),
+            json.dumps(task.payload, ensure_ascii=False),
+            task.delivery_mode,
+            task.delivery_target.to_json(),
+            task.model_override,
+            task.overlap_policy,
+            task.missed_run_policy,
+            task.workspace_root,
+            task.context_policy,
+            int(task.timeout_seconds),
+            json.dumps(task.retry_policy, ensure_ascii=False),
+            json.dumps(task.selected_skills, ensure_ascii=False),
+            task.permission_profile,
+            # Part of the identity, not a decoration on it.  Two tasks that
+            # disagree about what "done" means are two different tasks, and
+            # treating them as one would answer "make this run only when the
+            # tests pass" with the existing task that runs regardless --
+            # reporting success while the criterion the caller just stated is
+            # silently discarded.
+            task.acceptance.to_json(),
+            # Part of the identity for the same reason the criterion above is:
+            # two tasks that disagree about what they leave behind are two
+            # different tasks, and folding them together would answer "also
+            # write this report" with the task that writes the other one --
+            # while reporting success.
+            json.dumps(declared_products(task), ensure_ascii=False),
+            task.workflow_id,
+            task.step_key,
+        )
+
     @_synchronized
     def find_matching_task(self, task: NewScheduledTask) -> Optional[ScheduledTask]:
+        clauses = []
+        params: list[Any] = []
+        for column, value in zip(
+            _TASK_IDENTITY_COLUMNS, self._identity_values(task)
+        ):
+            if column == "model_override":
+                # `= NULL` matches nothing, and "no model override" is a value
+                # this identity has to compare like any other.
+                clauses.append(f"(({column} IS NULL AND ? IS NULL) OR {column} = ?)")
+                params.extend([value, value])
+            else:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        clauses.append("enabled = ?")
+        params.append(1 if task.enabled else 0)
+        # The column names are this module's own constants, never caller input.
         row = self._conn.execute(
-            """
-            SELECT * FROM scheduled_tasks
-            WHERE name = ?
-              AND kind = ?
-              AND enabled = ?
-              AND trigger_json = ?
-              AND payload_json = ?
-              AND delivery_mode = ?
-              AND delivery_target_json = ?
-              AND (
-                    (model_override IS NULL AND ? IS NULL)
-                    OR model_override = ?
-                  )
-              AND overlap_policy = ?
-              AND missed_run_policy = ?
-              AND workspace_root = ?
-              AND context_policy = ?
-              AND timeout_seconds = ?
-              AND retry_policy_json = ?
-              AND selected_skills_json = ?
-              AND permission_profile = ?
-              AND acceptance_json = ?
-              AND produces_json = ?
-              AND workflow_id = ?
-              AND step_key = ?
-            ORDER BY created_at ASC
-            LIMIT 1
-            """,
-            (
-                task.name,
-                task.kind,
-                1 if task.enabled else 0,
-                task.trigger.to_json(),
-                json.dumps(task.payload, ensure_ascii=False),
-                task.delivery_mode,
-                task.delivery_target.to_json(),
-                task.model_override,
-                task.model_override,
-                task.overlap_policy,
-                task.missed_run_policy,
-                task.workspace_root,
-                task.context_policy,
-                int(task.timeout_seconds),
-                json.dumps(task.retry_policy, ensure_ascii=False),
-                json.dumps(task.selected_skills, ensure_ascii=False),
-                task.permission_profile,
-                # Part of the identity, not a decoration on it.  Two tasks that
-                # disagree about what "done" means are two different tasks, and
-                # treating them as one would answer "make this run only when
-                # the tests pass" with the existing task that runs regardless
-                # -- reporting success while the criterion the caller just
-                # stated is silently discarded.
-                task.acceptance.to_json(),
-                # Part of the identity for the same reason the criterion above
-                # is: two tasks that disagree about what they leave behind are
-                # two different tasks, and folding them together would answer
-                # "also write this report" with the task that writes the other
-                # one -- while reporting success.
-                json.dumps(declared_products(task), ensure_ascii=False),
-                task.workflow_id,
-                task.step_key,
-            ),
+            "SELECT * FROM scheduled_tasks WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at ASC LIMIT 1",
+            tuple(params),
         ).fetchone()
         return self._task_from_row(row) if row else None
 
@@ -880,25 +921,11 @@ class SchedulerStore:
         seen: set[tuple[object, ...]] = set()
         duplicate_ids: list[str] = []
         for row in rows:
-            signature = (
-                row["name"],
-                row["kind"],
-                row["trigger_json"],
-                row["payload_json"],
-                row["delivery_mode"],
-                row["delivery_target_json"],
-                row["model_override"],
-                row["overlap_policy"],
-                row["missed_run_policy"],
-                row["workspace_root"],
-                row["context_policy"],
-                row["timeout_seconds"],
-                row["retry_policy_json"],
-                row["selected_skills_json"],
-                row["permission_profile"],
-                row["workflow_id"],
-                row["step_key"],
-            )
+            # The same columns the create path compares, from the same list --
+            # this sweep and the create path have to reach the same verdict
+            # about the same pair of rows, or one of them disables something
+            # the other just promised to keep.
+            signature = tuple(row[column] for column in _TASK_IDENTITY_COLUMNS)
             if signature in seen:
                 duplicate_ids.append(row["id"])
             else:

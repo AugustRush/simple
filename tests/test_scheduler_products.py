@@ -471,6 +471,80 @@ def test_the_product_declaration_is_part_of_a_task_s_identity(tmp_path):
         store.close()
 
 
+def test_the_sweep_and_the_create_path_agree_about_what_a_duplicate_is(tmp_path):
+    """The same pair of rows has to get the same verdict from both.
+
+    ``find_matching_task`` decides whether a create is a repeat of something
+    already there; ``disable_duplicate_enabled_tasks`` runs on every tick and
+    switches the later of two identical tasks off.  They compared two
+    hand-written column lists, and the sweep's was missing the two halves of
+    the contract -- so two tasks disagreeing about what "done" means, or about
+    which files they leave behind, were distinct to creation and duplicates to
+    the sweep.  The later one was switched off, which is the opposite of what
+    the create path had just promised.
+    """
+    store = make_store(tmp_path)
+    try:
+        first = make_task(
+            store, name="same", workspace_root=str(tmp_path), produces=["out/a.md"]
+        )
+        second = make_task(
+            store, name="same", workspace_root=str(tmp_path), produces=["out/b.md"]
+        )
+
+        # Two different promises are two tasks, so nothing is switched off.
+        assert store.disable_duplicate_enabled_tasks() == 0
+        assert {task.id for task in store.list_tasks() if task.enabled} == {
+            first.id,
+            second.id,
+        }
+
+        # A third making the *same* promise as the first is a duplicate, and
+        # one of that pair is switched off.  Which one is the store's call --
+        # ordering against an equal creation time is arbitrary by design -- so
+        # the assertion is about the pair, not about a particular row.
+        third = make_task(
+            store, name="same", workspace_root=str(tmp_path), produces=["out/a.md"]
+        )
+        assert store.disable_duplicate_enabled_tasks() == 1
+        enabled = {task.id: task for task in store.list_tasks() if task.enabled}
+        assert second.id in enabled
+        assert len({first.id, third.id} & set(enabled)) == 1
+        # And what survived is one task per promise, which is the property the
+        # create path relies on.
+        assert sorted(
+            tuple(task.produces) for task in enabled.values()
+        ) == [("out/a.md",), ("out/b.md",)]
+    finally:
+        store.close()
+
+
+def test_the_two_readers_share_one_column_list():
+    """Pinned as a property, because a second list is how this broke.
+
+    A column added to one list and not the other is invisible in both: each
+    function is internally consistent, and they disagree only about the rows
+    they both look at.
+    """
+    from agent.scheduler.store import SchedulerStore, _TASK_IDENTITY_COLUMNS
+
+    assert "acceptance_json" in _TASK_IDENTITY_COLUMNS
+    assert "produces_json" in _TASK_IDENTITY_COLUMNS
+    assert "enabled" not in _TASK_IDENTITY_COLUMNS
+
+    # The values line up with the columns, so the zip in each caller pairs the
+    # right value with the right name.
+    spec = NewScheduledTask(
+        name="same",
+        kind="agent_prompt",
+        trigger=clock(),
+        payload={"prompt": "do the thing"},
+        delivery_mode="standalone",
+        delivery_target=DeliveryTarget.standalone(),
+    )
+    assert len(SchedulerStore._identity_values(spec)) == len(_TASK_IDENTITY_COLUMNS)
+
+
 def test_the_product_report_survives_reopening_the_database(tmp_path):
     """It is stored, not derived at read time."""
     store = make_store(tmp_path)

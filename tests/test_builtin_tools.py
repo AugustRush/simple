@@ -10,6 +10,25 @@ from types import SimpleNamespace
 import pytest
 
 
+def _soon(hours: int = 2) -> str:
+    """A moment in the future, in the zone these tests schedule in.
+
+    A clock reading rather than a date, on purpose.  ``2026-04-20T10:00:00``
+    was a few hours away when it was written and quietly became five months
+    *behind* -- at which point every create below was refused for being in the
+    past, so thirty tests reported a failure that had nothing to do with what
+    they are about.  Creating a one-off that has already passed is a task that
+    can never run, which is why the tools refuse it; a test that wants a valid
+    task has to ask for a valid moment.
+    """
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    return (
+        datetime.now(timezone.utc) + timedelta(hours=hours)
+    ).astimezone(ZoneInfo("Asia/Shanghai")).isoformat()
+
+
 @pytest.fixture(autouse=True)
 def _isolate_scheduler_state(monkeypatch, tmp_path):
     import agent.shared as shared_module
@@ -1645,7 +1664,7 @@ def test_schedule_create_uses_active_delivery_target_for_channel_messages(tmp_pa
                     "name": "reminder",
                     "trigger_type": "once",
                     "prompt": "测试一下",
-                    "at": "2026-04-20T10:00:00+08:00",
+                    "at": _soon(),
                     "timezone_name": "Asia/Shanghai",
                 },
             )
@@ -1680,7 +1699,7 @@ def test_schedule_create_defaults_to_standalone_without_active_target(tmp_path):
                 "name": "reminder",
                 "trigger_type": "once",
                 "prompt": "测试一下",
-                "at": "2026-04-20T10:00:00+08:00",
+                "at": _soon(),
                 "timezone_name": "Asia/Shanghai",
             },
         )
@@ -1704,7 +1723,7 @@ def test_schedule_create_uses_isolated_scheduler_db_in_tests(tmp_path):
                 "name": "isolated-reminder",
                 "trigger_type": "once",
                 "prompt": "测试隔离",
-                "at": "2026-04-20T10:00:00+08:00",
+                "at": _soon(),
                 "timezone_name": "Asia/Shanghai",
             },
         )
@@ -1828,7 +1847,7 @@ def test_schedule_create_supports_agent_task_action_type(tmp_path):
                 "trigger_type": "once",
                 "action_type": "agent_task",
                 "instruction": "总结今天的群消息",
-                "at": "2026-04-20T10:00:00+08:00",
+                "at": _soon(),
                 "timezone_name": "Asia/Shanghai",
             },
         )
@@ -1969,7 +1988,7 @@ def _create_scheduled_task(registry, **overrides):
         "name": "automation",
         "trigger_type": "once",
         "prompt": "跑一下测试",
-        "at": "2026-04-20T10:00:00+08:00",
+        "at": _soon(),
         "timezone_name": "Asia/Shanghai",
     }
     payload.update(overrides)
@@ -2224,7 +2243,7 @@ def test_a_question_cannot_leave_a_task_behind(tmp_path):
         {
             "name": "订单流程",
             "trigger_type": "once",
-            "at": "2026-04-20T10:00:00+08:00",
+            "at": _soon(),
             "message_text": "去核对一遍订单流程",
             "intent": "用户想了解订单流程，所以建个任务",
         },
@@ -2461,7 +2480,7 @@ def test_schedule_list_says_which_tasks_are_workflow_steps(tmp_path):
     created = _create_workflow(
         registry,
         [{"key": "collect", "name": "收集", "trigger_type": "once",
-          "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+          "at": _soon(), "timezone_name": "Asia/Shanghai",
           "instruction": "收集数据"}],
     )
     workflow_id = created["workflow"]["id"]
@@ -2572,9 +2591,12 @@ def test_schedule_runs_hands_back_the_acceptance_it_was_judged_against(tmp_path)
         )
     )
 
-    acceptance = payload["task"]["acceptance"]
-    assert acceptance["criteria"] == ["报告里要有结论一章"]
-    assert acceptance["verify_command"] == "grep -q 结论 report.md"
+    # Flat, under the names ``schedule_update`` takes, and that is the point:
+    # the reply has to be sendable straight back, and the writer reads
+    # ``criteria`` and ``verify_command`` rather than a nested object.  A
+    # definition that can be read but not written back is a description.
+    assert payload["task"]["criteria"] == ["报告里要有结论一章"]
+    assert payload["task"]["verify_command"] == "grep -q 结论 report.md"
 
 
 def test_schedule_runs_says_whether_the_output_file_is_still_there(tmp_path):
@@ -2697,7 +2719,7 @@ def test_workflow_list_names_the_task_behind_each_step_and_how_it_ended(tmp_path
         registry,
         [
             {"key": "collect", "name": "收集", "trigger_type": "once",
-             "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+             "at": _soon(), "timezone_name": "Asia/Shanghai",
              "instruction": "收集"},
             {"key": "publish", "name": "发布", "depends_on": ["collect"],
              "instruction": "发布"},
@@ -2713,7 +2735,7 @@ def test_workflow_list_names_the_task_behind_each_step_and_how_it_ended(tmp_path
     idle = _create_workflow(
         registry,
         [{"key": "alone", "name": "没人跑过", "trigger_type": "once",
-          "at": "2026-04-21T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+          "at": _soon(hours=3), "timezone_name": "Asia/Shanghai",
           "instruction": "独自跑"}],
         name="idle",
     )["workflow"]
@@ -2760,7 +2782,7 @@ def test_a_workflow_step_written_with_an_instruction_is_an_agent_task(tmp_path):
     created = _create_workflow(
         registry,
         [{"key": "collect", "name": "收集", "trigger_type": "once",
-          "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+          "at": _soon(), "timezone_name": "Asia/Shanghai",
           "instruction": "收集数据"}],
     )
 
@@ -2775,7 +2797,7 @@ def test_a_step_that_gave_a_literal_message_is_still_a_message(tmp_path):
     created = _create_workflow(
         registry,
         [{"key": "ping", "name": "提醒", "trigger_type": "once",
-          "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+          "at": _soon(), "timezone_name": "Asia/Shanghai",
           "message_text": "该开会了"}],
     )
 
@@ -2937,7 +2959,7 @@ def test_a_step_declares_its_products_and_the_chain_says_so(tmp_path):
         registry,
         [
             {"key": "collect", "name": "收集", "trigger_type": "once",
-             "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+             "at": _soon(), "timezone_name": "Asia/Shanghai",
              "instruction": "收集数据", "produces": ["raw.json"]},
             {"key": "analyze", "name": "分析", "depends_on": ["collect"],
              "instruction": "分析", "criteria": ["the summary exists"],
@@ -2961,7 +2983,7 @@ def test_workflow_list_carries_each_step_s_products(tmp_path):
         registry,
         [
             {"key": "collect", "name": "收集", "trigger_type": "once",
-             "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+             "at": _soon(), "timezone_name": "Asia/Shanghai",
              "instruction": "收集数据", "produces": ["raw.json"]},
         ],
     )
@@ -2979,7 +3001,7 @@ def test_workflow_create_refuses_a_step_product_outside_the_workspace(tmp_path):
         registry,
         [
             {"key": "collect", "name": "收集", "trigger_type": "once",
-             "at": "2026-04-20T10:00:00+08:00", "timezone_name": "Asia/Shanghai",
+             "at": _soon(), "timezone_name": "Asia/Shanghai",
              "instruction": "收集数据", "produces": ["/etc/passwd"]},
         ],
     )

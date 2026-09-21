@@ -2509,7 +2509,12 @@ def test_an_automatic_retry_keeps_the_upstreams_the_run_was_told_about(tmp_path)
 
 
 def _chain_steps() -> list[dict]:
-    """A three-step chain, in the shape the ``workflow_create`` tool takes."""
+    """A three-step chain, in the shape the ``workflow_create`` tool takes.
+
+    The entry step's moment is read off the wall clock rather than written
+    down: a one-off that is being *created* has to be in the future, and a
+    frozen literal silently stops being one the day it passes.
+    """
     return [
         {
             "key": "collect",
@@ -2517,7 +2522,7 @@ def _chain_steps() -> list[dict]:
             "action_type": "agent_task",
             "instruction": "collect the numbers",
             "trigger_type": "once",
-            "at": "2026-05-01T11:59:00+00:00",
+            "at": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
         },
         {
             "key": "analyze",
@@ -2633,7 +2638,12 @@ def test_workflow_create_refuses_a_chain_with_no_entry_at_all(tmp_path):
             tools._workflow_create("orphan", steps)
 
         assert "collect" in str(error.value)
-        assert "必须自带触发方式" in str(error.value)
+        # Worded as the interface words it.  Both surfaces put this refusal in
+        # front of the same person, and two spellings of one refusal read as two
+        # different rules -- the store's own wording ("必须自带触发方式") is the
+        # backstop below them, not the sentence anyone is meant to see.
+        assert "没有上游" in str(error.value)
+        assert "必须指定触发方式" in str(error.value)
         assert store.list_workflows() == []
         assert store.list_tasks() == []
     finally:

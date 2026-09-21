@@ -424,6 +424,18 @@ erasing them, so their run history stays readable. The leftovers are then
 ordinary tasks: `schedule_delete` removes any of them, and its history, when
 nobody needs to read it any more.
 
+Neither delete is how a *wrong* definition is fixed. `schedule_delete` takes the
+task's runs with it — they are its history, and rows left behind would name a
+task that no longer exists. A chain cannot be repaired step by step either:
+deleting a live step is refused, so the only route left is rebuilding the whole
+workflow, which is how the real scheduler ended up with **nine** step tasks
+belonging to workflows that are gone (eight from one retired chain, one from a
+probe) — disabled, pointing at a graph id nothing answers to, and with no
+history left to explain them. `workflow_update` and `schedule_update` change a
+definition in place: same task id, same run history, every edge intact, because
+a step's id is what the steps below it subscribed to. The steps and tasks those
+two drop are disabled, not deleted.
+
 The **自动化** page in the Web UI has a 工作流 tab showing the same graph, and
 its navigation entry carries a badge for runs that failed while the page was
 closed — the whole problem being a failure nobody was looking at. Behind it is
@@ -1231,8 +1243,8 @@ output sink.
 | Media | `transcribe_audio` |
 | Memory | `memory_write`, `memory_read`, `memory_search`, `memory_index`, `memory_clear`, `set_identity` |
 | Context | `context_retrieve`, `clear_context` |
-| Scheduling | `schedule_create`, `schedule_list`, `schedule_runs`, `schedule_delete` |
-| Workflows | `workflow_create`, `workflow_list`, `workflow_delete` |
+| Scheduling | `schedule_create`, `schedule_list`, `schedule_runs`, `schedule_update`, `schedule_set_enabled`, `schedule_run`, `schedule_cancel`, `schedule_delete` |
+| Workflows | `workflow_create`, `workflow_list`, `workflow_update`, `workflow_delete` |
 | Signals | `emit_signal`, `list_signals` |
 | Runs | `read_step_output`, `report_outcome` |
 | Web | `web_search`, `web_fetch`, `tavily_search` |
@@ -1249,6 +1261,15 @@ this turn (at least six characters, verbatim) and a call whose `intent` cannot
 be found in the request is refused. `read_step_output` and `report_outcome`
 only resolve inside a scheduled run.
 
+The five that maintain existing work — `schedule_update`, `schedule_set_enabled`,
+`schedule_run`, `schedule_cancel`, `workflow_update` — carry `requires_intent`
+instead: the caller has to say what it is doing and why, but not in the user's
+words. The sentence that should reach for them is a complaint ("那个日报老是
+失败"), not a request naming a field, so demanding a quote would make
+delete-and-recreate the only repair — which is what these tools exist to end.
+Every one of them keeps the task id, and with it the run history and every
+downstream step subscribed to its signal.
+
 `schedule_create` and `workflow_create` are also how a task declares what it
 has to produce (`produces`), and `schedule_list`, `workflow_list` and
 `schedule_runs` are how that declaration is read back: the creation half and
@@ -1256,6 +1277,12 @@ the observation half are one pair, because a task is created in a conversation
 and then runs in none. A task the agent built that has been failing every night
 since the day it was made looks exactly like one that has been succeeding, from
 the task row alone — `schedule_runs` is the only place the difference exists.
+It returns the whole definition alongside the runs, in exactly the vocabulary
+`schedule_update` accepts, so what is read can be sent back with one field
+changed and nothing else. The keys it reports that no edit may write —
+`id`, `workflow_id`, `step_key`, `enabled`, `delivery_mode`, `delivery_target`,
+`request_quote` — are the ones somebody else owns: the graph, the switch, the
+channel, and the past.
 
 Also registered at runtime:
 
@@ -1630,7 +1657,9 @@ Key properties:
 - **Intent-before-action**: write/shell tools require the assistant to declare intent first
 - **Request-before-creation**: the three creators (`schedule_create`,
   `workflow_create`, `emit_signal`) must quote the user's words from the current
-  turn; both gates are capabilities on the tool (`requires_intent`,
+  turn, while the maintenance tools (`schedule_update`, `schedule_set_enabled`,
+  `schedule_run`, `schedule_cancel`, `workflow_update`) state what they are
+  doing; both gates are capabilities on the tool (`requires_intent`,
   `requires_request`), not per-tool branches
 - **LLM retry**: transient API errors (rate limits, 5xx) retried with exponential backoff
 
@@ -1645,7 +1674,8 @@ calls for it:
 
 | Held back by default | Opened by |
 |---|---|
-| `schedule_create`, `schedule_delete`, `workflow_create`, `workflow_delete` | Naming or describing scheduled work **and** asking for it |
+| `schedule_create`, `schedule_delete`, `schedule_update`, `schedule_set_enabled`, `schedule_run`, `schedule_cancel`, `workflow_create`, `workflow_delete`, `workflow_update` | Naming or describing scheduled work **and** asking for it |
+| `schedule_runs` | Never — the answer to "did it actually run" is phrased in the user's own words, which name no cadence |
 | `emit_signal` | A scheduled run, or an ask that names scheduled work |
 | `report_outcome` | Being inside a scheduled run — no sentence in a conversation makes it usable |
 | `memory_index`, `memory_clear` | `memory`, `remember`, `forget`, `记忆`, `记住`, `忘记`, `上下文` |

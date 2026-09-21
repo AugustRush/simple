@@ -68,6 +68,17 @@ from .profiles import (
     profile_payloads,
     resolve_permission_profile,
 )
+from .editing import (
+    EditContext,
+    delivery_from_body,
+    describe_edit,
+    mirror_step_edit,
+    step_owns_no_trigger,
+    task_definition_payload,
+    task_from_body,
+    trigger_from_body,
+    trigger_to_body,
+)
 from .runtime import SchedulerService
 from .store import SchedulerStore
 from .unattended import ConsentDecision, UnattendedAudit, UnattendedOutputSink
@@ -117,6 +128,10 @@ __all__ = [
     "WorkflowStep",
     "acceptance_payload",
     "declared_products",
+    "delivery_from_body",
+    "describe_edit",
+    "EditContext",
+    "mirror_step_edit",
     "missing_products",
     "normalize_products",
     "parse_task_signal",
@@ -127,9 +142,14 @@ __all__ = [
     "run_needs_attention",
     "signal_mode",
     "signal_names",
+    "step_owns_no_trigger",
     "step_trigger_spec",
     "subscribes_to",
+    "task_definition_payload",
+    "task_from_body",
     "task_signal_name",
+    "trigger_from_body",
+    "trigger_to_body",
     "validate_acceptance",
     "validate_products",
     "validate_workflow_graph",

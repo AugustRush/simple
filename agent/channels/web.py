@@ -28,7 +28,6 @@ from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
 from agent.pathing import path_contains
 from agent.scheduler.models import (
-    LOCAL_TIMEZONE,
     RUN_IN_FLIGHT_STATUSES,
     acceptance_payload,
     parse_task_signal,
@@ -984,6 +983,24 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _names_a_trigger_field(raw: dict[str, Any]) -> bool:
+    """Whether a step body says anything about *when* it runs, other than type.
+
+    Kept separate from the ``trigger_type`` test so the type's own field is not
+    double-counted, and so a body that names only an hour is still read as an
+    answer.  Emptiness is not an answer: an editor that sends every field it
+    knows about, blank ones included, is not asking for anything.
+    """
+    from agent.scheduler.editing import TRIGGER_BODY_FIELDS
+
+    return any(
+        field_name != "trigger_type"
+        and field_name != "trigger_from"
+        and str(raw.get(field_name) or "").strip()
+        for field_name in TRIGGER_BODY_FIELDS
+    )
+
+
 class WebChannel(Channel):
     """Starlette-based channel for a browser frontend."""
 
@@ -1339,71 +1356,58 @@ class WebChannel(Channel):
             })
         return JSONResponse({"attachments": result})
 
-    def _trigger_from_body(self, body: dict[str, Any], existing: Any = None):
-        """Turn the trigger fields of a request body into a ``TriggerSpec``.
+    def _feishu_ready(self) -> bool:
+        feishu = self._feishu_channel_config()
+        return bool(feishu.get("app_id") and feishu.get("app_secret"))
 
-        Shared by the schedule API and by a workflow's entry step.  A second
-        copy of these rules would be free to disagree with this one about what
-        "每周三 09:00" means, and the disagreement would show up as a task that
-        fires on the wrong day rather than as an error.
+    def _signal_problem(self, name: str) -> Optional[str]:
+        """Why *name* can never fire, or None when it can.
+
+        A short-lived connection of its own, because the builder deliberately
+        knows nothing about persistence: it turns a body into a spec, and the
+        caller owns the write.  The check needs to read tasks, so it borrows a
+        connection rather than widening the builder's contract for one
+        validation.
         """
-        from agent.scheduler import TriggerSpec
+        from agent.scheduler import SchedulerStore
 
-        trigger_type = str(
-            body.get(
-                "trigger_type",
-                getattr(getattr(existing, "trigger", None), "trigger_type", "once"),
-            )
-        ).lower()
-        # An omitted zone means the machine's own, not UTC: the browser sends
-        # its zone explicitly, so this only decides the case where nothing did.
-        timezone_name = str(body.get("timezone_name", LOCAL_TIMEZONE)).strip() or LOCAL_TIMEZONE
-        if trigger_type == "once":
-            trigger = TriggerSpec.once(body["at"], timezone_name)
-            if trigger.initial_run_at() <= datetime.now(timezone.utc):
-                raise ValueError("执行时间必须晚于当前时间")
-        elif trigger_type == "interval":
-            every = int(body["every"])
-            if every < 1:
-                raise ValueError("重复间隔必须大于 0")
-            trigger = TriggerSpec.interval(
-                every, str(body["unit"]), body["anchor_at"], timezone_name
-            )
-        elif trigger_type == "daily":
-            trigger = TriggerSpec.daily(str(body["time_of_day"]), timezone_name)
-        elif trigger_type == "weekly":
-            trigger = TriggerSpec.weekly(
-                str(body["day_of_week"]), str(body["time_of_day"]), timezone_name
-            )
-        elif trigger_type == "weekdays":
-            trigger = TriggerSpec.weekdays(str(body["time_of_day"]), timezone_name)
-        elif trigger_type == "monthly":
-            trigger = TriggerSpec.monthly(
-                int(body["day_of_month"]), str(body["time_of_day"]), timezone_name
-            )
-        elif trigger_type == "signal":
-            signal_name = str(body.get("signal_name", "")).strip()
-            if not signal_name:
-                raise ValueError("请选择或填写要等待的信号")
-            # A short-lived connection of its own, because this function
-            # deliberately knows nothing about the store: it turns a request
-            # body into a spec, and the caller owns persistence.  The check
-            # needs to read tasks, so it borrows a connection rather than
-            # widening the function's contract for one validation.
-            from agent.scheduler import SchedulerStore
+        probe = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        try:
+            return probe.describe_signal_problem(name)
+        finally:
+            probe.close()
 
-            probe = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
-            try:
-                problem = probe.describe_signal_problem(signal_name)
-            finally:
-                probe.close()
-            if problem:
-                raise ValueError(f"信号「{signal_name}」无法生效：{problem}")
-            trigger = TriggerSpec.signal(signal_name)
-        else:
-            raise ValueError("不支持的执行计划")
-        trigger.instantiate().next_after(datetime.now(timezone.utc))
-        return trigger
+    def _edit_context(self):
+        """What building a task definition needs from this process.
+
+        Named in one place because two builders ask for it -- a standalone task
+        and a workflow's step -- and a step that resolved the folder, the skill
+        catalogue or the model list differently from a task would be the same
+        definition accepted through one door and refused through another.
+        """
+        from agent.scheduler import EditContext
+
+        chosen = self._components.get("workspace_root")
+        return EditContext(
+            chosen_workspace_root=Path(chosen) if chosen else None,
+            fallback_workspace_root=Path.cwd().resolve(),
+            skill_catalog=self._components.get("skill_catalog"),
+            model_validator=self._resolve_model_override,
+            feishu_ready=self._feishu_ready,
+            signal_problem=self._signal_problem,
+        )
+
+    def _trigger_from_body(self, body: dict[str, Any], existing: Any = None):
+        """A ``TriggerSpec`` from a body, filling gaps from what was stored."""
+        from agent.scheduler import trigger_from_body
+
+        return trigger_from_body(body, existing, signal_problem=self._signal_problem)
+
+    def _delivery_from_body(self, body: dict[str, Any], existing: Any = None):
+        """Delivery mode and target, from the body or from what the task had."""
+        from agent.scheduler import delivery_from_body
+
+        return delivery_from_body(body, existing, feishu_ready=self._feishu_ready)
 
     def _feishu_channel_config(self) -> dict[str, Any]:
         """The global Feishu channel config, as delivery reads it at run time.
@@ -1418,216 +1422,28 @@ class WebChannel(Channel):
         feishu = cfg.get("channels", {}).get("feishu", {})
         return feishu if isinstance(feishu, dict) else {}
 
-    def _delivery_from_body(self, body: dict[str, Any], existing: Any = None):
-        """Delivery mode and target, from the body or from what the task had.
-
-        "发到飞书" is the one channel the runtime can deliver to, and it reads
-        the global Feishu app credentials -- per-task credentials are not a
-        thing this interface offers.  Checking them here is the difference
-        between a form that says what it does and one that accepts a task
-        whose every run fails at 3am with a RuntimeError nobody typed.
-        """
-        from agent.scheduler import DeliveryTarget
-
-        delivery_mode = str(
-            body.get("delivery_mode", getattr(existing, "delivery_mode", "standalone"))
-            or "standalone"
-        )
-        if delivery_mode not in {"standalone", "channel"}:
-            raise ValueError("不支持的投递方式")
-        if delivery_mode == "standalone":
-            return "standalone", DeliveryTarget.standalone()
-
-        raw_target = body.get("delivery_target")
-        if isinstance(raw_target, dict) and raw_target:
-            target_type = str(raw_target.get("target_type", "")).strip()
-            payload = raw_target.get("payload")
-            if not isinstance(payload, dict):
-                raise ValueError("delivery_target.payload 必须是对象")
-            if target_type != "feishu_chat":
-                given = target_type or "（空）"
-                raise ValueError(f"暂不支持的投递渠道：{given}")
-            chat_id = str(payload.get("chat_id", "")).strip()
-            if not chat_id:
-                raise ValueError("发到飞书需要选择一个会话")
-            target = DeliveryTarget(
-                target_type="feishu_chat",
-                payload={
-                    "chat_id": chat_id,
-                    # Every chat the picker offers comes from the bot's chat
-                    # list, so a chat_id addresses it; receive_id_type is
-                    # written down because the pre-picker heuristic guessed
-                    # open_id for anything not marked "group" and would have
-                    # misread these.
-                    "chat_type": str(payload.get("chat_type", "group") or "group"),
-                    "receive_id_type": "chat_id",
-                },
-            )
-        else:
-            # Nothing chosen in this body: keep what the task already had,
-            # which is the only honest answer for an edit that did not touch
-            # delivery.  A task that never had one is asked to pick.
-            target = getattr(existing, "delivery_target", None)
-            if target is None or target.target_type != "feishu_chat":
-                raise ValueError("发到飞书需要选择一个会话")
-        feishu = self._feishu_channel_config()
-        if not feishu.get("app_id") or not feishu.get("app_secret"):
-            raise ValueError("发到飞书需要先在设置里填好飞书应用（app_id / app_secret）")
-        return "channel", target
-
     def _schedule_from_body(
         self, body: dict[str, Any], existing: Any = None, *, keep_trigger: bool = False
     ):
-        from agent.scheduler import Acceptance, NewScheduledTask, TriggerSpec
-        from agent.scheduler.profiles import PERMISSION_PROFILES
+        """The whole task a body leaves behind, given the task it edits.
 
-        name = str(body.get("name", getattr(existing, "name", ""))).strip()
-        if not name:
-            raise ValueError("任务名称不能为空")
-        if len(name) > 80:
-            raise ValueError("任务名称不能超过 80 个字符")
+        A field the body does not mention keeps the value the stored task had.
+        That is the convention the graph editor has always used -- written down
+        at ``_workflow_step_from_body``, where the reason is spelled out -- and
+        it is the one place the task editor did not follow it.  Because
+        ``update_task`` rewrites every column from the spec it is handed, a
+        field the builder left out was not *skipped*: it was written back as
+        the dataclass default.  Saving a task's name through the interface
+        cleared the files it had declared it would produce, and the run went on
+        failing against a promise its own row no longer contained.
+        """
+        from agent.scheduler import task_from_body
 
-        if keep_trigger:
-            # A step with upstreams does not own its trigger: the graph says it
-            # waits for them, and the task's own signal trigger is that answer
-            # written down.  Letting the task editor set a second one would
-            # either replace the edge with a clock or leave one of the two
-            # lying, and the task editor has no field that could express
-            # "after A and B succeed" anyway.  Saying so beats ignoring it.
-            asked = str(body.get("trigger_type", "")).strip().lower()
-            if asked and asked != existing.trigger.trigger_type:
-                raise ValueError(
-                    "这一步的触发方式由它上游的步骤决定，不能在这里改成别的"
-                )
-            trigger = existing.trigger
-        else:
-            trigger = self._trigger_from_body(body, existing)
-
-        existing_kind = str(getattr(existing, "kind", "agent_prompt"))
-        default_action = "message" if existing_kind == "message" else "agent_task"
-        action = str(body.get("action_type", default_action))
-        if action == "agent_task":
-            task_kind = "agent_prompt"
-            payload = {"prompt": str(body.get("prompt", "")).strip()}
-            max_content_length = 6000
-        elif action == "message":
-            task_kind = "message"
-            payload = {"message_text": str(body.get("message_text", "")).strip()}
-            max_content_length = 2000
-        else:
-            raise ValueError("不支持的任务类型")
-        content = str(next(iter(payload.values()), ""))
-        if not content:
-            raise ValueError("任务内容不能为空")
-        if len(content) > max_content_length:
-            raise ValueError(f"任务内容不能超过 {max_content_length} 个字符")
-
-        permission_profile = str(
-            body.get(
-                "permission_profile",
-                getattr(existing, "permission_profile", "inherit"),
-            )
-        )
-        if permission_profile not in PERMISSION_PROFILES:
-            raise ValueError("不支持的权限策略")
-        profile = PERMISSION_PROFILES[permission_profile]
-
-        # Resolved before the fallback chain on purpose.  A profile that
-        # grants writes needs a directory a *person* chose: falling back to
-        # the gateway process's working directory would make the task write
-        # somewhere nobody can predict from its definition.
-        chosen_workspace = str(
-            body.get("workspace_root")
-            or getattr(existing, "workspace_root", "")
-            or ""
-        ).strip()
-        if profile.requires_workspace_root and not chosen_workspace:
-            raise ValueError(
-                f"权限策略「{profile.label}」需要显式指定项目文件夹，"
-                "不能回落到服务进程的当前目录"
-            )
-        workspace_value = chosen_workspace or str(
-            self._components.get("workspace_root") or Path.cwd()
-        )
-        workspace = Path(workspace_value).expanduser().resolve(strict=False)
-        if task_kind == "agent_prompt" and not workspace.is_dir():
-            raise ValueError(f"项目文件夹不存在：{workspace}")
-
-        context_policy = str(
-            body.get("context_policy", getattr(existing, "context_policy", "stateless"))
-        )
-        if context_policy not in {"stateless", "task_history", "shared_memory"}:
-            raise ValueError("不支持的上下文策略")
-        timeout_seconds = int(
-            body.get("timeout_seconds", getattr(existing, "timeout_seconds", 1800))
-        )
-        if timeout_seconds < 10 or timeout_seconds > 604800:
-            raise ValueError("超时时间必须在 10 秒到 7 天之间")
-        raw_retry = body.get("retry_policy", getattr(existing, "retry_policy", {}))
-        retry = dict(raw_retry) if isinstance(raw_retry, dict) else {}
-        max_attempts = int(retry.get("max_attempts", 1))
-        backoff_seconds = int(retry.get("backoff_seconds", 30))
-        if max_attempts < 1 or max_attempts > 5:
-            raise ValueError("最大尝试次数必须在 1 到 5 之间")
-        if backoff_seconds < 0 or backoff_seconds > 86400:
-            raise ValueError("重试间隔必须在 0 到 86400 秒之间")
-
-        delivery_mode, delivery_target = self._delivery_from_body(body, existing)
-
-        raw_model = (
-            body.get("model_override")
-            if "model_override" in body
-            else getattr(existing, "model_override", None)
-        )
-        model_override = self._resolve_model_override(raw_model)
-        raw_skills = body.get(
-            "selected_skills", getattr(existing, "selected_skills", [])
-        )
-        if not isinstance(raw_skills, list):
-            raise ValueError("selected_skills must be a list")
-        selected_skills = list(dict.fromkeys(
-            str(item).strip() for item in raw_skills if str(item).strip()
-        ))
-        catalog = self._components.get("skill_catalog")
-        if catalog is not None:
-            for skill_id in selected_skills:
-                bundle = catalog.get(skill_id)
-                if bundle is None or not getattr(bundle, "user_invocable", False):
-                    raise ValueError(f"技能不可用：{skill_id}")
-        return NewScheduledTask(
-            name=name,
-            kind=task_kind,
-            trigger=trigger,
-            payload=payload,
-            delivery_mode=delivery_mode,
-            delivery_target=delivery_target,
-            model_override=model_override,
-            enabled=bool(body.get("enabled", getattr(existing, "enabled", True))),
-            workspace_root=str(workspace),
-            context_policy=context_policy,
-            timeout_seconds=timeout_seconds,
-            retry_policy={
-                "max_attempts": max_attempts,
-                "backoff_seconds": backoff_seconds,
-            },
-            selected_skills=selected_skills,
-            permission_profile=permission_profile,
-            # Kept from what is stored, never read from the body.  No endpoint
-            # here can set a criterion, so a body cannot carry one -- but
-            # ``update_task`` writes this column on every save, so leaving it
-            # out does not mean "unchanged", it means the dataclass default is
-            # written over whatever was there.  Editing a step's name through
-            # the task editor would then delete the criterion its chain stops
-            # on, and the deletion would look like the step had never declared
-            # one.
-            acceptance=getattr(existing, "acceptance", None) or Acceptance(),
-            # Membership is inherited, never taken from the body.  Which
-            # workflow a task is a step of is decided by materialising that
-            # workflow, so a request that could set it could also detach a step
-            # from the chain it is part of -- and a detached step keeps running
-            # while the graph that explains it stops mentioning it.
-            workflow_id=str(getattr(existing, "workflow_id", "") or ""),
-            step_key=str(getattr(existing, "step_key", "") or ""),
+        return task_from_body(
+            body,
+            existing,
+            context=self._edit_context(),
+            keep_trigger=keep_trigger,
         )
 
     def _borrowed_trigger(
@@ -1740,7 +1556,14 @@ class WebChannel(Channel):
                     "触发方式跟着入口步骤走"
                 )
         elif given_trigger:
-            trigger = self._trigger_from_body(raw)
+            trigger = self._trigger_from_body(raw, existing)
+        elif _names_a_trigger_field(raw):
+            # A body that names no ``trigger_type`` but does name, say, the hour
+            # is still an answer about when this runs; the stored trigger's own
+            # type is what it is answering about.  Read as "unset" it was
+            # silently ignored, and a step whose schedule was never moved
+            # looked exactly like one that was.
+            trigger = self._trigger_from_body(raw, existing)
         elif borrowed_trigger is not None:
             trigger = borrowed_trigger
         elif existing is not None and existing.trigger is not None:
@@ -2251,95 +2074,6 @@ class WebChannel(Channel):
         finally: store.close()
         return JSONResponse({"ok": True, "enabled": bool(body["enabled"])})
 
-    def _step_owns_no_trigger(self, store: Any, task: Any) -> bool:
-        """True when *task* is a workflow step whose timing comes from upstreams.
-
-        Answered from the graph, not from the task: a fan-in trigger and a
-        hand-picked signal both report ``trigger_type`` "signal", and only the
-        graph knows which steps have upstreams.
-        """
-        if not task.workflow_id or not task.step_key:
-            return False
-        workflow = store.get_workflow(task.workflow_id)
-        if workflow is None:
-            return False
-        step = workflow.step(task.step_key)
-        return step is not None and bool(step.depends_on)
-
-    def _mirror_step_edit(self, store: Any, task: Any) -> None:
-        """Copy an edited step task back into the graph it belongs to.
-
-        A step is edited through the ordinary task endpoint -- it is an
-        ordinary task, with its own run history and its own switches -- but
-        what it is *stored* as is a step of a graph, and the next save of that
-        workflow rebuilds the task from the graph.  Without this, changing a
-        step's prompt in the task editor would survive exactly until somebody
-        moved an edge.
-
-        The graph is not re-materialised: the task in hand was written a
-        moment ago and is the newer of the two, so rebuilding it from the step
-        copied from it would be a round trip that can only lose something.
-        """
-        if not task.workflow_id or not task.step_key:
-            return
-        workflow = store.get_workflow(task.workflow_id)
-        if workflow is None:
-            return
-        from agent.scheduler import Workflow, WorkflowStep
-
-        steps = []
-        matched = False
-        for step in workflow.steps:
-            if str(step.key).strip() != str(task.step_key).strip():
-                steps.append(step)
-                continue
-            matched = True
-            steps.append(
-                WorkflowStep(
-                    key=step.key,
-                    name=task.name,
-                    kind=task.kind,
-                    payload=dict(task.payload),
-                    # A task cannot express an edge, so it must not be able to
-                    # break or invent one.
-                    depends_on=list(step.depends_on),
-                    # Nor a trigger, when it has upstreams: the upstreams *are*
-                    # its trigger, and this is the one field where the task row
-                    # and the graph would otherwise disagree.
-                    trigger=None if step.depends_on else task.trigger,
-                    workspace_root=task.workspace_root,
-                    permission_profile=task.permission_profile,
-                    context_policy=task.context_policy,
-                    model_override=task.model_override,
-                    timeout_seconds=int(task.timeout_seconds),
-                    selected_skills=list(task.selected_skills),
-                    # Both of these live on the task row as well as on the step,
-                    # so leaving them out does not merely fail to copy an edit
-                    # -- it writes the dataclass default over whatever the graph
-                    # said.  Editing a step's schedule would silently drop its
-                    # acceptance criterion, and with it the chain's reason to
-                    # stop at that step; and reset its retry policy to "give up
-                    # after one attempt".
-                    acceptance=task.acceptance,
-                    retry_policy=dict(task.retry_policy),
-                    delivery_mode=task.delivery_mode,
-                    delivery_target=task.delivery_target,
-                )
-            )
-        if not matched:
-            return
-        store.update_workflow(
-            workflow.id,
-            Workflow(
-                name=workflow.name,
-                steps=steps,
-                id=workflow.id,
-                description=workflow.description,
-                enabled=workflow.enabled,
-            ),
-            materialize=False,
-        )
-
     async def _update_schedule(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
 
@@ -2349,7 +2083,7 @@ class WebChannel(Channel):
             body = await request.json()
             if not isinstance(body, dict):
                 raise ValueError("body must be an object")
-            from agent.scheduler import SchedulerStore
+            from agent.scheduler import SchedulerStore, mirror_step_edit, step_owns_no_trigger
 
             store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
             try:
@@ -2358,11 +2092,24 @@ class WebChannel(Channel):
                 if existing is None:
                     return JSONResponse({"error": "task not found"}, status_code=404)
                 spec = self._schedule_from_body(
-                    body, existing, keep_trigger=self._step_owns_no_trigger(store, existing)
+                    body,
+                    existing,
+                    # A step that waits on upstreams does not own its trigger:
+                    # the graph says it waits for them, and the task's own
+                    # signal trigger is that answer written down.  Letting the
+                    # task editor set a second one would either replace the
+                    # edge with a clock or leave one of the two lying, and the
+                    # editor has no field that could express "after A and B
+                    # succeed" anyway.  The store decides, so the two doors
+                    # cannot disagree.
+                    keep_trigger=step_owns_no_trigger(store, existing),
                 )
                 updated = store.update_task(task_id, spec)
                 if updated is not None:
-                    self._mirror_step_edit(store, updated)
+                    # The task row is what was written; the graph is what the
+                    # next save of the workflow rebuilds it from.  Without
+                    # this the edit survives until somebody moves an edge.
+                    mirror_step_edit(store, updated)
                 unseen = store.unacknowledged_attention_counts().get(task_id, 0)
             finally:
                 store.close()

@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -1778,7 +1779,9 @@ def test_channel_runner_exposes_feishu_delivery_target_to_scheduler_tools(
                     "name": "reminder",
                     "trigger_type": "once",
                     "prompt": "测试一下",
-                    "at": "2026-04-20T10:00:00+08:00",
+                    "at": (
+                        datetime.now(timezone.utc) + timedelta(hours=2)
+                    ).isoformat(),
                     "timezone_name": "Asia/Shanghai",
                 },
             )

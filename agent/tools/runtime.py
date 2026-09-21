@@ -200,19 +200,44 @@ def _schema_has_unsupported_keywords(schema: Any) -> bool:
 def _validate_value(value: Any, schema: Any, field: str) -> Optional[dict]:
     if _schema_has_unsupported_keywords(schema):
         return None
-    expected = _JSON_TYPE_MAP.get(schema.get("type", ""))
-    if expected is not None:
-        if schema.get("type") == "integer" and isinstance(value, bool):
-            return _invalid_request(
-                f"invalid value for field '{field}': expected integer"
+    declared = schema.get("type", "")
+    if isinstance(declared, list):
+        # JSON Schema lets ``type`` be a list ("string or null"), and this used
+        # to be looked up in a dict as if it were a string: a schema written
+        # that way failed every call with "unhashable type: 'list'", raised
+        # from inside the validator and naming neither the field nor the tool.
+        # A schema nobody could write correctly read as a tool that was broken.
+        options = [str(item) for item in declared]
+        if value is None:
+            if "null" not in options:
+                return _invalid_request(
+                    f"invalid value for field '{field}': null is not one of "
+                    + ", ".join(options)
+                )
+        else:
+            accepted = tuple(
+                _JSON_TYPE_MAP[item] for item in options if item in _JSON_TYPE_MAP
             )
-        if not isinstance(value, expected) or (
-            schema.get("type") == "boolean" and not isinstance(value, bool)
-        ):
-            return _invalid_request(
-                f"invalid value for field '{field}': expected "
-                f"{schema.get('type')}, got {type(value).__name__}"
-            )
+            if accepted and not isinstance(value, accepted):
+                return _invalid_request(
+                    f"invalid value for field '{field}': expected "
+                    + " or ".join(options)
+                    + f", got {type(value).__name__}"
+                )
+    else:
+        expected = _JSON_TYPE_MAP.get(declared or "")
+        if expected is not None:
+            if declared == "integer" and isinstance(value, bool):
+                return _invalid_request(
+                    f"invalid value for field '{field}': expected integer"
+                )
+            if not isinstance(value, expected) or (
+                declared == "boolean" and not isinstance(value, bool)
+            ):
+                return _invalid_request(
+                    f"invalid value for field '{field}': expected "
+                    f"{declared}, got {type(value).__name__}"
+                )
     enum_values = schema.get("enum")
     if isinstance(enum_values, list) and enum_values and value not in enum_values:
         return _invalid_request(
@@ -230,7 +255,7 @@ def _validate_value(value: Any, schema: Any, field: str) -> Optional[dict]:
             return _invalid_request(
                 f"invalid value for field '{field}': must be <= {maximum}"
             )
-    if schema.get("type") == "array":
+    if declared == "array" or (isinstance(declared, list) and "array" in declared):
         items_schema = schema.get("items")
         if isinstance(items_schema, dict) and isinstance(value, list):
             for index, item in enumerate(value):
@@ -301,6 +326,24 @@ class ToolRegistry:
         ("builtin", "memory_clear"): frozenset({"state_write"}),
         ("builtin", "schedule_create"): frozenset({"state_write", "requires_request"}),
         ("builtin", "schedule_delete"): frozenset({"state_write"}),
+        # The maintenance half of the schedule tools, and the split is
+        # deliberate.  `requires_request` is "nobody asked, so propose it
+        # instead"; `requires_intent` is "say what you are doing", which is what
+        # these need.  Correcting a task that is already failing is the case
+        # where the asker's own sentence is hardest to point at -- they asked
+        # why it broke, not for a particular field to change -- and refusing the
+        # fix would leave the only move as delete-and-recreate, which is the
+        # thing an edit exists to replace.  So the gate is a self-declaration,
+        # like ``shell``'s, and it lands in the audit trail where a task that
+        # changed under somebody can be read back.
+        #
+        # `schedule_cancel` is here rather than ungated because cancelling is
+        # destructive to the work in flight, and one sentence naming the run is
+        # cheap next to that.
+        ("builtin", "schedule_update"): frozenset({"state_write", "requires_intent"}),
+        ("builtin", "schedule_set_enabled"): frozenset({"state_write", "requires_intent"}),
+        ("builtin", "schedule_run"): frozenset({"state_write", "requires_intent"}),
+        ("builtin", "schedule_cancel"): frozenset({"state_write", "requires_intent"}),
         # The workflow trio was missing from this table entirely, which read as
         # "no capabilities" -- the same answer as a tool nobody had classified
         # yet.  Classified here because `workflow_create` now has to carry the
@@ -309,6 +352,10 @@ class ToolRegistry:
         ("builtin", "workflow_list"): frozenset({"read"}),
         ("builtin", "workflow_create"): frozenset({"state_write", "requires_request"}),
         ("builtin", "workflow_delete"): frozenset({"state_write"}),
+        # Same reasoning as `schedule_update`: rebuilding a chain instead of
+        # editing it is what leaves steps behind whose run history is stranded,
+        # so the edit is the move that has to be available.
+        ("builtin", "workflow_update"): frozenset({"state_write", "requires_intent"}),
         # Producing an action nobody asked for is what `requires_request`
         # refuses, and emitting a signal is an action: it starts whatever
         # subscribed to that name.  The stray emission that accompanied the
