@@ -7,7 +7,6 @@ import {
   TRACE_SEVERITY,
 } from '../constants'
 import type { ConfirmRisk, Message, SessionInfo, ToolDotSummary, ToolState } from '../types'
-import { CheckCircleFilled, ExclamationCircleFilled, LoadingOutlined } from '@ant-design/icons'
 
 
 export function toolStateLabel(state?: ToolState): string {
@@ -36,20 +35,6 @@ export function summariseToolDots(tools: Message[]): ToolDotSummary[] {
     summaries.push({ state, count: end - start })
   }
   return summaries
-}
-
-
-export function toolStateColor(state?: ToolState): string {
-  if (state === 'running') return 'processing'
-  if (state === 'blocked') return 'error'
-  return 'success'
-}
-
-
-export function toolStateIcon(state?: ToolState) {
-  if (state === 'running') return <LoadingOutlined spin />
-  if (state === 'blocked') return <ExclamationCircleFilled />
-  return <CheckCircleFilled />
 }
 
 
