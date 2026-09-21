@@ -440,7 +440,7 @@ def test_search_entries_queries_fts_index(tmp_path, monkeypatch):
     assert any("memory_items_fts" in sql for sql in seen_sql)
 
 
-def test_add_entry_does_not_write_user_visible_projections(tmp_path, monkeypatch):
+def test_add_entry_does_not_write_user_visible_projections(tmp_path):
     from agent import LTMEntry, LTMStore
 
     store = LTMStore(
@@ -470,10 +470,6 @@ def test_add_entry_does_not_write_user_visible_projections(tmp_path, monkeypatch
         )
     )
 
-    synced_categories: list[str] = []
-    monkeypatch.setattr(store, "_sync_category_snapshot", lambda category: None)
-    monkeypatch.setattr(store, "_sync_projection", lambda category: None)
-
     store.add_entry(
         LTMEntry(
             id="task-1",
@@ -486,7 +482,11 @@ def test_add_entry_does_not_write_user_visible_projections(tmp_path, monkeypatch
         )
     )
 
-    assert synced_categories == []
+    # The file projection layer is gone, so "nothing user-visible was written"
+    # is now a statement about the filesystem: facts live in SQLite only.
+    assert not list((tmp_path / "memory").rglob("*.md"))
+    assert not list((tmp_path / "memory").rglob("*.json"))
+    assert not (tmp_path / "context" / "_meta.json").exists()
 
 
 def test_ensure_fts_index_repairs_mismatched_rows_even_when_counts_match(tmp_path):

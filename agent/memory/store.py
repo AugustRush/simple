@@ -416,9 +416,6 @@ class LTMStore:
                 ],
             )
 
-    def _save_meta(self) -> None:
-        """Compatibility no-op: category stats are derived from SQLite."""
-
     def _cleanup_legacy_artifacts(self) -> None:
         self._meta_path.unlink(missing_ok=True)
         (self.memory_dir / "INDEX.md").unlink(missing_ok=True)
@@ -431,14 +428,6 @@ class LTMStore:
         normalized = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "_", normalized)
         normalized = re.sub(r"_+", "_", normalized).strip("._")
         return normalized or "general"
-
-    def _category_path(self, name: str) -> Path:
-        safe_name = self.normalize_category_name(name)
-        path = (self.dir / f"{safe_name}.json").resolve()
-        root = self.dir.resolve()
-        if root not in path.parents:
-            raise ValueError(f"Category path escaped context dir: {name}")
-        return path
 
     def _is_palace_locus(self, category: str) -> bool:
         return self.normalize_category_name(category) in shared.PALACE_LOCI
@@ -454,11 +443,6 @@ class LTMStore:
                 else "general"
             )
         return self.normalize_category_name(category)
-
-    def _projection_path(self, category: str, entity: str) -> Path:
-        category = self.normalize_category_name(category)
-        entity = self._normalize_entity(entity, category)
-        return self.memory_dir / category / f"{entity}.md"
 
     def _row_to_entry(self, row: sqlite3.Row) -> LTMEntry:
         return LTMEntry(
@@ -733,10 +717,6 @@ class LTMStore:
         ).fetchall()
         return {row["category"] for row in rows if row["category"] not in shared.PALACE_LOCI}
 
-    def _refresh_indexes(self) -> None:
-        """Mark derived category stats stale; they are recomputed on demand."""
-        self._category_stats_cache = None
-
     @property
     def _meta(self) -> dict:
         """Category stats, computed lazily and cached until the next write.
@@ -782,12 +762,6 @@ class LTMStore:
         # Only invalidate: the stats are derived, and recomputing them here
         # made every write pay for a table scan no caller had asked for.
         self._category_stats_cache = None
-
-    def _sync_category_snapshot(self, category: str) -> None:
-        """Compatibility no-op: user-visible memory is exported as JSONL."""
-
-    def _sync_projection(self, category: str) -> None:
-        """Compatibility no-op: memory palace loci are internal categories."""
 
     def _remove_category(self, category: str) -> None:
         category = self.normalize_category_name(category)
