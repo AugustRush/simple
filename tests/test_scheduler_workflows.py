@@ -3678,3 +3678,50 @@ def test_the_second_clock_entry_joins_the_round_waiting_for_it(tmp_path):
         assert len(rounds) == 1
     finally:
         store.close()
+def test_a_cancelled_step_is_not_recorded_as_a_failure_of_the_chain(tmp_path):
+    """Cancel is the user stopping the work, not the work failing.
+
+    A cancelled entry used to be rolled up like a failure: every downstream
+    step recorded as skipped with a reason naming a failure, the workflow run
+    marked ``failed``, and a ``skipped`` signal broadcast as though the chain
+    had broken.  The record should say what happened -- cancelled -- and a
+    cancelled round is not a failed one.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        claimed = store.claim_task_now(tasks["collect"].id, now=NOW)
+        assert claimed is not None
+
+        assert store.complete_run(
+            tasks["collect"].id,
+            claimed.run.id,
+            finished_at=NOW + timedelta(seconds=1),
+            status="cancelled",
+            error="cancelled by user",
+        )
+
+        analyze_runs = store.list_runs(tasks["analyze"].id)
+        assert len(analyze_runs) == 1
+        assert analyze_runs[0].status == RUN_SKIPPED_STATUS
+        # The reason is where a skipped run's account has always lived: its
+        # summary, not its error -- nothing failed, so there is no error.
+        assert "取消" in analyze_runs[0].summary
+        assert "failed" not in analyze_runs[0].summary
+        assert _workflow_run_status(store, claimed.run.workflow_run_id) == "cancelled"
+        # The signal for the step itself says cancelled, and the skipped ones
+        # say skipped -- what a subscriber hears matches what the record says.
+        names = [
+            row["name"]
+            for row in store._conn.execute(
+                "SELECT name FROM signal_emissions ORDER BY rowid"
+            ).fetchall()
+        ]
+        statuses = [parse_task_signal(name)[1] for name in names]
+        assert "cancelled" in statuses
+        assert statuses.count(RUN_SKIPPED_STATUS) == 2
+    finally:
+        store.close()
+
+

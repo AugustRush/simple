@@ -16,6 +16,7 @@ from .models import (
     RETRYABLE_RUN_STATUSES,
     RUN_SKIPPED_STATUS,
     RUN_SUCCESS_STATUS,
+    RUN_UNVERIFIED_STATUS,
     SIGNAL_MODE_ALL,
     TERMINAL_RUN_STATUSES,
     Acceptance,
@@ -3047,10 +3048,26 @@ class SchedulerStore:
         blocked_keys = workflow_downstream_steps(steps, step_key)
         if not blocked_keys:
             return []
-        reason = (
-            f"上游步骤「{step_key}」以 {status} 结束，这一步等不到它的成功信号，"
-            "因此没有运行"
-        )
+        # Cancel is the user stopping the work; the scheduler losing it
+        # (interrupted) is nobody's failure either.  Both still mean the
+        # downstream steps will not run, so they are recorded -- but with a
+        # reason that says what happened rather than one that reads as the
+        # chain having broken.
+        if status == "cancelled":
+            reason = (
+                f"上游步骤「{step_key}」被取消，这一步不再等待它的成功信号，"
+                "因此没有运行"
+            )
+        elif status == "interrupted":
+            reason = (
+                f"上游步骤「{step_key}」被中断（持有它的调度器已停止），"
+                "这一步等不到它的成功信号，因此没有运行"
+            )
+        else:
+            reason = (
+                f"上游步骤「{step_key}」以 {status} 结束，这一步等不到它的成功信号，"
+                "因此没有运行"
+            )
         skipped: list[str] = []
         for step in steps:
             key = str(step.key).strip()
@@ -3185,11 +3202,28 @@ class SchedulerStore:
             return
         if any(latest[key] in {"queued", "running"} for key in expected):
             return
-        status = (
-            RUN_SUCCESS_STATUS
-            if all(latest[key] == RUN_SUCCESS_STATUS for key in expected)
-            else "failed"
-        )
+        # The round's outcome is its worst step's, ranked by what a reader
+        # needs to know: a failure outranks everything, because something the
+        # chain was for did not happen.  Cancel is the user stopping the work
+        # and interrupted is the scheduler losing it; neither is a failure, and
+        # recording either as ``failed`` would turn a decision somebody made
+        # into history that says "it broke".  ``skipped`` alone cannot happen
+        # in a round that did its work -- a skipped step is only ever written
+        # beneath a step that did not succeed -- so a round of nothing but
+        # skips reads as failed.
+        outcomes = {latest[key] for key in expected}
+        if outcomes == {RUN_SUCCESS_STATUS}:
+            status = RUN_SUCCESS_STATUS
+        elif "failed" in outcomes:
+            status = "failed"
+        elif "cancelled" in outcomes:
+            status = "cancelled"
+        elif "interrupted" in outcomes:
+            status = "interrupted"
+        elif RUN_UNVERIFIED_STATUS in outcomes:
+            status = RUN_UNVERIFIED_STATUS
+        else:
+            status = "failed"
         self._conn.execute(
             """
             UPDATE workflow_runs
