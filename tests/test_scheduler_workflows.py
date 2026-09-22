@@ -677,6 +677,40 @@ def test_adding_a_step_leaves_the_edges_above_it_alone(tmp_path):
         store.close()
 
 
+def test_workflow_definition_cannot_change_during_an_active_execution(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        claimed = store.claim_task_now(tasks["collect"].id, now=NOW)
+        assert claimed is not None
+        assert claimed.run.workflow_run_id
+
+        edited = store.get_workflow(workflow.id)
+        edited.description = "new definition"
+        with pytest.raises(ValueError, match="执行中的轮次"):
+            store.update_workflow(workflow.id, edited)
+
+        assert store.complete_run(
+            tasks["collect"].id,
+            claimed.run.id,
+            finished_at=NOW + timedelta(seconds=1),
+            status="failed",
+        )
+        workflow_run = store._conn.execute(
+            "SELECT status, definition_version FROM workflow_runs WHERE id = ?",
+            (claimed.run.workflow_run_id,),
+        ).fetchone()
+        assert workflow_run["status"] == "failed"
+        assert workflow_run["definition_version"] == workflow.version
+
+        updated = store.update_workflow(workflow.id, edited)
+        assert updated is not None
+        assert updated.version == workflow.version + 1
+    finally:
+        store.close()
+
+
 def test_a_step_removed_from_the_graph_stops_firing(tmp_path):
     store = make_store(tmp_path)
     try:
@@ -732,6 +766,33 @@ def test_deleting_a_workflow_keeps_what_it_ran(tmp_path):
         assert all(store.get_task(task_id).enabled is False for task_id in ids)
         # History is not tidied away with the graph.
         assert store.list_runs(tasks["collect"].id)
+    finally:
+        store.close()
+
+
+def test_deleting_a_workflow_cancels_queued_and_requests_running_steps(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        running = store.claim_task_now(tasks["collect"].id, now=NOW)
+        assert running is not None
+        queued = store._enqueue_signal_run_in_transaction(
+            tasks["analyze"],
+            store.emit_signal("test.delete", now=NOW),
+            NOW,
+        )
+        store._conn.commit()
+
+        store.delete_workflow(workflow.id, now=NOW + timedelta(seconds=1))
+
+        assert store.get_run(tasks["collect"].id, running.run.id).cancel_requested_at
+        assert store.get_run(tasks["analyze"].id, queued).status == "cancelled"
+        workflow_run = store._conn.execute(
+            "SELECT status FROM workflow_runs WHERE id = ?",
+            (running.run.workflow_run_id,),
+        ).fetchone()
+        assert workflow_run["status"] == "cancelled"
     finally:
         store.close()
 
@@ -974,9 +1035,13 @@ def test_a_skip_reaches_the_whole_subtree_not_just_the_next_step(tmp_path):
 
         asyncio.run(scenario())
 
-        assert [run.status for run in store.list_runs(tasks["analyze"].id)] == ["failed"]
+        assert [run.status for run in store.list_runs(tasks["analyze"].id)] == [
+            "failed"
+        ]
         # Both of the steps below it, not only the adjacent one.
-        assert [run.status for run in store.list_runs(tasks["review"].id)] == ["skipped"]
+        assert [run.status for run in store.list_runs(tasks["review"].id)] == [
+            "skipped"
+        ]
         assert [run.status for run in store.list_runs(tasks["publish"].id)] == [
             "skipped"
         ]
@@ -1473,6 +1538,84 @@ def test_each_round_of_a_join_carries_only_that_rounds_arms(tmp_path):
         store.close()
 
 
+def test_interleaved_workflow_rounds_do_not_cross_complete_a_join(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(workflow.id)
+        left_name = task_signal_name(tasks["left"].id, RUN_SUCCESS_STATUS)
+        right_name = task_signal_name(tasks["right"].id, RUN_SUCCESS_STATUS)
+
+        arrivals = [
+            (left_name, "round-1", "left"),
+            (left_name, "round-2", "left"),
+            (right_name, "round-2", "right"),
+            (right_name, "round-1", "right"),
+        ]
+        for index, (name, workflow_run_id, step_key) in enumerate(arrivals):
+            store.emit_signal(
+                name,
+                {
+                    "workflow_id": workflow.id,
+                    "workflow_run_id": workflow_run_id,
+                    "step_key": step_key,
+                },
+                now=NOW + timedelta(seconds=index),
+            )
+            store.deliver_signals(now=NOW + timedelta(seconds=index))
+
+        runs = store.list_runs(tasks["join"].id)
+        assert len(runs) == 2
+        by_round = {run.workflow_run_id: run for run in runs}
+        assert set(by_round) == {"round-1", "round-2"}
+        for workflow_run_id, run in by_round.items():
+            payloads = [item["payload"] for item in run.config_snapshot["signals"]]
+            assert {item["step_key"] for item in payloads} == {"left", "right"}
+            assert {item["workflow_run_id"] for item in payloads} == {workflow_run_id}
+    finally:
+        store.close()
+
+
+def test_two_failures_in_one_round_record_one_skipped_join(tmp_path):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(fork_workflow())
+        tasks = store.step_tasks(workflow.id)
+        start = store.claim_task_now(tasks["start"].id, now=NOW)
+        assert start is not None
+        assert store.complete_run(
+            tasks["start"].id,
+            start.run.id,
+            finished_at=NOW + timedelta(seconds=1),
+            status=RUN_SUCCESS_STATUS,
+        )
+        store._conn.execute(
+            "UPDATE scheduled_tasks SET next_run_at = NULL WHERE id = ?",
+            (tasks["start"].id,),
+        )
+        store._conn.commit()
+        store.deliver_signals(now=NOW + timedelta(seconds=2))
+
+        branches = store.claim_due_tasks(
+            NOW + timedelta(seconds=3), limit=10, lease_seconds=30
+        )
+        assert {item.task.step_key for item in branches} == {"left", "right"}
+        for index, item in enumerate(branches):
+            assert store.complete_run(
+                item.task.id,
+                item.run.id,
+                finished_at=NOW + timedelta(seconds=4 + index),
+                status="failed",
+            )
+
+        skipped = store.list_runs(tasks["join"].id)
+        assert len(skipped) == 1
+        assert skipped[0].status == RUN_SKIPPED_STATUS
+        assert skipped[0].workflow_run_id == start.run.workflow_run_id
+    finally:
+        store.close()
+
+
 def test_an_arrival_from_an_upstream_that_is_gone_does_not_reach_the_run(tmp_path):
     """Editing a graph is what pulls a join's two halves apart.
 
@@ -1614,7 +1757,9 @@ def _handoff_tools(store: SchedulerStore, tmp_path: Path):
     return tools
 
 
-def _as_step_of(workflow_id: str, step_key: str, task_id: str, budget: int | None = None):
+def _as_step_of(
+    workflow_id: str, step_key: str, task_id: str, budget: int | None = None
+):
     """The metadata a scheduled run publishes, as a context manager would.
 
     ``budget`` is what the agent core records before each provider call; the
@@ -1937,9 +2082,7 @@ def test_a_join_started_by_hand_still_carries_every_arm(tmp_path):
         make_due(store, tasks["start"].id)
         run_rounds(make_handoff_service(store, tmp_path / "output"), 6)
 
-        claimed = store.claim_task_now(
-            tasks["join"].id, now=NOW + timedelta(hours=1)
-        )
+        claimed = store.claim_task_now(tasks["join"].id, now=NOW + timedelta(hours=1))
 
         assert claimed is not None
         signals = claimed.run.config_snapshot["signals"]
@@ -2013,7 +2156,10 @@ def test_retrying_from_the_run_snapshot_does_not_re_derive_the_upstreams(tmp_pat
                 json.dumps(
                     {
                         "signals": [
-                            {"name": "task:ghost:succeeded", "payload": {"step_key": "ghost"}}
+                            {
+                                "name": "task:ghost:succeeded",
+                                "payload": {"step_key": "ghost"},
+                            }
                         ]
                     }
                 ),
@@ -2096,7 +2242,11 @@ def test_a_run_that_only_notified_a_channel_is_still_written_down(tmp_path):
         run_rounds(_channel_service(store, tmp_path / "output", sent), 4)
 
         assert sent, "the middle step should have reached the channel"
-        run = [item for item in store.list_runs(tasks["analyze"].id) if item.status == "succeeded"][-1]
+        run = [
+            item
+            for item in store.list_runs(tasks["analyze"].id)
+            if item.status == "succeeded"
+        ][-1]
         assert run.delivery_status == "delivered"
         assert run.output_path
         assert Path(run.output_path).read_text(encoding="utf-8") == "out analyze"
@@ -2340,9 +2490,7 @@ def test_read_step_output_keeps_a_comfortable_read_when_the_budget_allows(tmp_pa
         _plant_output(store, tasks["collect"], tmp_path, "x" * 50000)
 
         tools = _handoff_tools(store, tmp_path)
-        token = _as_step_of(
-            workflow.id, "analyze", tasks["analyze"].id, budget=200000
-        )
+        token = _as_step_of(workflow.id, "analyze", tasks["analyze"].id, budget=200000)
         try:
             result = tools._read_step_output("collect")
         finally:
@@ -2436,7 +2584,13 @@ def test_the_tool_clamps_against_the_budget_the_core_publishes(tmp_path):
         ctx.metadata["scheduler_step_key"] = "analyze"
         agent._prepare_provider_context(
             ctx,
-            [{"name": "read_file", "description": "read", "input_schema": {"type": "object"}}],
+            [
+                {
+                    "name": "read_file",
+                    "description": "read",
+                    "input_schema": {"type": "object"},
+                }
+            ],
         )
         budget = ctx.metadata["_last_input_token_budget"]
         assert budget > 0
@@ -2494,6 +2648,51 @@ def test_an_automatic_retry_keeps_the_upstreams_the_run_was_told_about(tmp_path)
         assert queued.trigger_source == "automatic_retry"
         signals = queued.config_snapshot["signals"]
         assert [item["payload"]["step_key"] for item in signals] == ["collect"]
+    finally:
+        store.close()
+
+
+def test_workflow_retry_does_not_fail_or_skip_the_chain_before_attempts_exhausted(
+    tmp_path,
+):
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        failed_at = NOW + timedelta(hours=1)
+        claimed = store.claim_task_now(tasks["analyze"].id, now=failed_at)
+
+        assert claimed is not None
+        assert store.complete_run(
+            tasks["analyze"].id,
+            claimed.run.id,
+            finished_at=failed_at,
+            status="failed",
+            error="temporary",
+            retry_at=failed_at + timedelta(seconds=30),
+        )
+
+        analyze_runs = store.list_runs(tasks["analyze"].id)
+        assert [run.status for run in analyze_runs] == ["failed", "queued"]
+        assert store.list_runs(tasks["publish"].id) == []
+
+        retry = store.claim_due_tasks(
+            failed_at + timedelta(seconds=30), lease_seconds=30
+        )[0]
+        assert retry.run.task_id == tasks["analyze"].id
+        assert retry.run.attempt == 2
+        assert store.complete_run(
+            tasks["analyze"].id,
+            retry.run.id,
+            finished_at=failed_at + timedelta(seconds=31),
+            status="succeeded",
+            summary="recovered",
+        )
+
+        store.deliver_signals(now=failed_at + timedelta(seconds=32))
+        publish_runs = store.list_runs(tasks["publish"].id)
+        assert len(publish_runs) == 1
+        assert publish_runs[0].status == "queued"
     finally:
         store.close()
 
@@ -2557,7 +2756,9 @@ def test_workflow_create_materializes_each_step_as_a_task(tmp_path):
         assert result["ok"] is True
         workflow = result["workflow"]
         assert [item["key"] for item in workflow["steps"]] == [
-            "collect", "analyze", "publish",
+            "collect",
+            "analyze",
+            "publish",
         ]
         assert all(item["task_id"] for item in workflow["steps"])
 
@@ -2778,9 +2979,7 @@ def test_workflow_delete_disables_the_steps_and_keeps_the_runs(tmp_path):
 
         assert result["ok"] is True
         assert result["deleted"] is True
-        assert result["disabled_task_ids"] == sorted(
-            task.id for task in tasks.values()
-        )
+        assert result["disabled_task_ids"] == sorted(task.id for task in tasks.values())
         assert store.list_workflows() == []
         # The tasks still exist, but can no longer fire.
         after = {task.id: task for task in store.list_tasks()}
@@ -2941,7 +3140,6 @@ def test_the_delete_tool_refuses_a_live_step_and_takes_an_orphan(tmp_path):
         store.close()
 
 
-
 def test_a_chain_records_the_sentence_that_asked_for_it(tmp_path):
     """A chain, asked for by one sentence, carries that sentence on every step.
 
@@ -2984,7 +3182,10 @@ def test_editing_a_chain_keeps_who_asked_for_it(tmp_path):
         workflow = store.create_workflow(
             Workflow(
                 name="nightly report",
-                steps=[step("collect", trigger=clock()), step("publish", depends_on=["collect"])],
+                steps=[
+                    step("collect", trigger=clock()),
+                    step("publish", depends_on=["collect"]),
+                ],
                 request_quote="每天跑一遍收集和发布这两步",
             )
         )
@@ -3006,5 +3207,105 @@ def test_editing_a_chain_keeps_who_asked_for_it(tmp_path):
         assert reread.request_quote == "每天跑一遍收集和发布这两步"
         assert tasks["collect"].name == "收集（改）"
         assert tasks["collect"].request_quote == "每天跑一遍收集和发布这两步"
+    finally:
+        store.close()
+
+
+TERMINAL_RUN_STATUSES = {"succeeded", "failed", "interrupted", "cancelled"}
+
+
+async def _await_step_runs_settled(store, tasks, *, timeout: float = 8.0) -> None:
+    """Wait until every named step has a run and none of them is still going.
+
+    Polling the rows rather than awaiting an executor-side event, because the
+    interesting failure is "the step never ran at all": an event that is never
+    set would hang, and a hang is not a failing test.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        runs = [store.list_runs(tasks[key].id) for key in ("collect", "analyze", "publish")]
+        if all(run and run[0].status in TERMINAL_RUN_STATUSES for run in runs):
+            return
+        await asyncio.sleep(0.01)
+    settled = {
+        key: [run.status for run in store.list_runs(tasks[key].id)]
+        for key in ("collect", "analyze", "publish")
+    }
+    raise AssertionError(f"steps did not settle within {timeout}s: {settled}")
+
+
+def test_a_step_runs_when_its_upstream_finishes_not_at_the_next_poll(tmp_path):
+    """A hop costs a step, not a poll interval.
+
+    A step's successor is started by a signal, and signals are delivered at the
+    top of a tick -- so with a fixed ``sleep(poll_seconds)`` between ticks, every
+    hop of every chain pays the full interval, on top of whatever the step
+    itself took.  ``poll_seconds`` here is an hour, so the only way ``publish``
+    can run at all is if the loop is woken by ``analyze`` finishing.  The tests
+    above drive ``run_once`` by hand and therefore never exercised the sleep;
+    this timeout is what turns the old behaviour into a failure rather than a
+    hang.
+    """
+    import contextlib
+
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        published = asyncio.Event()
+
+        async def executor(task, run):
+            if task.name == "publish":
+                published.set()
+            return ExecutionResult(
+                summary=f"ran {task.name}", text_output=f"out {task.name}"
+            )
+
+        async def unused(*args, **kwargs):
+            raise AssertionError("system executor should not be called")
+
+        async def delivery(task, run, result):
+            return "delivered"
+
+        async def scenario():
+            service = SchedulerService(
+                store=store,
+                agent_executor=executor,
+                system_executor=unused,
+                delivery=delivery,
+                poll_seconds=3600,
+            )
+            loop_task = asyncio.create_task(service.run_forever())
+            try:
+                await asyncio.wait_for(published.wait(), timeout=8)
+                # ``published`` is set from inside publish's executor, which is
+                # before that run has recorded anything.  Stopping the loop
+                # there would cut the run off mid-bookkeeping -- the status
+                # would say "scheduler stopped" and the assertions below would
+                # be measuring the harness.  Waiting for the rows also makes the
+                # claim stronger: all three steps *succeeded*, and they did it
+                # without a poll.
+                await _await_step_runs_settled(store, tasks)
+            finally:
+                loop_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await loop_task
+                await service.shutdown()
+
+        asyncio.run(scenario())
+
+        for key in ("collect", "analyze", "publish"):
+            runs = store.list_runs(tasks[key].id)
+            assert len(runs) == 1, (
+                f"{key} ran {len(runs)} times: "
+                f"{[(r.id, r.status, r.error) for r in runs]}"
+            )
+            assert runs[0].status == "succeeded", (
+                f"{key} ended {runs[0].status!r}: {runs[0].error!r}"
+            )
     finally:
         store.close()

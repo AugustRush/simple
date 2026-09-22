@@ -13,6 +13,7 @@ from agent import shared
 from .models import (
     ATTENTION_STATUSES,
     DEFAULT_SIGNAL_MAX_DEPTH,
+    RETRYABLE_RUN_STATUSES,
     RUN_SKIPPED_STATUS,
     RUN_SUCCESS_STATUS,
     SIGNAL_MODE_ALL,
@@ -83,6 +84,7 @@ def _run_report_payload(
     status: str,
     workflow_id: str = "",
     step_key: str = "",
+    workflow_run_id: str = "",
     summary: str = "",
     output_path: str = "",
     declares: Any = None,
@@ -115,6 +117,8 @@ def _run_report_payload(
         payload["workflow_id"] = workflow_id
     if step_key:
         payload["step_key"] = step_key
+    if workflow_run_id:
+        payload["workflow_run_id"] = workflow_run_id
     if summary:
         # Long enough to be useful in a notification, short enough that a
         # chatty task cannot turn every downstream run's record into a copy of
@@ -150,8 +154,6 @@ def _run_report_payload(
 #: sweep because it only ever looks at switched-on rows), so including it here
 #: would compare the same thing twice in one place and not at all in the other.
 #:
-#: ``overlap_policy`` and ``missed_run_policy`` are in here for the reason
-#: spelled out above their defaults in ``models``: identity only.
 _TASK_IDENTITY_COLUMNS: tuple[str, ...] = (
     "name",
     "kind",
@@ -160,8 +162,6 @@ _TASK_IDENTITY_COLUMNS: tuple[str, ...] = (
     "delivery_mode",
     "delivery_target_json",
     "model_override",
-    "overlap_policy",
-    "missed_run_policy",
     "workspace_root",
     "context_policy",
     "timeout_seconds",
@@ -213,29 +213,23 @@ def _migrate_to_1(conn: sqlite3.Connection) -> None:
 
 def _migrate_to_2(conn: sqlite3.Connection) -> None:
     task_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
     }
     run_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_task_runs)"
-        ).fetchall()
+        row[1]
+        for row in conn.execute("PRAGMA table_info(scheduled_task_runs)").fetchall()
     }
     additions = {
         "workspace_root": "TEXT NOT NULL DEFAULT ''",
         "context_policy": "TEXT NOT NULL DEFAULT 'stateless'",
         "timeout_seconds": "INTEGER NOT NULL DEFAULT 1800",
         "retry_policy_json": (
-            "TEXT NOT NULL DEFAULT "
-            "'{\"max_attempts\": 1, \"backoff_seconds\": 30}'"
+            'TEXT NOT NULL DEFAULT \'{"max_attempts": 1, "backoff_seconds": 30}\''
         ),
     }
     for name, declaration in additions.items():
         if name not in task_columns:
-            conn.execute(
-                f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}"
-            )
+            conn.execute(f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}")
     run_additions = {
         "config_snapshot_json": "TEXT NOT NULL DEFAULT '{}'",
         "trigger_source": "TEXT NOT NULL DEFAULT 'schedule'",
@@ -251,9 +245,8 @@ def _migrate_to_2(conn: sqlite3.Connection) -> None:
 
 def _migrate_to_3(conn: sqlite3.Connection) -> None:
     run_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_task_runs)"
-        ).fetchall()
+        row[1]
+        for row in conn.execute("PRAGMA table_info(scheduled_task_runs)").fetchall()
     }
     if "retry_of_run_id" not in run_columns:
         conn.execute(
@@ -268,9 +261,7 @@ def _migrate_to_3(conn: sqlite3.Connection) -> None:
 
 def _migrate_to_4(conn: sqlite3.Connection) -> None:
     task_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
     }
     if "selected_skills_json" not in task_columns:
         conn.execute(
@@ -281,9 +272,7 @@ def _migrate_to_4(conn: sqlite3.Connection) -> None:
 
 def _migrate_to_5(conn: sqlite3.Connection) -> None:
     task_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
     }
     if "permission_profile" not in task_columns:
         conn.execute(
@@ -294,15 +283,11 @@ def _migrate_to_5(conn: sqlite3.Connection) -> None:
 
 def _migrate_to_6(conn: sqlite3.Connection) -> None:
     run_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_task_runs)"
-        ).fetchall()
+        row[1]
+        for row in conn.execute("PRAGMA table_info(scheduled_task_runs)").fetchall()
     }
     if "acknowledged_at" not in run_columns:
-        conn.execute(
-            "ALTER TABLE scheduled_task_runs ADD COLUMN "
-            "acknowledged_at TEXT"
-        )
+        conn.execute("ALTER TABLE scheduled_task_runs ADD COLUMN acknowledged_at TEXT")
         # Runs that predate this column were already reported
         # through the run list, which is how the user found out
         # about them.  Backfilling finished runs as seen keeps the
@@ -316,9 +301,8 @@ def _migrate_to_6(conn: sqlite3.Connection) -> None:
 
 def _migrate_to_7(conn: sqlite3.Connection) -> None:
     run_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_task_runs)"
-        ).fetchall()
+        row[1]
+        for row in conn.execute("PRAGMA table_info(scheduled_task_runs)").fetchall()
     }
     if "missed_count" not in run_columns:
         # No backfill: the column is not derivable after the fact,
@@ -342,9 +326,7 @@ def _migrate_to_8(conn: sqlite3.Connection) -> None:
 
 def _migrate_to_9(conn: sqlite3.Connection) -> None:
     task_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
     }
     # Which workflow and which step a task was materialised from.
     # On the task rather than in the graph, because the graph is
@@ -358,9 +340,7 @@ def _migrate_to_9(conn: sqlite3.Connection) -> None:
     }
     for name, declaration in additions.items():
         if name not in task_columns:
-            conn.execute(
-                f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}"
-            )
+            conn.execute(f"ALTER TABLE scheduled_tasks ADD COLUMN {name} {declaration}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_workflow "
         "ON scheduled_tasks(workflow_id, step_key)"
@@ -381,9 +361,7 @@ def _migrate_to_10(conn: sqlite3.Connection) -> None:
     # carried nothing", the honest answer for a round that was
     # recorded before there was anywhere to put it.
     join_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(signal_joins)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(signal_joins)").fetchall()
     }
     if "arrivals_json" not in join_columns:
         conn.execute(
@@ -402,9 +380,7 @@ def _migrate_to_11(conn: sqlite3.Connection) -> None:
     # passed.  Backfilling a pass would invent a verdict nobody
     # ever reached.
     task_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
     }
     if "acceptance_json" not in task_columns:
         conn.execute(
@@ -412,9 +388,8 @@ def _migrate_to_11(conn: sqlite3.Connection) -> None:
             "acceptance_json TEXT NOT NULL DEFAULT ''"
         )
     run_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_task_runs)"
-        ).fetchall()
+        row[1]
+        for row in conn.execute("PRAGMA table_info(scheduled_task_runs)").fetchall()
     }
     for name, declaration in (
         ("verdict", "TEXT NOT NULL DEFAULT ''"),
@@ -422,8 +397,7 @@ def _migrate_to_11(conn: sqlite3.Connection) -> None:
     ):
         if name not in run_columns:
             conn.execute(
-                f"ALTER TABLE scheduled_task_runs ADD COLUMN "
-                f"{name} {declaration}"
+                f"ALTER TABLE scheduled_task_runs ADD COLUMN {name} {declaration}"
             )
 
 
@@ -438,9 +412,7 @@ def _migrate_to_12(conn: sqlite3.Connection) -> None:
     # own name would look exactly like the real thing and would be
     # a lie about who asked.
     task_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
     }
     if "request_quote" not in task_columns:
         conn.execute(
@@ -454,14 +426,11 @@ def _migrate_to_12(conn: sqlite3.Connection) -> None:
     # this exist" with the words that started the whole thing,
     # rather than with the name of the step above it.
     workflow_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(workflows)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(workflows)").fetchall()
     }
     if "request_quote" not in workflow_columns:
         conn.execute(
-            "ALTER TABLE workflows ADD COLUMN "
-            "request_quote TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE workflows ADD COLUMN request_quote TEXT NOT NULL DEFAULT ''"
         )
 
 
@@ -479,9 +448,7 @@ def _migrate_to_13(conn: sqlite3.Connection) -> None:
     # look exactly like a declaration, and be a promise the task
     # never made.
     task_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1] for row in conn.execute("PRAGMA table_info(scheduled_tasks)").fetchall()
     }
     if "produces_json" not in task_columns:
         conn.execute(
@@ -489,15 +456,61 @@ def _migrate_to_13(conn: sqlite3.Connection) -> None:
             "produces_json TEXT NOT NULL DEFAULT '[]'"
         )
     run_columns = {
-        row[1] for row in conn.execute(
-            "PRAGMA table_info(scheduled_task_runs)"
-        ).fetchall()
+        row[1]
+        for row in conn.execute("PRAGMA table_info(scheduled_task_runs)").fetchall()
     }
     if "products_json" not in run_columns:
         conn.execute(
             "ALTER TABLE scheduled_task_runs ADD COLUMN "
             "products_json TEXT NOT NULL DEFAULT '[]'"
         )
+
+
+def _migrate_to_14(conn: sqlite3.Connection) -> None:
+    run_columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(scheduled_task_runs)").fetchall()
+    }
+    if "workflow_run_id" not in run_columns:
+        conn.execute(
+            "ALTER TABLE scheduled_task_runs ADD COLUMN "
+            "workflow_run_id TEXT NOT NULL DEFAULT ''"
+        )
+    workflow_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(workflows)").fetchall()
+    }
+    if "version" not in workflow_columns:
+        conn.execute(
+            "ALTER TABLE workflows ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+        )
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_runs (
+            id TEXT PRIMARY KEY,
+            workflow_id TEXT NOT NULL,
+            definition_version INTEGER NOT NULL,
+            definition_snapshot_json TEXT NOT NULL,
+            trigger_source TEXT NOT NULL,
+            root_task_id TEXT NOT NULL,
+            root_run_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'running',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow
+            ON workflow_runs(workflow_id, created_at);
+        CREATE TABLE IF NOT EXISTS workflow_signal_joins (
+            task_id TEXT NOT NULL,
+            workflow_run_id TEXT NOT NULL,
+            satisfied_json TEXT NOT NULL DEFAULT '[]',
+            arrivals_json TEXT NOT NULL DEFAULT '{}',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(task_id, workflow_run_id)
+        );
+        """
+    )
+
 
 # One entry per schema version.  The driver walks them in order and owns
 # the version bump, so a step only has to do the work.
@@ -515,11 +528,12 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     11: _migrate_to_11,
     12: _migrate_to_12,
     13: _migrate_to_13,
+    14: _migrate_to_14,
 }
 
 
 class SchedulerStore:
-    SCHEMA_VERSION = 13
+    SCHEMA_VERSION = 14
 
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or shared.SCHEDULER_DB_FILE
@@ -599,6 +613,7 @@ class SchedulerStore:
                     attempt INTEGER NOT NULL DEFAULT 1,
                     cancel_requested_at TEXT,
                     retry_of_run_id TEXT NOT NULL DEFAULT '',
+                    workflow_run_id TEXT NOT NULL DEFAULT '',
                     acknowledged_at TEXT,
                     missed_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -648,8 +663,32 @@ class SchedulerStore:
                     enabled INTEGER NOT NULL,
                     graph_json TEXT NOT NULL DEFAULT '{"steps": []}',
                     request_quote TEXT NOT NULL DEFAULT '',
+                    version INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workflow_runs (
+                    id TEXT PRIMARY KEY,
+                    workflow_id TEXT NOT NULL,
+                    definition_version INTEGER NOT NULL,
+                    definition_snapshot_json TEXT NOT NULL,
+                    trigger_source TEXT NOT NULL,
+                    root_task_id TEXT NOT NULL,
+                    root_run_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'running',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    finished_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow
+                    ON workflow_runs(workflow_id, created_at);
+                CREATE TABLE IF NOT EXISTS workflow_signal_joins (
+                    task_id TEXT NOT NULL,
+                    workflow_run_id TEXT NOT NULL,
+                    satisfied_json TEXT NOT NULL DEFAULT '[]',
+                    arrivals_json TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, workflow_run_id)
                 );
                 """
             )
@@ -685,8 +724,6 @@ class SchedulerStore:
             delivery_mode=row["delivery_mode"],
             delivery_target=DeliveryTarget.from_json(row["delivery_target_json"]),
             model_override=row["model_override"],
-            overlap_policy=row["overlap_policy"],
-            missed_run_policy=row["missed_run_policy"],
             workspace_root=row["workspace_root"],
             context_policy=row["context_policy"],
             timeout_seconds=int(row["timeout_seconds"]),
@@ -727,6 +764,7 @@ class SchedulerStore:
             attempt=int(row["attempt"]),
             cancel_requested_at=_dt(row["cancel_requested_at"]),
             retry_of_run_id=row["retry_of_run_id"],
+            workflow_run_id=row["workflow_run_id"],
             acknowledged_at=_dt(row["acknowledged_at"]),
             missed_count=int(row["missed_count"] or 0),
             created_at=_dt(row["created_at"]),
@@ -817,8 +855,8 @@ class SchedulerStore:
                 task.delivery_mode,
                 task.delivery_target.to_json(),
                 task.model_override,
-                task.overlap_policy,
-                task.missed_run_policy,
+                "forbid_overlap",
+                "coalesce",
                 task.workspace_root,
                 task.context_policy,
                 int(task.timeout_seconds),
@@ -853,8 +891,6 @@ class SchedulerStore:
             task.delivery_mode,
             task.delivery_target.to_json(),
             task.model_override,
-            task.overlap_policy,
-            task.missed_run_policy,
             task.workspace_root,
             task.context_policy,
             int(task.timeout_seconds),
@@ -882,9 +918,7 @@ class SchedulerStore:
     def find_matching_task(self, task: NewScheduledTask) -> Optional[ScheduledTask]:
         clauses = []
         params: list[Any] = []
-        for column, value in zip(
-            _TASK_IDENTITY_COLUMNS, self._identity_values(task)
-        ):
+        for column, value in zip(_TASK_IDENTITY_COLUMNS, self._identity_values(task)):
             if column == "model_override":
                 # `= NULL` matches nothing, and "no model override" is a value
                 # this identity has to compare like any other.
@@ -905,9 +939,7 @@ class SchedulerStore:
         return self._task_from_row(row) if row else None
 
     @_synchronized
-    def disable_duplicate_enabled_tasks(
-        self, now: Optional[datetime] = None
-    ) -> int:
+    def disable_duplicate_enabled_tasks(self, now: Optional[datetime] = None) -> int:
         rows = self._conn.execute(
             """
             SELECT * FROM scheduled_tasks
@@ -1170,9 +1202,8 @@ class SchedulerStore:
             return ""
         task_id, status = parsed
         if status not in TERMINAL_RUN_STATUSES:
-            return (
-                f"运行不会以「{status}」结束；可用的状态："
-                + "、".join(TERMINAL_RUN_STATUSES)
+            return f"运行不会以「{status}」结束；可用的状态：" + "、".join(
+                TERMINAL_RUN_STATUSES
             )
         if self.get_task(task_id) is None:
             return f"找不到 id 为 {task_id} 的任务"
@@ -1204,10 +1235,23 @@ class SchedulerStore:
                 subscribers.append(task)
         return subscribers
 
-    def _satisfied_joins(self, task_id: str) -> set[str]:
-        row = self._conn.execute(
-            "SELECT satisfied_json FROM signal_joins WHERE task_id = ?", (task_id,)
-        ).fetchone()
+    @staticmethod
+    def _emission_workflow_run_id(emission: SignalEmission) -> str:
+        return str(emission.payload.get("workflow_run_id", "") or "").strip()
+
+    def _satisfied_joins(self, task_id: str, workflow_run_id: str = "") -> set[str]:
+        if workflow_run_id:
+            row = self._conn.execute(
+                """
+                SELECT satisfied_json FROM workflow_signal_joins
+                WHERE task_id = ? AND workflow_run_id = ?
+                """,
+                (task_id, workflow_run_id),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT satisfied_json FROM signal_joins WHERE task_id = ?", (task_id,)
+            ).fetchone()
         if row is None:
             return set()
         try:
@@ -1247,7 +1291,8 @@ class SchedulerStore:
         Caller owns the transaction.
         """
         required = set(signal_names(task.trigger))
-        satisfied = self._satisfied_joins(task.id)
+        workflow_run_id = self._emission_workflow_run_id(emission)
+        satisfied = self._satisfied_joins(task.id, workflow_run_id)
         satisfied.add(emission.name)
         # Intersected with what this join actually waits for, so a name that
         # this task is not subscribed to can never contribute to completing it.
@@ -1263,36 +1308,66 @@ class SchedulerStore:
         # no longer above it, and read output from a round that is over.
         arrivals = {
             name: payload
-            for name, payload in self._join_arrivals(task.id).items()
+            for name, payload in self._join_arrivals(task.id, workflow_run_id).items()
             if name in required
         }
         if emission.name in required:
             arrivals[emission.name] = dict(emission.payload)
-        self._conn.execute(
-            """
-            INSERT INTO signal_joins (
-                task_id, satisfied_json, arrivals_json, updated_at
+        if workflow_run_id:
+            self._conn.execute(
+                """
+                INSERT INTO workflow_signal_joins (
+                    task_id, workflow_run_id, satisfied_json, arrivals_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, workflow_run_id) DO UPDATE SET
+                    satisfied_json = excluded.satisfied_json,
+                    arrivals_json = excluded.arrivals_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task.id,
+                    workflow_run_id,
+                    json.dumps(sorted(satisfied), ensure_ascii=False),
+                    json.dumps(arrivals, ensure_ascii=False),
+                    _iso(now),
+                ),
             )
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(task_id) DO UPDATE SET
-                satisfied_json = excluded.satisfied_json,
-                arrivals_json = excluded.arrivals_json,
-                updated_at = excluded.updated_at
-            """,
-            (
-                task.id,
-                json.dumps(sorted(satisfied), ensure_ascii=False),
-                json.dumps(arrivals, ensure_ascii=False),
-                _iso(now),
-            ),
-        )
+        else:
+            self._conn.execute(
+                """
+                INSERT INTO signal_joins (
+                    task_id, satisfied_json, arrivals_json, updated_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    satisfied_json = excluded.satisfied_json,
+                    arrivals_json = excluded.arrivals_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    task.id,
+                    json.dumps(sorted(satisfied), ensure_ascii=False),
+                    json.dumps(arrivals, ensure_ascii=False),
+                    _iso(now),
+                ),
+            )
         return missing
 
-    def _join_arrivals(self, task_id: str) -> dict[str, dict[str, Any]]:
+    def _join_arrivals(
+        self, task_id: str, workflow_run_id: str = ""
+    ) -> dict[str, dict[str, Any]]:
         """The payloads a join has collected since its last completed round."""
-        row = self._conn.execute(
-            "SELECT arrivals_json FROM signal_joins WHERE task_id = ?", (task_id,)
-        ).fetchone()
+        if workflow_run_id:
+            row = self._conn.execute(
+                """
+                SELECT arrivals_json FROM workflow_signal_joins
+                WHERE task_id = ? AND workflow_run_id = ?
+                """,
+                (task_id, workflow_run_id),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT arrivals_json FROM signal_joins WHERE task_id = ?", (task_id,)
+            ).fetchone()
         if row is None:
             return {}
         try:
@@ -1322,13 +1397,29 @@ class SchedulerStore:
             if signal_mode(trigger) == SIGNAL_MODE_ALL:
                 required = signal_names(trigger)
         satisfied = self._satisfied_joins(task_id)
+        if not satisfied:
+            latest_workflow_round = self._conn.execute(
+                """
+                SELECT workflow_run_id FROM workflow_signal_joins
+                WHERE task_id = ?
+                ORDER BY updated_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if latest_workflow_round is not None:
+                satisfied = self._satisfied_joins(
+                    task_id, str(latest_workflow_round["workflow_run_id"])
+                )
         return {
             "required": required,
             "satisfied": sorted(satisfied),
             "missing": [name for name in required if name not in satisfied],
         }
 
-    def _take_join(self, task_id: str) -> dict[str, dict[str, Any]]:
+    def _take_join(
+        self, task_id: str, workflow_run_id: str = ""
+    ) -> dict[str, dict[str, Any]]:
         """Read a join's collected arrivals, then spend them.  Caller owns the txn.
 
         Read-and-delete in one call because the two are never wanted apart: an
@@ -1336,8 +1427,15 @@ class SchedulerStore:
         later round, and one spent without being read is exactly the loss this
         column exists to fix.
         """
-        arrivals = self._join_arrivals(task_id)
-        self._conn.execute("DELETE FROM signal_joins WHERE task_id = ?", (task_id,))
+        arrivals = self._join_arrivals(task_id, workflow_run_id)
+        if workflow_run_id:
+            self._conn.execute(
+                "DELETE FROM workflow_signal_joins "
+                "WHERE task_id = ? AND workflow_run_id = ?",
+                (task_id, workflow_run_id),
+            )
+        else:
+            self._conn.execute("DELETE FROM signal_joins WHERE task_id = ?", (task_id,))
         return arrivals
 
     def _record_delivery(
@@ -1359,18 +1457,102 @@ class SchedulerStore:
             (_new_id(), emission_id, task_id, run_id, outcome, reason, _iso(now)),
         )
 
-    def _pending_run_for(self, task_id: str) -> Optional[str]:
+    def _pending_run_for(
+        self, task_id: str, workflow_run_id: str = ""
+    ) -> Optional[str]:
         """The run already waiting for, or running, this task, if any."""
+        workflow_clause = ""
+        params: list[Any] = [task_id]
+        if workflow_run_id:
+            workflow_clause = " AND workflow_run_id = ?"
+            params.append(workflow_run_id)
         row = self._conn.execute(
-            """
+            f"""
             SELECT id FROM scheduled_task_runs
             WHERE task_id = ? AND status IN ('queued', 'running')
+              {workflow_clause}
             ORDER BY created_at ASC
             LIMIT 1
             """,
-            (task_id,),
+            params,
         ).fetchone()
         return row["id"] if row else None
+
+    def _prepare_workflow_run(
+        self,
+        task: ScheduledTask,
+        run_id: str,
+        snapshot: dict[str, Any],
+        *,
+        now: datetime,
+        trigger_source: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Attach a run to one durable workflow execution.
+
+        A downstream signal carries the id created by the entry step.  A
+        manual, scheduled or external-signal entry has no such parent, so its
+        own run id becomes the workflow-run id.  The workflow graph is copied
+        at that boundary; later edits therefore cannot rewrite what this
+        execution means.
+        """
+        prepared = dict(snapshot or {})
+        if not task.workflow_id:
+            return prepared, ""
+        inherited = str(prepared.get("workflow_run_id", "") or "").strip()
+        signal = prepared.get("signal")
+        if not inherited and isinstance(signal, dict):
+            payload = signal.get("payload")
+            if isinstance(payload, dict):
+                same_workflow = str(payload.get("workflow_id", "") or "")
+                if same_workflow == task.workflow_id:
+                    inherited = str(payload.get("workflow_run_id", "") or "").strip()
+            # A free-form signal may start several entry branches without a
+            # task payload.  Its cascade origin is the one shared durable id
+            # all of those branches already carry, so it is also the natural
+            # workflow execution id.
+            if not inherited:
+                inherited = str(signal.get("origin_id", "") or "").strip()
+        workflow_run_id = inherited or run_id
+        workflow_row = self._conn.execute(
+            "SELECT graph_json, version FROM workflows WHERE id = ?",
+            (task.workflow_id,),
+        ).fetchone()
+        if workflow_row is None:
+            return prepared, ""
+        version = max(1, int(workflow_row["version"] or 1))
+        workflow_meta = prepared.get("workflow")
+        workflow_meta = dict(workflow_meta) if isinstance(workflow_meta, dict) else {}
+        workflow_meta.update(
+            {
+                "workflow_id": task.workflow_id,
+                "step_key": task.step_key,
+                "workflow_run_id": workflow_run_id,
+                "definition_version": version,
+            }
+        )
+        prepared["workflow"] = workflow_meta
+        prepared["workflow_run_id"] = workflow_run_id
+        self._conn.execute(
+            """
+            INSERT OR IGNORE INTO workflow_runs (
+                id, workflow_id, definition_version, definition_snapshot_json,
+                trigger_source, root_task_id, root_run_id, status,
+                created_at, updated_at, finished_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?, ?, NULL)
+            """,
+            (
+                workflow_run_id,
+                task.workflow_id,
+                version,
+                str(workflow_row["graph_json"] or "{}"),
+                trigger_source,
+                task.id,
+                run_id,
+                _iso(now),
+                _iso(now),
+            ),
+        )
+        return prepared, workflow_run_id
 
     def _enqueue_signal_run_in_transaction(
         self,
@@ -1416,15 +1598,22 @@ class SchedulerStore:
             if arrivals
             else [{"name": emission.name, "payload": dict(emission.payload)}]
         )
+        snapshot, workflow_run_id = self._prepare_workflow_run(
+            task,
+            run_id,
+            snapshot,
+            now=now,
+            trigger_source=f"signal:{emission.name}",
+        )
         self._conn.execute(
             """
             INSERT INTO scheduled_task_runs (
                 id, task_id, scheduled_for, started_at, finished_at, status,
                 summary, error, output_path, delivery_status,
                 config_snapshot_json, trigger_source, attempt,
-                missed_count, created_at, updated_at
+                workflow_run_id, missed_count, created_at, updated_at
             ) VALUES (?, ?, ?, ?, NULL, 'queued', '', '', '', '', ?,
-                      ?, 1, 0, ?, ?)
+                      ?, 1, ?, 0, ?, ?)
             """,
             (
                 run_id,
@@ -1433,6 +1622,7 @@ class SchedulerStore:
                 _iso(now),
                 json.dumps(snapshot, ensure_ascii=False),
                 f"signal:{emission.name}",
+                workflow_run_id,
                 _iso(now),
                 _iso(now),
             ),
@@ -1519,6 +1709,7 @@ class SchedulerStore:
                 waiting_on: list[str] = []
                 for task in subscribers:
                     arrivals: dict[str, dict[str, Any]] = {}
+                    workflow_run_id = self._emission_workflow_run_id(emission)
                     if signal_mode(task.trigger) == SIGNAL_MODE_ALL:
                         # A join records this arrival and runs only when the
                         # last one shows up.  Landing here without a run is the
@@ -1556,8 +1747,8 @@ class SchedulerStore:
                         # chance to hand them on.  A round that coalesces into
                         # an in-flight run drops them, which is what the
                         # ``coalesced`` reason below already says.
-                        arrivals = self._take_join(task.id)
-                    pending = self._pending_run_for(task.id)
+                        arrivals = self._take_join(task.id, workflow_run_id)
+                    pending = self._pending_run_for(task.id, workflow_run_id)
                     if pending:
                         # Already something to do.  For a signal that repeats
                         # -- "data.ready" while the report is still being
@@ -1709,7 +1900,8 @@ class SchedulerStore:
         which is what makes it the readable start of a cascade.
         """
         row = self._conn.execute(
-            "SELECT config_snapshot_json FROM scheduled_task_runs WHERE id = ?",
+            "SELECT config_snapshot_json, workflow_run_id "
+            "FROM scheduled_task_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
         snapshot: dict[str, Any] = {}
@@ -1722,6 +1914,10 @@ class SchedulerStore:
                 snapshot = decoded
         parent = snapshot.get("signal")
         parent = parent if isinstance(parent, dict) else {}
+        workflow_snapshot = snapshot.get("workflow")
+        workflow_snapshot = (
+            workflow_snapshot if isinstance(workflow_snapshot, dict) else {}
+        )
         task_row = self._conn.execute(
             "SELECT name, workflow_id, step_key, produces_json "
             "FROM scheduled_tasks WHERE id = ?",
@@ -1740,15 +1936,26 @@ class SchedulerStore:
             run_id=run_id,
             status=status,
             workflow_id=(
-                str(task_row["workflow_id"] or "") if task_row is not None else ""
+                str(workflow_snapshot.get("workflow_id", "") or "")
+                or (str(task_row["workflow_id"] or "") if task_row is not None else "")
             ),
-            step_key=str(task_row["step_key"] or "") if task_row is not None else "",
+            step_key=(
+                str(workflow_snapshot.get("step_key", "") or "")
+                or (str(task_row["step_key"] or "") if task_row is not None else "")
+            ),
+            workflow_run_id=str(row["workflow_run_id"] or "")
+            if row is not None
+            else "",
             summary=summary,
             output_path=str(output_path or ""),
             declares=(
-                json.loads(task_row["produces_json"] or "[]")
-                if task_row is not None
-                else []
+                snapshot.get("produces", [])
+                if isinstance(snapshot.get("produces"), list)
+                else (
+                    json.loads(task_row["produces_json"] or "[]")
+                    if task_row is not None
+                    else []
+                )
             ),
             products=(
                 json.loads(products_row["products_json"] or "[]")
@@ -1814,9 +2021,7 @@ class SchedulerStore:
         return {row["task_id"]: int(row["total"]) for row in rows}
 
     @_synchronized
-    def unacknowledged_attention_runs(
-        self, limit: int = 200
-    ) -> list[TaskRun]:
+    def unacknowledged_attention_runs(self, limit: int = 200) -> list[TaskRun]:
         """The runs nobody has looked at yet, newest first.
 
         The list behind :meth:`unacknowledged_attention_counts`, and the two
@@ -2044,8 +2249,8 @@ class SchedulerStore:
                 task.delivery_mode,
                 task.delivery_target.to_json(),
                 task.model_override,
-                task.overlap_policy,
-                task.missed_run_policy,
+                "forbid_overlap",
+                "coalesce",
                 task.workspace_root,
                 task.context_policy,
                 int(task.timeout_seconds),
@@ -2162,14 +2367,21 @@ class SchedulerStore:
                     {"name": name, "payload": payload}
                     for name, payload in sorted(arrivals.items())
                 ]
+        snapshot, workflow_run_id = self._prepare_workflow_run(
+            task,
+            run_id,
+            snapshot,
+            now=now,
+            trigger_source=trigger_source,
+        )
         self._conn.execute(
             """
             INSERT INTO scheduled_task_runs (
                 id, task_id, scheduled_for, started_at, finished_at, status,
                 summary, error, output_path, delivery_status,
                 config_snapshot_json, trigger_source, attempt,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, ?, ?, ?, ?)
+                workflow_run_id, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -2179,6 +2391,7 @@ class SchedulerStore:
                 json.dumps(snapshot, ensure_ascii=False),
                 trigger_source,
                 max(1, int(attempt)),
+                workflow_run_id,
                 _iso(now),
                 _iso(now),
             ),
@@ -2212,6 +2425,7 @@ class SchedulerStore:
                 config_snapshot=snapshot,
                 trigger_source=trigger_source,
                 attempt=max(1, int(attempt)),
+                workflow_run_id=workflow_run_id,
                 created_at=now,
                 updated_at=now,
             ),
@@ -2276,7 +2490,9 @@ class SchedulerStore:
                 return None
             task = self._task_from_row(task_row)
             source = self._run_from_row(source_row)
-            snapshot = execution_snapshot(task) if use_latest else source.config_snapshot
+            snapshot = (
+                execution_snapshot(task) if use_latest else source.config_snapshot
+            )
             if not snapshot:
                 snapshot = execution_snapshot(task)
             return self._claim_task_in_transaction(
@@ -2304,6 +2520,19 @@ class SchedulerStore:
                 (_iso(requested_at), _iso(requested_at), run_id, task_id),
             )
         return cursor.rowcount == 1
+
+    @_synchronized
+    def cancel_requested(self, task_id: str, run_id: str) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1 FROM scheduled_task_runs
+            WHERE id = ? AND task_id = ? AND status = 'running'
+              AND cancel_requested_at IS NOT NULL
+            LIMIT 1
+            """,
+            (run_id, task_id),
+        ).fetchone()
+        return row is not None
 
     @_synchronized
     def enqueue_retry(
@@ -2342,9 +2571,10 @@ class SchedulerStore:
                     id, task_id, scheduled_for, started_at, finished_at, status,
                     summary, error, output_path, delivery_status,
                     config_snapshot_json, trigger_source, attempt,
-                    cancel_requested_at, retry_of_run_id, created_at, updated_at
+                    cancel_requested_at, retry_of_run_id, workflow_run_id,
+                    created_at, updated_at
                 ) VALUES (?, ?, ?, ?, NULL, 'queued', '', '', '', '', ?,
-                          'automatic_retry', ?, NULL, ?, ?, ?)
+                          'automatic_retry', ?, NULL, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -2354,6 +2584,7 @@ class SchedulerStore:
                     json.dumps(source.config_snapshot, ensure_ascii=False),
                     source.attempt + 1,
                     source_run_id,
+                    source.workflow_run_id,
                     _iso(datetime.now(UTC)),
                     _iso(datetime.now(UTC)),
                 ),
@@ -2448,21 +2679,29 @@ class SchedulerStore:
                 # schedule.
                 missed_count = task.trigger.count_missed(scheduled_for, next_run_at)
                 lease_until = now + timedelta(seconds=lease_seconds)
+                snapshot, workflow_run_id = self._prepare_workflow_run(
+                    task,
+                    run_id,
+                    execution_snapshot(task),
+                    now=started_at,
+                    trigger_source="schedule",
+                )
                 self._conn.execute(
                     """
                     INSERT INTO scheduled_task_runs (
                         id, task_id, scheduled_for, started_at, finished_at, status,
                         summary, error, output_path, delivery_status,
                         config_snapshot_json, trigger_source, attempt,
-                        missed_count, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, 'schedule', 1, ?, ?, ?)
+                        workflow_run_id, missed_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, 'running', '', '', '', '', ?, 'schedule', 1, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
                         task.id,
                         _iso(task.next_run_at),
                         _iso(started_at),
-                        json.dumps(execution_snapshot(task), ensure_ascii=False),
+                        json.dumps(snapshot, ensure_ascii=False),
+                        workflow_run_id,
                         int(missed_count),
                         _iso(started_at),
                         _iso(started_at),
@@ -2494,7 +2733,9 @@ class SchedulerStore:
                 refreshed_row = self._conn.execute(
                     "SELECT * FROM scheduled_tasks WHERE id = ?", (task.id,)
                 ).fetchone()
-                refreshed = self._task_from_row(refreshed_row) if refreshed_row else None
+                refreshed = (
+                    self._task_from_row(refreshed_row) if refreshed_row else None
+                )
                 assert refreshed is not None
                 # Built by hand rather than re-read, so every field the row got
                 # has to be repeated here: one that is left out silently reads
@@ -2559,9 +2800,13 @@ class SchedulerStore:
             if cursor.rowcount != 1:
                 continue
             self._conn.execute(
-                    """
+                """
                     UPDATE scheduled_task_runs
-                    SET status = 'interrupted', finished_at = ?, updated_at = ?
+                    SET status = CASE
+                            WHEN cancel_requested_at IS NOT NULL THEN 'cancelled'
+                            ELSE 'interrupted'
+                        END,
+                        finished_at = ?, updated_at = ?
                     WHERE id = ? AND task_id = ? AND status = 'running'
                     """,
                 (
@@ -2658,9 +2903,7 @@ class SchedulerStore:
         return True
 
     @_synchronized
-    def owns_unexpired_lease(
-        self, task_id: str, run_id: str, *, now: datetime
-    ) -> bool:
+    def owns_unexpired_lease(self, task_id: str, run_id: str, *, now: datetime) -> bool:
         now = now.astimezone(UTC)
         row = self._conn.execute(
             """
@@ -2685,6 +2928,8 @@ class SchedulerStore:
         step_key: str,
         status: str,
         finished_at: datetime,
+        workflow_run_id: str = "",
+        workflow_steps: Optional[list[WorkflowStep]] = None,
     ) -> list[str]:
         """Record the steps this failure blocks as skipped.  Caller owns the txn.
 
@@ -2709,9 +2954,10 @@ class SchedulerStore:
         if status == RUN_SUCCESS_STATUS:
             return []
         workflow = self.get_workflow(workflow_id)
-        if workflow is None:
+        steps = workflow_steps or (workflow.steps if workflow is not None else [])
+        if not steps:
             return []
-        blocked_keys = workflow_downstream_steps(workflow.steps, step_key)
+        blocked_keys = workflow_downstream_steps(steps, step_key)
         if not blocked_keys:
             return []
         reason = (
@@ -2719,7 +2965,7 @@ class SchedulerStore:
             "因此没有运行"
         )
         skipped: list[str] = []
-        for step in workflow.steps:
+        for step in steps:
             key = str(step.key).strip()
             if key not in blocked_keys:
                 continue
@@ -2734,7 +2980,18 @@ class SchedulerStore:
             if row is None:
                 continue
             blocked_task_id = row["id"]
-            if self._pending_run_for(blocked_task_id):
+            if workflow_run_id:
+                existing = self._conn.execute(
+                    """
+                    SELECT id FROM scheduled_task_runs
+                    WHERE task_id = ? AND workflow_run_id = ?
+                    LIMIT 1
+                    """,
+                    (blocked_task_id, workflow_run_id),
+                ).fetchone()
+                if existing is not None:
+                    continue
+            if self._pending_run_for(blocked_task_id, workflow_run_id):
                 continue
             run_id = _new_id()
             snapshot = {
@@ -2751,8 +3008,8 @@ class SchedulerStore:
                     id, task_id, scheduled_for, started_at, finished_at, status,
                     summary, error, output_path, delivery_status,
                     config_snapshot_json, trigger_source, attempt,
-                    missed_count, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, 1, 0, ?, ?)
+                    workflow_run_id, missed_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, '', '', '', ?, ?, 1, ?, 0, ?, ?)
                 """,
                 (
                     run_id,
@@ -2764,6 +3021,7 @@ class SchedulerStore:
                     reason,
                     json.dumps(snapshot, ensure_ascii=False),
                     f"workflow:{step_key}",
+                    workflow_run_id,
                     _iso(finished_at),
                     _iso(finished_at),
                 ),
@@ -2782,6 +3040,63 @@ class SchedulerStore:
             skipped.append(blocked_task_id)
         return skipped
 
+    def _workflow_run_steps(self, workflow_run_id: str) -> list[WorkflowStep]:
+        if not workflow_run_id:
+            return []
+        row = self._conn.execute(
+            "SELECT definition_snapshot_json FROM workflow_runs WHERE id = ?",
+            (workflow_run_id,),
+        ).fetchone()
+        if row is None:
+            return []
+        try:
+            return Workflow.from_graph(row["definition_snapshot_json"]).steps
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+
+    def _settle_workflow_run(self, workflow_run_id: str, now: datetime) -> None:
+        """Roll up a workflow execution once every reachable step is settled."""
+        if not workflow_run_id:
+            return
+        definition_steps = self._workflow_run_steps(workflow_run_id)
+        if not definition_steps:
+            return
+        rows = self._conn.execute(
+            """
+            SELECT r.status, t.step_key
+            FROM scheduled_task_runs r
+            JOIN scheduled_tasks t ON t.id = r.task_id
+            WHERE r.workflow_run_id = ? AND t.step_key != ''
+            ORDER BY r.created_at DESC, r.rowid DESC
+            """,
+            (workflow_run_id,),
+        ).fetchall()
+        latest: dict[str, str] = {}
+        for row in rows:
+            latest.setdefault(str(row["step_key"]), str(row["status"]))
+        if not latest:
+            return
+        expected: set[str] = set(latest)
+        for step_key in tuple(latest):
+            expected.update(workflow_downstream_steps(definition_steps, step_key))
+        if any(key not in latest for key in expected):
+            return
+        if any(latest[key] in {"queued", "running"} for key in expected):
+            return
+        status = (
+            RUN_SUCCESS_STATUS
+            if all(latest[key] == RUN_SUCCESS_STATUS for key in expected)
+            else "failed"
+        )
+        self._conn.execute(
+            """
+            UPDATE workflow_runs
+            SET status = ?, updated_at = ?, finished_at = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (status, _iso(now), _iso(now), workflow_run_id),
+        )
+
     @_synchronized
     def complete_run(
         self,
@@ -2797,8 +3112,10 @@ class SchedulerStore:
         verdict: str = "",
         verification: Any = None,
         products: Any = None,
+        retry_at: Optional[datetime] = None,
     ) -> bool:
         finished_at = finished_at.astimezone(UTC)
+        retry_at = retry_at.astimezone(UTC) if retry_at is not None else None
         with self._immediate_transaction():
             task_cursor = self._conn.execute(
                 """
@@ -2853,28 +3170,87 @@ class SchedulerStore:
             )
             if run_cursor.rowcount != 1:
                 raise RuntimeError("owned scheduler run disappeared during completion")
+            retry_queued = False
+            if retry_at is not None and status in RETRYABLE_RUN_STATUSES:
+                source_row = self._conn.execute(
+                    "SELECT * FROM scheduled_task_runs WHERE id = ? AND task_id = ?",
+                    (run_id, task_id),
+                ).fetchone()
+                if source_row is None:
+                    raise RuntimeError(
+                        "completed scheduler run disappeared before retry"
+                    )
+                source = self._run_from_row(source_row)
+                retry_id = _new_id()
+                created_at = datetime.now(UTC)
+                self._conn.execute(
+                    """
+                    INSERT INTO scheduled_task_runs (
+                        id, task_id, scheduled_for, started_at, finished_at, status,
+                        summary, error, output_path, delivery_status,
+                        config_snapshot_json, trigger_source, attempt,
+                        cancel_requested_at, retry_of_run_id, workflow_run_id,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, NULL, 'queued', '', '', '', '', ?,
+                              'automatic_retry', ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        retry_id,
+                        task_id,
+                        _iso(source.scheduled_for),
+                        _iso(retry_at),
+                        json.dumps(source.config_snapshot, ensure_ascii=False),
+                        source.attempt + 1,
+                        run_id,
+                        source.workflow_run_id,
+                        _iso(created_at),
+                        _iso(created_at),
+                    ),
+                )
+                retry_queued = True
             # Inside the same transaction as the status, deliberately.  If the
             # two could commit separately, a crash between them would leave a
             # task that visibly succeeded while whatever was waiting on it
             # waits forever -- the exact failure that is hardest to notice.
-            self._emit_run_signal(
-                task_id, run_id, status, finished_at, summary, output_path
-            )
+            # A failed attempt with a durable retry queued is not the task's
+            # terminal outcome.  Publishing it would make subscribers and
+            # workflow descendants act on a failure that the retry policy says
+            # is still in progress.
+            if not retry_queued:
+                self._emit_run_signal(
+                    task_id, run_id, status, finished_at, summary, output_path
+                )
             # Same reasoning, one step further: a step that did not do its work
             # cannot unblock the steps below it, and their run will never
             # happen.  Recorded here, with the status, so no control path can
             # finish a step without the steps it blocks being settled.
             membership = self._conn.execute(
-                "SELECT workflow_id, step_key FROM scheduled_tasks WHERE id = ?",
-                (task_id,),
+                """
+                SELECT t.workflow_id, t.step_key, r.workflow_run_id
+                FROM scheduled_tasks t
+                JOIN scheduled_task_runs r ON r.id = ? AND r.task_id = t.id
+                WHERE t.id = ?
+                """,
+                (run_id, task_id),
             ).fetchone()
-            if membership is not None and membership["workflow_id"]:
+            if (
+                not retry_queued
+                and membership is not None
+                and membership["workflow_id"]
+            ):
+                workflow_run_id = str(membership["workflow_run_id"] or "")
                 self._skip_blocked_steps_in_transaction(
                     membership["workflow_id"],
                     str(membership["step_key"] or ""),
                     status,
                     finished_at,
+                    workflow_run_id,
+                    self._workflow_run_steps(workflow_run_id),
                 )
+            self._settle_workflow_run(
+                str(membership["workflow_run_id"] or "") if membership else "",
+                finished_at,
+            )
         return True
 
     def _live_workflow_step(self, task: ScheduledTask) -> bool:
@@ -2944,8 +3320,9 @@ class SchedulerStore:
             )
             # Same reasoning for a half-satisfied join: it is this task's own
             # progress, and it is meaningless without the task.
+            self._conn.execute("DELETE FROM signal_joins WHERE task_id = ?", (task_id,))
             self._conn.execute(
-                "DELETE FROM signal_joins WHERE task_id = ?", (task_id,)
+                "DELETE FROM workflow_signal_joins WHERE task_id = ?", (task_id,)
             )
             self._conn.execute(
                 "DELETE FROM scheduled_task_runs WHERE task_id = ?", (task_id,)
@@ -2975,6 +3352,7 @@ class SchedulerStore:
             request_quote=row["request_quote"] or "",
             created_at=_dt(row["created_at"]),
             updated_at=_dt(row["updated_at"]),
+            version=max(1, int(row["version"] or 1)),
         )
 
     def _validate_graph(self, steps: list[WorkflowStep]) -> list[str]:
@@ -3015,8 +3393,8 @@ class SchedulerStore:
                 """
                 INSERT INTO workflows (
                     id, name, description, enabled, graph_json,
-                    request_quote, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    request_quote, version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
                 """,
                 (
                     workflow_id,
@@ -3070,6 +3448,16 @@ class SchedulerStore:
         """
         if self.get_workflow(workflow_id) is None:
             return None
+        active = self._conn.execute(
+            """
+            SELECT id FROM workflow_runs
+            WHERE workflow_id = ? AND status = 'running'
+            LIMIT 1
+            """,
+            (workflow_id,),
+        ).fetchone()
+        if active is not None:
+            raise ValueError("workflow 仍有执行中的轮次，需等待完成或取消后再修改定义")
         self._validate_graph(workflow.steps)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
         with self._immediate_transaction():
@@ -3082,7 +3470,7 @@ class SchedulerStore:
                 """
                 UPDATE workflows
                 SET name = ?, description = ?, enabled = ?, graph_json = ?,
-                    updated_at = ?
+                    version = version + 1, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -3095,9 +3483,7 @@ class SchedulerStore:
                 ),
             )
             if materialize:
-                self._materialize_workflow_in_transaction(
-                    workflow_id, now=updated_at
-                )
+                self._materialize_workflow_in_transaction(workflow_id, now=updated_at)
         return self.get_workflow(workflow_id)
 
     @_synchronized
@@ -3125,6 +3511,34 @@ class SchedulerStore:
         now_dt = (now or datetime.now(UTC)).astimezone(UTC)
         disabled = [task.id for task in self.step_tasks(workflow_id).values()]
         with self._immediate_transaction():
+            if disabled:
+                placeholders = ", ".join("?" for _ in disabled)
+                self._conn.execute(
+                    f"""
+                    UPDATE scheduled_task_runs
+                    SET status = 'cancelled', finished_at = ?, updated_at = ?,
+                        error = CASE WHEN error = '' THEN 'workflow deleted' ELSE error END
+                    WHERE task_id IN ({placeholders}) AND status = 'queued'
+                    """,
+                    (_iso(now_dt), _iso(now_dt), *disabled),
+                )
+                self._conn.execute(
+                    f"""
+                    UPDATE scheduled_task_runs
+                    SET cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                        updated_at = ?
+                    WHERE task_id IN ({placeholders}) AND status = 'running'
+                    """,
+                    (_iso(now_dt), _iso(now_dt), *disabled),
+                )
+            self._conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status = 'cancelled', updated_at = ?, finished_at = ?
+                WHERE workflow_id = ? AND status = 'running'
+                """,
+                (_iso(now_dt), _iso(now_dt), workflow_id),
+            )
             for task_id in disabled:
                 self._conn.execute(
                     """
@@ -3136,6 +3550,9 @@ class SchedulerStore:
                 )
                 self._conn.execute(
                     "DELETE FROM signal_joins WHERE task_id = ?", (task_id,)
+                )
+                self._conn.execute(
+                    "DELETE FROM workflow_signal_joins WHERE task_id = ?", (task_id,)
                 )
             self._conn.execute("DELETE FROM workflows WHERE id = ?", (workflow_id,))
         return sorted(disabled)
@@ -3173,9 +3590,11 @@ class SchedulerStore:
         inherited = ""
         for key in order:
             step = by_key.get(key)
-            if step is not None and step.is_entry() and str(
-                step.workspace_root or ""
-            ).strip():
+            if (
+                step is not None
+                and step.is_entry()
+                and str(step.workspace_root or "").strip()
+            ):
                 inherited = str(
                     Path(step.workspace_root).expanduser().resolve(strict=False)
                 )

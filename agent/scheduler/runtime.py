@@ -61,10 +61,16 @@ class SchedulerService:
         if self.lease_seconds < 3:
             raise ValueError("lease_seconds must be at least 3")
         self.max_concurrent_runs = max(1, int(max_concurrent_runs))
+        self._run_semaphore = asyncio.Semaphore(self.max_concurrent_runs)
         self.signal_max_depth = max(0, int(signal_max_depth))
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._background_tasks: set[asyncio.Task] = set()
         self._cancel_requested: set[str] = set()
+        # Set whenever a run reaches a terminal state.  A tick delivers signals
+        # at its top, so without this a workflow hop could only ever be picked
+        # up by the next poll -- charging every chain a full interval per step
+        # on top of whatever the step itself took.  See `_idle_wait`.
+        self._wake = asyncio.Event()
         self._started_at = datetime.now(UTC)
         self._last_heartbeat = self._started_at
         self._running = False
@@ -76,6 +82,7 @@ class SchedulerService:
                 asyncio.to_thread(getattr(self.store, method_name), *args, **kwargs)
             )
         else:
+
             def invoke():
                 thread_store = SchedulerStore(db_path=self.store.db_path)
                 try:
@@ -93,7 +100,41 @@ class SchedulerService:
                 await operation
             raise
 
-    async def run_once(self, now: Optional[datetime] = None) -> int:
+    def _free_slots(self) -> int:
+        """How many runs may be claimed right now without having to queue.
+
+        ``_active_tasks`` is the in-flight set: a run is registered when it is
+        claimed and removed when it reaches a terminal state, so a run that is
+        *waiting* for a slot counts against the budget.  That is the point -- a
+        claim writes ``running`` and takes a lease, so a waiting run is already a
+        claim that has to be kept alive, and the budget exists to avoid creating
+        more of them than the slots can absorb.
+        """
+        return max(0, self.max_concurrent_runs - len(self._active_tasks))
+
+    async def run_once(
+        self, now: Optional[datetime] = None, *, background: bool = False
+    ) -> int:
+        """One tick: deliver signals, claim what can start, start it.
+
+        ``background`` decides whether the tick waits for what it started, and
+        the two callers want different answers.  ``run_forever`` passes ``True``:
+        a tick that awaits its own runs makes the scheduler's period
+        ``max(run duration) + poll_seconds``, so every unrelated task inherits
+        the latency of the slowest one and no signal is delivered while it runs.
+        The default is the blocking form because that is what a test wants --
+        given an explicit ``now`` and no loop running, waiting for the batch is
+        the only way the outcome is deterministic on the next line.
+
+        **Not re-entrant, and deliberately unguarded.** ``run_forever`` is the
+        only production caller and it awaits this sequentially, so a wake cannot
+        overlap a tick.  A second caller -- another loop, or a request handler
+        that wants to force a tick -- would have to serialise with this one,
+        because "deliver, then claim, then start" is not atomic against itself:
+        two overlapping ticks can both read the same free-slot count and between
+        them claim more runs than there are slots.  Add a guard at that point
+        rather than a lock now, which would only hide the assumption.
+        """
         current = (now or datetime.now(UTC)).astimezone(UTC)
         await self._store_call("disable_duplicate_enabled_tasks", current)
         # Before claiming, so a signal queued a moment ago becomes a run in
@@ -116,7 +157,10 @@ class SchedulerService:
             self._store_call(
                 "claim_due_tasks",
                 now=current,
-                limit=10,
+                # Only what can start.  A claim writes ``running`` onto the row
+                # and takes a lease, so a claim that cannot start is a run the
+                # store believes is going while nothing renews its lease.
+                limit=self._free_slots(),
                 lease_seconds=self.lease_seconds,
             )
         )
@@ -139,13 +183,16 @@ class SchedulerService:
             await self._await_store_completion(cleanup)
             raise cancelled
         if claimed:
-            sem = asyncio.Semaphore(self.max_concurrent_runs)
-
-            async def _run_item(item) -> None:
-                async with sem:
-                    await self._execute_claimed(item.task, item.run)
-
-            await asyncio.gather(*[_run_item(item) for item in claimed])
+            if background:
+                for item in claimed:
+                    self._start_background_claim(item)
+            else:
+                await asyncio.gather(
+                    *[
+                        self._execute_with_limit(item.task, item.run)
+                        for item in claimed
+                    ]
+                )
         return len(claimed)
 
     @staticmethod
@@ -162,15 +209,42 @@ class SchedulerService:
             while True:
                 self._last_heartbeat = datetime.now(UTC)
                 try:
-                    await self.run_once()
+                    await self.run_once(background=True)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
-                    logger.exception("Scheduler iteration failed; retrying after poll interval")
+                    logger.exception(
+                        "Scheduler iteration failed; retrying after poll interval"
+                    )
                 self._last_heartbeat = datetime.now(UTC)
-                await asyncio.sleep(self.poll_seconds)
+                await self._idle_wait()
         finally:
             self._running = False
+
+    async def _idle_wait(self) -> None:
+        """Wait for a run to finish, or for the poll interval to elapse.
+
+        The interval is the fallback for "is anything due?", not the unit of
+        latency.  A workflow hop is a signal delivered at the top of a tick, so
+        a fixed sleep here charges every chain a full interval per step; a run
+        reaching a terminal state sets ``_wake`` instead, which lets the next
+        tick deliver that run's signal as soon as the run is over.
+
+        **The clear must be unconditional.** A run can finish while the tick is
+        still running, so the wake is often set before this wait is ever reached.
+        Clearing only on the timeout path -- "consume it when it woke us" -- would
+        leave it set, and every later wait would then return instantly: measured
+        50 waits taking **0.002s** instead of the 2.50s they should have, i.e. a
+        busy loop at 100% CPU with no failing test to notice it. The event is a
+        "skip the rest of the sleep" flag, not a counter, so it has to be drained
+        whether or not it fired the wait.
+        """
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=self.poll_seconds)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._wake.clear()
 
     def health(self) -> dict[str, Any]:
         return {
@@ -191,10 +265,111 @@ class SchedulerService:
             await asyncio.gather(*pending, return_exceptions=True)
 
     def _start_background_claim(self, claimed) -> None:
-        operation = asyncio.create_task(self._execute_claimed(claimed.task, claimed.run))
+        operation = asyncio.create_task(
+            self._execute_with_limit(claimed.task, claimed.run)
+        )
         self._active_tasks[claimed.run.id] = operation
         self._background_tasks.add(operation)
-        operation.add_done_callback(self._background_tasks.discard)
+
+        def forget(task: asyncio.Task) -> None:
+            self._background_tasks.discard(task)
+            # The slot is normally given back in `_execute_with_limit`'s
+            # ``finally``, but a task cancelled before its first step never
+            # enters that coroutine and so never reaches it.  ``_free_slots``
+            # counts these entries, so a leak here is not cosmetic: the
+            # scheduler would keep believing a slot is busy until it claimed
+            # nothing.  ``shutdown()`` cancels pending work and is exactly that
+            # window.  The identity check keeps a late callback from dropping
+            # an entry that has since been replaced.
+            if self._active_tasks.get(claimed.run.id) is task:
+                self._active_tasks.pop(claimed.run.id, None)
+
+        operation.add_done_callback(forget)
+
+    async def _execute_with_limit(self, task, run) -> None:
+        """Hold a slot for one run, keeping its claim alive until it ends.
+
+        The lease *is* the claim on the task, so it has to be renewed from the
+        moment the run was claimed -- which is before this method's first await,
+        not after the slot is won.  Renewing only once the slot is held leaves
+        every queued run holding a lease that nothing refreshes, and the store
+        then finds an expired lease on a row that says ``running``: it
+        reschedules the task, and the work is done twice.
+
+        ``run_now`` is derived from the claim time for the same reason.  It maps
+        the loop's monotonic clock onto the run's wall clock, so an origin taken
+        after the wait would date every timestamp the run writes -- including
+        the ownership re-check that ends it -- to a moment that has already
+        passed, which is what let an expired lease pass that check unnoticed.
+        """
+        loop = asyncio.get_running_loop()
+        monotonic_start = loop.time()
+
+        def run_now() -> datetime:
+            elapsed = max(0.0, loop.time() - monotonic_start)
+            return run.started_at.astimezone(UTC) + timedelta(seconds=elapsed)
+
+        lost_ownership = asyncio.Event()
+        renewal = asyncio.create_task(
+            self._renew_lease(task, run, lost_ownership, run_now)
+        )
+        cancellation_watcher = asyncio.create_task(
+            self._watch_cancel_request(task, run)
+        )
+        acquired = False
+        try:
+            while not acquired:
+                try:
+                    await asyncio.wait_for(self._run_semaphore.acquire(), timeout=1)
+                    acquired = True
+                except asyncio.TimeoutError:
+                    if await self._store_call("cancel_requested", task.id, run.id):
+                        self._cancel_requested.add(run.id)
+                        await self._store_call(
+                            "complete_run",
+                            task.id,
+                            run.id,
+                            finished_at=datetime.now(UTC),
+                            status="cancelled",
+                            error="cancelled by user",
+                        )
+                        return
+            await self._execute_claimed(
+                task, run, lost_ownership=lost_ownership, run_now=run_now
+            )
+        except asyncio.CancelledError:
+            if not acquired:
+                if run.id in self._cancel_requested:
+                    await self._store_call(
+                        "complete_run",
+                        task.id,
+                        run.id,
+                        finished_at=datetime.now(UTC),
+                        status="cancelled",
+                        error="cancelled by user",
+                    )
+                else:
+                    await self._store_call(
+                        "release_claim",
+                        task.id,
+                        run.id,
+                        now=datetime.now(UTC),
+                        reason="scheduler stopped before execution slot opened",
+                    )
+            raise
+        finally:
+            if acquired:
+                self._run_semaphore.release()
+            self._active_tasks.pop(run.id, None)
+            self._cancel_requested.discard(run.id)
+            renewal.cancel()
+            cancellation_watcher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await renewal
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancellation_watcher
+            # The run is over, so whatever it emitted is waiting to be delivered.
+            self._wake.set()
 
     async def run_task_now(self, task_id: str):
         claimed = await self._store_call(
@@ -221,17 +396,37 @@ class SchedulerService:
         return claimed
 
     async def cancel_run(self, task_id: str, run_id: str) -> bool:
-        operation = self._active_tasks.get(run_id)
-        if operation is None or operation.done():
-            return False
         requested = await self._store_call(
             "request_cancel", task_id, run_id, now=datetime.now(UTC)
         )
         if not requested:
             return False
-        self._cancel_requested.add(run_id)
-        operation.cancel()
+        operation = self._active_tasks.get(run_id)
+        if operation is not None and not operation.done():
+            self._cancel_requested.add(run_id)
+            operation.cancel()
         return True
+
+    async def _watch_cancel_request(self, task, run) -> None:
+        """Let the lease owner observe cancellation requested by any instance."""
+        while True:
+            await asyncio.sleep(1)
+            try:
+                requested = await self._store_call("cancel_requested", task.id, run.id)
+            except AttributeError:
+                # Small test doubles predating durable cancellation do not
+                # implement the query; they still exercise the local path.
+                return
+            except Exception:
+                logger.exception("Failed to poll cancellation request")
+                continue
+            if not requested:
+                continue
+            self._cancel_requested.add(run.id)
+            operation = self._active_tasks.get(run.id)
+            if operation is not None and not operation.done():
+                operation.cancel()
+            return
 
     async def _renew_lease(self, task, run, lost_ownership: asyncio.Event, now) -> None:
         interval = self.lease_seconds / 3
@@ -275,7 +470,11 @@ class SchedulerService:
                 {operation, ownership_waiter},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if ownership_waiter in done and lost_ownership.is_set() and not operation.done():
+            if (
+                ownership_waiter in done
+                and lost_ownership.is_set()
+                and not operation.done()
+            ):
                 operation.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await operation
@@ -301,7 +500,9 @@ class SchedulerService:
             products=self._measure_products(task, run),
         )
 
-    async def _enqueue_automatic_retry(self, task, run, finished_at: datetime) -> None:
+    def _automatic_retry_at(
+        self, task, run, finished_at: datetime
+    ) -> Optional[datetime]:
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})
         retry_policy = snapshot.get("retry_policy")
         if not isinstance(retry_policy, dict):
@@ -309,17 +510,9 @@ class SchedulerService:
         max_attempts = max(1, int(retry_policy.get("max_attempts", 1) or 1))
         attempt = max(1, int(getattr(run, "attempt", 1) or 1))
         if attempt >= max_attempts:
-            return
+            return None
         base_delay = max(0, int(retry_policy.get("backoff_seconds", 30) or 0))
-        retry_at = finished_at + timedelta(
-            seconds=base_delay * (2 ** max(0, attempt - 1))
-        )
-        await self._store_call(
-            "enqueue_retry",
-            task.id,
-            run.id,
-            retry_at=retry_at,
-        )
+        return finished_at + timedelta(seconds=base_delay * (2 ** max(0, attempt - 1)))
 
     async def _owns_unexpired_lease(self, task, run, now) -> bool:
         try:
@@ -351,9 +544,7 @@ class SchedulerService:
             return []
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})
         workspace = str(
-            snapshot.get("workspace_root")
-            or getattr(task, "workspace_root", "")
-            or ""
+            snapshot.get("workspace_root") or getattr(task, "workspace_root", "") or ""
         ).strip()
         return product_report(workspace or str(Path.cwd()), declares)
 
@@ -399,7 +590,11 @@ class SchedulerService:
             products_error = "声明的产物没有产出：" + "、".join(missing)
         command = str(acceptance.verify_command or "").strip()
         if not command:
-            return combine_verdicts(self_verdict, products_verdict), None, products_error
+            return (
+                combine_verdicts(self_verdict, products_verdict),
+                None,
+                products_error,
+            )
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})
         workspace = str(
             snapshot.get("workspace_root") or getattr(task, "workspace_root", "") or ""
@@ -435,18 +630,22 @@ class SchedulerService:
             return RUN_UNVERIFIED_STATUS
         return RUN_SUCCESS_STATUS
 
-    async def _execute_claimed(self, task, run) -> None:
-        loop = asyncio.get_running_loop()
-        monotonic_start = loop.time()
+    async def _execute_claimed(
+        self,
+        task,
+        run,
+        *,
+        lost_ownership: asyncio.Event,
+        run_now: Callable[[], datetime],
+    ) -> None:
+        """Execute one claimed run and record how it ended.
 
-        def run_now() -> datetime:
-            elapsed = max(0.0, loop.time() - monotonic_start)
-            return run.started_at.astimezone(UTC) + timedelta(seconds=elapsed)
-
-        lost_ownership = asyncio.Event()
-        renewal = asyncio.create_task(
-            self._renew_lease(task, run, lost_ownership, run_now)
-        )
+        ``lost_ownership`` and ``run_now`` come from :meth:`_execute_with_limit`
+        rather than being made here, because both describe the *claim* rather
+        than this execution: the claim is taken before the run waits for a slot,
+        so the lease has to be renewed and the clock measured from that moment.
+        See that method for what each one costs when it starts late.
+        """
         current_task = asyncio.current_task()
         if current_task is not None:
             self._active_tasks[run.id] = current_task
@@ -463,6 +662,7 @@ class SchedulerService:
                 text = str(payload.get("message_text", "")).strip()
                 if not text:
                     raise ValueError("Message task has no message_text")
+
                 async def message_result():
                     return ExecutionResult(summary=text, text_output=text)
 
@@ -520,7 +720,9 @@ class SchedulerService:
             if delivery_status == "skipped" and not result.text_output.strip():
                 successful_delivery = True
             if not successful_delivery and not delivery_error:
-                delivery_error = f"unexpected delivery status: {delivery_status or 'empty'}"
+                delivery_error = (
+                    f"unexpected delivery status: {delivery_status or 'empty'}"
+                )
             products = self._measure_products(task, run)
             verdict, verification, products_error = await self._evaluate_acceptance(
                 task, run, result, products
@@ -545,9 +747,7 @@ class SchedulerService:
             # in which nothing was running.  The run succeeded, so nothing else
             # about it looks unusual; without this the history reads as a
             # schedule that has been firing on time.
-            missed_note = describe_missed_occurrences(
-                getattr(run, "missed_count", 0)
-            )
+            missed_note = describe_missed_occurrences(getattr(run, "missed_count", 0))
             run_summary = (
                 f"{missed_note}\n{result.summary}" if missed_note else result.summary
             )
@@ -564,9 +764,12 @@ class SchedulerService:
                 verdict=verdict,
                 verification=verification,
                 products=products,
+                retry_at=(
+                    self._automatic_retry_at(task, run, finished_at)
+                    if status in RETRYABLE_RUN_STATUSES
+                    else None
+                ),
             )
-            if status in RETRYABLE_RUN_STATUSES:
-                await self._enqueue_automatic_retry(task, run, finished_at)
         except asyncio.CancelledError:
             if run.id in self._cancel_requested:
                 await self._store_call(
@@ -613,15 +816,20 @@ class SchedulerService:
                 # lower, and the products it did leave are not handed to
                 # anybody, because nothing downstream runs on a failure.
                 products=self._measure_products(task, run),
+                retry_at=(
+                    self._automatic_retry_at(task, run, finished_at)
+                    if status in RETRYABLE_RUN_STATUSES
+                    else None
+                ),
             )
-            if status in RETRYABLE_RUN_STATUSES:
-                await self._enqueue_automatic_retry(task, run, finished_at)
         finally:
+            # Only the run's own bookkeeping is dropped here.  The lease renewal
+            # and the cancellation watcher are owned by `_execute_with_limit`,
+            # because they have to outlive this method: they are what keeps the
+            # claim alive while the run waits for a slot, which happens before
+            # this method is ever entered.
             self._active_tasks.pop(run.id, None)
             self._cancel_requested.discard(run.id)
-            renewal.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await renewal
 
     async def _deliver(self, task, run, result: ExecutionResult):
         if callable(self.delivery):

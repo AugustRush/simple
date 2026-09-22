@@ -18,9 +18,7 @@ def test_daily_trigger_next_after_returns_next_local_wall_clock_time():
     trigger = DailyTrigger(time_of_day="09:00", timezone_name="Asia/Shanghai")
     now = datetime(2026, 4, 19, 0, 30, tzinfo=timezone.utc)  # 08:30 local
 
-    assert trigger.next_after(now) == datetime(
-        2026, 4, 19, 1, 0, tzinfo=timezone.utc
-    )
+    assert trigger.next_after(now) == datetime(2026, 4, 19, 1, 0, tzinfo=timezone.utc)
 
 
 def test_weekdays_trigger_skips_weekend_in_local_timezone():
@@ -42,9 +40,7 @@ def test_monthly_trigger_skips_month_without_requested_date():
     )
     april = datetime(2026, 4, 1, tzinfo=timezone.utc)
 
-    assert trigger.next_after(april) == datetime(
-        2026, 5, 31, 1, 0, tzinfo=timezone.utc
-    )
+    assert trigger.next_after(april) == datetime(2026, 5, 31, 1, 0, tzinfo=timezone.utc)
 
 
 def test_weekly_trigger_rolls_forward_to_named_weekday():
@@ -57,9 +53,7 @@ def test_weekly_trigger_rolls_forward_to_named_weekday():
     )
     now = datetime(2026, 4, 20, 1, 30, tzinfo=timezone.utc)  # Monday 09:30 local
 
-    assert trigger.next_after(now) == datetime(
-        2026, 4, 22, 1, 0, tzinfo=timezone.utc
-    )
+    assert trigger.next_after(now) == datetime(2026, 4, 22, 1, 0, tzinfo=timezone.utc)
 
 
 @pytest.mark.parametrize(
@@ -77,9 +71,7 @@ def test_weekly_trigger_rolls_forward_to_named_weekday():
         ),
     ],
 )
-def test_weekly_trigger_preserves_wall_clock_across_dst(
-    scheduled_for, now, expected
-):
+def test_weekly_trigger_preserves_wall_clock_across_dst(scheduled_for, now, expected):
     from agent.scheduler import WeeklyTrigger
 
     trigger = WeeklyTrigger("sun", "09:00", "America/New_York")
@@ -90,7 +82,12 @@ def test_weekly_trigger_preserves_wall_clock_across_dst(
 
 
 def test_scheduler_store_creates_and_lists_tasks(tmp_path):
-    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
 
     store = SchedulerStore(db_path=tmp_path / "scheduler.db")
     created = store.create_task(
@@ -126,7 +123,12 @@ def test_scheduler_store_sets_schema_version(tmp_path):
 
 
 def test_scheduler_store_migrates_v4_permission_profile(tmp_path):
-    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
 
     db_path = tmp_path / "scheduler.db"
     connection = sqlite3.connect(db_path)
@@ -155,18 +157,21 @@ def test_scheduler_store_migrates_v4_permission_profile(tmp_path):
 
     store = SchedulerStore(db_path=db_path)
     columns = {
-        row[1] for row in sqlite3.connect(db_path).execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1]
+        for row in sqlite3.connect(db_path)
+        .execute("PRAGMA table_info(scheduled_tasks)")
+        .fetchall()
     }
-    created = store.create_task(NewScheduledTask(
-        name="migrated",
-        kind="agent_prompt",
-        trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
-        payload={"prompt": "check migration"},
-        delivery_mode="standalone",
-        delivery_target=DeliveryTarget.standalone(),
-    ))
+    created = store.create_task(
+        NewScheduledTask(
+            name="migrated",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "check migration"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
     store.close()
 
     assert "permission_profile" in columns
@@ -214,14 +219,16 @@ def test_scheduler_store_migrates_v11_request_quote(tmp_path):
 
     store = SchedulerStore(db_path=db_path)
     task_columns = {
-        row[1] for row in sqlite3.connect(db_path).execute(
-            "PRAGMA table_info(scheduled_tasks)"
-        ).fetchall()
+        row[1]
+        for row in sqlite3.connect(db_path)
+        .execute("PRAGMA table_info(scheduled_tasks)")
+        .fetchall()
     }
     workflow_columns = {
-        row[1] for row in sqlite3.connect(db_path).execute(
-            "PRAGMA table_info(workflows)"
-        ).fetchall()
+        row[1]
+        for row in sqlite3.connect(db_path)
+        .execute("PRAGMA table_info(workflows)")
+        .fetchall()
     }
     reread = store.get_task(pre_existing.id)
     store.close()
@@ -499,7 +506,9 @@ def test_scheduler_store_lease_and_completion_are_fenced(tmp_path):
     after_expiry = datetime(2026, 4, 19, 0, 0, 31, tzinfo=timezone.utc)
 
     assert store.renew_lease(task.id, claim.run.id, now=before_expiry, lease_seconds=30)
-    assert not store.renew_lease(task.id, "stale-run", now=before_expiry, lease_seconds=30)
+    assert not store.renew_lease(
+        task.id, "stale-run", now=before_expiry, lease_seconds=30
+    )
     assert store.owns_unexpired_lease(task.id, claim.run.id, now=before_expiry)
     assert not store.complete_run(
         task.id,
@@ -514,7 +523,9 @@ def test_scheduler_store_lease_and_completion_are_fenced(tmp_path):
         now=datetime(2026, 4, 19, 0, 0, 51, tzinfo=timezone.utc),
         lease_seconds=30,
     )
-    assert not store.owns_unexpired_lease(task.id, claim.run.id, now=after_expiry.replace(second=51))
+    assert not store.owns_unexpired_lease(
+        task.id, claim.run.id, now=after_expiry.replace(second=51)
+    )
     assert store.complete_run(
         task.id,
         claim.run.id,
@@ -573,9 +584,7 @@ def test_scheduler_service_executes_due_agent_prompt_task_and_persists_run(tmp_p
         lease_seconds=300,
     )
 
-    asyncio.run(
-        service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc))
-    )
+    asyncio.run(service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc)))
 
     runs = store.list_runs(task.id)
     refreshed = store.get_task(task.id)
@@ -590,7 +599,12 @@ def test_scheduler_service_executes_due_agent_prompt_task_and_persists_run(tmp_p
 
 
 def test_scheduler_run_captures_immutable_execution_snapshot(tmp_path):
-    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
 
     store = SchedulerStore(db_path=tmp_path / "scheduler.db")
     task = store.create_task(
@@ -621,11 +635,19 @@ def test_scheduler_run_captures_immutable_execution_snapshot(tmp_path):
     assert claimed.run.config_snapshot["timeout_seconds"] == 90
     assert claimed.run.config_snapshot["selected_skills"] == ["quality/review"]
     assert claimed.run.config_snapshot["permission_profile"] == "read_only"
-    assert store.get_run(task.id, claimed.run.id).config_snapshot == claimed.run.config_snapshot
+    assert (
+        store.get_run(task.id, claimed.run.id).config_snapshot
+        == claimed.run.config_snapshot
+    )
 
 
 def test_scheduler_manual_run_does_not_consume_next_occurrence(tmp_path):
-    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
 
     store = SchedulerStore(db_path=tmp_path / "scheduler.db")
     task = store.create_task(
@@ -652,7 +674,12 @@ def test_scheduler_manual_run_does_not_consume_next_occurrence(tmp_path):
 
 
 def test_scheduler_automatic_retry_is_durable_and_claimed_after_backoff(tmp_path):
-    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
 
     store = SchedulerStore(db_path=tmp_path / "scheduler.db")
     task = store.create_task(
@@ -679,8 +706,12 @@ def test_scheduler_automatic_retry_is_durable_and_claimed_after_backoff(tmp_path
 
     store.close()
     reopened = SchedulerStore(db_path=tmp_path / "scheduler.db")
-    assert reopened.claim_due_tasks(started + timedelta(seconds=9), lease_seconds=30) == []
-    retry = reopened.claim_due_tasks(started + timedelta(seconds=10), lease_seconds=30)[0]
+    assert (
+        reopened.claim_due_tasks(started + timedelta(seconds=9), lease_seconds=30) == []
+    )
+    retry = reopened.claim_due_tasks(started + timedelta(seconds=10), lease_seconds=30)[
+        0
+    ]
     assert retry.run.id == queued.id
     assert retry.run.attempt == 2
     assert retry.run.trigger_source == "automatic_retry"
@@ -722,14 +753,141 @@ def test_scheduler_service_queues_configured_retry_after_failure(tmp_path):
         delivery=unused,
         lease_seconds=300,
     )
-    asyncio.run(
-        service.run_once(now=datetime(2026, 4, 19, tzinfo=timezone.utc))
-    )
+    asyncio.run(service.run_once(now=datetime(2026, 4, 19, tzinfo=timezone.utc)))
 
     runs = store.list_runs(task.id)
     assert [run.status for run in runs] == ["failed", "queued"]
     assert runs[1].attempt == 2
     assert runs[1].retry_of_run_id == runs[0].id
+
+
+def test_scheduler_service_honours_cancel_requested_by_another_instance(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    db_path = tmp_path / "scheduler.db"
+    store = SchedulerStore(db_path=db_path)
+    task = store.create_task(
+        NewScheduledTask(
+            name="remote-cancel",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "wait"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def executor(_task, _run):
+            started.set()
+            await asyncio.Event().wait()
+
+        async def unused(*_args):
+            raise AssertionError("delivery should not run")
+
+        owner = SchedulerService(
+            store=store,
+            agent_executor=executor,
+            system_executor=executor,
+            delivery=unused,
+            lease_seconds=30,
+        )
+        requester = SchedulerService(
+            store=SchedulerStore(db_path=db_path),
+            agent_executor=executor,
+            system_executor=executor,
+            delivery=unused,
+            lease_seconds=30,
+        )
+        claimed = await owner.run_task_now(task.id)
+        assert claimed is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        assert await requester.cancel_run(task.id, claimed.run.id)
+        for _ in range(30):
+            run = store.get_run(task.id, claimed.run.id)
+            if run is not None and run.status == "cancelled":
+                break
+            await asyncio.sleep(0.1)
+        assert store.get_run(task.id, claimed.run.id).status == "cancelled"
+        await owner.shutdown()
+        await requester.shutdown()
+        requester.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_manual_runs_share_the_service_concurrency_limit(tmp_path):
+    from agent.scheduler import (
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    tasks = [
+        store.create_task(
+            NewScheduledTask(
+                name=f"manual-{index}",
+                kind="agent_prompt",
+                trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+                payload={"prompt": "run"},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+        for index in range(2)
+    ]
+
+    async def scenario():
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        starts = []
+
+        async def executor(task, _run):
+            starts.append(task.id)
+            if len(starts) == 1:
+                first_started.set()
+                await release_first.wait()
+            return ExecutionResult(summary="done", text_output="done")
+
+        async def delivery(*_args):
+            return "stored"
+
+        service = SchedulerService(
+            store=store,
+            agent_executor=executor,
+            system_executor=executor,
+            delivery=delivery,
+            max_concurrent_runs=1,
+        )
+        first = await service.run_task_now(tasks[0].id)
+        second = await service.run_task_now(tasks[1].id)
+        assert first is not None and second is not None
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await asyncio.sleep(0.05)
+        assert starts == [tasks[0].id]
+
+        release_first.set()
+        for _ in range(20):
+            if len(starts) == 2:
+                break
+            await asyncio.sleep(0.05)
+        assert starts == [tasks[0].id, tasks[1].id]
+        await service.shutdown()
+
+    asyncio.run(scenario())
 
 
 def test_scheduler_run_forever_recovers_after_iteration_error(tmp_path):
@@ -748,7 +906,7 @@ def test_scheduler_run_forever_recovers_after_iteration_error(tmp_path):
     calls = 0
     recovered = asyncio.Event()
 
-    async def flaky_run_once(now=None):
+    async def flaky_run_once(now=None, *, background=False):
         nonlocal calls
         calls += 1
         if calls == 1:
@@ -816,7 +974,12 @@ def test_scheduler_cancellation_releases_claim_committed_in_worker(tmp_path):
 
 
 def test_release_claim_restores_scheduled_occurrence(tmp_path):
-    from agent.scheduler import DeliveryTarget, NewScheduledTask, SchedulerStore, TriggerSpec
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerStore,
+        TriggerSpec,
+    )
 
     store = SchedulerStore(db_path=tmp_path / "scheduler.db")
     scheduled_for = datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc)
@@ -893,9 +1056,7 @@ def test_scheduler_service_coalesces_missed_interval_runs(tmp_path):
         lease_seconds=300,
     )
 
-    asyncio.run(
-        service.run_once(now=datetime(2026, 4, 19, 3, 5, tzinfo=timezone.utc))
-    )
+    asyncio.run(service.run_once(now=datetime(2026, 4, 19, 3, 5, tzinfo=timezone.utc)))
 
     refreshed = store.get_task(task.id)
     runs = store.list_runs(task.id)
@@ -944,9 +1105,7 @@ def test_scheduler_service_executes_memory_tidy_system_job(tmp_path):
         delivery=fake_delivery,
     )
 
-    asyncio.run(
-        service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc))
-    )
+    asyncio.run(service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc)))
 
     runs = store.list_runs(task.id)
 
@@ -973,8 +1132,12 @@ def test_scheduler_service_disables_duplicate_enabled_tasks_before_running(tmp_p
         delivery_mode="standalone",
         delivery_target=DeliveryTarget.standalone(),
     )
-    first = store.create_task(spec, now=datetime(2026, 4, 19, 18, 0, tzinfo=timezone.utc))
-    second = store.create_task(spec, now=datetime(2026, 4, 19, 18, 1, tzinfo=timezone.utc))
+    first = store.create_task(
+        spec, now=datetime(2026, 4, 19, 18, 0, tzinfo=timezone.utc)
+    )
+    second = store.create_task(
+        spec, now=datetime(2026, 4, 19, 18, 1, tzinfo=timezone.utc)
+    )
     executions = []
 
     async def fake_agent_executor(task, run):
@@ -1054,9 +1217,7 @@ def test_scheduler_service_executes_due_message_task_without_agent_executor(tmp_
         delivery=fake_delivery,
     )
 
-    asyncio.run(
-        service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc))
-    )
+    asyncio.run(service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc)))
 
     runs = store.list_runs(task.id)
 
@@ -1129,9 +1290,7 @@ def test_scheduler_service_executes_claimed_tasks_concurrently(tmp_path):
         max_concurrent_runs=2,
     )
 
-    asyncio.run(
-        service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc))
-    )
+    asyncio.run(service.run_once(now=datetime(2026, 4, 19, 0, 0, tzinfo=timezone.utc)))
 
     runs_first = store.list_runs(first.id)
     runs_second = store.list_runs(second.id)
@@ -1201,7 +1360,7 @@ def test_scheduler_service_cancels_execution_when_renewal_loses_ownership(monkey
         id="run", started_at=datetime(2026, 4, 19, tzinfo=timezone.utc)
     )
 
-    asyncio.run(service._execute_claimed(task, run))
+    asyncio.run(service._execute_with_limit(task, run))
 
     assert cancelled.is_set()
     assert delivered == []
@@ -1243,7 +1402,7 @@ def test_scheduler_service_checks_ownership_immediately_before_delivery():
         id="run", started_at=datetime(2026, 4, 19, tzinfo=timezone.utc)
     )
 
-    asyncio.run(service._execute_claimed(task, run))
+    asyncio.run(service._execute_with_limit(task, run))
 
     assert delivered == []
     assert completions[0][1]["status"] == "interrupted"
@@ -1284,13 +1443,15 @@ def test_scheduler_service_rechecks_ownership_after_delivery():
         id="run", started_at=datetime(2026, 4, 19, tzinfo=timezone.utc)
     )
 
-    asyncio.run(service._execute_claimed(task, run))
+    asyncio.run(service._execute_with_limit(task, run))
 
     assert len(completions) == 1
     assert completions[0][1]["status"] == "interrupted"
 
 
-def test_scheduler_delivery_failure_is_persisted_without_losing_executor_output(tmp_path):
+def test_scheduler_delivery_failure_is_persisted_without_losing_executor_output(
+    tmp_path,
+):
     from agent.scheduler import (
         DeliveryResult,
         DeliveryTarget,
@@ -1330,9 +1491,7 @@ def test_scheduler_delivery_failure_is_persisted_without_losing_executor_output(
         system_executor=executor,
         delivery=delivery,
     )
-    asyncio.run(
-        service.run_once(datetime(2026, 4, 19, tzinfo=timezone.utc))
-    )
+    asyncio.run(service.run_once(datetime(2026, 4, 19, tzinfo=timezone.utc)))
 
     run = store.list_runs(task.id)[0]
     refreshed = store.get_task(task.id)
@@ -1407,7 +1566,9 @@ def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_
             sent["drained"] = True
 
     monkeypatch.setattr("agent.channels.feishu.FeishuOutputSink", _FakeSink)
-    monkeypatch.setattr("agent.channels.feishu.build_feishu_client", lambda config: object())
+    monkeypatch.setattr(
+        "agent.channels.feishu.build_feishu_client", lambda config: object()
+    )
 
     delivery = SchedulerDelivery(
         cfg={
@@ -1441,7 +1602,9 @@ def test_scheduler_feishu_delivery_sends_to_stable_chat_target(monkeypatch, tmp_
     assert sent["drained"] is True
 
 
-def test_scheduler_feishu_delivery_honors_an_explicit_receive_id_type(monkeypatch, tmp_path):
+def test_scheduler_feishu_delivery_honors_an_explicit_receive_id_type(
+    monkeypatch, tmp_path
+):
     """A target written by the schedule editor carries its own answer.
 
     The chat_type -> receive_id_type heuristic predates the chat picker: it
@@ -1490,7 +1653,11 @@ def test_scheduler_feishu_delivery_honors_an_explicit_receive_id_type(monkeypatc
         delivery.deliver_channel(
             target=DeliveryTarget(
                 "feishu_chat",
-                {"chat_id": "oc_picked", "chat_type": "p2p", "receive_id_type": "chat_id"},
+                {
+                    "chat_id": "oc_picked",
+                    "chat_type": "p2p",
+                    "receive_id_type": "chat_id",
+                },
             ),
             text="picked chat",
             output_dir=tmp_path,
@@ -1504,7 +1671,9 @@ def test_scheduler_feishu_delivery_honors_an_explicit_receive_id_type(monkeypatc
 
     legacy = asyncio.run(
         delivery.deliver_channel(
-            target=DeliveryTarget("feishu_chat", {"chat_id": "ou_user", "chat_type": "p2p"}),
+            target=DeliveryTarget(
+                "feishu_chat", {"chat_id": "ou_user", "chat_type": "p2p"}
+            ),
             text="legacy target",
             output_dir=tmp_path,
         )
@@ -1574,7 +1743,9 @@ def test_schedule_cli_creates_daily_task(monkeypatch, tmp_path):
     monkeypatch.setattr(shared_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(shared_module, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setattr(shared_module, "SCHEDULER_DIR", tmp_path / "tasks")
-    monkeypatch.setattr(shared_module, "SCHEDULER_DB_FILE", tmp_path / "tasks" / "scheduler.db")
+    monkeypatch.setattr(
+        shared_module, "SCHEDULER_DB_FILE", tmp_path / "tasks" / "scheduler.db"
+    )
 
     runner = CliRunner()
     result = runner.invoke(
@@ -1604,7 +1775,9 @@ def test_schedule_cli_lists_persisted_tasks(monkeypatch, tmp_path):
     monkeypatch.setattr(shared_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
     monkeypatch.setattr(shared_module, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setattr(shared_module, "SCHEDULER_DIR", tmp_path / "tasks")
-    monkeypatch.setattr(shared_module, "SCHEDULER_DB_FILE", tmp_path / "tasks" / "scheduler.db")
+    monkeypatch.setattr(
+        shared_module, "SCHEDULER_DB_FILE", tmp_path / "tasks" / "scheduler.db"
+    )
 
     runner = CliRunner()
     create = runner.invoke(
@@ -1627,3 +1800,547 @@ def test_schedule_cli_lists_persisted_tasks(monkeypatch, tmp_path):
 
     assert listed.exit_code == 0
     assert "one-shot" in listed.stdout
+
+
+# ── The tick, the slot budget and the lease ────────────────────────────────
+#
+# Four properties of how the scheduler decides *when* to run things.  They are
+# separate from the execution tests above because none of them is about what a
+# run does; each is about when it is allowed to start, and what the store is
+# told while it waits.
+
+TERMINAL_RUN_STATUSES = {"succeeded", "failed", "interrupted", "cancelled"}
+
+
+async def _await_runs_settled(store, tasks, *, timeout: float = 8.0) -> None:
+    """Wait until every named task has a run and none of them is still going.
+
+    Polling the rows rather than awaiting an executor-side event, because the
+    interesting failure is "the run never started at all": an event that is
+    never set would hang, and a hang is not a failing test.
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        runs = [store.list_runs(task.id) for task in tasks]
+        if all(run and run[0].status in TERMINAL_RUN_STATUSES for run in runs):
+            return
+        await asyncio.sleep(0.05)
+    settled = {
+        task.name: [run.status for run in store.list_runs(task.id)] for task in tasks
+    }
+    raise AssertionError(f"runs did not settle within {timeout}s: {settled}")
+
+
+def test_a_long_run_does_not_delay_a_task_that_becomes_due(tmp_path):
+    """An unrelated task starts when it is due, not when the slow one ends.
+
+    The two executors hand each other an event: ``long`` cannot finish until
+    ``later`` has started.  So if a tick waits for the run it just claimed,
+    ``later`` can never be claimed and nothing settles -- which the poll below
+    turns into a failure rather than a hang.  Expressing it as an event rather
+    than as an elapsed-time assertion is what keeps it deterministic; the
+    measured version of this delay was 3.18s against a due time of 0.50s.
+    """
+    import contextlib
+
+    from agent.scheduler import (
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    now = datetime.now(timezone.utc)
+
+    def make(name: str, at: datetime):
+        return store.create_task(
+            NewScheduledTask(
+                name=name,
+                kind="agent_prompt",
+                trigger=TriggerSpec.once(at),
+                payload={"prompt": name},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+
+    slow = make("long", now)
+    later = make("later", now + timedelta(seconds=0.3))
+
+    later_started = asyncio.Event()
+
+    async def executor(task, run):
+        if task.name == "long":
+            await later_started.wait()
+        else:
+            later_started.set()
+        return ExecutionResult(summary=task.name, text_output=task.name)
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("system executor should not be called")
+
+    async def delivery(task, run, result):
+        return "stored"
+
+    async def scenario():
+        service = SchedulerService(
+            store=store,
+            agent_executor=executor,
+            system_executor=unused,
+            delivery=delivery,
+            poll_seconds=0.1,
+            max_concurrent_runs=3,
+        )
+        loop_task = asyncio.create_task(service.run_forever())
+        try:
+            await _await_runs_settled(store, (slow, later))
+        finally:
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+            await service.shutdown()
+
+    try:
+        asyncio.run(scenario())
+        for task in (slow, later):
+            runs = store.list_runs(task.id)
+            assert len(runs) == 1, f"{task.name} ran {len(runs)} times"
+            assert runs[0].status == "succeeded"
+    finally:
+        store.close()
+
+
+def test_the_scheduler_does_not_claim_more_than_it_can_start(tmp_path):
+    """Only as many tasks are claimed as there are slots to start them in.
+
+    With one slot and three tasks due, two of them cannot start.  Claiming them
+    anyway writes ``running`` onto a row that is doing nothing, which is what
+    makes a queue wait invisible -- and it is how a lease comes to be held by a
+    run that nothing is renewing.
+    """
+    from agent.scheduler import (
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    now = datetime.now(timezone.utc)
+    tasks = []
+    for index in range(3):
+        tasks.append(
+            store.create_task(
+                NewScheduledTask(
+                    name=f"task-{index}",
+                    kind="agent_prompt",
+                    trigger=TriggerSpec.once(now),
+                    payload={"prompt": f"task-{index}"},
+                    delivery_mode="standalone",
+                    delivery_target=DeliveryTarget.standalone(),
+                )
+            )
+        )
+
+    async def executor(task, run):
+        return ExecutionResult(summary=task.name, text_output=task.name)
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("system executor should not be called")
+
+    async def delivery(task, run, result):
+        return "stored"
+
+    service = SchedulerService(
+        store=store,
+        agent_executor=executor,
+        system_executor=unused,
+        delivery=delivery,
+        max_concurrent_runs=1,
+    )
+
+    try:
+        asyncio.run(service.run_once(now=datetime.now(timezone.utc)))
+
+        claimed = sorted(len(store.list_runs(task.id)) for task in tasks)
+        assert claimed == [0, 0, 1], f"claimed {claimed} runs for one slot"
+    finally:
+        store.close()
+
+
+def test_a_run_waiting_for_a_slot_keeps_its_lease(tmp_path):
+    """A claimed run that has to queue must not be declared abandoned.
+
+    One slot, so the second run has to wait -- and it waits longer than
+    ``lease_seconds``.  The lease is renewed from the moment the run is claimed,
+    so a wait cannot expire it.  Before that, renewal only began once the slot
+    was held: the store's recovery then found an expired lease on a ``running``
+    row, rescheduled the task, and the work ran a second time while the first
+    attempt's result was thrown away.
+    """
+    import contextlib
+
+    from agent.scheduler import (
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    lease_seconds = 3
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    now = datetime.now(timezone.utc)
+
+    def make(name: str):
+        return store.create_task(
+            NewScheduledTask(
+                name=name,
+                kind="agent_prompt",
+                # Not due on its own: both runs are started by hand, so the loop
+                # keeps ticking while they queue and the store's recovery runs.
+                trigger=TriggerSpec.once(now + timedelta(hours=1)),
+                payload={"prompt": name},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+
+    holder = make("holder")
+    queued = make("queued")
+
+    holding = asyncio.Event()
+    release = asyncio.Event()
+
+    async def executor(task, run):
+        if task.name == "holder":
+            holding.set()
+            await release.wait()
+        return ExecutionResult(summary=task.name, text_output=task.name)
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("system executor should not be called")
+
+    async def delivery(task, run, result):
+        return "stored"
+
+    async def scenario():
+        service = SchedulerService(
+            store=store,
+            agent_executor=executor,
+            system_executor=unused,
+            delivery=delivery,
+            poll_seconds=0.5,
+            lease_seconds=lease_seconds,
+            max_concurrent_runs=1,
+        )
+        loop_task = asyncio.create_task(service.run_forever())
+        try:
+            await service.run_task_now(holder.id)
+            await asyncio.wait_for(holding.wait(), timeout=5)
+            await service.run_task_now(queued.id)
+            # Past the lease.  Nothing has finished, so the only thing that can
+            # keep this run's claim alive is the renewal started at claim time.
+            await asyncio.sleep(lease_seconds + 1.0)
+            release.set()
+            await asyncio.sleep(2.0)
+        finally:
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+            await service.shutdown()
+
+    try:
+        asyncio.run(scenario())
+
+        runs = store.list_runs(queued.id)
+        assert len(runs) == 1, f"the queued run ran {len(runs)} times"
+        assert runs[0].status == "succeeded"
+    finally:
+        store.close()
+
+
+def test_a_run_that_queued_records_the_time_it_actually_finished(tmp_path):
+    """A queued run's timestamps include the time it spent waiting.
+
+    ``run_now()`` is ``started_at`` plus a monotonic elapsed measured from when
+    *execution* began, while ``started_at`` is the **claim** time -- so the queue
+    wait is subtracted from every derived timestamp.  Compared against the real
+    clock at completion, that is a whole queue wait of error, and it is also what
+    made the ownership re-check at the end of a run read a time in the past.
+    """
+    import contextlib
+
+    from agent.scheduler import (
+        DeliveryTarget,
+        ExecutionResult,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    now = datetime.now(timezone.utc)
+
+    def make(name: str):
+        return store.create_task(
+            NewScheduledTask(
+                name=name,
+                kind="agent_prompt",
+                trigger=TriggerSpec.once(now + timedelta(hours=1)),
+                payload={"prompt": name},
+                delivery_mode="standalone",
+                delivery_target=DeliveryTarget.standalone(),
+            )
+        )
+
+    holder = make("holder")
+    queued = make("queued")
+
+    holding = asyncio.Event()
+    release = asyncio.Event()
+    finished_at_wall_clock: list[datetime] = []
+
+    async def executor(task, run):
+        if task.name == "holder":
+            holding.set()
+            await release.wait()
+        else:
+            finished_at_wall_clock.append(datetime.now(timezone.utc))
+        return ExecutionResult(summary=task.name, text_output=task.name)
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("system executor should not be called")
+
+    async def delivery(task, run, result):
+        return "stored"
+
+    async def scenario():
+        service = SchedulerService(
+            store=store,
+            agent_executor=executor,
+            system_executor=unused,
+            delivery=delivery,
+            poll_seconds=0.5,
+            lease_seconds=300,
+            max_concurrent_runs=1,
+        )
+        loop_task = asyncio.create_task(service.run_forever())
+        try:
+            await service.run_task_now(holder.id)
+            await asyncio.wait_for(holding.wait(), timeout=5)
+            await service.run_task_now(queued.id)
+            # Long enough that being early by the whole wait is unmistakable.
+            await asyncio.sleep(2.5)
+            release.set()
+            await _await_runs_settled(store, (queued,))
+        finally:
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+            await service.shutdown()
+
+    try:
+        asyncio.run(scenario())
+
+        assert finished_at_wall_clock, "the queued run never executed"
+        run = store.list_runs(queued.id)[0]
+        assert run.finished_at is not None
+        drift = abs((run.finished_at - finished_at_wall_clock[0]).total_seconds())
+        assert drift < 1.0, (
+            f"finished_at is {drift:.2f}s from the real clock at completion; "
+            "the queue wait was left out of the run's timeline"
+        )
+    finally:
+        store.close()
+
+
+def test_a_claim_that_never_starts_gives_its_slot_back(tmp_path):
+    """``active_runs`` counts live runs, not runs that were once started.
+
+    The slot is registered by ``_start_background_claim`` before the task has
+    run a single step, and given back in ``_execute_with_limit``'s ``finally``.
+    A task cancelled inside that window never reaches the ``finally``, so the
+    entry would stay -- and since ``_free_slots`` is derived from this same
+    dict, the scheduler would go on believing a slot is busy forever, until it
+    claims nothing at all.  ``shutdown()`` is precisely that window: it cancels
+    whatever is still pending.
+    """
+    from agent.scheduler import SchedulerService, SchedulerStore
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("nothing should execute")
+
+    async def scenario():
+        service = SchedulerService(
+            store=store,
+            agent_executor=unused,
+            system_executor=unused,
+            delivery=unused,
+            poll_seconds=0.01,
+        )
+        claimed = SimpleNamespace(
+            task=SimpleNamespace(id="task-1"), run=SimpleNamespace(id="run-1")
+        )
+        service._start_background_claim(claimed)
+        # Registered before the coroutine has run, which is what makes the
+        # budget visible to `_free_slots` during the queue wait.
+        assert service.health()["active_runs"] == 1
+
+        await service.shutdown()
+        # A turn for the done-callback that forgets the slot.
+        await asyncio.sleep(0)
+
+        assert service.health()["active_runs"] == 0
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()
+
+
+def test_shutdown_releases_a_run_the_loop_started(tmp_path):
+    """A run cancelled by ``shutdown()`` gives its claim back.
+
+    ``shutdown()`` cancels whatever is in flight, and the claim has to come back
+    with it: the run terminal, the task's ``active_run_id`` cleared and
+    ``next_run_at`` restored.  Otherwise the task stays claimed by a process that
+    is no longer running, and it never fires again.
+    """
+    import contextlib
+
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    now = datetime.now(timezone.utc)
+    task = store.create_task(
+        NewScheduledTask(
+            name="in-flight",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once(now + timedelta(hours=1)),
+            payload={"prompt": "in-flight"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+        )
+    )
+
+    entered = asyncio.Event()
+
+    async def executor(task, run):
+        entered.set()
+        # Never returns; shutdown is what ends it.
+        await asyncio.Event().wait()
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("system executor should not be called")
+
+    async def delivery(task, run, result):
+        return "stored"
+
+    async def scenario():
+        service = SchedulerService(
+            store=store,
+            agent_executor=executor,
+            system_executor=unused,
+            delivery=delivery,
+            poll_seconds=0.05,
+        )
+        loop_task = asyncio.create_task(service.run_forever())
+        try:
+            await service.run_task_now(task.id)
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            assert service.health()["active_runs"] == 1
+        finally:
+            loop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await loop_task
+            await service.shutdown()
+        # A turn for the done-callback that forgets the slot.
+        await asyncio.sleep(0)
+        assert service.health()["active_runs"] == 0
+
+    try:
+        asyncio.run(scenario())
+
+        runs = store.list_runs(task.id)
+        assert len(runs) == 1, [(run.id, run.status) for run in runs]
+        assert runs[0].status == "interrupted", runs[0].status
+        assert runs[0].error == "scheduler stopped", runs[0].error
+        released = store.get_task(task.id)
+        assert released.active_run_id is None
+        assert released.next_run_at is not None
+    finally:
+        store.close()
+
+
+def test_a_wake_that_arrived_before_the_wait_is_drained_once(tmp_path):
+    """The clear in `_idle_wait` has to be unconditional, or the loop spins.
+
+    A run can finish while the tick is still running, so the wake is routinely
+    set before `_idle_wait` is reached.  Clearing only the timeout path -- "drain
+    it when it actually woke us" -- reads as tidier and is a busy loop: the event
+    stays set, so every later wait returns instantly.  Measured 50 waits taking
+    **0.002s** instead of the 2.50s they should have, i.e. 100% CPU with nothing
+    failing anywhere in the suite to notice it.
+
+    So it is drained whether or not it fired the wait.  Verified as a real guard
+    rather than assumed: with the clear moved onto the timeout path, this test
+    fails at the drain check below, and 50 waits complete in 0.002s instead of
+    2.50s.  The second check -- that the wait *after* the drained one really
+    waits -- is the belt-and-braces version of the same claim, in case a future
+    form drains the flag without restoring the sleep.
+    """
+    from agent.scheduler import SchedulerService, SchedulerStore
+
+    POLL = 0.2
+
+    async def unused(*args, **kwargs):
+        raise AssertionError("nothing should execute")
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+
+    async def scenario():
+        service = SchedulerService(
+            store=store,
+            agent_executor=unused,
+            system_executor=unused,
+            delivery=unused,
+            poll_seconds=POLL,
+        )
+        # A run reached a terminal state while the tick was still running.
+        service._wake.set()
+        assert service._wake.is_set()
+
+        await service._idle_wait()
+        assert not service._wake.is_set(), "the wake was not drained"
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await service._idle_wait()
+        elapsed = loop.time() - started
+        assert elapsed >= POLL / 2, (
+            f"the next wait returned after {elapsed:.3f}s with poll_seconds="
+            f"{POLL}, so the event was still set and the loop is spinning"
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        store.close()

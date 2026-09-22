@@ -110,9 +110,7 @@ class EditContext:
     #: for this session.
     chosen_workspace_root: Optional[Path] = None
     #: Where it goes when there is not even that.
-    fallback_workspace_root: Path = field(
-        default_factory=lambda: Path.cwd().resolve()
-    )
+    fallback_workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
     #: ``.get(skill_id)`` -> bundle with ``user_invocable``.
     skill_catalog: Any = None
     #: Model id -> itself, or raises for an id no provider group owns.
@@ -206,12 +204,16 @@ def trigger_from_body(
             return stored_payload.get(field_name)
         return fallback
 
-    trigger_type = str(
-        answered("trigger_type", getattr(stored, "trigger_type", "once"))
-    ).strip().lower()
+    trigger_type = (
+        str(answered("trigger_type", getattr(stored, "trigger_type", "once")))
+        .strip()
+        .lower()
+    )
     # An omitted zone means the machine's own, not UTC: the browser sends its
     # zone explicitly, so this only decides the case where nothing did.
-    timezone_name = str(answered("timezone_name", LOCAL_TIMEZONE)).strip() or LOCAL_TIMEZONE
+    timezone_name = (
+        str(answered("timezone_name", LOCAL_TIMEZONE)).strip() or LOCAL_TIMEZONE
+    )
 
     if trigger_type == "once":
         at = str(answered("at", "")).strip()
@@ -271,11 +273,21 @@ def trigger_from_body(
             names = [str(body["signal_name"]).strip()]
             single_form = True
         elif isinstance(body.get("signal_names"), list):
-            names = [str(item).strip() for item in body["signal_names"] if str(item).strip()]
-            mode = str(body.get("signal_mode") or stored_payload.get("mode") or SIGNAL_MODE_ALL)
+            names = [
+                str(item).strip() for item in body["signal_names"] if str(item).strip()
+            ]
+            mode = str(
+                body.get("signal_mode") or stored_payload.get("mode") or SIGNAL_MODE_ALL
+            )
         elif isinstance(stored_payload.get("names"), list):
-            names = [str(item).strip() for item in stored_payload["names"] if str(item).strip()]
-            mode = str(body.get("signal_mode") or stored_payload.get("mode") or SIGNAL_MODE_ALL)
+            names = [
+                str(item).strip()
+                for item in stored_payload["names"]
+                if str(item).strip()
+            ]
+            mode = str(
+                body.get("signal_mode") or stored_payload.get("mode") or SIGNAL_MODE_ALL
+            )
         else:
             single = str(stored_payload.get("name") or "").strip()
             if single:
@@ -364,7 +376,11 @@ def delivery_from_body(
         target = getattr(existing, "delivery_target", None)
         if target is None or target.target_type != "feishu_chat":
             raise ValueError("发到飞书需要选择一个会话")
-    if feishu_ready is not None and not feishu_ready() and _is_new_promise(existing, target):
+    if (
+        feishu_ready is not None
+        and not feishu_ready()
+        and _is_new_promise(existing, target)
+    ):
         raise ValueError("发到飞书需要先在设置里填好飞书应用（app_id / app_secret）")
     return "channel", target
 
@@ -429,9 +445,7 @@ def _infer_kind(body: dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _resolve_action(
-    body: dict[str, Any], existing: Any
-) -> tuple[str, dict[str, Any]]:
+def _resolve_action(body: dict[str, Any], existing: Any) -> tuple[str, dict[str, Any]]:
     """Kind and payload, from the body or from what the task had."""
     existing_kind = str(getattr(existing, "kind", "") or "")
     existing_payload = dict(getattr(existing, "payload", {}) or {})
@@ -499,14 +513,10 @@ def task_from_body(
     if keep_trigger:
         asked_type = str(body.get("trigger_type", "") or "").strip().lower()
         if asked_type and asked_type != existing.trigger.trigger_type:
-            raise ValueError(
-                "这一步的触发方式由它上游的步骤决定，不能在这里改成别的"
-            )
+            raise ValueError("这一步的触发方式由它上游的步骤决定，不能在这里改成别的")
         trigger = existing.trigger
     elif any(field_name in body for field_name in TRIGGER_BODY_FIELDS):
-        trigger = trigger_from_body(
-            body, existing, signal_problem=ctx.signal_problem
-        )
+        trigger = trigger_from_body(body, existing, signal_problem=ctx.signal_problem)
     elif existing is not None:
         trigger = existing.trigger
     else:
@@ -514,9 +524,9 @@ def task_from_body(
 
     task_kind, payload = _resolve_action(body, existing)
 
-    requested_profile = str(
-        answered("permission_profile", "inherit") or "inherit"
-    ).strip() or "inherit"
+    requested_profile = (
+        str(answered("permission_profile", "inherit") or "inherit").strip() or "inherit"
+    )
     if requested_profile not in PERMISSION_PROFILES:
         # Named, and with the alternatives, because two audiences read this:
         # the browser shows it to a person who picked from a list, and a tool
@@ -570,9 +580,7 @@ def task_from_body(
     if max_attempts < 1 or max_attempts > MAX_RETRY_ATTEMPTS:
         raise ValueError(f"最大尝试次数必须在 1 到 {MAX_RETRY_ATTEMPTS} 之间")
     if backoff_seconds < 0 or backoff_seconds > MAX_RETRY_BACKOFF_SECONDS:
-        raise ValueError(
-            f"重试间隔必须在 0 到 {MAX_RETRY_BACKOFF_SECONDS} 秒之间"
-        )
+        raise ValueError(f"重试间隔必须在 0 到 {MAX_RETRY_BACKOFF_SECONDS} 秒之间")
 
     raw_skills = answered("selected_skills", None)
     if raw_skills is not None and not isinstance(raw_skills, list):
@@ -607,11 +615,7 @@ def task_from_body(
     stored_acceptance = getattr(existing, "acceptance", None) or Acceptance()
     acceptance = Acceptance(
         criteria=(
-            [
-                str(item)
-                for item in (body.get("criteria") or [])
-                if str(item).strip()
-            ]
+            [str(item) for item in (body.get("criteria") or []) if str(item).strip()]
             if "criteria" in body
             else list(stored_acceptance.criteria)
         ),
@@ -633,6 +637,13 @@ def task_from_body(
         body, existing, feishu_ready=ctx.feishu_ready
     )
 
+    for field_name, supported in (
+        ("overlap_policy", "forbid_overlap"),
+        ("missed_run_policy", "coalesce"),
+    ):
+        if field_name in body and str(body.get(field_name) or supported) != supported:
+            raise ValueError(f"{field_name} 暂不支持自定义；当前固定为 {supported}")
+
     return NewScheduledTask(
         name=name,
         kind=task_kind,
@@ -642,8 +653,6 @@ def task_from_body(
         delivery_target=delivery_target,
         model_override=model_override,
         enabled=bool(answered("enabled", True)),
-        overlap_policy=str(answered("overlap_policy", "forbid_overlap") or "forbid_overlap"),
-        missed_run_policy=str(answered("missed_run_policy", "coalesce") or "coalesce"),
         workspace_root=str(workspace),
         context_policy=context_policy,
         timeout_seconds=timeout_seconds,

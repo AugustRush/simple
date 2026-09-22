@@ -138,7 +138,9 @@ class OnceTrigger:
         candidate = self.at.astimezone(UTC)
         return candidate if candidate > now.astimezone(UTC) else None
 
-    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+    def advance_from(
+        self, scheduled_for: datetime, now: datetime
+    ) -> Optional[datetime]:
         return None
 
 
@@ -165,7 +167,9 @@ class IntervalTrigger:
         candidate = self.anchor_at.astimezone(UTC)
         return _advance_until_future(candidate, self._step(), now.astimezone(UTC))
 
-    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+    def advance_from(
+        self, scheduled_for: datetime, now: datetime
+    ) -> Optional[datetime]:
         candidate = scheduled_for.astimezone(UTC) + self._step()
         return _advance_until_future(candidate, self._step(), now.astimezone(UTC))
 
@@ -189,7 +193,9 @@ class DailyTrigger:
             candidate_local = candidate_local + timedelta(days=1)
         return candidate_local.astimezone(UTC)
 
-    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+    def advance_from(
+        self, scheduled_for: datetime, now: datetime
+    ) -> Optional[datetime]:
         tz = ZoneInfo(self.timezone_name)
         candidate = (scheduled_for.astimezone(tz) + timedelta(days=1)).astimezone(UTC)
         while candidate <= now.astimezone(UTC):
@@ -220,7 +226,9 @@ class WeeklyTrigger:
             candidate_local = candidate_local + timedelta(days=7)
         return candidate_local.astimezone(UTC)
 
-    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+    def advance_from(
+        self, scheduled_for: datetime, now: datetime
+    ) -> Optional[datetime]:
         tz = ZoneInfo(self.timezone_name)
         candidate = (scheduled_for.astimezone(tz) + timedelta(days=7)).astimezone(UTC)
         while candidate <= now.astimezone(UTC):
@@ -249,7 +257,9 @@ class WeekdaysTrigger:
             candidate += timedelta(days=1)
         return candidate.astimezone(UTC)
 
-    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+    def advance_from(
+        self, scheduled_for: datetime, now: datetime
+    ) -> Optional[datetime]:
         candidate = self.next_after(scheduled_for)
         while candidate is not None and candidate <= now.astimezone(UTC):
             candidate = self.next_after(candidate)
@@ -288,7 +298,9 @@ class MonthlyTrigger:
             year, month = self._next_month(year, month)
         raise ValueError("unable to calculate monthly occurrence")
 
-    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+    def advance_from(
+        self, scheduled_for: datetime, now: datetime
+    ) -> Optional[datetime]:
         candidate = self.next_after(scheduled_for)
         while candidate is not None and candidate <= now.astimezone(UTC):
             candidate = self.next_after(candidate)
@@ -337,7 +349,9 @@ class SignalTrigger:
     def next_after(self, now: datetime) -> Optional[datetime]:
         return None
 
-    def advance_from(self, scheduled_for: datetime, now: datetime) -> Optional[datetime]:
+    def advance_from(
+        self, scheduled_for: datetime, now: datetime
+    ) -> Optional[datetime]:
         return None
 
 
@@ -463,48 +477,36 @@ class TriggerSpec:
         if self.trigger_type == "once":
             return OnceTrigger(
                 at=parse_datetime(self.payload["at"]),
-                timezone_name=resolve_timezone_name(
-                    self.payload.get("timezone_name")
-                ),
+                timezone_name=resolve_timezone_name(self.payload.get("timezone_name")),
             )
         if self.trigger_type == "interval":
             return IntervalTrigger(
                 every=int(self.payload["every"]),
                 unit=str(self.payload["unit"]),
                 anchor_at=parse_datetime(self.payload["anchor_at"]),
-                timezone_name=resolve_timezone_name(
-                    self.payload.get("timezone_name")
-                ),
+                timezone_name=resolve_timezone_name(self.payload.get("timezone_name")),
             )
         if self.trigger_type == "daily":
             return DailyTrigger(
                 time_of_day=str(self.payload["time_of_day"]),
-                timezone_name=resolve_timezone_name(
-                    self.payload.get("timezone_name")
-                ),
+                timezone_name=resolve_timezone_name(self.payload.get("timezone_name")),
             )
         if self.trigger_type == "weekly":
             return WeeklyTrigger(
                 day_of_week=str(self.payload["day_of_week"]),
                 time_of_day=str(self.payload["time_of_day"]),
-                timezone_name=resolve_timezone_name(
-                    self.payload.get("timezone_name")
-                ),
+                timezone_name=resolve_timezone_name(self.payload.get("timezone_name")),
             )
         if self.trigger_type == "weekdays":
             return WeekdaysTrigger(
                 time_of_day=str(self.payload["time_of_day"]),
-                timezone_name=resolve_timezone_name(
-                    self.payload.get("timezone_name")
-                ),
+                timezone_name=resolve_timezone_name(self.payload.get("timezone_name")),
             )
         if self.trigger_type == "monthly":
             return MonthlyTrigger(
                 day_of_month=int(self.payload["day_of_month"]),
                 time_of_day=str(self.payload["time_of_day"]),
-                timezone_name=resolve_timezone_name(
-                    self.payload.get("timezone_name")
-                ),
+                timezone_name=resolve_timezone_name(self.payload.get("timezone_name")),
             )
         if self.trigger_type == "signal":
             return SignalTrigger(
@@ -592,9 +594,7 @@ def describe_missed_occurrences(missed_count: int) -> str:
     if missed <= 0:
         return ""
     if missed >= TriggerSpec.MISSED_COUNT_LIMIT:
-        return (
-            f"⚠️ 本次运行前至少 {missed} 次计划未能执行（进程未运行，计数已达上限）。"
-        )
+        return f"⚠️ 本次运行前至少 {missed} 次计划未能执行（进程未运行，计数已达上限）。"
     return f"⚠️ 本次运行前有 {missed} 次计划未能执行（进程未运行）。"
 
 
@@ -774,16 +774,10 @@ class DeliveryTarget:
         return cls(target_type=data["target_type"], payload=data["payload"])
 
 
-# ``overlap_policy`` and ``missed_run_policy`` are **identity only**.  Their
-# values are part of the signature that ``find_matching_task`` and
-# ``disable_duplicate_enabled_tasks`` compare to decide whether two
-# definitions describe the same task.  No scheduling decision reads them: the
-# claim path always requires ``active_run_id IS NULL`` (i.e. forbid_overlap)
-# and always advances the cursor past ``now`` (i.e. coalesce), which is what
-# the defaults below spell out.  They are therefore not exposed as API inputs
-# or outputs -- a configurable field that changes nothing is worse than no
-# field, because the UI implies a promise the runtime does not keep.  Change a
-# default here and you change dedup identity, so treat that as a migration.
+# Overlap and missed-run behaviour are scheduler invariants for now: a task
+# has one active run and missed clock occurrences are coalesced.  The legacy
+# database columns remain readable, but public models deliberately do not
+# expose configuration that the runtime cannot honour.
 
 
 #: Bounds on a declared acceptance criterion.  A criterion is a sentence, not a
@@ -891,7 +885,9 @@ def acceptance_payload(acceptance: Optional["Acceptance"]) -> dict[str, Any]:
     data = dict(to_dict()) if callable(to_dict) else {}
     criteria = data.get("criteria")
     return {
-        "criteria": [str(item) for item in criteria] if isinstance(criteria, list) else [],
+        "criteria": [str(item) for item in criteria]
+        if isinstance(criteria, list)
+        else [],
         "verify_command": str(data.get("verify_command") or ""),
     }
 
@@ -977,9 +973,7 @@ def product_path_problem(path: str) -> Optional[str]:
     return None
 
 
-def validate_products(
-    produces: Any, *, label: str = "任务"
-) -> None:
+def validate_products(produces: Any, *, label: str = "任务") -> None:
     """Refuse a product declaration that could never be checked.
 
     Called where a task is written rather than where it runs, for the same
@@ -1175,8 +1169,6 @@ class NewScheduledTask:
     delivery_target: DeliveryTarget
     model_override: Optional[str] = None
     enabled: bool = True
-    overlap_policy: str = "forbid_overlap"
-    missed_run_policy: str = "coalesce"
     workspace_root: str = field(default_factory=lambda: str(Path.cwd().resolve()))
     context_policy: str = "stateless"
     timeout_seconds: int = 1800
@@ -1236,8 +1228,6 @@ class ScheduledTask:
     delivery_mode: str
     delivery_target: DeliveryTarget
     model_override: Optional[str]
-    overlap_policy: str
-    missed_run_policy: str
     workspace_root: str
     context_policy: str
     timeout_seconds: int
@@ -1343,6 +1333,10 @@ class TaskRun:
     attempt: int = 1
     cancel_requested_at: Optional[datetime] = None
     retry_of_run_id: str = ""
+    #: The durable execution of a workflow this attempt belongs to.  Empty for
+    #: standalone tasks.  Attempts and downstream steps keep the same value so
+    #: joins, cancellation and history never have to infer a round from time.
+    workflow_run_id: str = ""
     #: How many occurrences of this task were skipped on the way to this run
     #: because nothing was running to fire them.  Surviving a restart is the
     #: point: the number is the only record that the work did *not* happen,
@@ -1359,7 +1353,7 @@ class TaskRun:
 
 def execution_snapshot(task: ScheduledTask) -> dict[str, Any]:
     """Return the immutable, non-secret configuration used by one run."""
-    return {
+    snapshot = {
         "task_id": task.id,
         "task_updated_at": task.updated_at.isoformat(),
         "kind": task.kind,
@@ -1387,6 +1381,12 @@ def execution_snapshot(task: ScheduledTask) -> dict[str, Any]:
             "payload": task.delivery_target.payload,
         },
     }
+    if task.workflow_id:
+        snapshot["workflow"] = {
+            "workflow_id": task.workflow_id,
+            "step_key": task.step_key,
+        }
+    return snapshot
 
 
 #: The kinds of work a step can name.  Kept in step with what the runtime can
@@ -1651,6 +1651,7 @@ class Workflow:
     id: str = ""
     description: str = ""
     enabled: bool = True
+    version: int = 1
     #: The words that asked for this chain, quoted from whoever asked for it.
     #: Not part of :meth:`to_graph`: the graph is what the chain *is*, and this
     #: is what put it there -- the same relationship ``created_at`` has to it.
@@ -1684,6 +1685,7 @@ class Workflow:
         request_quote: str = "",
         created_at: Optional[datetime] = None,
         updated_at: Optional[datetime] = None,
+        version: int = 1,
     ) -> "Workflow":
         data = json.loads(raw or "{}")
         if not isinstance(data, dict):
@@ -1698,6 +1700,7 @@ class Workflow:
             name=str(data.get("name", "")),
             description=str(data.get("description", "")),
             enabled=bool(data.get("enabled", True)),
+            version=max(1, int(version or 1)),
             steps=steps,
             request_quote=str(request_quote or ""),
             created_at=created_at,
@@ -1798,10 +1801,7 @@ def validate_workflow_graph(
         payload = step.payload or {}
         if step.kind == "message" and not str(payload.get("message_text", "")).strip():
             raise ValueError(f"步骤 {key} 是消息任务，但缺少 message_text")
-        if (
-            step.kind == "agent_prompt"
-            and not str(payload.get("prompt", "")).strip()
-        ):
+        if step.kind == "agent_prompt" and not str(payload.get("prompt", "")).strip():
             raise ValueError(f"步骤 {key} 是 Agent 任务，但缺少 prompt")
         if step.kind == "system_job" and not str(payload.get("job_name", "")).strip():
             raise ValueError(f"步骤 {key} 是系统任务，但缺少 job_name")
@@ -1827,9 +1827,7 @@ def validate_workflow_graph(
     return order
 
 
-def step_trigger_spec(
-    step: WorkflowStep, upstream_task_ids: list[str]
-) -> TriggerSpec:
+def step_trigger_spec(step: WorkflowStep, upstream_task_ids: list[str]) -> TriggerSpec:
     """The trigger a step gets once its upstreams are real tasks.
 
     A dependent step waits for **all** of its upstreams to have succeeded, and
