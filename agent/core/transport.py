@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import abc
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import inspect
 import json
 from typing import Any, Callable, Optional
@@ -69,6 +69,17 @@ class ModelEndpoint:
 
     client: Any
     api_format: str
+    #: The owning provider's extra request headers, unresolved (a value may
+    #: still hold ``{session}``).  Carried here because two consumers do not go
+    #: through the transport's request methods -- memory consolidation and the
+    #: evolution engine hold an endpoint and call the SDK themselves -- and a
+    #: gateway that requires a per-conversation header rejects their calls as
+    #: surely as it rejects the chat path's.
+    headers: dict[str, str] = field(default_factory=dict)
+
+    def headers_kwarg(self) -> dict[str, Any]:
+        """``{"extra_headers": ...}`` for a request made with this endpoint."""
+        return request_extra_headers(self.headers)
 
 
 class ModelTransport(abc.ABC):
@@ -116,25 +127,12 @@ class ModelTransport(abc.ABC):
     def _headers_kwarg(self) -> dict[str, Any]:
         """``{"extra_headers": ...}`` for this request, or empty when none.
 
-        Empty rather than ``{"extra_headers": None}`` on purpose: a provider
-        that declares no headers must send a request byte-identical to the one
-        this transport sent before headers existed.
-
-        The session is read here, at request time, not at construction time.
-        The transport is built once per provider configuration and shared by
-        every conversation, so a value captured at construction could only be
-        a process-wide constant -- and a gateway asking for one id per
-        conversation would see one id for all of them.
+        Thin on purpose: the rule lives in :func:`request_extra_headers`, which
+        the endpoint holds as well.  Two copies of "which header, and what
+        does {session} mean" is how one of the two paths ends up sending
+        something the other does not.
         """
-        if not self.headers:
-            return {}
-        session = shared.current_session_id()
-        return {
-            "extra_headers": {
-                name: value.replace(shared.SESSION_HEADER_PLACEHOLDER, session)
-                for name, value in self.headers.items()
-            }
-        }
+        return request_extra_headers(self.headers)
 
     # ── Reasoning ──────────────────────────────────────────────────────
 
@@ -179,7 +177,7 @@ class ModelTransport(abc.ABC):
         lookup; callers that need a client *for a model* ask here rather than
         pairing a model string with whichever client happens to be at hand.
         """
-        return ModelEndpoint(self.client, self.api_format)
+        return ModelEndpoint(self.client, self.api_format, self.headers)
 
     # ── Tool/schema shaping ────────────────────────────────────────────
 
@@ -1041,7 +1039,7 @@ class RoutingTransport(ModelTransport):
         loop used to produce.  Asking the router resolves the pair instead.
         """
         transport = self._for(model)
-        return ModelEndpoint(transport.client, transport.api_format)
+        return ModelEndpoint(transport.client, transport.api_format, transport.headers)
 
     def convert_tools(self, tools: list[dict], model: Optional[str] = None) -> Any:
         return self._for(model).convert_tools(tools)
@@ -1268,6 +1266,36 @@ def routable_model_ids(cfg: dict) -> set[str]:
     if isinstance(top_level, str) and top_level.strip():
         ids.add(top_level.strip())
     return ids
+
+
+def request_extra_headers(
+    headers: Optional[dict[str, str]],
+) -> dict[str, Any]:
+    """``{"extra_headers": ...}`` for one request, or empty when there are none.
+
+    The single place ``{session}`` becomes an id, shared by the transport and
+    by :meth:`ModelEndpoint.headers_kwarg` so the two cannot drift into
+    disagreeing about what a provider's headers mean.
+
+    Empty rather than ``{"extra_headers": None}`` on purpose: a provider that
+    declares no headers must send a request byte-identical to the one this code
+    sent before headers existed.
+
+    The session is read at request time, not when the client or transport was
+    built: those are per provider configuration and shared by every
+    conversation, so a value captured there could only be a process-wide
+    constant -- and a gateway asking for one id per conversation would see one
+    id for all of them.
+    """
+    if not headers:
+        return {}
+    session = shared.current_session_id()
+    return {
+        "extra_headers": {
+            name: value.replace(shared.SESSION_HEADER_PLACEHOLDER, session)
+            for name, value in headers.items()
+        }
+    }
 
 
 def provider_client_cache_key(

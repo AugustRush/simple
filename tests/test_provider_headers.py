@@ -22,6 +22,7 @@ import pytest
 from agent import shared
 from agent.core.transport import (
     AnthropicTransport,
+    ModelEndpoint,
     OpenAITransport,
     build_routing_transport,
     provider_client_cache_key,
@@ -412,3 +413,87 @@ def test_header_warnings_name_the_problem():
     # A placeholder that will never be substituted must not look like it works.
     unknown = _warnings_for({"X-T": "{conversation}"})
     assert any("{conversation}" in w and "{session}" in w for w in unknown)
+
+
+# ── The consumers that make their own calls ───────────────────────────────
+
+
+def test_an_endpoint_carries_the_headers_of_the_provider_that_owns_the_model():
+    """Background work reaches the gateway too, so it needs the same headers.
+
+    Memory consolidation and the evolution engine do not go through the
+    transport's request methods: they hold a ``ModelEndpoint`` and call the SDK
+    themselves.  That pair was only (client, format), so a gateway that
+    requires a per-conversation header answered those calls with a 400 -- the
+    same request the chat path had just been taught to send, missing its
+    header.  The endpoint is what they have, so the headers belong on it.
+    """
+    cfg = {
+        "active_provider": "anthropic",
+        "providers": {
+            "anthropic": {"api_format": "anthropic", "models": ["m1"]},
+            "opencode-go": {
+                "api_format": "openai",
+                "api_key": "k",
+                "models": ["kimi-k2.7-code"],
+                "headers": {"x-opencode-session": "{session}"},
+            },
+        },
+    }
+    routing = build_routing_transport(cfg, "anthropic", object(), lambda c, f: object(), client_cache={})
+
+    token = shared._active_session_id.set("web:bg")
+    try:
+        endpoint = routing.endpoint_for("kimi-k2.7-code")
+        assert endpoint.headers_kwarg() == {"extra_headers": {"x-opencode-session": "web:bg"}}
+        # A provider with no headers adds nothing, exactly like the transport.
+        assert routing.endpoint_for("m1").headers_kwarg() == {}
+    finally:
+        shared._active_session_id.reset(token)
+
+
+def test_the_transport_and_the_endpoint_agree_on_the_header_rule():
+    """One rule, two holders -- or the two drift and only one path works."""
+    headers = {"User-Agent": "zcode/1.0", "x-opencode-session": "{session}"}
+    transport = OpenAITransport(object(), None, True, headers=headers)
+    endpoint = type(transport).endpoint_for(transport, None)
+
+    token = shared._active_session_id.set("web:same")
+    try:
+        assert transport._headers_kwarg() == endpoint.headers_kwarg()
+    finally:
+        shared._active_session_id.reset(token)
+
+
+def test_the_evolution_engine_sends_the_endpoints_headers():
+    """The background path is the chat path minus the transport, not minus the
+    headers: evolution holds an endpoint and calls the SDK itself."""
+    from agent.evolution import EvolutionEngine
+
+    seen: list[dict[str, Any]] = []
+
+    class _Completions:
+        @staticmethod
+        async def create(**kwargs: Any) -> Any:
+            seen.append(kwargs)
+            return type(
+                "Resp",
+                (),
+                {"choices": [type("C", (), {"message": type("M", (), {"content": "ok"})()})()]},
+            )()
+
+    client = type("Client", (), {"chat": type("Chat", (), {"completions": _Completions()})()})()
+    endpoint = ModelEndpoint(
+        client, "openai", {"x-opencode-session": "{session}"}
+    )
+    engine = EvolutionEngine(endpoint=endpoint, model="m", memory=object())
+
+    token = shared._active_session_id.set("scheduler:t:1")
+    try:
+        asyncio.run(engine.generate_text("hi", 16))
+    finally:
+        shared._active_session_id.reset(token)
+
+    assert seen and seen[0]["extra_headers"] == {
+        "x-opencode-session": "scheduler:t:1"
+    }

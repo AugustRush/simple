@@ -350,11 +350,16 @@ class ConsolidationEngine:
                 prompt = self._build_consolidation_prompt(
                     chunk_text, source_label, idx, len(conversation_chunks)
                 )
+                # Same reason as the evolution engine: this call is the chat
+                # path's request minus its headers, and a gateway that requires
+                # one per conversation rejects it.
+                headers_kwarg = endpoint.headers_kwarg()
                 if endpoint.api_format == "anthropic":
                     resp = await endpoint.client.messages.create(
                         model=model,
                         max_tokens=self.output_tokens,
                         messages=[{"role": "user", "content": prompt}],
+                        **headers_kwarg,
                     )
                     raw_responses.append(resp.content[0].text)
                 else:
@@ -362,6 +367,7 @@ class ConsolidationEngine:
                         model=model,
                         max_tokens=self.output_tokens,
                         messages=[{"role": "user", "content": prompt}],
+                        **headers_kwarg,
                     )
                     raw_responses.append(resp.choices[0].message.content or "")
                 usage = extract_provider_usage(resp)

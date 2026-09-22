@@ -160,17 +160,24 @@ class EvolutionEngine:
         The endpoint carries the client and the wire format together, so a
         model named here cannot be posted to a client that does not serve it.
         """
+        # The endpoint's own headers, so a gateway that requires a
+        # per-conversation header gets one here too: this call does not go
+        # through the transport, and without this it is the same request
+        # minus the header the gateway rejects.
+        headers_kwarg = self.endpoint.headers_kwarg()
         if self.endpoint.api_format == "anthropic":
             response = await self.endpoint.client.messages.create(
                 model=self.model,
                 max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
+                **headers_kwarg,
             )
             return response.content[0].text
         response = await self.endpoint.client.chat.completions.create(
             model=self.model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
+            **headers_kwarg,
         )
         return response.choices[0].message.content or ""
 
