@@ -476,12 +476,18 @@ prompt semantics the plan did not consider.
   at the same reserve** so retrieval stops being starved (~1k → ~9k) and the
   output-budget escalation stops measuring against a budget it just shrank.
   → Retrieval now sizes against `output_reserve` in both branches.
-  **Violation #17 was not a bug:** the old
-  `current_budget + (input_budget − estimate)` is algebraically identical to
-  `context_window − overhead − estimate`, because the `current_budget` added and
-  the `current_budget` subtracted by the shrunk budget cancel exactly. It is
-  refactored to `_output_room` anyway, so the cancellation is visible rather than
-  incidental — which is what keeps it correct once the reserve changes.
+  **Violation #17 is not a bug in effect, but the two forms are not the same
+  number.** The old form is `current_budget + max(0, input_budget − estimate −
+  256)`, with `input_budget` shrunk by `current_budget`; that equals the room when
+  the room is the larger of the two and `current_budget` otherwise. Measured on
+  this machine: 61413 tokens of room under a 64000 cap returned **64000** there and
+  **61413** here. What is preserved is the escalation *decision*, because the caller
+  retries only when this exceeds `current_budget` — below that both forms decline,
+  and above it both return the room. So the rewrite is safe, but not because the
+  terms cancel; the earlier claim of algebraic identity was wrong and is corrected
+  in the code comment too. Expressing it as `_output_room` removes the dependence on
+  `current_budget` appearing in the budget's reserve and never names a cap the
+  window cannot hold.
 - [x] **Step 5: Fix `_reserve_input_context`** (`bootstrap.py:47-63`) so the guard
   keys on the reserve rather than on `max_tokens >= context_window`, which never
   fires for this provider.
