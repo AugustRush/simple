@@ -2,7 +2,7 @@
   "_readme": "Copy this file to ~/.agent/config.json and fill in your API keys.",
   "active_provider": "anthropic",
   "providers": {
-    "_readme": "api_format must be 'anthropic' or 'openai'. supports_vision controls whether image attachments are sent directly to the model. api_key can be a literal value or '$ENV_VAR' to read from environment. context_window controls the input context limit used by message compaction. Set higher for models with larger context windows. thinking.effort is optional and lives on the provider, not on the model, because the level is the provider's own word for it; see the deepseek block for what it accepts and what leaving it out does.",
+    "_readme": "api_format must be 'anthropic' or 'openai'. supports_vision controls whether image attachments are sent directly to the model. api_key can be a literal value or '$ENV_VAR' to read from environment. context_window controls the input context limit used by message compaction. Set higher for models with larger context windows. thinking.effort is optional and lives on the provider, not on the model, because the level is the provider's own word for it; see the deepseek block for what it accepts and what leaving it out does. stream_usage is optional too, and defaults to the opposite of thinking.effort: a streaming call asks the provider for its token report, because a stream that reports nothing cannot be measured or recorded; set it to false only for a gateway that rejects stream_options.",
     "anthropic": {
       "api_format": "anthropic",
       "supports_vision": true,

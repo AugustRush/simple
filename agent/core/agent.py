@@ -18,6 +18,7 @@ import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt
 from agent.core.context_assembler import ContextAssembler
+from agent.core.payload_shape import describe_payload
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
 from agent.memory.consolidation import estimate_message_tokens
@@ -293,6 +294,9 @@ class BaseAgent:
 
     _TOOL_LOOP_REPEAT_THRESHOLD = 3
     _TOOL_LOOP_UNPRODUCTIVE_THRESHOLD = 4
+    #: Set once, so a provider that never reports usage says so once per
+    #: process rather than on every turn of every session.
+    _missing_usage_warned: bool = False
     _CONTINUE_PROMPT = (
         "Continue exactly from where you left off. "
         "Do not repeat previous text. "
@@ -1434,6 +1438,7 @@ class BaseAgent:
         if budget <= 0:
             raise ContextLimitError("provider input token budget is not positive")
         context_manager = self._context_manager_for(ctx)
+        messages_before = len(ctx.messages)
         if context_manager is not None:
             ctx.messages = context_manager.compact_messages(
                 ctx.messages, input_token_budget=budget
@@ -1452,6 +1457,14 @@ class BaseAgent:
                 input_token_budget=budget,
                 estimate_tokens=estimate_message_tokens,
             )
+        # Whether this call is about to pay full price for its history: the
+        # body it sends is not the one the previous call sent plus an append.
+        ctx.metadata["_payload_shape"] = describe_payload(
+            ctx.system_prompt,
+            tools,
+            ctx.messages,
+            compacted=len(ctx.messages) != messages_before,
+        )
         estimate = self._estimate_input_tokens(ctx.messages, ctx=ctx)
         if estimate >= budget:
             raise ContextLimitError(
@@ -1473,8 +1486,14 @@ class BaseAgent:
         Without this the character heuristic never learns: it carries the same
         systematic bias for the life of the process, and the only signal that it
         was wrong is a provider-side failure.
+
+        This is also the one place a provider request's real cost is known, so
+        it is where the row that makes the prompt cache measurable is written.
+        `agent.core.payload_shape` says which fields the row carries and why
+        those are the ones that explain a miss.
         """
         predicted = int(ctx.metadata.pop("_predicted_input_tokens", 0) or 0)
+        shape = ctx.metadata.pop("_payload_shape", None)
         observed_usage = getattr(self._transport, "observed_usage", None)
         usage = (
             observed_usage(response)
@@ -1490,6 +1509,13 @@ class BaseAgent:
                     predicted, usage.input_tokens
                 )
         if usage.total_tokens <= 0:
+            # Nothing worth recording: a row of zeros reads as a request that
+            # cost nothing rather than as one whose cost was never reported, and
+            # it would drag down every aggregate it entered.  Said out loud
+            # once, because the alternative is what this path used to do --
+            # leave every streamed turn missing from `usage_events` with
+            # nothing anywhere to say why.
+            self._warn_missing_usage(ctx)
             return
         session_id = str(
             ctx.metadata.get("session_id")
@@ -1503,6 +1529,18 @@ class BaseAgent:
         store = getattr(context_manager, "store", None)
         record = getattr(store, "append_usage_event", None)
         if callable(record):
+            metadata: dict[str, Any] = {
+                "step": step,
+                "predicted_input_tokens": predicted,
+                # The ceiling this call was fitted to.  Recorded beside the
+                # payload's shape because "did the request fit, or was it cut"
+                # is the question the two answer together.
+                "input_budget": int(
+                    ctx.metadata.get("_last_input_token_budget") or 0
+                ),
+            }
+            if isinstance(shape, dict):
+                metadata.update(shape)
             with shared._suppress_with_log("provider usage persistence skipped"):
                 record(
                     session_id=session_id,
@@ -1512,7 +1550,7 @@ class BaseAgent:
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,
                     cached_input_tokens=usage.cached_input_tokens,
-                    metadata={"step": step, "predicted_input_tokens": predicted},
+                    metadata=metadata,
                 )
         _emit_event(
             "provider_usage",
@@ -1521,6 +1559,24 @@ class BaseAgent:
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
             cached_input_tokens=usage.cached_input_tokens,
+        )
+
+    def _warn_missing_usage(self, ctx: "AgentContext") -> None:
+        """Say once that a provider reported no usage for a call.
+
+        Silence here is what let the interactive path go unmeasured: the row was
+        skipped, nothing was logged, and the only symptom was an absent column
+        in a database nobody was reading.  One line per process is enough to
+        turn that into a diagnosable state, and low enough volume to leave on.
+        """
+        if BaseAgent._missing_usage_warned:
+            return
+        BaseAgent._missing_usage_warned = True
+        shared.CONSOLE.print(
+            "[yellow]Provider reported no token usage for a call "
+            f"({self._effective_model(ctx)}); it will not appear in "
+            "usage_events. If the gateway rejects stream_options, set "
+            "providers.<name>.stream_usage to false.[/yellow]"
         )
 
     def _next_structured_output_budget(

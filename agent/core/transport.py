@@ -88,9 +88,24 @@ class ModelTransport(abc.ABC):
     #: than compared against a default word.
     thinking_effort: Optional[str] = None
 
-    def __init__(self, client: Any, thinking_effort: Any = None) -> None:
+    #: Whether a streaming call asks the provider to report what it cost.
+    #: On by default because ``stream_options`` is part of the OpenAI wire
+    #: format this transport already speaks, and because a stream that reports
+    #: nothing cannot be recorded at all — which is how the interactive path
+    #: went unmeasured while every non-streaming call was recorded.  A gateway
+    #: that rejects the parameter names it in its own error, and
+    #: ``providers.<name>.stream_usage: false`` turns it off.
+    stream_usage: bool = True
+
+    def __init__(
+        self,
+        client: Any,
+        thinking_effort: Any = None,
+        stream_usage: Any = True,
+    ) -> None:
         self.client = client
         self.thinking_effort = shared.normalize_thinking_effort(thinking_effort)
+        self.stream_usage = bool(stream_usage)
 
     # ── Reasoning ──────────────────────────────────────────────────────
 
@@ -498,6 +513,14 @@ class OpenAITransport(ModelTransport):
             kwargs["tools"] = api_tools
         if stream:
             kwargs["stream"] = True
+            if self.stream_usage:
+                # Without this a streamed call reports no usage at all, so a
+                # streamed turn can be neither recorded nor used to calibrate
+                # the token estimator — which is why the interactive path had
+                # no rows in `usage_events` while every non-streaming call had
+                # them.  The provider answers in a final chunk carrying an
+                # empty `choices` list and the usage object; `stream` reads it.
+                kwargs["stream_options"] = {"include_usage": True}
         kwargs.update(self._reasoning_effort_kwarg(thinking_effort))
         return kwargs
 
@@ -526,6 +549,11 @@ class OpenAITransport(ModelTransport):
         finish_reason = "stop"
         tool_calls_acc: dict[int, dict] = {}
         provider_extras_acc: dict[str, Any] = {}
+        #: The provider's own count for this call, when it sent one.  Kept
+        #: apart from `provider_extras_acc` because that dict is merged into
+        #: the assistant message that goes back into the history, and usage is
+        #: a property of the call rather than content of the reply.
+        usage: Any = None
         # Reasoning is reported as often as the gateway produces it — one
         # fragment per chunk, before the first answer token — so the UI can
         # show it growing instead of dumping it at the end of the turn.
@@ -541,6 +569,14 @@ class OpenAITransport(ModelTransport):
         # AsyncOpenAI.chat.completions.create() returns a coroutine that
         # awaits to an AsyncStream — must await before iterating.
         async for chunk in await self.client.chat.completions.create(**kwargs):
+            # A usage-only chunk arrives last and carries an *empty* `choices`
+            # list, so it must be read before the `continue` that skips it —
+            # otherwise the one chunk that says what the call cost is the one
+            # chunk this loop discards.  Guarded on `is not None` rather than
+            # truthiness so a gateway that reports a zeroed usage is read as
+            # "reported zero" instead of "reported nothing".
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage
             if not chunk.choices:
                 continue
             choice = chunk.choices[0]
@@ -608,7 +644,8 @@ class OpenAITransport(ModelTransport):
                         provider_extras_acc or None,
                     ),
                 )
-            ]
+            ],
+            usage=usage,
         )
         return response, "".join(collected)
 
@@ -867,18 +904,26 @@ class OpenAITransport(ModelTransport):
 
 
 def build_transport(
-    api_format: str, client: Any, thinking_effort: Any = None
+    api_format: str,
+    client: Any,
+    thinking_effort: Any = None,
+    stream_usage: Any = True,
 ) -> ModelTransport:
     """Single dispatch point — adding a provider here is the only place to edit.
 
     ``thinking_effort`` is the provider's configured effort (see
     ``shared.THINKING_EFFORTS``); omitted means "no opinion", which is what
     keeps an unconfigured provider's requests byte-for-byte what they were.
+
+    ``stream_usage`` reaches only the OpenAI transport.  Anthropic's SDK reports
+    usage on the finished streamed message with no parameter to ask for it, so
+    there is nothing there to configure and passing the value on would be
+    carrying a name that is never read.
     """
     if api_format == "anthropic":
         return AnthropicTransport(client, thinking_effort)
     if api_format == "openai":
-        return OpenAITransport(client, thinking_effort)
+        return OpenAITransport(client, thinking_effort, stream_usage)
     raise ValueError(f"unsupported api_format: {api_format!r}")
 
 
@@ -909,7 +954,9 @@ class RoutingTransport(ModelTransport):
         routes: dict[str, ModelTransport],
         thinking_overrides: Optional[dict[str, str]] = None,
     ) -> None:
-        super().__init__(default.client, default.thinking_effort)
+        super().__init__(
+            default.client, default.thinking_effort, default.stream_usage
+        )
         self.default = default
         self.routes = routes
         # A per-model effort wins over the owning provider's, keyed by model
@@ -1078,6 +1125,38 @@ def provider_thinking_effort(provider_cfg: dict) -> str | None:
     if not isinstance(thinking, dict):
         return None
     return shared.normalize_thinking_effort(thinking.get("effort"))
+
+
+#: Spellings a JSON config uses for "no".  Only the explicit ones count, so a
+#: typo leaves the measurement working rather than silently switching it off.
+_FALSY_WORDS = frozenset({"false", "no", "off", "none", "0"})
+
+
+def provider_stream_usage(provider_cfg: dict) -> bool:
+    """Whether one provider's streaming calls should ask for usage.
+
+    ``providers.<name>.stream_usage``, defaulting to **on** — the opposite
+    default from ``thinking.effort``'s, and deliberately so.  ``reasoning_effort``
+    is a non-standard parameter, so a provider the config never mentioned must
+    not receive it; ``stream_options`` is part of the OpenAI chat-completions
+    format this transport already speaks, and a stream that reports nothing
+    cannot be recorded or used to calibrate the estimator, which is exactly the
+    state the interactive path was stuck in.
+
+    The escape hatch exists for a gateway that rejects the parameter: it names
+    ``stream_options`` in its own error, and one line of provider config turns
+    the request back into what it was.
+    """
+    if not isinstance(provider_cfg, dict):
+        return True
+    value = provider_cfg.get("stream_usage")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in _FALSY_WORDS
+    if isinstance(value, int):
+        return value != 0
+    return True
 
 
 def model_thinking_overrides(provider_cfg: dict) -> dict[str, str]:
@@ -1261,6 +1340,7 @@ def build_routing_transport(
         default_format,
         default_client,
         provider_thinking_effort(active_cfg) if active_cfg else None,
+        provider_stream_usage(active_cfg) if active_cfg else True,
     )
     routes: dict[str, ModelTransport] = {}
     transports: dict[str, ModelTransport] = {}
@@ -1293,6 +1373,7 @@ def build_routing_transport(
                     api_format,
                     _client_for(provider_cfg, api_format),
                     provider_thinking_effort(provider_cfg),
+                    provider_stream_usage(provider_cfg),
                 )
                 transports[name] = transport
         routes[model] = transport

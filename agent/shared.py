@@ -520,6 +520,12 @@ class _OAIChoice:
 @dataclass
 class _OAIResponse:
     choices: list[_OAIChoice]
+    #: Provider usage, when the caller asked for it.  Only the streaming
+    #: assembler in `OpenAITransport` sets this: a non-streaming response is the
+    #: SDK's own object, which carries `usage` natively.  Optional so every
+    #: existing construction site keeps working, and so a gateway that reports
+    #: nothing is distinguishable from one that reported zero.
+    usage: object | None = None
 
 
 @dataclass
