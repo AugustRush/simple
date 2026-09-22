@@ -684,6 +684,15 @@ class ContextManager:
     # Anthropic and OpenAI reject unknown fields on a message object.
     _EVICTION_SENTINEL = "[context-eviction]"
 
+    #: How far below the input budget a compaction cuts once it has been
+    #: triggered.  Cutting to the brim would put the very next step over the
+    #: line again, and every cut rewrites the front of the body — which is
+    #: exactly what a provider's prefix cache reuses — so the remaining
+    #: conversation is re-billed at full rate each time.  A deep, rare cut costs
+    #: one re-bill and buys many append-only turns; a shallow, frequent one pays
+    #: that price on nearly every request.  See `fit_to_budget`.
+    _COMPACTION_LOW_WATER = 0.5
+
     @classmethod
     def _eviction_notice(cls, dropped_count: int) -> dict:
         return {
@@ -777,19 +786,35 @@ class ContextManager:
             return [msg for index, msg in enumerate(messages) if index in kept_indexes]
 
         compacted = materialize()
-        while estimate_tokens(compacted) >= budget:
-            removable = next(
-                (
-                    unit
-                    for unit in retained
-                    if newest_request_index not in unit
-                ),
-                None,
-            )
-            if removable is None:
-                raise ContextLimitError("complete conversation context exceeds input budget")
-            retained.remove(removable)
-            compacted = materialize()
+        if estimate_tokens(compacted) >= budget:
+            # Compaction has been triggered, so cut deep rather than to the
+            # first size that fits.  The body is what a provider's prefix cache
+            # reuses and every cut rewrites its front, so the whole remaining
+            # conversation is re-billed at full rate.  Trimming to the brim puts
+            # the next step over the line again and re-cuts on nearly every
+            # request; trimming to the low-water mark leaves the turns that
+            # follow append-only and pushes the next cut many turns away.
+            low_water = max(1, int(budget * cls._COMPACTION_LOW_WATER))
+            while retained and estimate_tokens(compacted) > low_water:
+                removable = next(
+                    (
+                        unit
+                        for unit in retained
+                        if newest_request_index not in unit
+                    ),
+                    None,
+                )
+                if removable is None:
+                    # Everything left is the newest request, which is never
+                    # dropped.  If that still does not fit, the request itself
+                    # is the problem and there is no cut that would help.
+                    break
+                retained.remove(removable)
+                compacted = materialize()
+            if estimate_tokens(compacted) >= budget:
+                raise ContextLimitError(
+                    "complete conversation context exceeds input budget"
+                )
         kept_indexes = {item for unit in retained for item in unit}
         dropped_messages = [
             message
@@ -803,9 +828,19 @@ class ContextManager:
             # missing, so leave an explicit notice.  The notice is an aid, not a
             # requirement: if it does not fit alongside the conversation it is
             # omitted rather than allowed to fail the compaction it describes.
+            #
+            # It is never prepended and never last.  Position 0 of the body is
+            # the one place a rewrite costs the whole cached prefix, and the
+            # last message is the one a provider reads as the turn to answer --
+            # putting the notice there means the model replies to the notice
+            # instead of to the user.  It goes at the tail of the *retained*
+            # prefix, immediately before the newest request: every retained
+            # message is untouched, and the user's own words stay last.
             notice = cls._eviction_notice(dropped_now)
-            if estimate_tokens([notice] + compacted) < budget:
-                compacted = [notice] + compacted
+            if estimate_tokens(compacted + [notice]) < budget:
+                compacted = cls._with_notice_before_newest_request(
+                    compacted, notice, messages, newest_request_index
+                )
         if len(compacted) != len(messages):
             # Counts alone say how much was lost but not what: a caller
             # cannot tell a dropped tool batch from a dropped user request.
@@ -821,6 +856,39 @@ class ContextManager:
                 else 0,
             )
         return compacted
+
+    @classmethod
+    def _with_notice_before_newest_request(
+        cls,
+        compacted: list[dict],
+        notice: dict,
+        messages: list[dict],
+        newest_request_index: int,
+    ) -> list[dict]:
+        """Place *notice* at the tail of the retained prefix, not after it.
+
+        Appending it to the very end of the body puts the notice where the
+        provider reads the current turn, so the model answers the notice rather
+        than the user -- ``M = [... retained ..., user(request), user(notice)]``.
+        Prepending it instead rewrites position 0, which is the one offset a
+        prefix cache cannot tolerate losing.  Immediately before the newest
+        request is the only position that satisfies both: every retained
+        message is byte-identical to what the previous call sent, and the user's
+        own words remain the last message.
+
+        ``newest_request_index`` indexes ``messages``, and ``compacted`` holds
+        the same objects, so the request is located by identity rather than by
+        re-testing which message looks like a request.
+        """
+        if newest_request_index < 0:
+            return compacted + [notice]
+        request = messages[newest_request_index]
+        for position, message in enumerate(compacted):
+            if message is request:
+                return compacted[:position] + [notice] + compacted[position:]
+        # The request was not retained, which `fit_to_budget` never does; fall
+        # back to appending rather than dropping the notice.
+        return compacted + [notice]
 
     @staticmethod
     def _role_sequence(messages: list[dict], limit: int = 40) -> str:

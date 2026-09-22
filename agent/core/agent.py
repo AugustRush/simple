@@ -60,6 +60,15 @@ _UPSTREAM_DETAIL_BUDGET = 2400
 _UPSTREAM_STRUCTURED_BUDGET = 1200
 _RENDEZVOUS_INPUT_BUDGET = 6000
 
+#: Set on ``ctx.metadata`` for the duration of one turn, and read by
+#: ``BaseAgent._post_turn_maintenance``.  That method performs the only two
+#: edits to a provider payload that a prefix cache cannot survive -- compaction
+#: cuts the front of the body, and ``_with_task_context`` rewrites the head --
+#: and both are correct *between* turns but ruinous inside one, because a turn's
+#: steps are meant to share a prefix.  Module-level rather than a class
+#: attribute because the reader is a ``staticmethod``.
+_TURN_IN_PROGRESS_KEY = "_turn_in_progress"
+
 # Context variable so built-in tools can access the active AgentContext
 _active_agent_context: contextvars.ContextVar[Optional["AgentContext"]] = (
     contextvars.ContextVar("active_agent_context", default=None)
@@ -1441,6 +1450,50 @@ class BaseAgent:
         # with the measurement instead of correcting anything.
         return estimate_message_tokens(messages)
 
+    def _compact_body_for_turn(self, ctx: "AgentContext") -> None:
+        """Cut the body to a low-water mark once, before the turn's first call.
+
+        Compaction rewrites the front of the body, and the front is the one
+        thing a provider's prefix cache can reuse.  Doing it here rather than
+        inside the provider loop is what keeps the rest of a turn append-only:
+        a turn that cuts mid-flight both loses context the model was actively
+        using and pays for a fresh prefix on every step that follows, whereas a
+        single cut at the boundary leaves every step an append.
+
+        `_prepare_provider_context` keeps its own call as an emergency fallback
+        for a step whose own tool results overflow the window.  That is rare
+        precisely because this cut leaves half the budget free, and it stays
+        because the alternative is a hard failure in the middle of a turn.
+        """
+        tools = ctx.metadata.get("_selected_tools")
+        if not isinstance(tools, list):
+            return
+        budget = self._input_token_budget(ctx, tools)
+        if budget <= 0:
+            return
+        messages_before = len(ctx.messages)
+        context_manager = self._context_manager_for(ctx)
+        compact = getattr(context_manager, "compact_messages", None)
+        if callable(compact):
+            ctx.messages = compact(ctx.messages, input_token_budget=budget)
+        else:
+            # A manager is optional here, exactly as it is in
+            # `_prepare_provider_context`: fitting a request into the window is
+            # a property of the request rather than of memory, so
+            # `fit_to_budget` is the same algorithm without the instance.  Runs
+            # with no manager (the scheduler's `stateless` policy) and callers
+            # that supply a retrieval-only stand-in both land here.
+            ctx.messages = ContextManager.fit_to_budget(
+                ctx.messages,
+                input_token_budget=budget,
+                estimate_tokens=estimate_message_tokens,
+            )
+        if len(ctx.messages) != messages_before:
+            # Read and cleared by the first `_prepare_provider_context` of the
+            # turn, so the recorded row says "this call paid full price for its
+            # history" only on the call that actually did.
+            ctx.metadata["_body_compacted_pending"] = True
+
     def _prepare_provider_context(
         self,
         ctx: "AgentContext",
@@ -1457,6 +1510,12 @@ class BaseAgent:
         if budget <= 0:
             raise ContextLimitError("provider input token budget is not positive")
         context_manager = self._context_manager_for(ctx)
+        # Compaction normally runs once, at the turn boundary (see
+        # `_compact_body_for_turn`), so that everything after it is an append.
+        # What remains here is the emergency path: a step whose own tool results
+        # have overflowed the window.  It stays because the alternative is a
+        # hard failure mid-turn, and it is rare because the boundary cut leaves
+        # half the budget free.
         messages_before = len(ctx.messages)
         if context_manager is not None:
             ctx.messages = context_manager.compact_messages(
@@ -1476,13 +1535,18 @@ class BaseAgent:
                 input_token_budget=budget,
                 estimate_tokens=estimate_message_tokens,
             )
-        # Whether this call is about to pay full price for its history: the
-        # body it sends is not the one the previous call sent plus an append.
+        # Whether this call is about to pay full price for its history: the body
+        # it sends is not the one the previous call sent plus an append.  A cut
+        # made at the turn boundary belongs to the turn's *first* call, which is
+        # the one that pays for it; the flag is cleared here so the steps after
+        # it are not all reported as misses.  The in-loop cut is counted
+        # directly, because it happened on this call.
         ctx.metadata["_payload_shape"] = describe_payload(
             ctx.system_prompt,
             tools,
             ctx.messages,
-            compacted=len(ctx.messages) != messages_before,
+            compacted=bool(ctx.metadata.pop("_body_compacted_pending", False))
+            or len(ctx.messages) != messages_before,
         )
         estimate = self._estimate_input_tokens(ctx.messages, ctx=ctx)
         if estimate >= budget:
@@ -2846,7 +2910,12 @@ class BaseAgent:
         await heartbeat.__aenter__()
 
         try:
+            ctx.metadata[_TURN_IN_PROGRESS_KEY] = True
             orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
+            # Cut once, here, so every step below is an append.  See
+            # `_compact_body_for_turn` for why the position of this call is what
+            # decides whether a turn's steps share a cacheable prefix.
+            self._compact_body_for_turn(ctx)
 
             # D1: bounded step loop — prevents infinite model loops.
             # Vocabulary: a *step* is one model request plus the tools that
@@ -3287,6 +3356,10 @@ class BaseAgent:
             # that token is reset above, so no extra stack bookkeeping is needed.
             ctx.metadata.pop("_provider_step", None)
             ctx.metadata.pop("_selected_tools", None)
+            # Cleared here rather than around the whole method so that
+            # `_post_turn_maintenance` -- which the runtime calls after this
+            # returns -- can tell a between-turns call from a mid-turn one.
+            ctx.metadata.pop(_TURN_IN_PROGRESS_KEY, None)
 
         return AgentResult(
             agent_id=ctx.agent_id,
@@ -3326,6 +3399,10 @@ class BaseAgent:
             metadata.get("_last_input_token_budget")
             or default_input_budget
         )
+        # Read here, not at the compaction block below: `metadata` is rebound to
+        # the caller's record_kwargs partway through this method, and the mark
+        # lives on `ctx.metadata`.  See `_TURN_IN_PROGRESS_KEY`.
+        between_turns = not metadata.get(_TURN_IN_PROGRESS_KEY)
         if ctx_mgr:
             consume_suppression = getattr(
                 ctx_mgr, "consume_memory_clear_suppression", None
@@ -3413,8 +3490,24 @@ class BaseAgent:
         # 2. Wake the background memory worker so staged content gets
         #    consolidated without delaying the interactive loop.
         # The pre-loop check in send_message handles the common case.
-        if ctx_mgr and ctx_mgr.should_compact_messages(
-            ctx.messages, input_token_budget=input_token_budget
+        #
+        # Both edits below rewrite a payload that a provider's prefix cache is
+        # holding: compaction cuts the front of the body, and `_with_task_context`
+        # rebuilds the head.  Each is correct once per *turn*, but a turn issues
+        # one provider call per step and those calls are meant to share a prefix,
+        # so doing either one mid-turn re-bills the rest of the turn in full.
+        # `between_turns` makes "only between turns" a precondition instead of an
+        # assumption -- the sole production caller (`complete_turn`) already
+        # satisfies it, and a future caller inside a tool loop would otherwise
+        # reintroduce the miss silently.  Everything after this block -- turn
+        # recording, staging, the checkpoint -- touches no payload and is
+        # deliberately not gated.
+        if (
+            between_turns
+            and ctx_mgr
+            and ctx_mgr.should_compact_messages(
+                ctx.messages, input_token_budget=input_token_budget
+            )
         ):
             ctx.messages = ctx_mgr.compact_messages(
                 ctx.messages, input_token_budget=input_token_budget

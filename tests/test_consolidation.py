@@ -2593,6 +2593,135 @@ def test_compaction_with_notice_preserves_pairing_and_is_stable(tmp_path):
     assert len(again) == len(compacted)
 
 
+# ── The body is append-only between cuts: a cut is what the cache cannot survive ──
+
+
+def test_a_body_under_the_budget_is_only_ever_appended_to(tmp_path):
+    """I2: within a turn the body grows; nothing rewrites its front.
+
+    A turn issues one provider call per step and every call re-sends the whole
+    body, so the steps of one turn are only cheap together if each payload
+    starts with the previous one.  A provider's prefix cache reuses exactly the
+    part before the first difference, so a single dropped unit would re-bill
+    everything after it, on every remaining step of the turn.  Below the budget
+    there is nothing to drop -- and this pins that by identity, not equality:
+    the entries must be the same objects, because equal-but-rebuilt is still a
+    rewrite at the wire level.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    budget = 100_000
+
+    step_one = _long_conversation(2)
+    after_step_one = ctx_mgr.compact_messages(step_one, input_token_budget=budget)
+    assert after_step_one == step_one
+    assert _notices(after_step_one) == []
+
+    step_two = after_step_one + [
+        {"role": "assistant", "content": "calling a tool"},
+        {"role": "user", "content": "tool result"},
+    ]
+    after_step_two = ctx_mgr.compact_messages(step_two, input_token_budget=budget)
+
+    assert len(after_step_two) == len(step_two), "nothing was due for eviction"
+    assert all(
+        before is after for before, after in zip(after_step_two, after_step_one)
+    ), "the front of the body was rewritten"
+    assert after_step_two[len(after_step_one):] == step_two[len(after_step_one):]
+    assert _notices(after_step_two) == []
+
+
+def test_a_triggered_compaction_cuts_to_the_low_water_mark(tmp_path):
+    """I3: a cut that only just fits re-cuts on the very next step.
+
+    Every cut rewrites the front of the body, so the cost is paid per cut rather
+    than per token.  Cutting to the brim makes the next step overflow again and
+    turns the cut into the steady state; cutting deep makes it rare.  The
+    assertion is deliberately not expressed in terms of the low-water constant
+    itself -- that would hold for any value of it, including a brim cut -- but
+    in terms of what the cut has to buy: enough room that a step's own tool
+    output still fits.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    budget = 4000
+    compacted = ctx_mgr.compact_messages(
+        _long_conversation(30), input_token_budget=budget
+    )
+    used = ctx_mgr.consolidation.estimate_tokens(compacted)
+
+    assert used < budget, "compaction must still fit the budget"
+    assert budget - used >= budget // 3, (
+        "the cut stopped at the brim, so the next step would cut the body again"
+    )
+
+
+def test_the_eviction_notice_never_becomes_the_current_request(tmp_path):
+    """The notice is an advisory, so it must not occupy the request's slot.
+
+    A provider reads the last user message as the turn to answer.  Appending the
+    notice there makes the model reply to the notice rather than to the user,
+    and prepending it rewrites position 0, which is the offset a prefix cache
+    cannot afford to lose.  Between the retained prefix and the request is the
+    only placement that satisfies both.
+    """
+    from agent.memory.system import ContextManager
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    body = _long_conversation(6) + [
+        {"role": "user", "content": "the real request"}
+    ]
+    compacted = ctx_mgr.compact_messages(body, input_token_budget=600)
+
+    assert _notices(compacted), "eviction must not be silent"
+    assert compacted[-1]["content"] == "the real request", (
+        "the user's request must stay the last message"
+    )
+    assert not str(compacted[0]["content"]).startswith(
+        ContextManager._EVICTION_SENTINEL
+    ), "position 0 of the body must never be rewritten"
+
+
+def test_post_turn_maintenance_leaves_a_mid_turn_payload_alone(tmp_path):
+    """I1/I2: the payload rewrites here belong to the turn boundary.
+
+    `send_message` marks ``ctx.metadata`` for the whole of a turn.  If
+    maintenance runs while that mark is set -- a caller inside a tool loop
+    rather than after the turn -- compaction cuts the front of the body and
+    ``_with_task_context`` rebuilds the head, both between two provider calls
+    that are supposed to share a prefix.  Recording the turn is not a payload
+    edit and must still happen.
+    """
+    from types import SimpleNamespace
+
+    from agent import BaseAgent
+    from agent.core.agent import _TURN_IN_PROGRESS_KEY
+
+    manager = make_ctx_manager(tmp_path)
+    manager.mark_activity()
+    messages = _long_conversation(30)
+    ctx = SimpleNamespace(
+        messages=list(messages),
+        system_prompt="head",
+        metadata={_TURN_IN_PROGRESS_KEY: True},
+    )
+    # A small window holding a large body, so compaction is unambiguously due.
+    agent = SimpleNamespace(max_tokens=1024, context_window=2048)
+    assert manager.should_compact_messages(messages, input_token_budget=2048)
+
+    BaseAgent._post_turn_maintenance(
+        ctx_mgr=manager,
+        agent=agent,
+        ctx=ctx,
+        user_content="question",
+        assistant_content="answer",
+        system_prompt="head",
+        task_context="the original request",
+    )
+
+    assert ctx.messages == messages, "a mid-turn call must not cut the body"
+    assert ctx.system_prompt == "head", "a mid-turn call must not rebuild the head"
+    assert manager.staging.count() > 0, "recording the turn is not a payload edit"
+
+
 def test_provider_checkpoint_preserves_openai_tool_protocol_and_summary(tmp_path):
     ctx_mgr = make_ctx_manager(tmp_path)
     messages = [
@@ -2751,6 +2880,12 @@ def test_retrieval_budget_default_leaves_room_for_the_conversation(tmp_path):
 
     assert budget == max(1024, int(usable * agent_module.RETRIEVAL_BUDGET_FRACTION))
     assert budget < usable // 2, "retrieval must not be able to claim the window"
+    # If the cap were what sized this, a provider configured for long answers
+    # would have its retrieval budget cut by the same factor.
+    assert budget > max(
+        1024,
+        int((128_000 - 64_000) * agent_module.RETRIEVAL_BUDGET_FRACTION),
+    )
 
     agent.max_retrieval_tokens = 4096
     assert agent._retrieval_token_budget() == 4096
