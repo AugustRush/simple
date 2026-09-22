@@ -3435,3 +3435,246 @@ def test_join_progress_shows_the_round_not_the_no_round_leftovers(tmp_path):
         store.close()
 
 
+def test_a_stale_claim_settles_the_workflow_run_it_interrupted(tmp_path):
+    """Recovery, not only completion, has to close a workflow execution.
+
+    ``complete_run`` is where a workflow run is rolled up, but it is not the
+    only way a run ends: a scheduler that dies mid-run leaves a lease to
+    expire, and ``recover_stale_runs`` is what marks that run ``interrupted``.
+    If the roll-up lives only in ``complete_run``, every crashed entry step
+    leaves its workflow run ``running`` for ever -- and ``update_workflow``
+    refuses to edit a definition while any run of it is ``running``, so one
+    crash would lock the definition until the whole workflow was deleted.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        claimed = store.claim_task_now(tasks["collect"].id, now=NOW)
+        assert claimed is not None
+
+        store.recover_stale_runs(now=NOW + timedelta(minutes=10))
+
+        assert _workflow_run_status(store, claimed.run.workflow_run_id) in {
+            "interrupted",
+            "failed",
+        }
+        # The definition is editable again: the round is over, so nothing of
+        # the old definition is still executing.
+        edited = store.get_workflow(workflow.id)
+        edited.description = "after crash"
+        assert store.update_workflow(workflow.id, edited) is not None
+    finally:
+        store.close()
+
+
+def test_a_released_claim_settles_the_workflow_run_it_released(tmp_path):
+    """``release_claim`` ends a run too, so it has to roll up the round as well.
+
+    The scheduler releases a claim when it stops before the slot opens, and a
+    released run is left ``interrupted`` with nobody completing it afterwards.
+    Same consequence as a stale lease: the round stays ``running`` for ever.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        claimed = store.claim_task_now(tasks["collect"].id, now=NOW)
+        assert claimed is not None
+
+        assert store.release_claim(
+            tasks["collect"].id,
+            claimed.run.id,
+            now=NOW + timedelta(seconds=1),
+            reason="scheduler stopped",
+        )
+
+        assert _workflow_run_status(store, claimed.run.workflow_run_id) in {
+            "interrupted",
+            "failed",
+        }
+    finally:
+        store.close()
+
+
+def test_a_dormant_round_does_not_lock_the_definition_for_ever(tmp_path):
+    """A round whose remaining steps are merely not coming must not block edits.
+
+    A workflow with two clock entries runs one of them; the other entry's
+    occurrence is weeks away, so the round will not complete on its own any
+    time soon.  ``update_workflow`` may refuse while a round is genuinely in
+    progress, but a round with no queued or running work left is not in
+    progress -- it is finished for practical purposes, and leaving it
+    ``running`` converts one manual run into a permanent edit lock.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(
+            Workflow(
+                name="dual entry",
+                steps=[
+                    step("a", trigger=clock()),
+                    step("b", trigger=TriggerSpec.once("2027-01-01T00:00:00+00:00", "UTC")),
+                    step("join", depends_on=["a", "b"]),
+                ],
+            )
+        )
+        tasks = store.step_tasks(workflow.id)
+        claimed = store.claim_task_now(tasks["a"].id, now=NOW)
+        assert claimed is not None
+        assert store.complete_run(
+            tasks["a"].id,
+            claimed.run.id,
+            finished_at=NOW + timedelta(seconds=1),
+            status="succeeded",
+        )
+
+        edited = store.get_workflow(workflow.id)
+        edited.description = "one entry ran, the other never will"
+        updated = store.update_workflow(workflow.id, edited)
+
+        assert updated is not None
+        assert updated.description == edited.description
+    finally:
+        store.close()
+
+
+def test_running_a_join_upstream_now_joins_the_round_waiting_for_it(tmp_path):
+    """A manual run of a join upstream feeds the round, not a new round.
+
+    ``run_now``/``claim_task_now`` on a step whose join is mid-round used to
+    mint a fresh workflow-run id, so its success signal carried the new id and
+    the waiting join never heard it: the round it belongs to stalls for ever
+    while a second, empty round is created around the manual run.  The manual
+    run has to inherit the round its downstream join is waiting on.
+
+    A dual-entry workflow makes the round deterministic: ``a`` fires, its
+    report opens the join's round, and ``b`` -- whose clock is a week out --
+    is what the user runs by hand.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(
+            Workflow(
+                name="dual entry",
+                steps=[
+                    step("a", trigger=clock()),
+                    step("b", trigger=TriggerSpec.once("2027-01-01T00:00:00+00:00", "UTC")),
+                    step("join", depends_on=["a", "b"]),
+                ],
+            )
+        )
+        tasks = store.step_tasks(workflow.id)
+        # Run ``a`` off its clock, which is what consumes the occurrence: a
+        # manual claim deliberately does not, and a leftover occurrence would
+        # fire a second round of its own and muddy what is being measured.
+        make_due(store, tasks["a"].id)
+        due = store.claim_due_tasks(now=NOW, limit=5, lease_seconds=300)
+        assert [item.task.step_key for item in due] == ["a"]
+        round_id = due[0].run.workflow_run_id
+        assert round_id
+        assert store.complete_run(
+            tasks["a"].id,
+            due[0].run.id,
+            finished_at=NOW + timedelta(seconds=1),
+            status="succeeded",
+        )
+        store.deliver_signals(now=NOW + timedelta(seconds=2))
+
+        # The join heard from a and is short b, all inside one round.
+        progress = store.join_progress(tasks["join"].id)
+        assert progress["missing"] == [task_signal_name(tasks["b"].id, "succeeded")]
+
+        # The user runs b now, weeks before its clock.
+        running = store.claim_task_now(tasks["b"].id, now=NOW + timedelta(seconds=3))
+        assert running is not None
+        assert running.run.workflow_run_id == round_id
+
+        assert store.complete_run(
+            tasks["b"].id,
+            running.run.id,
+            finished_at=NOW + timedelta(seconds=4),
+            status="succeeded",
+        )
+        store.deliver_signals(now=NOW + timedelta(seconds=5))
+        claimed = store.claim_due_tasks(
+            now=NOW + timedelta(seconds=6), limit=5, lease_seconds=300
+        )
+        join_claims = [c for c in claimed if c.task.step_key == "join"]
+        assert len(join_claims) == 1
+        assert join_claims[0].run.workflow_run_id == round_id
+        # And no second round was minted around the manual run.
+        rounds = store._conn.execute(
+            "SELECT id FROM workflow_runs WHERE workflow_id = ?",
+            (workflow.id,),
+        ).fetchall()
+        assert len(rounds) == 1
+    finally:
+        store.close()
+
+
+def test_the_second_clock_entry_joins_the_round_waiting_for_it(tmp_path):
+    """Two clock entries meeting at a join share one round.
+
+    Each entry firing is normally its own round, but a join that is already
+    waiting on this step cannot be completed by a round the step was not part
+    of: the report it sends carries the new round's id, and the waiting join
+    never hears it.  So a clock firing pairs with the round that is waiting
+    for it -- which is what makes a fork-join built from two schedules work at
+    all, instead of leaving both rounds permanently one report short.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(
+            Workflow(
+                name="dual clock",
+                steps=[
+                    step("a", trigger=clock()),
+                    step("b", trigger=clock("2026-05-01T11:58:00+00:00")),
+                    step("join", depends_on=["a", "b"]),
+                ],
+            )
+        )
+        tasks = store.step_tasks(workflow.id)
+        # a's occurrence is placed ahead of b's so `limit=1` picks a: the
+        # scenario needs a to open the round and b to join it later.
+        make_due(store, tasks["a"].id, when=NOW - timedelta(minutes=5))
+        first = store.claim_due_tasks(now=NOW, limit=1, lease_seconds=300)
+        assert [item.task.step_key for item in first] == ["a"]
+        round_id = first[0].run.workflow_run_id
+        assert store.complete_run(
+            tasks["a"].id,
+            first[0].run.id,
+            finished_at=NOW + timedelta(seconds=1),
+            status="succeeded",
+        )
+        store.deliver_signals(now=NOW + timedelta(seconds=2))
+
+        # b's own clock comes due; it belongs to the round already waiting.
+        make_due(store, tasks["b"].id, when=NOW + timedelta(minutes=5))
+        second = store.claim_due_tasks(
+            now=NOW + timedelta(minutes=5), limit=5, lease_seconds=300
+        )
+        assert [item.task.step_key for item in second] == ["b"]
+        assert second[0].run.workflow_run_id == round_id
+
+        assert store.complete_run(
+            tasks["b"].id,
+            second[0].run.id,
+            finished_at=NOW + timedelta(minutes=5, seconds=1),
+            status="succeeded",
+        )
+        store.deliver_signals(now=NOW + timedelta(minutes=5, seconds=2))
+        claimed = store.claim_due_tasks(
+            now=NOW + timedelta(minutes=5, seconds=3), limit=5, lease_seconds=300
+        )
+        join_claims = [item for item in claimed if item.task.step_key == "join"]
+        assert len(join_claims) == 1
+        assert join_claims[0].run.workflow_run_id == round_id
+        rounds = store._conn.execute(
+            "SELECT id FROM workflow_runs WHERE workflow_id = ?",
+            (workflow.id,),
+        ).fetchall()
+        assert len(rounds) == 1
+    finally:
+        store.close()

@@ -1492,6 +1492,54 @@ class SchedulerStore:
         ).fetchone()
         return row["id"] if row else None
 
+    def _round_waiting_on(self, task: ScheduledTask) -> str:
+        """The open round whose join is still short this task's success report.
+
+        Used when a step is started by something other than an upstream signal
+        -- a person pressing "run now", or a clock.  Neither has a parent run
+        to inherit a round from, so without this the run mints a fresh
+        workflow-run id: its success signal then carries that new id, the join
+        that was waiting for it hears nothing, and the round it belongs to
+        stalls for ever while an empty second round is created around the run.
+
+        Only a round that is demonstrably waiting qualifies: some join in the
+        same workflow has a pending arrival set that requires this task's
+        success signal and does not have it yet.  Any other kind of round is
+        left alone, so an ordinary scheduled entry still starts a new round of
+        its own.
+        """
+        if not task.workflow_id:
+            return ""
+        wanted = task_signal_name(task.id, RUN_SUCCESS_STATUS)
+        rows = self._conn.execute(
+            """
+            SELECT j.task_id, j.workflow_run_id, j.satisfied_json
+            FROM workflow_signal_joins j
+            JOIN scheduled_tasks t ON t.id = j.task_id
+            JOIN workflow_runs w
+              ON w.id = j.workflow_run_id AND w.status = 'running'
+            WHERE t.workflow_id = ? AND t.enabled = 1
+            ORDER BY j.updated_at DESC, j.rowid DESC
+            """,
+            (task.workflow_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                satisfied = {
+                    str(item)
+                    for item in json.loads(row["satisfied_json"] or "[]")
+                }
+            except (TypeError, ValueError):
+                satisfied = set()
+            if wanted in satisfied:
+                continue
+            join_task = self.get_task(str(row["task_id"]))
+            if join_task is None or join_task.trigger is None:
+                continue
+            if wanted in set(signal_names(join_task.trigger)):
+                return str(row["workflow_run_id"])
+        return ""
+
     def _prepare_workflow_run(
         self,
         task: ScheduledTask,
@@ -1526,6 +1574,16 @@ class SchedulerStore:
             # workflow execution id.
             if not inherited:
                 inherited = str(signal.get("origin_id", "") or "").strip()
+        # Nothing above names a parent for a step a person or a clock started,
+        # but one may still be waiting: a join mid-round is short of exactly
+        # this step's report.  Joining that round is what lets a manual run of
+        # an upstream continue the chain instead of stranding it -- see
+        # `_round_waiting_on`.  Retries are excluded: a retry's round comes
+        # from the snapshot it was cloned with, and re-running with the
+        # latest definition is a new attempt rather than a repair of the old
+        # round.
+        if not inherited and trigger_source in {"manual", "schedule"}:
+            inherited = self._round_waiting_on(task)
         workflow_run_id = inherited or run_id
         workflow_row = self._conn.execute(
             "SELECT graph_json, version FROM workflows WHERE id = ?",
@@ -2834,6 +2892,12 @@ class SchedulerStore:
                     row["task_id"],
                 ),
             )
+            # The recovered run may be the last thing its workflow round ever
+            # gets -- the scheduler that owned it is gone -- so the round is
+            # rolled up here rather than waiting for a completion that will
+            # not come.  Without this, one crash left the round ``running``
+            # for ever and ``update_workflow`` refused every later edit.
+            self._settle_workflow_run_of_run(row["active_run_id"], now)
             recovered += 1
         return recovered
 
@@ -2918,6 +2982,11 @@ class SchedulerStore:
                 """,
                 (reason, _iso(now), _iso(now), run_id, task_id),
             )
+            # A released claim is over: nothing completes it afterwards, so if
+            # it was the only live work of its workflow round, the round is
+            # rolled up here.  Same reasoning as the stale-lease recovery
+            # above -- every way a run ends has to close the round it ends.
+            self._settle_workflow_run_of_run(run_id, now)
         return True
 
     @_synchronized
@@ -3073,7 +3142,22 @@ class SchedulerStore:
             return []
 
     def _settle_workflow_run(self, workflow_run_id: str, now: datetime) -> None:
-        """Roll up a workflow execution once every reachable step is settled."""
+        """Roll up a workflow execution once nothing of it is still in flight.
+
+        A step can still run only while it, or something of the round it
+        belongs to, has a run queued or running.  The ``expected`` set starts
+        from the steps that have already appeared and grows by their
+        downstreams, so a step that has not appeared yet keeps the round open
+        -- it may still be fed, by the upstream that owes it a report or by a
+        manual run inheriting this round (see :meth:`_round_waiting_on`).
+
+        A round that stays open that way has nothing in flight and cannot
+        finish on its own; it is closed by :meth:`_close_rounds_before_edit`
+        when the definition is next edited, rather than being declared over
+        here where it would also lose the chance of that manual rescue.
+
+        Caller owns the transaction.
+        """
         if not workflow_run_id:
             return
         definition_steps = self._workflow_run_steps(workflow_run_id)
@@ -3114,6 +3198,100 @@ class SchedulerStore:
             """,
             (status, _iso(now), _iso(now), workflow_run_id),
         )
+
+    def _settle_workflow_run_of_run(self, run_id: str, now: datetime) -> None:
+        """Close out the workflow round one run belonged to.  Caller owns txn.
+
+        Every path that ends a run without completing it -- lease recovery,
+        claim release -- reaches here, and each of them can be the last event
+        the round ever gets: the scheduler that owned the run is gone, so no
+        completion and no success signal is coming.  The downstream steps the
+        round was waiting on are therefore recorded as skipped (the same
+        record ``complete_run`` writes for a failure, with a reason that says
+        which non-success ending caused it), and the round is rolled up.
+        """
+        row = self._conn.execute(
+            """
+            SELECT r.task_id, r.status, r.workflow_run_id,
+                   t.workflow_id, t.step_key
+            FROM scheduled_task_runs r
+            JOIN scheduled_tasks t ON t.id = r.task_id
+            WHERE r.id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return
+        workflow_run_id = str(row["workflow_run_id"] or "")
+        if not workflow_run_id:
+            return
+        status = str(row["status"] or "")
+        if status and status != RUN_SUCCESS_STATUS:
+            self._skip_blocked_steps_in_transaction(
+                str(row["workflow_id"] or ""),
+                str(row["step_key"] or ""),
+                status,
+                now,
+                workflow_run_id,
+                self._workflow_run_steps(workflow_run_id),
+            )
+        self._settle_workflow_run(workflow_run_id, now)
+
+    def _close_rounds_before_edit(self, workflow_id: str, now: datetime) -> None:
+        """End every round that is not executing something.  Caller owns txn.
+
+        An edit may proceed while a round is ``running`` only if that round has
+        no queued or running work: work in flight is executing the definition
+        being replaced, and refusing there is the point of the check.  A round
+        whose remaining steps are simply not coming -- the second clock entry
+        of a dual-entry workflow, a join waiting on an upstream nobody will
+        run -- has nothing in flight and can never complete on its own, so
+        leaving it ``running`` turned one manual run into an edit lock that
+        only deleting the workflow could open.  It is closed here, interrupted,
+        because that is what it is: an execution the scheduler stopped being
+        able to finish.
+
+        Deliberately not a periodic sweep.  A round with nothing in flight is
+        still rescuable -- manually running the upstream its join waits on
+        joins that round (see :meth:`_round_waiting_on`) -- so closing it on a
+        timer would take that away.  It is closed when somebody edits the
+        definition, which is the moment the old round is declared over.
+        """
+        rounds = self._conn.execute(
+            "SELECT id FROM workflow_runs WHERE workflow_id = ? AND status = 'running'",
+            (workflow_id,),
+        ).fetchall()
+        for row in rounds:
+            round_id = str(row["id"])
+            self._settle_workflow_run(round_id, now)
+            live = self._conn.execute(
+                """
+                SELECT 1 FROM scheduled_task_runs
+                WHERE workflow_run_id = ? AND status IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (round_id,),
+            ).fetchone()
+            if live is not None:
+                raise ValueError(
+                    "workflow 仍有执行中的轮次，需等待完成或取消后再修改定义"
+                )
+            self._conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status = 'interrupted', updated_at = ?, finished_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (_iso(now), _iso(now), round_id),
+            )
+            # Half-collected arrivals belong to the round that just ended, and
+            # the graph they were waiting on is about to be replaced.  Left
+            # behind they would complete a round nobody opened, on a report
+            # from before the edit.
+            self._conn.execute(
+                "DELETE FROM workflow_signal_joins WHERE workflow_run_id = ?",
+                (round_id,),
+            )
 
     @_synchronized
     def complete_run(
@@ -3477,19 +3655,10 @@ class SchedulerStore:
         """
         if self.get_workflow(workflow_id) is None:
             return None
-        active = self._conn.execute(
-            """
-            SELECT id FROM workflow_runs
-            WHERE workflow_id = ? AND status = 'running'
-            LIMIT 1
-            """,
-            (workflow_id,),
-        ).fetchone()
-        if active is not None:
-            raise ValueError("workflow 仍有执行中的轮次，需等待完成或取消后再修改定义")
         self._validate_graph(workflow.steps)
         updated_at = (now or datetime.now(UTC)).astimezone(UTC)
         with self._immediate_transaction():
+            self._close_rounds_before_edit(workflow_id, updated_at)
             # `request_quote` is deliberately absent here.  It records who asked
             # for the chain, and editing a step does not change that -- while a
             # caller that rebuilds the graph from an edit form has no quote to
