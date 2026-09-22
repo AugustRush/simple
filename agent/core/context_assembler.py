@@ -85,6 +85,34 @@ _SEARCH_EXTRAS = {"tavily_search"}
 # does not ride along in every prompt.
 _ATTACHMENT_GATED_TOOLS = {"transcribe_audio"}
 
+#: Every group whose membership a *turn* can change.  Nothing here is a
+#: permission boundary -- calls dispatch by name against the whole registry --
+#: but membership is not the only thing this set controls: it also decides
+#: where in the tool block those schemas sit, and that position is load-bearing.
+#: A provider's prefix cache can only reuse what precedes the first difference,
+#: and the tool schemas sit ahead of every message, so a schema whose presence
+#: varies per turn cuts everything after it out of the reusable prefix.  Putting
+#: these last keeps the shared prefix as long as the session's stable set
+#: however the gates land.
+#:
+#: Measured on this machine: the first of these is 6th of 44 in registration
+#: order, so without the ordering a turn that merely mentions a keyword would
+#: cut the shared prefix down to five schemas' worth.
+#:
+#: `_SKILL_RUNTIME_TOOLS` is deliberately absent: it is never withheld, so it is
+#: part of the stable set even though `required_skills` also names it.
+_CONDITIONAL_TOOLS = frozenset(
+    _MANAGEMENT_TOOLS
+    | _SCHEDULE_TOOLS
+    | _WORKFLOW_TOOLS
+    | _SIGNAL_TOOLS
+    | _RUN_SELF_REPORT_TOOLS
+    | _DEEP_MEMORY_TOOLS
+    | _ORCHESTRATION_TOOLS
+    | _SEARCH_EXTRAS
+    | _ATTACHMENT_GATED_TOOLS
+)
+
 #: Words that name or describe scheduled work.  These open the *reading*
 #: tools: "我有哪些定时任务" and "你们的工作流怎么用" are both questions about
 #: this feature, and both want the list.
@@ -261,17 +289,7 @@ class ContextAssembler:
         scheduled_run: bool = False,
     ) -> list[dict[str, Any]]:
         names = {str(tool.get("name") or "") for tool in tools}
-        selected = names - (
-            _MANAGEMENT_TOOLS
-            | _SCHEDULE_TOOLS
-            | _WORKFLOW_TOOLS
-            | _SIGNAL_TOOLS
-            | _RUN_SELF_REPORT_TOOLS
-            | _DEEP_MEMORY_TOOLS
-            | _ORCHESTRATION_TOOLS
-            | _SEARCH_EXTRAS
-            | _ATTACHMENT_GATED_TOOLS
-        )
+        selected = names - _CONDITIONAL_TOOLS
 
         if _matches(query, _SCHEDULED_WORK_TERMS):
             selected |= _SCHEDULED_WORK_READ_TOOLS
@@ -307,7 +325,14 @@ class ContextAssembler:
         for name in names:
             if name and re.search(rf"(?<![\w-]){re.escape(name.casefold())}(?![\w-])", lowered):
                 selected.add(name)
-        return [tool for tool in tools if str(tool.get("name") or "") in selected]
+        # The always-on schemas first, the turn-dependent ones last, each bucket
+        # keeping the registry's order.  Membership is unchanged -- this only
+        # decides which prefix two turns with different gates have in common.
+        # See `_CONDITIONAL_TOOLS` for why the position matters.
+        return sorted(
+            (tool for tool in tools if str(tool.get("name") or "") in selected),
+            key=lambda tool: str(tool.get("name") or "") in _CONDITIONAL_TOOLS,
+        )
 
     def allocate(
         self,

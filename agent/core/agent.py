@@ -16,7 +16,7 @@ from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 
 import agent as agent_module
 from agent import shared
-from agent.config import _compose_system_prompt
+from agent.config import _compose_system_prompt, _now
 from agent.core.context_assembler import ContextAssembler
 from agent.core.payload_shape import describe_payload
 from agent.core.attachments import MessageAttachment, format_attachment_context
@@ -366,25 +366,44 @@ class BaseAgent:
         self,
         user_message: str,
         attachments: tuple[MessageAttachment, ...] = (),
+        turn_context: str = "",
     ) -> str | list[dict[str, Any]]:
-        if not attachments:
-            return user_message
+        """The user's message, preceded by this turn's own context.
 
+        ``turn_context`` is everything the turn has to say that is not the
+        user's own words: the session checkpoint, retrieved memory, the skills
+        this turn activates, the orchestration policy, and the time.  It is
+        built here rather than appended to the system prompt because the system
+        prompt is the *head* of the request -- the one part a provider's prefix
+        cache can serve for every call in the session -- so a per-turn value
+        placed there is paid for by invalidating the whole conversation behind
+        it.  In the message the same text is appended once and then frozen,
+        which is also the honest record of what the model was actually shown.
+
+        The user's own words stay last, so the request is read after the
+        material that frames it.
+        """
         direct_images: list[MessageAttachment] = []
         fallback_attachments: list[MessageAttachment] = []
-        if self.supports_vision:
-            for attachment in attachments:
-                if attachment.kind == "image" and attachment.local_path.is_file():
-                    direct_images.append(attachment)
-                else:
-                    fallback_attachments.append(attachment)
-        else:
-            fallback_attachments = list(attachments)
+        if attachments:
+            if self.supports_vision:
+                for attachment in attachments:
+                    if attachment.kind == "image" and attachment.local_path.is_file():
+                        direct_images.append(attachment)
+                    else:
+                        fallback_attachments.append(attachment)
+            else:
+                fallback_attachments = list(attachments)
 
+        parts: list[str] = []
+        if turn_context:
+            parts.append(turn_context)
+        if user_message:
+            parts.append(user_message)
         fallback_context = format_attachment_context(fallback_attachments)
-        text = user_message
         if fallback_context:
-            text = f"{user_message}\n\n{fallback_context}" if user_message else fallback_context
+            parts.append(fallback_context)
+        text = "\n\n".join(parts)
         if not direct_images:
             return text
 
@@ -2580,8 +2599,12 @@ class BaseAgent:
         orchestration, and append the user message.  Returns the orchestration
         decision so the loop can route spawn calls correctly.
 
-        Caller is responsible for restoring ``ctx.system_prompt`` afterwards
-        (send_message captures ``original_system`` before calling this).
+        Everything this turn adds that varies per turn is collected into
+        ``turn_blocks`` and carried by the turn's own message, never by
+        ``ctx.system_prompt``.  The system prompt is the head of the request, so
+        a volatile value there caps what the provider can serve from its prefix
+        cache for the rest of the session; in the message it is appended once
+        and then frozen.  ``ctx.system_prompt`` is left exactly as it was found.
         """
         # What this turn was asked to do, in the asker's own words, published
         # for the tools that have to prove they are answering it (see
@@ -2590,13 +2613,16 @@ class BaseAgent:
         # that turn's authority, and the one case that must never pass is a turn
         # where nobody asked for anything.
         self.registry.set_context("turn_request", user_message)
+        turn_blocks: list[str] = []
+        handoff_block = str(ctx.metadata.get("_handoff_block") or "").strip()
+        if handoff_block:
+            turn_blocks.append(handoff_block)
         checkpoint_summary = str(
             ctx.metadata.get("_checkpoint_summary") or ""
         ).strip()
         if checkpoint_summary:
-            ctx.system_prompt = (
-                ctx.system_prompt
-                + "\n\n<session_checkpoint trust=\"untrusted_evidence\">\n"
+            turn_blocks.append(
+                '<session_checkpoint trust="untrusted_evidence">\n'
                 + html.escape(checkpoint_summary, quote=False)
                 + "\n</session_checkpoint>"
             )
@@ -2649,9 +2675,8 @@ class BaseAgent:
                 include_working_state=has_active_state,
             )
             if retrieved:
-                ctx.system_prompt = (
-                    ctx.system_prompt
-                    + "\n\n<retrieved_context trust=\"untrusted_evidence\">\n"
+                turn_blocks.append(
+                    '<retrieved_context trust="untrusted_evidence">\n'
                     + html.escape(retrieved, quote=False)
                     + "\n</retrieved_context>"
                 )
@@ -2664,11 +2689,7 @@ class BaseAgent:
                 if activation:
                     active_blocks.append(activation)
             if active_blocks:
-                ctx.system_prompt = (
-                    ctx.system_prompt
-                    + "\n\n## Active Skills\n"
-                    + "\n\n".join(active_blocks)
-                )
+                turn_blocks.append("## Active Skills\n" + "\n\n".join(active_blocks))
         if decision.mode == "explicit":
             policy = (
                 "When using orchestration tools, encode ordering and coordination "
@@ -2680,11 +2701,22 @@ class BaseAgent:
                     decision.guidance,
                     800,
                 )
-            ctx.system_prompt += "\n\n## Orchestration policy\n" + policy
+            turn_blocks.append("## Orchestration policy\n" + policy)
+        # The time rides here rather than in the system prompt: it changes every
+        # minute, and in the head that would cap the provider's cacheable prefix
+        # at whatever precedes it for every request in the session.  Here it is
+        # also more accurate -- the time of *this* turn, not of whichever turn
+        # last re-rendered the prompt.
+        turn_blocks.append(
+            f"Current UTC time: {_now()}. "
+            "Use the current_time tool when the user asks about local time or timezone conversions."
+        )
         ctx.messages.append(
             {
                 "role": "user",
-                "content": self._build_user_message_content(user_message, attachments),
+                "content": self._build_user_message_content(
+                    user_message, attachments, turn_context="\n\n".join(turn_blocks)
+                ),
             }
         )
         return decision
@@ -2753,8 +2785,6 @@ class BaseAgent:
         a stream the caller asks for, so this signature did not have to grow a
         second callback that every caller would then have to accept.
         """
-        # Capture original system prompt before any per-turn injections.
-        original_system = ctx.system_prompt
         tool_calls_made: list[str] = []
         tool_result_history: list[tuple[str, str]] = []
         result_text = ""
@@ -3250,10 +3280,11 @@ class BaseAgent:
                 tool_calls=len(tool_calls_made),
                 duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
             )
-            # Always restore the original system prompt.  The current ctx
-            # is published via the _active_agent_context ContextVar; that
-            # token is reset above, so no extra stack bookkeeping is needed.
-            ctx.system_prompt = original_system
+            # Nothing restores the system prompt here any more: the turn's own
+            # context rides in its message (see `_prepare_turn`), so the prompt
+            # is never mutated during a turn and needs no round trip.  The
+            # current ctx is published via the _active_agent_context ContextVar;
+            # that token is reset above, so no extra stack bookkeeping is needed.
             ctx.metadata.pop("_provider_step", None)
             ctx.metadata.pop("_selected_tools", None)
 
@@ -3687,9 +3718,15 @@ class BaseAgent:
             ctx = AgentContext(role=role, system_prompt=sys_prompt)
             ctx.metadata["_orchestration_child"] = True
             self._propagate_sub_metadata(ctx, active_ctx)
+            # The handoff is per-spawn, so it belongs in the turn's message and
+            # not in the system prompt: two sub-agents of the same role share a
+            # rendered prompt only while nothing per-spawn sits in it, and a
+            # shared head is what lets the provider serve their common prefix
+            # from its cache.  `_prepare_turn` picks this up the same way it
+            # picks up the session checkpoint.
             if handoff:
-                ctx.system_prompt += (
-                    "\n\n## Handoff data from upstream\n"
+                ctx.metadata["_handoff_block"] = (
+                    "## Handoff data from upstream\n"
                     + self._bounded_json(handoff, limit=6000)
                 )
             return ctx

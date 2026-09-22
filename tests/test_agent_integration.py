@@ -436,6 +436,12 @@ Policy body.
 
 
 def test_retrieved_context_cannot_close_its_untrusted_envelope():
+    """Retrieved memory is framed as untrusted evidence and cannot escape it.
+
+    The block rides in the turn's message rather than in the system prompt (see
+    ``BaseAgent._prepare_turn``), so the envelope is asserted where the content
+    actually is.
+    """
     import agent as agent_module
 
     class _ContextManager:
@@ -450,9 +456,76 @@ def test_retrieved_context_cannot_close_its_untrusted_envelope():
 
     agent._prepare_turn(ctx, "question", ())
 
-    assert ctx.system_prompt.count("</retrieved_context>") == 1
-    assert "&lt;/retrieved_context&gt;" in ctx.system_prompt
-    assert "&lt;tag&gt;" in ctx.system_prompt
+    sent = ctx.messages[-1]["content"]
+    assert sent.count("</retrieved_context>") == 1
+    assert "&lt;/retrieved_context&gt;" in sent
+    assert "&lt;tag&gt;" in sent
+    # And the prompt is left exactly as it was found — that is the point of
+    # carrying the turn's own context in its message.
+    assert ctx.system_prompt == "system"
+
+
+def test_a_turns_context_never_reaches_the_system_prompt(monkeypatch):
+    """The head of the request is a pure function of session-stable state.
+
+    Everything a turn adds that varies per turn -- the session checkpoint,
+    retrieved memory, the skills it activates, the orchestration policy, the
+    time -- rides in the turn's own message instead.  The system prompt is the
+    head of *every* request in the session, and a provider's prefix cache can
+    only reuse what precedes the first difference, so a volatile value there
+    would cap what is cacheable for the rest of the session.  In the message it
+    is appended once and then frozen, where it costs nothing to vary.
+    """
+    import agent as agent_module
+
+    class _ContextManager:
+        def retrieve_implicit_context(self, *_args, **_kwargs):
+            return "remembered: the user prefers metric units"
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    agent.context_manager = _ContextManager()
+
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [agent_module.shared._OAIChoice("stop", agent_module.shared._OAIMsg("one", None))]
+            ),
+            agent_module.shared._OAIResponse(
+                [agent_module.shared._OAIChoice("stop", agent_module.shared._OAIMsg("two", None))]
+            ),
+        ]
+    )
+    seen_prompts: list[str] = []
+
+    async def fake_create(ctx, tools):
+        seen_prompts.append(ctx.system_prompt)
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    ctx.metadata["_checkpoint_summary"] = "earlier: the user asked about units"
+    asyncio.run(agent.send_message(ctx, "first question"))
+    asyncio.run(agent.send_message(ctx, "second question"))
+
+    # The head is identical on both calls, and is what the caller set up.
+    assert seen_prompts == ["system", "system"]
+    assert ctx.system_prompt == "system"
+
+    # The volatile content is in the body, frozen -- and it is what the model
+    # actually saw, which is the honest record of the turn.
+    first_turn, second_turn = ctx.messages[0]["content"], ctx.messages[2]["content"]
+    for marker in ("<session_checkpoint", "<retrieved_context", "Current UTC time:"):
+        assert marker in first_turn, marker
+        assert marker in second_turn, marker
+
+    # The user's own words stay last in the message, and each turn carries only
+    # its own.
+    assert first_turn.endswith("first question")
+    assert second_turn.endswith("second question")
+    assert "first question" not in second_turn
 
 
 def test_each_turn_publishes_its_own_request_and_no_other():
@@ -626,6 +699,13 @@ Policy body.
     async def fake_create(ctx, tools):
         observed["calls"] += 1
         observed["system_prompt"] = ctx.system_prompt
+        # The first user entry is the turn's own message, which carries the
+        # orchestration policy now that per-turn content no longer rides in the
+        # system prompt.  Taken by role rather than by index because later
+        # entries are tool results.
+        observed["turn_message"] = next(
+            m["content"] for m in ctx.messages if m.get("role") == "user"
+        )
         return next(responses)
 
     async def fake_run_parallel_subtasks(specs, max_concurrency=None):
@@ -663,8 +743,8 @@ Policy body.
         ("researcher", "inspect performance", "read_only"),
         ("critic", "inspect correctness", "read_only"),
     ]
-    assert "Planner selected orchestration mode" not in observed["system_prompt"]
-    assert "explicit subtask graph is authoritative" in observed["system_prompt"]
+    assert "Planner selected orchestration mode" not in observed["turn_message"]
+    assert "explicit subtask graph is authoritative" in observed["turn_message"]
 
 
 def test_send_message_ignores_keyword_hint_when_spawn_plan_is_explicitly_parallel(
@@ -5031,7 +5111,13 @@ def test_tool_execution_failure_does_not_leave_incomplete_tool_history(monkeypat
     result = asyncio.run(agent.send_message(ctx, "do it"))
 
     assert result.error == "tool failed unexpectedly"
-    assert ctx.messages == [{"role": "user", "content": "do it"}]
+    # No assistant entry and no tool result survived the failure: the turn's
+    # message is all that is left.  Its content carries this turn's own context
+    # ahead of the user's words, so assert the shape and the tail rather than
+    # the whole string -- the words the user typed are what must survive.
+    assert len(ctx.messages) == 1
+    assert ctx.messages[0]["role"] == "user"
+    assert ctx.messages[0]["content"].endswith("do it")
 
 
 def test_base_agent_runs_internal_parallel_orchestration_without_public_tool_exposure(
@@ -6493,8 +6579,12 @@ def test_send_message_auto_continue_preserves_openai_provider_extras(monkeypatch
     assert result.error is None
     assert result.content == "第一段没有说完，这是续写完成。"
     assert len(seen_messages) == 2
-    assert seen_messages[1] == [
-        {"role": "user", "content": "hello"},
+    # The continuation reuses the same context, so message 0 is the turn's own
+    # message — which carries the turn context ahead of the user's words — and
+    # what this test is about is the two entries the continuation *adds*.
+    assert seen_messages[1][0]["role"] == "user"
+    assert seen_messages[1][0]["content"].endswith("hello")
+    assert seen_messages[1][1:] == [
         {
             "role": "assistant",
             "content": "第一段没有说完",
@@ -6552,8 +6642,9 @@ def test_send_message_auto_continue_ignores_non_copyable_context_metadata(monkey
     assert result.error is None
     assert result.content == "第一段没有说完，这是续写完成。"
     assert len(seen_messages) == 2
-    assert seen_messages[1] == [
-        {"role": "user", "content": "hello"},
+    assert seen_messages[1][0]["role"] == "user"
+    assert seen_messages[1][0]["content"].endswith("hello")
+    assert seen_messages[1][1:] == [
         {"role": "assistant", "content": "第一段没有说完"},
         {
             "role": "user",
@@ -7248,7 +7339,11 @@ def test_agent_core_isolates_concurrent_session_model_overrides():
             self.both_started = asyncio.Event()
 
         async def create(self, **kwargs):
-            self.calls.append((kwargs["model"], kwargs["messages"][-1]["content"]))
+            # The turn's message carries that turn's own context ahead of the
+            # user's words (see ``BaseAgent._prepare_turn``), so the request is
+            # identified by its tail: what the caller actually typed.
+            content = kwargs["messages"][-1]["content"]
+            self.calls.append((kwargs["model"], content.rsplit("\n\n", 1)[-1]))
             if len(self.calls) == 2:
                 self.both_started.set()
             await self.both_started.wait()

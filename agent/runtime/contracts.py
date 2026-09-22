@@ -272,11 +272,17 @@ class RuntimeSessionState:
         """Single authority for writing ctx.system_prompt during a session.
 
         Any runtime path that refreshes the prompt mid-session (dirty skills,
-        config reload, workspace switch, post-compaction rebuild) must go
-        through here so the current task context stays attached. send_message
-        restores ctx.system_prompt to its pre-turn value at turn end, so a
-        refresh that forgot the task context would leave every remaining
-        tool step of a multi-step turn without the original request.
+        config reload, workspace switch) must go through here so the current
+        task context stays attached.  The task context is the one thing a
+        rebuild would otherwise drop, and it is what a long operation's first
+        instruction survives as once compaction has taken the message that
+        carried it.
+
+        ``send_message`` no longer restores the prompt at turn end — a turn's
+        own context rides in its message now, so the prompt is never mutated
+        during a turn and has nothing to restore.  What that means here is that
+        a refresh made during a turn is *not* undone afterwards; the value set
+        here is the session's head from then on.
         """
         import agent as agent_module
 

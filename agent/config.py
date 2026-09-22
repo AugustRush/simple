@@ -1082,12 +1082,16 @@ def _compose_system_prompt(
         _system_prompt_cache_value = _render_static_prompt(inputs)
         _system_prompt_cache_key = inputs
 
-    # Always recompute dynamic footer (time-dependent content)
+    # No time-dependent footer here on purpose.  This string is the head of
+    # every provider request, so a value that changes minute to minute sits in
+    # front of the entire conversation: the provider's prefix cache can only
+    # reuse what precedes the first difference, so the clock caps every request
+    # in the session at the few hundred tokens before it.  The current time now
+    # rides in the turn's own message (see ``BaseAgent._prepare_turn``), which
+    # is cache-neutral -- the message tail is unique per request anyway -- and
+    # strictly more accurate, because it is the time of *this* turn rather than
+    # of whichever turn last re-rendered the prompt.
     result = _system_prompt_cache_value
-    result += "\n" + (
-        f"Current UTC time: {_now()}. "
-        "Use the current_time tool when the user asks about local time or timezone conversions."
-    )
     result += "\n" + (
         "You are a personal AI agent with long-term memory, scheduled task support, and "
         "multi-channel delivery. When appropriate, proactively suggest setting reminders, "

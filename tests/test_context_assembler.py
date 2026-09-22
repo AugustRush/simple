@@ -120,6 +120,33 @@ def test_explicit_name_match_respects_word_boundaries():
     assert "spawn_agent" in selected("call spawn_agent now")
 
 
+def test_the_always_on_schemas_come_before_the_turn_dependent_ones():
+    """Order, not only membership, decides how much two turns share.
+
+    A provider's prefix cache reuses only what precedes the first difference,
+    and the tool schemas sit ahead of every message.  A schema whose presence a
+    turn can change therefore has to sit *last*: otherwise a turn that merely
+    mentions a keyword cuts every schema after it out of the reusable prefix.
+    """
+    from agent.core.context_assembler import _CONDITIONAL_TOOLS
+
+    assembler = ContextAssembler()
+    plain = [t["name"] for t in assembler.select_tools(ALL_GROUPS, "帮我写个报告")]
+    opened = [
+        t["name"]
+        for t in assembler.select_tools(ALL_GROUPS, "每天早上提醒我喝水，并行跑子代理")
+    ]
+
+    # A gated turn is a superset, and it is the *same* list with the extras
+    # appended — that is exactly what leaves the two turns sharing a prefix.
+    assert set(plain) < set(opened)
+    assert opened[: len(plain)] == plain
+
+    # No turn-dependent schema sits anywhere but the tail.
+    assert [name for name in plain if name in _CONDITIONAL_TOOLS] == []
+    assert set(opened[len(plain):]) <= _CONDITIONAL_TOOLS
+
+
 def test_required_skills_open_the_skill_runtime_tools():
     names = _selected_names(
         ContextAssembler(), "do the thing", required_skills=("skill-manager",)
