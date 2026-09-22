@@ -2979,6 +2979,15 @@ class BaseAgent:
         _cancel_token_token = shared._active_cancel_token.set(
             ctx.metadata.get("cancel_token")
         )
+        # The conversation this turn belongs to, for the same reason and for one
+        # more: a gateway that asks for "one stable id per conversation" in a
+        # request header gets it from here.  Set for the span of the turn by
+        # both the interactive paths and the scheduler, whose runs each carry
+        # their own `scheduler:<task>:<run>` id, so a scheduled run is one
+        # conversation to the provider just as it is to us.
+        _session_id_token = shared._active_session_id.set(
+            str(ctx.metadata.get("session_id") or "") or None
+        )
 
         # B1: wrap ALL mutations (prompt injection, messages append, stack push)
         # inside the try/finally so they are always cleaned up on error.
@@ -3417,6 +3426,7 @@ class BaseAgent:
                 _active_orchestration_runs.reset(orchestration_token)
             _active_agent_context.reset(_active_ctx_token)
             shared._active_cancel_token.reset(_cancel_token_token)
+            shared._active_session_id.reset(_session_id_token)
             await heartbeat.stop(
                 status=trace_status if trace_status != "ok" else "finished",
                 detail=trace_status,

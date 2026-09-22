@@ -466,6 +466,47 @@ def _check_providers(cfg: dict, warnings: list[str]) -> None:
         if not isinstance(pcfg.get("default_model"), str) or not pcfg.get("default_model"):
             warnings.append(f"providers.{pname}.default_model: must be a non-empty string")
         _check_thinking(pname, pcfg, warnings)
+        _check_provider_headers(pname, pcfg, warnings)
+
+
+#: A header name is an HTTP token: printable ASCII minus separators.  Checked
+#: because a name the SDK cannot send would otherwise sit in a config that
+#: looks fine and quietly never arrive.
+_HEADER_NAME_RE = re.compile(r"[A-Za-z0-9!#$%&'*+.^_`|~-]+")
+
+
+def _check_provider_headers(pname: str, pcfg: dict, warnings: list[str]) -> None:
+    """Validate one provider's extra request headers.
+
+    ``providers.<name>.headers`` reaches the wire verbatim, so the two things
+    worth catching are a value that cannot be a header (a list, a nested dict)
+    and a placeholder that will never be substituted -- the second matters
+    because it *looks* like it works while sending a literal ``{session}`` to
+    the gateway.
+    """
+    headers = pcfg.get("headers")
+    if headers is None:
+        return
+    if not isinstance(headers, dict):
+        warnings.append(
+            f"providers.{pname}.headers: must be a dict of header name → value"
+        )
+        return
+    for name, value in headers.items():
+        if not _HEADER_NAME_RE.fullmatch(str(name).strip()):
+            warnings.append(
+                f"providers.{pname}.headers: '{name}' is not a valid header name"
+            )
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            warnings.append(f"providers.{pname}.headers.{name}: must be a string")
+            continue
+        for token in re.findall(r"\{[^}]*\}", str(value)):
+            if token != shared.SESSION_HEADER_PLACEHOLDER:
+                warnings.append(
+                    f"providers.{pname}.headers.{name}: unknown placeholder "
+                    f"'{token}'; only {shared.SESSION_HEADER_PLACEHOLDER} is "
+                    f"substituted (one value per conversation)"
+                )
 
 
 def _check_numeric_ranges(cfg: dict, warnings: list[str]) -> None:

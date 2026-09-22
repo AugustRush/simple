@@ -356,6 +356,90 @@ _active_cancel_token: contextvars.ContextVar[Optional[CancelToken]] = (
     contextvars.ContextVar("active_cancel_token", default=None)
 )
 
+# The conversation the current turn belongs to, for the same reason: a provider
+# request is built deep below the turn, and a gateway that wants one stable id
+# per conversation (`x-opencode-session` and its like) has to get it from the
+# turn that is asking rather than from the process that is serving.
+_active_session_id: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("active_session_id", default=None)
+)
+
+#: The token a provider's ``headers`` value uses to ask for one value per
+#: conversation.  A placeholder rather than a callback because the value has to
+#: survive being written into a JSON config file, and the substitution happens
+#: per request -- see ``ModelTransport._headers_kwarg``.
+SESSION_HEADER_PLACEHOLDER = "{session}"
+
+#: Stable for the life of this process.  Two jobs: the fallback for
+#: :func:`current_session_id` when a request is made outside any turn (a
+#: background consolidation, say), and the reason a provider that asks for a
+#: per-session value never receives an empty one.
+_INSTANCE_ID = uuid.uuid4().hex
+
+
+def instance_id() -> str:
+    """This process's own id, stable for as long as it runs."""
+    return _INSTANCE_ID
+
+
+def current_session_id() -> str:
+    """The conversation the current turn belongs to, or the process id.
+
+    The fallback is deliberate rather than an error state: work that runs
+    outside a turn has no conversation to name, and a header that must be
+    present is better served by the process's own stable id than by an empty
+    string or by a value that changes on every request.
+    """
+    session = _active_session_id.get()
+    return str(session) if session else _INSTANCE_ID
+
+
+def resolve_provider_headers(
+    provider_cfg: object, *, provider_name: str = ""
+) -> dict[str, str]:
+    """The extra request headers one provider declares, environment expanded.
+
+    ``providers.<name>.headers`` is a name → value map for gateways that need
+    more than a URL and a key: a client identifier, a routing or session
+    header, an organisation tag.  A value of the exact form ``$NAME`` is read
+    from the environment, the same rule ``api_key`` follows -- and with the
+    same failure: a missing variable is named and raised rather than sent as an
+    empty header, because a gateway that requires the header answers an empty
+    one with a rejection that does not say why.
+
+    ``{session}`` is left in place here and substituted per request (see
+    :data:`SESSION_HEADER_PLACEHOLDER`), which is the whole point of it: one
+    client serves every conversation.
+
+    A pair that is not a name → string pair is dropped rather than guessed at;
+    ``_validate_config`` reports those, where the typo is visible.
+    """
+    if not isinstance(provider_cfg, dict):
+        return {}
+    raw = provider_cfg.get("headers")
+    if not isinstance(raw, dict) or not raw:
+        return {}
+    resolved: dict[str, str] = {}
+    for name, value in raw.items():
+        header = str(name).strip()
+        if not header or isinstance(value, bool):
+            continue
+        if not isinstance(value, (str, int, float)):
+            continue
+        text = str(value)
+        if text.startswith("$"):
+            variable = text[1:]
+            from_env = os.environ.get(variable, "")
+            if not from_env:
+                where = f" (provider: {provider_name})" if provider_name else ""
+                raise RuntimeError(
+                    f"Header '{header}' reads env var '{variable}', which is not "
+                    f"set{where}. Run: export {variable}=..."
+                )
+            text = from_env
+        resolved[header] = text
+    return resolved
+
 
 CONSOLE = Console()
 

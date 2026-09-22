@@ -102,10 +102,39 @@ class ModelTransport(abc.ABC):
         client: Any,
         thinking_effort: Any = None,
         stream_usage: Any = True,
+        headers: Optional[dict[str, str]] = None,
     ) -> None:
         self.client = client
         self.thinking_effort = shared.normalize_thinking_effort(thinking_effort)
         self.stream_usage = bool(stream_usage)
+        #: This provider's configured extra request headers, unresolved: a
+        #: value may still contain ``{session}``, substituted per request
+        #: rather than here because one client serves every conversation (see
+        #: :meth:`_headers_kwarg`).
+        self.headers = dict(headers) if isinstance(headers, dict) else {}
+
+    def _headers_kwarg(self) -> dict[str, Any]:
+        """``{"extra_headers": ...}`` for this request, or empty when none.
+
+        Empty rather than ``{"extra_headers": None}`` on purpose: a provider
+        that declares no headers must send a request byte-identical to the one
+        this transport sent before headers existed.
+
+        The session is read here, at request time, not at construction time.
+        The transport is built once per provider configuration and shared by
+        every conversation, so a value captured at construction could only be
+        a process-wide constant -- and a gateway asking for one id per
+        conversation would see one id for all of them.
+        """
+        if not self.headers:
+            return {}
+        session = shared.current_session_id()
+        return {
+            "extra_headers": {
+                name: value.replace(shared.SESSION_HEADER_PLACEHOLDER, session)
+                for name, value in self.headers.items()
+            }
+        }
 
     # ── Reasoning ──────────────────────────────────────────────────────
 
@@ -350,6 +379,7 @@ class AnthropicTransport(ModelTransport):
             messages=messages,
             tools=self.convert_tools(tools),
             **self._thinking_kwarg(max_tokens, thinking_effort),
+            **self._headers_kwarg(),
         )
 
     async def stream(
@@ -364,6 +394,7 @@ class AnthropicTransport(ModelTransport):
             messages=messages,
             tools=self.convert_tools(tools),
             **self._thinking_kwarg(max_tokens, thinking_effort),
+            **self._headers_kwarg(),
         ) as stream:
             # ``text_stream`` yields answer text only, so the thinking blocks
             # are read off the finished message instead.  That trades
@@ -386,6 +417,7 @@ class AnthropicTransport(ModelTransport):
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": prompt}],
+                **self._headers_kwarg(),
             )
             if resp.content and hasattr(resp.content[0], "text"):
                 return resp.content[0].text.strip()
@@ -522,6 +554,7 @@ class OpenAITransport(ModelTransport):
                 # empty `choices` list and the usage object; `stream` reads it.
                 kwargs["stream_options"] = {"include_usage": True}
         kwargs.update(self._reasoning_effort_kwarg(thinking_effort))
+        kwargs.update(self._headers_kwarg())
         return kwargs
 
     async def create(
@@ -658,6 +691,7 @@ class OpenAITransport(ModelTransport):
                     {"role": "system", "content": system},
                     {"role": "user", "content": prompt},
                 ],
+                **self._headers_kwarg(),
             )
             if resp.choices and resp.choices[0].message.content:
                 return resp.choices[0].message.content.strip()
@@ -908,6 +942,7 @@ def build_transport(
     client: Any,
     thinking_effort: Any = None,
     stream_usage: Any = True,
+    headers: Optional[dict[str, str]] = None,
 ) -> ModelTransport:
     """Single dispatch point — adding a provider here is the only place to edit.
 
@@ -919,11 +954,18 @@ def build_transport(
     usage on the finished streamed message with no parameter to ask for it, so
     there is nothing there to configure and passing the value on would be
     carrying a name that is never read.
+
+    ``headers`` is the provider's configured extra request headers, already
+    environment-expanded by :func:`shared.resolve_provider_headers`.  It
+    reaches both formats: the need is a property of the gateway, not of the
+    wire format it speaks.
     """
     if api_format == "anthropic":
-        return AnthropicTransport(client, thinking_effort)
+        return AnthropicTransport(client, thinking_effort, headers=headers)
     if api_format == "openai":
-        return OpenAITransport(client, thinking_effort, stream_usage)
+        return OpenAITransport(
+            client, thinking_effort, stream_usage, headers=headers
+        )
     raise ValueError(f"unsupported api_format: {api_format!r}")
 
 
@@ -955,7 +997,10 @@ class RoutingTransport(ModelTransport):
         thinking_overrides: Optional[dict[str, str]] = None,
     ) -> None:
         super().__init__(
-            default.client, default.thinking_effort, default.stream_usage
+            default.client,
+            default.thinking_effort,
+            default.stream_usage,
+            headers=default.headers,
         )
         self.default = default
         self.routes = routes
@@ -1341,6 +1386,11 @@ def build_routing_transport(
         default_client,
         provider_thinking_effort(active_cfg) if active_cfg else None,
         provider_stream_usage(active_cfg) if active_cfg else True,
+        headers=shared.resolve_provider_headers(
+            active_cfg, provider_name=active
+        )
+        if active_cfg
+        else None,
     )
     routes: dict[str, ModelTransport] = {}
     transports: dict[str, ModelTransport] = {}
@@ -1374,6 +1424,9 @@ def build_routing_transport(
                     _client_for(provider_cfg, api_format),
                     provider_thinking_effort(provider_cfg),
                     provider_stream_usage(provider_cfg),
+                    headers=shared.resolve_provider_headers(
+                        provider_cfg, provider_name=name
+                    ),
                 )
                 transports[name] = transport
         routes[model] = transport
