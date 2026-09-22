@@ -60,6 +60,13 @@ _UPSTREAM_DETAIL_BUDGET = 2400
 _UPSTREAM_STRUCTURED_BUDGET = 1200
 _RENDEZVOUS_INPUT_BUDGET = 6000
 
+#: Slack left between the estimated request and the window when deriving the
+#: per-call output cap.  The estimate is a character heuristic that the provider
+#: corrects after the fact, so the cap is clamped a little below the literal
+#: remaining room rather than exactly at it: overshooting the window is a hard
+#: provider error, while undershooting costs a few tokens of answer length.
+_OUTPUT_CAP_MARGIN = 256
+
 #: Set on ``ctx.metadata`` for the duration of one turn, and read by
 #: ``BaseAgent._post_turn_maintenance``.  That method performs the only two
 #: edits to a provider payload that a prefix cache cannot survive -- compaction
@@ -321,6 +328,7 @@ class BaseAgent:
         api_format: str = "anthropic",
         supports_vision: bool = False,
         context_window: int | None = None,
+        output_reserve: int = shared.DEFAULT_OUTPUT_RESERVE,
         transport: Optional["ModelTransport"] = None,
     ):
         self.client = client
@@ -329,6 +337,11 @@ class BaseAgent:
         self.supports_vision = supports_vision
         self.model = model
         self.max_tokens = max_tokens
+        # Room the input budget must leave free for the answer.  Separate from
+        # `max_tokens` on purpose: the cap says how long one response may be,
+        # the reserve says how much of the window the input may not take.  See
+        # `_input_token_budget`.
+        self.output_reserve = output_reserve
         self.context_window = (
             context_window
             if context_window is not None
@@ -1346,6 +1359,16 @@ class BaseAgent:
 
     # ── Format-aware API helpers ──────────────────────────────────────────
 
+    def _configured_output_cap(self, output_max_tokens: int | None) -> int:
+        """The cap this call would send if the window had room for all of it.
+
+        ``None`` means "the configured cap".  Resolving that to a number before
+        the budget is computed is the conflation this separation exists to
+        remove: the same number then also becomes the input budget's reserve, so
+        a provider configured for long answers gets the smallest usable context.
+        """
+        return self.max_tokens if output_max_tokens is None else int(output_max_tokens)
+
     async def _create(
         self,
         ctx: "AgentContext",
@@ -1354,17 +1377,24 @@ class BaseAgent:
         output_max_tokens: int | None = None,
     ) -> Any:
         """Non-streaming API call, returns a normalised response object."""
-        output_budget = self.max_tokens if output_max_tokens is None else int(
-            output_max_tokens
-        )
+        # `output_max_tokens` is forwarded unresolved on purpose; see
+        # `_configured_output_cap`.
         self._prepare_provider_context(
             ctx,
             tools,
-            output_max_tokens=output_budget,
+            output_max_tokens=output_max_tokens,
         )
         response = await self._transport.create(
             model=self._effective_model(ctx),
-            max_tokens=output_budget,
+            # Not the configured cap: the cap this call can afford depends on
+            # what the request actually weighs, which only
+            # `_prepare_provider_context` knows.  The fallback covers the case
+            # where it returned before recording one.
+            max_tokens=int(
+                ctx.metadata.pop(
+                    "_output_cap", self._configured_output_cap(output_max_tokens)
+                )
+            ),
             system=ctx.system_prompt,
             messages=ctx.messages,
             tools=tools,
@@ -1380,18 +1410,22 @@ class BaseAgent:
     ) -> int:
         """How much of the window automatic retrieval may claim.
 
-        Retrieval is injected into the system prompt, which compaction never
-        touches, so an unbounded injection is not merely wasteful — it
-        permanently occupies room the conversation needs, and a large enough one
-        drives the input budget negative and hard-fails every turn.  A fraction
-        of the window keeps the failure mode impossible by construction rather
-        than relying on stored memories staying short.
+        Retrieval rides in the turn's own message, so an unbounded injection
+        cannot occupy room permanently -- compaction can drop it -- but it is
+        still charged in full on the call that carries it, and a large enough
+        one drives the input budget negative and hard-fails the turn.  A
+        fraction of the window keeps that failure impossible by construction
+        rather than relying on stored memories staying short.
         """
         configured = int(getattr(self, "max_retrieval_tokens", 0) or 0)
         if ctx is not None and tools is not None:
             budget = self.context_assembler.allocate(
                 context_window=self.context_window,
-                output_tokens=self.max_tokens,
+                # The reserve, not the configured cap: retrieval competes with
+                # the conversation for the same window, and sizing that window
+                # by the output *cap* starved retrieval to roughly a ninth of
+                # what it should have had (about 1k against about 9k here).
+                output_tokens=self.output_reserve,
                 system_prompt=ctx.system_prompt,
                 tools=tools,
                 current_messages=ctx.messages,
@@ -1409,8 +1443,43 @@ class BaseAgent:
             return budget.retrieval_tokens
         if configured > 0:
             return configured
-        usable = max(0, int(self.context_window) - int(self.max_tokens))
+        usable = max(0, int(self.context_window) - int(self.output_reserve))
         return max(1024, int(usable * shared.RETRIEVAL_BUDGET_FRACTION))
+
+    def _payload_overhead(self, ctx: "AgentContext", tools: list[dict]) -> int:
+        """Tokens the provider bills that are not in ``ctx.messages``.
+
+        The system prompt and the tool schemas ride in every request and are
+        charged on every call, so they are part of what the window has to hold
+        even though they never appear in ``ctx.messages``.  Measuring them in
+        one place is what keeps the input budget and the output cap from
+        disagreeing about what the request already costs.
+        """
+        overhead_messages = [
+            {"role": "system", "content": ctx.system_prompt},
+            {
+                "role": "system",
+                "content": json.dumps(tools, ensure_ascii=False, sort_keys=True),
+            },
+        ]
+        return self._estimate_input_tokens(overhead_messages, ctx=ctx)
+
+    def _output_room(
+        self, ctx: "AgentContext", tools: list[dict]
+    ) -> int:
+        """Tokens the window can still give to the response.
+
+        The window holds the system prompt, the tool schemas, the messages *and*
+        the answer, so the answer's ceiling is whatever is left after the first
+        three.  This is what makes a per-call cap possible without shrinking the
+        conversation: the cap follows the input rather than deciding it.
+        """
+        return (
+            self.context_window
+            - self._payload_overhead(ctx, tools)
+            - self._estimate_input_tokens(ctx.messages, ctx=ctx)
+            - _OUTPUT_CAP_MARGIN
+        )
 
     def _input_token_budget(
         self,
@@ -1419,16 +1488,19 @@ class BaseAgent:
         *,
         output_max_tokens: int | None = None,
     ) -> int:
-        overhead_messages = [
-            {"role": "system", "content": ctx.system_prompt},
-            {
-                "role": "system",
-                "content": json.dumps(tools, ensure_ascii=False, sort_keys=True),
-            },
-        ]
-        overhead = self._estimate_input_tokens(overhead_messages, ctx=ctx)
-        output_budget = self.max_tokens if output_max_tokens is None else output_max_tokens
-        return self.context_window - output_budget - overhead
+        # The reserve is what the input budget holds back for the answer, and it
+        # is not the configured cap: a cap is a ceiling on one response, not a
+        # claim on the window, so letting it set the reserve meant a provider
+        # configured for long answers silently got the smallest context.  When
+        # the caller names a specific output budget, that is the room it must
+        # leave instead -- the two are the same question asked from opposite
+        # ends.
+        reserve = (
+            self.output_reserve
+            if output_max_tokens is None
+            else int(output_max_tokens)
+        )
+        return self.context_window - reserve - self._payload_overhead(ctx, tools)
 
     def _estimate_input_tokens(
         self,
@@ -1557,11 +1629,19 @@ class BaseAgent:
         # count can calibrate the estimator once the call returns.  The provider
         # charges for system prompt and tool schemas too, so the comparable
         # prediction is messages + overhead.
-        output_budget = self.max_tokens if output_max_tokens is None else int(
-            output_max_tokens
-        )
-        overhead = self.context_window - output_budget - budget
+        configured_cap = self._configured_output_cap(output_max_tokens)
+        overhead = self._payload_overhead(ctx, tools)
         ctx.metadata["_predicted_input_tokens"] = estimate + max(0, overhead)
+        # The cap actually sent, derived here because this is the only place the
+        # real input estimate exists.  `max_tokens` is not tokenised into the
+        # prompt, so it costs nothing in cache terms to vary it per call -- and
+        # varying it is what lets the configured cap stay generous: on a short
+        # request the window has room for all of it, and only a request that
+        # nearly fills the window has to settle for less.  Deriving it any other
+        # way (shrinking the cap itself) is how long answers get truncated.
+        ctx.metadata["_output_cap"] = max(
+            1, min(configured_cap, self._output_room(ctx, tools))
+        )
 
     def _observe_provider_usage(self, ctx: "AgentContext", response: Any) -> None:
         """Feed the provider's exact input count back into the estimator.
@@ -1668,15 +1748,27 @@ class BaseAgent:
         tools: list[dict],
         current_budget: int,
     ) -> int:
-        input_budget = self._input_token_budget(
-            ctx,
-            tools,
-            output_max_tokens=current_budget,
-        )
-        input_estimate = self._estimate_input_tokens(ctx.messages, ctx=ctx)
-        spare_tokens = max(0, input_budget - input_estimate - 256)
+        """The larger cap to retry a truncated structured output with.
+
+        Bounded by the room the window actually has, which is the same quantity
+        the per-call cap is derived from -- measuring it any other way is how the
+        escalation ends up asking for more output than the window can hold.
+
+        The old form reached it through
+        ``current_budget + max(0, input_budget - estimate - 256)``, with
+        ``input_budget`` shrunk by ``current_budget``.  That expression equals
+        the room when the room is the larger of the two and ``current_budget``
+        otherwise, so it is *not* the same number: measured on this machine, a
+        request leaving 61413 tokens of room under a 64000 cap returned 64000
+        there and 61413 here.  What is preserved is the escalation *decision*,
+        because the caller retries only when this exceeds ``current_budget`` --
+        below that both forms decline, and above it both return the room.
+        Writing it as the room removes the dependence on ``current_budget``
+        appearing in the budget's reserve, and never names a cap the window
+        cannot hold.
+        """
         desired = max(current_budget * 2, current_budget + 4096)
-        return min(desired, current_budget + spare_tokens)
+        return min(desired, max(1, self._output_room(ctx, tools)))
 
     async def _recover_incomplete_tool_response(
         self,
@@ -3564,7 +3656,11 @@ class BaseAgent:
         self._prepare_provider_context(ctx, tools)
         response, text = await self._transport.stream(
             model=self._effective_model(ctx),
-            max_tokens=self.max_tokens,
+            # Derived per call by `_prepare_provider_context`: a request that
+            # nearly fills the window has to leave itself less room for the
+            # answer than a short one does.  Falls back to the configured cap
+            # when that method took an early return.
+            max_tokens=int(ctx.metadata.pop("_output_cap", self.max_tokens)),
             system=ctx.system_prompt,
             messages=ctx.messages,
             tools=tools,
@@ -3693,6 +3789,7 @@ class BaseAgent:
             api_format=self.api_format,
             supports_vision=self.supports_vision,
             context_window=self.context_window,
+            output_reserve=self.output_reserve,
             transport=self._transport,
         )
         sub_agent.context_manager = self._context_manager_for()

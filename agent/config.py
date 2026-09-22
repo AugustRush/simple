@@ -300,7 +300,7 @@ class ModelClientFactory:
 
 
 _KNOWN_SECTIONS = frozenset({
-    "active_provider", "providers", "model", "max_tokens",
+    "active_provider", "providers", "model", "max_tokens", "output_reserve",
     "memory", "orchestration", "evolution", "scheduler", "audio",
     "mcp_servers", "context", "plugins", "skills", "channels", "user_tools",
     "system_prompt_file", "output_dir", "tavily_api_key",
@@ -507,6 +507,9 @@ def _check_numeric_ranges(cfg: dict, warnings: list[str]) -> None:
     )
     _check_int("llm_max_retries", 0, 20)
     _check_float("llm_retry_base_delay", 0.1)
+    # Bounded by the largest window any provider here offers, because a reserve
+    # bigger than the window would leave the input budget negative.
+    _check_int("output_reserve", 1, 1_000_000)
 
 
 def _check_scheduler(cfg: dict, warnings: list[str]) -> None:

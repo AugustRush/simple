@@ -152,6 +152,15 @@ USER_PLUGINS_DIR = AGENT_HOME / "plugins"
 DEFAULT_MODEL = "claude-opus-4-5"
 DEFAULT_MAX_TOKENS = 8192
 
+# How much of the window a request holds back for the answer it is about to ask
+# for.  This is deliberately *not* `DEFAULT_MAX_TOKENS`: the configured cap is a
+# ceiling on one response, while this is the room the input budget must leave
+# free.  Deriving the input budget from the cap conflated the two, so a provider
+# configured for long answers got the smallest usable context -- deepseek's
+# 64000-token cap against a 128000 window left roughly 57k for the whole
+# conversation.  Sized to cover a full default-length answer.
+DEFAULT_OUTPUT_RESERVE = 8192
+
 # ── Thinking effort ───────────────────────────────────────────────────────
 # Our own vocabulary for "how hard should the model think".  It lives here
 # rather than in a transport because three layers have to agree on it: config
@@ -559,6 +568,7 @@ __all__ = [
     "USER_PLUGINS_DIR",
     "DEFAULT_MODEL",
     "DEFAULT_MAX_TOKENS",
+    "DEFAULT_OUTPUT_RESERVE",
     "MEMORY_TIDY_INTERVAL",
     "MEMORY_TIDY_FILE_THRESHOLD",
     "DEFAULT_MAX_PARALLEL_AGENTS",

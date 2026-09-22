@@ -4954,6 +4954,10 @@ def test_create_enforces_input_budget_before_transport(tmp_path):
         api_format="openai",
         context_window=100,
         max_tokens=20,
+        # The window here is deliberately tiny, so the reserve has to be named
+        # too: the default is sized for a real provider window and would leave
+        # this one no input budget at all.
+        output_reserve=20,
     )
     agent.context_manager = manager
     agent._transport = Transport()
@@ -4972,6 +4976,138 @@ def test_create_enforces_input_budget_before_transport(tmp_path):
     budget = agent._input_token_budget(ctx, [{"name": "tool", "description": "y" * 40}])
     assert manager.consolidation.estimate_tokens(calls[0]["messages"]) < budget
     assert calls[0]["messages"][-1]["content"] == "latest"
+
+
+def test_the_output_cap_follows_the_request_instead_of_capping_the_conversation():
+    """I5: the reserve is not the cap, and the cap is derived per call.
+
+    Two failures sit either side of this.  Deriving the *input* budget from the
+    configured cap gives a provider set up for long answers the smallest usable
+    context -- deepseek's 64000-token cap against a 128000 window left roughly
+    57k for the whole conversation.  Clamping the *cap* down to a fixed reserve
+    rather than to the room the request leaves would truncate exactly those long
+    answers.  So a short request has to still send the whole configured cap, and
+    a request that nearly fills the window has to send what is left instead of
+    overrunning it.
+    """
+    import agent as agent_module
+
+    context_window, configured_cap, reserve = 100_000, 64_000, 8_192
+    tools = [{"name": "tool", "description": "y" * 40}]
+
+    class Transport:
+        def __init__(self):
+            self.calls = []
+
+        async def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return object()
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="openai",
+        context_window=context_window,
+        max_tokens=configured_cap,
+        output_reserve=reserve,
+    )
+    transport = Transport()
+    agent._transport = transport
+
+    # A request that leaves the window mostly free keeps the whole cap: this is
+    # the anti-truncation half, and it is what fails if the cap is derived from
+    # the reserve rather than from the room.
+    short_ctx = agent_module.AgentContext(
+        system_prompt="s", messages=[{"role": "user", "content": "hi"}]
+    )
+    asyncio.run(agent._create(short_ctx, tools))
+    assert transport.calls[-1]["max_tokens"] == configured_cap, (
+        "a short request must still send the full configured cap"
+    )
+
+    # 240k characters is ~60000 tokens here: above the 35975 the old
+    # cap-derived budget would have allowed, and below the reserve-derived one.
+    # Getting past `_create` at all is the decoupling; the cap then has to come
+    # down to what the window has left.
+    long_ctx = agent_module.AgentContext(
+        system_prompt="s", messages=[{"role": "user", "content": "x" * 240_000}]
+    )
+    asyncio.run(agent._create(long_ctx, tools))
+
+    sent = transport.calls[-1]["max_tokens"]
+    charged = agent._payload_overhead(long_ctx, tools) + agent._estimate_input_tokens(
+        long_ctx.messages, ctx=long_ctx
+    )
+    assert sent < configured_cap, "the cap was not clamped to the remaining room"
+    assert sent > 0
+    assert charged + sent <= context_window, "the request overran the window"
+
+
+def test_a_compacted_body_still_leaves_room_for_the_full_configured_cap():
+    """I3 and I5 only hold together: the deep cut is what keeps the cap whole.
+
+    The cap is clamped to the room the request leaves, so a conversation allowed
+    to grow to the edge of the window would send a small cap and truncate long
+    answers -- the exact regression this work exists to avoid.  It cannot happen,
+    because compaction cuts the body to half the input budget, and at that size
+    the window still holds the entire configured cap.  Asserted as the
+    consequence rather than as the fraction, so raising the low-water mark or the
+    reserve until the two stop fitting together fails here.
+    """
+    import agent as agent_module
+    from agent.memory.system import ContextManager
+
+    context_window, configured_cap, reserve = 128_000, 64_000, 8_192
+    tools = [{"name": "tool", "description": "y" * 40}]
+
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="openai",
+        context_window=context_window,
+        max_tokens=configured_cap,
+        output_reserve=reserve,
+    )
+    probe = agent_module.AgentContext(system_prompt="s", messages=[])
+    budget = agent._input_token_budget(probe, tools)
+    # The low-water mark is where a compaction leaves the body, so it is the
+    # largest the conversation can be when a turn starts.  Read from the
+    # constant rather than written as "half", so raising the mark is what makes
+    # this fail rather than something the test would keep agreeing with.
+    body_tokens = int(budget * ContextManager._COMPACTION_LOW_WATER)
+    body = agent_module.AgentContext(
+        system_prompt="s",
+        messages=[{"role": "user", "content": "x" * (body_tokens * 4)}],
+    )
+
+    room = agent._output_room(body, tools)
+    assert room >= configured_cap, (
+        f"a body at the low-water mark leaves only {room} tokens of output room, "
+        f"so the configured cap of {configured_cap} would be clamped"
+    )
+    assert min(configured_cap, room) == configured_cap
+
+
+def test_the_output_reserve_clamps_only_a_cap_that_would_starve_the_window():
+    """The guard keys on the reserve, not on `max_tokens >= context_window`.
+
+    That older condition caught only the most extreme config and passed the one
+    that actually occurs: deepseek's 64000-token cap against a 128000 window
+    satisfied `max_tokens < context_window` while leaving 64000 for the entire
+    conversation.  It must still never lower a healthy cap, because the cap is
+    the only thing bounding a long answer.
+    """
+    from agent.bootstrap import _reserve_input_context
+
+    # A healthy cap is left alone.  Lowering it is what truncates long output.
+    assert _reserve_input_context(64_000, 128_000, reserve=8_192) == 64_000
+    # A cap at the window, and one just under it, both leave the reserve short.
+    assert _reserve_input_context(128_000, 128_000, reserve=8_192) == 119_808
+    assert _reserve_input_context(125_000, 128_000, reserve=8_192) == 119_808
+    # No window to reason about: the cap is the only thing known.
+    assert _reserve_input_context(64_000, None, reserve=8_192) == 64_000
 
 
 def test_create_fits_the_budget_without_a_context_manager(tmp_path):
@@ -5000,6 +5136,9 @@ def test_create_fits_the_budget_without_a_context_manager(tmp_path):
         api_format="openai",
         context_window=100,
         max_tokens=20,
+        # Named for the same reason as in the managed-path test above: this
+        # window is far smaller than a real one.
+        output_reserve=20,
     )
     agent.context_manager = None
     agent._transport = Transport()

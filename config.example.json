@@ -77,6 +77,7 @@
   },
   "max_tool_call_iterations": 40,
   "_max_tool_call_iterations_readme": "Maximum model/tool exchange rounds in one turn before stopping as a possible loop. Values above the runtime cap are clamped; long workflows should make progress visible instead of raising this limit.",
+  "_output_reserve_readme": "How much of the context window a request holds back for the answer, in tokens. This is NOT max_tokens: max_tokens is a ceiling on one response, while output_reserve is the room the conversation must leave free. Keeping them separate is what lets a provider be configured for long answers without shrinking its usable context -- deriving the input budget from max_tokens meant a 64000-token cap against a 128000 window left roughly 57k for the entire conversation. Set it per provider under providers.<name>.output_reserve, or here for all of them. The cap actually sent is derived per request as min(max_tokens, window - request - margin), so a request that nearly fills the window gets a smaller cap while a short one still gets the full max_tokens.",
   "memory": {
     "_readme": "tidy_interval_seconds: how often (in seconds) the agent auto-reorganises memory. tidy_file_threshold: minimum number of new memory files before a tidy is triggered.",
     "tidy_interval_seconds": 3600,

@@ -4217,11 +4217,13 @@ def test_a_session_rebuilt_after_a_provider_switch_does_not_inherit_the_old_clie
     # The newly active provider asks for its whole context as output, so the
     # same safety reserve used at process bootstrap must also be applied here.
     # Read on the agent as well as on the recorded dict, because the agent is
-    # what sends.
+    # what sends.  The reserve is `output_reserve`, which is a fixed number of
+    # tokens rather than a fraction of the window: it is sized for the answer
+    # being asked for, and that does not grow just because the window did.
     assert result["max_tokens"] != global_components["max_tokens"], (
         "the session inherited the process-start max_tokens"
     )
-    assert result["max_tokens"] == 45000
+    assert result["max_tokens"] == 50000 - shared.DEFAULT_OUTPUT_RESERVE
     assert result["agent"].model == result["model"]
     assert result["agent"].max_tokens == result["max_tokens"]
     assert result["agent"].supports_vision is True

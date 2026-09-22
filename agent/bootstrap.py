@@ -44,23 +44,56 @@ def _active_context_window(cfg: dict) -> int | None:
     return int(raw) if raw is not None else None
 
 
+def _active_output_reserve(cfg: dict) -> int:
+    """Resolve how much of the window to hold back for the answer."""
+    providers = cfg.get("providers", {})
+    active_name = cfg.get("active_provider", "anthropic")
+    provider_cfg = (
+        providers.get(active_name, {}) if isinstance(providers, dict) else {}
+    )
+    raw = cfg.get("output_reserve") or provider_cfg.get("output_reserve")
+    if raw is None:
+        return shared.DEFAULT_OUTPUT_RESERVE
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return shared.DEFAULT_OUTPUT_RESERVE
+
+
 def _reserve_input_context(
     max_tokens: int,
     context_window: int | None,
     *,
+    reserve: int = shared.DEFAULT_OUTPUT_RESERVE,
     announce: bool = False,
 ) -> int:
-    """Keep the output cap from consuming the provider's whole context."""
-    if context_window is None or max_tokens < context_window:
+    """Keep the output cap from consuming the provider's whole context.
+
+    The cap is a ceiling on one response, not a claim on the window: a request
+    reserves ``reserve`` tokens for its answer and spends the rest on input.  So
+    the only config this has to correct is one whose cap leaves less than that
+    reserve free.
+
+    The guard used to be ``max_tokens >= context_window``, which caught only the
+    most extreme case and missed the one that actually occurs: deepseek's 64000
+    against a 128000 window passed the test while leaving 64000 for the entire
+    conversation.  The input budget no longer derives from the cap at all (see
+    ``BaseAgent._input_token_budget``), so that config is now handled where it
+    belongs; this remains to catch a cap that would leave the window with no
+    room for input whatsoever.
+    """
+    if context_window is None:
         return max_tokens
-    reserve = max(4096, min(16384, context_window // 10))
-    adjusted = max(1, context_window - reserve)
-    if announce and adjusted < max_tokens:
+    adjusted = max(1, context_window - max(1, int(reserve)))
+    if max_tokens <= adjusted:
+        return max_tokens
+    if announce:
         shared.CONSOLE.print(
-            f"[yellow]max_tokens={max_tokens} equals context_window={context_window}; "
-            f"using {adjusted} to reserve input context[/yellow]"
+            f"[yellow]max_tokens={max_tokens} leaves less than the "
+            f"{reserve}-token output reserve free in a {context_window}-token "
+            f"window; using {adjusted} to reserve input context[/yellow]"
         )
-    return min(max_tokens, adjusted)
+    return adjusted
 
 
 def _project_memory_scope(workspace_root: Path) -> str:
@@ -232,8 +265,9 @@ async def _build_web_session_components(
         session_cfg
     )
     session_context_window = _active_context_window(session_cfg)
+    session_output_reserve = _active_output_reserve(session_cfg)
     session_max_tokens = _reserve_input_context(
-        session_max_tokens, session_context_window
+        session_max_tokens, session_context_window, reserve=session_output_reserve
     )
     session_provider = str(session_cfg.get("active_provider") or "")
     session_supports_vision = provider_supports_vision(
@@ -254,6 +288,7 @@ async def _build_web_session_components(
         api_format=session_transport.api_format,
         supports_vision=session_supports_vision,
         context_window=session_context_window,
+        output_reserve=session_output_reserve,
         transport=session_transport,
     )
     for name in (
@@ -436,8 +471,9 @@ async def _build_components_async(
 
     providers = cfg.get("providers", {})
     context_window = _active_context_window(cfg)
+    output_reserve = _active_output_reserve(cfg)
     max_tokens = _reserve_input_context(
-        max_tokens, context_window, announce=announce
+        max_tokens, context_window, reserve=output_reserve, announce=announce
     )
 
     system_prompt = _load_system_prompt(cfg, prompts_dir=prompts_dir)
@@ -705,6 +741,7 @@ async def _build_components_async(
         api_format=api_format,
         supports_vision=supports_vision,
         context_window=context_window,
+        output_reserve=output_reserve,
         transport=routing_transport,
     )
     agent.max_parallel_agents = max(

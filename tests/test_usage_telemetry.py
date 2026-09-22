@@ -401,7 +401,7 @@ def test_a_compaction_that_rewrites_the_body_is_recorded_as_such(tmp_path):
     # The reserve is named explicitly because this window is far smaller than a
     # real one, so the default reserve would leave it no input budget at all.
     agent = _agent_with_store(
-        tmp_path, max_tokens=512, context_window=3000
+        tmp_path, max_tokens=512, context_window=3000, output_reserve=512
     )
     ctx = agent_module.AgentContext(
         system_prompt="system prompt",

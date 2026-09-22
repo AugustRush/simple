@@ -2864,7 +2864,12 @@ def test_retrieval_budget_spends_on_entries_rather_than_dropping_the_section(tmp
 
 
 def test_retrieval_budget_default_leaves_room_for_the_conversation(tmp_path):
-    """The default budget is a fraction of the window, not the whole thing."""
+    """The default budget is a fraction of the window, not the whole thing.
+
+    It is sized against the *output reserve*, not the configured cap.  Retrieval
+    competes with the conversation for the same window, so sizing it by a
+    generous output cap starved it to roughly a ninth of what it should have had.
+    """
     import agent as agent_module
 
     class _Agent(agent_module.BaseAgent):
@@ -2873,7 +2878,8 @@ def test_retrieval_budget_default_leaves_room_for_the_conversation(tmp_path):
 
     agent = _Agent()
     agent.context_window = 128_000
-    agent.max_tokens = 8192
+    agent.max_tokens = 64_000
+    agent.output_reserve = 8192
 
     budget = agent._retrieval_token_budget()
     usable = 128_000 - 8192
