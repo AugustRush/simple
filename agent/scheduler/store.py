@@ -1387,22 +1387,34 @@ class SchedulerStore:
 
         Without this, a join that is one name short looks exactly like a task
         that is broken -- nothing has run and nothing says why.
+
+        For a step of a workflow the answer is the open round's, not the
+        round-less bucket's: an arrival with no round attached cannot complete
+        a round, so counting it as "heard from" would hide the report the
+        round is actually short of.  The round-less bucket is what the answer
+        falls back to only when no round has heard anything -- which is the
+        case where it is the only thing there is.
         """
         row = self._conn.execute(
-            "SELECT trigger_json FROM scheduled_tasks WHERE id = ?", (task_id,)
+            "SELECT trigger_json, workflow_id FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         required: list[str] = []
+        workflow_id = ""
         if row is not None:
             trigger = TriggerSpec.from_json(row["trigger_json"])
             if signal_mode(trigger) == SIGNAL_MODE_ALL:
                 required = signal_names(trigger)
-        satisfied = self._satisfied_joins(task_id)
-        if not satisfied:
+            workflow_id = str(row["workflow_id"] or "")
+        satisfied: set[str] = set()
+        if workflow_id:
             latest_workflow_round = self._conn.execute(
                 """
-                SELECT workflow_run_id FROM workflow_signal_joins
-                WHERE task_id = ?
-                ORDER BY updated_at DESC, rowid DESC
+                SELECT j.workflow_run_id FROM workflow_signal_joins j
+                JOIN workflow_runs w
+                  ON w.id = j.workflow_run_id AND w.status = 'running'
+                WHERE j.task_id = ?
+                ORDER BY j.updated_at DESC, j.rowid DESC
                 LIMIT 1
                 """,
                 (task_id,),
@@ -1411,6 +1423,8 @@ class SchedulerStore:
                 satisfied = self._satisfied_joins(
                     task_id, str(latest_workflow_round["workflow_run_id"])
                 )
+        if not satisfied:
+            satisfied = self._satisfied_joins(task_id)
         return {
             "required": required,
             "satisfied": sorted(satisfied),
@@ -2741,7 +2755,10 @@ class SchedulerStore:
                 # has to be repeated here: one that is left out silently reads
                 # as its default while the database holds the real value, and
                 # the run the scheduler is about to execute would disagree with
-                # the run the history shows.
+                # the run the history shows.  The snapshot is the *prepared*
+                # one for the same reason -- `_prepare_workflow_run` just
+                # stamped the workflow round into it, and the row above stores
+                # that copy, not the raw `execution_snapshot`.
                 claimed.append(
                     ClaimedTask(
                         task=refreshed,
@@ -2752,8 +2769,9 @@ class SchedulerStore:
                             started_at=started_at,
                             finished_at=None,
                             status="running",
-                            config_snapshot=execution_snapshot(task),
+                            config_snapshot=snapshot,
                             trigger_source="schedule",
+                            workflow_run_id=workflow_run_id,
                             missed_count=missed_count,
                             created_at=started_at,
                             updated_at=started_at,
@@ -3116,6 +3134,17 @@ class SchedulerStore:
     ) -> bool:
         finished_at = finished_at.astimezone(UTC)
         retry_at = retry_at.astimezone(UTC) if retry_at is not None else None
+        # The status decides what the record means and what every subscriber
+        # hears, and this method is called from several modules.  A typo used
+        # to be absorbed silently -- anything that was not `succeeded` was
+        # treated as a failure, so `success` marked the whole downstream chain
+        # skipped and the workflow run failed, with nothing saying why.  The
+        # legal vocabulary is known here, so it is checked here.
+        if status not in TERMINAL_RUN_STATUSES:
+            raise ValueError(
+                f"未知的运行终态 {status!r}；可用："
+                + "、".join(TERMINAL_RUN_STATUSES)
+            )
         with self._immediate_transaction():
             task_cursor = self._conn.execute(
                 """

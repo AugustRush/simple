@@ -3309,3 +3309,129 @@ def test_a_step_runs_when_its_upstream_finishes_not_at_the_next_poll(tmp_path):
             )
     finally:
         store.close()
+
+
+# ── Workflow-run bookkeeping gaps found in review ─────────────────────────
+
+
+def _workflow_run_status(store: SchedulerStore, workflow_run_id: str) -> str:
+    row = store._conn.execute(
+        "SELECT status FROM workflow_runs WHERE id = ?", (workflow_run_id,)
+    ).fetchone()
+    return str(row["status"]) if row is not None else ""
+
+
+def test_complete_run_rejects_a_status_that_is_not_a_run_status(tmp_path):
+    """A typo in ``status`` must fail loudly, not fabricate history.
+
+    ``complete_run`` is called across module boundaries (runtime, web channel,
+    tools), and the one guard it had -- ``_skip_blocked_steps`` treating every
+    non-success as a failure -- turned a one-letter typo (``success`` for
+    ``succeeded``) into a cascade of skipped runs and a failed workflow run,
+    all silently.  The store knows the legal statuses; it says no.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        claimed = store.claim_task_now(tasks["collect"].id, now=NOW)
+        assert claimed is not None
+
+        with pytest.raises(ValueError, match="未知的运行终态"):
+            store.complete_run(
+                tasks["collect"].id,
+                claimed.run.id,
+                finished_at=NOW + timedelta(seconds=1),
+                status="success",
+            )
+        # Nothing was written: the run is still running and the round open.
+        assert store.list_runs(tasks["collect"].id)[0].status == "running"
+        assert _workflow_run_status(store, claimed.run.workflow_run_id) == "running"
+    finally:
+        store.close()
+
+
+def test_a_clock_claim_carries_the_workflow_round_it_belongs_to(tmp_path):
+    """The claimed task must agree with the row the database holds.
+
+    ``claim_due_tasks`` builds the returned ``TaskRun`` by hand, and the hand
+    copy once omitted ``workflow_run_id`` while the row it claims had one --
+    exactly the drift its own comment warns about.  The scheduler executes the
+    copy; anything the row gained and the copy lost is invisible to it.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(linear_workflow())
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["collect"].id)
+
+        claimed = store.claim_due_tasks(
+            now=NOW, limit=5, lease_seconds=300
+        )
+        assert len(claimed) == 1
+
+        row = store._conn.execute(
+            "SELECT workflow_run_id, config_snapshot_json FROM scheduled_task_runs "
+            "WHERE id = ?",
+            (claimed[0].run.id,),
+        ).fetchone()
+        assert claimed[0].run.workflow_run_id == row["workflow_run_id"]
+        snapshot = json.loads(row["config_snapshot_json"])
+        assert snapshot.get("workflow_run_id") == row["workflow_run_id"]
+        assert claimed[0].run.config_snapshot == snapshot
+    finally:
+        store.close()
+
+
+def test_join_progress_shows_the_round_not_the_no_round_leftovers(tmp_path):
+    """A workflow join's progress is its round's, not an older stray arrival.
+
+    Arrivals that carry no round (an external emitter naming the same signal)
+    are recorded in the round-less bucket, and a join waiting inside a round
+    can never be completed by them.  Reporting them as "satisfied" answers the
+    wrong question -- it hides the report the round is actually short of, so a
+    join that is one upstream away looks like it is waiting for an upstream
+    that already reported.
+    """
+    store = make_store(tmp_path)
+    try:
+        workflow = store.create_workflow(
+            Workflow(
+                name="dual entry",
+                steps=[
+                    step("a", trigger=clock()),
+                    step("b", trigger=TriggerSpec.once("2027-01-01T00:00:00+00:00", "UTC")),
+                    step("join", depends_on=["a", "b"]),
+                ],
+            )
+        )
+        tasks = store.step_tasks(workflow.id)
+        make_due(store, tasks["a"].id)
+        due = store.claim_due_tasks(now=NOW, limit=5, lease_seconds=300)
+        assert store.complete_run(
+            tasks["a"].id,
+            due[0].run.id,
+            finished_at=NOW + timedelta(seconds=1),
+            status="succeeded",
+        )
+        store.deliver_signals(now=NOW + timedelta(seconds=2))
+
+        # Somebody outside the workflow reports b's success, carrying no round.
+        store.emit_signal(
+            task_signal_name(tasks["b"].id, "succeeded"),
+            {"task_id": tasks["b"].id, "status": "succeeded"},
+            now=NOW + timedelta(seconds=3),
+        )
+        store.deliver_signals(now=NOW + timedelta(seconds=4))
+
+        progress = store.join_progress(tasks["join"].id)
+        assert progress["satisfied"] == [
+            task_signal_name(tasks["a"].id, "succeeded")
+        ]
+        assert progress["missing"] == [
+            task_signal_name(tasks["b"].id, "succeeded")
+        ]
+    finally:
+        store.close()
+
+
