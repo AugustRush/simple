@@ -1,6 +1,8 @@
 /** The settings view. Rendered by the App container from its context object. */
 
+import { useState } from 'react'
 import type { AppCtx } from '../app/AppCtx'
+import type { ProviderFieldSpec } from '../types'
 import { thinkingEffortOf } from '../lib/format'
 import { ApiOutlined, CheckCircleFilled, MessageOutlined, ReloadOutlined } from '@ant-design/icons'
 import {
@@ -10,17 +12,410 @@ import {
   Form,
   Input,
   InputNumber,
+  Popconfirm,
   Row,
   Select,
   Skeleton,
   Space,
   Switch,
+  Tag,
+  message,
 } from 'antd'
 
 const { TextArea } = Input
 
+//: The mask the backend sends instead of a stored credential.  Typed back
+//: unchanged, it means "keep what is on disk" -- which is what lets a form
+//: round-trip a key it is not allowed to show.
+const MASK = '******'
+
+/** One control per field kind, chosen from what the backend declared.
+ *
+ * No field name appears in this file: the vocabulary arrives in
+ * `provider_fields`, so a field added on the server renders here without an
+ * edit -- and a field removed there stops being offered.  That is the whole
+ * point of the table, and the reason this is a switch on `kind` rather than a
+ * form spelled out for the providers we happen to ship.
+ */
+function providerFieldControl(
+  spec: ProviderFieldSpec,
+  value: unknown,
+  onChange: (next: unknown) => void,
+  //: The id its <label htmlFor> points at.  Passed in rather than derived from
+  //: the key, because the same field is on screen twice when the editor and
+  //: the "add" form are both open, and two elements sharing an id is the kind
+  //: of thing that only shows up as a mislabelled field later.
+  controlId: string,
+) {
+  switch (spec.kind) {
+    case 'bool':
+      return (
+        <Switch
+          id={controlId}
+          checked={Boolean(value)}
+          onChange={checked => onChange(checked)}
+        />
+      )
+    case 'int':
+      return (
+        <InputNumber
+          id={controlId}
+          style={{ width: '100%' }}
+          value={typeof value === 'number' ? value : undefined}
+          onChange={next => onChange(next ?? null)}
+        />
+      )
+    case 'choice':
+      return (
+        <Select
+          id={controlId}
+          value={typeof value === 'string' && value ? value : undefined}
+          onChange={next => onChange(next)}
+          options={spec.choices.map(choice => ({ value: choice, label: choice }))}
+        />
+      )
+    case 'secret':
+      return (
+        <Input.Password
+          id={controlId}
+          value={typeof value === 'string' ? value : ''}
+          placeholder={value === MASK ? '已保存（留空表示不改）' : ''}
+          onChange={event => onChange(event.target.value)}
+        />
+      )
+    case 'string_list':
+      return (
+        <Select
+          id={controlId}
+          mode="tags"
+          style={{ width: '100%' }}
+          value={Array.isArray(value) ? (value as string[]) : []}
+          onChange={next => onChange(next)}
+          placeholder="输入后回车添加"
+          tokenSeparators={[',', ' ']}
+        />
+      )
+    case 'string_map': {
+      // Rows, not a map: an empty map has no rows, and "add a row" that
+      // immediately discards the blank row it just made is a button that does
+      // nothing -- which is exactly what adding the *first* header looked
+      // like.  Blanks are dropped when the value is stored, not while it is
+      // being typed.
+      const pairs: [string, string][] = Array.isArray(value)
+        ? (value as [string, string][])
+        : Object.entries((value && typeof value === 'object' ? value : {}) as Record<string, string>)
+            .map(([key, item]) => [key, String(item ?? '')])
+      const commit = (next: [string, string][]) => onChange(next)
+      return (
+        <div className="provider-map">
+          {pairs.map(([key, item], index) => (
+            <Space.Compact key={`${key}-${index}`} style={{ width: '100%', marginBottom: 6 }}>
+              <Input
+                aria-label={`${spec.label} 名称 ${index + 1}`}
+                style={{ width: '40%' }}
+                value={key}
+                placeholder="名称"
+                onChange={event => {
+                  const next = [...pairs]
+                  next[index] = [event.target.value, item]
+                  commit(next)
+                }}
+              />
+              <Input
+                aria-label={`${spec.label} 值 ${index + 1}`}
+                style={{ width: '60%' }}
+                value={item}
+                placeholder="值"
+                onChange={event => {
+                  const next = [...pairs]
+                  next[index] = [key, event.target.value]
+                  commit(next)
+                }}
+              />
+              <Button
+                danger
+                type="text"
+                onClick={() => commit(pairs.filter((_, i) => i !== index))}
+              >
+                删除
+              </Button>
+            </Space.Compact>
+          ))}
+          <Button size="small" onClick={() => commit([...pairs, ['', '']])}>
+            添加一行
+          </Button>
+        </div>
+      )
+    }
+    default:
+      return (
+        <Input
+          id={controlId}
+          value={typeof value === 'string' ? value : ''}
+          onChange={event => onChange(event.target.value)}
+        />
+      )
+  }
+}
+
+/** The provider list and per-provider editor.
+ *
+ * Defined at module scope on purpose: `createSettingsView` runs on every App
+ * render, so a component created inside it would be a new type each time and
+ * React would remount it -- losing the draft the user is typing.
+ */
+function ProvidersCard({
+  config,
+  fields,
+  busy,
+  onSave,
+  onDelete,
+  onActivate,
+  onTest,
+}: {
+  config: any
+  fields: ProviderFieldSpec[]
+  busy: string
+  onSave: (name: string, values: Record<string, unknown>) => Promise<boolean>
+  onDelete: (name: string) => Promise<boolean>
+  onActivate: (name: string) => Promise<boolean>
+  onTest: (name: string) => Promise<boolean>
+}) {
+  const [editing, setEditing] = useState<string | null>(null)
+  const [adding, setAdding] = useState(false)
+  const [newName, setNewName] = useState('')
+  const [draft, setDraft] = useState<Record<string, unknown>>({})
+  const [saving, setSaving] = useState(false)
+
+  const providers: Record<string, any> = config?.providers || {}
+  const names = Object.keys(providers).filter(name => !name.startsWith('_'))
+  const activeName = String(config?.active_provider || '')
+
+  //: ``string_map`` fields are edited as rows and stored as a map.
+  const toEditor = (spec: ProviderFieldSpec, raw: unknown): unknown => {
+    if (spec.kind !== 'string_map') return raw
+    if (Array.isArray(raw)) return raw
+    return Object.entries((raw && typeof raw === 'object' ? raw : {}) as Record<string, string>)
+      .map(([key, item]) => [key, String(item ?? '')] as [string, string])
+  }
+
+  const toStored = (spec: ProviderFieldSpec, raw: unknown): unknown => {
+    if (spec.kind !== 'string_map') return raw
+    if (!Array.isArray(raw)) return raw
+    const built: Record<string, string> = {}
+    for (const [key, item] of raw as [string, string][]) {
+      const name = String(key ?? '').trim()
+      if (name) built[name] = String(item ?? '')
+    }
+    return built
+  }
+
+  const openEditor = (name: string) => {
+    const stored = providers[name] || {}
+    const seeded: Record<string, unknown> = {}
+    for (const spec of fields) {
+      if (stored[spec.key] !== undefined) seeded[spec.key] = toEditor(spec, stored[spec.key])
+    }
+    setAdding(false)
+    setEditing(name)
+    setDraft(seeded)
+  }
+
+  const openNew = () => {
+    const seeded: Record<string, unknown> = {}
+    for (const spec of fields) {
+      if (spec.default !== null && spec.default !== undefined) seeded[spec.key] = spec.default
+    }
+    setEditing(null)
+    setAdding(true)
+    setNewName('')
+    setDraft(seeded)
+  }
+
+  // Only what the user actually changed.  Sending the whole block back would
+  // assert values for fields nobody looked at, and two open tabs would
+  // overwrite each other; the backend merges a patch.
+  const changedFields = (name: string | null) => {
+    const stored = name ? providers[name] || {} : {}
+    const patch: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(draft)) {
+      const spec = fields.find(f => f.key === key)
+      const normalized = spec ? toStored(spec, value) : value
+      if (JSON.stringify(stored[key] ?? null) !== JSON.stringify(normalized ?? null)) {
+        patch[key] = normalized
+      }
+    }
+    return patch
+  }
+
+  const submit = async () => {
+    const name = adding ? newName.trim() : String(editing || '')
+    if (!name) return
+    for (const spec of fields) {
+      if (spec.required && !String(draft[spec.key] ?? '').trim()) {
+        message.error(`${spec.label} 不能为空`)
+        return
+      }
+    }
+    // A half-typed row (a name with no value, or the reverse) is dropped
+    // rather than sent: the backend would store a header the SDK then cannot
+    // send.  Blank rows are how the editor holds space, not data.
+    for (const spec of fields) {
+      if (spec.kind !== 'string_map' || !Array.isArray(draft[spec.key])) continue
+      const rows = draft[spec.key] as [string, string][]
+      const half = rows.find(([key, item]) => Boolean(String(key || '').trim()) !== Boolean(String(item || '').trim()))
+      if (half) {
+        message.error(`${spec.label}：「${half[0] || half[1]}」这一行只填了一半，请补全或删除`)
+        return
+      }
+    }
+    const patch = changedFields(adding ? null : name)
+    if (adding && !Object.keys(patch).length) {
+      // A brand-new provider has nothing to diff against, so every seeded
+      // field is a change by definition.
+      for (const spec of fields) {
+        if (draft[spec.key] !== undefined) patch[spec.key] = draft[spec.key]
+      }
+    }
+    setSaving(true)
+    const ok = await onSave(name, patch)
+    setSaving(false)
+    if (ok) {
+      setEditing(null)
+      setAdding(false)
+      setDraft({})
+    }
+  }
+
+  return (
+    <Card
+      className="settings-card settings-card-wide"
+      title="Providers"
+      extra={<span className="card-kicker">ENDPOINTS</span>}
+    >
+      <p className="settings-hint">
+        每个 Provider 是一个接口地址、一个密钥和一组模型。改动只作用于这一个 Provider，
+        不会影响其它；「高级 JSON」里手写的同一段配置也会即时反映到这里。
+      </p>
+      <Space direction="vertical" style={{ width: '100%' }} size="small">
+        {names.map(name => {
+          const provider = providers[name] || {}
+          const isActive = name === activeName
+          const open = editing === name
+          return (
+            <Card key={name} size="small" className="provider-row">
+              <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
+                <Space wrap>
+                  <strong>{name}</strong>
+                  {isActive && <Tag color="green">使用中</Tag>}
+                  <span className="settings-hint">
+                    {String(provider.api_format || '?')} · {String(provider.base_url || '默认地址')} ·{' '}
+                    {(provider.models || []).length || 1} 个模型
+                  </span>
+                </Space>
+                <Space wrap>
+                  <Button
+                    size="small"
+                    loading={busy === name}
+                    onClick={() => onTest(name)}
+                  >
+                    测试
+                  </Button>
+                  <Button
+                    size="small"
+                    disabled={isActive}
+                    onClick={() => onActivate(name)}
+                  >
+                    {isActive ? '当前使用' : '切换到此'}
+                  </Button>
+                  <Button size="small" onClick={() => (open ? setEditing(null) : openEditor(name))}>
+                    {open ? '收起' : '编辑'}
+                  </Button>
+                  <Popconfirm
+                    title={`删除 Provider「${name}」？`}
+                    onConfirm={() => onDelete(name)}
+                  >
+                    <Button size="small" danger disabled={isActive}>
+                      删除
+                    </Button>
+                  </Popconfirm>
+                </Space>
+              </Space>
+              {open && (
+                <div className="provider-editor">
+                  {fields.map(spec => (
+                    <div key={spec.key} className="provider-field">
+                      <label className="settings-field-label" htmlFor={`${name}-${spec.key}`}>
+                        {spec.label}
+                        {spec.required && <span style={{ color: '#ff4d4f' }}> *</span>}
+                      </label>
+                      {providerFieldControl(
+                        spec,
+                        draft[spec.key],
+                        next => setDraft(prev => ({ ...prev, [spec.key]: next })),
+                        `${name}-${spec.key}`,
+                      )}
+                      {spec.help && <div className="settings-hint">{spec.help}</div>}
+                    </div>
+                  ))}
+                  <Space>
+                    <Button type="primary" loading={saving} onClick={submit}>
+                      保存这个 Provider
+                    </Button>
+                    <Button onClick={() => setEditing(null)}>取消</Button>
+                  </Space>
+                </div>
+              )}
+            </Card>
+          )
+        })}
+      </Space>
+      {adding ? (
+        <Card size="small" className="provider-row" style={{ marginTop: 12 }}>
+          <label className="settings-field-label" htmlFor="new-provider-name">
+            名称
+          </label>
+          <Input
+            id="new-provider-name"
+            value={newName}
+            placeholder="例如 opencode-go"
+            onChange={event => setNewName(event.target.value)}
+          />
+          <div className="provider-editor">
+            {fields.map(spec => (
+              <div key={spec.key} className="provider-field">
+                <label className="settings-field-label" htmlFor={`new-${spec.key}`}>
+                  {spec.label}
+                  {spec.required && <span style={{ color: '#ff4d4f' }}> *</span>}
+                </label>
+                {providerFieldControl(
+                  spec,
+                  draft[spec.key],
+                  next => setDraft(prev => ({ ...prev, [spec.key]: next })),
+                  `new-${spec.key}`,
+                )}
+                {spec.help && <div className="settings-hint">{spec.help}</div>}
+              </div>
+            ))}
+          </div>
+          <Space>
+            <Button type="primary" loading={saving} onClick={submit}>
+              添加
+            </Button>
+            <Button onClick={() => setAdding(false)}>取消</Button>
+          </Space>
+        </Card>
+      ) : (
+        <Button style={{ marginTop: 12 }} onClick={openNew}>
+          添加 Provider
+        </Button>
+      )}
+    </Card>
+  )
+}
+
 export function createSettingsView(ctx: AppCtx) {
-  const { applyToken, config, configText, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, pageMeta, resetSettings, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, settingsModelOptions, setTokenDraft, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
+  const { activateProvider, applyToken, config, configText, deleteProvider, form, handleSettingsFormChange, jsonStatus, loadingView, messageApi, pageMeta, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendShortcut, setConfigText, setSendShortcut, setSettingsDirty, settingsDirty, settingsModelOptions, setTokenDraft, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } = ctx
 
 
   const renderSettings = () => {
@@ -121,6 +516,16 @@ export function createSettingsView(ctx: AppCtx) {
               style={{ width: '100%' }}
             />
           </Card>
+
+          <ProvidersCard
+            config={config}
+            fields={providerFields}
+            busy={providerBusy}
+            onSave={saveProvider}
+            onDelete={deleteProvider}
+            onActivate={activateProvider}
+            onTest={testProvider}
+          />
 
           <Card className="settings-card settings-card-wide" title="模型与频道" extra={<span className="card-kicker">RUNTIME</span>}>
             <Form form={form} layout="vertical" onValuesChange={handleSettingsFormChange}>

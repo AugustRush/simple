@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { MODEL_PICKER_CHROME } from '../constants'
 import { effortOptionsFrom, estimateLabelWidth, measureLabelWidth, thinkingEffortOf } from '../lib/format'
-import type { FeishuChatInfo } from '../types'
+import type { FeishuChatInfo, ProviderFieldSpec } from '../types'
 import { Form } from 'antd'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
@@ -42,6 +42,15 @@ export function useSettings(deps: Deps) {
   const [thinkingEffortOptions, setThinkingEffortOptions] = useState(
     () => effortOptionsFrom(null),
   )
+
+  // The provider vocabulary, also from the backend. The Providers card renders
+  // whatever these rows say, so a field added on the server appears in the form
+  // with no change here -- and one removed on the server stops being offered.
+  const [providerFields, setProviderFields] = useState<ProviderFieldSpec[]>([])
+
+  // Which provider a slow action (test / activate / delete) is running for, so
+  // the row shows a spinner instead of the page freezing.
+  const [providerBusy, setProviderBusy] = useState('')
 
   const [form] = Form.useForm()
 
@@ -137,6 +146,7 @@ export function useSettings(deps: Deps) {
       // the page offers what this backend will validate -- a level added on
       // the server shows up here without a second copy of the list here.
       setThinkingEffortOptions(effortOptionsFrom(data.thinking_efforts))
+      setProviderFields(Array.isArray(data.provider_fields) ? data.provider_fields : [])
 
       const providers = cfg.providers || {}
       const active = providers[cfg.active_provider] || {}
@@ -248,6 +258,93 @@ export function useSettings(deps: Deps) {
     setToken(next)
     setTokenDraft(next)
     messageApi.success(next ? '令牌已保存' : '令牌已清除')
+  }
+
+  // One provider, one request.  Deliberately not "send the whole config back":
+  // the page would then be asserting values for fields nobody looked at, and
+  // two open tabs would overwrite each other.  The backend merges.
+  const saveProvider = async (name: string, fields: Record<string, unknown>) => {
+    setProviderBusy(name)
+    try {
+      const resp = await api(`/api/providers/${encodeURIComponent(name)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider: fields }),
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (!resp.ok) throw new Error(data.error || `保存失败（${resp.status}）`)
+      messageApi.success(`Provider「${name}」已保存`)
+      await loadSettings()
+      return true
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : '保存失败')
+      return false
+    } finally {
+      setProviderBusy('')
+    }
+  }
+
+  const deleteProvider = async (name: string) => {
+    setProviderBusy(name)
+    try {
+      const resp = await api(`/api/providers/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (!resp.ok) throw new Error(data.error || `删除失败（${resp.status}）`)
+      messageApi.success(`Provider「${name}」已删除`)
+      await loadSettings()
+      return true
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : '删除失败')
+      return false
+    } finally {
+      setProviderBusy('')
+    }
+  }
+
+  const activateProvider = async (name: string) => {
+    setProviderBusy(name)
+    try {
+      const resp = await api(`/api/providers/${encodeURIComponent(name)}/activate`, {
+        method: 'POST',
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (!resp.ok) throw new Error(data.error || `切换失败（${resp.status}）`)
+      messageApi.success(`已切换到「${name}」`)
+      await loadSettings()
+      return true
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : '切换失败')
+      return false
+    } finally {
+      setProviderBusy('')
+    }
+  }
+
+  // The failure text is the point of the button: it is the only place a gateway
+  // gets to say why it refused -- a wrong base_url, a bad key, a header it did
+  // not like.  Swallowing it into "test failed" would waste the one useful bit.
+  const testProvider = async (name: string) => {
+    setProviderBusy(name)
+    try {
+      const resp = await api(`/api/providers/${encodeURIComponent(name)}/test`, {
+        method: 'POST',
+      })
+      const data = await resp.json().catch(() => ({}))
+      if (!resp.ok) throw new Error(data.error || `测试失败（${resp.status}）`)
+      if (data.ok) {
+        messageApi.success(`「${name}」可用：${data.model}（${data.latency_ms} ms）`)
+      } else {
+        messageApi.error(`「${name}」不可用：${data.error}`)
+      }
+      return Boolean(data.ok)
+    } catch (error) {
+      messageApi.error(error instanceof Error ? error.message : '测试失败')
+      return false
+    } finally {
+      setProviderBusy('')
+    }
   }
 
   const saveSettings = async () => {
@@ -369,5 +466,5 @@ export function useSettings(deps: Deps) {
     setCurrentModel(model)
   }
 
-  return { activeProviderName, applyToken, config, configText, currentProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, loadSettings, mergeSettingsForm, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, resetSettings, saveSettings, sendFeishuTest, setConfig, setConfigText, setCurrentProvider, setFeishuChats, setFeishuChatsError, setFeishuChatsLoaded, setFeishuChatsLoading, setFeishuTesting, setPickingDirectory, setSettingsDirty, setThinkingEffortOptions, setTokenDraft, settingsDirty, settingsModelOptions, thinkingEffortOptions, tokenDirty, tokenDraft } as const
+  return { activateProvider, activeProviderName, applyToken, config, configText, currentProvider, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, loadSettings, mergeSettingsForm, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, setConfig, setConfigText, setCurrentProvider, setFeishuChats, setFeishuChatsError, setFeishuChatsLoaded, setFeishuChatsLoading, setFeishuTesting, setPickingDirectory, setSettingsDirty, setThinkingEffortOptions, setTokenDraft, settingsDirty, settingsModelOptions, testProvider, thinkingEffortOptions, tokenDirty, tokenDraft } as const
 }

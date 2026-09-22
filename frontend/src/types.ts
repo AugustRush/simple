@@ -419,6 +419,21 @@ export interface ScheduleDraft {
 }
 
 
+//: One row of the provider vocabulary, as /api/config publishes it.  The
+//: Providers card renders whatever these say instead of naming fields itself,
+//: so a field added on the server shows up here with no change to this file.
+export interface ProviderFieldSpec {
+  key: string
+  kind: 'string' | 'secret' | 'int' | 'bool' | 'choice' | 'string_list' | 'string_map'
+  label: string
+  help: string
+  default?: unknown
+  required: boolean
+  choices: string[]
+  secret: boolean
+  secret_values: boolean
+}
+
 export interface FeishuChatInfo {
   chat_id: string
   name: string

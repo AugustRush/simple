@@ -9,7 +9,7 @@ import type { ChangeEvent, Dispatch, MutableRefObject, KeyboardEvent as ReactKey
 import type { FormInstance } from 'antd'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
-import type { AttachmentInfo, AttentionRun, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo } from '../types'
+import type { AttachmentInfo, AttentionRun, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo } from '../types'
 
 export interface AppCtx {
   updateMessage: (id: string, patch: Partial<Message>) => void
@@ -225,6 +225,12 @@ export interface AppCtx {
   form: FormInstance<any>
   handleSettingsFormChange: (changed: any, all: any) => void
   config: any
+  providerFields: ProviderFieldSpec[]
+  providerBusy: string
+  saveProvider: (name: string, fields: Record<string, unknown>) => Promise<boolean>
+  deleteProvider: (name: string) => Promise<boolean>
+  activateProvider: (name: string) => Promise<boolean>
+  testProvider: (name: string) => Promise<boolean>
   settingsModelOptions: { value: string; label: string; }[]
   thinkingEffortOptions: { value: string; label: string; }[]
   configText: string

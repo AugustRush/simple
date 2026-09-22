@@ -53,7 +53,7 @@ function App() {
 
   const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
 
-  const { applyToken, config, configText, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, resetSettings, saveSettings, sendFeishuTest, setConfigText, setSettingsDirty, setTokenDraft, settingsDirty, settingsModelOptions, thinkingEffortOptions, tokenDirty, tokenDraft } = settings
+  const { activateProvider, applyToken, config, configText, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, testProvider, setConfigText, setSettingsDirty, setTokenDraft, settingsDirty, settingsModelOptions, thinkingEffortOptions, tokenDirty, tokenDraft } = settings
 
   const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadScheduleRuns, loadSchedules, loadWorkflows, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } = automation
 
@@ -274,6 +274,12 @@ function App() {
     form,
     handleSettingsFormChange,
     config,
+    providerFields,
+    providerBusy,
+    saveProvider,
+    deleteProvider,
+    activateProvider,
+    testProvider,
     settingsModelOptions,
     thinkingEffortOptions,
     configText,
