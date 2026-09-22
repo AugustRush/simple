@@ -185,6 +185,170 @@ def _ensure_config_file() -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class ProviderField:
+    """One key a provider entry may carry, described once for every consumer.
+
+    The three consumers are config validation, the settings page's form, and
+    the CLI wizard, and they must not each keep their own copy of the
+    vocabulary: a key added to one and forgotten in another is a setting the
+    user can write but not see, or see but not write.  `thinking_efforts` set
+    the precedent for publishing this backend-side ("the page renders what
+    this backend accepts instead of keeping its own copy of the set"); this
+    widens it from a list of words to the fields themselves.
+
+    ``kind`` is what a renderer switches on:
+
+    ``string``      free text
+    ``secret``      free text that is never returned in the clear
+    ``int``         a number
+    ``bool``        a switch
+    ``choice``      one of ``choices``
+    ``string_list`` a list of strings (models)
+    ``string_map``  name → value pairs (thinking, headers)
+    """
+
+    key: str
+    kind: str
+    label: str
+    help: str
+    default: Any = None
+    required: bool = False
+    choices: tuple[str, ...] = ()
+    #: For ``string_map``: whether values under secret-looking names are hidden
+    #: when the config is handed to a client.  True for headers, because an
+    #: Authorization value is a credential that happens to be spelled as a
+    #: header -- and the settings page round-trips the whole provider block.
+    secret_values: bool = False
+
+
+#: Every key a provider entry may carry, in the order the form should show
+#: them.  ``test_provider_fields_are_the_keys_the_code_reads`` holds this
+#: against what the loader actually reads, so the table cannot drift into
+#: describing a config that no longer exists.
+PROVIDER_FIELDS: tuple[ProviderField, ...] = (
+    ProviderField(
+        "api_format",
+        "choice",
+        "接口格式",
+        "这个分组说哪种协议。OpenAI 兼容的网关（含本地 vLLM/Ollama）选 openai。",
+        default="openai",
+        required=True,
+        choices=("openai", "anthropic"),
+    ),
+    ProviderField(
+        "api_key",
+        "secret",
+        "API Key",
+        "密钥本身，或 $ENV_VAR 形式从环境变量读。",
+        required=True,
+    ),
+    ProviderField(
+        "base_url",
+        "string",
+        "Base URL",
+        "接口地址。留空用官方默认；OpenAI 兼容网关通常以 /v1 结尾。",
+    ),
+    ProviderField(
+        "default_model",
+        "string",
+        "默认模型",
+        "这个分组的默认模型 id，也是路由表认领的 id。",
+        required=True,
+    ),
+    ProviderField(
+        "models",
+        "string_list",
+        "可选模型",
+        "下拉里列出的模型 id。default_model 即使不在这里也照样可用。",
+    ),
+    ProviderField(
+        "max_tokens",
+        "int",
+        "输出上限",
+        "一次回答最多多长。写在这里就只作用于这个分组。",
+    ),
+    ProviderField(
+        "context_window",
+        "int",
+        "上下文窗口",
+        "这个分组的模型能吃多少 token，压缩按它判断。",
+    ),
+    ProviderField(
+        "output_reserve",
+        "int",
+        "输出预留",
+        "输入预算要为回答留出的空间。不是输出上限：上限是「最多多长」，预留是"
+        "「窗口要空多少出来」。",
+    ),
+    ProviderField(
+        "supports_vision",
+        "bool",
+        "支持图片",
+        "为真时图片直接发给模型，否则转成文字描述。",
+        default=False,
+    ),
+    ProviderField(
+        "stream_usage",
+        "bool",
+        "流式上报用量",
+        "让流式请求带回 token 用量，用于记账与估算校准。拒绝 stream_options 的"
+        "网关才需要关掉。",
+        default=True,
+    ),
+    ProviderField(
+        "thinking",
+        "string_map",
+        "思考强度",
+        "effort 取 off/low/medium/high，或 models 子表按模型分别指定。",
+    ),
+    ProviderField(
+        "headers",
+        "string_map",
+        "额外请求头",
+        "随每个请求发出的头。值用 $ENV_VAR 读环境变量；{session} 会在每个请求上"
+        "替换成当前会话 id（一个会话一个稳定值）。",
+        secret_values=True,
+    ),
+)
+
+def provider_fields_payload() -> list[dict[str, Any]]:
+    """The provider vocabulary as JSON, for a client that renders a form.
+
+    One shape, defined once: the settings page, and any other client, reads
+    this instead of hard-coding field names.  ``kind`` is what a renderer
+    switches on (see :class:`ProviderField`), and ``secret`` says a value must
+    never be echoed back in the clear.
+    """
+    return [
+        {
+            "key": field.key,
+            "kind": field.kind,
+            "label": field.label,
+            "help": field.help,
+            "default": field.default,
+            "required": bool(field.required),
+            "choices": list(field.choices),
+            "secret": field.kind == "secret",
+            "secret_values": bool(field.secret_values),
+        }
+        for field in PROVIDER_FIELDS
+    ]
+
+
+#: Who owns the shape of a ``string_map`` field's contents.
+#:
+#: ``scalar``     the generic checker: a dict whose values are strings.
+#: ``own_checker`` a dedicated validator instead -- ``thinking`` accepts a bare
+#:                 effort word as shorthand and names the accepted values in
+#:                 its own message, so a generic "must be a dict" on top of it
+#:                 would be a second, worse answer to the same question.
+PROVIDER_MAP_VALUE_KINDS: dict[str, str] = {
+    "thinking": "own_checker",
+    "headers": "scalar",
+}
+
+
 class ModelClientFactory:
     """Build the right async API client from provider config."""
 
@@ -448,6 +612,7 @@ def _check_providers(cfg: dict, warnings: list[str]) -> None:
     providers = cfg.get("providers", {})
     if not isinstance(providers, dict):
         providers = {}
+    known = {field.key for field in PROVIDER_FIELDS}
     for pname, pcfg in providers.items():
         # `_readme` companions sit beside the real providers in the example
         # config, the same convention the top-level unknown-key check honours.
@@ -456,6 +621,18 @@ def _check_providers(cfg: dict, warnings: list[str]) -> None:
         if not isinstance(pcfg, dict):
             warnings.append(f"providers.{pname}: must be a dict, got {type(pcfg).__name__}")
             continue
+        # A key the loader never reads is a setting the user believes in and
+        # the agent ignores -- the same failure the top-level unknown-key check
+        # exists for, one level down.  PROVIDER_FIELDS is the vocabulary, so a
+        # key that is missing from it is either a typo here or a field nobody
+        # declared.
+        for key in pcfg:
+            if key.startswith("_") or key in known:
+                continue
+            warnings.append(
+                f"providers.{pname}.{key}: unknown provider key — ignored "
+                f"(known: {', '.join(sorted(known))})"
+            )
         fmt = pcfg.get("api_format", "")
         if fmt not in ("anthropic", "openai"):
             warnings.append(
@@ -465,8 +642,63 @@ def _check_providers(cfg: dict, warnings: list[str]) -> None:
             warnings.append(f"providers.{pname}.api_key: must be a string")
         if not isinstance(pcfg.get("default_model"), str) or not pcfg.get("default_model"):
             warnings.append(f"providers.{pname}.default_model: must be a non-empty string")
+        _check_provider_types(pname, pcfg, warnings)
         _check_thinking(pname, pcfg, warnings)
         _check_provider_headers(pname, pcfg, warnings)
+
+
+def _check_provider_types(pname: str, pcfg: dict, warnings: list[str]) -> None:
+    """Type-check the provider fields whose kind is not free text.
+
+    The kinds are read off :data:`PROVIDER_FIELDS`, so a field added to the
+    table is checked from the moment it is declared -- which is the whole point
+    of keeping one vocabulary.  Free text and secrets are left to the checks
+    that know more about them (``api_key``, ``default_model``,
+    ``_check_provider_headers``).
+    """
+    for field in PROVIDER_FIELDS:
+        if field.key not in pcfg or field.kind in ("string", "secret"):
+            continue
+        value = pcfg[field.key]
+        if field.kind == "choice":
+            if isinstance(value, str) and value in field.choices:
+                continue
+            warnings.append(
+                f"providers.{pname}.{field.key}: must be one of "
+                f"{', '.join(field.choices)}, got {value!r}"
+            )
+        elif field.kind == "int":
+            if isinstance(value, bool) or not isinstance(value, int):
+                warnings.append(
+                    f"providers.{pname}.{field.key}: must be an integer, got {value!r}"
+                )
+        elif field.kind == "bool":
+            if not isinstance(value, bool):
+                warnings.append(
+                    f"providers.{pname}.{field.key}: must be true or false, got {value!r}"
+                )
+        elif field.kind == "string_list":
+            if isinstance(value, str):
+                continue
+            if isinstance(value, list) and all(isinstance(i, str) for i in value):
+                continue
+            warnings.append(
+                f"providers.{pname}.{field.key}: must be a list of strings, got {value!r}"
+            )
+        elif field.kind == "string_map":
+            if PROVIDER_MAP_VALUE_KINDS.get(field.key) == "own_checker":
+                continue
+            if not isinstance(value, dict):
+                warnings.append(
+                    f"providers.{pname}.{field.key}: must be a dict, got {value!r}"
+                )
+                continue
+            if PROVIDER_MAP_VALUE_KINDS.get(field.key) == "scalar":
+                for name, item in value.items():
+                    if isinstance(item, bool) or not isinstance(item, (str, int, float)):
+                        warnings.append(
+                            f"providers.{pname}.{field.key}.{name}: must be a string"
+                        )
 
 
 #: A header name is an HTTP token: printable ASCII minus separators.  Checked

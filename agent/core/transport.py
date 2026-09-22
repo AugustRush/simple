@@ -1124,8 +1124,8 @@ class RoutingTransport(ModelTransport):
         return self.default.image_content_block(mime_type, data)
 
 
-def _provider_models(provider_cfg: dict) -> list[str]:
-    """The model ids a provider offers.
+def provider_model_ids(provider_cfg: dict) -> list[str]:
+    """The model ids a provider offers.  Also read by the settings page.
 
     Its ``models`` list, plus the model it declares as its own
     ``default_model``.  The default is included even when a list exists: a
@@ -1248,7 +1248,7 @@ def routing_table(cfg: dict) -> dict[str, str]:
     for name, provider_cfg in providers.items():
         if not isinstance(provider_cfg, dict):
             continue
-        for model in _provider_models(provider_cfg):
+        for model in provider_model_ids(provider_cfg):
             if model in table and name != active:
                 continue
             table[model] = name

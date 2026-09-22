@@ -943,21 +943,42 @@ class WebOutputSink(OutputSink):
                 self._queue.task_done()
 
 
+#: Header names whose value is a credential.  A header is just a name, so the
+#: only thing that can be said about one is whether its *name* reads like a
+#: secret -- which is what a masking pass has to go on, and is why the list is
+#: a pattern rather than an enumeration.
+_SECRET_HEADER_RE = re.compile(r"authorization|cookie|(^|[-_])key$|key[-_]|token|secret")
+
+
 def _mask_api_keys(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Return a copy of ``cfg`` with provider API keys masked for display."""
+    """Return a copy of ``cfg`` with provider credentials masked for display.
+
+    ``api_key`` and any header whose name reads like a credential: the settings
+    page round-trips the whole provider block, so a token that happens to be
+    spelled as a header would otherwise be handed back to the browser in the
+    clear.  The masking must be symmetric with :func:`_restore_masked_api_keys`
+    or a save would write ``******`` over a working credential.
+    """
     import copy
 
     masked = copy.deepcopy(cfg)
     providers = masked.get("providers")
     if isinstance(providers, dict):
         for provider in providers.values():
-            if isinstance(provider, dict) and provider.get("api_key"):
+            if not isinstance(provider, dict):
+                continue
+            if provider.get("api_key"):
                 provider["api_key"] = "******"
+            headers = provider.get("headers")
+            if isinstance(headers, dict):
+                for name, value in headers.items():
+                    if value and _SECRET_HEADER_RE.search(str(name).lower()):
+                        headers[name] = "******"
     return masked
 
 
 def _restore_masked_api_keys(new_cfg: dict[str, Any], current_cfg: dict[str, Any]) -> None:
-    """Keep existing API keys when the UI saved the masked placeholder back."""
+    """Keep existing credentials when the UI saved the masked placeholder back."""
     providers = new_cfg.get("providers")
     current_providers = current_cfg.get("providers")
     if not isinstance(providers, dict) or not isinstance(current_providers, dict):
@@ -965,10 +986,16 @@ def _restore_masked_api_keys(new_cfg: dict[str, Any], current_cfg: dict[str, Any
     for name, provider in providers.items():
         if not isinstance(provider, dict):
             continue
+        current = current_providers.get(name)
         if provider.get("api_key") == "******":
-            current = current_providers.get(name)
             if isinstance(current, dict) and current.get("api_key"):
                 provider["api_key"] = current["api_key"]
+        headers = provider.get("headers")
+        current_headers = current.get("headers") if isinstance(current, dict) else None
+        if isinstance(headers, dict) and isinstance(current_headers, dict):
+            for header_name, value in headers.items():
+                if value == "******" and current_headers.get(header_name):
+                    headers[header_name] = current_headers[header_name]
 
 
 def _jsonable(value: Any) -> Any:
@@ -1198,19 +1225,260 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.config import load_config
+        from agent.config import load_config, provider_fields_payload
         from agent.shared import THINKING_EFFORTS
 
         cfg, _ = load_config()
         masked = _mask_api_keys(cfg)
-        # The efforts the settings page offers, sent for the same reason the
-        # permission profiles are: the page renders what this backend accepts
-        # instead of keeping its own copy of the set -- the two would drift
-        # the moment a level is added.
+        # The vocabulary the settings page renders from, sent for the same
+        # reason `thinking_efforts` is: the page draws what this backend
+        # accepts instead of keeping its own copy of the fields, so a provider
+        # key added here appears in the form without a frontend change and one
+        # removed here disappears from it.
         return JSONResponse({
             "config": masked,
             "thinking_efforts": list(THINKING_EFFORTS),
+            "provider_fields": provider_fields_payload(),
         })
+
+    def _bump_config_revision(self) -> None:
+        """Make the next turn rebuild against the config just written."""
+        self._components["config_revision"] = (
+            int(self._components.get("config_revision", 0)) + 1
+        )
+
+    @staticmethod
+    def _provider_write_error(provider_name: str, provider: dict[str, Any]) -> Optional[str]:
+        """Why this provider block cannot be written, or None.
+
+        Structural problems are refused here rather than warned about, because
+        a write is an assertion about what the agent will do next: a key the
+        loader never reads, a format that does not exist, or a missing required
+        field would be saved and then quietly ignored at runtime.  Warnings
+        remain the mode for *reading* a config -- the file may already hold
+        something imperfect and refusing to start over it would be worse.
+        """
+        from agent.config import PROVIDER_FIELDS, _validate_config
+
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(provider_name or "")):
+            return (
+                "provider 名字只能包含字母、数字、点、下划线和连字符，"
+                "且不能以下划线开头"
+            )
+        for field in PROVIDER_FIELDS:
+            if field.required and not str(provider.get(field.key) or "").strip():
+                return f"{field.label}（{field.key}）不能为空"
+        warnings = _validate_config({"providers": {provider_name: provider}})
+        hard = [w for w in warnings if "unknown provider key" in w]
+        if hard:
+            return hard[0]
+        typed = [
+            w
+            for w in warnings
+            if f"providers.{provider_name}." in w
+            and (
+                "must be one of" in w
+                or "must be an integer" in w
+                or "must be true or false" in w
+                or "must be a list of strings" in w
+                or "must be a dict" in w
+            )
+        ]
+        if typed:
+            return typed[0]
+        return None
+
+    async def _provider_save(self, request: Any) -> Any:
+        """Create or update one provider, leaving every other key alone."""
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        name = str(request.path_params.get("provider_name") or "").strip()
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid json body"}, status_code=400)
+        incoming = body.get("provider") if isinstance(body, dict) else None
+        if not isinstance(incoming, dict):
+            return JSONResponse({"error": "body must be {'provider': {...}}"}, status_code=400)
+        from agent.config import PROVIDER_FIELDS, load_config, save_config
+
+        cfg, _ = load_config()
+        providers = cfg.get("providers")
+        if not isinstance(providers, dict):
+            providers = {}
+            cfg["providers"] = providers
+        current = providers.get(name)
+        merged = dict(current) if isinstance(current, dict) else {}
+        # Only declared fields are written: a patch that names a key the
+        # loader never reads is a promise the agent would not keep, and the
+        # `_readme` companions are documentation, not settings.
+        known = {field.key for field in PROVIDER_FIELDS}
+        unknown = [
+            key for key in incoming if key not in known and not str(key).startswith("_")
+        ]
+        if unknown:
+            return JSONResponse(
+                {
+                    "error": (
+                        f"未知的 provider 字段：{'、'.join(sorted(unknown))}；"
+                        f"可用：{'、'.join(sorted(known))}"
+                    )
+                },
+                status_code=400,
+            )
+        for key, value in incoming.items():
+            if key in known:
+                merged[key] = value
+        # A value the page was shown masked means "unchanged": it must be
+        # resolved against what is on disk before anything is written, or a
+        # save would store the asterisks over a working credential.
+        _restore_masked_api_keys({"providers": {name: merged}}, cfg)
+        error = self._provider_write_error(name, merged)
+        if error:
+            return JSONResponse({"error": error}, status_code=400)
+        providers[name] = merged
+        try:
+            save_config(cfg)
+        except Exception as exc:
+            return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
+        self._bump_config_revision()
+        return JSONResponse({"ok": True, "provider": _mask_api_keys({"providers": {name: merged}})["providers"][name]})
+
+    async def _provider_delete(self, request: Any) -> Any:
+        """Remove a provider, refusing the two that would brick the config."""
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        name = str(request.path_params.get("provider_name") or "").strip()
+        from agent.config import load_config, save_config
+
+        cfg, _ = load_config()
+        providers = cfg.get("providers")
+        if not isinstance(providers, dict) or name not in providers:
+            return JSONResponse({"error": f"找不到 provider '{name}'"}, status_code=404)
+        if str(cfg.get("active_provider") or "") == name:
+            return JSONResponse(
+                {"error": "这是当前使用的 provider，请先切换到别的再删除"},
+                status_code=400,
+            )
+        if len([k for k in providers if not str(k).startswith("_")]) <= 1:
+            return JSONResponse({"error": "至少要保留一个 provider"}, status_code=400)
+        providers.pop(name, None)
+        try:
+            save_config(cfg)
+        except Exception as exc:
+            return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
+        self._bump_config_revision()
+        return JSONResponse({"ok": True})
+
+    async def _provider_activate(self, request: Any) -> Any:
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        name = str(request.path_params.get("provider_name") or "").strip()
+        from agent.config import load_config, save_config
+
+        cfg, _ = load_config()
+        providers = cfg.get("providers")
+        if not isinstance(providers, dict) or name not in providers:
+            return JSONResponse({"error": f"找不到 provider '{name}'"}, status_code=404)
+        cfg["active_provider"] = name
+        # The model has to follow the switch when the old id is not one this
+        # group offers.  `routable_model_ids` would not catch that -- it spans
+        # every provider, so another group's model id is still "routable" and
+        # the session would keep sending it to the endpoint that does not own
+        # it (the 400-naming-its-own-models failure the routing table exists
+        # to prevent).  The question is group-scoped.
+        from agent.core.transport import provider_model_ids
+
+        provider_cfg = providers.get(name) or {}
+        current_model = str(cfg.get("model") or "")
+        if current_model and current_model not in provider_model_ids(provider_cfg):
+            cfg["model"] = str(provider_cfg.get("default_model") or "")
+        try:
+            save_config(cfg)
+        except Exception as exc:
+            return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
+        self._bump_config_revision()
+        return JSONResponse({"ok": True, "active_provider": name, "model": cfg.get("model", "")})
+
+    async def _provider_test(self, request: Any) -> Any:
+        """Send one minimal request to a provider, through the real path.
+
+        Deliberately not a hand-rolled HTTP call: the point of the button is to
+        prove that *this* provider's configuration works -- its base_url, its
+        wire format, its auth, and its headers, including a per-conversation
+        header (which falls back to the process id here, there being no
+        conversation).  A check that builds its own request would pass while
+        the agent's own requests failed.
+        """
+        from starlette.responses import JSONResponse
+
+        if not self._authorized(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        name = str(request.path_params.get("provider_name") or "").strip()
+        from agent.config import load_config
+        from agent.bootstrap import _provider_client_factory
+        from agent.core.transport import build_transport, provider_stream_usage
+        from agent.shared import resolve_provider_headers
+
+        cfg, _ = load_config()
+        providers = cfg.get("providers")
+        if not isinstance(providers, dict) or name not in providers:
+            return JSONResponse({"error": f"找不到 provider '{name}'"}, status_code=404)
+        provider_cfg = providers.get(name) or {}
+        if not isinstance(provider_cfg, dict):
+            return JSONResponse({"error": f"provider '{name}' 不是一个对象"}, status_code=400)
+        api_format = str(provider_cfg.get("api_format") or "openai")
+        model = str(provider_cfg.get("default_model") or "")
+        if not model:
+            return JSONResponse({"error": "这个 provider 没有 default_model"}, status_code=400)
+
+        started = time.perf_counter()
+        try:
+            client = _provider_client_factory(provider_cfg, api_format)
+            transport = build_transport(
+                api_format,
+                client,
+                None,
+                provider_stream_usage(provider_cfg),
+                headers=resolve_provider_headers(provider_cfg, provider_name=name),
+            )
+            # Small but not degenerate: a gateway is entitled to reject a
+            # max_tokens of 1, and that rejection would say nothing about the
+            # configuration being tested.
+            await transport.create(
+                model=model,
+                max_tokens=16,
+                system="You are a connectivity check. Reply with one word.",
+                messages=[{"role": "user", "content": "ping"}],
+                tools=[],
+            )
+        except Exception as exc:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "provider": name,
+                    "model": model,
+                    "latency_ms": round((time.perf_counter() - started) * 1000),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+                status_code=200,
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "provider": name,
+                "model": model,
+                "latency_ms": round((time.perf_counter() - started) * 1000),
+                "error": "",
+            },
+            status_code=200,
+        )
 
     async def _config_save(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
@@ -1236,7 +1504,7 @@ class WebChannel(Channel):
             return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
         # Existing turns continue with their captured components; the next
         # turn will rebuild each session runtime against the new global config.
-        self._components["config_revision"] = int(self._components.get("config_revision", 0)) + 1
+        self._bump_config_revision()
         return JSONResponse({"ok": True})
 
     async def _plugins(self, request: Any) -> Any:
@@ -3537,6 +3805,30 @@ class WebChannel(Channel):
             Route("/api/commands", self._commands, methods=["GET"]),
             Route("/api/config", self._config_get, methods=["GET"]),
             Route("/api/config", self._config_save, methods=["POST"]),
+            # Provider-level edits.  Separate from /api/config because the
+            # settings page should not have to send a whole config back to
+            # change one endpoint, and because "the page sent what it was
+            # shown" is how a field nobody looked at gets overwritten.
+            Route(
+                "/api/providers/{provider_name}",
+                self._provider_save,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/providers/{provider_name}",
+                self._provider_delete,
+                methods=["DELETE"],
+            ),
+            Route(
+                "/api/providers/{provider_name}/activate",
+                self._provider_activate,
+                methods=["POST"],
+            ),
+            Route(
+                "/api/providers/{provider_name}/test",
+                self._provider_test,
+                methods=["POST"],
+            ),
             Route("/api/plugins", self._plugins, methods=["GET"]),
             Route("/api/skills", self._skills, methods=["GET"]),
             Route("/api/context", self._context_stats, methods=["GET"]),
