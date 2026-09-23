@@ -339,11 +339,23 @@ class ModelTransport(abc.ABC):
     ) -> list[dict]:
         """Build the tool-result message(s) to append after a tool batch."""
 
-    @abc.abstractmethod
     def tool_result_rollback_count(
-        self, tool_call_count: int, model: Optional[str] = None
+        self,
+        tool_calls: list[dict],
+        results: list[str],
+        model: Optional[str] = None,
     ) -> int:
-        """How many trailing messages a tool batch added, for rollback math."""
+        """How many trailing messages a tool batch added, for rollback math.
+
+        Derived from the append rather than from the number of calls.  The
+        append is a ``zip``, so a short ``results`` produces fewer messages than
+        there were calls, and a rollback that counted calls would delete one
+        message more than the batch created -- cutting into the turn's real
+        history to undo a content-filter rejection.  One implementation, because
+        the formats differ only in how many messages they put the results in,
+        and that is the thing being counted.
+        """
+        return len(self.build_tool_result_messages(tool_calls, results, model=model))
 
     @abc.abstractmethod
     def build_final_message(
@@ -480,8 +492,17 @@ class AnthropicTransport(ModelTransport):
         return stop_reason, text, tool_calls
 
     def completion_error(self, response, model=None):
-        if getattr(response, "stop_reason", None) == "max_tokens":
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "max_tokens":
             return "Model response was truncated (stop_reason=max_tokens)"
+        if stop_reason is None:
+            # Anthropic reports `stop_reason` as null until a response is
+            # complete, so its absence is the provider's own way of saying the
+            # text is not the whole answer.
+            return (
+                "The provider reported no stop_reason, so the response may be "
+                "truncated. Treat the text as incomplete."
+            )
         return None
 
     def build_assistant_message(self, response, text, model=None):
@@ -500,9 +521,6 @@ class AnthropicTransport(ModelTransport):
                 ],
             }
         ]
-
-    def tool_result_rollback_count(self, tool_call_count, model=None):
-        return 1  # All tool results live in a single user message
 
     def build_final_message(self, response, text, model=None):
         # No tool_use blocks to preserve — plain text entry is canonical.
@@ -627,7 +645,13 @@ class OpenAITransport(ModelTransport):
             thinking_effort=thinking_effort,
         )
         collected: list[str] = []
-        finish_reason = "stop"
+        # ``None`` until a chunk says why the stream ended.  The default used to
+        # be ``"stop"``, which is a claim this transport has no evidence for: a
+        # gateway that omits the terminator reported a half-finished answer as a
+        # complete one, and the caller then committed that text to history as the
+        # answer with nothing anywhere recording it had been cut off.  "Not
+        # reported" is a fact; inventing "stop" destroys it.
+        finish_reason: Optional[str] = None
         tool_calls_acc: dict[int, dict] = {}
         provider_extras_acc: dict[str, Any] = {}
         #: The provider's own count for this call, when it sent one.  Kept
@@ -687,7 +711,29 @@ class OpenAITransport(ModelTransport):
                 )
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
+                    # `index` is the accumulator key, and the SDK types it
+                    # `Optional[int]`.  A gateway that omits it would put every
+                    # call under one key: ids and names overwrite each other and
+                    # the argument fragments concatenate, so one corrupt call is
+                    # executed instead of the several that were sent.
+                    #
+                    # Without an index, the delta's own shape is what says which
+                    # call it belongs to: a call *opens* with an id and a name,
+                    # and every delta after that is an argument fragment for the
+                    # call already open.  So an opening delta takes a fresh slot
+                    # and a continuation appends to the open one.  Position
+                    # within the chunk looks like a substitute and is not -- two
+                    # calls streamed one per chunk are both at position 0.
                     idx = tc_delta.index
+                    if idx is None:
+                        opens_call = bool(tc_delta.id) or bool(
+                            tc_delta.function and tc_delta.function.name
+                        )
+                        idx = (
+                            max(tool_calls_acc, default=-1) + 1
+                            if opens_call or not tool_calls_acc
+                            else max(tool_calls_acc)
+                        )
                     if idx not in tool_calls_acc:
                         tool_calls_acc[idx] = {
                             "id": tc_delta.id or "",
@@ -767,16 +813,42 @@ class OpenAITransport(ModelTransport):
             return None
         if finish == "length":
             return "Model response was truncated (finish_reason=length)"
+        if finish is None:
+            return (
+                "The stream ended without reporting a finish_reason, so the "
+                "response may be truncated. Treat the text as incomplete."
+            )
         return None
 
     def has_incomplete_tool_calls(
         self, response: Any, model: Optional[str] = None
     ) -> bool:
+        """Whether a tool call in *response* may be cut short.
+
+        Two ways it can be, and neither is visible from the call alone.  A
+        ``length`` stop is the provider saying so.  A stream that never reported
+        a terminator says nothing at all -- and a call cut mid-arguments still
+        parses as far as it got, which ``_parse_tool_arguments`` reports as
+        ``{"_malformed_arguments": ...}``.  Executing that would hand a tool a
+        dict of the wrong shape, so it is treated as an incomplete protocol and
+        retried instead.
+        """
         try:
             choice = response.choices[0]
-            return choice.finish_reason == "length" and bool(choice.message.tool_calls)
         except Exception:
             return False
+        calls = getattr(choice.message, "tool_calls", None)
+        if not calls:
+            return False
+        if choice.finish_reason in ("length", None):
+            return True
+        return any(
+            "_malformed_arguments" in parsed
+            for parsed in (
+                self._parse_tool_arguments(getattr(call.function, "arguments", ""))
+                for call in calls
+            )
+        )
 
     def build_assistant_message(self, response, text, model=None):
         msg = response.choices[0].message
@@ -803,9 +875,6 @@ class OpenAITransport(ModelTransport):
             {"role": "tool", "tool_call_id": tc["id"], "content": r}
             for tc, r in zip(tool_calls, results)
         ]
-
-    def tool_result_rollback_count(self, tool_call_count, model=None):
-        return tool_call_count  # One tool message per call
 
     def build_final_message(self, response, text, model=None):
         # Reuse the tool-batch entry shape so model_extra fields survive.
@@ -1175,9 +1244,9 @@ class RoutingTransport(ModelTransport):
         return self._for(model).build_tool_result_messages(tool_calls, results)
 
     def tool_result_rollback_count(
-        self, tool_call_count: int, model: Optional[str] = None
+        self, tool_calls, results, model: Optional[str] = None
     ) -> int:
-        return self._for(model).tool_result_rollback_count(tool_call_count)
+        return self._for(model).tool_result_rollback_count(tool_calls, results)
 
     def image_content_block(self, mime_type: str, data: str) -> dict:
         # Attachment blocks are built from agent-local state before a

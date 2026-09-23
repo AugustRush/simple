@@ -2075,9 +2075,12 @@ class BaseAgent:
         dropped_roles: list[str] = []
         if tool_uses:
             # The transport knows how many trailing tool-result messages it
-            # appended for this batch; +1 for the preceding assistant turn.
+            # appended for this batch; +1 for the preceding assistant turn.  The
+            # count comes from the batch itself, not from how many calls were
+            # requested: a short `results` appends fewer messages, and cutting
+            # by call count would take one message of real history with it.
             result_msg_count = self._transport.tool_result_rollback_count(
-                len(tool_uses), model=self._effective_model(ctx)
+                tool_uses, results, model=self._effective_model(ctx)
             )
             cut = result_msg_count + 1
             dropped_roles = [
