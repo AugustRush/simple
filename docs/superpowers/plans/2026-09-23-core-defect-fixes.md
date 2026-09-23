@@ -25,7 +25,7 @@ given.
 
 ## Status
 
-**Implemented and verified. Tasks 0-6 are done, in the tree.**
+**Implemented, verified, committed. Tasks 0-6 are done, in seven commits.**
 
 | run | failed | passed | skipped |
 |---|---|---|---|
@@ -372,8 +372,15 @@ and splitting means the other 60-odd files are never hostage to it.
 - Run the suite after **each** task, not once at the end.
 - For each fix, do a RED check: disable the fix and confirm the corresponding Task 0
   test goes red, then restore.
-- Commit per task. Task 1 and Task 2 are independent; Task 6's dedup half depends on
-  nothing but reads better after Task 4.
+- Commit per task, except where two tasks are not separable at a hunk boundary.
+  Committed as seven: `docs(plan)`, `test(core)`, then Task 1; **Task 2 and Task 3
+  together** (they meet in `_prepare_turn`, where the request object is both the
+  thing being named and the thing retrieval is sized against); Task 4; Task 5;
+  Task 6. `git diff <base>..HEAD` reproduces the verified working tree exactly
+  (+393/−108 over the six files), which is how the split was checked.
+- The per-task RED property was verified at the Task 2+3 commit by stashing the
+  remaining work: exactly 8 tests failed there, and they were precisely Task 4's
+  two, Task 5's five, and Task 6's one. Every Task 1/2/3 test was green.
 
 ## Out of scope
 
