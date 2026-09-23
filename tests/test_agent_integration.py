@@ -8802,6 +8802,7 @@ def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
             lease_seconds=30,
             max_concurrent_runs=1,
             components=primary,
+            config_loader=lambda: cfg,
         )
     )
     task = types.SimpleNamespace(
@@ -8899,6 +8900,7 @@ def test_scheduler_agent_executor_hands_the_run_its_upstream_results(
             lease_seconds=30,
             max_concurrent_runs=1,
             components={"output_dir": tmp_path, "workspace_root": tmp_path},
+            config_loader=_minimal_cfg,
         )
     )
     task = types.SimpleNamespace(
@@ -9027,6 +9029,7 @@ def test_scheduler_agent_executor_grants_workspace_writes_and_states_the_envelop
             lease_seconds=30,
             max_concurrent_runs=1,
             components={"output_dir": tmp_path},
+            config_loader=lambda: cfg,
         )
     )
     task = types.SimpleNamespace(
@@ -9086,6 +9089,7 @@ def test_scheduler_agent_executor_refuses_write_profile_without_a_workspace(
             lease_seconds=30,
             max_concurrent_runs=1,
             components={"output_dir": tmp_path},
+            config_loader=lambda: cfg,
         )
     )
     task = types.SimpleNamespace(
@@ -10058,3 +10062,98 @@ def test_max_steps_takes_precedence_over_the_legacy_key(monkeypatch, tmp_path):
     components = agent_module._build_components(cfg)
 
     assert components["agent"].max_tool_call_iterations == 11
+
+
+def test_a_scheduled_run_reads_the_config_on_disk_not_the_startup_snapshot(
+    monkeypatch, tmp_path
+):
+    """A provider edit must reach automation without restarting the process.
+
+    The gateway builds its scheduler service once, from the config it read at
+    startup, and every run used to rebuild its components from that snapshot --
+    while a chat turn rebuilds from disk on each turn.  So an edit to a
+    provider (a key, a base_url, the headers a gateway requires) worked
+    immediately in conversation and kept failing in scheduled tasks and
+    workflows until the whole process was restarted, with the failure landing
+    in a run record nobody was watching.
+    """
+    import types
+
+    import agent as agent_module
+    import agent.cli as cli_module
+    from agent.runtime import TurnExecution, TurnResult
+
+    class _FakeService:
+        def __init__(self, **kwargs):
+            self.agent_executor = kwargs["agent_executor"]
+
+    class _FakeStore:
+        pass
+
+    class _FakeAgent:
+        context_manager = object()
+
+    class _FakeAgentCore:
+        async def handle_turn(self, turn_input, state, **kwargs):
+            return TurnExecution(result=TurnResult(text="done"))
+
+    captured: dict[str, list] = {"configs": []}
+
+    async def fake_build(cfg, *, announce=True, resource_home=None):
+        captured["configs"].append(cfg)
+        return {
+            "agent": _FakeAgent(),
+            "agent_core": _FakeAgentCore(),
+            "system_prompt": "system",
+            "skill_catalog": _CLEAN_SKILL_CATALOG,
+        }
+
+    async def fake_close(components):
+        return None
+
+    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
+    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
+    monkeypatch.setattr(agent_module, "_close_components", fake_close)
+
+    # What the process saw at startup: a provider with no headers yet.
+    startup_cfg = _minimal_cfg()
+    # What is on disk by the time the run happens: the user added them.
+    on_disk = _minimal_cfg()
+    on_disk["providers"]["fake"]["headers"] = {"x-opencode-session": "{session}"}
+    monkeypatch.setattr(agent_module, "load_config", lambda: (on_disk, False))
+
+    service, _store, _components = asyncio.run(
+        cli_module._build_scheduler_service(
+            startup_cfg,
+            poll_seconds=1,
+            lease_seconds=30,
+            max_concurrent_runs=1,
+            components={"output_dir": tmp_path, "workspace_root": tmp_path},
+        )
+    )
+
+    task = types.SimpleNamespace(
+        id="task-1",
+        name="review",
+        payload={"prompt": "hi"},
+        workspace_root=str(tmp_path),
+        context_policy="stateless",
+        permission_profile="inherit",
+        model_override=None,
+    )
+    run = types.SimpleNamespace(
+        id="run-1",
+        config_snapshot={
+            "payload": {"prompt": "hi"},
+            "workspace_root": str(tmp_path),
+            "context_policy": "stateless",
+        },
+    )
+    asyncio.run(service.agent_executor(task, run))
+
+    assert captured["configs"], "the run never rebuilt its components"
+    used = captured["configs"][0]
+    assert used["providers"]["fake"].get("headers") == {
+        "x-opencode-session": "{session}"
+    }, "the run used the config captured when the service started"

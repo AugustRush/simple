@@ -742,7 +742,19 @@ async def _build_scheduler_service(
     max_concurrent_runs: int,
     signal_max_depth: int = DEFAULT_SIGNAL_MAX_DEPTH,
     components: Optional[dict] = None,
+    config_loader: Optional[Callable[[], dict]] = None,
 ):
+    """Build the scheduler service and the executor its runs go through.
+
+    ``config_loader`` answers "what is the config now" for a run that builds its
+    own components.  Left unset it reads the file on disk, because that is the
+    copy the user edits: a service built at process start would otherwise pin
+    the provider settings of that moment, and an edit -- a key, a base_url, the
+    headers a gateway demands -- would reach conversation (which reloads every
+    turn) while scheduled tasks and workflows kept failing on the old ones
+    until somebody restarted the process.  Callers that hold a config that is
+    not on disk (tests) pass their own loader.
+    """
     owned_components = components is None
     if components is None:
         components = await agent_module._build_components_async(cfg)
@@ -806,7 +818,16 @@ async def _build_scheduler_service(
         if isolated_runtime:
             run_output = delivery.output_root / task_id / run_id / "artifacts"
             run_output.mkdir(parents=True, exist_ok=True)
-            run_cfg = dict(cfg)
+            # Read what is configured *now*, not what was configured when this
+            # service started: a scheduled run is a fresh execution, and the
+            # settings that decide where it talks to are the ones on disk.  See
+            # the `config_loader` note in `_build_scheduler_service`.
+            current_cfg = (
+                config_loader()
+                if config_loader is not None
+                else agent_module.load_config()[0]
+            )
+            run_cfg = dict(current_cfg)
             run_cfg["workspace_root"] = str(workspace)
             run_cfg["output_dir"] = str(run_output)
             run_cfg = apply_profile_to_config(run_cfg, profile)
