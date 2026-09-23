@@ -1328,6 +1328,29 @@ class ContextManager:
                 lines.append(f"- {turn.role.upper()}: {content}")
         return "\n".join(lines) if len(lines) > 1 else ""
 
+    @staticmethod
+    def _visible_texts(content: str) -> set[str]:
+        """Every string a staged turn could have been sent as.
+
+        A user message is not the user's words: it is ``turn_context + "\\n\\n" +
+        user_message`` (see ``BaseAgent._build_user_message_content``), so the
+        staged turn's raw text is the *last* ``\\n\\n``-separated part of it, not
+        the whole thing.  Testing the whole string by equality is what this did,
+        and it stopped matching the moment per-turn context moved out of the
+        system prompt and into the message -- after which the same staged turns
+        were re-injected on every turn, at full price, until a checkpoint
+        happened to exist.
+
+        Both forms are returned because the two message kinds are stored
+        differently: an assistant entry holds its text verbatim, a user entry
+        holds it behind its framing.  An empty result is not a match for
+        anything, so blank messages stay out of the set.
+        """
+        text = str(content or "").strip()
+        if not text:
+            return set()
+        return {text, text.rsplit("\n\n", 1)[-1].strip()}
+
     def _recent_unconsolidated_context(
         self,
         current_messages: Optional[list[dict]] = None,
@@ -1342,20 +1365,16 @@ class ContextManager:
         for msg in current_messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                text = content.strip()
-                if text:
-                    visible_contents.add(text)
+                visible_contents |= self._visible_texts(content)
                 continue
             if not isinstance(content, list):
                 continue
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                text = str(
-                    block.get("text", "") or block.get("content", "")
-                ).strip()
-                if text:
-                    visible_contents.add(text)
+                visible_contents |= self._visible_texts(
+                    str(block.get("text", "") or block.get("content", ""))
+                )
         missing = [
             msg
             for msg in staged
