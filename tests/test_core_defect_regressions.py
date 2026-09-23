@@ -1,9 +1,10 @@
-"""Regression tests for the four defects found by the first-principles audit.
+"""Regression tests for the defects found by the 2026-09-23 audit.
 
 Each test here was written **before** its fix and was red on the tree that
-produced it.  They are grouped in one file because they share a root cause
-rather than a module: `ctx.messages` is written by `transport` and read by
-`memory`, and nothing enforced that both agree on what a message is.
+produced it.  They share a file because they came from one audit, not because
+they share a module: the sections below name the area each one is about, and
+several are about the boundary between `transport` and `memory`, where nothing
+enforced that both agree on what a message is.
 
 The audit is recorded in `docs/superpowers/plans/2026-09-23-core-defect-fixes.md`.
 """
@@ -126,6 +127,61 @@ def test_a_stored_anthropic_message_is_json_native():
                 "serialized to SQLite and restored by another process, so its "
                 "content must be plain dicts"
             )
+
+
+def test_a_stored_anthropic_block_carries_no_unset_fields():
+    """The stored form is a *request*, so it must not name fields it has no value for.
+
+    `model_dump()` on a response block emits every optional field, including the
+    ones this response left unset -- `citations: null` on a text block,
+    `caller: null` on a `tool_use`.  The SDK forwards those to the wire verbatim
+    (measured against a captured request body), so each one is an explicit value
+    for a field the request schema types as a list or a string.  The fields that
+    *do* carry meaning must survive: a thinking block's `signature` is what lets
+    the provider accept that block back on a later turn.
+    """
+    from anthropic.types import (
+        Message,
+        TextBlock,
+        ThinkingBlock,
+        ToolUseBlock,
+        Usage,
+    )
+
+    from agent.core.transport import AnthropicTransport
+
+    response = Message(
+        id="msg_1",
+        content=[
+            ThinkingBlock(thinking="hmm", signature="sig-abc", type="thinking"),
+            TextBlock(text="let me look", type="text"),
+            ToolUseBlock(
+                id="toolu_1", input={"cmd": "ls"}, name="shell", type="tool_use"
+            ),
+        ],
+        model="claude-x",
+        role="assistant",
+        stop_reason="tool_use",
+        stop_sequence=None,
+        type="message",
+        usage=Usage(input_tokens=10, output_tokens=5),
+    )
+
+    stored = AnthropicTransport(None).build_assistant_message(response, "let me look")
+
+    for block in stored["content"]:
+        assert isinstance(block, dict)
+        unset = [key for key, value in block.items() if value is None]
+        assert not unset, (
+            f"the {block['type']} block still carries unset {unset}; those reach "
+            "the provider as explicit values"
+        )
+
+    thinking = next(b for b in stored["content"] if b["type"] == "thinking")
+    assert thinking["signature"] == "sig-abc", (
+        "the signature is what the provider needs to accept this thinking block "
+        "back on a later turn, so it must not be dropped with the unset fields"
+    )
 
 
 def test_the_checkpoint_round_trip_preserves_anthropic_blocks():

@@ -170,7 +170,16 @@ class ModelTransport(abc.ABC):
                 # fields a reader would otherwise lose: ``signature`` on a
                 # thinking block is what the provider needs to accept that
                 # block back on a later turn.
-                normalized.append(dump())
+                #
+                # ``exclude_none`` because this is the dump of a *response*
+                # block, so it names every optional field including the ones
+                # this response left unset -- ``citations: null`` on a text
+                # block, ``caller: null`` on a ``tool_use``.  Those reach the
+                # wire verbatim (measured: the SDK forwards them), which sends
+                # an explicit value for a field the request schema types as a
+                # list or a string.  Omitting them is what "not set" means, and
+                # it is the shape the API's own examples show.
+                normalized.append(dump(exclude_none=True))
                 continue
             raise TypeError(
                 "a provider content block must be a dict or expose model_dump(); "

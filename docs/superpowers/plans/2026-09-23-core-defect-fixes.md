@@ -30,10 +30,11 @@ given.
 | run | failed | passed | skipped |
 |---|---|---|---|
 | before any fix | 24 | 2634 | 1 |
-| after all fixes | 16 | 2650 | 1 |
+| after all fixes | 16 | 2651 | 1 |
 
-`2650 − 2631 = 19`: the tree gained exactly the 19 tests this work added — the 18
-this plan lists, plus the reader-guard test from note 5 — and all 19 pass. The 16
+`2651 − 2631 = 20`: the tree gained exactly the 20 tests this work added — the 18
+this plan lists, plus the reader-guard test from note 5 and the null-free-dump
+test from note 6 — and all 20 pass. The 16
 that remain are the known environment set (12
 `test_sandbox_conformance`, 2 `test_user_tool_isolation`, `test_builtin_tools`,
 `test_agent_integration::test_build_components_loads_user_tool_plugins`) — the
@@ -42,7 +43,7 @@ state except the ones this plan intended to change**. The "before" figure's 24 i
 those same 16 plus the 8 red-by-design tests that existed at the time.
 
 Measured in two passes, because `tests/test_channel_layer.py` cannot be read from
-inside the harness sandbox (see *Verification protocol*): 2585 passed / 16 failed
+inside the harness sandbox (see *Verification protocol*): 2586 passed / 16 failed
 with it excluded, and 65 passed when it runs alone. Both passes need a fresh
 `TMPDIR` and `$HOME/.local/bin` on `PATH`.
 
@@ -50,6 +51,12 @@ with it excluded, and 65 passed when it runs alone. Both passes need a fresh
 recorded at its task below: the `input_tokens` direction (Task 4), the
 position-in-chunk fallback (Task 5), the "silent" checkpoint failure (Task 6),
 and one defect the plan never listed (Task 5).
+
+**A later review pass** (note 6) changed one line — the stored Anthropic block is
+now `model_dump(exclude_none=True)` — and flagged one premise this plan asserted
+without measuring: that a gateway may end a stream without a terminator. The
+measurement did not support it, and the change is kept anyway, for the reasons
+note 6 gives.
 
 ---
 
@@ -372,6 +379,60 @@ transport's assumptions about well-formed streams are load-bearing.
    (`_checkpoint_summary`, the staged-turn visibility check) still skip — there
    the cost is a line of summary text, not a deleted tool result — and each says
    so at the site.
+
+6. **A review pass over the finished work: one line changed, one premise that was
+   never measured.** Both were found by measuring rather than by re-reading.
+
+   **(a) The stored block was the dump of a *response*, and a response dump names
+   fields it has no value for.** `model_dump()` emits every optional field,
+   including the ones the response left unset — `citations: null` on a text block,
+   `caller: null` on a `tool_use`. Measured by capturing the request body the SDK
+   actually sends (`httpx.MockTransport` behind a real `AsyncAnthropic`): the SDK
+   forwards both **verbatim**, so each was an explicit value for a field the
+   request schema types as a list or a string. Now `exclude_none=True`, which is
+   what "not set" means and what the API's own examples show.
+
+   This also closed the assertion Task 1 asked for and the first pass did not
+   write: a test now asserts that no stored block carries an unset field **and**
+   that a thinking block's `signature` survives, since dropping that with the
+   unset fields would break multi-turn extended thinking. RED-checked by
+   monkeypatching the old form back in: `{'text': ['citations'], 'tool_use':
+   ['caller']}`. This is the one change whose premise did not need verifying —
+   omitting an explicit null from an optional field cannot break anything, so the
+   edit is strictly dominant either way.
+
+   **(b) Task 5's `finish_reason = None` rests on a premise nobody measured** —
+   that a gateway may end a stream without reporting a terminator. Measured
+   against every configured provider that answers, twice: `deepseek-flash` and
+   `glm-5.3-flash` each emitted **exactly one** terminator chunk per stream —
+   `stop` for text, `tool_calls` for a tool call, `length` when the cap was hit.
+   The other four providers could not answer at all (401, 403 insufficient
+   balance, 400 arrears, 400 missing session header), so they are not evidence
+   either way.
+
+   The plan's stated rationale is also a **misreading**: the SDK types
+   `finish_reason` `Optional[str]` because it is optional *on a chunk*, where
+   `None` is the normal value for every chunk but the last — it is not evidence
+   that a final chunk may be null.
+
+   **Kept anyway**, and here is the honest accounting. On every gateway that
+   works here the change is a no-op, so its cost is hypothetical; where it does
+   fire, the failure is loud and bounded, and the old behaviour was silent and
+   unbounded (a half answer committed to history as the answer). The bound is
+   smaller than it first looks: `_continue_truncated_response` returns on the
+   first continuation that finishes cleanly, so an unterminated *stream* costs
+   **one** extra call, not six — the six only happen if the gateway omits the
+   terminator in non-streaming responses too. And the alternative is a transport
+   asserting `"stop"` when it has no evidence for it, which is the class of
+   defect this plan exists to remove. Flagged here rather than hidden.
+
+   **(c) The index-less fallback has a measured limitation.** A gateway that
+   omits `index` *and* repeats `name` on every delta is split into one call per
+   delta (`[{'id': 'call_a', 'args': '{"cmd": '}, {'id': '', 'name': 'shell',
+   'args': '"ls"}'}]`). It degrades safely: both halves fail to parse, so
+   `_malformed_arguments` routes them to the existing retry rather than executing
+   either. The two shapes the fallback is *for* — one call across two deltas, and
+   two calls one per chunk — were both measured correct.
 
 ---
 
