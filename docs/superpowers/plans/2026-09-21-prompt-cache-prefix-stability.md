@@ -33,13 +33,13 @@ permitted`, plus `test_build_components_loads_user_tool_plugins`). Baseline was
 task, not once at the end, so any regression would have been attributable to a single
 change.
 
-**Outstanding — Task 4 Step 3.** The end-to-end reading (does the <20% band stop
-dominating the uncached bill; do `foreground` rows exist; is the head stable within a
-session) needs a *new* session. Every row in the store predates the Task 0 transport
-fix, so `scripts/analyze_cache_hits.py` still reports the same 641 rows over
-2026-09-09 → 2026-09-21 and prints its own "no `foreground` / `tool_step` rows"
-warning. Re-run it after a real interactive session to close this out. Nothing in the
-code needs to change for it; the data simply does not exist yet.
+**Closed — Task 4 Step 3, run 2026-09-23.** The end-to-end reading was taken on
+1008 rows once real sessions existed. Two of its four criteria pass and two do not,
+and the two failures are one cause: the tool gate changes the tool schemas per turn,
+`head_fingerprint` covers the schemas, and so the head moves — which re-prices the
+whole conversation behind it. `foreground` caches **7.2%** and `tool_step` caches
+**95.5%**. The full reading, the pinned-`cached` evidence that locates the divergence
+in `T` rather than `S`, and what would unblock it are in Step 3 below.
 
 **Two deliberate deviations from the plan as written**, both recorded in full at the
 end of their task sections:
@@ -535,22 +535,65 @@ than coincidentally matching it.
   Baseline was 16 / 2570, so the six new tests are the whole delta and nothing
   regressed. The run was also done per task — after Task 1, Task 2 and Task 3 —
   so a regression would have been attributable to one change.
-- [ ] **Step 3: Re-run the `usage_events` analysis** on a real session and compare
+- [x] **Step 3: Re-run the `usage_events` analysis** on a real session and compare
   against the baseline table above. Success criteria:
   - `phase='foreground'` and `'tool_step'` rows exist;
   - the <20% hit band stops dominating uncached tokens;
   - the count of rows with a changed `head_fingerprint` within a session drops to
     the number of genuine capability changes (target: 0);
   - `compacted=true` rows are a small fraction of calls, not the steady state.
-  → **Cannot be completed in this session, and saying otherwise would be false.**
-  `scripts/analyze_cache_hits.py` runs and reports the *same* 641 rows over
-  2026-09-09 → 2026-09-21, because those are the rows already on disk: the
-  Task 0 transport fix only takes effect when the agent runs again, so no
-  `foreground`/`tool_step` row and no `head_fingerprint` exists yet. What the run
-  does confirm is that the report's own guard rails work — it prints "no
-  'foreground' / 'tool_step' rows" and "No row carries `head_fingerprint` yet"
-  rather than silently showing a clean-looking table. Re-run this step after a
-  real interactive session; that is the only way to close it.
+  → **Run 2026-09-23, 1008 rows (2026-09-09 → 2026-09-23). Two of the four criteria
+  are met; the two that are not turn out to be one cause.**
+
+  | phase | calls | input | cached | uncached | hit |
+  |---|---|---|---|---|---|
+  | subagent | 675 | 28.02M | 16.63M | 11.39M | 59.3% |
+  | tool_step | 174 | 13.74M | 13.12M | 0.62M | 95.5% |
+  | foreground | 8 | 0.52M | 0.04M | 0.48M | 7.2% |
+  | consolidation | 151 | 0.33M | 0.02M | 0.31M | 6.5% |
+
+  - **Criterion 1 — MET.** The rows exist (8 `foreground`, 174 `tool_step`). The
+    Task 0 transport fix did what it was for.
+  - **Criterion 2 — NOT MET.** The <20% band carried 55.9% of uncached tokens in
+    the old reading and 53.5% now. Better, but not the point.
+  - **Criterion 3 — NOT MET, and now explained.** 3 of 3 sessions changed head
+    (4/3/3 distinct heads). `select_tools(all_tools, user_message, …)`
+    (`agent.py:2830`) picks the tool set *per turn, from the user's words*, and
+    `head_fingerprint` covers the tool schemas — so the head moves whenever the
+    gate does.
+  - **Criterion 4 — MET.** 6 `rewritten` calls against 286 that recorded the flag:
+    2.1%. Compaction is rare and deep, as I3 intends.
+
+  **The two failures are one failure, and the store says which.** In session
+  `1173a5923fc1`, `cached_input_tokens` stays pinned at exactly **7424** across
+  three head changes while `input_tokens` runs 98k–119k. A pinned cache read
+  beside a moving head can only mean the stable prefix ends at the system prompt:
+  `S` is being served from cache (~7.4k tokens) and nothing after it is, because
+  the divergence is in `T`. Had `S` moved, `cached` would have collapsed to 0.
+
+  So the <20% band (criterion 2) and the unstable head (criterion 3) are the same
+  fact seen twice: **the tool gate re-prices the whole conversation on every turn
+  that changes it** — and in `foreground`, that is most of them.
+
+  **What this contradicts.** Deviation 1 kept the gate because dropping it "would
+  expose destructive tools", and said the ordering fix "captures most of the cache
+  benefit". The measurement does not support the second claim: ordering cannot help
+  when the *set* changes, because two different subsets diverge at the first schema
+  that differs, not at the last. And `context_assembler.py:52-61` states the
+  opposite of the first claim in its own words — the gate "is about **budget, not
+  permission** … cannot be a guard and was never able to be one", because calls
+  dispatch by name against the whole registry and the system prompt names every
+  tool in the same turn. Two files in this repo describe the same mechanism as a
+  budget device and as a safety boundary; one of them is wrong, and it is not the
+  one next to the code.
+
+  **What would unblock it.** The gate is load-bearing for safety only if the first
+  claim holds, and the unguarded members of the gated groups are enumerable:
+  `schedule_delete`, `workflow_delete`, `memory_clear` (each `state_write` with no
+  `requires_request`) and `spawn_agent` (`orchestration`). Giving those four the
+  capability would leave the gate a pure budget decision — at which point the tool
+  set can be session-stable, and the head with it. That is a safety call, not a
+  cache one, so it is recorded here rather than taken.
 - [x] **Step 4: Confirm no truncation regression** by exercising a long single
   response and a large single tool call, and confirming either one clean response
   or an auto-continued one with no duplicated seam text.
