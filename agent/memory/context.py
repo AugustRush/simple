@@ -521,18 +521,44 @@ class ContextManager:
         )
 
     @staticmethod
-    def _anthropic_tool_result_ids(message: dict) -> Optional[set[str]]:
+    def _content_blocks(message: dict) -> list[dict]:
+        """The message's content blocks, with their one invariant enforced.
+
+        Every writer appends JSON-native blocks: ``ModelTransport`` normalises
+        provider content through ``_json_native_blocks``, and the agent's own
+        messages are built from dicts.  So a non-dict block is not a shape to
+        tolerate -- it means a writer regressed, or the record came back
+        corrupted (``store.py``'s ``default=str`` stores a stray SDK object as a
+        ``repr`` string).
+
+        Skipping it is the exact failure this layer exists to prevent: an
+        unread ``tool_use`` makes its ``tool_result`` look like an orphan, the
+        pair is dropped, and the model is handed a conversation missing the tool
+        results it already ran -- silently, and permanently, since the repaired
+        list is written back to ``ctx.messages``.
+        """
+        content = message.get("content")
+        if not isinstance(content, list):
+            return []
+        for block in content:
+            if not isinstance(block, dict):
+                raise ContextLimitError(
+                    f"message content block is {type(block).__name__}, not a dict; "
+                    "every message in ctx.messages must be JSON-native"
+                )
+        return content
+
+    @classmethod
+    def _anthropic_tool_result_ids(cls, message: dict) -> Optional[set[str]]:
         if message.get("role") != "user":
             return None
         content = message.get("content")
         if not isinstance(content, list) or not content:
             return None
-        if not all(
-            isinstance(block, dict) and block.get("type") == "tool_result"
-            for block in content
-        ):
+        blocks = cls._content_blocks(message)
+        if not all(block.get("type") == "tool_result" for block in blocks):
             return None
-        return {str(block.get("tool_use_id") or "") for block in content}
+        return {str(block.get("tool_use_id") or "") for block in blocks}
 
     @classmethod
     def _is_real_user_request(cls, message: dict) -> bool:
@@ -600,12 +626,10 @@ class ContextManager:
                 for call in openai_calls or []
                 if isinstance(call, dict)
             }
-            content = message.get("content")
-            content_blocks = content if isinstance(content, list) else []
             anthropic_ids = {
                 str(block.get("id") or "")
-                for block in content_blocks
-                if isinstance(block, dict) and block.get("type") == "tool_use"
+                for block in cls._content_blocks(message)
+                if block.get("type") == "tool_use"
             }
             expected_ids = openai_ids | anthropic_ids
             if expected_ids:
@@ -651,12 +675,8 @@ class ContextManager:
                 and messages[index + 1].get("role") == "assistant"
                 and not messages[index + 1].get("tool_calls")
                 and not any(
-                    isinstance(block, dict) and block.get("type") == "tool_use"
-                    for block in (
-                        messages[index + 1].get("content")
-                        if isinstance(messages[index + 1].get("content"), list)
-                        else []
-                    )
+                    block.get("type") == "tool_use"
+                    for block in cls._content_blocks(messages[index + 1])
                 )
             ):
                 units.append([index, index + 1])
@@ -680,12 +700,15 @@ class ContextManager:
                 for call in openai_calls or []
                 if isinstance(call, dict)
             }
-            content = message.get("content")
-            blocks = content if isinstance(content, list) else []
+            # `_content_blocks` raises rather than skipping an unreadable block.
+            # Here that matters most: this function is what *drops* an orphan
+            # tool_result, so an unread `tool_use` is not a missing id -- it is
+            # the tool result of a tool the model already ran, deleted from the
+            # conversation.
             anthropic_ids = {
                 str(block.get("id") or "")
-                for block in blocks
-                if isinstance(block, dict) and block.get("type") == "tool_use"
+                for block in cls._content_blocks(message)
+                if block.get("type") == "tool_use"
             }
             expected_ids = openai_ids | anthropic_ids
             if expected_ids:
@@ -1370,6 +1393,11 @@ class ContextManager:
             if not isinstance(content, list):
                 continue
             for block in content:
+                # Tolerated on purpose, unlike the protocol paths: this only
+                # collects text to compare against, so an unreadable block
+                # costs at worst one redundant re-injection.  `_content_blocks`
+                # has already raised earlier in this same pass if the invariant
+                # were actually broken, so this cannot be the first to see it.
                 if not isinstance(block, dict):
                     continue
                 visible_contents |= self._visible_texts(
@@ -1672,6 +1700,9 @@ class ContextManager:
             if isinstance(content, list):
                 parts = []
                 for block in content:
+                    # Tolerated on purpose: this builds a readable summary, so
+                    # a block it cannot read costs a line of text, not a tool
+                    # result.  Failing here would lose the whole checkpoint.
                     if not isinstance(block, dict):
                         continue
                     text = block.get("text") or block.get("content")

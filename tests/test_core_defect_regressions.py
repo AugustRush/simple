@@ -147,6 +147,55 @@ def test_the_checkpoint_round_trip_preserves_anthropic_blocks():
     assert assistant[1]["id"] == "toolu_1"
 
 
+def test_a_non_dict_content_block_is_reported_rather_than_skipped():
+    """The reader must not quietly re-derive the type either.
+
+    The defect was silent.  `_repair_tool_history` pairs a `tool_use` with its
+    `tool_result` by looking for **dicts**, so a block it could not read made the
+    result look like an orphan, and the pair was dropped -- with nothing
+    anywhere recording that a tool the model had already run went missing.
+
+    The writer now guarantees JSON-native blocks, so a non-dict here can only
+    mean a writer regressed or a checkpoint came back corrupted.  Both are
+    things this layer must say out loud: `ContextLimitError` is what
+    `_format_agent_error` turns into a visible error, and the alternative is a
+    conversation quietly missing its tool results.
+
+    The tolerance that remains is deliberate and narrow: the two text-extraction
+    paths (`_checkpoint_summary`, the staged-turn visibility check) still skip an
+    unreadable block, because there the cost is a line of summary text rather
+    than a deleted tool result.
+    """
+    from anthropic.types import ToolUseBlock
+
+    from agent.memory.system import ContextLimitError
+
+    messages = [
+        {"role": "user", "content": "please list the files"},
+        {
+            "role": "assistant",
+            "content": [
+                ToolUseBlock(
+                    id="toolu_1", input={"cmd": "ls"}, name="shell", type="tool_use"
+                )
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"}
+            ],
+        },
+    ]
+
+    with pytest.raises(ContextLimitError, match="not a dict"):
+        _compact(messages)
+
+    # Control: the same history with the block in its wire form compacts, so the
+    # raise above is about the block's type and not about the history's shape.
+    assert _block_types(_compact(_anthropic_history())[1]) == ["text", "tool_use"]
+
+
 # ── 2. A cut inside a turn must not remove that turn's reason for existing ───
 
 
