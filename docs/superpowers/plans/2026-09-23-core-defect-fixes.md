@@ -30,10 +30,11 @@ given.
 | run | failed | passed | skipped |
 |---|---|---|---|
 | before any fix | 24 | 2634 | 1 |
-| after all fixes | 16 | 2649 | 1 |
+| after all fixes | 16 | 2650 | 1 |
 
-`2649 − 2631 = 18`: the tree gained exactly the 18 tests this plan added, and all
-18 pass. The 16 that remain are the known environment set (12
+`2650 − 2631 = 19`: the tree gained exactly the 19 tests this work added — the 18
+this plan lists, plus the reader-guard test from note 5 — and all 19 pass. The 16
+that remain are the known environment set (12
 `test_sandbox_conformance`, 2 `test_user_tool_isolation`, `test_builtin_tools`,
 `test_agent_integration::test_build_components_loads_user_tool_plugins`) — the
 `FAILED` list is byte-identical to the recorded baseline, so **no test changed
@@ -41,7 +42,7 @@ state except the ones this plan intended to change**. The "before" figure's 24 i
 those same 16 plus the 8 red-by-design tests that existed at the time.
 
 Measured in two passes, because `tests/test_channel_layer.py` cannot be read from
-inside the harness sandbox (see *Verification protocol*): 2584 passed / 16 failed
+inside the harness sandbox (see *Verification protocol*): 2585 passed / 16 failed
 with it excluded, and 65 passed when it runs alone. Both passes need a fresh
 `TMPDIR` and `$HOME/.local/bin` on `PATH`.
 
@@ -92,6 +93,39 @@ cd /Users/shike/Desktop/simple
 ./.venv/bin/python /tmp/repro_core.py    # blocks dropped + request dropped
 ./.venv/bin/python /tmp/repro_core2.py   # same, starting from a real anthropic.types.Message
 ```
+
+**Both are stale after the fix, and re-running them is misleading.** They are
+kept here as the *evidence that the defects were live*, not as a post-fix check.
+`repro_core.py` hand-builds the block list, so it bypasses the transport — the
+boundary the fix is at — and still prints BROKEN, correctly. Its section B calls
+`fit_to_budget` without `protected`, i.e. the old calling convention.
+`repro_core2.py` calls `build_assistant_message(None, response, ...)`, relying on
+the old body never touching `self`; the new body does
+(`self._json_native_blocks`) and raises `AttributeError`.
+
+The post-fix confirmation is `/tmp/repro_core3.py`, which starts from a real
+`anthropic.types.Message`, goes through a real transport instance, and checks the
+shape the fix actually produces. Measured output:
+
+```
+A. real Message -> real transport -> real compaction
+  stored assistant content: ['text', 'tool_use']
+  [ok ] the stored message is JSON-native (no SDK objects)
+  [ok ] tool_use survived compaction -- kept 1
+  [ok ] tool_result survived compaction -- kept 1
+  [ok ] the checkpoint round-trip stores blocks, not a repr
+
+B. an interjection must not displace the turn's request
+  with protected=[request]: ['ORIGINAL-TURN-REQUEST xxxxxx']
+  [ok ] the request is what the provider reads as the turn to answer
+  without protected (fallback): ['[context-eviction] 1 earlier', '<user_interjection>stop</use']
+  [ok ] the newest-user-message heuristic still names the interjection
+```
+
+Section B is the whole point in two lines: **the old path still loses the
+request** (it answers an eviction notice, with the interjection as the newest
+message), and the new one does not. That is the defect and the fix, side by side
+in one run.
 
 `repro_core2.py` output, verbatim:
 
@@ -179,8 +213,11 @@ after their task. Without them the fixes are unverifiable.
       `default=str` stays as a safety net but must no longer be *load-bearing*.
 - [x] Consider (and only then decide) whether `memory`'s two `isinstance(block, dict)`
       guards (`context.py:558-563`, `context.py:640-644`) should keep tolerating
-      non-dict blocks. Recommendation: keep them — they cost nothing and they are
-      what would have caught this — but the defect is fixed at the writer.
+      non-dict blocks. **Reversed on re-reading — see note 5 below.** The original
+      recommendation ("keep them — they are what would have caught this") was
+      backwards: they did not catch it, they *concealed* it. The protocol paths
+      now raise via `_content_blocks`; the two text-extraction paths still skip,
+      deliberately and with the reason stated at each site.
 - [x] Green: Task 0's first and third tests, plus `tests/test_consolidation.py` and
       any transport suite.
 
@@ -315,6 +352,26 @@ transport's assumptions about well-formed streams are load-bearing.
    compensate for a bug elsewhere would have been the wrong trade, so
    `_has_provider_checkpoint` keeps its honest meaning ("a checkpoint exists") and
    is unchanged.
+
+5. **Task 1: the reader's tolerant guards had to go loud, and the plan's own
+   first-principles section said so.** The plan's Task 1 bullet recommended
+   keeping the `isinstance(block, dict)` skips on the grounds that "they are what
+   would have caught this". They are not — they are what *hid* it. Measured by
+   restoring the old guard: a history whose `tool_use` block is an SDK object
+   compacts to `[[], ['ToolUseBlock']]` — the `tool_result` is deleted with no
+   error, no log and no trace, which is the P0 itself. The same section of this
+   plan had already called these guards "a patch that hides the defect instead of
+   removing it"; the bullet contradicted it and the bullet was wrong.
+
+   So the protocol readers now share one `_content_blocks` helper that raises
+   `ContextLimitError` (which `_format_agent_error` turns into a visible error)
+   instead of skipping. That is safe because every writer was checked to emit
+   dicts: both `build_assistant_message`s, both `build_tool_result_messages`,
+   both `build_final_message`s, both `image_content_block`s and
+   `_build_user_message_content`. The two text-extraction paths
+   (`_checkpoint_summary`, the staged-turn visibility check) still skip — there
+   the cost is a line of summary text, not a deleted tool result — and each says
+   so at the site.
 
 ---
 
