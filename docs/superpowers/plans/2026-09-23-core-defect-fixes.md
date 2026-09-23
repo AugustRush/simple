@@ -30,11 +30,12 @@ given.
 | run | failed | passed | skipped |
 |---|---|---|---|
 | before any fix | 24 | 2634 | 1 |
-| after all fixes | 16 | 2651 | 1 |
+| after all fixes | 16 | 2654 | 1 |
 
-`2651 − 2631 = 20`: the tree gained exactly the 20 tests this work added — the 18
-this plan lists, plus the reader-guard test from note 5 and the null-free-dump
-test from note 6 — and all 20 pass. The 16
+`2654 − 2631 = 23`: the tree gained exactly the 23 tests this work added — the 18
+this plan lists, plus the reader-guard test from note 5, the null-free-dump test
+from note 6, and the three parametrized framing cases from note 7 — and all 23
+pass. The 16
 that remain are the known environment set (12
 `test_sandbox_conformance`, 2 `test_user_tool_isolation`, `test_builtin_tools`,
 `test_agent_integration::test_build_components_loads_user_tool_plugins`) — the
@@ -43,7 +44,7 @@ state except the ones this plan intended to change**. The "before" figure's 24 i
 those same 16 plus the 8 red-by-design tests that existed at the time.
 
 Measured in two passes, because `tests/test_channel_layer.py` cannot be read from
-inside the harness sandbox (see *Verification protocol*): 2586 passed / 16 failed
+inside the harness sandbox (see *Verification protocol*): 2589 passed / 16 failed
 with it excluded, and 65 passed when it runs alone. Both passes need a fresh
 `TMPDIR` and `$HOME/.local/bin` on `PATH`.
 
@@ -52,11 +53,11 @@ recorded at its task below: the `input_tokens` direction (Task 4), the
 position-in-chunk fallback (Task 5), the "silent" checkpoint failure (Task 6),
 and one defect the plan never listed (Task 5).
 
-**A later review pass** (note 6) changed one line — the stored Anthropic block is
-now `model_dump(exclude_none=True)` — and flagged one premise this plan asserted
-without measuring: that a gateway may end a stream without a terminator. The
-measurement did not support it, and the change is kept anyway, for the reasons
-note 6 gives.
+**Two later review passes** (notes 6 and 7) changed two things and flagged one
+premise. Note 6: the stored Anthropic block is now `model_dump(exclude_none=True)`,
+and Task 5's `finish_reason` premise was measured and not supported — kept anyway,
+for the reasons given there. Note 7: Task 6's dedup fix was incomplete for two of
+the three message shapes, and is now exact for all of them.
 
 ---
 
@@ -433,6 +434,35 @@ transport's assumptions about well-formed streams are load-bearing.
    `_malformed_arguments` routes them to the existing retry rather than executing
    either. The two shapes the fallback is *for* — one call across two deltas, and
    two calls one per chunk — were both measured correct.
+
+7. **Task 6's own fix was incomplete, and only for the shapes its test did not use.**
+   The plan offered two options — "compare against the assembled content's tail", or
+   (preferred) keep injected-content hashes in `ctx.metadata` — and the first pass
+   took the tail. But the assembled content is
+   `"\n\n".join([turn_context, user_message, attachment_context])`
+   (`agent.py:433-435`) and `turn_context` is itself a `"\n\n"` join, so the tail is
+   the user's words only when the message is a single paragraph **and** nothing is
+   appended after it.
+
+   Measured, both ways it fails: with a non-vision attachment the tail recovers the
+   *attachment context*; with a two-paragraph request it recovers only the second
+   paragraph. In both cases a turn the model can already see was re-injected, at
+   full price — the same defect the task set out to remove, still live for the
+   shapes the test happened not to use (it used a single-paragraph, attachment-free
+   message, which is the one shape the tail gets right).
+
+   Replaced with `_shows_text`: the staged text matches iff it is a `"\n\n"`-delimited
+   run of a message's content, or the whole of it. That is exact for every shape,
+   because a part of a `"\n\n"` join is always bounded by `"\n\n"` or by the ends of
+   the string. It accepts everything the equality test and the tail test accepted, so
+   it can only cause *fewer* re-injections — the safe direction, since a false match
+   skips a turn rather than inventing one. The new test is parametrized over all
+   three shapes; RED-checked by monkeypatching the tail back, cases 2 and 3 fail
+   while case 1 passes.
+
+   The general lesson, and the second time this plan met it: **a test written from
+   the shape in the bug report will not cover the shapes the fix breaks on.** The
+   first pass here fixed exactly the case the report named.
 
 ---
 

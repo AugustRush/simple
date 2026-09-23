@@ -219,8 +219,8 @@ def test_a_non_dict_content_block_is_reported_rather_than_skipped():
 
     The tolerance that remains is deliberate and narrow: the two text-extraction
     paths (`_checkpoint_summary`, the staged-turn visibility check) still skip an
-    unreadable block, because there the cost is a line of summary text rather
-    than a deleted tool result.
+    unreadable block, because neither can lose a tool result -- the first would
+    drop a line of summary, the second at worst re-injects a turn.
     """
     from anthropic.types import ToolUseBlock
 
@@ -740,3 +740,83 @@ def test_a_staged_turn_that_is_no_longer_visible_is_injected(tmp_path):
     )
 
     assert "capital of Peru" in injected
+
+
+def _manager_with_a_staged_turn(tmp_path, text: str):
+    """A manager holding one staged user turn, ready to retrieve against."""
+    from agent import (
+        ConsolidationEngine,
+        ContextManager,
+        LocalRetriever,
+        LTMStore,
+        StagingBuffer,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir)
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        idle_seconds=300,
+        min_messages=4,
+        staging=StagingBuffer(context_dir=context_dir, session_id="s"),
+    )
+    manager.staging.append("user", text)
+    return manager
+
+
+_TURN_CONTEXT = "\n\n".join(
+    [
+        "<session_checkpoint>\nwe discussed geography.\n</session_checkpoint>",
+        "## Active Skills\n- none",
+        "Current UTC time: 2026-09-23 00:00 UTC. Use the current_time tool when "
+        "the user asks about local time.",
+    ]
+)
+
+
+@pytest.mark.parametrize(
+    "user_message, attachment_context",
+    [
+        ("what is the capital of Peru", ""),
+        ("what is the capital of Peru\n\nand which continent is it in", ""),
+        (
+            "what is the capital of Peru",
+            "[attachment: notes.txt]\nline one\nline two",
+        ),
+    ],
+)
+def test_a_visible_turn_is_recognised_however_it_was_framed(
+    tmp_path, user_message, attachment_context
+):
+    """The user's words are one *part* of the message, and not always the last.
+
+    `_build_user_message_content` joins the turn context, the user's words and
+    the attachment context with `"\\n\\n"`, and the turn context is itself such a
+    join.  So matching the content's *tail* recovers the attachment context
+    whenever there is one, and only the last paragraph of a multi-paragraph
+    message -- in both of those cases a turn the model can already see was
+    injected a second time, at full price.  The first case is the only one the
+    earlier test covers, which is why it passed while both of these did not.
+    """
+    manager = _manager_with_a_staged_turn(tmp_path, user_message)
+
+    parts = [
+        part
+        for part in (_TURN_CONTEXT, user_message, attachment_context)
+        if part
+    ]
+    injected = manager.retrieve_implicit_context(
+        "and of Chile?",
+        current_messages=[{"role": "user", "content": "\n\n".join(parts)}],
+        current_turn_id="t2",
+        token_budget=4000,
+        include_recent_session=True,
+        include_working_state=False,
+    )
+
+    assert "capital of Peru" not in injected, (
+        f"the turn was already sent as {user_message!r} with attachment context "
+        f"{attachment_context!r}; it must not be injected again"
+    )

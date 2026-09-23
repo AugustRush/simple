@@ -1352,27 +1352,37 @@ class ContextManager:
         return "\n".join(lines) if len(lines) > 1 else ""
 
     @staticmethod
-    def _visible_texts(content: str) -> set[str]:
-        """Every string a staged turn could have been sent as.
+    def _shows_text(content: str, text: str) -> bool:
+        """Whether *content* carries *text* as one of its ``\\n\\n``-separated parts.
 
-        A user message is not the user's words: it is ``turn_context + "\\n\\n" +
-        user_message`` (see ``BaseAgent._build_user_message_content``), so the
-        staged turn's raw text is the *last* ``\\n\\n``-separated part of it, not
-        the whole thing.  Testing the whole string by equality is what this did,
-        and it stopped matching the moment per-turn context moved out of the
-        system prompt and into the message -- after which the same staged turns
-        were re-injected on every turn, at full price, until a checkpoint
-        happened to exist.
+        A user message is not the user's words: it is
+        ``"\\n\\n".join([turn_context, user_message, attachment_context])`` (see
+        ``BaseAgent._build_user_message_content``), and ``turn_context`` is itself
+        a ``"\\n\\n"`` join of this turn's blocks.  So the user's words are one
+        *part* of the content -- not the whole of it, and not necessarily the
+        last one, because a non-vision attachment's context is appended after
+        them.
 
-        Both forms are returned because the two message kinds are stored
-        differently: an assistant entry holds its text verbatim, a user entry
-        holds it behind its framing.  An empty result is not a match for
-        anything, so blank messages stay out of the set.
+        Comparing the whole string by equality is what this did, and it stopped
+        matching the moment per-turn context moved out of the system prompt and
+        into the message.  Taking the tail instead recovers the attachment
+        context whenever there is one, and only the *last paragraph* of a
+        multi-paragraph message -- both measured, both still re-injected.
+
+        Matching a delimited run is exact for every shape, because a part of a
+        ``"\\n\\n"`` join is always bounded by ``"\\n\\n"`` or by the ends of the
+        string.  It accepts everything the equality test and the tail test
+        accepted, so it can only cause *fewer* re-injections, and a match still
+        means what it should: this text was already sent.
         """
-        text = str(content or "").strip()
-        if not text:
-            return set()
-        return {text, text.rsplit("\n\n", 1)[-1].strip()}
+        if not content or not text:
+            return False
+        return (
+            content == text
+            or content.startswith(text + "\n\n")
+            or content.endswith("\n\n" + text)
+            or f"\n\n{text}\n\n" in content
+        )
 
     def _recent_unconsolidated_context(
         self,
@@ -1384,31 +1394,39 @@ class ContextManager:
             return ""
         if current_messages is None:
             return ""
-        visible_contents: set[str] = set()
+        # Every string the model has already been shown, kept whole: what the
+        # staged text is compared *against* is a delimited run inside one of
+        # these, so they must not be pre-split (see `_shows_text`).
+        visible_contents: list[str] = []
         for msg in current_messages:
             content = msg.get("content", "")
             if isinstance(content, str):
-                visible_contents |= self._visible_texts(content)
+                visible_contents.append(content)
                 continue
             if not isinstance(content, list):
                 continue
             for block in content:
                 # Tolerated on purpose, unlike the protocol paths: this only
-                # collects text to compare against, so an unreadable block
-                # costs at worst one redundant re-injection.  `_content_blocks`
-                # has already raised earlier in this same pass if the invariant
-                # were actually broken, so this cannot be the first to see it.
+                # collects text to compare against, so an unreadable block costs
+                # at worst one redundant re-injection -- never a lost tool
+                # result.  It is not a second tolerance to maintain: the
+                # protocol reads all share `_content_blocks`, which raises.
                 if not isinstance(block, dict):
                     continue
-                visible_contents |= self._visible_texts(
+                visible_contents.append(
                     str(block.get("text", "") or block.get("content", ""))
                 )
-        missing = [
-            msg
-            for msg in staged
-            if str(msg.get("content", "")).strip()
-            and str(msg.get("content", "")).strip() not in visible_contents
-        ]
+        missing = []
+        for msg in staged:
+            staged_text = str(msg.get("content", "")).strip()
+            if not staged_text:
+                continue
+            if any(
+                self._shows_text(content, staged_text)
+                for content in visible_contents
+            ):
+                continue
+            missing.append(msg)
         if not missing:
             return ""
         lines = ["## Current Session (not yet consolidated)"]
