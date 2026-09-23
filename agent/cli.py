@@ -822,10 +822,17 @@ async def _build_scheduler_service(
             # service started: a scheduled run is a fresh execution, and the
             # settings that decide where it talks to are the ones on disk.  See
             # the `config_loader` note in `_build_scheduler_service`.
+            #
+            # `load_config_for_run` rather than `load_config`: the latter
+            # substitutes the built-in defaults for a file it cannot parse,
+            # which for a run would mean providers nobody configured (and no
+            # keys) -- an authentication error naming the wrong problem -- and
+            # it prints the config's warnings, which on this path would repeat
+            # once per run.
             current_cfg = (
                 config_loader()
                 if config_loader is not None
-                else agent_module.load_config()[0]
+                else agent_module.load_config_for_run(cfg)
             )
             run_cfg = dict(current_cfg)
             run_cfg["workspace_root"] = str(workspace)

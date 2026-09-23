@@ -76,10 +76,13 @@ class ModelEndpoint:
     #: gateway that requires a per-conversation header rejects their calls as
     #: surely as it rejects the chat path's.
     headers: dict[str, str] = field(default_factory=dict)
+    #: Named only so a missing environment variable can say which provider
+    #: asked for it.
+    provider_name: str = ""
 
     def headers_kwarg(self) -> dict[str, Any]:
         """``{"extra_headers": ...}`` for a request made with this endpoint."""
-        return request_extra_headers(self.headers)
+        return request_extra_headers(self.headers, self.provider_name)
 
 
 class ModelTransport(abc.ABC):
@@ -114,14 +117,17 @@ class ModelTransport(abc.ABC):
         thinking_effort: Any = None,
         stream_usage: Any = True,
         headers: Optional[dict[str, str]] = None,
+        provider_name: str = "",
     ) -> None:
         self.client = client
         self.thinking_effort = shared.normalize_thinking_effort(thinking_effort)
         self.stream_usage = bool(stream_usage)
-        #: This provider's configured extra request headers, unresolved: a
-        #: value may still contain ``{session}``, substituted per request
-        #: rather than here because one client serves every conversation (see
-        #: :meth:`_headers_kwarg`).
+        #: Named so a header's missing environment variable can say where it
+        #: came from.
+        self.provider_name = str(provider_name or "")
+        #: This provider's configured extra request headers as written: a value
+        #: may still be ``$NAME`` or contain ``{session}``.  Both resolve per
+        #: request -- see :meth:`_headers_kwarg`.
         self.headers = dict(headers) if isinstance(headers, dict) else {}
 
     def _headers_kwarg(self) -> dict[str, Any]:
@@ -132,7 +138,7 @@ class ModelTransport(abc.ABC):
         does {session} mean" is how one of the two paths ends up sending
         something the other does not.
         """
-        return request_extra_headers(self.headers)
+        return request_extra_headers(self.headers, self.provider_name)
 
     # ── Reasoning ──────────────────────────────────────────────────────
 
@@ -177,7 +183,9 @@ class ModelTransport(abc.ABC):
         lookup; callers that need a client *for a model* ask here rather than
         pairing a model string with whichever client happens to be at hand.
         """
-        return ModelEndpoint(self.client, self.api_format, self.headers)
+        return ModelEndpoint(
+            self.client, self.api_format, self.headers, self.provider_name
+        )
 
     # ── Tool/schema shaping ────────────────────────────────────────────
 
@@ -941,6 +949,7 @@ def build_transport(
     thinking_effort: Any = None,
     stream_usage: Any = True,
     headers: Optional[dict[str, str]] = None,
+    provider_name: str = "",
 ) -> ModelTransport:
     """Single dispatch point — adding a provider here is the only place to edit.
 
@@ -953,16 +962,22 @@ def build_transport(
     there is nothing there to configure and passing the value on would be
     carrying a name that is never read.
 
-    ``headers`` is the provider's configured extra request headers, already
-    environment-expanded by :func:`shared.resolve_provider_headers`.  It
-    reaches both formats: the need is a property of the gateway, not of the
-    wire format it speaks.
+    ``headers`` is the provider's configured extra request headers as written
+    (:func:`shared.provider_headers`); they are resolved per request, so a
+    value may still hold ``$NAME`` or ``{session}``.  They reach both formats:
+    the need is a property of the gateway, not of the wire format it speaks.
     """
     if api_format == "anthropic":
-        return AnthropicTransport(client, thinking_effort, headers=headers)
+        return AnthropicTransport(
+            client, thinking_effort, headers=headers, provider_name=provider_name
+        )
     if api_format == "openai":
         return OpenAITransport(
-            client, thinking_effort, stream_usage, headers=headers
+            client,
+            thinking_effort,
+            stream_usage,
+            headers=headers,
+            provider_name=provider_name,
         )
     raise ValueError(f"unsupported api_format: {api_format!r}")
 
@@ -999,6 +1014,7 @@ class RoutingTransport(ModelTransport):
             default.thinking_effort,
             default.stream_usage,
             headers=default.headers,
+            provider_name=default.provider_name,
         )
         self.default = default
         self.routes = routes
@@ -1039,7 +1055,12 @@ class RoutingTransport(ModelTransport):
         loop used to produce.  Asking the router resolves the pair instead.
         """
         transport = self._for(model)
-        return ModelEndpoint(transport.client, transport.api_format, transport.headers)
+        return ModelEndpoint(
+            transport.client,
+            transport.api_format,
+            transport.headers,
+            transport.provider_name,
+        )
 
     def convert_tools(self, tools: list[dict], model: Optional[str] = None) -> Any:
         return self._for(model).convert_tools(tools)
@@ -1269,33 +1290,28 @@ def routable_model_ids(cfg: dict) -> set[str]:
 
 
 def request_extra_headers(
-    headers: Optional[dict[str, str]],
+    headers: Optional[dict[str, str]], provider_name: str = ""
 ) -> dict[str, Any]:
     """``{"extra_headers": ...}`` for one request, or empty when there are none.
 
-    The single place ``{session}`` becomes an id, shared by the transport and
-    by :meth:`ModelEndpoint.headers_kwarg` so the two cannot drift into
-    disagreeing about what a provider's headers mean.
+    The single place a provider's declared headers become the headers of a
+    request, shared by the transport and by :meth:`ModelEndpoint.headers_kwarg`
+    so the two cannot drift into disagreeing about what they mean.
 
     Empty rather than ``{"extra_headers": None}`` on purpose: a provider that
     declares no headers must send a request byte-identical to the one this code
     sent before headers existed.
 
-    The session is read at request time, not when the client or transport was
-    built: those are per provider configuration and shared by every
-    conversation, so a value captured there could only be a process-wide
-    constant -- and a gateway asking for one id per conversation would see one
-    id for all of them.
+    Both substitutions happen at request time, not when the client or transport
+    was built.  ``{session}`` has to: those objects are per provider
+    configuration and shared by every conversation, so a value captured there
+    could only be a process-wide constant.  ``$NAME`` does too, so that a
+    provider whose variable is unset costs one failing request rather than a
+    gateway that refuses to start.
     """
     if not headers:
         return {}
-    session = shared.current_session_id()
-    return {
-        "extra_headers": {
-            name: value.replace(shared.SESSION_HEADER_PLACEHOLDER, session)
-            for name, value in headers.items()
-        }
-    }
+    return {"extra_headers": shared.request_headers(headers, provider_name=provider_name)}
 
 
 def provider_client_cache_key(
@@ -1414,11 +1430,8 @@ def build_routing_transport(
         default_client,
         provider_thinking_effort(active_cfg) if active_cfg else None,
         provider_stream_usage(active_cfg) if active_cfg else True,
-        headers=shared.resolve_provider_headers(
-            active_cfg, provider_name=active
-        )
-        if active_cfg
-        else None,
+        headers=shared.provider_headers(active_cfg) if active_cfg else None,
+        provider_name=active,
     )
     routes: dict[str, ModelTransport] = {}
     transports: dict[str, ModelTransport] = {}
@@ -1452,9 +1465,8 @@ def build_routing_transport(
                     _client_for(provider_cfg, api_format),
                     provider_thinking_effort(provider_cfg),
                     provider_stream_usage(provider_cfg),
-                    headers=shared.resolve_provider_headers(
-                        provider_cfg, provider_name=name
-                    ),
+                    headers=shared.provider_headers(provider_cfg),
+                    provider_name=name,
                 )
                 transports[name] = transport
         routes[model] = transport

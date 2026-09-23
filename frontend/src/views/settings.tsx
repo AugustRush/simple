@@ -19,7 +19,6 @@ import {
   Space,
   Switch,
   Tag,
-  message,
 } from 'antd'
 
 const { TextArea } = Input
@@ -168,6 +167,7 @@ function ProvidersCard({
   config,
   fields,
   busy,
+  notify,
   onSave,
   onDelete,
   onActivate,
@@ -176,6 +176,10 @@ function ProvidersCard({
   config: any
   fields: ProviderFieldSpec[]
   busy: string
+  //: The app's message API rather than antd's static one: the static call
+  //: cannot see the app's ConfigProvider, so it renders with the default theme
+  //: and locale -- a different-looking toast from every other toast here.
+  notify: { error: (text: string) => void }
   onSave: (name: string, values: Record<string, unknown>) => Promise<boolean>
   onDelete: (name: string) => Promise<boolean>
   onActivate: (name: string) => Promise<boolean>
@@ -210,11 +214,24 @@ function ProvidersCard({
     return built
   }
 
+  //: What the agent will actually use for a field: what the config says, or
+  //: the vocabulary's default when it says nothing.  The form shows this
+  //: rather than a bare "off" for an absent switch -- an unconfigured provider
+  //: streams usage and does not support vision, and a form that claims
+  //: otherwise is describing something the runtime will not do.
+  const effective = (spec: ProviderFieldSpec, stored: unknown): unknown =>
+    stored !== undefined ? stored : spec.default
+
+  //: Stored shape, so a draft (rows for a string_map) can be compared with it.
+  const normalize = (spec: ProviderFieldSpec, raw: unknown): unknown =>
+    toStored(spec, toEditor(spec, raw))
+
   const openEditor = (name: string) => {
     const stored = providers[name] || {}
     const seeded: Record<string, unknown> = {}
     for (const spec of fields) {
-      if (stored[spec.key] !== undefined) seeded[spec.key] = toEditor(spec, stored[spec.key])
+      const value = effective(spec, stored[spec.key])
+      if (value !== undefined) seeded[spec.key] = toEditor(spec, value)
     }
     setAdding(false)
     setEditing(name)
@@ -238,11 +255,16 @@ function ProvidersCard({
   const changedFields = (name: string | null) => {
     const stored = name ? providers[name] || {} : {}
     const patch: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(draft)) {
-      const spec = fields.find(f => f.key === key)
-      const normalized = spec ? toStored(spec, value) : value
-      if (JSON.stringify(stored[key] ?? null) !== JSON.stringify(normalized ?? null)) {
-        patch[key] = normalized
+    for (const spec of fields) {
+      if (!(spec.key in draft)) continue
+      const normalized = normalize(spec, draft[spec.key])
+      const current = normalize(spec, effective(spec, stored[spec.key]))
+      // Compared against the *effective* current value, not the stored one:
+      // the draft was seeded with the default for a field the config omits, and
+      // that seed is not a change the user made.  Otherwise opening a provider
+      // and pressing save would write every default into the file.
+      if (JSON.stringify(current ?? null) !== JSON.stringify(normalized ?? null)) {
+        patch[spec.key] = normalized
       }
     }
     return patch
@@ -253,7 +275,7 @@ function ProvidersCard({
     if (!name) return
     for (const spec of fields) {
       if (spec.required && !String(draft[spec.key] ?? '').trim()) {
-        message.error(`${spec.label} 不能为空`)
+        notify.error(`${spec.label} 不能为空`)
         return
       }
     }
@@ -265,16 +287,16 @@ function ProvidersCard({
       const rows = draft[spec.key] as [string, string][]
       const half = rows.find(([key, item]) => Boolean(String(key || '').trim()) !== Boolean(String(item || '').trim()))
       if (half) {
-        message.error(`${spec.label}：「${half[0] || half[1]}」这一行只填了一半，请补全或删除`)
+        notify.error(`${spec.label}：「${half[0] || half[1]}」这一行只填了一半，请补全或删除`)
         return
       }
     }
     const patch = changedFields(adding ? null : name)
-    if (adding && !Object.keys(patch).length) {
-      // A brand-new provider has nothing to diff against, so every seeded
-      // field is a change by definition.
+    if (adding) {
+      // A new provider has nothing to differ from: everything the form holds is
+      // what the user is asking to be configured, defaults included.
       for (const spec of fields) {
-        if (draft[spec.key] !== undefined) patch[spec.key] = draft[spec.key]
+        if (draft[spec.key] !== undefined) patch[spec.key] = normalize(spec, draft[spec.key])
       }
     }
     setSaving(true)
@@ -521,6 +543,7 @@ export function createSettingsView(ctx: AppCtx) {
             config={config}
             fields={providerFields}
             busy={providerBusy}
+            notify={messageApi}
             onSave={saveProvider}
             onDelete={deleteProvider}
             onActivate={activateProvider}

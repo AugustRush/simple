@@ -32,16 +32,22 @@ from agent.core.transport import (
 # ── Resolution ────────────────────────────────────────────────────────────
 
 
-def test_a_provider_without_headers_resolves_to_nothing():
-    assert shared.resolve_provider_headers({}) == {}
-    assert shared.resolve_provider_headers({"headers": {}}) == {}
-    assert shared.resolve_provider_headers({"headers": None}) == {}
-    assert shared.resolve_provider_headers("not a dict") == {}
+def test_a_provider_without_headers_declares_nothing():
+    assert shared.provider_headers({}) == {}
+    assert shared.provider_headers({"headers": {}}) == {}
+    assert shared.provider_headers({"headers": None}) == {}
+    assert shared.provider_headers("not a dict") == {}
 
 
-def test_env_values_are_read_and_the_session_placeholder_is_left_alone(monkeypatch):
+def test_declared_values_are_returned_as_written(monkeypatch):
+    """Both substitutions belong to the request, not to this step.
+
+    ``$NAME`` because a provider whose variable is unset must not be able to
+    stop the agent from starting, and ``{session}`` because one client serves
+    every conversation.  So what comes out here is still the template.
+    """
     monkeypatch.setenv("HEADER_TOKEN", "tok-123")
-    resolved = shared.resolve_provider_headers(
+    declared = shared.provider_headers(
         {
             "headers": {
                 "Authorization": "$HEADER_TOKEN",
@@ -50,27 +56,68 @@ def test_env_values_are_read_and_the_session_placeholder_is_left_alone(monkeypat
             }
         }
     )
-    assert resolved == {
-        "Authorization": "tok-123",
+    assert declared == {
+        "Authorization": "$HEADER_TOKEN",
         "User-Agent": "zcode/1.0",
-        # Left for the request to substitute: one client serves every
-        # conversation, so this cannot be decided here.
         "x-opencode-session": "{session}",
     }
 
 
-def test_a_missing_env_var_is_named_rather_than_sent_empty(monkeypatch):
-    monkeypatch.delenv("HEADER_TOKEN_MISSING", raising=False)
-    with pytest.raises(RuntimeError, match="HEADER_TOKEN_MISSING"):
-        shared.resolve_provider_headers(
-            {"headers": {"Authorization": "$HEADER_TOKEN_MISSING"}},
-            provider_name="opencode-go",
-        )
+def test_an_unused_providers_missing_variable_does_not_stop_the_agent(monkeypatch):
+    """The regression that mattered: declaring a header is not using it.
+
+    Resolving ``$NAME`` while the transport was built meant one provider with a
+    variable the shell did not export -- one nobody would ever call -- refused
+    to let the process start at all.  ``api_key`` has never worked that way, and
+    ``_validate_config`` states the rule: config problems are warnings, because
+    a typo must not brick the agent.  The failure is now paid only by a request
+    that actually needs the header.
+    """
+    monkeypatch.delenv("UNSET_HEADER_TOKEN", raising=False)
+    cfg = {
+        "active_provider": "anthropic",
+        "providers": {
+            "anthropic": {"api_format": "anthropic", "api_key": "k", "models": ["m1"]},
+            "unused": {
+                "api_format": "openai",
+                "api_key": "k",
+                "models": ["g1"],
+                "headers": {"Authorization": "$UNSET_HEADER_TOKEN"},
+            },
+        },
+    }
+    routing = build_routing_transport(
+        cfg, "anthropic", object(), lambda c, f: object(), client_cache={}
+    )
+    assert routing._for("g1") is not routing.default
+
+    with pytest.raises(RuntimeError, match="UNSET_HEADER_TOKEN"):
+        routing._for("g1")._headers_kwarg()
 
 
 def test_the_process_has_one_stable_id_to_fall_back_to():
     assert shared.instance_id() == shared.instance_id()
     assert shared.current_session_id() == shared.instance_id()
+
+
+def test_request_headers_resolve_env_and_session(monkeypatch):
+    monkeypatch.setenv("HEADER_TOKEN", "tok-123")
+    token = shared._active_session_id.set("web:one")
+    try:
+        assert shared.request_headers(
+            {"Authorization": "$HEADER_TOKEN", "x-opencode-session": "{session}"},
+            provider_name="opencode-go",
+        ) == {"Authorization": "tok-123", "x-opencode-session": "web:one"}
+    finally:
+        shared._active_session_id.reset(token)
+
+
+def test_a_missing_env_var_is_named_when_the_request_needs_it(monkeypatch):
+    monkeypatch.delenv("HEADER_TOKEN_MISSING", raising=False)
+    with pytest.raises(RuntimeError, match="HEADER_TOKEN_MISSING"):
+        shared.request_headers(
+            {"Authorization": "$HEADER_TOKEN_MISSING"}, provider_name="opencode-go"
+        )
 
 
 def test_the_current_session_is_read_from_the_context(monkeypatch):
@@ -497,3 +544,23 @@ def test_the_evolution_engine_sends_the_endpoints_headers():
     assert seen and seen[0]["extra_headers"] == {
         "x-opencode-session": "scheduler:t:1"
     }
+
+
+def test_a_sub_agent_reports_the_same_conversation_as_its_parent():
+    """A sub-agent runs inside the parent's conversation, so it says so.
+
+    The child context is built from a fixed set of propagated metadata; when
+    ``session_id`` was not one of them, the child turn had no conversation to
+    name and the per-conversation header fell back to the process id -- one
+    conversation, two ids, which is precisely what a gateway asking for a
+    stable per-conversation value is trying to avoid.
+    """
+    from agent.core.agent import AgentContext, BaseAgent
+
+    parent = AgentContext(role="parent", system_prompt="s")
+    parent.metadata["session_id"] = "web:parent"
+    child = AgentContext(role="child", system_prompt="s")
+
+    BaseAgent._propagate_sub_metadata(child, parent)
+
+    assert child.metadata["session_id"] == "web:parent"

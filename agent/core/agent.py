@@ -3782,6 +3782,14 @@ class BaseAgent:
                 sub_ctx.metadata["context_manager"] = active_ctx.metadata[
                     "context_manager"
                 ]
+            # The conversation this sub-agent is running inside.  Without it the
+            # child turn has no session of its own, and anything that needs one
+            # -- the per-conversation request header a gateway may require --
+            # falls back to a per-process value, so the main turn and its
+            # sub-agents would report two different conversations for one
+            # conversation's work.
+            if "session_id" in active_ctx.metadata:
+                sub_ctx.metadata["session_id"] = active_ctx.metadata["session_id"]
 
     def _create_sub_agent(self, sub_registry: "ToolRegistry") -> "BaseAgent":
         # Inherit the parent's transport rather than building one from

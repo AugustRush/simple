@@ -394,22 +394,23 @@ def current_session_id() -> str:
     return str(session) if session else _INSTANCE_ID
 
 
-def resolve_provider_headers(
-    provider_cfg: object, *, provider_name: str = ""
-) -> dict[str, str]:
-    """The extra request headers one provider declares, environment expanded.
+def provider_headers(provider_cfg: object) -> dict[str, str]:
+    """The extra request headers one provider declares, as written.
 
     ``providers.<name>.headers`` is a name → value map for gateways that need
     more than a URL and a key: a client identifier, a routing or session
-    header, an organisation tag.  A value of the exact form ``$NAME`` is read
-    from the environment, the same rule ``api_key`` follows -- and with the
-    same failure: a missing variable is named and raised rather than sent as an
-    empty header, because a gateway that requires the header answers an empty
-    one with a rejection that does not say why.
+    header, an organisation tag.  The values are returned **unresolved** --
+    ``$NAME`` and ``{session}`` are still there -- because both resolve per
+    request, not when a transport is built:
 
-    ``{session}`` is left in place here and substituted per request (see
-    :data:`SESSION_HEADER_PLACEHOLDER`), which is the whole point of it: one
-    client serves every conversation.
+    * ``{session}`` must, since one client serves every conversation, and
+    * ``$NAME`` must, because resolving it here would mean a provider whose
+      environment variable is not set *currently* prevents the whole agent
+      from starting -- including when that provider is never used.  A typo in
+      an unused group is not a reason to refuse to run, which is the rule
+      ``_validate_config`` already states for config problems.  The failure
+      belongs where the header is actually needed, and
+      :func:`request_headers` raises it there, naming the variable.
 
     A pair that is not a name → string pair is dropped rather than guessed at;
     ``_validate_config`` reports those, where the typo is visible.
@@ -419,13 +420,34 @@ def resolve_provider_headers(
     raw = provider_cfg.get("headers")
     if not isinstance(raw, dict) or not raw:
         return {}
-    resolved: dict[str, str] = {}
+    declared: dict[str, str] = {}
     for name, value in raw.items():
         header = str(name).strip()
         if not header or isinstance(value, bool):
             continue
         if not isinstance(value, (str, int, float)):
             continue
+        declared[header] = str(value)
+    return declared
+
+
+def request_headers(
+    templates: object, *, provider_name: str = ""
+) -> dict[str, str]:
+    """Resolve one provider's declared headers for the request being made now.
+
+    ``$NAME`` reads the environment (the same rule ``api_key`` follows, and
+    with a real failure rather than an empty header: a gateway that requires a
+    header answers an empty one with a rejection that does not say why), and
+    ``{session}`` becomes the current conversation's id.  Raised here, at the
+    moment of use, so the cost of a missing variable is one failing request
+    rather than a gateway that will not start.
+    """
+    if not isinstance(templates, dict) or not templates:
+        return {}
+    session = current_session_id()
+    resolved: dict[str, str] = {}
+    for header, value in templates.items():
         text = str(value)
         if text.startswith("$"):
             variable = text[1:]
@@ -437,7 +459,7 @@ def resolve_provider_headers(
                     f"set{where}. Run: export {variable}=..."
                 )
             text = from_env
-        resolved[header] = text
+        resolved[str(header)] = text.replace(SESSION_HEADER_PLACEHOLDER, session)
     return resolved
 
 

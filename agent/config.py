@@ -608,43 +608,69 @@ def _check_thinking(pname: str, pcfg: dict, warnings: list[str]) -> None:
             )
 
 
+def provider_config_errors(provider_name: str, provider: dict) -> list[str]:
+    """Everything that makes one provider block unwritable, as messages.
+
+    The write path refuses these; the read path only warns about them.  That
+    difference is deliberate and is the whole reason this exists: reading a
+    file must not be able to brick startup over a typo (see
+    ``_validate_config``), but *writing* is an assertion about what the agent
+    will do next -- and a header whose name is not an HTTP token, or a
+    placeholder that will never be substituted, is a setting the user believes
+    in and the wire will not honour.  Both paths run the same checks, so a
+    field added to :data:`PROVIDER_FIELDS` is enforced in both places at once.
+    """
+    problems: list[str] = []
+    _check_one_provider(provider_name, provider, problems)
+    return problems
+
+
 def _check_providers(cfg: dict, warnings: list[str]) -> None:
     providers = cfg.get("providers", {})
     if not isinstance(providers, dict):
         providers = {}
-    known = {field.key for field in PROVIDER_FIELDS}
     for pname, pcfg in providers.items():
         # `_readme` companions sit beside the real providers in the example
         # config, the same convention the top-level unknown-key check honours.
         if pname.startswith("_"):
             continue
-        if not isinstance(pcfg, dict):
-            warnings.append(f"providers.{pname}: must be a dict, got {type(pcfg).__name__}")
+        _check_one_provider(pname, pcfg, warnings)
+
+
+def _check_one_provider(pname: str, pcfg: object, warnings: list[str]) -> None:
+    """Every provider-scoped rule, for one provider entry.
+
+    Shared by the reader (warnings) and the settings API (refusals); the
+    callers differ only in what they do with the messages, never in which
+    checks run.
+    """
+    if not isinstance(pcfg, dict):
+        warnings.append(f"providers.{pname}: must be a dict, got {type(pcfg).__name__}")
+        return
+    known = {field.key for field in PROVIDER_FIELDS}
+    # A key the loader never reads is a setting the user believes in and the
+    # agent ignores -- the same failure the top-level unknown-key check exists
+    # for, one level down.  PROVIDER_FIELDS is the vocabulary, so a key that is
+    # missing from it is either a typo here or a field nobody declared.
+    for key in pcfg:
+        if key.startswith("_") or key in known:
             continue
-        # A key the loader never reads is a setting the user believes in and
-        # the agent ignores -- the same failure the top-level unknown-key check
-        # exists for, one level down.  PROVIDER_FIELDS is the vocabulary, so a
-        # key that is missing from it is either a typo here or a field nobody
-        # declared.
-        for key in pcfg:
-            if key.startswith("_") or key in known:
-                continue
-            warnings.append(
-                f"providers.{pname}.{key}: unknown provider key — ignored "
-                f"(known: {', '.join(sorted(known))})"
-            )
-        fmt = pcfg.get("api_format", "")
-        if fmt not in ("anthropic", "openai"):
-            warnings.append(
-                f"providers.{pname}.api_format: must be 'anthropic' or 'openai', got '{fmt}'"
-            )
-        if not isinstance(pcfg.get("api_key"), str):
-            warnings.append(f"providers.{pname}.api_key: must be a string")
-        if not isinstance(pcfg.get("default_model"), str) or not pcfg.get("default_model"):
-            warnings.append(f"providers.{pname}.default_model: must be a non-empty string")
-        _check_provider_types(pname, pcfg, warnings)
-        _check_thinking(pname, pcfg, warnings)
-        _check_provider_headers(pname, pcfg, warnings)
+        warnings.append(
+            f"providers.{pname}.{key}: unknown provider key — ignored "
+            f"(known: {', '.join(sorted(known))})"
+        )
+    fmt = pcfg.get("api_format", "")
+    if fmt not in ("anthropic", "openai"):
+        warnings.append(
+            f"providers.{pname}.api_format: must be 'anthropic' or 'openai', got '{fmt}'"
+        )
+    if not isinstance(pcfg.get("api_key"), str):
+        warnings.append(f"providers.{pname}.api_key: must be a string")
+    if not isinstance(pcfg.get("default_model"), str) or not pcfg.get("default_model"):
+        warnings.append(f"providers.{pname}.default_model: must be a non-empty string")
+    _check_provider_types(pname, pcfg, warnings)
+    _check_thinking(pname, pcfg, warnings)
+    _check_provider_headers(pname, pcfg, warnings)
 
 
 def _check_provider_types(pname: str, pcfg: dict, warnings: list[str]) -> None:
@@ -844,7 +870,45 @@ def _validate_config(cfg: dict) -> list[str]:
     return warnings
 
 
-def load_config() -> tuple[dict, bool]:
+#: Structural sections a config file may leave out; the loader fills them so a
+#: caller never has to check for their absence.
+_BACKFILLED_SECTIONS = (
+    "memory",
+    "orchestration",
+    "evolution",
+    "scheduler",
+    "audio",
+    "mcp_servers",
+    "context",
+    "file_access",
+    "permissions",
+)
+
+
+def _read_config_file() -> Optional[dict]:
+    """The file's contents with the structural sections backfilled, or None.
+
+    None means "could not be read or parsed", which the callers answer
+    differently on purpose: :func:`load_config` substitutes the built-in
+    defaults so the agent still starts, while :func:`load_config_for_run`
+    prefers a config that is known good (see there for why).
+    """
+    config_path = shared.resolve_config_file()
+    try:
+        raw = json.loads(config_path.read_text())
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    # Only backfill structural sections the user hasn't touched; never
+    # overwrite top-level identity keys.
+    for section in _BACKFILLED_SECTIONS:
+        if section not in raw and section in DEFAULT_CONFIG:
+            raw[section] = DEFAULT_CONFIG[section]
+    return raw
+
+
+def load_config(*, warn: bool = True) -> tuple[dict, bool]:
     """Load config from disk, creating it on first run.
 
     Returns (cfg, is_first_run).
@@ -853,34 +917,42 @@ def load_config() -> tuple[dict, bool]:
     - User file is the source of truth for active_provider / model / providers.
     - DEFAULT_CONFIG only fills in completely missing structural sub-sections
       (memory, orchestration, evolution) so the agent always has safe defaults.
+
+    ``warn=False`` silences the validation warnings.  They are worth printing
+    when a process starts and worth *not* printing on every later read: a
+    caller that re-reads the config often (a scheduler run) would otherwise
+    repeat the same line about the same stale key for ever, burying whatever
+    the run itself had to say.
     """
     first_run = _ensure_config_file()
-    config_path = shared.resolve_config_file()
-    try:
-        raw = json.loads(config_path.read_text())
-        # Only backfill structural sections the user hasn't touched;
-        # never overwrite top-level identity keys.
-        for section in (
-            "memory",
-            "orchestration",
-            "evolution",
-            "scheduler",
-            "audio",
-            "mcp_servers",
-            "context",
-            "file_access",
-            "permissions",
-        ):
-            if section not in raw and section in DEFAULT_CONFIG:
-                raw[section] = DEFAULT_CONFIG[section]
-        # Validate and warn (never block startup)
-        config_warnings = _validate_config(raw)
-        for w in config_warnings:
-            shared.CONSOLE.print(f"[yellow]Config: {w}[/yellow]")
-        return raw, first_run
-    except Exception as e:
-        shared.CONSOLE.print(f"[yellow]Config parse error: {e} — using defaults[/yellow]")
+    raw = _read_config_file()
+    if raw is None:
+        if warn:
+            shared.CONSOLE.print(
+                "[yellow]Config parse error: unusable file — using defaults[/yellow]"
+            )
         return dict(DEFAULT_CONFIG), first_run
+    if warn:
+        # Validate and warn (never block startup)
+        for w in _validate_config(raw):
+            shared.CONSOLE.print(f"[yellow]Config: {w}[/yellow]")
+    return raw, first_run
+
+
+def load_config_for_run(fallback: dict) -> dict:
+    """The config a scheduled run should use, or *fallback* if unreadable.
+
+    The file on disk when it parses, because that is the copy the user edits
+    and a run is a fresh execution -- see ``config_loader`` in
+    ``cli._build_scheduler_service``.  When it does *not* parse, the answer is
+    the caller's last known-good config rather than :func:`load_config`'s
+    built-in defaults: those defaults name providers nobody configured (and no
+    keys), so a run would fail with an authentication error pointing at the
+    wrong thing entirely.  Nothing is printed here for the same reason the
+    warnings are silenced: this runs once per scheduled run.
+    """
+    raw = _read_config_file()
+    return raw if raw is not None else dict(fallback)
 
 
 def save_config(cfg: dict):

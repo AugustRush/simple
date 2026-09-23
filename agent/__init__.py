@@ -285,6 +285,7 @@ from .config import (
     _now,
     _resolve_output_dir,
     load_config,
+    load_config_for_run,
     save_config,
 )
 from .bootstrap import _build_components, _build_components_async

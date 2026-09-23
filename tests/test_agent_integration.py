@@ -10121,7 +10121,7 @@ def test_a_scheduled_run_reads_the_config_on_disk_not_the_startup_snapshot(
     # What is on disk by the time the run happens: the user added them.
     on_disk = _minimal_cfg()
     on_disk["providers"]["fake"]["headers"] = {"x-opencode-session": "{session}"}
-    monkeypatch.setattr(agent_module, "load_config", lambda: (on_disk, False))
+    monkeypatch.setattr(agent_module, "load_config_for_run", lambda fallback: on_disk)
 
     service, _store, _components = asyncio.run(
         cli_module._build_scheduler_service(
@@ -10157,3 +10157,33 @@ def test_a_scheduled_run_reads_the_config_on_disk_not_the_startup_snapshot(
     assert used["providers"]["fake"].get("headers") == {
         "x-opencode-session": "{session}"
     }, "the run used the config captured when the service started"
+
+
+def test_an_unreadable_config_leaves_a_run_on_the_last_known_good_one(
+    monkeypatch, tmp_path
+):
+    """A broken file must not turn a run into "the built-in providers".
+
+    `load_config` answers "give me something usable" by substituting
+    DEFAULT_CONFIG when the file does not parse -- right for a process that
+    still has to start, wrong for a scheduled run: the built-in entries name
+    providers nobody configured and carry no keys, so the run would fail with
+    an authentication error pointing at something the user never chose.  The
+    last known-good config is the honest fallback.
+    """
+    import agent as agent_module
+    from agent.config import load_config_for_run
+
+    startup = _minimal_cfg()
+    startup["active_provider"] = "mine"
+    startup["providers"] = {
+        "mine": {"api_format": "openai", "api_key": "k", "default_model": "m"}
+    }
+    path = tmp_path / "config.json"
+    monkeypatch.setattr(agent_module.shared, "resolve_config_file", lambda: path)
+
+    assert load_config_for_run(startup)["active_provider"] == "mine"
+
+    # And a file that does parse wins, because that is the copy the user edits.
+    path.write_text(json.dumps({"active_provider": "edited", "providers": {}}))
+    assert load_config_for_run(startup)["active_provider"] == "edited"

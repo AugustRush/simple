@@ -9,6 +9,7 @@ response for non-streaming calls).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import mimetypes
@@ -1258,7 +1259,7 @@ class WebChannel(Channel):
         remain the mode for *reading* a config -- the file may already hold
         something imperfect and refusing to start over it would be worse.
         """
-        from agent.config import PROVIDER_FIELDS, _validate_config
+        from agent.config import PROVIDER_FIELDS, provider_config_errors
 
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", str(provider_name or "")):
             return (
@@ -1268,24 +1269,15 @@ class WebChannel(Channel):
         for field in PROVIDER_FIELDS:
             if field.required and not str(provider.get(field.key) or "").strip():
                 return f"{field.label}（{field.key}）不能为空"
-        warnings = _validate_config({"providers": {provider_name: provider}})
-        hard = [w for w in warnings if "unknown provider key" in w]
-        if hard:
-            return hard[0]
-        typed = [
-            w
-            for w in warnings
-            if f"providers.{provider_name}." in w
-            and (
-                "must be one of" in w
-                or "must be an integer" in w
-                or "must be true or false" in w
-                or "must be a list of strings" in w
-                or "must be a dict" in w
-            )
-        ]
-        if typed:
-            return typed[0]
+        # The same checks the config reader warns about, refusing instead of
+        # warning: a write is an assertion about what the agent will do next.
+        # Reading the *messages* would mean matching their text, which is how a
+        # header name that is not an HTTP token could be saved by a form and
+        # then sent verbatim (a strict gateway rejects it, and the reason is
+        # nowhere near the config that caused it).
+        errors = provider_config_errors(provider_name, provider)
+        if errors:
+            return errors[0]
         return None
 
     async def _provider_save(self, request: Any) -> Any:
@@ -1404,7 +1396,18 @@ class WebChannel(Channel):
         except Exception as exc:
             return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
         self._bump_config_revision()
-        return JSONResponse({"ok": True, "active_provider": name, "model": cfg.get("model", "")})
+        # The model the session will actually send with, not the raw `model`
+        # key: that key may be absent, in which case the provider's
+        # `default_model` is what a turn resolves to -- and the page has to show
+        # the id it is about to put on the wire.  `active_model_and_tokens` is
+        # the one place that answers "which model does this config name", so
+        # this asks it instead of deciding again.
+        from agent.config import ModelClientFactory
+
+        effective_model, _tokens = ModelClientFactory.active_model_and_tokens(cfg)
+        return JSONResponse(
+            {"ok": True, "active_provider": name, "model": effective_model}
+        )
 
     async def _provider_test(self, request: Any) -> Any:
         """Send one minimal request to a provider, through the real path.
@@ -1424,7 +1427,7 @@ class WebChannel(Channel):
         from agent.config import load_config
         from agent.bootstrap import _provider_client_factory
         from agent.core.transport import build_transport, provider_stream_usage
-        from agent.shared import resolve_provider_headers
+        from agent.shared import provider_headers
 
         cfg, _ = load_config()
         providers = cfg.get("providers")
@@ -1446,7 +1449,8 @@ class WebChannel(Channel):
                 client,
                 None,
                 provider_stream_usage(provider_cfg),
-                headers=resolve_provider_headers(provider_cfg, provider_name=name),
+                headers=provider_headers(provider_cfg),
+                provider_name=name,
             )
             # Small but not degenerate: a gateway is entitled to reject a
             # max_tokens of 1, and that rejection would say nothing about the
@@ -1469,6 +1473,13 @@ class WebChannel(Channel):
                 },
                 status_code=200,
             )
+        finally:
+            # This endpoint builds its own client (the routing transport's
+            # cached one belongs to the running components), so it owns closing
+            # it: an SDK client holds a connection pool, and a button that
+            # leaves one behind per press leaks sockets.
+            with contextlib.suppress(Exception):
+                await client.close()
         return JSONResponse(
             {
                 "ok": True,

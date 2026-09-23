@@ -312,6 +312,15 @@ export function useSettings(deps: Deps) {
       const data = await resp.json().catch(() => ({}))
       if (!resp.ok) throw new Error(data.error || `切换失败（${resp.status}）`)
       messageApi.success(`已切换到「${name}」`)
+      // Follow the switch in the composer too.  `loadSettings` only seeds the
+      // model when nothing is chosen yet -- on purpose, so a reload cannot
+      // revert a per-turn pick -- but a provider switch is exactly the case
+      // where the old id stops meaning what the user meant: it belongs to the
+      // group they just left, so the next message would go there instead.
+      if (data.model) {
+        currentModelRef.current = String(data.model)
+        setCurrentModel(String(data.model))
+      }
       await loadSettings()
       return true
     } catch (error) {
