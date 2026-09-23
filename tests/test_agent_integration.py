@@ -9312,7 +9312,7 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
         def should_compact_messages(self, messages, input_token_budget):
             return True
 
-        def compact_messages(self, messages, *, input_token_budget):
+        def compact_messages(self, messages, *, input_token_budget, protected=None):
             return messages
 
         def should_session_end_sleep(self):

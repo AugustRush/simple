@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 from agent import shared
 from agent.lexical import lexical_terms
@@ -541,9 +541,54 @@ class ContextManager:
         ) is None
 
     @classmethod
+    def _protected_indexes(
+        cls, messages: list[dict], protected: Optional[Sequence[dict]]
+    ) -> set[int]:
+        """Which messages this cut must not drop, as indexes into *messages*.
+
+        A turn is the unit of intent: compaction may drop history, it may not
+        drop what the turn exists to answer.  A caller inside a turn knows the
+        message object it appended, so it passes it and the message is found by
+        identity -- "which message is the request" is a fact about the object,
+        not about how it reads.
+
+        Without one, fall back to the newest message that *looks* like a
+        request.  That proxy is exactly what an interjection falsifies: it
+        arrives mid-turn as a real user message, so the newest-looking request
+        stops being the turn's own and the original becomes evictable.  Callers
+        inside a turn should pass the object rather than rely on this.
+        """
+        if protected:
+            indexes = {
+                index
+                for index, message in enumerate(messages)
+                if any(message is item for item in protected)
+            }
+            if indexes:
+                return indexes
+        newest = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if cls._is_real_user_request(messages[index])
+            ),
+            -1,
+        )
+        return {newest} if newest >= 0 else set()
+
+    @classmethod
     def _complete_message_units(
-        cls, messages: list[dict], newest_request_index: int
+        cls, messages: list[dict], protected: set[int]
     ) -> list[list[int]]:
+        """Group messages into the smallest units a cut is allowed to remove.
+
+        A unit is a provider protocol unit -- an assistant tool call together
+        with every result answering it -- or a question and the reply to it.
+        ``protected`` indexes messages the cut must keep, and a protected user
+        message is deliberately *not* folded together with the assistant reply
+        that follows: sharing a unit would mean dropping the reply drops the
+        request with it, which is the one thing a cut may not do.
+        """
         units: list[list[int]] = []
         index = 0
         while index < len(messages):
@@ -601,7 +646,7 @@ class ContextManager:
                 raise ContextLimitError("tool history contains an orphan tool result")
             if (
                 role == "user"
-                and index != newest_request_index
+                and index not in protected
                 and index + 1 < len(messages)
                 and messages[index + 1].get("role") == "assistant"
                 and not messages[index + 1].get("tool_calls")
@@ -725,13 +770,23 @@ class ContextManager:
         return kept, dropped
 
     def compact_messages(
-        self, messages: list[dict], *, input_token_budget: int
+        self,
+        messages: list[dict],
+        *,
+        input_token_budget: int,
+        protected: Optional[Sequence[dict]] = None,
     ) -> list[dict]:
-        """Drop the oldest turns until the payload fits ``input_token_budget``."""
+        """Drop the oldest turns until the payload fits ``input_token_budget``.
+
+        ``protected`` names the message objects this cut must keep.  A caller
+        inside a turn passes the request it appended; see
+        :meth:`_protected_indexes` for what happens when it does not.
+        """
         return self.fit_to_budget(
             messages,
             input_token_budget=input_token_budget,
             estimate_tokens=self.consolidation.estimate_tokens,
+            protected=protected,
         )
 
     @classmethod
@@ -741,6 +796,7 @@ class ContextManager:
         *,
         input_token_budget: int,
         estimate_tokens: Callable[[list[dict]], int],
+        protected: Optional[Sequence[dict]] = None,
     ) -> list[dict]:
         """Fit a provider payload into ``input_token_budget``, dropping oldest first.
 
@@ -766,20 +822,16 @@ class ContextManager:
         # report cumulative loss instead of stacking notices.
         messages, dropped_before = cls._strip_eviction_notices(messages)
         messages = cls._repair_tool_history(messages)
-        newest_request_index = next(
-            (
-                index
-                for index in range(len(messages) - 1, -1, -1)
-                if cls._is_real_user_request(messages[index])
-            ),
-            -1,
-        )
-        if newest_request_index >= 0 and estimate_tokens(
-            [messages[newest_request_index]]
-        ) >= budget:
-            raise ContextLimitError("newest user request exceeds provider input budget")
+        # Resolved once, here, because everything below is stated over it: which
+        # units are grouped as one, which may be removed, and where the notice
+        # goes.
+        keep = cls._protected_indexes(messages, protected)
+        if any(estimate_tokens([messages[index]]) >= budget for index in keep):
+            raise ContextLimitError(
+                "a message this turn must keep exceeds the provider input budget"
+            )
 
-        retained = cls._complete_message_units(messages, newest_request_index)
+        retained = cls._complete_message_units(messages, keep)
 
         def materialize() -> list[dict]:
             kept_indexes = {item for unit in retained for item in unit}
@@ -797,11 +849,7 @@ class ContextManager:
             low_water = max(1, int(budget * cls._COMPACTION_LOW_WATER))
             while retained and estimate_tokens(compacted) > low_water:
                 removable = next(
-                    (
-                        unit
-                        for unit in retained
-                        if newest_request_index not in unit
-                    ),
+                    (unit for unit in retained if not keep.intersection(unit)),
                     None,
                 )
                 if removable is None:
@@ -838,8 +886,8 @@ class ContextManager:
             # message is untouched, and the user's own words stay last.
             notice = cls._eviction_notice(dropped_now)
             if estimate_tokens(compacted + [notice]) < budget:
-                compacted = cls._with_notice_before_newest_request(
-                    compacted, notice, messages, newest_request_index
+                compacted = cls._with_notice_before_protected_request(
+                    compacted, notice, messages, keep
                 )
         if len(compacted) != len(messages):
             # Counts alone say how much was lost but not what: a caller
@@ -858,12 +906,12 @@ class ContextManager:
         return compacted
 
     @classmethod
-    def _with_notice_before_newest_request(
+    def _with_notice_before_protected_request(
         cls,
         compacted: list[dict],
         notice: dict,
         messages: list[dict],
-        newest_request_index: int,
+        protected: set[int],
     ) -> list[dict]:
         """Place *notice* at the tail of the retained prefix, not after it.
 
@@ -871,18 +919,19 @@ class ContextManager:
         provider reads the current turn, so the model answers the notice rather
         than the user -- ``M = [... retained ..., user(request), user(notice)]``.
         Prepending it instead rewrites position 0, which is the one offset a
-        prefix cache cannot tolerate losing.  Immediately before the newest
-        request is the only position that satisfies both: every retained
-        message is byte-identical to what the previous call sent, and the user's
-        own words remain the last message.
+        prefix cache cannot tolerate losing.  Immediately before the request is
+        the only position that satisfies both: every retained message is
+        byte-identical to what the previous call sent, and the turn's own words
+        remain the last thing the provider reads.
 
-        ``newest_request_index`` indexes ``messages``, and ``compacted`` holds
-        the same objects, so the request is located by identity rather than by
-        re-testing which message looks like a request.
+        ``protected`` indexes ``messages`` and ``compacted`` holds the same
+        objects, so the request is located by identity rather than by re-testing
+        which message looks like a request.  The *last* protected index is the
+        one to sit before: everything the turn must keep stays after the notice.
         """
-        if newest_request_index < 0:
+        if not protected:
             return compacted + [notice]
-        request = messages[newest_request_index]
+        request = messages[max(protected)]
         for position, message in enumerate(compacted):
             if message is request:
                 return compacted[:position] + [notice] + compacted[position:]

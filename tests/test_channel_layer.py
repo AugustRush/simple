@@ -1474,7 +1474,7 @@ def test_channel_runner_wakes_session_memory_worker_on_compaction(monkeypatch):
         def should_compact_messages(self, messages, input_token_budget):
             return True
 
-        def compact_messages(self, messages, *, input_token_budget):
+        def compact_messages(self, messages, *, input_token_budget, protected=None):
             return [{"role": "user", "content": "compacted"}]
 
     class _RootContextManager:

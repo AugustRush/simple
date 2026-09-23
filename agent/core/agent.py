@@ -76,6 +76,14 @@ _OUTPUT_CAP_MARGIN = 256
 #: attribute because the reader is a ``staticmethod``.
 _TURN_IN_PROGRESS_KEY = "_turn_in_progress"
 
+#: The message object ``_prepare_turn`` appended for this turn, held so
+#: compaction can recognise it by identity.  A cut inside a turn must not remove
+#: what the turn was asked to do, and the only reliable way to name that message
+#: is to keep the object: the alternative -- "the newest message that looks like
+#: a user request" -- is falsified by an interjection, which is a real user
+#: message appended *after* the request (see ``_inject_pending_interjections``).
+_TURN_REQUEST_KEY = "_turn_request_message"
+
 # Context variable so built-in tools can access the active AgentContext
 _active_agent_context: contextvars.ContextVar[Optional["AgentContext"]] = (
     contextvars.ContextVar("active_agent_context", default=None)
@@ -1522,6 +1530,18 @@ class BaseAgent:
         # with the measurement instead of correcting anything.
         return estimate_message_tokens(messages)
 
+    @staticmethod
+    def _protected_turn_messages(ctx: "AgentContext") -> list[dict]:
+        """The messages a cut running inside this turn must keep.
+
+        The turn's own request, and nothing else: history is evictable, the
+        reason the turn exists is not.  Empty outside a turn, where the caller
+        has no object to hand over and ``ContextManager._protected_indexes``
+        falls back to the newest message that looks like a request.
+        """
+        message = ctx.metadata.get(_TURN_REQUEST_KEY)
+        return [message] if isinstance(message, dict) else []
+
     def _compact_body_for_turn(self, ctx: "AgentContext") -> None:
         """Cut the body to a low-water mark once, before the turn's first call.
 
@@ -1544,10 +1564,13 @@ class BaseAgent:
         if budget <= 0:
             return
         messages_before = len(ctx.messages)
+        protected = self._protected_turn_messages(ctx)
         context_manager = self._context_manager_for(ctx)
         compact = getattr(context_manager, "compact_messages", None)
         if callable(compact):
-            ctx.messages = compact(ctx.messages, input_token_budget=budget)
+            ctx.messages = compact(
+                ctx.messages, input_token_budget=budget, protected=protected
+            )
         else:
             # A manager is optional here, exactly as it is in
             # `_prepare_provider_context`: fitting a request into the window is
@@ -1559,6 +1582,7 @@ class BaseAgent:
                 ctx.messages,
                 input_token_budget=budget,
                 estimate_tokens=estimate_message_tokens,
+                protected=protected,
             )
         if len(ctx.messages) != messages_before:
             # Read and cleared by the first `_prepare_provider_context` of the
@@ -1589,9 +1613,15 @@ class BaseAgent:
         # hard failure mid-turn, and it is rare because the boundary cut leaves
         # half the budget free.
         messages_before = len(ctx.messages)
+        # This is the cut an interjection can arm: it runs mid-turn, after any
+        # interjection has been appended as a real user message, so "the newest
+        # message that looks like a request" would name the interjection and free
+        # the turn's own request for eviction.  Passing the object is what makes
+        # the proxy unnecessary here.
+        protected = self._protected_turn_messages(ctx)
         if context_manager is not None:
             ctx.messages = context_manager.compact_messages(
-                ctx.messages, input_token_budget=budget
+                ctx.messages, input_token_budget=budget, protected=protected
             )
         else:
             # Fitting the request into the window is not a memory operation: it
@@ -1606,6 +1636,7 @@ class BaseAgent:
                 ctx.messages,
                 input_token_budget=budget,
                 estimate_tokens=estimate_message_tokens,
+                protected=protected,
             )
         # Whether this call is about to pay full price for its history: the body
         # it sends is not the one the previous call sent plus an append.  A cut
@@ -2807,35 +2838,11 @@ class BaseAgent:
             )
         ctx.metadata["_selected_tools"] = selected_tools
         context_manager = self._context_manager_for(ctx)
-        retrieval_budget = self._retrieval_token_budget(
-            ctx,
-            selected_tools,
-            current_user_content=user_message,
-        )
-        if context_manager and retrieval_budget > 0:
-            has_active_state = True
-            if ctx.metadata.get("_has_provider_checkpoint"):
-                active_state = getattr(
-                    context_manager, "has_active_working_state", None
-                )
-                if callable(active_state):
-                    has_active_state = bool(active_state())
-            retrieved = context_manager.retrieve_implicit_context(
-                user_message,
-                current_messages=ctx.messages,
-                current_turn_id=str(ctx.metadata.get("turn_id") or ""),
-                token_budget=retrieval_budget,
-                include_recent_session=not bool(
-                    ctx.metadata.get("_has_provider_checkpoint")
-                ),
-                include_working_state=has_active_state,
-            )
-            if retrieved:
-                turn_blocks.append(
-                    '<retrieved_context trust="untrusted_evidence">\n'
-                    + html.escape(retrieved, quote=False)
-                    + "\n</retrieved_context>"
-                )
+        # Retrieval's place in the block list is reserved now and filled in
+        # below, because its *size* cannot be decided until every other block
+        # that rides in this same message has been built: they share one window.
+        retrieval_slot = len(turn_blocks)
+        turn_blocks.append("")
         skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
         required_skills: list[str] = list(ctx.metadata.get("required_skills", []))
         if skill_catalog and required_skills:
@@ -2867,14 +2874,59 @@ class BaseAgent:
             f"Current UTC time: {_now()}. "
             "Use the current_time tool when the user asks about local time or timezone conversions."
         )
-        ctx.messages.append(
-            {
-                "role": "user",
-                "content": self._build_user_message_content(
-                    user_message, attachments, turn_context="\n\n".join(turn_blocks)
-                ),
-            }
+        # Size retrieval against the message it will actually ride in.  Sizing it
+        # from the raw user message charged the window for a message that is
+        # never sent: what goes out is `turn_context + "\n\n" + user_message`, so
+        # every token the blocks above added was invisible to the allocation and
+        # retrieval was handed room that had already been spent -- which the
+        # turn-boundary cut then had to take back out of older history.
+        blocks_without_retrieval = "\n\n".join(
+            block for block in turn_blocks if block
         )
+        retrieval_budget = self._retrieval_token_budget(
+            ctx,
+            selected_tools,
+            current_user_content=self._build_user_message_content(
+                user_message, attachments, turn_context=blocks_without_retrieval
+            ),
+        )
+        if context_manager and retrieval_budget > 0:
+            has_active_state = True
+            if ctx.metadata.get("_has_provider_checkpoint"):
+                active_state = getattr(
+                    context_manager, "has_active_working_state", None
+                )
+                if callable(active_state):
+                    has_active_state = bool(active_state())
+            retrieved = context_manager.retrieve_implicit_context(
+                user_message,
+                current_messages=ctx.messages,
+                current_turn_id=str(ctx.metadata.get("turn_id") or ""),
+                token_budget=retrieval_budget,
+                include_recent_session=not bool(
+                    ctx.metadata.get("_has_provider_checkpoint")
+                ),
+                include_working_state=has_active_state,
+            )
+            if retrieved:
+                turn_blocks[retrieval_slot] = (
+                    '<retrieved_context trust="untrusted_evidence">\n'
+                    + html.escape(retrieved, quote=False)
+                    + "\n</retrieved_context>"
+                )
+        request_message = {
+            "role": "user",
+            "content": self._build_user_message_content(
+                user_message,
+                attachments,
+                turn_context="\n\n".join(block for block in turn_blocks if block),
+            ),
+        }
+        ctx.messages.append(request_message)
+        # Named so that a cut running later *inside this turn* can recognise it.
+        # A message is identified by the object, not by how it reads, because an
+        # interjection appended after it reads the same way.
+        ctx.metadata[_TURN_REQUEST_KEY] = request_message
         return decision
 
     async def _handle_end_turn(
@@ -3458,6 +3510,11 @@ class BaseAgent:
             # that token is reset above, so no extra stack bookkeeping is needed.
             ctx.metadata.pop("_provider_step", None)
             ctx.metadata.pop("_selected_tools", None)
+            # The turn is over, so nothing may claim to be its request any more.
+            # A value left behind would protect a message of the *previous* turn
+            # from the next turn's cut, which is the same borrow-the-last-turn's
+            # authority mistake `turn_request` is overwritten to avoid.
+            ctx.metadata.pop(_TURN_REQUEST_KEY, None)
             # Cleared here rather than around the whole method so that
             # `_post_turn_maintenance` -- which the runtime calls after this
             # returns -- can tell a between-turns call from a mid-turn one.
