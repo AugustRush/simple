@@ -140,6 +140,45 @@ class ModelTransport(abc.ABC):
         """
         return request_extra_headers(self.headers, self.provider_name)
 
+    # ── Content ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _json_native_blocks(blocks: Any) -> list[dict[str, Any]]:
+        """Provider content blocks in the one form every reader understands.
+
+        ``ctx.messages`` is not a live SDK object graph.  It is serialized to
+        SQLite (``LTMStore.save_provider_checkpoint``), restored by another
+        process (``channels.base``), and read by the memory layer, which pairs a
+        ``tool_use`` with its ``tool_result`` by looking for *dicts*
+        (``ContextManager._repair_tool_history``).  A pydantic block passes every
+        check that reads it as an object and fails every check that reads it as a
+        dict, so storing one silently discards its tool result on the next
+        compaction and persists a ``repr`` into the checkpoint.
+
+        Converting here — at the only place a provider response becomes a
+        message — is what makes that contract true for every reader at once,
+        instead of teaching each reader the SDK's types one at a time.
+        """
+        normalized: list[dict[str, Any]] = []
+        for block in blocks or ():
+            if isinstance(block, dict):
+                normalized.append(block)
+                continue
+            dump = getattr(block, "model_dump", None)
+            if callable(dump):
+                # ``model_dump`` is the wire shape itself, and it carries the
+                # fields a reader would otherwise lose: ``signature`` on a
+                # thinking block is what the provider needs to accept that
+                # block back on a later turn.
+                normalized.append(dump())
+                continue
+            raise TypeError(
+                "a provider content block must be a dict or expose model_dump(); "
+                f"got {type(block).__name__}. Storing it would corrupt the "
+                "session record that the memory layer reads."
+            )
+        return normalized
+
     # ── Reasoning ──────────────────────────────────────────────────────
 
     @staticmethod
@@ -446,7 +485,10 @@ class AnthropicTransport(ModelTransport):
         return None
 
     def build_assistant_message(self, response, text, model=None):
-        return {"role": "assistant", "content": response.content}
+        return {
+            "role": "assistant",
+            "content": self._json_native_blocks(response.content),
+        }
 
     def build_tool_result_messages(self, tool_calls, results, model=None):
         return [
