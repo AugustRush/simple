@@ -1698,6 +1698,12 @@ class BaseAgent:
         if context_manager is None:
             return
         if predicted > 0 and usage.input_tokens > 0:
+            # Like for like: `predicted` is the whole payload (messages plus the
+            # system prompt and tool schemas), so it must be compared against the
+            # provider's whole prompt count.  Feeding it the *uncached* slice
+            # instead makes the measurement shrink as caching improves, the
+            # estimate always looks too high, and the calibration clamp drags it
+            # to its floor -- an estimator that can never learn it under-counts.
             with shared._suppress_with_log("token calibration skipped"):
                 context_manager.consolidation.observe_actual_usage(
                     predicted, usage.input_tokens
