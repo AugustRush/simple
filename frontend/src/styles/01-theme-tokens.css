@@ -87,9 +87,29 @@ textarea {
   font: inherit;
 }
 
+/* A tint, not a fill. This used to be `--primary` behind white text, which in
+ * the dark theme is white on #e4e4e7 -- selecting anything made it vanish.
+ * No `color` here on purpose: left unset, selected text keeps its own colour,
+ * so selection can never cost contrast; the tint only has to be visible
+ * against the ground it sits on. */
+:root {
+  --selection-bg: rgba(228, 228, 231, 0.28);
+}
+
+html[data-theme='light'] {
+  --selection-bg: rgba(39, 39, 42, 0.16);
+}
+
 ::selection {
-  background: var(--primary);
-  color: #fff;
+  background: var(--selection-bg);
+}
+
+/* The user bubble is a light chip with dark text in both themes (see
+ * 10-secondary-glass.css), so the dark theme's light tint would vanish into
+ * it. It takes the same dark tint the light theme uses everywhere. */
+.bubble-user ::selection,
+.bubble-user::selection {
+  background: rgba(22, 23, 25, 0.18);
 }
 
 ::-webkit-scrollbar {

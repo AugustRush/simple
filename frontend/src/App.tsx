@@ -12,7 +12,8 @@ import { renderExtensions } from './views/extensions'
 import { renderSchedules } from './views/automation'
 import { createSettingsView } from './views/settings'
 import { relativeTime } from './lib/format'
-import { sessionStatusOf } from './lib/tools'
+import { isSessionBusy, sessionStatusOf } from './lib/tools'
+import { SessionTitle } from './components/SessionTitle'
 
 import { useUi } from './hooks/useUi'
 import { useApiClient } from './hooks/useApiClient'
@@ -49,15 +50,17 @@ function App() {
 
   const { approvalCommandRef, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, sendConfirm, setConfirmDetailOpen } = confirm
 
-  const { activateTurnIndex, activeSession, activity, allFilteredSessionsSelected, applyCommand, chatScrollRef, composerSendable, connected, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSelectedSessions, deleteSession, dismissTaskGuidance, expandedTraces, fileInputRef, filteredCommands, filteredSessions, handleChatScroll, handleComposerKeyDown, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, keepTurnSummary, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renameSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSelectedSessionIds, setSendShortcut, setSessionSearch, stopStreaming, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
+  const { activateTurnIndex, activeSession, activity, allFilteredSessionsSelected, awayFromLatest, chatScrollRef, composerRef, composerSendable, connected, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSelectedSessions, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSelectedSessionIds, setSendShortcut, setSessionSearch, stopStreaming, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
   const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
 
   const { activateProvider, applyToken, config, configText, deleteProvider, feishuChats, feishuChatsError, feishuChatsLoaded, feishuChatsLoading, feishuTesting, form, handleModelChange, handleSettingsFormChange, jsonStatus, loadFeishuChats, modelOptions, modelSelectPlaceholder, modelSelectWidth, pickDirectory, pickingDirectory, providerBusy, providerFields, resetSettings, saveProvider, saveSettings, sendFeishuTest, testProvider, setConfigText, setSettingsDirty, setTokenDraft, settingsDirty, settingsModelOptions, thinkingEffortOptions, tokenDirty, tokenDraft } = settings
 
-  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadScheduleRuns, loadSchedules, loadWorkflows, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } = automation
+  const { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, attentionByTask, attentionRuns, automationTab, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadScheduleRuns, loadSchedules, loadWorkflows, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleQuery, setScheduleStatusFilter, setSelectedScheduleIds, setSelectedScheduleRunId, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, signals, signalsWaiting, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } = automation
 
-  const { navItems, navigateTo, pageMeta, paletteCommands } = shell
+  const { handlePaletteKeyDown, navItems, navigateTo, pageMeta, paletteCommands, paletteEntries, paletteIndex, runPaletteEntry, setPaletteIndex } = shell
+
+  const paletteInputRef = React.useRef<HTMLInputElement | null>(null)
 
   // Views are pure renderers built from this one context object.
   const ctx: AppCtx = {
@@ -81,6 +84,15 @@ function App() {
     activateTurnIndex,
     chatScrollRef,
     handleChatScroll,
+    awayFromLatest,
+    jumpToLatest,
+    composerRef,
+    focusComposer,
+    handleComposerPaste,
+    fileDragActive,
+    handleChatDragOver,
+    handleChatDragLeave,
+    handleChatDrop,
     setInput,
     isStreaming,
     confirmReq,
@@ -126,9 +138,11 @@ function App() {
     stopStreaming,
     composerSendable,
     creatingSession,
+    createSession,
     sendMessage,
     resolvedComposerText,
     pageMeta,
+    sessions,
     filteredSessions,
     allFilteredSessionsSelected,
     selectedSessionIds,
@@ -142,7 +156,9 @@ function App() {
     deleteSession,
     setPendingDeleteSessionId,
     revealSession,
-    renameSession,
+    renamingSession,
+    setRenamingSession,
+    commitSessionTitle,
     pluginSearch,
     setPluginSearch,
     loadingView,
@@ -169,6 +185,7 @@ function App() {
     workflowModalOpen,
     editingWorkflowId,
     workflowSaving,
+    startingWorkflowIds,
     workflowGraph,
     setWorkflowModalOpen,
     setEditingWorkflowId,
@@ -404,13 +421,15 @@ function App() {
               />
             ) : (
               filteredSessions.map((item, index) => {
-                const showLiveHeader =
-                  item.live &&
-                  (index === 0 || !filteredSessions[index - 1].live)
+                // Live sessions lead the list now, so the divider that
+                // matters is where they end: history gets its own label
+                // once something live sits above it.
+                const showHistoryHeader =
+                  !item.live && index > 0 && Boolean(filteredSessions[index - 1].live)
                 return (
                   <React.Fragment key={item.session_id}>
-                    {showLiveHeader && (
-                      <div className="session-panel-label sub">动态会话</div>
+                    {showHistoryHeader && (
+                      <div className="session-panel-label sub">历史会话</div>
                     )}
                     <div
                       className={`session-item ${
@@ -423,6 +442,12 @@ function App() {
                       onClick={event => handleSessionContainerClick(event, item.session_id)}
                       onKeyDown={event => {
                         if (event.target !== event.currentTarget) return
+                        // F2 renames, as it does for a file in Finder/Explorer.
+                        if (event.key === 'F2') {
+                          event.preventDefault()
+                          setRenamingSession(`sider:${item.session_id}`)
+                          return
+                        }
                         if (event.key === 'Enter' || event.key === ' ') {
                           event.preventDefault()
                           handleSessionContainerClick(event, item.session_id)
@@ -430,11 +455,17 @@ function App() {
                       }}
                     >
                       <div className="session-item-status">
-                        <span className={item.live ? 'live' : 'durable'} />
+                        <span className={`${item.live ? 'live' : 'durable'}${isSessionBusy(item) ? ' busy' : ''}`} />
                       </div>
                       <div className="session-item-main">
                         <div className="session-item-title">
-                          {item.title || '未命名会话'}
+                          <SessionTitle
+                            item={item}
+                            editing={renamingSession === `sider:${item.session_id}`}
+                            onStartEdit={() => setRenamingSession(`sider:${item.session_id}`)}
+                            onCommit={title => void commitSessionTitle(item, title)}
+                            onCancel={() => setRenamingSession(null)}
+                          />
                         </div>
                         <div className="session-item-meta">
                           {/* The busy word rides with the counts because that
@@ -492,7 +523,7 @@ function App() {
                                 key: 'rename',
                                 label: '重命名',
                                 icon: <EditOutlined />,
-                                onClick: () => renameSession(item),
+                                onClick: () => setRenamingSession(`sider:${item.session_id}`),
                               },
                               {
                                 key: 'delete',
@@ -670,69 +701,77 @@ function App() {
           setCommandPaletteOpen(false)
           setPaletteQuery('')
         }}
+        afterClose={flushComposerFocus}
+        // `autoFocus` alone lost: it only fires when the input first mounts,
+        // and the modal stays mounted between openings -- so from the second
+        // ⌘K on, focus sat on the dialog frame and typing went nowhere.
+        afterOpenChange={open => { if (open) paletteInputRef.current?.focus() }}
       >
         <div className="command-palette">
           <div className="command-palette-search">
             <SearchOutlined />
             <input
+              ref={paletteInputRef}
               autoFocus
               value={paletteQuery}
               onChange={event => setPaletteQuery(event.target.value)}
+              onKeyDown={handlePaletteKeyDown}
               placeholder="搜索命令、导航或输入关键词…"
+              role="combobox"
+              aria-expanded
+              aria-controls="command-palette-list"
+              aria-activedescendant={paletteEntries[paletteIndex] ? `palette-${paletteEntries[paletteIndex].key}` : undefined}
             />
             <kbd>ESC</kbd>
           </div>
-          <div className="command-palette-section">命令</div>
-          {paletteCommands.length === 0 ? (
-            <div className="command-empty">没有匹配命令</div>
-          ) : (
-            paletteCommands.slice(0, 8).map(command => (
+          <div id="command-palette-list" role="listbox" aria-label="命令与导航">
+            <div className="command-palette-section" role="presentation">命令</div>
+            {paletteCommands.length === 0 && <div className="command-empty" role="presentation">没有匹配命令</div>}
+            {paletteEntries.map((entry, index) => entry.kind === 'command' && (
               <button
                 type="button"
-                className="command-item"
-                key={command.name}
-                onClick={() => applyCommand(command)}
+                className={`command-item ${index === paletteIndex ? 'active' : ''}`}
+                key={entry.key}
+                id={`palette-${entry.key}`}
+                role="option"
+                aria-selected={index === paletteIndex}
+                tabIndex={-1}
+                ref={element => { if (element && index === paletteIndex) element.scrollIntoView({ block: 'nearest' }) }}
+                onMouseMove={() => { if (index !== paletteIndex) setPaletteIndex(index) }}
+                onClick={() => runPaletteEntry(entry)}
               >
                 <CodeOutlined />
                 <span className="command-item-main">
-                  <strong>{command.usage || `/${command.name}`}</strong>
-                  <small>{command.description || '无描述'}</small>
+                  <strong>{entry.command.usage || `/${entry.command.name}`}</strong>
+                  <small>{entry.command.description || '无描述'}</small>
                 </span>
-                <span>Enter</span>
-              </button>
-            ))
-          )}
-          <div className="command-palette-section">导航</div>
-          <div className="palette-nav">
-            {navItems.map(item => (
-              <button
-                type="button"
-                key={item.key}
-                onClick={() => {
-                  navigateTo(item.key)
-                  setCommandPaletteOpen(false)
-                  setPaletteQuery('')
-                }}
-              >
-                {item.icon}
-                {item.label}
+                <kbd className="command-item-enter" aria-hidden="true">↵</kbd>
               </button>
             ))}
+            <div className="command-palette-section" role="presentation">导航</div>
             {/* Settings lives in the sidebar footer, but the palette is the
                 keyboard's map of the app: leaving it out would make the one
                 navigation surface that cannot reach it. */}
-            <button
-              type="button"
-              key="settings"
-              onClick={() => {
-                navigateTo('settings')
-                setCommandPaletteOpen(false)
-                setPaletteQuery('')
-              }}
-            >
-              <SettingOutlined />
-              设置
-            </button>
+            <div className="palette-nav" role="presentation">
+              {paletteEntries.map((entry, index) => entry.kind === 'nav' && (
+                <button
+                  type="button"
+                  className={index === paletteIndex ? 'active' : ''}
+                  key={entry.key}
+                  id={`palette-${entry.key}`}
+                  role="option"
+                  aria-selected={index === paletteIndex}
+                  tabIndex={-1}
+                  ref={element => { if (element && index === paletteIndex) element.scrollIntoView({ block: 'nearest' }) }}
+                  onMouseMove={() => { if (index !== paletteIndex) setPaletteIndex(index) }}
+                  onClick={() => runPaletteEntry(entry)}
+                >
+                  {entry.icon}
+                  {entry.label}
+                </button>
+              ))}
+              {!paletteEntries.some(entry => entry.kind === 'nav') && <div className="command-empty">没有匹配的页面</div>}
+            </div>
           </div>
         </div>
       </Modal>

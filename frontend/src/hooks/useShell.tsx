@@ -1,7 +1,9 @@
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react'
 import { SCHEDULE_FAST_POLL_MS, SCHEDULE_IDLE_POLL_MS } from '../constants'
-import { AppstoreOutlined, ClockCircleOutlined, FolderOpenOutlined, MessageOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, ClockCircleOutlined, FolderOpenOutlined, MessageOutlined, SettingOutlined } from '@ant-design/icons'
 import { Modal } from 'antd'
+import type { CommandInfo } from '../types'
 import { useUi } from './useUi'
 import { useConversations } from './useConversations'
 import { useExtensions } from './useExtensions'
@@ -11,7 +13,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, automationTab, commands, connected, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setAutomationTab, setClock, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationTab, commandPaletteOpen, commands, connected, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -190,6 +192,66 @@ export function useShell(deps: Deps) {
     // someone visits every day.
   ]
 
+  // The palette's own list: one index over commands and destinations, so the
+  // arrow keys reach everything the palette shows. It used to print "Enter"
+  // on every command while the input had no key handling at all -- Enter did
+  // nothing, and the only way to use the palette was the mouse.
+  //
+  // Destinations match on plain text. The navigation entries carry JSX labels
+  // (the schedules one holds the failure badge, itself a button, which also
+  // made the palette render a button inside a button), and the placeholder
+  // promises that navigation is searchable too.
+  type PaletteEntry =
+    | { kind: 'command'; key: string; command: CommandInfo }
+    | { kind: 'nav'; key: string; view: string; label: string; icon: ReactNode }
+
+  const paletteEntries = useMemo<PaletteEntry[]>(() => {
+    const query = paletteQuery.trim().toLowerCase()
+    const destinations = [
+      { view: 'chat', label: '对话', icon: <MessageOutlined />, terms: 'chat' },
+      { view: 'sessions', label: '会话管理', icon: <FolderOpenOutlined />, terms: 'sessions' },
+      { view: 'extensions', label: '扩展', icon: <AppstoreOutlined />, terms: '插件 技能 extensions plugins skills' },
+      { view: 'schedules', label: '自动化', icon: <ClockCircleOutlined />, terms: '定时任务 工作流 schedules workflows automation' },
+      { view: 'settings', label: '设置', icon: <SettingOutlined />, terms: 'settings' },
+    ].filter(item => !query || `${item.label} ${item.terms}`.toLowerCase().includes(query))
+    return [
+      ...paletteCommands.slice(0, 8).map(command => ({ kind: 'command' as const, key: `command:${command.name}`, command })),
+      ...destinations.map(({ view, label, icon }) => ({ kind: 'nav' as const, key: `nav:${view}`, view, label, icon })),
+    ]
+  }, [paletteCommands, paletteQuery])
+
+  const [paletteIndex, setPaletteIndex] = useState(0)
+
+  // A new query or a fresh opening starts from the top; a shrinking list must
+  // not leave the index pointing past its end.
+  useEffect(() => {
+    setPaletteIndex(0)
+  }, [paletteQuery, commandPaletteOpen])
+
+  const runPaletteEntry = (entry: PaletteEntry) => {
+    if (entry.kind === 'command') {
+      applyCommand(entry.command)
+      return
+    }
+    navigateTo(entry.view)
+    setCommandPaletteOpen(false)
+    setPaletteQuery('')
+  }
+
+  const handlePaletteKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.nativeEvent.isComposing) return
+    const count = paletteEntries.length
+    if (!count) return
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      const step = event.key === 'ArrowDown' ? 1 : -1
+      setPaletteIndex(index => (index + step + count) % count)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      runPaletteEntry(paletteEntries[Math.min(paletteIndex, count - 1)])
+    }
+  }
+
   const pageMeta: Record<string, { title: string; subtitle: string }> = {
     chat: {
       title: activeSession ? '当前对话' : '开始新的对话',
@@ -218,5 +280,5 @@ export function useShell(deps: Deps) {
     },
   }
 
-  return { navItems, navigateTo, openAttention, pageMeta, paletteCommands } as const
+  return { navItems, navigateTo, openAttention, pageMeta, paletteCommands, paletteEntries, paletteIndex, setPaletteIndex, handlePaletteKeyDown, runPaletteEntry } as const
 }

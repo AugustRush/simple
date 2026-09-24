@@ -877,3 +877,85 @@ html[data-theme='light'] .tool-trace-items {
     animation: none;
   }
 }
+
+/* "Back to the latest" -- shown once the reader has scrolled far enough up
+ * that the view stopped following new output. Sits over the bottom edge of
+ * the message pane, clear of the composer, and out of the conversation
+ * rail's column on the right. */
+.chat-jump-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text);
+  /* A later layer makes --surface-raised translucent glass; over running
+   * message text that let the words behind show through the label. The page
+   * ground underneath keeps it opaque. */
+  background: linear-gradient(var(--surface-raised), var(--surface-raised)), var(--bg);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  cursor: pointer;
+  transform: translateX(-50%);
+  animation: chat-jump-latest-in 0.16s ease-out;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.chat-jump-latest:hover {
+  background: linear-gradient(var(--surface-hover), var(--surface-hover)), linear-gradient(var(--surface-raised), var(--surface-raised)), var(--bg);
+  border-color: var(--primary-border);
+}
+
+.chat-jump-latest:active {
+  background: linear-gradient(var(--primary-soft), var(--primary-soft)), linear-gradient(var(--surface-raised), var(--surface-raised)), var(--bg);
+  transform: translateX(-50%) scale(0.97);
+  transition-duration: 0s;
+}
+
+.chat-jump-latest:focus-visible {
+  outline: 2px solid var(--primary-border);
+  outline-offset: 2px;
+}
+
+@keyframes chat-jump-latest-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px);
+  }
+}
+
+/* Dropping files onto the chat. The hint covers the whole view so the target
+ * is unmistakable; it ignores the pointer so dragleave/drop still land on the
+ * view underneath. */
+.chat-drop-hint {
+  position: absolute;
+  inset: 8px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  border: 1.5px dashed var(--primary-border);
+  border-radius: 16px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  font-size: 14px;
+  pointer-events: none;
+}
+
+.chat-drop-hint .anticon {
+  font-size: 22px;
+  color: var(--text-secondary);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-jump-latest {
+    animation: none;
+  }
+}

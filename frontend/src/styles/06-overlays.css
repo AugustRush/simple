@@ -82,3 +82,26 @@
   background: var(--surface-hover);
   border-color: var(--border-strong);
 }
+
+/* The keyboard's current item. The palette list is driven from the search
+ * input (focus never leaves it), so the highlight is `.active`, not :focus. */
+.palette-nav button.active {
+  color: var(--text);
+  background: var(--surface-hover);
+  border-color: var(--border-strong);
+}
+
+.palette-nav .command-empty {
+  padding: 6px 0;
+  text-align: left;
+}
+
+/* The Enter hint only on the item Enter would run -- on every row it named a
+ * key that, for all but one of them, did nothing. */
+.command-item .command-item-enter {
+  visibility: hidden;
+}
+
+.command-item.active .command-item-enter {
+  visibility: visible;
+}

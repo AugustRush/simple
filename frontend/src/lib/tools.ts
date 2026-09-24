@@ -57,3 +57,25 @@ export function confirmRisk(level?: string): ConfirmRisk {
 /** A session's busy-state word, or '' when it is idle (or its server is old). */
 export const sessionStatusOf = (item: SessionInfo): string =>
   SESSION_STATUS_LABELS[String(item.status || 'idle')] || ''
+
+
+/** Running, stopping or holding queued work -- the states that get a badge. */
+export const isSessionBusy = (item: SessionInfo): boolean => Boolean(sessionStatusOf(item))
+
+
+const activityTime = (item: SessionInfo): number => {
+  const time = Date.parse(item.last_activity || '')
+  return Number.isNaN(time) ? 0 : time
+}
+
+
+/**
+ * Working sessions first, then sessions still held live, then history; most
+ * recent first inside each group. Mirrors the server's order so an older
+ * server (or a status that changed since the list was sorted) still lands the
+ * session the agent is busy in at the top.
+ */
+export const compareSessions = (a: SessionInfo, b: SessionInfo): number =>
+  Number(isSessionBusy(b)) - Number(isSessionBusy(a)) ||
+  Number(Boolean(b.live)) - Number(Boolean(a.live)) ||
+  activityTime(b) - activityTime(a)

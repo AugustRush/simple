@@ -3,8 +3,10 @@ import { CONVERSATION_SUMMARY_HALF_HEIGHT, INTERRUPT_RETRY_MS, INTERRUPT_STUCK_M
 import { truncate } from '../lib/format'
 import { fileHref, withFileSession } from '../lib/media'
 import { findOpenSubAgentNote, foldSubAgentEvent, newSubAgentNote, sealSubAgentNotes } from '../lib/subagent'
+import { compareSessions, isSessionBusy } from '../lib/tools'
 import type { AttachmentInfo, CommandInfo, ConfirmRequest, Message, MessageRole, QueuedMessage, SessionInfo, SessionState, ToolState } from '../types'
-import { Input, Modal } from 'antd'
+import { Modal } from 'antd'
+import type { TextAreaRef } from 'antd/es/input/TextArea'
 import { useUi } from './useUi'
 import { useApiClient } from './useApiClient'
 import { useConfirm } from './useConfirm'
@@ -182,10 +184,16 @@ export function useConversations(deps: Deps) {
 
   const hoverClearTimerRef = useRef<number | null>(null)
 
+  // Scrolling up stops the view following new output, which is right -- but
+  // until now nothing said so, and the only way back was to scroll the whole
+  // way by hand while the answer kept growing underneath.
+  const [awayFromLatest, setAwayFromLatest] = useState(false)
+
   const scrollChatToBottom = useCallback((behavior: ScrollBehavior = 'auto') => {
     const container = chatScrollRef.current
     if (!container) return
     followChatRef.current = true
+    setAwayFromLatest(false)
     container.scrollTo({ top: container.scrollHeight, behavior })
   }, [])
 
@@ -197,7 +205,17 @@ export function useConversations(deps: Deps) {
     const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight
     const nearBottom = distanceToBottom <= 96
     followChatRef.current = nearBottom
+    // Scroll events fire per frame; React bails out when the value is
+    // unchanged, so this only renders when the threshold is crossed.
+    setAwayFromLatest(!nearBottom)
   }, [])
+
+  // Instant, not smooth: a smooth scroll emits intermediate scroll events that
+  // read as "away from the bottom" and would switch following back off while
+  // a streaming answer is still growing past the animation's target.
+  const jumpToLatest = useCallback(() => {
+    scrollChatToBottom('auto')
+  }, [scrollChatToBottom])
 
   useEffect(() => {
     // Streaming updates can arrive many times per second. Never enqueue a
@@ -211,12 +229,25 @@ export function useConversations(deps: Deps) {
     return () => cancelAnimationFrame(frame)
   }, [messages, scrollChatToBottom])
 
+  // The skeleton is for "nothing to show yet". Every send, turn end and queue
+  // change refreshes this list, and each refresh used to swap the whole
+  // sidebar for a skeleton and back -- a flash per message, and a list that
+  // jumped under the pointer.
+  const sessionsLoadedRef = useRef(false)
+  // Titles saved in place but not yet confirmed. A list refresh already in
+  // flight when the edit landed would otherwise put the old title back.
+  const pendingTitlesRef = useRef(new Map<string, string>())
+
   const loadSessions = useCallback(async () => {
     try {
-      setLoadingSessions(true)
+      if (!sessionsLoadedRef.current) setLoadingSessions(true)
       const resp = await api('/api/sessions')
       const data = await resp.json()
-      const nextSessions = data.sessions || []
+      const pendingTitles = pendingTitlesRef.current
+      const nextSessions: SessionInfo[] = (data.sessions || []).map((item: SessionInfo) =>
+        pendingTitles.has(item.session_id) ? { ...item, title: pendingTitles.get(item.session_id) } : item,
+      )
+      sessionsLoadedRef.current = true
       setSessions(nextSessions)
       setSelectedSessionIds(current =>
         current.filter(id => nextSessions.some((item: SessionInfo) => item.session_id === id)),
@@ -868,6 +899,27 @@ export function useConversations(deps: Deps) {
     return () => window.clearInterval(timer)
   }, [activeSession, isStreaming, loadSessionState])
 
+  // The list's busy badges only changed on this tab's own events -- a send, a
+  // ``done`` on the open socket. Switch away from a running session and its
+  // socket closes, so its ``done`` never arrives here and the badge read
+  // 运行中 for good; a turn started from another tab or channel never
+  // appeared at all. While anything is working, re-read the list; when
+  // nothing is, stop. A hidden tab skips the poll and catches up on return.
+  const anySessionBusy = isStreaming || sessions.some(isSessionBusy)
+  useEffect(() => {
+    const refreshIfVisible = () => {
+      if (document.visibilityState === 'visible') void loadSessions()
+    }
+    document.addEventListener('visibilitychange', refreshIfVisible)
+    window.addEventListener('focus', refreshIfVisible)
+    const timer = anySessionBusy ? window.setInterval(refreshIfVisible, 3000) : undefined
+    return () => {
+      document.removeEventListener('visibilitychange', refreshIfVisible)
+      window.removeEventListener('focus', refreshIfVisible)
+      if (timer !== undefined) window.clearInterval(timer)
+    }
+  }, [anySessionBusy, loadSessions])
+
   const uploadPendingAttachments = async (): Promise<AttachmentInfo[]> => {
     if (!activeSession || !pendingAttachments.length) return pendingAttachments
     return pendingAttachments
@@ -1138,6 +1190,13 @@ export function useConversations(deps: Deps) {
   const handleFilesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files || [])
     event.target.value = ''
+    await addFiles(files)
+  }
+
+  /** The one way a file becomes a pending attachment -- the picker, a paste
+   * and a drop all land here, so the session bootstrap and the 12-file cap
+   * cannot drift between them. */
+  const addFiles = async (files: File[]) => {
     if (!files.length) return
     let sessionId = activeSession
     if (!sessionId) {
@@ -1163,6 +1222,45 @@ export function useConversations(deps: Deps) {
     } catch {
       // api helper surfaces the error
     }
+  }
+
+  /** A screenshot on the clipboard used to paste as nothing at all. Files win
+   * unless the clipboard also carries both plain and rich text: copying cells
+   * from Excel or a paragraph from Word brings a rendered image along, and
+   * that paste is meant as text. (A browser's "copy image" has HTML but no
+   * plain text, so it still counts as a file.) */
+  const handleComposerPaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const data = event.clipboardData
+    if (!data || !data.files.length) return
+    if (data.types.includes('text/plain') && data.types.includes('text/html')) return
+    event.preventDefault()
+    void addFiles(Array.from(data.files))
+  }
+
+  // Dropping a file anywhere on the chat used to hand it to the browser, which
+  // navigated away from the app to show it -- losing the draft and the stream.
+  const [fileDragActive, setFileDragActive] = useState(false)
+
+  const draggingFiles = (event: React.DragEvent) => Array.from(event.dataTransfer?.types || []).includes('Files')
+
+  const handleChatDragOver = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!draggingFiles(event)) return
+    event.preventDefault()
+    event.dataTransfer.dropEffect = 'copy'
+    setFileDragActive(true)
+  }
+
+  const handleChatDragLeave = (event: React.DragEvent<HTMLDivElement>) => {
+    // Leaving for a child is not leaving the target.
+    if (event.relatedTarget instanceof Node && event.currentTarget.contains(event.relatedTarget)) return
+    setFileDragActive(false)
+  }
+
+  const handleChatDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    if (!draggingFiles(event)) return
+    event.preventDefault()
+    setFileDragActive(false)
+    void addFiles(Array.from(event.dataTransfer.files))
   }
 
   const pickWorkspace = async () => {
@@ -1200,35 +1298,35 @@ export function useConversations(deps: Deps) {
     }
   }
 
-  const renameSession = (item: SessionInfo) => {
-    let value = item.title || ''
-    Modal.confirm({
-      title: '重命名会话',
-      content: (
-        <Input
-          defaultValue={value}
-          autoFocus
-          placeholder="输入会话标题"
-          onChange={event => {
-            value = event.target.value
-          }}
-        />
-      ),
-      okText: '保存',
-      cancelText: '取消',
-      onOk: async () => {
-        await api(
-          `/api/sessions/${encodeURIComponent(item.session_id)}`,
-          {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ title: value.trim() }),
-          },
-        )
-        messageApi.success('会话已重命名')
-        loadSessions()
-      },
-    })
+  // Which title is open for editing, as `${place}:${session_id}`: the sidebar
+  // and the sessions page show the same session at once, and only the one the
+  // person acted on should turn into an input.
+  const [renamingSession, setRenamingSession] = useState<string | null>(null)
+
+  const commitSessionTitle = async (item: SessionInfo, next: string) => {
+    setRenamingSession(null)
+    const title = next.trim().slice(0, 120)
+    // Clearing the box reads as "never mind", not "remove the title": an
+    // emptied input is far more often a slip than a wish for 未命名会话.
+    if (!title || title === (item.title || '')) return
+    const sid = item.session_id
+    const previous = item.title
+    const retitle = (value: string | undefined) =>
+      setSessions(current => current.map(s => (s.session_id === sid ? { ...s, title: value } : s)))
+    pendingTitlesRef.current.set(sid, title)
+    retitle(title)
+    try {
+      await api(`/api/sessions/${encodeURIComponent(sid)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title }),
+      })
+    } catch {
+      // api() has said why; the row goes back to what the server still has.
+      retitle(previous)
+    } finally {
+      pendingTitlesRef.current.delete(sid)
+    }
   }
 
   const revealSession = async (item: SessionInfo) => {
@@ -1289,10 +1387,15 @@ export function useConversations(deps: Deps) {
     sid: string,
   ) => {
     const target = event.target as HTMLElement | null
+    // The second click of a double-click: the first one already opened the
+    // session, and the double-click itself means "rename" -- running the whole
+    // switch (state reset, history reload) again would be pure waste.
+    if (event.detail > 1) return
     if (
       target?.closest('.ant-dropdown') ||
       target?.closest('.ant-dropdown-trigger') ||
-      target?.closest('.session-item-delete-actions')
+      target?.closest('.session-item-delete-actions') ||
+      target?.closest('.ant-typography-copy')
     ) {
       return
     }
@@ -1383,10 +1486,10 @@ export function useConversations(deps: Deps) {
         (item.title || '').toLowerCase().includes(query) ||
         item.session_id.toLowerCase().includes(query),
     )
-    return [
-      ...filtered.filter(item => !item.live),
-      ...filtered.filter(item => item.live),
-    ]
+    // Active sessions lead: this list used to push every live session to the
+    // bottom, so the conversation the agent was working in sat under all of
+    // history. ``sort`` is stable, so ties keep the server's order.
+    return [...filtered].sort(compareSessions)
   }, [sessions, sessionSearch])
 
   const allFilteredSessionsSelected = filteredSessions.length > 0 &&
@@ -1445,6 +1548,25 @@ export function useConversations(deps: Deps) {
     setView('chat')
     setCommandPaletteOpen(false)
     setPaletteQuery('')
+    // The command is half-written -- it is waiting for its arguments -- so the
+    // caret belongs in the composer. It cannot move there yet: the closing
+    // palette hands focus back to whatever held it before it opened, so this
+    // waits for the palette's `afterClose`.
+    composerFocusPendingRef.current = true
+  }
+
+  const composerRef = useRef<TextAreaRef | null>(null)
+
+  const composerFocusPendingRef = useRef(false)
+
+  const focusComposer = () => {
+    requestAnimationFrame(() => composerRef.current?.focus({ cursor: 'end' }))
+  }
+
+  const flushComposerFocus = () => {
+    if (!composerFocusPendingRef.current) return
+    composerFocusPendingRef.current = false
+    focusComposer()
   }
 
   const toggleTraceExpanded = (id: string) => {
@@ -1622,5 +1744,5 @@ export function useConversations(deps: Deps) {
     if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
   }
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, activeSession, activeSessionRef, activity, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerSendable, connectWs, connected, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileInputRef, filteredCommands, filteredSessions, followChatRef, handleChatScroll, handleComposerKeyDown, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, keepTurnSummary, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renameSession, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }

@@ -68,8 +68,121 @@
   font-weight: 700;
 }
 
+.session-card-title-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Shown on hover or keyboard focus only, like the row actions in the
+   sidebar: a pencil on every card at rest is noise on a grid of them. */
+.session-card-rename.ant-btn {
+  flex: 0 0 auto;
+  opacity: 0;
+  transition: opacity 0.16s ease;
+}
+
+.session-card:hover .session-card-rename.ant-btn,
+.session-card-rename.ant-btn:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .session-card-rename.ant-btn {
+    opacity: 1;
+  }
+}
+
 .session-card-id {
   margin: 10px 0 16px;
+}
+
+/* Selected wins over hover and active: in selection mode it is the one state
+   the card exists to show. */
+.session-card.session-card-selected,
+.session-card.session-card-selected:hover {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px var(--primary), 0 14px 34px rgba(0, 0, 0, 0.1);
+}
+
+.sessions-search.ant-input-affix-wrapper {
+  width: 240px;
+  max-width: 100%;
+}
+
+/* Sticky so the bulk actions stay reachable while scrolling a long grid to
+   pick more cards. */
+.sessions-selection-bar {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin: -6px 0 18px;
+  padding: 9px 12px 9px 16px;
+  border: 1px solid var(--primary-border);
+  border-radius: 12px;
+  /* The glass surfaces are translucent; without the solid ground under them
+     the cards scrolling past would show through the bar's text. */
+  background: linear-gradient(var(--primary-soft), var(--primary-soft)), var(--bg);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.12);
+}
+
+.sessions-selection-count {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.sessions-selection-hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.sessions-selection-actions {
+  margin-left: auto;
+}
+
+.session-group + .session-group {
+  margin-top: 28px;
+}
+
+.session-group-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.session-group-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+
+.session-group-count {
+  padding: 0 7px;
+  border-radius: 999px;
+  color: var(--text-secondary);
+  background: var(--surface-hover);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  line-height: 18px;
+}
+
+.session-group-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+@media (max-width: 640px) {
+  .session-group-hint,
+  .sessions-selection-hint {
+    display: none;
+  }
 }
 
 .session-card-footer {

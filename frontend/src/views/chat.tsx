@@ -10,6 +10,7 @@ import { confirmRisk, confirmToolLabel, summariseToolDots, toolStateLabel } from
 import type { Message, SubAgentNote } from '../types'
 import {
   ApiOutlined,
+  ArrowDownOutlined,
   ArrowUpOutlined,
   CheckCircleFilled,
   CloseOutlined,
@@ -31,7 +32,7 @@ import { createPortal } from 'react-dom'
 const { TextArea } = Input
 
 export function renderChat(ctx: AppCtx) {
-  const { activateTurnIndex, activeSession, activity, approvalCommandRef, chatScrollRef, commandIndex, commandItemRefs, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissTaskGuidance, expandedTraces, fileInputRef, filteredCommands, handleChatScroll, handleComposerKeyDown, handleFilesSelected, handleModelChange, handleRailMouseMove, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, keepTurnSummary, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
+  const { activateTurnIndex, activeSession, activity, approvalCommandRef, awayFromLatest, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
 
   const renderAttachment = (item: Message) => {
@@ -423,7 +424,18 @@ export function renderChat(ctx: AppCtx) {
   }
 
   return (
-    <div className="chat-view">
+    <div
+      className={`chat-view ${fileDragActive ? 'file-drag-active' : ''}`}
+      onDragOver={handleChatDragOver}
+      onDragLeave={handleChatDragLeave}
+      onDrop={handleChatDrop}
+    >
+      {fileDragActive && (
+        <div className="chat-drop-hint" aria-hidden="true">
+          <PaperClipOutlined />
+          <span>松开即可添加为附件</span>
+        </div>
+      )}
       {/* .chat-scroll-area spans only the message pane, so the conversation
        * rail is bounded by the composer in pure CSS — no JS height tracking
        * needed when banners or the composer resize. */}
@@ -508,11 +520,10 @@ export function renderChat(ctx: AppCtx) {
                     key={item}
                     size="small"
                     onClick={() => {
-                      if (item.startsWith('/')) {
-                        setInput(item)
-                      } else {
-                        setInput(`${item}`)
-                      }
+                      setInput(item)
+                      // Filled but not focused, the suggestion left the
+                      // reader to go and click the box it had just typed in.
+                      focusComposer()
                     }}
                   >
                     {item}
@@ -545,6 +556,12 @@ export function renderChat(ctx: AppCtx) {
           )}
         </div>
       </div>
+      {awayFromLatest && messages.length > 0 && (
+        <button type="button" className="chat-jump-latest" onClick={jumpToLatest}>
+          <ArrowDownOutlined />
+          {isStreaming ? '回到正在生成的回复' : '回到最新'}
+        </button>
+      )}
       </div>
 
       <div className="composer-wrap">
@@ -795,6 +812,7 @@ export function renderChat(ctx: AppCtx) {
             </div>
           )}
           <TextArea
+            ref={composerRef}
             value={input}
             onChange={event => {
               setInput(event.target.value)
@@ -802,6 +820,7 @@ export function renderChat(ctx: AppCtx) {
               setCommandDismissed(false)
             }}
             onKeyDown={handleComposerKeyDown}
+            onPaste={handleComposerPaste}
             placeholder="给 Simple Agent 发送消息"
             autoSize={{ minRows: 1, maxRows: 6 }}
             variant="borderless"

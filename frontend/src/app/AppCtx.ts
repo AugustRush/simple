@@ -5,8 +5,9 @@
  * renderers. Handing them one typed object keeps that boundary explicit and
  * keeps the views from growing a second source of truth.
  */
-import type { ChangeEvent, Dispatch, MutableRefObject, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, SetStateAction } from 'react'
+import type { ChangeEvent, ClipboardEvent, Dispatch, DragEvent, MutableRefObject, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, SetStateAction } from 'react'
 import type { FormInstance } from 'antd'
+import type { TextAreaRef } from 'antd/es/input/TextArea'
 import type { MessageInstance } from 'antd/es/message/interface'
 import type { MessageType } from 'antd/es/message/interface'
 import type { AttachmentInfo, AttentionRun, CommandInfo, ConfirmDecision, ConfirmRequest, FeishuChatInfo, ProviderFieldSpec, Message, PermissionProfileOption, PluginInfo, ScheduleArtifact, ScheduleDraft, ScheduleInfo, SchedulerHealth, ScheduleRun, ScheduleRunOutput, SessionInfo, SessionState, SignalInfo, SkillInfo, WorkflowDraft, WorkflowGraphCheck, WorkflowInfo, WorkflowStepDraft, WorkflowStepInfo } from '../types'
@@ -32,6 +33,15 @@ export interface AppCtx {
   activateTurnIndex: (index: number) => void
   chatScrollRef: MutableRefObject<HTMLDivElement | null>
   handleChatScroll: () => void
+  awayFromLatest: boolean
+  jumpToLatest: () => void
+  composerRef: MutableRefObject<TextAreaRef | null>
+  focusComposer: () => void
+  handleComposerPaste: (event: ClipboardEvent<HTMLTextAreaElement>) => void
+  fileDragActive: boolean
+  handleChatDragOver: (event: DragEvent<HTMLDivElement>) => void
+  handleChatDragLeave: (event: DragEvent<HTMLDivElement>) => void
+  handleChatDrop: (event: DragEvent<HTMLDivElement>) => void
   setInput: (value: string) => void
   isStreaming: boolean
   confirmReq: ConfirmRequest | null
@@ -77,9 +87,13 @@ export interface AppCtx {
   stopStreaming: () => void
   composerSendable: boolean
   creatingSession: boolean
+  createSession: () => Promise<void>
   sendMessage: (overrideText?: string | undefined) => Promise<void>
   resolvedComposerText: string
   pageMeta: Record<string, { title: string; subtitle: string; }>
+  // Every session, unfiltered -- so an empty page can tell "none yet" from
+  // "none match the search".
+  sessions: SessionInfo[]
   filteredSessions: SessionInfo[]
   allFilteredSessionsSelected: boolean
   selectedSessionIds: string[]
@@ -93,7 +107,10 @@ export interface AppCtx {
   deleteSession: (item: SessionInfo) => Promise<void>
   setPendingDeleteSessionId: Dispatch<SetStateAction<string | null>>
   revealSession: (item: SessionInfo) => Promise<void>
-  renameSession: (item: SessionInfo) => void
+  // `${place}:${session_id}` of the title being edited in place, if any.
+  renamingSession: string | null
+  setRenamingSession: Dispatch<SetStateAction<string | null>>
+  commitSessionTitle: (item: SessionInfo, title: string) => Promise<void>
   pluginSearch: string
   setPluginSearch: Dispatch<SetStateAction<string>>
   loadingView: boolean
@@ -120,6 +137,8 @@ export interface AppCtx {
   workflowModalOpen: boolean
   editingWorkflowId: string | null
   workflowSaving: boolean
+  // Workflows whose "run now" request has not come back yet.
+  startingWorkflowIds: string[]
   workflowGraph: WorkflowGraphCheck
   setWorkflowModalOpen: Dispatch<SetStateAction<boolean>>
   setEditingWorkflowId: Dispatch<SetStateAction<string | null>>

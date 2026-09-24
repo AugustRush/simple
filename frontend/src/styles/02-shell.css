@@ -159,6 +159,20 @@
   box-shadow: 0 0 0 4px var(--green-soft);
 }
 
+/* A turn is running (or stopping, or queued) -- the dot is the part of the
+ * row the eye scans first, so it pulses; the badge in the meta line names
+ * which of the three it is. */
+.session-item-status span.busy {
+  background: var(--primary);
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .session-item-status span.busy {
+    animation: none;
+  }
+}
+
 .session-item-main {
   flex: 1;
   min-width: 0;
@@ -172,6 +186,29 @@
   font-weight: 600;
   color: var(--text-secondary);
   transition: color 0.16s ease;
+}
+
+/* A session title being renamed in place (sidebar row and session card).
+   Same font as the text it replaces; the border is what says "this is now
+   editable". No negative margin or glow: both title boxes clip overflow, and
+   either would be cut off at the edge. */
+.session-title-input {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  flex: 1;
+  margin: 0;
+  padding: 1px 6px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--primary-border);
+  border-radius: 6px;
+  outline: none;
+}
+
+.session-title-input:focus {
+  border-color: var(--primary);
 }
 
 .session-item-meta {

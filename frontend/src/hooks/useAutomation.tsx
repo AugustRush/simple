@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { KNOWN_PERMISSION_PROFILES, SCHEDULE_OVERDUE_GRACE_MS, SCHEDULE_WATCH_WINDOW_MS } from '../constants'
 import { defaultScheduleDraft, msUntilNextRun, scheduleDraftFromTask, scheduleRequestBody } from '../lib/schedule'
 import { checkWorkflowGraph, cleanStepKeys, defaultWorkflowDraft, defaultWorkflowStep, defaultWorkflowTrigger, describeChainTrigger, nextStepKey, planWorkflowStepMove, spliceWorkflowStep, stepContent, storedEntryStep, swapWorkflowSteps, workflowDownstreamKeys, workflowDraftFromInfo, workflowRequestBody } from '../lib/workflow'
@@ -17,6 +17,11 @@ export function useAutomation(deps: Deps) {
   const { api, apiHeaders, config, confirmResourceDeletion, feishuChatsLoaded, feishuChatsLoading, loadFeishuChats, messageApi, refreshJson, sessionState, setLoadingView, view } = deps
 
   const [schedules, setSchedules] = useState<ScheduleInfo[]>([])
+  // Workflows whose "run now" request is in flight. The ref is the guard (a
+  // double click lands before the state re-renders); the state drives the
+  // button's spinner.
+  const startingWorkflowRef = useRef<Set<string>>(new Set())
+  const [startingWorkflowIds, setStartingWorkflowIds] = useState<string[]>([])
 
   const [signals, setSignals] = useState<SignalInfo[]>([])
 
@@ -1004,25 +1009,52 @@ export function useAutomation(deps: Deps) {
   }
 
   const runWorkflowNow = async (info: WorkflowInfo) => {
+    if (startingWorkflowRef.current.has(info.id)) return
     const entries = info.steps.filter(step => step.depends_on.length === 0 && step.task_id)
     if (!entries.length) {
       messageApi.warning('这个流程还没有可运行的入口步骤')
       return
     }
+    // An entry already in flight would only come back as a 409 -- and it used
+    // to abort the loop there, so the entries after it never started and the
+    // ones before it had started without a word: the success toast and the
+    // refresh both sat after the loop.
+    const idle = entries.filter(step => !step.in_flight)
+    if (!idle.length) {
+      messageApi.info('入口步骤都在运行中')
+      return
+    }
+    startingWorkflowRef.current.add(info.id)
+    setStartingWorkflowIds(Array.from(startingWorkflowRef.current))
     try {
       // Started at the entries and only at the entries: the steps below them
       // are waiting for those to succeed, and running them directly would be
-      // asking for a result that does not exist yet.
-      for (const step of entries) {
-        await api(`/api/schedules/${encodeURIComponent(step.task_id)}/run`, { method: 'POST' })
-      }
-      messageApi.success(
-        entries.length > 1
-          ? `已启动 ${entries.length} 个入口步骤`
-          : '入口步骤已开始运行',
+      // asking for a result that does not exist yet. Each entry is its own
+      // request, so one refusal does not stop the others; `api` has already
+      // toasted each refusal's reason.
+      const results = await Promise.allSettled(
+        idle.map(step => api(`/api/schedules/${encodeURIComponent(step.task_id)}/run`, { method: 'POST' })),
       )
+      const started = results.filter(result => result.status === 'fulfilled').length
+      const skipped = entries.length - idle.length
+      const failed = idle.length - started
+      const tail = [
+        skipped ? `${skipped} 个已在运行` : '',
+        failed ? `${failed} 个未能启动` : '',
+      ].filter(Boolean).join('，')
+      if (!started) {
+        messageApi.error(`入口步骤都没有启动${tail ? `（${tail}）` : ''}`)
+      } else if (tail) {
+        messageApi.warning(`已启动 ${started} 个入口步骤，${tail}`)
+      } else {
+        messageApi.success(started > 1 ? `已启动 ${started} 个入口步骤` : '入口步骤已开始运行')
+      }
+    } finally {
+      // Whatever did start is now running, so the picture is stale either way.
       await Promise.all([loadWorkflows(true), loadSchedules(true)])
-    } catch { /* surfaced */ }
+      startingWorkflowRef.current.delete(info.id)
+      setStartingWorkflowIds(Array.from(startingWorkflowRef.current))
+    }
   }
 
   const openEditSchedule = (task: ScheduleInfo) => {
@@ -1138,13 +1170,17 @@ export function useAutomation(deps: Deps) {
         method: 'POST',
       })
       const data = await resp.json()
+      const runId: string | undefined = data.run?.id || undefined
       messageApi.success('任务已开始运行')
-      setSelectedScheduleRunId(data.run?.id || null)
+      setSelectedScheduleRunId(runId || null)
       await loadSchedules(true)
       if (scheduleDetailOpen && selectedSchedule?.id === task.id) {
         await loadScheduleRuns(task.id, true, true)
       } else {
-        openScheduleDetails(task)
+        // The run id has to go through: opening the drawer resets the
+        // selection, so the one set above was wiped and the drawer came up
+        // on no run instead of the run just started.
+        openScheduleDetails(task, runId)
       }
     } catch { /* surfaced */ }
   }
@@ -1244,5 +1280,5 @@ export function useAutomation(deps: Deps) {
     else messageApi.info('这一步的任务暂时读不到，先刷新一下')
   }
 
-  return { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, applyAttention, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationTab, blankWorkflowStep, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSignals, loadUnseenFailures, loadWorkflows, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, permissionProfiles, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAttentionLatestByTask, setAttentionRuns, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setPermissionProfiles, setScheduleArtifacts, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleOutputLoading, setSchedulePreview, setSchedulePreviewError, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleSaving, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSchedules, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setSignals, setSignalsWaiting, setUnseenFailures, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, setWorkflowSaving, setWorkflows, setWorkflowsLoaded, signals, signalsWaiting, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } as const
+  return { acknowledgeScheduleRun, activePermissionProfile, addWorkflowStep, applyAttention, applySchedules, attentionByTask, attentionLatestByTask, attentionRuns, automationTab, blankWorkflowStep, bulkScheduleAction, cancelScheduleRun, changeWorkflowStepUpstreams, clearScheduleAttention, deleteSchedule, deleteWorkflow, duplicateSchedule, editingScheduleId, editingStep, editingWorkflow, editingWorkflowId, filteredSchedules, filteredWorkflows, insertWorkflowStepAfter, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSignals, loadUnseenFailures, loadWorkflows, moveWorkflowStep, openCreateSchedule, openCreateWorkflow, openEditSchedule, openEditWorkflow, openScheduleDetails, openStepDetails, patchWorkflowStep, permissionProfileLabel, permissionProfileOptions, permissionProfiles, recentWorkspaceRoots, removeWorkflowStep, retryScheduleRun, runScheduleNow, runWorkflowNow, saveSchedule, saveWorkflow, scheduleArtifacts, scheduleDetailOpen, scheduleDraft, scheduleModalOpen, scheduleOutputLoading, schedulePreview, schedulePreviewError, scheduleQuery, scheduleRunOutput, scheduleRuns, scheduleRunsLoading, scheduleSaving, scheduleStatusFilter, schedulerHealth, schedulerRefreshedAt, schedulerStale, schedulerWatchful, schedules, selectedSchedule, selectedScheduleIds, selectedScheduleRun, selectedScheduleRunId, selectedScheduleRunTask, setAttentionLatestByTask, setAttentionRuns, setAutomationTab, setEditingScheduleId, setEditingWorkflowId, setPermissionProfiles, setScheduleArtifacts, setScheduleDetailOpen, setScheduleDraft, setScheduleModalOpen, setScheduleOutputLoading, setSchedulePreview, setSchedulePreviewError, setScheduleQuery, setScheduleRunOutput, setScheduleRuns, setScheduleRunsLoading, setScheduleSaving, setScheduleStatusFilter, setSchedulerHealth, setSchedulerRefreshedAt, setSchedulerStale, setSchedules, setSelectedSchedule, setSelectedScheduleIds, setSelectedScheduleRunId, setSignals, setSignalsWaiting, setUnseenFailures, setWorkflowDraft, setWorkflowKeyRewrite, setWorkflowModalOpen, setWorkflowQuery, setWorkflowSaving, setWorkflows, setWorkflowsLoaded, signals, signalsWaiting, startingWorkflowIds, toggleSchedule, toggleWorkflow, unseenFailures, workflowAttention, workflowDraft, workflowGraph, workflowKeyRewrite, workflowModalOpen, workflowOrderDiffersFromArray, workflowQuery, workflowSaving, workflows, workflowsLoaded } as const
 }
