@@ -122,6 +122,88 @@ def test_session_service_reports_what_a_live_session_is_doing():
     assert sessions["idle"]["status"] == "idle"
 
 
+def test_session_service_puts_working_sessions_first():
+    """The list answers "what is my agent doing" at the top: a turn running
+    (or stopping, or queued) outranks any idle session however recent, a
+    session still held live outranks history, and recency orders each group.
+    """
+    now = datetime.now(timezone.utc).timestamp()
+    live = {
+        "running-old": SimpleNamespace(
+            turn_count=1, operation_state="active", restart_queue=[],
+            last_activity=now - 600,
+        ),
+        "queued": SimpleNamespace(
+            turn_count=1, operation_state="idle", restart_queue=[object()],
+            last_activity=now - 300,
+        ),
+        "idle-live-new": SimpleNamespace(
+            turn_count=1, operation_state="idle", restart_queue=[],
+            last_activity=now - 5,
+        ),
+    }
+
+    class _Store(_FakeStore):
+        def list_session_ids(self, prefix="", limit=50):
+            # The journal's own clock format, newer than every live session.
+            fresh = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f UTC")
+            return [("history-new", fresh, 3)]
+
+    service = SessionService(store=_Store(), live_states=live)
+
+    order = [item["session_id"] for item in service.list_sessions()]
+
+    assert order == ["queued", "running-old", "idle-live-new", "history-new"]
+
+
+def test_session_list_recency_survives_mixed_clock_formats():
+    """The journal writes ``YYYY-MM-DD HH:MM:SS.ffffff UTC`` and the registry
+    writes ``isoformat()``. Compared as strings the space sorts below ``T``,
+    so a journaled session active an hour ago sank under a registry session
+    from yesterday-evening's same date. Every value is normalised to one
+    clock before ordering.
+    """
+    later = datetime(2026, 9, 24, 23, 0, tzinfo=timezone.utc)
+    earlier = datetime(2026, 9, 24, 1, 0, tzinfo=timezone.utc)
+
+    class _Store(_FakeStore):
+        def list_session_ids(self, prefix="", limit=50):
+            return [
+                ("journal-later", later.strftime("%Y-%m-%d %H:%M:%S.%f UTC"), 1),
+                ("iso-earlier", earlier.isoformat(), 1),
+            ]
+
+    service = SessionService(store=_Store())
+    sessions = service.list_sessions()
+
+    assert [item["session_id"] for item in sessions] == ["journal-later", "iso-earlier"]
+    assert sessions[0]["last_activity"] == later.isoformat()
+
+
+def test_durable_session_never_reports_running():
+    """A registry row left at "active" by a process killed mid-turn must not
+    read as 运行中 after restart: only a live session can be running a turn.
+    """
+
+    class _Registry:
+        def list(self, limit=500):
+            return [{
+                "session_id": "orphan",
+                "title": "",
+                "created_at": "",
+                "last_activity": "2026-09-24T00:00:00+00:00",
+                "status": "active",
+            }]
+
+    service = SessionService()
+    service._registry = _Registry()
+
+    (item,) = service.list_sessions()
+    assert item["session_id"] == "orphan"
+    assert item["live"] is False
+    assert item["status"] == "idle"
+
+
 def test_session_service_tracks_live_mapping_after_empty_bind():
     live = {}
     service = SessionService(live_states=live)

@@ -110,6 +110,50 @@ class _WebSessionRegistry:
         ]
 
 
+def _activity_iso(value: Any) -> str:
+    """One clock format for every ``last_activity`` the session list reports.
+
+    The list merges three sources that each write their own format: the
+    registry and live states use ``isoformat()`` (``2026-09-24T09:00:00+00:00``)
+    while the turn journal writes ``2026-09-24 09:00:00.000000 UTC``. Sorting
+    those as strings compares the separator before the time -- ``' '`` sorts
+    below ``'T'`` -- so on the same day every journaled session sank beneath
+    every registry one whatever the clock said. Unparseable values pass
+    through unchanged rather than being dropped.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    candidate = text[:-4] + "+00:00" if text.endswith(" UTC") else text
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
+
+
+_BUSY_SESSION_STATUSES = frozenset({"active", "cancelling", "queued"})
+
+
+def _session_order(item: dict[str, Any]) -> tuple[int, int, float]:
+    """Working sessions first, then the ones still held live, then history;
+    most recent first inside each group.
+
+    Recency alone put a session whose turn has been running for ten minutes
+    under one that was merely opened a minute ago -- the one place the list
+    is asked "what is my agent doing" answered it at the bottom.
+    """
+    busy = str(item.get("status") or "idle") in _BUSY_SESSION_STATUSES
+    live = bool(item.get("live"))
+    try:
+        stamp = datetime.fromisoformat(str(item.get("last_activity") or "")).timestamp()
+    except ValueError:
+        stamp = 0.0
+    return (0 if busy else 1, 0 if live else 1, -stamp)
+
+
 def _turn_ids(turns: Any) -> set[str]:
     """The message ids of ``turns``, used to re-attach legacy events."""
     return {
@@ -505,7 +549,7 @@ class SessionService:
             try:
                 for item in self._registry.list(limit=limit):
                     durable[item["session_id"]] = {
-                        "last_activity": item.get("last_activity", ""),
+                        "last_activity": _activity_iso(item.get("last_activity", "")),
                         "turn_count": 0,
                         "created_at": item.get("created_at", ""),
                         "status": item.get("status", "idle"),
@@ -519,11 +563,16 @@ class SessionService:
                 try:
                     for item in list_ids(limit=limit):
                         sid = str(item[0])
-                        last_activity = str(item[1] or "") if len(item) > 1 else ""
+                        last_activity = _activity_iso(item[1]) if len(item) > 1 else ""
                         turn_count = int(item[2] or 0) if len(item) > 2 else 0
                         current = durable.get(sid, {})
                         durable[sid] = {
-                            "last_activity": last_activity,
+                            # The registry is touched when a turn ends, the
+                            # journal when a turn is written; whichever is
+                            # later is when the session was last active.
+                            "last_activity": max(
+                                last_activity, current.get("last_activity", "")
+                            ),
                             "turn_count": turn_count,
                             "created_at": current.get("created_at", ""),
                             "status": current.get("status", "idle"),
@@ -560,7 +609,7 @@ class SessionService:
                         if rows:
                             row = rows[0]
                             durable[sid] = {
-                                "last_activity": str(row[1] or ""),
+                                "last_activity": _activity_iso(row[1]),
                                 "turn_count": int(row[2] or 0),
                             }
                     titles.update(
@@ -606,6 +655,11 @@ class SessionService:
         for session_id, info in durable.items():
             if session_id in live_seen:
                 continue
+            # Only a live session can be running a turn. The registry's
+            # ``status`` is written at turn start and reset in a ``finally``,
+            # so a process killed mid-turn leaves it at "active" for good --
+            # and the list then says "运行中" (and ranks it with the working
+            # sessions) for an agent that has been gone since the restart.
             sessions.append(
                 {
                     "session_id": session_id,
@@ -614,11 +668,11 @@ class SessionService:
                     "live": False,
                     "title": titles.get(session_id, ""),
                     "created_at": info.get("created_at", ""),
-                    "status": info.get("status", "idle"),
+                    "status": "idle",
                 }
             )
 
-        sessions.sort(key=lambda item: item["last_activity"], reverse=True)
+        sessions.sort(key=_session_order)
         return sessions
 
     def get_session_state(self, session_id: str) -> dict[str, Any]:
