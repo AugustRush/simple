@@ -147,8 +147,23 @@ class ConsolidationEngine:
         # Multiplier correcting the character heuristic toward the provider's
         # actual accounting.  Starts neutral and is adjusted from observed usage
         # (see observe_actual_usage); 1.0 means "heuristic used as-is".
+        # It prices the *body* only: the head has its own per-fingerprint
+        # measured cost (see estimate_head_tokens), because the two segments'
+        # true ratios differ -- measured on this machine the schemas run at
+        # ~0.5x the heuristic while ASCII tool transcripts run at ~1.4x, and no
+        # single scalar can express both at once.
         self.token_calibration: float = 1.0
         self._calibration_samples: int = 0
+        # Head cost per head fingerprint (see estimate_head_tokens).  The seed
+        # is remembered beside the measured value so the learned cost can be
+        # clamped to a sane band around the heuristic that produced it.
+        self._head_cost: dict[str, float] = {}
+        self._head_seed: dict[str, float] = {}
+        # The previous split-aware observation, as (fingerprint, raw body
+        # estimate, actual input count).  Body calibration is learned from the
+        # *difference* between consecutive observations, which cancels the head
+        # out entirely -- see observe_payload_usage.
+        self._prev_payload_obs: Optional[tuple[str, int, int]] = None
 
     # ── Trigger ───────────────────────────────────────────────────────────────
 
@@ -175,20 +190,28 @@ class ConsolidationEngine:
     # Bounds on the learned multiplier.  A heuristic that needs more than a 4x
     # correction is broken in a way calibration should not paper over, and one
     # below 1.0 would make the estimator claim text is cheaper than the
-    # character floor — neither is worth trusting.
+    # character floor -- neither is worth trusting.
     _MIN_CALIBRATION = 1.0
     _MAX_CALIBRATION = 4.0
+    # Bounds on the learned head cost, as a multiple of the raw heuristic it
+    # was seeded from.  A learned cost outside this band says the observation
+    # was contaminated (typically a body estimate still converging), not that
+    # the heuristic is 10x wrong.
+    _HEAD_COST_MIN_FACTOR = 0.25
+    _HEAD_COST_MAX_FACTOR = 4.0
+    # A body delta below this carries more estimate noise than signal.
+    _BODY_DELTA_MIN_TOKENS = 256
 
-    def observe_actual_usage(self, estimated: int, actual: int) -> None:
-        """Correct the heuristic from the provider's exact count.
+    def _apply_calibration_observation(
+        self, estimated: float, actual: float
+    ) -> None:
+        """Move the body's calibration factor one ratchet step.
 
         The loss here is asymmetric: underestimating means a payload reaches the
         provider over its limit and the call hard-fails, while overestimating
         only wastes budget.  So an underestimate is corrected immediately and in
         full, and an overestimate is relaxed slowly.
         """
-        if estimated <= 0 or actual <= 0:
-            return
         observed_ratio = actual / estimated
         # Undo the multiplier already applied, to recover the ratio the raw
         # heuristic would need.
@@ -201,6 +224,142 @@ class ConsolidationEngine:
             self._MAX_CALIBRATION, max(self._MIN_CALIBRATION, updated)
         )
         self._calibration_samples += 1
+
+    def observe_actual_usage(self, estimated: int, actual: int) -> None:
+        """Correct the body's estimator from the provider's exact count.
+
+        Like for like: both numbers must describe the same block of content.
+        On the provider path the preferred entry point is
+        :meth:`observe_payload_usage`, which splits the payload into its head
+        and body and prices each from its own evidence; this method remains for
+        callers that have a single block and no head to separate out.
+        """
+        if estimated <= 0 or actual <= 0:
+            return
+        self._apply_calibration_observation(estimated, actual)
+
+    def estimate_tokens_raw(self, messages: list[dict]) -> int:
+        """The character heuristic alone, with no learned correction.
+
+        The split-aware observation path compares the provider's count against
+        the raw estimate so the correction stays a property of the estimator
+        rather than feeding the learned factor back into its own input.
+        """
+        return estimate_message_tokens(
+            messages,
+            chars_per_token=self.chars_per_token,
+            cjk_chars_per_token=self.cjk_chars_per_token,
+            calibration=1.0,
+            max_image_tokens=self.MAX_IMAGE_TOKENS,
+        )
+
+    def estimate_head_tokens(
+        self,
+        fingerprint: str,
+        system_prompt: str,
+        tools: list[dict],
+    ) -> int:
+        """Price the head (system prompt + tool schemas), locked to its bytes.
+
+        The head rides in every request of a session and its content is
+        session-stable, so its cost is a property of those bytes -- it is
+        computed once per fingerprint and then only ever *measured*, never
+        re-derived.  Re-deriving it through the shared calibration factor was
+        the defect this replaces: a body-composition change moved the factor,
+        the factor re-priced a byte-identical head, and the input budget
+        shrank by tens of thousands of tokens mid-turn -- triggering
+        compaction the payload never needed and re-billing the whole body.
+
+        ``fingerprint`` is the caller's content hash of the head (the same
+        value ``agent.core.payload_shape.head_fingerprint`` records), passed in
+        rather than computed here so this module need not import from core.
+        First sight is priced at the raw heuristic: that is the safe direction,
+        since a head priced below its real cost lets a payload leave for the
+        provider over the window.
+        """
+        cost = self._head_cost.get(fingerprint)
+        if cost is None:
+            seed = float(
+                estimate_message_tokens(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "system",
+                            "content": json.dumps(
+                                tools, ensure_ascii=False, sort_keys=True
+                            ),
+                        },
+                    ],
+                    chars_per_token=self.chars_per_token,
+                    cjk_chars_per_token=self.cjk_chars_per_token,
+                    calibration=1.0,
+                    max_image_tokens=self.MAX_IMAGE_TOKENS,
+                )
+            )
+            self._head_seed[fingerprint] = seed
+            self._head_cost[fingerprint] = seed
+            cost = seed
+        return int(cost)
+
+    def observe_payload_usage(
+        self,
+        *,
+        fingerprint: str,
+        head_estimate: int,
+        body_raw: int,
+        actual: int,
+    ) -> None:
+        """Learn the head's cost and the body's correction from one payload.
+
+        The provider reports one number for the whole prompt, so the two
+        segments' prices have to be recovered from different evidence:
+
+        * The **body** factor comes from the *difference* between two
+          consecutive observations with the same head fingerprint.  Identical
+          head bytes mean the head cancels out of the difference entirely --
+          ``actual_n - actual_{n-1}`` is purely the appended body's true cost,
+          whatever happened to the body in between (a compaction cut makes the
+          difference negative and the sample is simply skipped).  This is also
+          why the guard is the fingerprint and not "same session": two
+          interleaved agents whose heads are byte-identical still produce a
+          valid marginal measurement.
+        * The **head** cost is the residual: ``actual - body_cal * body_raw``.
+          It inherits the same ratchet shape as the body factor -- rise in one
+          step (a head priced below its real cost lets the payload leave over
+          the window), descend 10% at a time -- and is clamped to a band around
+          the heuristic it was seeded from, because a residual far outside that
+          band says the body factor was still converging, not that the
+          heuristic is wildly wrong.
+        """
+        if actual <= 0 or body_raw < 0 or not fingerprint:
+            return
+        prev = self._prev_payload_obs
+        if prev is not None and prev[0] == fingerprint:
+            d_body = body_raw - prev[1]
+            d_actual = actual - prev[2]
+            if d_body >= self._BODY_DELTA_MIN_TOKENS and d_actual > 0:
+                self._apply_calibration_observation(
+                    self.token_calibration * d_body, d_actual
+                )
+        self._prev_payload_obs = (fingerprint, int(body_raw), int(actual))
+        current = self._head_cost.get(fingerprint)
+        if current is None:
+            current = float(head_estimate) if head_estimate > 0 else 0.0
+            if current <= 0:
+                return
+            self._head_seed.setdefault(fingerprint, current)
+            self._head_cost[fingerprint] = current
+        implied = actual - self.token_calibration * body_raw
+        if implied <= 0:
+            return
+        if implied > current:
+            updated = implied  # underpriced head: jump straight to safety
+        else:
+            updated = current + 0.1 * (implied - current)
+        seed = self._head_seed.get(fingerprint) or current
+        lo = seed * self._HEAD_COST_MIN_FACTOR
+        hi = seed * self._HEAD_COST_MAX_FACTOR
+        self._head_cost[fingerprint] = min(hi, max(lo, updated))
 
     def should_sleep(self, messages: list[dict], max_tokens: int) -> bool:
         return self.estimate_tokens(messages) >= int(

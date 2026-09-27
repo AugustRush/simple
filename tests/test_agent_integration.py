@@ -9720,12 +9720,108 @@ def test_provider_usage_calibrates_the_token_estimator(tmp_path):
     )
 
     assert manager.consolidation.token_calibration == 1.0
+    from agent.core.payload_shape import head_fingerprint
+
+    head_fp = head_fingerprint(ctx.system_prompt, [])
+    head_before = manager.consolidation.estimate_head_tokens(
+        head_fp, ctx.system_prompt, []
+    )
     asyncio.run(agent._create(ctx, []))
     # The payload really cost 900 tokens but was predicted far lower, so the
-    # estimator must have corrected upward.
-    assert manager.consolidation.token_calibration > 1.0
-    # And the prediction marker must not leak into later turns.
+    # estimator must have corrected upward -- into the head's measured cost,
+    # which is where a head-dominated payload's truth lands.  The body's own
+    # factor stays put: nothing about this observation was body evidence.
+    head_after = manager.consolidation.estimate_head_tokens(
+        head_fp, ctx.system_prompt, []
+    )
+    assert head_after > head_before
+    assert manager.consolidation.token_calibration == 1.0
+    # And the prediction markers must not leak into later turns.
     assert "_predicted_input_tokens" not in ctx.metadata
+    assert "_predicted_head_cost" not in ctx.metadata
+    assert "_predicted_body_raw" not in ctx.metadata
+
+
+def test_body_composition_noise_no_longer_shrinks_the_input_budget(tmp_path):
+    """The regression pin for the measured phantom budget shrink.
+
+    A real 100-step turn (2026-09-26) saw `input_budget` fall from 82588 to
+    68382 while the head fingerprint stayed byte-identical: the single shared
+    calibration factor priced the head, body-composition evidence moved the
+    factor, and a byte-identical head got re-priced mid-turn -- triggering
+    emergency compaction the payload still fit.  The head's price is now locked
+    to its bytes, so body evidence must move the body's correction only.
+    """
+    import json
+
+    import agent as agent_module
+    from agent.memory.consolidation import estimate_message_tokens
+
+    store = agent_module.LTMStore(context_dir=tmp_path / "context")
+    manager = agent_module.ContextManager(
+        store=store,
+        retriever=agent_module.LocalRetriever(),
+        consolidation=agent_module.ConsolidationEngine(store=store),
+        staging=agent_module.StagingBuffer(
+            context_dir=tmp_path / "context", session_id="budget-pin"
+        ),
+    )
+    agent = agent_module.BaseAgent(
+        object(),
+        agent_module.ToolRegistry(),
+        model="fake-model",
+        api_format="anthropic",
+        context_window=128_000,
+        max_tokens=1_000,
+    )
+    agent.context_manager = manager
+    system_prompt = "s" * 40_000  # ~10k raw head tokens: shrinkage is legible
+    tools: list = []
+    ctx = agent_module.AgentContext(
+        system_prompt=system_prompt,
+        messages=[{"role": "user", "content": "hello"}],
+    )
+
+    class _Usage:
+        def __init__(self, n):
+            self.input_tokens = n
+            self.output_tokens = 0
+
+    class _Response:
+        def __init__(self, n):
+            self.usage = _Usage(n)
+
+    engine = manager.consolidation
+    head_raw = estimate_message_tokens(
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "system",
+                "content": json.dumps(tools, ensure_ascii=False, sort_keys=True),
+            },
+        ]
+    )
+    true_head = head_raw  # the heuristic is exact on the head
+    body_ratio = 1.4  # ASCII transcripts are under-counted by the heuristic
+
+    def drive() -> int:
+        body_raw = estimate_message_tokens(ctx.messages)
+        agent._prepare_provider_context(ctx, tools)
+        budget = int(ctx.metadata["_last_input_token_budget"])
+        agent._observe_provider_usage(
+            ctx, _Response(true_head + int(body_ratio * body_raw))
+        )
+        return budget
+
+    budget_first = drive()
+    ctx.messages.append({"role": "user", "content": "a" * 40_000})  # ~10k raw tokens
+    drive()
+    budget_third = drive()
+
+    # The body's correction was learned from the append deltas...
+    assert engine.token_calibration > 1.3
+    # ...and the head's price never moved, so the budget did not shrink.
+    assert abs(budget_third - budget_first) <= 4
 
 
 def test_observed_input_tokens_reads_either_provider_field():

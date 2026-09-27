@@ -18,7 +18,7 @@ import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt, _now
 from agent.core.context_assembler import ContextAssembler
-from agent.core.payload_shape import describe_payload
+from agent.core.payload_shape import describe_payload, head_fingerprint
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
 from agent.memory.consolidation import estimate_message_tokens
@@ -1462,7 +1462,24 @@ class BaseAgent:
         even though they never appear in ``ctx.messages``.  Measuring them in
         one place is what keeps the input budget and the output cap from
         disagreeing about what the request already costs.
+
+        The price itself comes from the memory engine and is locked to the
+        head's bytes (``ConsolidationEngine.estimate_head_tokens``).  It used to
+        be re-derived here through the shared calibration factor, which let a
+        body-composition change re-price a byte-identical head mid-turn and
+        shrink the input budget by tens of thousands of tokens -- measured on a
+        real session as 82588 -> 68382 with the head fingerprint unchanged,
+        triggering emergency compaction the payload never needed.
         """
+        context_manager = self._context_manager_for(ctx)
+        consolidation = getattr(context_manager, "consolidation", None)
+        estimate_head = getattr(consolidation, "estimate_head_tokens", None)
+        if callable(estimate_head):
+            return estimate_head(
+                head_fingerprint(ctx.system_prompt, tools),
+                ctx.system_prompt,
+                tools,
+            )
         overhead_messages = [
             {"role": "system", "content": ctx.system_prompt},
             {
@@ -1529,6 +1546,23 @@ class BaseAgent:
         # budget is derived from this same estimator, it moved the wall along
         # with the measurement instead of correcting anything.
         return estimate_message_tokens(messages)
+
+    def _estimate_raw_body_tokens(self, ctx: "AgentContext") -> int:
+        """The body's cost under the raw character heuristic, uncorrected.
+
+        The split-aware calibration path compares the provider's count against
+        the raw estimate so the learned correction stays a property of the
+        estimator rather than feeding the factor its own output.  Falls back to
+        the free function, which is already calibration-free, so the no-manager
+        path (where the calibrated and raw estimates coincide) stays
+        self-consistent.
+        """
+        context_manager = self._context_manager_for(ctx)
+        consolidation = getattr(context_manager, "consolidation", None)
+        raw = getattr(consolidation, "estimate_tokens_raw", None)
+        if callable(raw):
+            return raw(ctx.messages)
+        return estimate_message_tokens(ctx.messages)
 
     @staticmethod
     def _protected_turn_messages(ctx: "AgentContext") -> list[dict]:
@@ -1663,6 +1697,12 @@ class BaseAgent:
         configured_cap = self._configured_output_cap(output_max_tokens)
         overhead = self._payload_overhead(ctx, tools)
         ctx.metadata["_predicted_input_tokens"] = estimate + max(0, overhead)
+        # What the two halves of the prediction cost, for the split-aware
+        # calibration in `_observe_provider_usage`: the head at the price this
+        # budget actually charged it, the body at the raw heuristic so the
+        # learned correction never feeds on itself.
+        ctx.metadata["_predicted_head_cost"] = max(0, overhead)
+        ctx.metadata["_predicted_body_raw"] = self._estimate_raw_body_tokens(ctx)
         # The cap actually sent, derived here because this is the only place the
         # real input estimate exists.  `max_tokens` is not tokenised into the
         # prompt, so it costs nothing in cache terms to vary it per call -- and
@@ -1687,6 +1727,8 @@ class BaseAgent:
         those are the ones that explain a miss.
         """
         predicted = int(ctx.metadata.pop("_predicted_input_tokens", 0) or 0)
+        head_cost = int(ctx.metadata.pop("_predicted_head_cost", 0) or 0)
+        body_raw = int(ctx.metadata.pop("_predicted_body_raw", 0) or 0)
         shape = ctx.metadata.pop("_payload_shape", None)
         observed_usage = getattr(self._transport, "observed_usage", None)
         usage = (
@@ -1704,10 +1746,37 @@ class BaseAgent:
             # instead makes the measurement shrink as caching improves, the
             # estimate always looks too high, and the calibration clamp drags it
             # to its floor -- an estimator that can never learn it under-counts.
-            with shared._suppress_with_log("token calibration skipped"):
-                context_manager.consolidation.observe_actual_usage(
-                    predicted, usage.input_tokens
-                )
+            #
+            # The split-aware path prices the two halves from their own
+            # evidence: the body factor from the difference between consecutive
+            # observations (which cancels the head out entirely), the head from
+            # the residual, locked per fingerprint.  One shared factor could not
+            # price both -- measured on this machine the schemas run ~0.5x the
+            # heuristic while ASCII tool transcripts run ~1.4x -- and letting
+            # body evidence move a byte-identical head's price was what shrank
+            # the input budget mid-turn and cut context the payload still fit.
+            head_fp = (
+                shape.get("head_fingerprint")
+                if isinstance(shape, dict)
+                else None
+            )
+            consolidation = getattr(context_manager, "consolidation", None)
+            observe_split = getattr(consolidation, "observe_payload_usage", None)
+            if callable(observe_split) and head_fp:
+                with shared._suppress_with_log("token calibration skipped"):
+                    observe_split(
+                        fingerprint=head_fp,
+                        head_estimate=head_cost,
+                        body_raw=body_raw,
+                        actual=usage.input_tokens,
+                    )
+            elif callable(
+                getattr(consolidation, "observe_actual_usage", None)
+            ):
+                with shared._suppress_with_log("token calibration skipped"):
+                    consolidation.observe_actual_usage(
+                        predicted, usage.input_tokens
+                    )
         if usage.total_tokens <= 0:
             # Nothing worth recording: a row of zeros reads as a request that
             # cost nothing rather than as one whose cost was never reported, and

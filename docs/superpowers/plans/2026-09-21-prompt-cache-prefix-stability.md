@@ -625,6 +625,91 @@ rather than assumed.
 
 ---
 
+## Task 5: Price the head from its own evidence (2026-09-26)
+
+**Files:** `agent/memory/consolidation.py`, `agent/core/agent.py`,
+`tests/test_consolidation.py`, `tests/test_agent_integration.py`.
+
+**The measurement.** Session `5671a608`, turn `msg-1790412180948-2775` (100
+provider steps). `head_fingerprint` was byte-identical (`f2d2a0ed…`) for the whole
+turn, yet `input_budget` fell **82588 → 68382** (step 1 → 46) and recovered to
+**73481** by step 50 — a 14,206-token shrink with nothing in the head changing.
+The implied head estimate rose 37,220 → 51,426 over the same window. Three
+independent probes put the head's *real* cost at **~21k tokens** (the session's
+first call billed 21,946 with a one-message body; `cached_input_tokens` pins at
+20,480–21,632 immediately after every cut, when the body has just been
+rewritten). Meanwhile the body was being *under*-estimated by 20–40% (step 9:
+body estimate 74.9k against a real ~104k), so the two segments' true ratios
+differ by ~2.7x (head ≈0.5x the heuristic, ASCII transcripts ≈1.4x) and no single
+scalar can price both at once.
+
+**Why it was a Task 3 side effect.** `observe_actual_usage` compares the whole
+payload against the provider's count and moves one `token_calibration`; Task 3
+then made the *calibrated* overhead a budget term (`_input_token_budget = window
+− reserve − overhead`). Body evidence therefore re-priced a byte-identical head
+on every observation, and the ratchet's asymmetry (underestimate → jump straight
+to safety, overestimate → relax 10%) biases the factor upward over a long turn.
+
+**What was done.**
+
+- `ConsolidationEngine.estimate_head_tokens(fingerprint, system_prompt, tools)` —
+  head cost memoized per head fingerprint, seeded at the raw heuristic (the safe
+  direction: a head priced below its real cost lets a payload leave over the
+  window) and thereafter only ever *measured*.
+- `observe_payload_usage(...)` — the body factor is learned from the *difference*
+  between consecutive observations with the same fingerprint (identical head
+  bytes cancel out of the difference, so the sample stays valid across a cut's
+  regrowth and between interleaved agents); the head cost is the residual, same
+  ratchet shape, clamped to 0.25x–4x its seed because a residual outside that
+  band says the body factor was still converging.
+- `observe_actual_usage` is retained for single-block callers, and
+  `estimate_tokens` / the free function are untouched, so every body-only path
+  (sleep trigger, compaction, staging) keeps its semantics.
+- `_payload_overhead` now asks the engine (falling back to the old computation
+  when there is no manager). The matching `allocate(static_tokens=…)` wiring is
+  **deliberately not in this commit**: `agent/core/context_assembler.py` in the
+  working tree carries an unrelated uncommitted rewrite (the tool-gate removal),
+  and the one-line change sits inside it where no hunk split can separate them.
+  It stays in the tree as a follow-up to land with that rewrite.
+
+**Verification.**
+
+- 7 new engine tests + 1 new agent test. One existing test was re-pointed
+  deliberately: `test_provider_usage_calibrates_the_token_estimator` now asserts
+  the head's measured cost rises while the body factor stays put — the
+  correction genuinely moved into the head for a head-dominated payload. The four
+  consolidation calibration tests were left alone: they exercise body-only
+  messages, which is exactly what the retained method still means.
+- **Red-checked.** With the two replaced function bodies restored — done by
+  monkeypatch rather than a source revert, because the working tree carries
+  unrelated in-flight work —
+  `test_body_composition_noise_no_longer_shrinks_the_input_budget` fails with a
+  **2,002-token** shrink. The assertion is discriminating, not decorative.
+- Focused suites (`consolidation`, `context_assembler`, `usage_telemetry`,
+  `cache_hit_analysis`, `runtime_contracts`, `model_routing`): **268 passed**.
+- Full suite: **16 failed / 2616 passed / 1 skipped** — the same 16 as the
+  recorded baseline (15 × `sandbox_apply: Operation not permitted` +
+  `test_build_components_loads_user_tool_plugins`), and none of them in a
+  modified module.
+
+**Cache impact: none, and the sign is right.** A hit is decided by the payload
+bytes (`S ‖ T ‖ M`); every number this task moves lives in `ctx.metadata`. The
+same session shows the proof: `input_budget` oscillated 15k while hits ran 90–99%
+inside append-only stretches, and every miss sits on a cut row. So pricing policy
+cannot move the hit rate — while fewer phantom cuts can only raise it.
+
+**What this does *not* fix.** Of that turn's five mid-turn cuts (and the previous
+turn's five), roughly six were genuine window exhaustion (actuals 116k–127k
+against a real limit of ~119.8k), two coin-flips and two avoidable — the clearest
+being step 58 (real pre-cut ~107k, under the limit by ~13k). The head lock
+removes the phantom shrink and the deepest unnecessary cut; the body still
+outgrows the window because single tool transcripts of 13k–31k tokens enter
+`ctx.messages` verbatim (`transport.build_tool_result_messages` caps nothing).
+That is the truncation task, and it needs the transcript-vs-artifact policy
+decision first.
+
+---
+
 ## Risks
 
 - **Retrieval in the user message changes what the model sees.** Tests assert on

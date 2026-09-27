@@ -2489,6 +2489,198 @@ def test_calibration_ignores_unusable_samples(tmp_path):
     assert engine.token_calibration == before
 
 
+# ── Head pricing: locked to head bytes, measured from the provider ──
+
+
+def _head_fixture():
+    """A head (system prompt + tool schemas) big enough to price distinctly."""
+    system_prompt = "You are a tool-wielding agent. " * 200
+    tools = [
+        {
+            "name": f"tool_{i}",
+            "description": "does something " * 10,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        for i in range(20)
+    ]
+    return system_prompt, tools
+
+
+def _head_fp(system_prompt, tools):
+    from agent.core.payload_shape import head_fingerprint
+
+    return head_fingerprint(system_prompt, tools)
+
+
+def test_head_estimate_is_memoized_on_head_bytes(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    system_prompt, tools = _head_fixture()
+    fp = _head_fp(system_prompt, tools)
+    first = engine.estimate_head_tokens(fp, system_prompt, tools)
+    assert first > 0
+    # Same bytes, same price — the value is locked, not re-derived.
+    assert engine.estimate_head_tokens(fp, system_prompt, tools) == first
+    # Different bytes get their own independent price.
+    other = engine.estimate_head_tokens(
+        _head_fp(system_prompt + "z" * 400, tools),
+        system_prompt + "z" * 400,
+        tools,
+    )
+    assert other != first
+
+
+def test_head_seed_is_the_raw_heuristic_never_below(tmp_path):
+    """First sight prices the head at the raw heuristic: the safe direction."""
+    from agent.memory.consolidation import estimate_message_tokens
+
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    system_prompt, tools = _head_fixture()
+    raw = estimate_message_tokens(
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "system",
+                "content": json.dumps(tools, ensure_ascii=False, sort_keys=True),
+            },
+        ]
+    )
+    assert (
+        engine.estimate_head_tokens(_head_fp(system_prompt, tools), system_prompt, tools)
+        == raw
+    )
+
+
+def test_a_body_underestimate_does_not_reprice_the_head(tmp_path):
+    """The regression pin for the measured phantom shrink.
+
+    The body's raw heuristic under-counts ASCII tool transcripts (true cost
+    1.4x raw) while the head's heuristic is exact.  Under the single shared
+    calibration factor, the body's evidence dragged the factor to 1.4 and
+    re-priced a byte-identical head 1.4x -- shrinking the input budget mid-turn
+    (measured: 82588 -> 68382 across one turn, head fingerprint unchanged).
+    With the split, body evidence must move the body's factor only.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    system_prompt, tools = _head_fixture()
+    fp = _head_fp(system_prompt, tools)
+    seed = engine.estimate_head_tokens(fp, system_prompt, tools)
+
+    # Prime with an empty body: it establishes the delta baseline without any
+    # body error for the residual to misattribute to the head.
+    engine.observe_payload_usage(
+        fingerprint=fp, head_estimate=seed, body_raw=0, actual=seed
+    )
+    body_raw = 0
+    for _ in range(5):
+        body_raw += 600
+        actual = seed + int(1.4 * body_raw)  # head exact, body under-counted
+        engine.observe_payload_usage(
+            fingerprint=fp,
+            head_estimate=engine.estimate_head_tokens(fp, system_prompt, tools),
+            body_raw=body_raw,
+            actual=actual,
+        )
+    assert abs(engine.token_calibration - 1.4) < 0.05
+    assert engine.estimate_head_tokens(fp, system_prompt, tools) == seed
+
+
+def test_split_calibration_converges_when_both_segments_are_wrong(tmp_path):
+    """Head and body true ratios differ (0.75x vs 1.5x raw); both must converge.
+
+    A single shared factor cannot express two different ratios at once -- this
+    is the measured shape of the real miscalibration (schemas ~0.5x raw,
+    transcripts ~1.4x raw), and the reason the split exists.
+    """
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    system_prompt, tools = _head_fixture()
+    fp = _head_fp(system_prompt, tools)
+    seed = engine.estimate_head_tokens(fp, system_prompt, tools)
+    true_head = int(seed * 0.75)
+    true_body_ratio = 1.5
+
+    body_raw = 4000
+    for _ in range(40):
+        body_raw += 600
+        actual = true_head + int(true_body_ratio * body_raw)
+        engine.observe_payload_usage(
+            fingerprint=fp,
+            head_estimate=engine.estimate_head_tokens(fp, system_prompt, tools),
+            body_raw=body_raw,
+            actual=actual,
+        )
+    assert abs(engine.token_calibration - true_body_ratio) < 0.05 * true_body_ratio
+    learned = engine.estimate_head_tokens(fp, system_prompt, tools)
+    assert abs(learned - true_head) < 0.05 * true_head
+
+
+def test_a_shrinking_body_skips_the_delta_and_regrows_cleanly(tmp_path):
+    """A compaction cut makes the difference negative; that sample is skipped."""
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    system_prompt, tools = _head_fixture()
+    fp = _head_fp(system_prompt, tools)
+    head = engine.estimate_head_tokens(fp, system_prompt, tools)
+
+    # Grow, cut, regrow: only the qualifying deltas may calibrate.
+    engine.observe_payload_usage(
+        fingerprint=fp, head_estimate=head, body_raw=8000,
+        actual=head + int(1.4 * 8000),
+    )
+    assert engine.token_calibration == 1.0  # first observation has no delta
+    engine.observe_payload_usage(
+        fingerprint=fp, head_estimate=head, body_raw=2000,
+        actual=head + int(1.4 * 2000),
+    )
+    assert engine.token_calibration == 1.0  # the cut's negative delta is skipped
+    engine.observe_payload_usage(
+        fingerprint=fp, head_estimate=head, body_raw=2600,
+        actual=head + int(1.4 * 2600),
+    )
+    assert abs(engine.token_calibration - 1.4) < 0.05  # regrowth calibrates
+
+
+def test_head_cost_respects_its_bounds(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    system_prompt, tools = _head_fixture()
+    fp = _head_fp(system_prompt, tools)
+    seed = engine.estimate_head_tokens(fp, system_prompt, tools)
+
+    # A residual far above the seed (a body estimate still converging) clamps
+    # at 4x rather than swallowing the whole payload.
+    engine.observe_payload_usage(
+        fingerprint=fp, head_estimate=seed, body_raw=10, actual=seed * 100
+    )
+    assert engine.estimate_head_tokens(fp, system_prompt, tools) <= seed * 4
+    # A persistently cheap residual descends no further than 0.25x.
+    for _ in range(200):
+        engine.observe_payload_usage(
+            fingerprint=fp, head_estimate=seed, body_raw=10, actual=seed // 8
+        )
+    assert engine.estimate_head_tokens(fp, system_prompt, tools) >= seed // 4
+
+
+def test_observe_payload_usage_ignores_unusable_samples(tmp_path):
+    ctx_mgr = make_ctx_manager(tmp_path)
+    engine = ctx_mgr.consolidation
+    system_prompt, tools = _head_fixture()
+    fp = _head_fp(system_prompt, tools)
+    seed = engine.estimate_head_tokens(fp, system_prompt, tools)
+    before_cal = engine.token_calibration
+    for kwargs in (
+        {"fingerprint": fp, "head_estimate": seed, "body_raw": 1000, "actual": 0},
+        {"fingerprint": fp, "head_estimate": seed, "body_raw": 1000, "actual": -5},
+        {"fingerprint": "", "head_estimate": seed, "body_raw": 1000, "actual": 5000},
+    ):
+        engine.observe_payload_usage(**kwargs)
+    assert engine.token_calibration == before_cal
+    assert engine.estimate_head_tokens(fp, system_prompt, tools) == seed
+
+
 # ── Eviction must be visible: the model cannot retrieve what it cannot know ──
 
 
