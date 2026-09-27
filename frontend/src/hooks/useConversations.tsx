@@ -838,7 +838,7 @@ export function useConversations(deps: Deps) {
         }
 
         if (evt.type === 'confirm_request') {
-          const timeout = Number(evt.timeout_seconds) > 0 ? Number(evt.timeout_seconds) : 120
+          const timeout = Number(evt.timeout_seconds) > 0 ? Number(evt.timeout_seconds) : 300
           confirmDeadlineRef.current = Date.now() + timeout * 1000
           setConfirmRemaining(timeout)
           setConfirmDetailOpen(false)

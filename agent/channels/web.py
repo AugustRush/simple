@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 # How long a browser is given to answer an approval prompt before the pending
 # action is declined.  Sent to the client as ``timeout_seconds`` so the UI can
 # count down honestly instead of going quiet and letting the approval expire.
-CONFIRMATION_TIMEOUT_SECONDS = 120
+CONFIRMATION_TIMEOUT_SECONDS = 300
 
 # Approval decisions a client may return.  ``allow_session`` widens the consent
 # from "this one command" to "this command for the rest of the session" and is
