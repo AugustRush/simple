@@ -7056,6 +7056,159 @@ def test_auto_continue_accumulates_each_truncated_segment(monkeypatch):
     assert {"role": "assistant", "content": " three"} in seen_messages[3]
 
 
+def test_auto_continue_carries_tools_and_runs_continuation_tool_calls(monkeypatch):
+    """A truncation continuation must keep the turn's tools attached, and when
+    it comes back asking for tool calls the step loop must execute them.
+
+    Regression: the continuation went out with an empty tool list, so a model
+    that still wanted to call a tool wrote it as text in its own markup --
+    a garbled token-delimiter dump -- and that text became the final answer.
+    """
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    registry.register("lookup", "look things up", {"type": "object"}, lambda **kw: "ok")
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    agent.max_truncation_continuations = 2
+
+    responses = iter(
+        [
+            # Step 1: the truncated final response -- the whole output budget
+            # spent before any visible content or tool call (what a thinking
+            # model cut at finish_reason=length looks like).
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "length", agent_module.shared._OAIMsg("", None)
+                    )
+                ]
+            ),
+            # The continuation, with tools attached this time, asks for one.
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "tool_calls",
+                        agent_module.shared._OAIMsg(
+                            "",
+                            [
+                                agent_module.shared._OAITC(
+                                    "call-1",
+                                    agent_module.shared._OAIFunc("lookup", "{}"),
+                                )
+                            ],
+                        ),
+                    )
+                ]
+            ),
+            # The step after the tools ran: the real final answer.
+            agent_module.shared._OAIResponse(
+                [
+                    agent_module.shared._OAIChoice(
+                        "stop", agent_module.shared._OAIMsg("done after tools", None)
+                    )
+                ]
+            ),
+        ]
+    )
+    calls = []
+    ran_tools = []
+
+    async def fake_create(ctx, tools):
+        calls.append({"tools": list(tools), "messages": list(ctx.messages)})
+        return next(responses)
+
+    async def fake_run_tool_uses(tool_uses, orchestration_decision=None):
+        ran_tools.append([tu["name"] for tu in tool_uses])
+        return ['{"ok": true}']
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+    monkeypatch.setattr(agent, "_run_tool_uses", fake_run_tool_uses)
+
+    result = asyncio.run(
+        agent.send_message(agent_module.AgentContext(system_prompt="system"), "do it")
+    )
+
+    assert result.error is None
+    assert result.content == "done after tools"
+    assert result.tool_calls_made == ["lookup"]
+    # The continuation carried the turn's tools instead of an empty list.
+    assert len(calls) == 3
+    assert [t["name"] for t in calls[0]["tools"]] == ["lookup"]
+    assert calls[1]["tools"] == calls[0]["tools"]
+    # The tools the continuation asked for actually ran...
+    assert ran_tools == [["lookup"]]
+    # ...and the next request attached their results to the conversation the
+    # calls were issued against: continue prompt, then the tool-call entry,
+    # then the tool result.
+    final_messages = calls[2]["messages"]
+    continue_index = next(
+        index
+        for index, message in enumerate(final_messages)
+        if message.get("content") == agent_module.BaseAgent._CONTINUE_PROMPT
+    )
+    assert final_messages[continue_index + 1]["role"] == "assistant"
+    assert final_messages[continue_index + 1]["tool_calls"][0]["id"] == "call-1"
+    assert final_messages[continue_index + 2] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": '{"ok": true}',
+    }
+
+
+def test_truncation_continuation_hands_tool_calls_back_with_its_conversation(
+    monkeypatch,
+):
+    """The continuation's own message list is the one the tool calls refer to,
+    so it becomes the turn's history when the response is handed back."""
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    tool_schema = {"name": "lookup", "description": "x", "input_schema": {}}
+    seen_tools = []
+
+    async def fake_create(ctx, tools):
+        seen_tools.append(list(tools))
+        return agent_module.shared._OAIResponse(
+            [
+                agent_module.shared._OAIChoice(
+                    "tool_calls",
+                    agent_module.shared._OAIMsg(
+                        "",
+                        [
+                            agent_module.shared._OAITC(
+                                "call-1",
+                                agent_module.shared._OAIFunc("lookup", "{}"),
+                            )
+                        ],
+                    ),
+                )
+            ]
+        )
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(
+        system_prompt="system", messages=[{"role": "user", "content": "hello"}]
+    )
+
+    merged, error, tool_response = asyncio.run(
+        agent._continue_truncated_response(ctx, "partial", [tool_schema])
+    )
+
+    assert error is None
+    assert merged == "partial"
+    assert tool_response is not None
+    assert seen_tools == [[tool_schema]]
+    assert ctx.messages == [
+        {"role": "user", "content": "hello"},
+        {"role": "user", "content": agent_module.BaseAgent._CONTINUE_PROMPT},
+    ]
+
+
 def test_build_components_applies_truncation_continuation_limit(monkeypatch, tmp_path):
     import agent as agent_module
 
@@ -7654,9 +7807,12 @@ def test_truncation_continuation_preserves_request_model_override():
         metadata={"model_override": "request-model"},
     )
 
-    text, error = asyncio.run(agent._continue_truncated_response(ctx, "partial"))
+    text, error, tool_response = asyncio.run(
+        agent._continue_truncated_response(ctx, "partial", [])
+    )
 
     assert error is None
+    assert tool_response is None
     assert text == "partial continued"
     assert transport.models == ["request-model"]
 

@@ -1948,7 +1948,15 @@ class BaseAgent:
 
     @staticmethod
     def _build_continuation_context(ctx: "AgentContext") -> "AgentContext":
-        """Create the minimal context needed for bounded auto-continue requests."""
+        """Create the minimal context needed for bounded auto-continue requests.
+
+        ``_provider_step``, ``turn_id`` and ``_orchestration_child`` ride along
+        so the continuation's provider call is attributed to the step and turn
+        it belongs to rather than being logged as a fresh foreground step one;
+        the turn-request reference rides along so an emergency compaction
+        inside the continuation cannot evict the request the turn exists to
+        answer.
+        """
         return AgentContext(
             agent_id=ctx.agent_id,
             role=ctx.role,
@@ -1957,7 +1965,15 @@ class BaseAgent:
             tools_enabled=ctx.tools_enabled,
             metadata={
                 key: ctx.metadata[key]
-                for key in ("model_override", "context_manager", "session_id")
+                for key in (
+                    "model_override",
+                    "context_manager",
+                    "session_id",
+                    "turn_id",
+                    "_provider_step",
+                    "_orchestration_child",
+                    _TURN_REQUEST_KEY,
+                )
                 if key in ctx.metadata
             },
         )
@@ -1966,8 +1982,19 @@ class BaseAgent:
         self,
         ctx: "AgentContext",
         partial_text: str,
-    ) -> tuple[str, Optional[str]]:
-        """Try to complete a truncated final response with bounded follow-up calls."""
+        tools: list[dict],
+    ) -> tuple[str, Optional[str], Optional[Any]]:
+        """Try to complete a truncated final response with bounded follow-up calls.
+
+        The continuation carries the turn's own tools.  A continuation sent
+        without them cannot produce a native tool call, and a model that wants
+        one anyway writes it as text in its own markup -- which is how a garbled
+        token-delimiter dump once became a turn's final answer.  A continuation
+        that comes back asking for tools is not an answer at all: it is the
+        step the truncated response was cut out of, so its conversation is
+        adopted into ``ctx`` and its response is returned as the third element
+        for the caller's step loop to execute through the normal tool path.
+        """
         merged = partial_text
         continuation_ctx = self._build_continuation_context(ctx)
         attempts = 0
@@ -1976,18 +2003,24 @@ class BaseAgent:
             continuation_ctx.messages.append(
                 {"role": "user", "content": self._CONTINUE_PROMPT}
             )
-            response = await self._create(continuation_ctx, [])
+            response = await self._create(continuation_ctx, tools)
             stop_reason, text, tool_uses = self._parse_response(
                 response, continuation_ctx
             )
             if stop_reason == "tool_use" and tool_uses:
-                break
+                # The calls were issued against the continuation's message
+                # list -- the continue prompt, and whatever compaction the
+                # continuation's own call had to do -- so that list, not the
+                # pre-continuation one, is the history the tool results must
+                # attach to for the next request to read coherently.
+                ctx.messages[:] = continuation_ctx.messages
+                return merged, None, response
             merged = self._merge_continuation_text(merged, text)
             continuation_error = self._response_completion_error(
                 response, continuation_ctx
             )
             if continuation_error is None:
-                return merged, None
+                return merged, None, None
             continuation_ctx.messages.append(
                 self._transport.build_final_message(
                     response, text, model=self._effective_model(continuation_ctx)
@@ -1997,6 +2030,7 @@ class BaseAgent:
             merged,
             f"Model response remained truncated after "
             f"{attempts} auto-continue attempts",
+            None,
         )
 
     def _assistant_message(
@@ -3037,15 +3071,19 @@ class BaseAgent:
         streamed_text: str,
         prior_text: str,
         tool_result_history: list[tuple[str, str]],
-    ) -> tuple[str, Optional[str]]:
-        """Finalize a non-tool-use response and return (result_text, continuation_error).
+        tools: list[dict],
+    ) -> tuple[str, Optional[str], Optional[Any]]:
+        """Finalize a non-tool-use response.
 
-        Picks the best text (parsed > streamed > prior), promotes a tool's
+        Returns ``(result_text, continuation_error, tool_response)``.  Picks
+        the best text (parsed > streamed > prior), promotes a tool's
         ``summary_text`` if the model returned nothing, appends the assistant
         entry, attempts truncation continuation when the transport reports
         one, and falls back to an apology when the response is entirely
         empty.  ``continuation_error`` is non-None only when continuation
-        still failed; caller propagates it.
+        still failed; ``tool_response`` is non-None only when the continuation
+        came back asking for tools, in which case the caller must run that
+        response through its step loop instead of ending the turn.
         """
         result_text = text or streamed_text or prior_text
         if not result_text and tool_result_history:
@@ -3058,13 +3096,21 @@ class BaseAgent:
 
         completion_error = self._response_completion_error(response, ctx)
         if completion_error:
-            result_text, continuation_error = (
-                await self._continue_truncated_response(ctx, result_text)
+            result_text, continuation_error, tool_response = (
+                await self._continue_truncated_response(
+                    ctx, result_text, tools
+                )
             )
-            ctx.messages[-1] = self._transport.build_final_message(
-                response, result_text, model=self._effective_model(ctx)
-            )
-            return result_text, continuation_error
+            if tool_response is None:
+                # Only a continuation that ended in text finalises the
+                # truncated message.  One that came back with tool calls has
+                # already replaced the history with its own conversation,
+                # whose last message is the continue prompt, not this
+                # response's entry.
+                ctx.messages[-1] = self._transport.build_final_message(
+                    response, result_text, model=self._effective_model(ctx)
+                )
+            return result_text, continuation_error, tool_response
 
         # Silent stop with no text and no tool history is almost always a
         # safety-filtered or malformed response; speak up so the user isn't
@@ -3076,7 +3122,7 @@ class BaseAgent:
                 "your request or checking if it triggered a "
                 "content policy filter."
             )
-        return result_text, None
+        return result_text, None, None
 
     async def send_message(
         self,
@@ -3177,6 +3223,10 @@ class BaseAgent:
             # separately by the runtime layer (TurnExecution.continuation_rounds).
             max_steps = max(1, int(self.max_tool_call_iterations))
             _step_index = 0
+            # Set when a truncation continuation comes back asking for tools:
+            # the next iteration adopts that response without a model call and
+            # runs it through the normal tool branch.
+            pending_tool_response: Any = None
             while True:
                 if _step_index == max_steps:
                     trace_status = "tool_loop_exceeded"
@@ -3229,6 +3279,10 @@ class BaseAgent:
                     recovered = filter_recovery.take_pending_response()
                     if recovered is not None:
                         response = recovered
+                        streamed_text = ""
+                    elif pending_tool_response is not None:
+                        response = pending_tool_response
+                        pending_tool_response = None
                         streamed_text = ""
                     else:
                         # Wrap the LLM call as a task and register a cleanup
@@ -3496,9 +3550,16 @@ class BaseAgent:
                         _step_index += 1
                         continue
                     else:
-                        result_text, continuation_error = await self._handle_end_turn(
-                            ctx, response, text, streamed_text,
-                            result_text, tool_result_history,
+                        result_text, continuation_error, continuation_tool_response = (
+                            await self._handle_end_turn(
+                                ctx,
+                                response,
+                                text,
+                                streamed_text,
+                                result_text,
+                                tool_result_history,
+                                tools,
+                            )
                         )
                         if continuation_error is not None:
                             trace_status = "continuation_error"
@@ -3509,6 +3570,15 @@ class BaseAgent:
                                 tool_calls_made=tool_calls_made,
                                 error=continuation_error,
                             )
+                        if continuation_tool_response is not None:
+                            # The truncation continuation asked for tools:
+                            # adopt its response as this step's and let the
+                            # loop execute the calls through the normal tool
+                            # path.  The continuation was a model call, so it
+                            # is charged a step like any other.
+                            pending_tool_response = continuation_tool_response
+                            _step_index += 1
+                            continue
                         break
 
                 except Exception as e:
