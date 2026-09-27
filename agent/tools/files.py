@@ -245,6 +245,29 @@ _STABLE_ERROR_CODES = frozenset(
     }
 )
 
+# Failures the agent can fix by adjusting its own next call — re-reading the
+# file, fixing a path, picking another name — rather than by asking the user
+# or giving up.  The message and details already say exactly what to change,
+# so the tool-loop watchdog must count these as information gained, not as a
+# stalled turn: a bounded stretch of failed edits (match_count_mismatch being
+# the everyday case) used to trip the "连续多次调用工具，但结果没有继续推进"
+# stop even though every retry carried new information and the next one was
+# often the one that landed.  Environment and permission failures are NOT
+# here: retrying those without new input is exactly the loop the watchdog
+# exists to stop.
+_AGENT_RECOVERABLE_CODES = frozenset(
+    {
+        "invalid_request",
+        "invalid_path",
+        "already_exists",
+        "not_directory",
+        "not_regular_file",
+        "revision_required",
+        "revision_conflict",
+        "match_count_mismatch",
+    }
+)
+
 
 class FileServiceError(Exception):
     """A stable, structured failure for the file service."""
@@ -268,6 +291,7 @@ class FileServiceError(Exception):
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": False,
+            "recoverable_by_agent": self.code in _AGENT_RECOVERABLE_CODES,
             "error": {
                 "code": self.code,
                 "message": self.message,

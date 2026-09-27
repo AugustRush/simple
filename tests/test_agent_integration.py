@@ -2107,6 +2107,63 @@ def test_tool_loop_watchdog_records_last_structured_outcome():
     assert state["last_outcome"]["fatal"] is True
 
 
+def test_watchdog_does_not_stop_distinct_agent_recoverable_edit_failures(tmp_path):
+    """真实 edit_file 连续四次各不相同的失败，看门狗不得停轮。
+
+    每次失败的 old_text 都不同——模型在改写匹配串、正在收敛。看门狗曾把这些
+    按「连续无产出轮次」累计，第 4 轮就以「连续多次调用工具，但结果没有继续
+    推进」停掉回合，而往往下一次就成功了。修复后真实工具载荷带
+    ``recoverable_by_agent``（见 test_file_errors_mark_agent_recoverable_codes），
+    分类为有进展；同一个失败编辑原样重试 3 次仍要被 same_pair 拦下。
+
+    载荷必须来自真实 FileService：手工在 JSON 里写 recoverable_by_agent 的
+    版本在修复前的代码上同样通过（分类器本来就认这个键），A/B 不成立。
+    """
+    import agent as agent_module
+    from agent.tools.files import DEFAULT_FILE_ACCESS, FileAccessPolicy, FileService
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = tmp_path / "output"
+    output.mkdir()
+    service = FileService(
+        FileAccessPolicy.from_config(
+            dict(DEFAULT_FILE_ACCESS),
+            workspace_root=workspace,
+            output_root=output,
+        )
+    )
+    (output / "a.txt").write_text("one two three\n", encoding="utf-8")
+    revision = service.read_file("output_dir", "a.txt")["revision"]
+
+    def failing_edit(old_text: str) -> tuple[list[dict], list[str]]:
+        result = service.edit_file(
+            "output_dir",
+            "a.txt",
+            expected_revision=revision,
+            replacements=[{"old_text": old_text, "new_text": "x", "expected_count": 1}],
+        )
+        assert result["error"]["code"] == "match_count_mismatch"
+        return (
+            [{"name": "edit_file", "input": {"path": "a.txt", "old_text": old_text}}],
+            [json.dumps(result)],
+        )
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    state = agent._new_watchdog_state()
+    for old_text in ("alpha", "beta", "gamma", "delta"):
+        tool_uses, results = failing_edit(old_text)
+        assert agent._check_tool_loop_stuck(state, tool_uses, results) == ""
+
+    for _ in range(2):
+        tool_uses, results = failing_edit("alpha")
+        assert agent._check_tool_loop_stuck(state, tool_uses, results) == ""
+    tool_uses, results = failing_edit("alpha")
+    assert agent._check_tool_loop_stuck(state, tool_uses, results) == "same_pair"
+
+
 def test_send_message_stuck_response_sanitizes_intent_required_loop(monkeypatch):
     import agent as agent_module
 

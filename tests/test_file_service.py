@@ -940,6 +940,38 @@ def test_edit_file_match_count_mismatch_rolls_back(tmp_path):
     assert not list((output).glob("*.simple-tmp-*"))
 
 
+def test_file_errors_mark_agent_recoverable_codes(tmp_path):
+    """自愈型失败要带 recoverable_by_agent，环境失败不带。
+
+    工具循环看门狗把「错误消息已经说明该怎么改」的失败当作新信息而不是
+    停滞：match_count_mismatch / 修订冲突这类失败重读文件即可修复，连着
+    几次失败通常正是编辑收敛的过程。access_denied / not_found 这类环境
+    问题不带标记——没有新输入的重试正是看门狗要拦的空转。
+    """
+    service, workspace, output = _service(tmp_path)
+    (output / "a.txt").write_text("keep\n", encoding="utf-8")
+    rev = service.read_file("output_dir", "a.txt")["revision"]
+
+    mismatch = service.edit_file(
+        "output_dir",
+        "a.txt",
+        expected_revision=rev,
+        replacements=[{"old_text": "missing", "new_text": "x", "expected_count": 1}],
+    )
+    assert mismatch["recoverable_by_agent"] is True
+
+    stale = service.edit_file(
+        "output_dir",
+        "a.txt",
+        expected_revision="deadbeef",
+        replacements=[{"old_text": "keep", "new_text": "x", "expected_count": 1}],
+    )
+    assert stale["recoverable_by_agent"] is True
+
+    missing = service.read_file("output_dir", "nope.txt")
+    assert missing["recoverable_by_agent"] is False
+
+
 def test_edit_file_rejects_invalid_replacements(tmp_path):
     service, workspace, output = _service(tmp_path)
     (output / "a.txt").write_text("a\n", encoding="utf-8")
