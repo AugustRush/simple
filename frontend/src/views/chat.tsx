@@ -1,12 +1,13 @@
 /** The chat view. Rendered by the App container from its context object. */
 
 import type { AppCtx } from '../app/AppCtx'
-import { CONFIRM_RISK_LABELS, TASK_INTERRUPTED_STATUSES, TASK_STATUS_LABELS } from '../constants'
+import { ApprovalBar } from '../components/ApprovalBar'
+import { TASK_INTERRUPTED_STATUSES, TASK_STATUS_LABELS } from '../constants'
 import { compactWorkspacePath, truncate } from '../lib/format'
 import { markdownToHtml } from '../lib/markdown'
 import { fileHref, mediaKindForUrl } from '../lib/media'
 import { subagentCounts } from '../lib/subagent'
-import { confirmRisk, confirmToolLabel, summariseToolDots, toolStateLabel } from '../lib/tools'
+import { summariseToolDots, toolStateLabel } from '../lib/tools'
 import type { Message, SubAgentNote } from '../types'
 import {
   ApiOutlined,
@@ -50,7 +51,7 @@ function isInTurnUserMessage(item: Message): boolean {
 }
 
 export function renderChat(ctx: AppCtx) {
-  const { activateTurnIndex, activeSession, activity, approvalCommandRef, awayFromLatest, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
+  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
 
   const renderAttachment = (item: Message) => {
@@ -608,84 +609,18 @@ export function renderChat(ctx: AppCtx) {
       </div>
 
       <div className="composer-wrap">
-        {confirmReq && (() => {
-          const risk = confirmRisk(confirmReq.risk_level)
-          const timedOut = confirmRemaining <= 0
-          const commandText = confirmReq.command || '未知命令'
-          const showDetailToggle = confirmOverflowing || confirmDetailOpen
-          return (
-            <div
-              className={`approval-bar approval-risk-${risk}`}
-              role="alertdialog"
-              aria-label="工具审批"
-              aria-live="assertive"
-            >
-              <div className="approval-head">
-                <SafetyCertificateOutlined className="approval-icon" />
-                <span className="approval-title">需要你的批准</span>
-                <span className={`approval-risk-tag approval-risk-tag-${risk}`}>
-                  {CONFIRM_RISK_LABELS[risk]}
-                </span>
-                <span className="approval-tool">{confirmToolLabel(confirmReq.name)}</span>
-                <span className={`approval-timer ${timedOut ? 'expired' : ''}`}>
-                  {timedOut ? '已超时，等待服务器确认' : `${confirmRemaining}s 后自动拒绝`}
-                </span>
-              </div>
-              {confirmReq.reason && (
-                <div className="approval-reason">{confirmReq.reason}</div>
-              )}
-              <div
-                className={`approval-command ${confirmDetailOpen ? 'expanded' : ''}`}
-                ref={approvalCommandRef}
-              >
-                <code>{commandText}</code>
-              </div>
-              {showDetailToggle && (
-                <button
-                  type="button"
-                  className="approval-detail-toggle"
-                  onClick={() => setConfirmDetailOpen(open => !open)}
-                >
-                  {confirmDetailOpen ? '收起命令' : '展开完整命令'}
-                  <DownOutlined rotate={confirmDetailOpen ? 180 : 0} />
-                </button>
-              )}
-              <div className="approval-actions">
-                <span className="approval-hints">
-                  <kbd>Esc</kbd> 拒绝
-                  <span className="approval-hint-sep" />
-                  <kbd>⌘</kbd><kbd>↵</kbd> 允许本次
-                  {confirmReq.allow_session && (
-                    <>
-                      <span className="approval-hint-sep" />
-                      <kbd>⌘</kbd><kbd>⇧</kbd><kbd>↵</kbd> 本会话总是允许
-                    </>
-                  )}
-                </span>
-                <Button size="small" disabled={timedOut} onClick={() => sendConfirm('deny')}>
-                  拒绝
-                </Button>
-                {confirmReq.allow_session && (
-                  <Button
-                    size="small"
-                    disabled={timedOut}
-                    onClick={() => sendConfirm('allow_session')}
-                  >
-                    本会话总是允许
-                  </Button>
-                )}
-                <Button
-                  size="small"
-                  type="primary"
-                  disabled={timedOut}
-                  onClick={() => sendConfirm('allow_once')}
-                >
-                  允许本次
-                </Button>
-              </div>
-            </div>
-          )
-        })()}
+        {confirmReq && (
+          <ApprovalBar
+            confirmReq={confirmReq}
+            remaining={confirmRemaining}
+            detailOpen={confirmDetailOpen}
+            overflowing={confirmOverflowing}
+            commandRef={attachApprovalCommand}
+            onToggleDetail={() => setConfirmDetailOpen(open => !open)}
+            onDecide={sendConfirm}
+            onDismiss={dismissConfirm}
+          />
+        )}
         {queueView.length > 0 && (
           <div className="message-queue-banner">
             <div className="message-queue-head">

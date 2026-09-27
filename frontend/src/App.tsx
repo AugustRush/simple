@@ -14,6 +14,7 @@ import { createSettingsView } from './views/settings'
 import { relativeTime } from './lib/format'
 import { isSessionBusy, sessionStatusOf } from './lib/tools'
 import { SessionTitle } from './components/SessionTitle'
+import { ApprovalBar } from './components/ApprovalBar'
 
 import { useUi } from './hooks/useUi'
 import { useApiClient } from './hooks/useApiClient'
@@ -75,7 +76,7 @@ function App() {
 
   const { contextHolder, messageApi, token } = apiClient
 
-  const { approvalCommandRef, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, sendConfirm, setConfirmDetailOpen } = confirm
+  const { attachApprovalCommand, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, dismissConfirm, sendConfirm, setConfirmDetailOpen } = confirm
 
   const { activateTurnIndex, activeSession, activity, allFilteredSessionsSelected, awayFromLatest, chatScrollRef, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSelectedSessions, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSelectedSessionIds, setSendShortcut, setSessionSearch, stopStreaming, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
@@ -161,9 +162,10 @@ function App() {
     confirmRemaining,
     confirmOverflowing,
     confirmDetailOpen,
-    approvalCommandRef,
+    attachApprovalCommand,
     setConfirmDetailOpen,
     sendConfirm,
+    dismissConfirm,
     queueView,
     withdrawQueuedMessages,
     sessionState,
@@ -673,6 +675,26 @@ function App() {
           <Content className="app-content">{renderCurrentView()}</Content>
         </Layout>
       </Layout>
+
+      {/* The approval bar, shown on every view except chat (chat renders it
+          inside its composer stack). A pending approval keeps counting down
+          to an auto-deny wherever the user navigates, so it must stay visible
+          and answerable from any page, not silently expire in the view the
+          user left. */}
+      {view !== 'chat' && confirmReq && (
+        <div className="approval-floating">
+          <ApprovalBar
+            confirmReq={confirmReq}
+            remaining={confirmRemaining}
+            detailOpen={confirmDetailOpen}
+            overflowing={confirmOverflowing}
+            commandRef={attachApprovalCommand}
+            onToggleDetail={() => setConfirmDetailOpen(open => !open)}
+            onDecide={sendConfirm}
+            onDismiss={dismissConfirm}
+          />
+        </div>
+      )}
 
       {/* The search modal. Structure mirrors the command palette: the input
           is the modal's fixed head, only the result list scrolls. It used to

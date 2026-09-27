@@ -48,9 +48,10 @@ export interface AppCtx {
   confirmRemaining: number
   confirmOverflowing: boolean
   confirmDetailOpen: boolean
-  approvalCommandRef: MutableRefObject<HTMLDivElement | null>
   setConfirmDetailOpen: Dispatch<SetStateAction<boolean>>
   sendConfirm: (decision: ConfirmDecision) => void
+  dismissConfirm: () => void
+  attachApprovalCommand: (element: HTMLDivElement | null) => void
   queueView: { id: string; text: string; withdrawable: boolean; }[]
   withdrawQueuedMessages: (messageIds: string[]) => Promise<void>
   sessionState: SessionState | null

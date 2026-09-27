@@ -678,6 +678,25 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
   .approval-actions { justify-content: flex-end; }
 }
 
+/* The same bar, fixed to the bottom center, on every view except chat. A
+ * pending approval keeps counting down to an auto-deny wherever the user
+ * navigates, so it has to stay visible and answerable from any page. Sits
+ * under antd's modals (z-index 1000+): an open modal covers it, and Esc
+ * closes that modal first, before the approval's own Esc-to-deny can hear it. */
+.approval-floating {
+  position: fixed;
+  left: 50%;
+  bottom: 16px;
+  transform: translateX(-50%);
+  width: min(820px, calc(100vw - 32px));
+  z-index: 700;
+}
+
+.approval-floating .approval-bar {
+  width: 100%;
+  margin: 0;
+}
+
 /* Conversation composer
  *
  * Treat the footer as one control surface: lightweight tools on the left,

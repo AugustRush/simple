@@ -16,7 +16,13 @@ export function useConfirm(deps: Deps) {
 
   const [confirmOverflowing, setConfirmOverflowing] = useState(false)
 
-  const approvalCommandRef = useRef<HTMLDivElement | null>(null)
+  // The command box element, held as state via a callback ref rather than a
+  // useRef: the bar now has two render sites (the chat composer and the
+  // floating bar shown on every other view), so a view switch swaps the
+  // element mid-prompt. A useRef never tells the measuring effect that
+  // happened; a state-setter ref does.
+  const [approvalCommandEl, setApprovalCommandEl] = useState<HTMLDivElement | null>(null)
+  const attachApprovalCommand = setApprovalCommandEl
 
   // Absolute deadline rather than a decremented counter: background tabs get
   // their timers throttled, and a counter would drift behind the server.
@@ -42,6 +48,14 @@ export function useConfirm(deps: Deps) {
     },
     [confirmReq],
   )
+
+  // Locally drop an expired prompt. The server auto-denies at its own
+  // deadline regardless, so there is nothing to answer by the time this can
+  // be clicked -- only a dead bar to take off the screen.
+  const dismissConfirm = useCallback(() => {
+    setConfirmReq(null)
+    setConfirmDetailOpen(false)
+  }, [])
 
   // Countdown to the server-side deadline, so "it just silently expired" can't
   // happen while the user is deciding.
@@ -72,7 +86,7 @@ export function useConfirm(deps: Deps) {
     // Keep the toggle available while expanded, otherwise collapsing becomes
     // impossible as soon as the tall box stops overflowing.
     if (confirmDetailOpen) return
-    const element = approvalCommandRef.current
+    const element = approvalCommandEl
     if (!element) {
       setConfirmOverflowing(false)
       return
@@ -82,11 +96,27 @@ export function useConfirm(deps: Deps) {
     const observer = new ResizeObserver(measure)
     observer.observe(element)
     return () => observer.disconnect()
-  }, [confirmReq, confirmDetailOpen])
+  }, [confirmReq, confirmDetailOpen, approvalCommandEl])
 
   useEffect(() => {
     if (!confirmReq) return
     const onKeyDown = (event: KeyboardEvent) => {
+      // Another layer already consumed this key: the composer's own Esc
+      // (close the command popover, clear a "/" draft) and its Cmd/Ctrl+Enter
+      // send both call preventDefault(), and without this guard the same
+      // keystroke would also answer the approval -- denying a call the user
+      // meant to keep deciding on, or approving one while sending a message.
+      if (event.defaultPrevented || event.isComposing) return
+      // Focus inside an open overlay (dropdown menu, select popup, popover,
+      // modal): Esc there means "close the overlay", and the overlay closes
+      // without preventing the event, so it would still bubble here.
+      const target = event.target
+      if (
+        target instanceof HTMLElement &&
+        target.closest('.ant-modal, .ant-dropdown, .ant-select-dropdown, .ant-popover')
+      ) {
+        return
+      }
       if (event.key === 'Escape') {
         event.preventDefault()
         sendConfirm('deny')
@@ -118,5 +148,5 @@ export function useConfirm(deps: Deps) {
     })
   }
 
-  return { approvalCommandRef, confirmDeadlineRef, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmResourceDeletion, sendConfirm, setConfirmDetailOpen, setConfirmOverflowing, setConfirmRemaining, setConfirmReq } as const
+  return { attachApprovalCommand, confirmDeadlineRef, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, confirmResourceDeletion, dismissConfirm, sendConfirm, setConfirmDetailOpen, setConfirmOverflowing, setConfirmRemaining, setConfirmReq } as const
 }
