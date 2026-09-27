@@ -3472,3 +3472,88 @@ def test_hook_timeout_reports_that_the_worker_is_still_blocked(capsys):
     finally:
         release.set()
         pool.shutdown(wait=True)
+
+
+def test_draining_an_interjection_keeps_it_for_the_turns_record():
+    """What the model read mid-turn has to reach the durable record.
+
+    The payload and the record were built from different facts: the message
+    went into ``ctx.messages`` (so the model answered it) while the journal
+    only ever received the message that *opened* the turn.  The transcript
+    then showed an answer to a question nobody could read back, and the user's
+    own words were lost from both the display and the memory pipeline.  What
+    is held here is what ``_post_turn_maintenance`` journals at turn end.
+    """
+    import agent as agent_module
+
+    ctx = agent_module.AgentContext(system_prompt="sys")
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    agent._inject_pending_interjections(
+        ctx,
+        [
+            {"text": "  ", "urgency": "normal"},  # blank: nothing to record
+            {
+                "text": "这些文件里有 markdown 吗？",
+                "message_id": "i1",
+                "urgency": "now",
+                "arrived_at": 1758700000.0,
+            },
+        ],
+    )
+
+    held = ctx.metadata["_turn_interjections"]
+    assert [entry["text"] for entry in held] == ["这些文件里有 markdown 吗？"]
+    # Id and urgency travel with it: the id is the write's idempotency key and
+    # what a client matches its queued row against.
+    assert held[0]["message_id"] == "i1"
+    assert held[0]["urgency"] == "now"
+    assert held[0]["arrived_at"] == 1758700000.0
+
+
+def test_a_second_drain_in_one_turn_appends_rather_than_replaces():
+    """One turn can drain the mailbox more than once, and both were answered."""
+    import agent as agent_module
+
+    ctx = agent_module.AgentContext(system_prompt="sys")
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+
+    agent._inject_pending_interjections(ctx, [{"text": "第一句"}])
+    agent._inject_pending_interjections(ctx, [{"text": "第二句"}])
+
+    assert [entry["text"] for entry in ctx.metadata["_turn_interjections"]] == [
+        "第一句",
+        "第二句",
+    ]
+
+
+def test_the_sink_notice_distinguishes_an_interjection_from_a_restart():
+    """A client has to say *when* a queued message will be dealt with.
+
+    The two kinds are the difference between "read by the turn running now"
+    and "will get its own turn", and a client that recovers that by matching
+    the English sentence is one wording change away from showing it wrong.
+    """
+    from agent.core.output import OutputSink
+
+    seen: list[tuple[str, str]] = []
+
+    class _Sink(OutputSink):
+        def on_status(self, text: str, *, level: str = "info") -> None:
+            seen.append(("status", text))
+
+    sink = _Sink()
+    sink.on_message_queued("你好", kind="interjection", message_id="m1")
+    sink.on_message_queued("再见", kind="restart", message_id="m2")
+
+    # The default keeps the terminal's existing wording, so the CLI is
+    # unchanged by the structured call.
+    assert seen == [
+        ("status", "Interjection queued."),
+        ("status", "Message queued for the next turn."),
+    ]

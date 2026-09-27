@@ -4318,3 +4318,51 @@ def test_a_session_rebuilt_after_a_provider_switch_does_not_inherit_the_old_clie
     # either — that is the same 400 seen from the other side.
     assert transport.endpoint_for("deepseek-flash").client is not result["client"]
     assert transport.endpoint_for("deepseek-flash").client.provider == "deepseek"
+
+
+def test_a_recorded_interjection_is_exposed_as_in_turn_speech(tmp_path):
+    """The client needs the flag, and needs the tools to stay with their turn.
+
+    Without the flag an interjection row is indistinguishable from a turn
+    boundary, and the browser's grouping treats it as one -- splitting the very
+    turn that answered it.  Without excluding it from the orphan-placement
+    pool, the turn's tool rows would attach to the interjection instead of to
+    the request that opened the turn.
+    """
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="列出文件",
+        assistant_content="收到了",
+        channel="web",
+        message_id="turn-1",
+        interjections=[
+            {"text": "顺便看一眼 markdown", "message_id": "inj-1", "urgency": "now"}
+        ],
+    )
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="turn-1",
+        event_type="tool_completed",
+        payload={"operation_id": "tool-1", "tool_name": "list_files", "ok": True},
+    )
+
+    messages = SessionService(store=store).get_messages("web-session")
+
+    # The request that opened the turn, the turn's tool rows (attached to that
+    # request, not to the interjection), the interjection, then the answer that
+    # addressed it.
+    assert [item.get("role") for item in messages] == ["user", "tool", "user", "assistant"]
+    assert messages[1].get("tool") == "list_files"
+    assert messages[2].get("content") == "顺便看一眼 markdown"
+    assert messages[3].get("content") == "收到了"
+
+    interjection = messages[2]
+    assert interjection["interjection"] is True
+    # The client matches its optimistic row by the id the server was given, so
+    # the flag -- not the id -- is what has to survive the display projection.
+    assert "message_id" not in interjection
+    # The ordinary user row is left alone: it is still a turn boundary.
+    assert "interjection" not in messages[0]

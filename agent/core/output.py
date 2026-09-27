@@ -422,6 +422,30 @@ class OutputSink(ABC):
     def on_status(self, text: str, *, level: str = "info") -> None:
         """Display a status message."""
 
+    def on_message_queued(
+        self,
+        text: str,
+        *,
+        kind: str,
+        message_id: str = "",
+        urgency: str = "normal",
+    ) -> None:
+        """A message arrived while a turn was running and has been accepted.
+
+        ``kind`` is ``"interjection"`` when it is folded into the turn running
+        now, or ``"restart"`` when it will run as a turn of its own after this
+        one.  That distinction is why this is not an ``on_status`` line: a
+        client has to be able to say *when* the message will be dealt with, and
+        one that has to recover that from prose is a string edit away from
+        misreporting it.  The default renders the English line this used to be
+        a status for, so a sink with only a terminal behaves as it did.
+        """
+        self.on_status(
+            "Interjection queued." if kind == "interjection"
+            else "Message queued for the next turn.",
+            level="info",
+        )
+
     def on_error(self, error: str) -> None:
         """Display an error message."""
 

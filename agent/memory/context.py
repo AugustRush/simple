@@ -317,6 +317,7 @@ class ContextManager:
         assistant_message_id: str = "",
         reply_to_id: str = "",
         metadata: Optional[dict[str, Any]] = None,
+        interjections: Optional[Sequence[dict[str, Any]]] = None,
     ) -> ConversationWriteResult:
         """Persist an exchange and expose which event rows were created."""
         session_id = self.staging.session_id
@@ -329,6 +330,7 @@ class ContextManager:
             assistant_message_id=assistant_message_id,
             reply_to_id=reply_to_id,
             metadata=metadata,
+            interjections=interjections,
         )
         return write_result
 

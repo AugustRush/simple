@@ -218,6 +218,12 @@ def _messages_from_turns(
                 "message_id": str(getattr(turn, "message_id", "") or ""),
                 "reply_to_id": reply_to_id,
             }
+            # A message the user sent *during* this turn.  The flag travels with
+            # the row because the client has to render it as in-turn speech: an
+            # ordinary user row is a turn boundary, and treating an interjection
+            # as one splits the very turn that answered it.
+            if role == "user" and metadata.get("interjection"):
+                item["interjection"] = True
             if attachments:
                 item["attachments"] = attachments
             messages.append(item)
@@ -376,7 +382,13 @@ def _order_display_messages(
     user_turns = [
         item
         for item in turns_only
-        if item.get("role") == "user" and item.get("message_id")
+        if item.get("role") == "user"
+        and item.get("message_id")
+        # An interjection carries an id too, and it shares its turn's
+        # timestamp, so leaving it in this pool would let it collect the
+        # turn's orphaned tool rows -- the rows belong to the turn, which is
+        # the message that opened it.
+        and not item.get("interjection")
     ]
     for tool in tools_only:
         if str(tool.get("turn_id") or ""):

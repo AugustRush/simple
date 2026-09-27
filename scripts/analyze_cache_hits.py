@@ -282,6 +282,31 @@ def head_history(rows: Iterable[UsageRow]) -> dict[str, list[str]]:
     return history
 
 
+def shape_coverage(
+    rows: Iterable[UsageRow],
+) -> dict[str, tuple[int, int, str]]:
+    """Per phase: (calls, calls carrying the shape, last call time).
+
+    The head and body sections can only speak for rows that recorded the
+    shape, and the phases do not record it equally.  Without this a reader
+    takes "sessions whose head changed: 4" for a statement about the whole
+    table, when it is a statement about the four sessions that were ever asked
+    the question -- the sub-agent path is most of the bill and has answered
+    nothing.  The closing time is here because a phase that stopped being
+    recorded looks exactly like a phase that got better.
+    """
+    coverage: dict[str, tuple[int, int, str]] = {}
+    for row in rows:
+        phase = row.phase or "(unnamed)"
+        calls, shaped, latest = coverage.get(phase, (0, 0, ""))
+        coverage[phase] = (
+            calls + 1,
+            shaped + (1 if row.head_fingerprint else 0),
+            max(latest, row.created_at),
+        )
+    return coverage
+
+
 # ── Rendering ──────────────────────────────────────────────────────────────
 
 
@@ -391,6 +416,12 @@ def render(rows: Sequence[UsageRow], source: Path, top: int = 5) -> str:
                         _totals_row(label, totals)
                         for label, totals in rewrites.items()
                     ],
+                )
+                + (
+                    f"\n{unrecorded} row(s) recorded no body flag and are not in "
+                    "this table."
+                    if unrecorded
+                    else ""
                 ),
             )
         )
@@ -404,6 +435,7 @@ def render(rows: Sequence[UsageRow], source: Path, top: int = 5) -> str:
         )
 
     history = head_history(rows)
+    coverage = shape_coverage(rows)
     if history:
         unstable = {
             session: heads for session, heads in history.items() if len(heads) > 1
@@ -411,6 +443,19 @@ def render(rows: Sequence[UsageRow], source: Path, top: int = 5) -> str:
         lines = [
             f"sessions with a recorded head: {len(history)}",
             f"sessions whose head changed mid-session: {len(unstable)}",
+            "",
+            "Scope: the two lines above and the table below cover only rows",
+            "whose phase recorded the shape:",
+            "",
+            _table(
+                ("phase", "calls", "with shape", "last call"),
+                [
+                    [phase, str(calls), str(shaped), latest or "?"]
+                    for phase, (calls, shaped, latest) in sorted(
+                        coverage.items(), key=lambda item: -item[1][0]
+                    )
+                ],
+            ),
         ]
         if unstable:
             lines.append("")

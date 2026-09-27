@@ -91,10 +91,19 @@ class ConversationWriteResult:
     user_created: bool = False
     assistant_created: bool = False
     first_assistant_for_user: bool = False
+    #: Texts of the interjection rows this call actually inserted.  Empty when
+    #: there were none, and empty again for one already on disk: the insert is
+    #: idempotent on the message id, so a retry must not push the same words
+    #: into the memory pipeline twice.
+    interjections_created: tuple[str, ...] = ()
 
     @property
     def changed(self) -> bool:
-        return self.user_created or self.assistant_created
+        return (
+            self.user_created
+            or self.assistant_created
+            or bool(self.interjections_created)
+        )
 
 
 @dataclass(frozen=True)

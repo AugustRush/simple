@@ -336,6 +336,10 @@ export function useConversations(deps: Deps) {
               tool: item.tool,
               toolState: item.toolState as ToolState | undefined,
               attachments: Array.isArray(item.attachments) ? item.attachments : undefined,
+              // A message the user sent during the turn that answered it.  It
+              // has to survive this mapping: without the flag the row reads as
+              // a turn boundary, and the grouping would split that turn again.
+              interjection: item.interjection === true ? true : undefined,
             }
           },
         )
@@ -375,6 +379,18 @@ export function useConversations(deps: Deps) {
             else merged.push(tool)
           }
           merged.push(...runningSubagents)
+          // Messages sent during this turn are not in the transcript yet -- the
+          // record gets them when the turn ends -- so a refresh mid-turn would
+          // otherwise erase the reader's own words from the screen.
+          const pendingInTurn = current.filter(
+            item => item.role === 'user' && (item.queued || item.interjection),
+          )
+          const knownContents = new Set(
+            merged.filter(item => item.role === 'user').map(item => item.content),
+          )
+          for (const pending of pendingInTurn) {
+            if (!knownContents.has(pending.content)) merged.push(pending)
+          }
           if (latestStream) merged.push(latestStream)
         }
         messagesRef.current = merged
@@ -669,22 +685,58 @@ export function useConversations(deps: Deps) {
           return
         }
 
+        if (evt.type === 'message_queued') {
+          // A message accepted mid-turn.  The channel now says *which* queue it
+          // went into, so the row can be marked for what it is instead of being
+          // guessed at from the wording of a status line.  Nothing is appended
+          // to the transcript: the message is already there, optimistically,
+          // and the server's record will confirm it -- an interjection inside
+          // the turn it interrupted, a restart as its own later turn.
+          const pendingId = String(evt.message_id || '')
+          const kind = String(evt.kind || '')
+          const text = String(evt.text || '')
+          if (pendingId) {
+            updateMessage(pendingId, {
+              queued: kind !== 'interjection',
+              interjection: kind === 'interjection',
+            })
+          }
+          if (kind === 'interjection') {
+            // The running turn has read it, so it is no longer waiting for
+            // anything: leaving it in the strip would keep offering a withdraw
+            // for a message that cannot be taken back.
+            queuedMessagesRef.current = queuedMessagesRef.current.filter(
+              item => item.id !== pendingId,
+            )
+            setQueuedMessages([...queuedMessagesRef.current])
+            setActivity('这条插话已交给正在进行的回合')
+          } else {
+            setActivity(
+              `已排队 ${queuedMessagesRef.current.length || 1} 条消息，将在本回合结束后处理`,
+            )
+            if (text) {
+              const entry = queuedMessagesRef.current.find(item => item.id === pendingId)
+              if (entry) entry.text = text
+            }
+          }
+          return
+        }
+
         if (evt.type === 'status' || evt.type === 'info') {
           const text =
             evt.text ||
             (typeof evt.content === 'string'
               ? evt.content
               : JSON.stringify(evt.content))
-          // The coordinator acknowledges messages submitted while a turn is
-          // active with a queue status.  Remove the optimistic local queue
-          // marker as soon as that acknowledgement arrives; otherwise an
-          // interjection (which is consumed by the current turn) can remain
-          // stuck as "排队中" forever after a single turn_complete event.
-          if (/queued|排队/i.test(text) && queuedMessagesRef.current.length > 0) {
-            const queued = queuedMessagesRef.current.shift()
-            setQueuedMessages([...queuedMessagesRef.current])
-            if (queued) updateMessage(queued.id, { queued: false })
-          }
+          // A status is what the agent is doing *right now*, not something it
+          // said: it belongs in the activity line and nowhere else.  It used
+          // to be appended as a transcript row, which turned a transient
+          // acknowledgement -- and, for the queue notices, an English sentence
+          // written for a terminal -- into a permanent-looking message that
+          // vanished again on reload.  Command *output* still arrives as a
+          // status, so the row stays for it: only the queue notices, which the
+          // channel now sends as `message_queued`, are excluded, and they never
+          // reach this branch.
           setActivity(truncate(text, 90))
           appendMessage({ id: makeId(), role: 'command', content: text })
           return

@@ -1325,3 +1325,75 @@ def test_set_session_prompt_attaches_task_context_regardless_of_caller():
     state.task_context = ""
     state.set_session_prompt("next turn prompt")
     assert state.ctx.system_prompt == "next turn prompt"
+
+
+def test_an_interjection_reaches_the_record_and_the_memory_pipeline(tmp_path):
+    """The whole path, through the real objects: drain -> journal -> display.
+
+    The defect this pins was a gap between two facts that were both true: the
+    model read the interjection (it was in ``ctx.messages``) while the journal
+    only ever received the message that *opened* the turn.  Each half passed on
+    its own; together they produced a transcript that showed the agent
+    answering a question which appeared nowhere -- and dropped the user's own
+    words from the memory pipeline with it.
+    """
+    import agent as agent_module
+    from agent.memory.consolidation import ConsolidationEngine
+    from agent.memory.context import ContextManager
+    from agent.memory.retrieval import LocalRetriever
+    from agent.memory.store import LTMStore
+    from agent.session_service import SessionService
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    staging = agent_module.StagingBuffer(path=tmp_path / "staging.jsonl")
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=staging,
+    )
+    staging.session_id = "web-session"
+
+    registry = agent_module.ToolRegistry()
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    ctx = agent_module.AgentContext(system_prompt="sys")
+
+    # What the running turn does when the mailbox is drained.
+    agent._inject_pending_interjections(
+        ctx,
+        [{"text": "这些文件里有 markdown 吗？", "message_id": "inj-1", "urgency": "now"}],
+    )
+
+    class _Agent:
+        max_tokens = 1000
+
+    agent_module.BaseAgent._post_turn_maintenance(
+        ctx_mgr=manager,
+        agent=_Agent(),
+        ctx=ctx,
+        user_content="列出文件",
+        assistant_content="有 markdown",
+        channel="web",
+        record_kwargs={
+            "message_id": "turn-1",
+            "metadata": {"message_id": "turn-1"},
+        },
+    )
+
+    turns = store.recent_conversation_turns(session_id="web-session")
+    assert [(t.role, t.content) for t in turns] == [
+        ("user", "列出文件"),
+        ("user", "这些文件里有 markdown 吗？"),
+        ("assistant", "有 markdown"),
+    ]
+    # The user's words reach the memory pipeline, in the order they said them.
+    staged = [(item["role"], item["content"]) for item in staging.read_all()]
+    assert ("user", "这些文件里有 markdown 吗？") in staged
+
+    # And the client is told, by flag rather than by prose.
+    display = SessionService(store=store).get_messages("web-session")
+    assert [item["role"] for item in display] == ["user", "user", "assistant"]
+    assert display[1]["interjection"] is True
+    assert "interjection" not in display[0]

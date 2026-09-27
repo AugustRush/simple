@@ -76,6 +76,15 @@ export interface Message {
   content: string
   streaming?: boolean
   queued?: boolean
+  /**
+   * A message the user sent while a turn was already running.
+   *
+   * Set by the server on the recorded row (the message was folded into the
+   * turn that answered it), and known locally via `queued` while that turn is
+   * still in flight.  Either way it is *not* a turn boundary: it renders
+   * inside the turn, marked as an aside, instead of starting a new exchange.
+   */
+  interjection?: boolean
   link?: string
   tool?: string
   toolState?: ToolState

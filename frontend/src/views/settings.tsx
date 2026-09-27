@@ -157,6 +157,37 @@ function providerFieldControl(
   }
 }
 
+/** One field of the provider editor: label, control, help.
+ *
+ * Extracted because the same three elements used to render twice -- the
+ * editor of an existing provider and the "add" form -- as two copies of the
+ * same JSX. `kind` rides along as a class so CSS can size a row by what it
+ * holds: a switch is a label with a pill beside it, a header table wants the
+ * full width, everything else is a column in the two-column grid.
+ */
+function ProviderFieldRow({
+  spec,
+  value,
+  onChange,
+  idPrefix,
+}: {
+  spec: ProviderFieldSpec
+  value: unknown
+  onChange: (next: unknown) => void
+  idPrefix: string
+}) {
+  return (
+    <div className={`provider-field provider-field-${spec.kind}`}>
+      <label className="settings-field-label" htmlFor={`${idPrefix}-${spec.key}`}>
+        {spec.label}
+        {spec.required && <span className="provider-field-required"> *</span>}
+      </label>
+      {providerFieldControl(spec, value, onChange, `${idPrefix}-${spec.key}`)}
+      {spec.help && <div className="settings-hint">{spec.help}</div>}
+    </div>
+  )
+}
+
 /** The provider list and per-provider editor.
  *
  * Defined at module scope on purpose: `createSettingsView` runs on every App
@@ -326,15 +357,16 @@ function ProvidersCard({
           const open = editing === name
           return (
             <Card key={name} size="small" className="provider-row">
-              <Space style={{ width: '100%', justifyContent: 'space-between' }} wrap>
-                <Space wrap>
+              {/* The summary line sits under the name, on a line of its own:
+                  inline with the name it shared one flex row with four
+                  buttons, and the first long base_url wrapped the buttons to
+                  a second row and jumped every row below. Its own line can
+                  ellipsize instead. */}
+              <div className="provider-row-head">
+                <div className="provider-row-title">
                   <strong>{name}</strong>
                   {isActive && <Tag color="green">使用中</Tag>}
-                  <span className="settings-hint">
-                    {String(provider.api_format || '?')} · {String(provider.base_url || '默认地址')} ·{' '}
-                    {(provider.models || []).length || 1} 个模型
-                  </span>
-                </Space>
+                </div>
                 <Space wrap>
                   <Button
                     size="small"
@@ -362,25 +394,26 @@ function ProvidersCard({
                     </Button>
                   </Popconfirm>
                 </Space>
-              </Space>
+              </div>
+              <div
+                className="provider-row-meta"
+                title={`${String(provider.api_format || '?')} · ${String(provider.base_url || '默认地址')} · ${(provider.models || []).length || 1} 个模型`}
+              >
+                {String(provider.api_format || '?')} · {String(provider.base_url || '默认地址')} ·{' '}
+                {(provider.models || []).length || 1} 个模型
+              </div>
               {open && (
                 <div className="provider-editor">
                   {fields.map(spec => (
-                    <div key={spec.key} className="provider-field">
-                      <label className="settings-field-label" htmlFor={`${name}-${spec.key}`}>
-                        {spec.label}
-                        {spec.required && <span style={{ color: '#ff4d4f' }}> *</span>}
-                      </label>
-                      {providerFieldControl(
-                        spec,
-                        draft[spec.key],
-                        next => setDraft(prev => ({ ...prev, [spec.key]: next })),
-                        `${name}-${spec.key}`,
-                      )}
-                      {spec.help && <div className="settings-hint">{spec.help}</div>}
-                    </div>
+                    <ProviderFieldRow
+                      key={spec.key}
+                      spec={spec}
+                      value={draft[spec.key]}
+                      onChange={next => setDraft(prev => ({ ...prev, [spec.key]: next }))}
+                      idPrefix={name}
+                    />
                   ))}
-                  <Space>
+                  <Space className="provider-editor-actions">
                     <Button type="primary" loading={saving} onClick={submit}>
                       保存这个 Provider
                     </Button>
@@ -401,23 +434,18 @@ function ProvidersCard({
             id="new-provider-name"
             value={newName}
             placeholder="例如 opencode-go"
+            style={{ maxWidth: 320 }}
             onChange={event => setNewName(event.target.value)}
           />
           <div className="provider-editor">
             {fields.map(spec => (
-              <div key={spec.key} className="provider-field">
-                <label className="settings-field-label" htmlFor={`new-${spec.key}`}>
-                  {spec.label}
-                  {spec.required && <span style={{ color: '#ff4d4f' }}> *</span>}
-                </label>
-                {providerFieldControl(
-                  spec,
-                  draft[spec.key],
-                  next => setDraft(prev => ({ ...prev, [spec.key]: next })),
-                  `new-${spec.key}`,
-                )}
-                {spec.help && <div className="settings-hint">{spec.help}</div>}
-              </div>
+              <ProviderFieldRow
+                key={spec.key}
+                spec={spec}
+                value={draft[spec.key]}
+                onChange={next => setDraft(prev => ({ ...prev, [spec.key]: next }))}
+                idPrefix="new"
+              />
             ))}
           </div>
           <Space>
@@ -481,62 +509,62 @@ export function createSettingsView(ctx: AppCtx) {
         <Skeleton active paragraph={{ rows: 10 }} />
       ) : (
         <div className="settings-grid">
+          {/* One card, two rows. These used to be two half-empty 480px cards,
+              each holding a single control in a 225px frame, while the model
+              form below was squeezed for the width they were wasting. A row
+              per preference is the shape a boolean-ish setting wants (see the
+              channel switches further down), and both take effect without the
+              save button, which the kicker says. */}
           <Card
-            className="settings-card"
-            title="访问令牌"
-            extra={
-              <span className="card-kicker">
-                SECURITY<span className="settings-instant-tag">即时生效</span>
-              </span>
-            }
+            className="settings-card settings-card-wide"
+            title="访问与偏好"
+            extra={<span className="card-kicker">即时生效</span>}
           >
-            <p className="settings-hint">
-              Web 频道默认只绑定本地地址，因此令牌通常可以为空。对外暴露端口时请填写鉴权令牌。
-            </p>
-            <Space.Compact style={{ width: '100%' }}>
-              <Input.Password
-                value={tokenDraft}
-                onChange={event => setTokenDraft(event.target.value)}
-                onPressEnter={applyToken}
-                placeholder="auth_token（可选）"
+            <div className="settings-pref">
+              <div className="settings-pref-copy">
+                <span className="settings-pref-name">访问令牌</span>
+                <span className="settings-pref-desc">
+                  Web 频道默认只绑定本地地址，令牌通常可以为空；对外暴露端口时请填写鉴权令牌。
+                </span>
+              </div>
+              <Space.Compact className="settings-pref-control">
+                <Input.Password
+                  value={tokenDraft}
+                  onChange={event => setTokenDraft(event.target.value)}
+                  onPressEnter={applyToken}
+                  placeholder="auth_token（可选）"
+                />
+                <Button
+                  type="primary"
+                  className="settings-inline-save"
+                  disabled={!tokenDirty}
+                  onClick={applyToken}
+                >
+                  {tokenDirty ? '保存令牌' : '已保存'}
+                </Button>
+              </Space.Compact>
+            </div>
+            <div className="settings-pref">
+              <div className="settings-pref-copy">
+                <span className="settings-pref-name">发送快捷键</span>
+                <span className="settings-pref-desc">
+                  中文输入法用 Enter 上屏，切换成 Ctrl/Cmd + Enter 可避免误发送。
+                </span>
+              </div>
+              <Select
+                value={sendShortcut}
+                onChange={value => {
+                  setSendShortcut(value)
+                  localStorage.setItem('send_shortcut', value)
+                  messageApi.success(`发送快捷键已改为：${value === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'}`)
+                }}
+                options={[
+                  { value: 'enter', label: 'Enter' },
+                  { value: 'ctrl-enter', label: 'Ctrl/Cmd + Enter' },
+                ]}
+                className="settings-pref-control settings-pref-select"
               />
-              <Button
-                type="primary"
-                className="settings-inline-save"
-                disabled={!tokenDirty}
-                onClick={applyToken}
-              >
-                {tokenDirty ? '保存令牌' : '已保存'}
-              </Button>
-            </Space.Compact>
-          </Card>
-
-          <Card
-            className="settings-card"
-            title="发送偏好"
-            extra={
-              <span className="card-kicker">
-                UX<span className="settings-instant-tag">即时生效</span>
-              </span>
-            }
-          >
-            <p className="settings-hint">
-              修改发送快捷键。中文输入法用 Enter 上屏，切换成 Ctrl/Cmd + Enter 可避免误发送。
-            </p>
-            <label className="settings-field-label">发送快捷键</label>
-            <Select
-              value={sendShortcut}
-              onChange={value => {
-                setSendShortcut(value)
-                localStorage.setItem('send_shortcut', value)
-                messageApi.success(`发送快捷键已改为：${value === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'}`)
-              }}
-              options={[
-                { value: 'enter', label: 'Enter' },
-                { value: 'ctrl-enter', label: 'Ctrl/Cmd + Enter' },
-              ]}
-              style={{ width: '100%' }}
-            />
+            </div>
           </Card>
 
           <ProvidersCard
@@ -689,6 +717,7 @@ export function createSettingsView(ctx: AppCtx) {
               }}
               className="settings-json"
               spellCheck={false}
+              autoSize={{ minRows: 12, maxRows: 30 }}
             />
           </Card>
         </div>

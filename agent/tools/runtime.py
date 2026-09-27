@@ -317,7 +317,11 @@ class ToolRegistry:
         ("builtin", "set_identity"): frozenset({"state_write"}),
         ("builtin", "memory_clear"): frozenset({"state_write"}),
         ("builtin", "schedule_create"): frozenset({"state_write", "requires_request"}),
-        ("builtin", "schedule_delete"): frozenset({"state_write"}),
+        # Declared at the registration site rather than here, like the rest of
+        # the schedule maintenance half: see the note below on why a destructive
+        # schedule tool declares its intent.  The default here has to agree with
+        # that declaration or a reader takes the table for the answer.
+        ("builtin", "schedule_delete"): frozenset({"state_write", "requires_intent"}),
         # The maintenance half of the schedule tools, and the split is
         # deliberate.  `requires_request` is "nobody asked, so propose it
         # instead"; `requires_intent` is "say what you are doing", which is what
@@ -343,7 +347,7 @@ class ToolRegistry:
         # the next reader concludes the other half was considered.
         ("builtin", "workflow_list"): frozenset({"read"}),
         ("builtin", "workflow_create"): frozenset({"state_write", "requires_request"}),
-        ("builtin", "workflow_delete"): frozenset({"state_write"}),
+        ("builtin", "workflow_delete"): frozenset({"state_write", "requires_intent"}),
         # Same reasoning as `schedule_update`: rebuilding a chain instead of
         # editing it is what leaves steps behind whose run history is stranded,
         # so the edit is the move that has to be available.
@@ -354,12 +358,18 @@ class ToolRegistry:
         # unasked task this was written for is the same failure with a shorter
         # blast radius, so it gets the same check.
         #
-        # The deletes above do NOT get it, and that is a decision rather than an
-        # omission: creating something and answering a question by deleting
-        # something are not the same failure, because a delete cannot be an
-        # answer to "怎么用" the way a freshly built task can.  Marking a delete
-        # would also demand the user's words for tidying up after an edit, which
-        # is where the asker's own sentence is hardest to point at.
+        # The two deletes carry `requires_intent` rather than
+        # `requires_request`, and the difference is the one the distinction
+        # exists for.  A creation is an answer to a question, so refusing an
+        # unasked one is right; tidying up after an edit is not, and demanding
+        # the user's words for it would fail on the sentence that never named a
+        # deletion.  That is the argument against `requires_request`, and it is
+        # not an argument against a self-declaration: `schedule_cancel` already
+        # declares, deleting a task takes its run history with it -- strictly
+        # more than cancelling does -- and once the schemas are sent for the
+        # life of the session (see `ContextAssembler.select_tools`), a delete
+        # nobody chose cannot be left as the one destructive call with nothing
+        # in front of it.
         ("builtin", "emit_signal"): frozenset({"state_write", "requires_request"}),
         ("runtime:skill", "activate_skill"): frozenset({"read"}),
         ("runtime:skill", "list_skill_files"): frozenset({"read"}),

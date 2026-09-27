@@ -620,6 +620,62 @@ html[data-theme='light'] .tool-trace-items {
   font-size: 11px;
 }
 
+/* A message the user sent while the turn was running.
+ *
+ * Not a turn of its own -- the turn it interrupted is still the one being
+ * answered -- so it reads as an aside: narrower than a turn, hung off the
+ * left rail, with a 插话 tag instead of a "你" bubble.  The distinction is the
+ * whole point: as an ordinary user row this split the running turn in two and
+ * pushed that turn's tool trace below the message that interrupted it. */
+.message-interjection {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 2px 0 2px 14px;
+  padding: 9px 12px;
+  border-left: 2px solid var(--border-strong);
+  border-radius: 0 10px 10px 0;
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+  color: var(--text-secondary);
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.message-interjection.is-pending {
+  border-left-style: dashed;
+}
+
+.message-interjection-mark {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  line-height: 18px;
+}
+
+.message-interjection-body {
+  min-width: 0;
+}
+
+.message-interjection-body .markdown > :first-child {
+  margin-top: 0;
+}
+
+.message-interjection-body .markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.message-interjection-state {
+  flex: 0 0 auto;
+  color: var(--amber);
+  font-size: 10px;
+  line-height: 20px;
+}
+
 .system-note {
   align-self: stretch;
   max-width: min(680px, 100%);

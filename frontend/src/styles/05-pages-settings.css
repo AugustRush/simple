@@ -301,6 +301,183 @@
   font-size: 13px;
 }
 
+/* ---- Provider rows and editor ---- */
+
+.provider-row + .provider-row {
+  margin-top: 10px;
+}
+
+.provider-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.provider-row-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* The summary under the name: format · base_url · model count, on a line of
+   its own so a long URL ellipsizes instead of wrapping the buttons under it.
+   `title` carries the full URL -- the line is a preview, not the value. */
+.provider-row-meta {
+  margin-top: 4px;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-row-meta:empty {
+  display: none;
+}
+
+/* The editor's field grid. Two columns at 640px+ (the closed row is one
+ * `space-between` line, so 640 is about where the card stops being wide),
+ * one column below. `dense` lets a wide field (a header table) slot into a
+ * gap a narrow one leaves, instead of the row staying half-empty.
+ *
+ * The row gap is grid's; the label/control/help stack inside a field uses
+ * margins so a field's pieces stay together in the dense flow. */
+.provider-editor {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 18px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.provider-editor-actions {
+  grid-column: 1 / -1;
+  margin-top: 2px;
+}
+
+@media (max-width: 640px) {
+  .provider-editor {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.provider-field .settings-field-label {
+  margin-bottom: 7px;
+}
+
+.provider-field .settings-hint {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.provider-field-required {
+  color: #ff4d4f;
+}
+
+/* A header table is rows of inputs; squeezed into one 400px column those
+   rows fold into three-line stacks. It takes the full row instead, like it
+   already does on a phone. */
+.provider-field-string_map {
+  grid-column: 1 / -1;
+}
+
+/* A boolean is a label with a pill beside it, not a column: the switch is
+   its own control height, so a stacked field put 44px in a 400px column and
+   left the rest empty. Same shape as the channel switches below. */
+.provider-field-bool {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-hover);
+}
+
+.provider-field-bool .settings-field-label {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.provider-field-bool .settings-hint {
+  flex: 1;
+  margin: 0;
+  font-size: 11px;
+}
+
+.provider-field-bool .ant-switch {
+  flex: 0 0 auto;
+}
+
+/* ---- Instant-effect preferences ---- */
+
+/* Two rows in one card: what it is on the left (name over description),
+   the control on the right, aligned to a width that a compact (a token
+   input and its save button) does not rattle around in. Both rows used to
+   be their own half-empty cards. */
+.settings-pref {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+}
+
+.settings-pref + .settings-pref {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-pref-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.settings-pref-name {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.settings-pref-desc {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.settings-pref-control {
+  flex: 0 1 380px;
+}
+
+.settings-pref-select {
+  width: 200px;
+}
+
+@media (max-width: 640px) {
+  .settings-pref {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .settings-pref-control {
+    flex-basis: auto;
+  }
+
+  .settings-pref-select {
+    width: 100%;
+  }
+}
+
 /* Marks a card whose control takes effect the moment it changes, so the
  * difference from the cards behind the "保存设置" button is visible rather than
  * something the user has to work out. */
@@ -446,7 +623,6 @@
 }
 
 .settings-json {
-  min-height: 360px !important;
   color: var(--text);
   background: #0c0e14;
   border-color: var(--border);
@@ -455,6 +631,8 @@
   /* A `line-height` used to sit here. antd's own `.ant-input` rule is injected
      after this sheet and won, so the box has always been drawn at antd's
      1.5714 -- the declaration described a line box that was never rendered. */
+  /* The height is `autoSize` in the component: it follows the content (12-30
+     rows) instead of the fixed 360px that showed 19 of 185 lines. */
 }
 
 html[data-theme='light'] .settings-json {

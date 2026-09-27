@@ -628,6 +628,32 @@ class WebOutputSink(OutputSink):
     def on_status(self, text: str, *, level: str = "info") -> None:
         self._emit({"type": "status", "text": text, "level": level})
 
+    def on_message_queued(
+        self,
+        text: str,
+        *,
+        kind: str,
+        message_id: str = "",
+        urgency: str = "normal",
+    ) -> None:
+        """A message accepted mid-turn, as data rather than as a sentence.
+
+        Deliberately not an ``on_status`` line.  This client shows the message
+        in its queue strip and then renders it in the turn once the record has
+        it, so what it needs is the kind and the id -- not prose to parse, and
+        not a transcript row for a transient acknowledgement.  The English
+        fallback stays on the base sink, for the channels that only print.
+        """
+        self._emit(
+            {
+                "type": "message_queued",
+                "text": text,
+                "kind": kind,
+                "message_id": message_id,
+                "urgency": urgency,
+            }
+        )
+
     def on_error(self, error: str) -> None:
         self._emit({"type": "error", "error": error})
 

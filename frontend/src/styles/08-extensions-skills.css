@@ -91,10 +91,15 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
   box-shadow: none;
   font-weight: 500;
 }
+/* One column. The page used to be a 980px two-column grid whose first row
+ * was two half-empty cards, while the four-column model form below squeezed
+ * into 220px columns. A full-width row gives the model form ~250px columns
+ * and every card a consistent edge; the small settings now sit in one
+ * "访问与偏好" card of two rows (see `.settings-pref`). */
 .settings-view .settings-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 20px;
-  max-width: 980px;
+  max-width: 1080px;
 }
 /* Wide cards say so themselves.  This used to be `.settings-card:nth-child(3)`,
  * which meant the layout silently changed whenever a card was reordered or
@@ -145,10 +150,6 @@ html[data-theme] .settings-inline-save:active:not(:disabled) {
   }
   .settings-view .settings-grid {
     grid-template-columns: minmax(0, 1fr);
-  }
-  .settings-view .settings-card-wide,
-  .settings-view .settings-json-card {
-    grid-column: auto;
   }
 }
 

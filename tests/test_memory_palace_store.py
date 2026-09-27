@@ -333,3 +333,81 @@ def test_export_jsonl_replaces_the_file_durably(tmp_path, monkeypatch):
     # intermediate state was a complete file.
     assert observed == [before]
     assert [p.name for p in (tmp_path / "memory").iterdir() if p.name.startswith(".")] == []
+
+
+# ── Interjections are part of the turn that answered them ───────────────────
+
+
+def _interjection_store(tmp_path):
+    from agent import LTMStore
+
+    return LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+
+
+def test_an_interjection_is_journaled_between_the_request_and_the_answer(tmp_path):
+    """The model answers it in this turn, so the record has to show the words.
+
+    Before this, only the message that *opened* a turn was written: the
+    transcript held an answer to a question that appeared nowhere, and the
+    user's own sentence was gone -- from the display and from the memory
+    pipeline alike.
+    """
+    store = _interjection_store(tmp_path)
+
+    result = store.write_conversation_exchange(
+        session_id="cli",
+        user_content="列出文件",
+        assistant_content="收到，先不总结",
+        message_id="m1",
+        interjections=[
+            {"text": "这些文件里有 markdown 吗？", "message_id": "i1", "urgency": "now"}
+        ],
+    )
+
+    assert result.interjections_created == ("这些文件里有 markdown 吗？",)
+    turns = store.recent_conversation_turns(session_id="cli")
+    assert [(t.role, t.content) for t in turns] == [
+        ("user", "列出文件"),
+        ("user", "这些文件里有 markdown 吗？"),
+        ("assistant", "收到，先不总结"),
+    ]
+    # The flag is what lets a client render it as in-turn speech rather than
+    # as the start of another turn.
+    assert turns[1].metadata.get("interjection") is True
+    assert turns[1].metadata.get("urgency") == "now"
+
+
+def test_replaying_the_same_turn_does_not_duplicate_an_interjection(tmp_path):
+    """The write is idempotent on the message id, like the user row beside it."""
+    store = _interjection_store(tmp_path)
+    entry = {"text": "补一句", "message_id": "i1"}
+
+    for _ in range(3):
+        result = store.write_conversation_exchange(
+            session_id="cli",
+            user_content="原始请求",
+            assistant_content="回答",
+            message_id="m1",
+            interjections=[entry],
+        )
+
+    contents = [t.content for t in store.recent_conversation_turns(session_id="cli")]
+    assert contents.count("补一句") == 1
+    # Only the call that created the row reports it, so nothing stages the
+    # same words into the memory pipeline twice.
+    assert result.interjections_created == ()
+
+
+def test_an_interjection_without_an_id_is_still_recorded_once_per_turn(tmp_path):
+    """A channel that cannot name its messages must not lose them."""
+    store = _interjection_store(tmp_path)
+
+    store.write_conversation_exchange(
+        session_id="cli",
+        user_content="原始请求",
+        assistant_content="回答",
+        interjections=[{"text": "没有 id 的插话"}],
+    )
+
+    contents = [t.content for t in store.recent_conversation_turns(session_id="cli")]
+    assert contents == ["原始请求", "没有 id 的插话", "回答"]

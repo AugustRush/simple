@@ -1274,12 +1274,21 @@ class BuiltinTools:
                     "task_id": {
                         "type": "string",
                         "description": "Scheduled task id to delete",
-                    }
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Required. Why this task is being deleted, and what "
+                            "it was for."
+                        ),
+                    },
                 },
-                "required": ["task_id"],
+                "required": ["task_id", "intent"],
+                "additionalProperties": False,
             },
             self._schedule_delete,
             source="builtin",
+            capabilities=("state_write", "requires_intent"),
         )
 
         r.register(
@@ -1662,12 +1671,21 @@ class BuiltinTools:
                     "workflow_id": {
                         "type": "string",
                         "description": "Workflow id to delete; workflow_list shows them",
-                    }
+                    },
+                    "intent": {
+                        "type": "string",
+                        "description": (
+                            "Required. Why this chain is being deleted, and what "
+                            "it was for."
+                        ),
+                    },
                 },
-                "required": ["workflow_id"],
+                "required": ["workflow_id", "intent"],
+                "additionalProperties": False,
             },
             self._workflow_delete,
             source="builtin",
+            capabilities=("state_write", "requires_intent"),
         )
 
         r.register(
@@ -4253,8 +4271,12 @@ class BuiltinTools:
             ),
         )
 
-    def _schedule_delete(self, task_id: str) -> dict[str, Any]:
+    def _schedule_delete(self, task_id: str, intent: str = "") -> dict[str, Any]:
         """Delete a task, and its run history with it.
+
+        ``intent`` is declared, not read: the executor refuses the call without
+        it, and this function never inspects it.  Same shape as
+        ``schedule_cancel``, and declared at registration rather than here.
 
         Which tasks may be deleted here is the store's answer, not this
         tool's: a running task, and a step of a workflow that still exists,
@@ -4946,8 +4968,10 @@ class BuiltinTools:
             )
         return self._ok(count=len(items), items=items)
 
-    def _workflow_delete(self, workflow_id: str) -> dict[str, Any]:
+    def _workflow_delete(self, workflow_id: str, intent: str = "") -> dict[str, Any]:
         """Stop a workflow, keeping the record that it ran.
+
+        ``intent`` is declared, not read -- see ``_schedule_delete``.
 
         The tasks behind it are disabled rather than deleted, which is what the
         store does; this only says so, because "deleted" would suggest the run

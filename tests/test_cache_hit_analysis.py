@@ -34,6 +34,7 @@ from scripts.analyze_cache_hits import (  # noqa: E402
     group_by,
     head_history,
     read_events,
+    shape_coverage,
     render,
     rewrite_totals,
 )
@@ -347,3 +348,40 @@ def test_uncached_tokens_are_summed_so_the_bill_can_be_read_off_the_table():
 def test_the_uncached_column_appears_in_the_rendered_report():
     rows = [_row(input_tokens=1000, cached=900), _row(input_tokens=1000, cached=0)]
     assert "1.1k" in render(rows, source=":memory:")
+
+
+def test_the_head_section_states_which_phases_it_covers():
+    """A reader must not take the head table for the whole table.
+
+    The sub-agent path is most of the bill and records no shape, so a report
+    that printed "sessions whose head changed: 4" alone would read as a
+    statement about every call in the database.  The coverage block names the
+    phases that were never asked the question -- and when each phase last
+    recorded anything, because a phase that stopped being recorded looks
+    exactly like a phase that got better.
+    """
+    rows = [
+        _row(phase="tool_step", metadata={HEAD_KEY: "a" * 8},
+             created_at="2026-09-24 08:00:00 UTC"),
+        _row(phase="subagent", created_at="2026-09-22 09:00:00 UTC"),
+        _row(phase="subagent", created_at="2026-09-22 09:30:00 UTC"),
+    ]
+    report = render(rows, Path("palace.db"))
+
+    assert "with shape" in report
+    assert "subagent" in report
+    assert "2026-09-22 09:30:00 UTC" in report
+
+
+def test_shape_coverage_counts_only_rows_that_recorded_a_head():
+    """Counts and the closing time per phase, so staleness is visible."""
+    rows = [
+        _row(phase="foreground", metadata={HEAD_KEY: "a" * 8},
+             created_at="2026-09-24 08:00:00 UTC"),
+        _row(phase="foreground", created_at="2026-09-24 09:00:00 UTC"),
+        _row(phase="subagent", created_at="2026-09-22 09:00:00 UTC"),
+    ]
+    coverage = shape_coverage(rows)
+
+    assert coverage["foreground"] == (2, 1, "2026-09-24 09:00:00 UTC")
+    assert coverage["subagent"] == (1, 0, "2026-09-22 09:00:00 UTC")

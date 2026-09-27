@@ -27,6 +27,33 @@ import { useShell } from './hooks/useShell'
 const { Content, Header, Sider } = Layout
 dayjs.locale('zh-cn')
 
+//: How many hits the search modal shows before the "还有 N 条" line. The
+//: list scrolls, so this is a "don't render a wall" cap rather than a
+//: screen-space one -- but the line has to say it, or a session past the cut
+//: looks like it does not exist.
+const SEARCH_RESULT_LIMIT = 12
+
+/** The query's first hit inside `text`, wrapped in a `<mark>`.
+ *
+ * Search matches on substring (title or session id), so a hit is a run of
+ * characters the user just typed -- marking it is what lets them scan a list
+ * of similar titles for the one they meant. Only the first hit is marked:
+ * the rest are found by eye from there.
+ */
+function highlightQuery(text: string, query: string): React.ReactNode {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return text
+  const at = text.toLowerCase().indexOf(needle)
+  if (at < 0) return text
+  return (
+    <>
+      {text.slice(0, at)}
+      <mark>{text.slice(at, at + needle.length)}</mark>
+      {text.slice(at + needle.length)}
+    </>
+  )
+}
+
 function App() {
   const ui = useUi()
 
@@ -50,7 +77,7 @@ function App() {
 
   const { approvalCommandRef, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, sendConfirm, setConfirmDetailOpen } = confirm
 
-  const { activateTurnIndex, activeSession, activity, allFilteredSessionsSelected, awayFromLatest, chatScrollRef, composerRef, composerSendable, connected, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSelectedSessions, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSelectedSessionIds, setSendShortcut, setSessionSearch, stopStreaming, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
+  const { activateTurnIndex, activeSession, activity, allFilteredSessionsSelected, awayFromLatest, chatScrollRef, composerRef, composerSendable, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, deleteSelectedSessions, deleteSession, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadingSessions, messages, pendingAttachments, pendingDeleteSessionId, permissionLabel, permissionLevel, pickWorkspace, queueView, renamingSession, commitSessionTitle, setRenamingSession, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setInput, setPendingAttachments, setPendingDeleteSessionId, setSelectedSessionIds, setSendShortcut, setSessionSearch, stopStreaming, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = conversations
 
   const { deletePlugin, deleteSkill, extensionsTab, filteredPlugins, filteredSkills, pluginSearch, setExtensionsTab, setPluginSearch, setSkillFilter, setSkillSearch, skillFilter, skillSearch, skills, togglePlugin, toggleSkill } = extensions
 
@@ -61,6 +88,41 @@ function App() {
   const { handlePaletteKeyDown, navItems, navigateTo, pageMeta, paletteCommands, paletteEntries, paletteIndex, runPaletteEntry, setPaletteIndex } = shell
 
   const paletteInputRef = React.useRef<HTMLInputElement | null>(null)
+
+  //: The search modal's keyboard cursor, on the same plan as the command
+  //: palette's: the input keeps focus, arrows move a highlight, Enter opens
+  //: the highlighted row. Reset whenever the query (or the modal itself)
+  //: changes what the list is, so the highlight never points past the end.
+  const [searchIndex, setSearchIndex] = React.useState(0)
+  const searchResults = filteredSessions.slice(0, SEARCH_RESULT_LIMIT)
+  const activeSearchIndex = Math.min(searchIndex, Math.max(searchResults.length - 1, 0))
+  React.useEffect(() => {
+    setSearchIndex(0)
+  }, [sessionSearch, searchOpen])
+
+  const openSearchResult = (sid: string) => {
+    selectSession(sid)
+    setSearchOpen(false)
+    setSessionSearch('')
+  }
+
+  //: Same contract as the command palette's key handler: arrows cycle with
+  //: wrap-around (a short list should not dead-end at either end), Enter runs
+  //: the highlighted row. Escape needs no case here -- rc-dialog hears it on
+  //: the document and closes the modal itself.
+  const handleSearchKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (!searchResults.length) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      setSearchIndex(index => (index + 1) % searchResults.length)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      setSearchIndex(index => (index - 1 + searchResults.length) % searchResults.length)
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      openSearchResult(searchResults[activeSearchIndex].session_id)
+    }
+  }
 
   // Views are pure renderers built from this one context object.
   const ctx: AppCtx = {
@@ -316,8 +378,6 @@ function App() {
   }
 
   const currentMeta = pageMeta[view] || pageMeta.chat
-
-  const activeSessionInfo = sessions.find(item => item.session_id === activeSession)
 
   return (
     <ConfigProvider
@@ -614,9 +674,14 @@ function App() {
         </Layout>
       </Layout>
 
+      {/* The search modal. Structure mirrors the command palette: the input
+          is the modal's fixed head, only the result list scrolls. It used to
+          sit inside the scrolling body, so a long list scrolled the query box
+          out of sight -- the one control the user still needed. */}
       <Modal
         open={searchOpen}
         className="global-search-modal"
+        width={680}
         title={
           <div className="global-search-title">
             <SearchOutlined />
@@ -638,56 +703,57 @@ function App() {
             placeholder="搜索标题或会话 ID"
             value={sessionSearch}
             onChange={event => setSessionSearch(event.target.value)}
+            onKeyDown={handleSearchKeyDown}
             allowClear
+            aria-controls="global-search-results"
           />
 
-          <div className="current-session-panel">
-            <div className="current-session-label">当前会话</div>
-            {activeSessionInfo ? (
-              <div className="current-session-content">
-                <div className="current-session-main">
-                  <strong>{activeSessionInfo.title || '未命名会话'}</strong>
-                  <code>{activeSessionInfo.session_id}</code>
-                </div>
-                <div className="current-session-stats">
-                  <span className={`session-status ${connected ? 'connected' : ''}`}>
-                    <i /> {connected ? '实时连接' : '连接中断'}
-                  </span>
-                  <span>{activeSessionInfo.turn_count || 0} 轮</span>
-                  <span>{relativeTime(activeSessionInfo.last_activity)}</span>
-                </div>
-              </div>
-            ) : (
-              <div className="current-session-empty">尚未选择会话</div>
-            )}
-          </div>
-
           <div className="global-search-section-title">会话</div>
-          <div className="global-search-results">
-            {filteredSessions.length === 0 ? (
+          <div
+            className="global-search-results"
+            id="global-search-results"
+            role="listbox"
+            aria-label="会话列表"
+          >
+            {searchResults.length === 0 ? (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配的会话" />
             ) : (
-              filteredSessions.slice(0, 12).map(item => (
+              searchResults.map((item, index) => (
                 <button
                   type="button"
-                  className={`global-search-item ${item.session_id === activeSession ? 'active' : ''}`}
+                  className={`global-search-item ${item.session_id === activeSession ? 'active' : ''} ${
+                    index === activeSearchIndex ? 'cursor' : ''
+                  }`}
                   key={item.session_id}
-                  onClick={() => {
-                    selectSession(item.session_id)
-                    setSearchOpen(false)
-                    setSessionSearch('')
+                  role="option"
+                  aria-selected={index === activeSearchIndex}
+                  ref={element => {
+                    if (element && index === activeSearchIndex) {
+                      element.scrollIntoView({ block: 'nearest' })
+                    }
                   }}
+                  onMouseMove={() => { if (index !== activeSearchIndex) setSearchIndex(index) }}
+                  onClick={() => openSearchResult(item.session_id)}
                 >
                   <span className={`session-status-dot ${item.live ? 'live' : ''}`} />
                   <span className="global-search-item-main">
-                    <strong>{item.title || '未命名会话'}</strong>
-                    <small>{item.turn_count || 0} 轮 · {relativeTime(item.last_activity)} · {item.session_id.slice(0, 12)}</small>
+                    <strong>{highlightQuery(item.title || '未命名会话', sessionSearch)}</strong>
+                    <small>
+                      {item.turn_count || 0} 轮 · {relativeTime(item.last_activity)} ·{' '}
+                      {highlightQuery(item.session_id.slice(0, 12), sessionSearch)}
+                    </small>
                   </span>
                   {item.session_id === activeSession && <span className="current-mark">当前</span>}
+                  <kbd className="global-search-enter" aria-hidden="true">↵</kbd>
                 </button>
               ))
             )}
           </div>
+          {filteredSessions.length > searchResults.length && (
+            <div className="global-search-more">
+              仅显示前 {SEARCH_RESULT_LIMIT} 条，还有 {filteredSessions.length - searchResults.length} 个匹配，换个更具体的关键词
+            </div>
+          )}
         </div>
       </Modal>
 

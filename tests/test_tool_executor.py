@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import time
+
+import pytest
 
 from agent.core.output import EventCollector, _active_event_collector, _active_sink
 from agent.tools.executor import RegularToolExecutor, report_tool_progress
@@ -711,3 +714,109 @@ def test_sync_tool_sees_the_callers_context():
     asyncio.run(run())
 
     assert seen == [sink]
+
+
+# ─── the deletes: a permanent schema still has to declare itself ─────────────
+
+
+def _delete_registry(tool_name: str):
+    """A registry whose delete tool carries the shipped capabilities.
+
+    Built from the real vocabulary rather than a hand-written copy: the point
+    of the test is that the capability *the shipped tool declares* is enforced,
+    so a copy that drifted from `builtin_tools.py` would pin nothing.
+    """
+    from agent.tools.runtime import ToolRegistry as _Registry
+
+    registry = _Registry()
+    called = []
+
+    async def delete(**kwargs):
+        called.append(kwargs)
+        return {"ok": True}
+
+    capabilities = _Registry._DEFAULT_TOOL_CAPABILITIES.get(
+        ("builtin", tool_name), frozenset()
+    )
+    registry.register(
+        tool_name,
+        "Delete",
+        {"type": "object", "properties": {}, "required": []},
+        delete,
+        source="builtin",
+        capabilities=capabilities,
+    )
+    return registry, called
+
+
+@pytest.mark.parametrize("tool_name", ["schedule_delete", "workflow_delete"])
+def test_a_delete_without_a_declared_intent_is_refused(tool_name):
+    """The schemas are sent for the life of the session now, so the two
+    destructive members of that set are the ones that must declare themselves.
+
+    Same requirement ``schedule_cancel`` carries -- and deleting takes the run
+    history with it, which cancelling does not.
+    """
+    registry, called = _delete_registry(tool_name)
+
+    result = asyncio.run(
+        RegularToolExecutor(registry).run({"name": tool_name, "input": {"task_id": "t1"}})
+    )
+    payload = json.loads(result)
+
+    assert payload["ok"] is False
+    assert payload["intent_required"] is True
+    assert called == []
+
+
+@pytest.mark.parametrize("tool_name", ["schedule_delete", "workflow_delete"])
+def test_a_delete_with_a_specific_intent_runs(tool_name):
+    registry, called = _delete_registry(tool_name)
+
+    result = asyncio.run(
+        RegularToolExecutor(registry).run(
+            {
+                "name": tool_name,
+                "input": {
+                    "task_id": "t1",
+                    "intent": "用户在对话里说这个每日简报不要了。",
+                },
+            }
+        )
+    )
+
+    assert json.loads(result) == {"ok": True}
+    assert len(called) == 1
+
+
+@pytest.mark.parametrize("tool_name", ["schedule_delete", "workflow_delete"])
+def test_the_delete_schemas_are_now_shipped_for_the_session(tool_name):
+    """Both are in the permanently-sent set, which is what makes the guard above
+    load-bearing rather than theoretical."""
+    from agent.core.context_assembler import ContextAssembler
+
+    tools = [{"name": tool_name}, {"name": "read_file"}]
+    assert tool_name in [
+        tool["name"] for tool in ContextAssembler().select_tools(tools)
+    ]
+
+
+def test_the_shipped_delete_schemas_require_a_declared_intent():
+    """The schema asks for it, so a model reading the tool passes one.
+
+    Checked against the registration in `builtin_tools.py` rather than a copy:
+    a required field the executor enforces but the schema omits is a call the
+    model cannot make correctly on the first try.
+    """
+    from agent.tools.builtin_tools import BuiltinTools
+
+    registry = ToolRegistry()
+    BuiltinTools(memory=object(), registry=registry, workspace_root=Path.cwd())
+    for name, field in (("schedule_delete", "task_id"), ("workflow_delete", "workflow_id")):
+        schema = next(
+            tool["input_schema"]
+            for tool in registry.to_anthropic_format()
+            if tool["name"] == name
+        )
+        assert schema["required"] == [field, "intent"], name
+        assert schema["properties"]["intent"]["type"] == "string", name

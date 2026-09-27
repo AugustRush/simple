@@ -31,6 +31,24 @@ import { createPortal } from 'react-dom'
 
 const { TextArea } = Input
 
+/** A user message that belongs to the turn already open, not to a new one.
+ *
+ * Two flags, one meaning.  ``queued`` is the local one: this message was sent
+ * while the agent was mid-reply, and the server has not answered yet about
+ * which queue it went into.  ``interjection`` is the server's: the message was
+ * folded into the turn that was running, so it is part of that turn's record.
+ * Both cases have to keep the turn open -- flushing on either one is what
+ * split a running turn in two and pushed its tool trace to the bottom.
+ *
+ * A message queued for a *later* turn (the restart queue) carries ``queued``
+ * too, and is also kept inside the open group while it waits: it has not
+ * started a turn yet, and the server's transcript will place it correctly once
+ * it does.
+ */
+function isInTurnUserMessage(item: Message): boolean {
+  return item.role === 'user' && Boolean(item.queued || item.interjection)
+}
+
 export function renderChat(ctx: AppCtx) {
   const { activateTurnIndex, activeSession, activity, approvalCommandRef, awayFromLatest, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
@@ -228,6 +246,24 @@ export function renderChat(ctx: AppCtx) {
       )
     }
 
+    if (item.role === 'user' && isInTurnUserMessage(item)) {
+      // Said during the turn, not before it.  Rendered as an aside inside the
+      // turn: a "你" bubble here would read as a second request and push the
+      // turn's own trace below it, which is exactly the layout this replaced.
+      return (
+        <div key={item.id} className={`message-interjection ${item.queued ? 'is-pending' : ''}`}>
+          <span className="message-interjection-mark" aria-hidden="true">插话</span>
+          <div className="message-interjection-body">
+            <div
+              className="markdown"
+              dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, activeSession, token) }}
+            />
+          </div>
+          {item.queued && <span className="message-interjection-state">待读</span>}
+        </div>
+      )
+    }
+
     const isUser = item.role === 'user'
     return (
       <div
@@ -405,7 +441,14 @@ export function renderChat(ctx: AppCtx) {
     }
 
     messages.forEach(item => {
-      if (item.role === 'user') {
+      // A message the user sent *while a turn was running* is not a turn
+      // boundary: it belongs to the turn that is already open.  Flushing here
+      // split the running turn in half -- its tool trace was orphaned to the
+      // bottom of the new group, and the answer to the interjection ended up
+      // rendered above the interjection itself.  Two sources, one rule: the
+      // local `queued` flag while the turn is live, and the server's
+      // `interjection` flag once the record has it.
+      if (item.role === 'user' && !isInTurnUserMessage(item)) {
         flushTurn()
         groupUser = item
       } else if (item.role === 'tool' && item.tool !== 'attachment' && !item.link) {

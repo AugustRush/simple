@@ -171,18 +171,29 @@ class CommandCoordinator:
         if classification.kind == "text":
             if state.operation_state == "cancelling":
                 self._queue_restart(turn_input, sink, state, ready=sink_ready)
-                self._safe_status(
-                    sink, "Message queued for the next turn.", level="info"
+                self._safe_queued_notice(
+                    sink,
+                    turn_input.text,
+                    kind="restart",
+                    message_id=str(turn_input.metadata.get("message_id") or ""),
                 )
                 return None
             if state.operation_state == "active":
                 if state.accepts_interjections:
                     self._queue_interjection(turn_input, sink, state, ready=sink_ready)
-                    self._safe_status(sink, "Interjection queued.", level="info")
+                    self._safe_queued_notice(
+                        sink,
+                        turn_input.text,
+                        kind="interjection",
+                        message_id=str(turn_input.metadata.get("message_id") or ""),
+                    )
                 else:
                     self._queue_restart(turn_input, sink, state, ready=sink_ready)
-                    self._safe_status(
-                        sink, "Message queued for the next turn.", level="info"
+                    self._safe_queued_notice(
+                        sink,
+                        turn_input.text,
+                        kind="restart",
+                        message_id=str(turn_input.metadata.get("message_id") or ""),
                     )
                 return None
             return await self._run_operation(
@@ -490,7 +501,13 @@ class CommandCoordinator:
                 urgency="now",
                 ready=sink_ready,
             )
-            self._safe_status(sink, "Urgent interjection queued.", level="info")
+            self._safe_queued_notice(
+                sink,
+                payload,
+                kind="interjection",
+                urgency="now",
+                message_id=str(payload_input.metadata.get("message_id") or ""),
+            )
         else:
             self._queue_restart(
                 payload_input,
@@ -930,6 +947,31 @@ class CommandCoordinator:
             sink.on_status(text, level=level)
         except Exception:
             logger.exception("command output sink status failed")
+
+    @staticmethod
+    def _safe_queued_notice(
+        sink: Any,
+        text: str,
+        *,
+        kind: str,
+        message_id: str = "",
+        urgency: str = "normal",
+    ) -> None:
+        """Tell the sink a message was accepted while a turn was running.
+
+        Structured rather than a prose status because the two kinds mean
+        different things to a reader -- one is being read by the running turn,
+        the other will get its own -- and a client that has to infer which from
+        an English sentence is one wording change from showing it wrong.
+        ``on_message_queued`` falls back to that same sentence for sinks that
+        only have a terminal, so the CLI is unchanged.
+        """
+        try:
+            sink.on_message_queued(
+                text, kind=kind, message_id=message_id, urgency=urgency
+            )
+        except Exception:
+            logger.exception("command output sink queue notice failed")
 
     @staticmethod
     def _safe_error(sink: Any, error: str) -> None:

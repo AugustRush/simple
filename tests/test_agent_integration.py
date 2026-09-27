@@ -10283,3 +10283,157 @@ def test_an_unreadable_config_leaves_a_run_on_the_last_known_good_one(
     # And a file that does parse wins, because that is the copy the user edits.
     path.write_text(json.dumps({"active_provider": "edited", "providers": {}}))
     assert load_config_for_run(startup)["active_provider"] == "edited"
+
+
+def test_two_turns_of_one_session_offer_the_same_tool_schemas(monkeypatch):
+    """The tool block is part of the head, so it cannot depend on the words.
+
+    ``S ‖ T ‖ M``: the schemas sit ahead of every message, so a provider's
+    prefix cache can only reuse up to the first difference *in* them -- and
+    everything after that difference is the whole conversation.  A set chosen
+    from each turn's own words therefore re-prices the entire body on every
+    turn that changes it.  What the session offers has to be a function of
+    session-stable state, so this asserts the two turns of one session send
+    byte-identical schemas.
+    """
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+
+    def _noop(**_kwargs):
+        return {"ok": True}
+
+    registry.register(
+        "read_file", "Read a file.", {"type": "object", "properties": {}}, _noop,
+        source="builtin",
+    )
+    registry.register(
+        "write_file", "Write a file.", {"type": "object", "properties": {}}, _noop,
+        source="builtin",
+    )
+    registry.register(
+        "schedule_create", "Create a scheduled task.",
+        {"type": "object", "properties": {}}, _noop, source="builtin",
+    )
+    registry.register(
+        "tavily_search", "Search the web.",
+        {"type": "object", "properties": {}}, _noop, source="builtin",
+    )
+    agent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+
+    responses = iter(
+        [
+            agent_module.shared._OAIResponse(
+                [agent_module.shared._OAIChoice("stop", agent_module.shared._OAIMsg("one", None))]
+            ),
+            agent_module.shared._OAIResponse(
+                [agent_module.shared._OAIChoice("stop", agent_module.shared._OAIMsg("two", None))]
+            ),
+        ]
+    )
+    seen: list[list[dict]] = []
+
+    async def fake_create(ctx, tools):
+        seen.append(json.loads(json.dumps(tools)))
+        return next(responses)
+
+    monkeypatch.setattr(agent, "_create", fake_create)
+
+    ctx = agent_module.AgentContext(system_prompt="system")
+    # The first turn mentions no keyword group at all; the second one names
+    # scheduled work and a search.  Same session, so the same schemas.
+    asyncio.run(agent.send_message(ctx, "你好"))
+    asyncio.run(agent.send_message(ctx, "每天早上九点提醒我看盘，顺便调研一下"))
+
+    assert [tool["name"] for tool in seen[0]] == [tool["name"] for tool in seen[1]]
+    assert seen[0] == seen[1]
+
+
+def test_two_subagents_with_different_tasks_share_one_head(monkeypatch):
+    """Siblings must send the same head, or neither can reuse the other's cache.
+
+    A sub-agent's task is per-spawn data, so it rides in the turn's message --
+    like the handoff block -- and never in the system prompt or the tool
+    schemas.  The head is the only part two siblings *can* share, since their
+    bodies begin with different words, so this asserts the provider sees the
+    same bytes for both while the tasks differ.  The upstream handoff is what
+    makes this worth pinning: it used to be appended to the system prompt, and
+    a per-spawn value there means no two spawns of a role ever share a prefix.
+    """
+    import agent as agent_module
+
+    registry = agent_module.ToolRegistry()
+    registry.register(
+        "read_file",
+        "Read files",
+        {"type": "object", "properties": {}, "required": []},
+        lambda **kwargs: {"ok": True},
+        source="test",
+        capabilities=("read",),
+    )
+    registry.register(
+        "write_file",
+        "Write files",
+        {"type": "object", "properties": {}, "required": []},
+        lambda **kwargs: {"ok": True},
+        source="test",
+        capabilities=("output_write",),
+    )
+    # A tool from a group the old gate opened only on its own keywords -- so
+    # the two tasks below would have produced two different tool blocks.
+    registry.register(
+        "tavily_search",
+        "Search the web",
+        {"type": "object", "properties": {}, "required": []},
+        lambda **kwargs: {"ok": True},
+        source="test",
+        capabilities=("read",),
+    )
+    parent = agent_module.BaseAgent(
+        object(), registry, model="fake-model", api_format="openai"
+    )
+    parent.register_spawn_capability("base system prompt")
+    parent_ctx = agent_module.AgentContext(system_prompt="parent prompt")
+    from agent.core.agent import _active_agent_context
+
+    token = _active_agent_context.set(parent_ctx)
+
+    heads: list[tuple[str, str]] = []
+
+    async def fake_create(self, ctx, tools, **_kwargs):
+        if ctx.metadata.get("_orchestration_child"):
+            heads.append(
+                (ctx.system_prompt, json.dumps(tools, sort_keys=True, ensure_ascii=False))
+            )
+        return agent_module.shared._OAIResponse(
+            [
+                agent_module.shared._OAIChoice(
+                    "stop", agent_module.shared._OAIMsg("done", None)
+                )
+            ]
+        )
+
+    monkeypatch.setattr(agent_module.BaseAgent, "_create", fake_create)
+
+    async def _spawn(task: str) -> None:
+        await registry.call(
+            "spawn_agent",
+            {"role": "researcher", "task": task, "handoff": {"step": task[:2]}},
+        )
+
+    try:
+        # The two tasks are worded to trip *different* keyword groups: the
+        # first names research, the second names nothing the old gate knew.
+        asyncio.run(_spawn("调研一下最新的方案 A"))
+        asyncio.run(_spawn("把结论整理成一份给团队的总结"))
+    finally:
+        _active_agent_context.reset(token)
+
+    assert len(heads) == 2, heads
+    assert heads[0][0] == heads[1][0], "sibling heads diverge in the system prompt"
+    assert heads[0][1] == heads[1][1], "sibling heads diverge in the tool schemas"
+    # And neither head carries the per-spawn task.
+    assert "方案 A" not in heads[0][0]
+    assert "总结" not in heads[1][0]

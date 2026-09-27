@@ -1436,6 +1436,11 @@ class BaseAgent:
                 output_tokens=self.output_reserve,
                 system_prompt=ctx.system_prompt,
                 tools=tools,
+                # One home for the head's price: the same measured,
+                # fingerprint-locked value the input budget uses, so retrieval
+                # sizing cannot price the head with the body's calibration
+                # factor behind the budget's back.
+                static_tokens=self._payload_overhead(ctx, tools),
                 current_messages=ctx.messages,
                 current_user_content=current_user_content,
                 estimate=lambda messages: self._estimate_input_tokens(messages, ctx=ctx),
@@ -2813,11 +2818,17 @@ class BaseAgent:
             return
         blocks: list[str] = []
         interjected: list[str] = []
+        #: (entry, text) pairs, kept alongside the rendered blocks: the record
+        #: written at turn end needs the id and the urgency of each one, and
+        #: re-deriving them from `drained` afterwards would have to skip the
+        #: same blanks twice, in step.
+        read: list[tuple[dict[str, Any], str]] = []
         for entry in drained:
             text = str(entry.get("text", "") or "").strip()
             if not text:
                 continue
             interjected.append(text)
+            read.append((entry, text))
             who = str(entry.get("from_user", "") or "user")
             urgency = str(entry.get("urgency", "normal") or "normal")
             arrived = entry.get("arrived_at")
@@ -2844,6 +2855,25 @@ class BaseAgent:
             "role": "user",
             "content": "\n\n".join(blocks) + footer,
         })
+        # Held for the turn's record rather than only for the payload: the model
+        # reads these mid-turn and answers them in the same turn, so a
+        # transcript without them shows an answer to a question nobody can see
+        # -- which is what the durable record used to do, since only the message
+        # that *opened* the turn was journaled.  The record is written at turn
+        # end from this list; it is not cleared here because one turn may drain
+        # the mailbox several times, and every drained message is part of what
+        # the turn answered.
+        recorded = ctx.metadata.setdefault("_turn_interjections", [])
+        if isinstance(recorded, list):
+            for entry, text in read:
+                recorded.append(
+                    {
+                        "text": text,
+                        "message_id": str(entry.get("message_id") or ""),
+                        "urgency": str(entry.get("urgency") or "normal"),
+                        "arrived_at": entry.get("arrived_at"),
+                    }
+                )
         # An interjection is the user asking for something *during* this turn,
         # so it belongs to what this turn was asked to do.  Leaving it out would
         # make a tool refuse an instruction the user had just typed, which reads
@@ -2896,25 +2926,17 @@ class BaseAgent:
         # staging side would let recently-compacted turns drop from view.
         decision = self._plan_orchestration(ctx, user_message)
         all_tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
-        selected_tools = self.context_assembler.select_tools(
+        # The schemas are the same for every call this agent instance makes --
+        # see `ContextAssembler.select_tools` for why a per-turn set is the
+        # expensive thing to do.  The one exception is the run's own report
+        # channel, which refuses outside a run: shipping it in a conversation
+        # would be shipping a tool whose only possible outcome is an error.
+        # `scheduler_run_id` is fixed at context construction, so that gate is
+        # a function of session-stable state too.
+        ctx.metadata["_selected_tools"] = self.context_assembler.select_tools(
             all_tools,
-            user_message,
-            required_skills=ctx.metadata.get("required_skills", ()),
-            attachment_kinds=(attachment.kind for attachment in attachments),
-            # The run's own report channel, and only inside a run: it refuses
-            # in a conversation, so shipping its schema there would be
-            # shipping a tool whose only possible outcome is an error.
             scheduled_run=bool(ctx.metadata.get("scheduler_run_id")),
         )
-        if decision.mode == "explicit":
-            selected_names = {str(tool.get("name") or "") for tool in selected_tools}
-            selected_tools.extend(
-                tool
-                for tool in all_tools
-                if tool.get("name") == "spawn_agent"
-                and tool.get("name") not in selected_names
-            )
-        ctx.metadata["_selected_tools"] = selected_tools
         context_manager = self._context_manager_for(ctx)
         # Retrieval's place in the block list is reserved now and filled in
         # below, because its *size* cannot be decided until every other block
@@ -2963,7 +2985,7 @@ class BaseAgent:
         )
         retrieval_budget = self._retrieval_token_budget(
             ctx,
-            selected_tools,
+            ctx.metadata.get("_selected_tools") or [],
             current_user_content=self._build_user_message_content(
                 user_message, attachments, turn_context=blocks_without_retrieval
             ),
@@ -3660,12 +3682,27 @@ class BaseAgent:
                 return
             if record_kwargs is None:
                 record_kwargs = {}
+            # The messages the user sent while this turn was running.  They are
+            # part of what this turn answered, so they are journaled with it,
+            # between the request and the answer -- see
+            # `MemoryStore.write_conversation_exchange`.  Read (not cleared)
+            # from metadata: a turn that drained the mailbox twice wrote both
+            # batches, and clearing here would drop the second on the floor if
+            # this method ever ran twice.
+            interjections = (
+                metadata.get("_turn_interjections")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not isinstance(interjections, list):
+                interjections = []
             record_turn_result = getattr(ctx_mgr, "record_turn_result", None)
             if callable(record_turn_result):
                 write_result = record_turn_result(
                     user_content=user_content,
                     assistant_content=assistant_content or "",
                     channel=channel,
+                    interjections=interjections,
                     **record_kwargs,
                 )
                 new_turn = bool(getattr(write_result, "changed", False))
@@ -3676,6 +3713,15 @@ class BaseAgent:
                 stage_assistant = bool(
                     getattr(write_result, "assistant_created", False)
                 )
+                # The user's words, in the order they said them: the memory
+                # pipeline is built from what the user said, and an interjection
+                # is something they said.  Only the rows this call created, so a
+                # retried turn does not stage the same text twice.
+                stage_interjections = [
+                    str(text)
+                    for text in getattr(write_result, "interjections_created", ()) or ()
+                    if str(text).strip()
+                ]
             else:
                 fallback_kwargs = dict(record_kwargs)
                 fallback_kwargs.pop("assistant_message_id", None)
@@ -3688,6 +3734,7 @@ class BaseAgent:
                 new_turn = recorded is not False
                 stage_user = new_turn
                 stage_assistant = new_turn and bool(assistant_content)
+                stage_interjections = []
             record_runtime_event = getattr(ctx_mgr, "record_runtime_event", None)
             if new_turn and callable(record_runtime_event):
                 metadata = (
@@ -3717,6 +3764,12 @@ class BaseAgent:
             if new_turn:
                 if stage_user:
                     ctx_mgr.staging.append("user", user_content)
+                # Interjections are the user's own words, spoken during this
+                # turn: the staging buffer is what consolidation reads, so
+                # leaving them out would make the memory a record of only the
+                # sentences a turn happened to *start* with.
+                for text in stage_interjections:
+                    ctx_mgr.staging.append("user", text)
                 if stage_assistant:
                     ctx_mgr.staging.append("assistant", assistant_content)
                 if ctx_mgr.should_enqueue_consolidation():

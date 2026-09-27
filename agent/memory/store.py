@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import sqlite3
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from agent import shared
 from agent.lexical import LATIN_TOKEN_RE
@@ -1003,6 +1003,7 @@ class LTMStore:
         assistant_message_id: str = "",
         reply_to_id: str = "",
         metadata: Optional[dict[str, Any]] = None,
+        interjections: Optional[Sequence[dict[str, Any]]] = None,
         created_at: Optional[str] = None,
     ) -> ConversationWriteResult:
         """Idempotently journal a user event and optional assistant completion.
@@ -1010,6 +1011,15 @@ class LTMStore:
         A non-empty message ID is an idempotency key for the user event.  The
         user row is committed before an LLM request can begin; a later call can
         attach the assistant row without duplicating the user event.
+
+        ``interjections`` are the messages the user sent *during* the turn and
+        the model read mid-flight.  They are written here, between the request
+        that opened the turn and the answer it produced, because that is where
+        they happened: the model answered them within this same turn, so a
+        record without them claims the answer came from nowhere -- and the
+        reader loses the words that asked for it.  Each row carries an
+        ``interjection`` marker, which is what lets a client render it as
+        in-turn speech rather than as the start of another turn.
         """
         payload = metadata or {}
         if not isinstance(payload, dict):
@@ -1029,6 +1039,7 @@ class LTMStore:
         user_created = False
         assistant_created = False
         first_assistant_for_user = False
+        interjections_created: list[str] = []
         with conn:
             conn.execute("BEGIN IMMEDIATE")
             existing_user = None
@@ -1060,6 +1071,52 @@ class LTMStore:
                     ),
                 )
                 user_created = True
+            # After the request that opened the turn and before its answer:
+            # row ids are the display order, and this is where the message
+            # happened.  Also after, not before, so the turn's own request
+            # stays the first row a reader sees for it.
+            for entry in interjections or ():
+                if not isinstance(entry, dict):
+                    continue
+                text = str(entry.get("text") or "").strip()
+                if not text:
+                    continue
+                entry_id = str(entry.get("message_id") or "").strip()
+                if entry_id:
+                    already = conn.execute(
+                        """
+                        SELECT id FROM conversation_turns
+                        WHERE session_id = ? AND role = 'user' AND message_id = ?
+                        LIMIT 1
+                        """,
+                        (clean_session_id, entry_id),
+                    ).fetchone()
+                    if already is not None:
+                        continue
+                entry_metadata: dict[str, Any] = {
+                    "interjection": True,
+                    "urgency": str(entry.get("urgency") or "normal"),
+                }
+                if entry.get("arrived_at"):
+                    entry_metadata["arrived_at"] = entry["arrived_at"]
+                conn.execute(
+                    """
+                    INSERT INTO conversation_turns (
+                        session_id, role, content, channel, message_id, reply_to_id,
+                        metadata_json, created_at
+                    ) VALUES (?, 'user', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        clean_session_id,
+                        text,
+                        str(channel or ""),
+                        entry_id,
+                        clean_message_id,
+                        json.dumps(entry_metadata, ensure_ascii=False, sort_keys=True),
+                        timestamp,
+                    ),
+                )
+                interjections_created.append(text)
             if clean_assistant_content:
                 existing_assistant = None
                 if clean_assistant_message_id:
@@ -1117,6 +1174,7 @@ class LTMStore:
             user_created=user_created,
             assistant_created=assistant_created,
             first_assistant_for_user=first_assistant_for_user,
+            interjections_created=tuple(interjections_created),
         )
 
     def append_conversation_exchange(
