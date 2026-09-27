@@ -670,7 +670,8 @@ to safety, overestimate → relax 10%) biases the factor upward over a long turn
   **deliberately not in this commit**: `agent/core/context_assembler.py` in the
   working tree carries an unrelated uncommitted rewrite (the tool-gate removal),
   and the one-line change sits inside it where no hunk split can separate them.
-  It stays in the tree as a follow-up to land with that rewrite.
+  It stayed in the tree as a follow-up — **landed in `6d44a8d`**, the next commit,
+  which is where that rewrite was committed.
 
 **Verification.**
 
