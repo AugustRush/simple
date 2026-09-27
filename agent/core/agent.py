@@ -2942,6 +2942,18 @@ class BaseAgent:
         # that turn's authority, and the one case that must never pass is a turn
         # where nobody asked for anything.
         self.registry.set_context("turn_request", user_message)
+        # The interjections this turn answers, emptied at the boundary for the
+        # same reason as `turn_request` above: `ctx.metadata` is the session's,
+        # so a ledger left over from the previous turn would be journaled again
+        # by this one.  Reset here rather than read-and-cleared at turn end
+        # because it has to outlive every drain inside the turn: the mailbox is
+        # drained once per step, and every round of the continuation loop calls
+        # this method and then `_post_turn_maintenance` on the same ctx
+        # (`runtime/contracts.py`), so the ledger is read more than once per
+        # user message.  An interjection carrying no message id has no key for
+        # its write to be idempotent on, so a stale ledger is a duplicate row in
+        # the transcript and the same words staged into memory again.
+        ctx.metadata["_turn_interjections"] = []
         turn_blocks: list[str] = []
         handoff_block = str(ctx.metadata.get("_handoff_block") or "").strip()
         if handoff_block:

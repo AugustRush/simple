@@ -3532,6 +3532,37 @@ def test_a_second_drain_in_one_turn_appends_rather_than_replaces():
     ]
 
 
+def test_the_interjection_ledger_belongs_to_one_turn():
+    """A turn boundary empties it; a drain inside a turn only appends.
+
+    ``ctx.metadata`` is the *session's*, not the turn's -- that is why
+    ``_selected_tools`` and the turn-request key are popped at turn end.  The
+    ledger has to survive a whole turn (one turn may drain the mailbox several
+    times, and ``_post_turn_maintenance`` reads it only after the turn ends),
+    so it cannot be read-and-cleared there -- but it must not survive *into*
+    the next turn either.  A ledger left over from the previous turn is
+    re-journaled by every turn that follows; for an interjection that carries
+    no id that is a fresh row each time, because there is no key for the write
+    to be idempotent on.
+    """
+    import agent as agent_module
+
+    ctx = agent_module.AgentContext(system_prompt="sys")
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+
+    agent._inject_pending_interjections(ctx, [{"text": "没有 id 的插话"}])
+    assert [entry["text"] for entry in ctx.metadata["_turn_interjections"]] == [
+        "没有 id 的插话"
+    ]
+
+    # The boundary of the next turn.
+    agent._prepare_turn(ctx, "下一轮的请求", ())
+
+    assert ctx.metadata.get("_turn_interjections") == []
+
+
 def test_the_sink_notice_distinguishes_an_interjection_from_a_restart():
     """A client has to say *when* a queued message will be dealt with.
 

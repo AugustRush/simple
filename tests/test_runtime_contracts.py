@@ -569,6 +569,144 @@ def test_post_turn_maintenance_is_idempotent_for_replayed_message_id(tmp_path):
     assert manager.staging.count() == 2
 
 
+def test_a_later_turn_does_not_rejournal_the_previous_turns_interjection(tmp_path):
+    """The ledger is per turn, so a turn with no interjection writes none.
+
+    Two turns share one ``ctx`` -- it is the session's context, fetched once in
+    the channel loop and reused.  An interjection without a message id has no
+    idempotency key, so if the ledger from turn one is still there when turn
+    two ends, turn two writes turn one's words again: a duplicate row in the
+    transcript, and the same user text staged into the memory pipeline twice.
+    """
+    from agent import (
+        AgentContext,
+        BaseAgent,
+        ConsolidationEngine,
+        ContextManager,
+        LocalRetriever,
+        LTMStore,
+        StagingBuffer,
+        ToolRegistry,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir, memory_dir=tmp_path / "memory")
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
+    )
+
+    agent = BaseAgent(
+        object(), ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    ctx = AgentContext(system_prompt="system")
+
+    def run_turn(message_id: str, user_content: str, interjections=()):
+        agent._prepare_turn(ctx, user_content, ())
+        if interjections:
+            agent._inject_pending_interjections(ctx, list(interjections))
+        BaseAgent._post_turn_maintenance(
+            ctx_mgr=manager,
+            agent=agent,
+            ctx=ctx,
+            user_content=user_content,
+            assistant_content=f"answer to {user_content}",
+            channel="cli",
+            record_kwargs={
+                "message_id": message_id,
+                "metadata": {"message_id": message_id},
+            },
+        )
+
+    run_turn("m1", "原始请求", [{"text": "没有 id 的插话"}])
+    run_turn("m2", "第二个请求")
+
+    contents = [
+        turn.content
+        for turn in store.recent_conversation_turns(session_id="session-1", limit=20)
+    ]
+    assert contents.count("没有 id 的插话") == 1
+
+
+def test_a_continuation_round_does_not_rewrite_the_turns_interjection(tmp_path):
+    """One user turn runs several rounds, and each round ends the turn.
+
+    The runtime drives a turn through ``max_continuations + 1`` rounds
+    (`contracts.py:789`), each calling `send_message` -- and so `_prepare_turn`
+    -- on the same ctx, then `complete_turn`.  So `_post_turn_maintenance` is
+    not a once-per-turn call: the second round re-attaches an assistant row
+    under the *same* turn id.  It must not also carry the interjection the
+    first round already journaled, which for a message with no id is a fresh
+    row every time.
+    """
+    from agent import (
+        AgentContext,
+        BaseAgent,
+        ConsolidationEngine,
+        ContextManager,
+        LocalRetriever,
+        LTMStore,
+        StagingBuffer,
+        ToolRegistry,
+    )
+
+    context_dir = tmp_path / "context"
+    store = LTMStore(context_dir=context_dir, memory_dir=tmp_path / "memory")
+    manager = ContextManager(
+        store=store,
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(store=store),
+        staging=StagingBuffer(context_dir=context_dir, session_id="session-1"),
+    )
+
+    agent = BaseAgent(
+        object(), ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    ctx = AgentContext(system_prompt="system")
+
+    def boundary(prompt: str):
+        """What starts each round: `send_message` calls this on the same ctx."""
+        agent._prepare_turn(ctx, prompt, ())
+
+    def finish(user_content: str, completion: int):
+        """What ends each round: `complete_turn` records the turn."""
+        BaseAgent._post_turn_maintenance(
+            ctx_mgr=manager,
+            agent=agent,
+            ctx=ctx,
+            user_content=user_content,
+            assistant_content=f"answer {completion}",
+            channel="cli",
+            record_kwargs={
+                # One turn id for every round, as the continuation loop sends.
+                "message_id": "m1",
+                "assistant_message_id": f"m1:completion:{completion}",
+                "metadata": {"message_id": "m1"},
+            },
+        )
+
+    # Round one: drained mid-round, so it belongs to round one's record.
+    boundary("原始请求")
+    agent._inject_pending_interjections(ctx, [{"text": "没有 id 的插话"}])
+    finish("原始请求", 1)
+
+    # Round two of the *same* turn: same turn id, a second assistant row.
+    boundary("继续")
+    finish("继续", 2)
+
+    contents = [
+        turn.content
+        for turn in store.recent_conversation_turns(session_id="session-1", limit=20)
+    ]
+    # Both rounds recorded, so the second really did run against this turn --
+    # otherwise the assertion below would hold for the wrong reason.
+    assert contents.count("answer 1") == 1
+    assert contents.count("answer 2") == 1
+    assert contents.count("没有 id 的插话") == 1
+
+
 def test_agent_core_journals_user_input_before_model_completion(tmp_path):
     from agent import (
         AgentContext,
