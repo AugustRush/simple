@@ -6,7 +6,7 @@ import { useApiClient } from './useApiClient'
 type Deps = ReturnType<typeof useApiClient>
 
 export function useConfirm(deps: Deps) {
-  const { wsRef } = deps
+  const { wsRef, messageApi } = deps
 
   const [confirmReq, setConfirmReq] = useState<ConfirmRequest | null>(null)
 
@@ -33,11 +33,20 @@ export function useConfirm(deps: Deps) {
   const sendConfirm = useCallback(
     (decision: ConfirmDecision) => {
       const request = confirmReq
-      setConfirmReq(null)
-      setConfirmDetailOpen(false)
       if (!request) return
       const socket = wsRef.current
-      if (!socket || socket.readyState !== WebSocket.OPEN) return
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        // The decision reached nobody. Clearing the bar here would read as
+        // "answered" while the server never heard it: the turn keeps waiting
+        // on the deadline and fails closed, so a clicked "允许本次" is what
+        // the tool is denied. Keep the bar so the decision can be re-made --
+        // a reconnecting browser is re-offered the prompt server-side, with
+        // the time that actually remains.
+        messageApi.error('连接已断开，决策未送达；恢复连接后可重新决定')
+        return
+      }
+      setConfirmReq(null)
+      setConfirmDetailOpen(false)
       socket.send(
         JSON.stringify({
           type: 'confirm_response',
@@ -46,7 +55,7 @@ export function useConfirm(deps: Deps) {
         }),
       )
     },
-    [confirmReq],
+    [confirmReq, wsRef, messageApi],
   )
 
   // Locally drop an expired prompt. The server auto-denies at its own

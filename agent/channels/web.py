@@ -498,6 +498,13 @@ class WebOutputSink(OutputSink):
         self._completion_event = asyncio.Event()
         self.on_attachment = on_attachment
         self._confirmation_handler = confirmation_handler
+        # The approval prompt currently awaiting an answer, as
+        # ``(payload, deadline)`` with the deadline on loop time. Kept so a
+        # reconnecting browser can be re-offered the decision -- the waiter
+        # survives the socket the prompt was sent to, but the prompt itself
+        # was only ever sent to that socket (see
+        # ``pending_confirmation_resend``).
+        self._pending_confirmation: Optional[tuple[dict[str, Any], float]] = None
         # Session output directory scanned for media produced during a turn so
         # images/audio/video show inline even if the agent never called send_file.
         self._output_dir = output_dir
@@ -606,6 +613,30 @@ class WebOutputSink(OutputSink):
     def set_websocket(self, websocket: Any) -> None:
         """Route subsequent events to the currently selected browser tab."""
         self._websocket = websocket
+
+    def pending_confirmation_resend(self) -> dict[str, Any] | None:
+        """The pending approval prompt, re-addressed to a newly connected tab.
+
+        The waiter survives the socket the prompt was sent to, but the prompt
+        itself does not: a browser that switched tabs (or reloaded) mid-
+        approval would otherwise render a session that looks idle while the
+        decision ran out its clock and failed closed. The re-offer carries
+        the seconds that actually remain, so the receiving countdown stays
+        honest about the server's own deadline.
+        """
+        if self._pending_confirmation is None:
+            return None
+        prompt, deadline = self._pending_confirmation
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return None
+        resent = dict(prompt)
+        # Truncated, never rounded up: the client treats a non-positive
+        # timeout_seconds as "server sent nothing" and falls back to a full
+        # window, which would be a lie. Losing the last sub-second is the
+        # safe direction -- the bar converges a moment before the server does.
+        resent["timeout_seconds"] = max(1, int(remaining))
+        return resent
 
     def on_tool_start(self, name: str, inputs: dict) -> None:
         self._emit({"type": "tool_start", "name": name, "inputs": dict(inputs)})
@@ -858,52 +889,63 @@ class WebOutputSink(OutputSink):
         # socket reader while nothing was waiting on the token yet; the reply
         # was dropped on the floor and the prompt then sat until it timed out.
         pending = handler(confirmation_token) if callable(handler) else None
-        self._emit(
-            {
-                "type": "confirm_request",
-                "name": name,
-                "command": command,
-                "risk_level": risk_level,
-                "reason": reason,
-                "confirmation_token": confirmation_token,
-                "allow_session": allow_session,
-                "timeout_seconds": CONFIRMATION_TIMEOUT_SECONDS,
-            }
+        prompt = {
+            "type": "confirm_request",
+            "name": name,
+            "command": command,
+            "risk_level": risk_level,
+            "reason": reason,
+            "confirmation_token": confirmation_token,
+            "allow_session": allow_session,
+            "timeout_seconds": CONFIRMATION_TIMEOUT_SECONDS,
+        }
+        # Remember the prompt while it is out. A browser that reconnects
+        # mid-approval must be re-offered the decision, with the seconds
+        # that actually remain, on the socket it now reads -- otherwise the
+        # new tab shows a session that looks idle while the decision runs
+        # out its clock. Cleared when the answer (or the timeout) lands.
+        self._pending_confirmation = (
+            prompt,
+            asyncio.get_running_loop().time() + CONFIRMATION_TIMEOUT_SECONDS,
         )
+        self._emit(prompt)
         await self.flush()
-        decision = "deny"
-        if pending is not None:
-            try:
-                decision = _normalize_confirm_decision(
-                    {"decision": await pending}
-                )
-            except Exception:
+        try:
+            decision = "deny"
+            if pending is not None:
+                try:
+                    decision = _normalize_confirm_decision(
+                        {"decision": await pending}
+                    )
+                except Exception:
+                    return False
+            else:
+                # Collection/testing sinks have no shared WebSocket reader.
+                try:
+                    data = await asyncio.wait_for(
+                        self._websocket.receive_json(),
+                        timeout=CONFIRMATION_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    return False
+                if not isinstance(data, dict) or data.get("type") != "confirm_response":
+                    return False
+                decision = _normalize_confirm_decision(data)
+            if decision == "deny":
                 return False
-        else:
-            # Collection/testing sinks have no shared WebSocket reader.
-            try:
-                data = await asyncio.wait_for(
-                    self._websocket.receive_json(),
-                    timeout=CONFIRMATION_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                return False
-            if not isinstance(data, dict) or data.get("type") != "confirm_response":
-                return False
-            decision = _normalize_confirm_decision(data)
-        if decision == "deny":
-            return False
-        if decision == "allow_session" and allow_session:
-            # Hand the intent to the redeem step; it owns the pending record.
-            from agent.security.shell import shell_pending_mark_session_scope
+            if decision == "allow_session" and allow_session:
+                # Hand the intent to the redeem step; it owns the pending record.
+                from agent.security.shell import shell_pending_mark_session_scope
 
-            try:
-                shell_pending_mark_session_scope(
-                    confirmation_token, scope=scope
-                )
-            except Exception:
-                logger.debug("session-scope consent mark failed", exc_info=True)
-        return True
+                try:
+                    shell_pending_mark_session_scope(
+                        confirmation_token, scope=scope
+                    )
+                except Exception:
+                    logger.debug("session-scope consent mark failed", exc_info=True)
+            return True
+        finally:
+            self._pending_confirmation = None
 
     @staticmethod
     def _session_scope_supported(
@@ -1065,6 +1107,13 @@ class WebChannel(Channel):
         ] = None
         self._sessions: dict[str, Any] = {}
         self._live_sinks: dict[str, set[WebOutputSink]] = {}
+        # Pending approval answers, keyed by session then confirmation token.
+        # The waiter outlives the connection that created it: a tab switch,
+        # a refresh, or a reconnect hands the session a new socket while the
+        # approval keeps waiting, and the reply can arrive on any of that
+        # session's connections -- see ``wait_for_confirmation`` and the
+        # ``confirm_response`` branch of the socket reader.
+        self._confirmation_waiters: dict[str, dict[str, asyncio.Future[str]]] = {}
         self._components: dict[str, Any] = {}
         self._session_service: Optional[SessionService] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -3568,8 +3617,17 @@ class WebChannel(Channel):
                     await websocket.send_json(snapshot)
                 except Exception:
                     pass
+            # An approval that was in flight when the old tab went away is
+            # re-offered here, carrying the seconds that actually remain, so
+            # the new tab can answer it rather than watching a session that
+            # looks idle while the decision runs out its clock.
+            resend = live_sink.pending_confirmation_resend()
+            if resend is not None:
+                try:
+                    await websocket.send_json(resend)
+                except Exception:
+                    pass
         active_tasks: set[asyncio.Task[Any]] = set()
-        confirmation_waiters: dict[str, asyncio.Future[str]] = {}
 
         def wait_for_confirmation(token: str) -> asyncio.Future[str]:
             """Resolve to an ``allow_once`` / ``allow_session`` / ``deny`` string.
@@ -3577,10 +3635,17 @@ class WebChannel(Channel):
             A bare bool could not express "always allow", so the waiter carries
             the human's decision verbatim and lets the sink decide what it
             means for the pending record it is about to redeem.
+
+            The waiter registers on the channel, per session, not in this
+            connection's closure: a tab switch or a refresh hands the session
+            a new socket while the approval keeps waiting, and a reply
+            arriving on the new socket used to be dropped -- only this
+            connection's reader ever looked for the token, so the decision
+            silently ran out its clock and failed closed.
             """
             loop = asyncio.get_running_loop()
             future: asyncio.Future[str] = loop.create_future()
-            confirmation_waiters[token] = future
+            self._confirmation_waiters.setdefault(session_id, {})[token] = future
             async def guarded() -> str:
                 try:
                     return str(await asyncio.wait_for(
@@ -3589,7 +3654,11 @@ class WebChannel(Channel):
                 except asyncio.TimeoutError:
                     return "deny"
                 finally:
-                    confirmation_waiters.pop(token, None)
+                    waiters = self._confirmation_waiters.get(session_id)
+                    if waiters is not None:
+                        waiters.pop(token, None)
+                        if not waiters:
+                            self._confirmation_waiters.pop(session_id, None)
             return asyncio.ensure_future(guarded())
 
         async def process_message(
@@ -3660,7 +3729,11 @@ class WebChannel(Channel):
                     continue
                 if data.get("type") == "confirm_response":
                     token = str(data.get("confirmation_token") or "")
-                    waiter = confirmation_waiters.get(token)
+                    # Routed through the session's registry rather than this
+                    # connection's own dict: the reply is free to arrive on
+                    # whichever connection of the session is current, and only
+                    # this session's waiters may answer its tokens.
+                    waiter = self._confirmation_waiters.get(session_id, {}).get(token)
                     if waiter is not None and not waiter.done():
                         waiter.set_result(_normalize_confirm_decision(data))
                     continue

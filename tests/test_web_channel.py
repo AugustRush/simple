@@ -444,6 +444,66 @@ def test_web_stream_tool_confirmation_roundtrip():
             assert received[-1]["text"] == "approved"
 
 
+def test_web_confirm_request_survives_a_tab_switch(monkeypatch):
+    """An approval pending across a reconnect must stay answerable.
+
+    A tab switch, a refresh, or a reconnect hands the session a new socket
+    while the approval keeps waiting. The waiter used to live in the old
+    connection's closure and the prompt was never re-offered, so a decision
+    sent on the new socket was dropped on the floor and the action silently
+    ran out its clock and was denied -- the user pressed "允许" and the tool
+    ran denied 300 seconds later. The waiter now registers per session, and
+    the rebind re-offers the prompt with the seconds that actually remain.
+    """
+    from starlette.testclient import TestClient
+
+    from agent.channels import web as web_channel
+
+    # A short clock, so a regression fails an assertion instead of hanging:
+    # without the re-offer the waiter still times out into a denial, which
+    # arrives on the second socket and shows up here as the wrong first event.
+    monkeypatch.setattr(web_channel, "CONFIRMATION_TIMEOUT_SECONDS", 3)
+
+    channel = _channel()
+    channel.bind_runtime({}, {})
+    channel._handler = _confirm_handler
+
+    with TestClient(channel.app) as client:
+        sid = client.post("/api/sessions").json()["session_id"]
+        with client.websocket_connect(f"/api/sessions/{sid}/stream") as first:
+            first.send_json({"type": "message", "text": "run tool"})
+            req = first.receive_json()
+            assert req["type"] == "confirm_request"
+            assert req["confirmation_token"] == "token-1"
+
+            # The second tab opens while the approval is still unanswered.
+            # The sink rebinds to it, so its events -- and the decision --
+            # now travel on this socket.
+            with client.websocket_connect(f"/api/sessions/{sid}/stream") as second:
+                resent = second.receive_json()
+                assert resent["type"] == "confirm_request", (
+                    "the pending approval must be re-offered on the new socket"
+                )
+                assert resent["confirmation_token"] == "token-1"
+                assert 0 < resent["timeout_seconds"] <= req["timeout_seconds"]
+                second.send_json({
+                    "type": "confirm_response",
+                    "decision": "allow_once",
+                    "confirmation_token": "token-1",
+                })
+                events = []
+                while True:
+                    event = second.receive_json()
+                    events.append(event)
+                    if event["type"] in ("turn_complete", "error"):
+                        break
+                assert events[-1]["type"] == "turn_complete", events
+
+    # The turn's verdict is the proof: a decision taken on the second socket
+    # reached the waiter the first socket created, so the tool was allowed.
+    assert events[-1]["text"] == "approved"
+
+
 _T0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
 _DANGEROUS = "mkfs /dev/disk0"
 

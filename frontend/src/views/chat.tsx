@@ -609,18 +609,6 @@ export function renderChat(ctx: AppCtx) {
       </div>
 
       <div className="composer-wrap">
-        {confirmReq && (
-          <ApprovalBar
-            confirmReq={confirmReq}
-            remaining={confirmRemaining}
-            detailOpen={confirmDetailOpen}
-            overflowing={confirmOverflowing}
-            commandRef={attachApprovalCommand}
-            onToggleDetail={() => setConfirmDetailOpen(open => !open)}
-            onDecide={sendConfirm}
-            onDismiss={dismissConfirm}
-          />
-        )}
         {queueView.length > 0 && (
           <div className="message-queue-banner">
             <div className="message-queue-head">
@@ -712,7 +700,27 @@ export function renderChat(ctx: AppCtx) {
             <span>{activity}</span>
           </div>
         )}
-        <div className="composer">
+        {/* While an approval is pending it covers the composer rather than
+            stacking above it: the turn is waiting on a decision, not on the
+            next message, so the input reads as unavailable instead of
+            offering a box that is not the thing to answer. The composer's own
+            children are hidden (not removed) so its box keeps the height the
+            cover spans -- see .approval-cover in 04-composer.css. */}
+        <div className={`composer${confirmReq ? ' approval-pending' : ''}`}>
+          {confirmReq && (
+            <div className="approval-cover">
+              <ApprovalBar
+                confirmReq={confirmReq}
+                remaining={confirmRemaining}
+                detailOpen={confirmDetailOpen}
+                overflowing={confirmOverflowing}
+                commandRef={attachApprovalCommand}
+                onToggleDetail={() => setConfirmDetailOpen(open => !open)}
+                onDecide={sendConfirm}
+                onDismiss={dismissConfirm}
+              />
+            </div>
+          )}
           {pendingAttachments.length > 0 && (
             <div className="composer-attachments" aria-label="待发送附件">
               {pendingAttachments.map(item => {

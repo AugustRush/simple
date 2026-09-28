@@ -512,10 +512,13 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 }
 
 /* ── Tool approval bar ─────────────────────────────────────────────────────
- * Replaces the former blocking modal. Sits in the composer stack, so the
- * transcript stays scrollable and a decision can be made with the context
- * that prompted it. Colour comes from --risk-color, set per risk tier, which
- * keeps the light/dark themes to a single pair of rules. */
+ * Replaces the former blocking modal. In the chat view it covers the
+ * composer (see .approval-cover in 04-composer.css); on every other view it
+ * floats bottom-centre, because the server-side deadline runs regardless of
+ * which page the user is on. Either way the transcript stays scrollable, so
+ * a decision can be made with the context that prompted it. Colour comes
+ * from --risk-color, set per risk tier, which keeps the light/dark themes to
+ * a single pair of rules. */
 .approval-bar {
   --risk-color: var(--red);
   width: min(820px, 100%);

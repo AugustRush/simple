@@ -168,6 +168,45 @@
   border-color: var(--primary-border);
 }
 
+/* A pending tool approval covers the composer instead of stacking above it.
+ * The turn is waiting on a decision, not on the next message, so the input
+ * area reads as unavailable: the cover is opaque and sits exactly over the
+ * composer box, and the composer's own children are hidden rather than
+ * removed so its height -- the box the cover spans -- does not move.
+ *
+ * `.composer.approval-pending` takes no pointer events, and hiding its
+ * children with `visibility: hidden` (which keeps their layout box) drops
+ * the covered input out of both the tab order and the accessibility tree,
+ * so the hidden input cannot be tabbed into while a decision is
+ * outstanding; the approval bar is what answers.
+ *
+ * The cover is a flex column anchored to the bottom: a bar taller than the
+ * composer (an expanded command, 42vh) grows upward into the page rather
+ * than being clipped. It also outranks the command popover's z-index 30, in
+ * case a popover was still open when the prompt arrived. */
+.approval-cover {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  background: var(--bg);
+}
+
+.composer.approval-pending {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  pointer-events: none;
+}
+
+.composer.approval-pending > *:not(.approval-cover) {
+  visibility: hidden;
+}
+
 .composer .ant-input {
   padding: 5px 2px 8px;
   color: var(--text);

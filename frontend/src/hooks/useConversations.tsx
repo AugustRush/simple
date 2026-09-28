@@ -474,6 +474,14 @@ export function useConversations(deps: Deps) {
           // Ignore close errors on an already closed socket.
         }
       }
+      // The approval bar belongs to the session its socket narrates. On a
+      // session switch the old prompt would sit over the new session's UI,
+      // and its reply would be sent on this new socket where the old
+      // session's waiter cannot hear it. Dismiss it here: an approval still
+      // pending is re-offered (with the time that remains) when the old
+      // session's socket reconnects, or fails closed at its own deadline.
+      setConfirmReq(null)
+      setConfirmDetailOpen(false)
       setConnected(false)
       setActivity('正在连接…')
       setIsStreaming(false)
@@ -843,6 +851,11 @@ export function useConversations(deps: Deps) {
           setConfirmRemaining(timeout)
           setConfirmDetailOpen(false)
           setConfirmReq(evt as ConfirmRequest)
+          // The bar covers the composer, so a still-focused textarea would
+          // swallow keystrokes into an input the user can no longer see, and
+          // its send shortcut would queue a message instead of answering the
+          // approval. Hand focus back to the page.
+          composerRef.current?.blur()
         }
       }
     },
