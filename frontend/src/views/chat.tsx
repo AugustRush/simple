@@ -700,13 +700,240 @@ export function renderChat(ctx: AppCtx) {
             <span>{activity}</span>
           </div>
         )}
-        {/* While an approval is pending it covers the composer rather than
-            stacking above it: the turn is waiting on a decision, not on the
-            next message, so the input reads as unavailable instead of
-            offering a box that is not the thing to answer. The composer's own
-            children are hidden (not removed) so its box keeps the height the
-            cover spans -- see .approval-cover in 04-composer.css. */}
-        <div className={`composer${confirmReq ? ' approval-pending' : ''}`}>
+        {/* While an approval is pending, its bar covers the composer instead
+            of stacking above it: the turn is waiting on a decision, not on
+            the next message, so the input reads as unavailable rather than
+            offering a box that is not the thing to answer.
+
+            The cover is a sibling of the composer, never a child of it, and
+            that is load-bearing: with the bar inside, taking the covered
+            composer out of the tab order and the pointer path also reached
+            the bar's own buttons, and 允许本次 stopped being clickable (a
+            real page probe caught it; the unit tests and the type checker
+            cannot see that). See .composer-stage in 04-composer.css. */}
+        <div className="composer-stage">
+          <div className={`composer${confirmReq ? ' approval-pending' : ''}`}>
+            {pendingAttachments.length > 0 && (
+              <div className="composer-attachments" aria-label="待发送附件">
+                {pendingAttachments.map(item => {
+                  const fileUrl = fileHref(item.path, activeSession, token)
+                  const kindLabel = item.kind === 'image'
+                    ? '图片'
+                    : item.kind === 'document'
+                      ? '文档'
+                      : item.kind === 'archive'
+                        ? '压缩包'
+                        : '文件'
+                  return (
+                    <div className="composer-attachment" key={item.id}>
+                      {item.kind === 'image' ? (
+                        <img src={fileUrl} alt="" />
+                      ) : (
+                        <span className="composer-attachment-icon"><FileTextOutlined /></span>
+                      )}
+                      <span className="composer-attachment-main">
+                        <strong title={item.filename}>{item.filename}</strong>
+                        <small>{kindLabel}{item.size_bytes ? ` · ${Math.max(1, Math.round(item.size_bytes / 1024))} KB` : ''}</small>
+                      </span>
+                      <Tooltip title="移除附件">
+                        <button
+                          type="button"
+                          className="composer-attachment-remove"
+                          aria-label={`移除 ${item.filename}`}
+                          onClick={() => setPendingAttachments(prev => prev.filter(attachment => attachment.id !== item.id))}
+                        >
+                          <CloseOutlined />
+                        </button>
+                      </Tooltip>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {(inlineCommandOpen || inlineCommandEmpty) && (
+              <div className="command-popover" role="listbox" aria-label="可用命令">
+                <div className="command-popover-head">
+                  <span>可用命令</span>
+                  <span>↑ ↓ 选择 · {sendShortcutLabel} 发送 · Tab 补全 · Esc 关闭</span>
+                </div>
+                {inlineCommandOpen ? filteredCommands.map((command, index) => (
+                  <button
+                    type="button"
+                    key={command.name}
+                    ref={element => {
+                      if (element) commandItemRefs.current[command.name] = element
+                      else delete commandItemRefs.current[command.name]
+                    }}
+                    className={`command-item ${index === commandIndex ? 'active' : ''}`}
+                    role="option"
+                    aria-selected={index === commandIndex}
+                    onMouseEnter={() => {
+                      setCommandIndex(index)
+                      setCommandIndexPinned(true)
+                    }}
+                    onMouseDown={event => {
+                      event.preventDefault()
+                      setInput(`/${command.name} `)
+                      setCommandIndex(0)
+                    }}
+                  >
+                    {command.kind === 'skill' ? <ApiOutlined /> : <CodeOutlined />}
+                    <span className="command-item-main">
+                      <strong>{command.usage || `/${command.name}`}</strong>
+                      <small>{command.kind === 'skill' ? '技能 · ' : ''}{command.description || '无描述'}</small>
+                    </span>
+                    <kbd>/</kbd>
+                  </button>
+                )) : (
+                  <div className="command-empty">没有匹配的命令，{sendShortcutLabel} 将按原文发送</div>
+                )}
+              </div>
+            )}
+            <TextArea
+              ref={composerRef}
+              value={input}
+              onChange={event => {
+                setInput(event.target.value)
+                // Any edit re-opens the popover if it was dismissed with Esc.
+                setCommandDismissed(false)
+              }}
+              onKeyDown={handleComposerKeyDown}
+              onPaste={handleComposerPaste}
+              placeholder="给 Simple Agent 发送消息"
+              autoSize={{ minRows: 1, maxRows: 6 }}
+              variant="borderless"
+              disabled={false}
+            />
+            <div className="composer-footer">
+              <div className="composer-tools">
+                <Tooltip title="添加图片或文件">
+                  <Button type="text" className="composer-icon-button" aria-label="添加附件" icon={<PaperClipOutlined />} onClick={() => fileInputRef.current?.click()} />
+                </Tooltip>
+                <input ref={fileInputRef} type="file" multiple hidden onChange={handleFilesSelected} accept="image/*,.pdf,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" />
+                <div className="composer-context-controls">
+                  <Tooltip title={sessionState?.workspace_root ? `切换工作区：${sessionState.workspace_root}` : '选择 Agent 接下来工作的项目文件夹'}>
+                    <button
+                      type="button"
+                      className={`workspace-picker ${sessionState?.workspace_status === 'missing' ? 'workspace-picker-missing' : ''}`}
+                      aria-label={sessionState?.workspace_root
+                        ? `当前工作区：${sessionState.workspace_root}，${sessionState.workspace_write ? '可写' : '只读'}，点击切换`
+                        : '选择工作区'}
+                      onClick={pickWorkspace}
+                    >
+                      <FolderOpenOutlined aria-hidden="true" />
+                      {sessionState?.workspace_root ? (
+                        <>
+                          <strong title={sessionState.workspace_root}>{compactWorkspacePath(sessionState.workspace_root)}</strong>
+                          <span className="workspace-status-dot" aria-hidden="true" />
+                        </>
+                      ) : (
+                        <strong>选择工作区</strong>
+                      )}
+                    </button>
+                  </Tooltip>
+                  <Dropdown
+                    trigger={['click']}
+                    placement="topLeft"
+                    menu={{
+                    items: [
+                      {
+                        key: 'permission-title',
+                        label: '当前会话权限',
+                        disabled: true,
+                      },
+                      ...[
+                        ['ask', '需确认', '敏感操作逐项确认'],
+                        ['medium', '中权限', '高风险操作仍需确认'],
+                        ['high', '高权限', '大多数操作自动执行'],
+                        ['full', '完全访问', '最高权限，仍保留安全拦截'],
+                      ].map(([key, label, description]) => ({
+                        key: `level:${key}`,
+                        label: (
+                          <span className="permission-menu-item">
+                            <span>
+                              <strong>{label}</strong>
+                              <small>{description}</small>
+                            </span>
+                            {permissionLevel === key && <CheckCircleFilled />}
+                          </span>
+                        ),
+                        onClick: () => updateSessionPermissions({ level: key }),
+                      })),
+                      { type: 'divider' as const },
+                      {
+                        key: 'sandbox-title',
+                        label: '文件沙箱',
+                        disabled: true,
+                      },
+                      ...[
+                        ['restricted', '工作区', '仅限当前工作区'],
+                        ['read_all', '全盘可读', '读取范围更广，写入仍受限'],
+                        ['none', '无沙箱', '整机访问，仅完全访问可用'],
+                      ].map(([key, label, description]) => ({
+                        key: `sandbox:${key}`,
+                        disabled: key === 'none' && permissionLevel !== 'full',
+                        label: (
+                          <span className="permission-menu-item">
+                            <span>
+                              <strong>{label}</strong>
+                              <small>{description}</small>
+                            </span>
+                            {sandboxMode === key && <CheckCircleFilled />}
+                          </span>
+                        ),
+                        onClick: () => updateSessionPermissions({ sandbox: key }),
+                      })),
+                    ],
+                    }}
+                  >
+                    <Button
+                      type="text"
+                      className="permission-button"
+                      icon={<SafetyCertificateOutlined />}
+                      aria-label={`当前权限：${permissionLabel}`}
+                    >
+                      <span className="permission-button-label">{permissionLabel}</span>
+                    </Button>
+                  </Dropdown>
+                  <Select
+                    value={currentModel || undefined}
+                    placeholder={modelSelectPlaceholder}
+                    onChange={handleModelChange}
+                    options={modelOptions}
+                    className="model-select"
+                    style={{ width: modelSelectWidth }}
+                    popupMatchSelectWidth={false}
+                    variant="borderless"
+                  />
+                </div>
+              </div>
+              <div className="composer-actions">
+                {isStreaming && (
+                  <Tooltip title={interrupting ? '正在中断…' : '终止生成'}>
+                    <Button
+                      type="default"
+                      danger
+                      className="send-button stop-button"
+                      aria-label={interrupting ? '正在中断' : '终止生成'}
+                      icon={<StopOutlined />}
+                      loading={interrupting}
+                      onClick={stopStreaming}
+                    />
+                  </Tooltip>
+                )}
+                <Tooltip title={isStreaming ? '排队发送' : `发送 (${sendShortcutLabel})`}>
+                  <Button
+                    type="primary"
+                    className="send-button"
+                    aria-label={isStreaming ? '排队发送' : '发送'}
+                    icon={<ArrowUpOutlined />}
+                    disabled={!isStreaming && (!composerSendable || creatingSession)}
+                    onClick={() => sendMessage(resolvedComposerText)}
+                  />
+                </Tooltip>
+              </div>
+            </div>
+          </div>
           {confirmReq && (
             <div className="approval-cover">
               <ApprovalBar
@@ -721,226 +948,6 @@ export function renderChat(ctx: AppCtx) {
               />
             </div>
           )}
-          {pendingAttachments.length > 0 && (
-            <div className="composer-attachments" aria-label="待发送附件">
-              {pendingAttachments.map(item => {
-                const fileUrl = fileHref(item.path, activeSession, token)
-                const kindLabel = item.kind === 'image'
-                  ? '图片'
-                  : item.kind === 'document'
-                    ? '文档'
-                    : item.kind === 'archive'
-                      ? '压缩包'
-                      : '文件'
-                return (
-                  <div className="composer-attachment" key={item.id}>
-                    {item.kind === 'image' ? (
-                      <img src={fileUrl} alt="" />
-                    ) : (
-                      <span className="composer-attachment-icon"><FileTextOutlined /></span>
-                    )}
-                    <span className="composer-attachment-main">
-                      <strong title={item.filename}>{item.filename}</strong>
-                      <small>{kindLabel}{item.size_bytes ? ` · ${Math.max(1, Math.round(item.size_bytes / 1024))} KB` : ''}</small>
-                    </span>
-                    <Tooltip title="移除附件">
-                      <button
-                        type="button"
-                        className="composer-attachment-remove"
-                        aria-label={`移除 ${item.filename}`}
-                        onClick={() => setPendingAttachments(prev => prev.filter(attachment => attachment.id !== item.id))}
-                      >
-                        <CloseOutlined />
-                      </button>
-                    </Tooltip>
-                  </div>
-                )
-              })}
-            </div>
-          )}
-          {(inlineCommandOpen || inlineCommandEmpty) && (
-            <div className="command-popover" role="listbox" aria-label="可用命令">
-              <div className="command-popover-head">
-                <span>可用命令</span>
-                <span>↑ ↓ 选择 · {sendShortcutLabel} 发送 · Tab 补全 · Esc 关闭</span>
-              </div>
-              {inlineCommandOpen ? filteredCommands.map((command, index) => (
-                <button
-                  type="button"
-                  key={command.name}
-                  ref={element => {
-                    if (element) commandItemRefs.current[command.name] = element
-                    else delete commandItemRefs.current[command.name]
-                  }}
-                  className={`command-item ${index === commandIndex ? 'active' : ''}`}
-                  role="option"
-                  aria-selected={index === commandIndex}
-                  onMouseEnter={() => {
-                    setCommandIndex(index)
-                    setCommandIndexPinned(true)
-                  }}
-                  onMouseDown={event => {
-                    event.preventDefault()
-                    setInput(`/${command.name} `)
-                    setCommandIndex(0)
-                  }}
-                >
-                  {command.kind === 'skill' ? <ApiOutlined /> : <CodeOutlined />}
-                  <span className="command-item-main">
-                    <strong>{command.usage || `/${command.name}`}</strong>
-                    <small>{command.kind === 'skill' ? '技能 · ' : ''}{command.description || '无描述'}</small>
-                  </span>
-                  <kbd>/</kbd>
-                </button>
-              )) : (
-                <div className="command-empty">没有匹配的命令，{sendShortcutLabel} 将按原文发送</div>
-              )}
-            </div>
-          )}
-          <TextArea
-            ref={composerRef}
-            value={input}
-            onChange={event => {
-              setInput(event.target.value)
-              // Any edit re-opens the popover if it was dismissed with Esc.
-              setCommandDismissed(false)
-            }}
-            onKeyDown={handleComposerKeyDown}
-            onPaste={handleComposerPaste}
-            placeholder="给 Simple Agent 发送消息"
-            autoSize={{ minRows: 1, maxRows: 6 }}
-            variant="borderless"
-            disabled={false}
-          />
-          <div className="composer-footer">
-            <div className="composer-tools">
-              <Tooltip title="添加图片或文件">
-                <Button type="text" className="composer-icon-button" aria-label="添加附件" icon={<PaperClipOutlined />} onClick={() => fileInputRef.current?.click()} />
-              </Tooltip>
-              <input ref={fileInputRef} type="file" multiple hidden onChange={handleFilesSelected} accept="image/*,.pdf,.txt,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" />
-              <div className="composer-context-controls">
-                <Tooltip title={sessionState?.workspace_root ? `切换工作区：${sessionState.workspace_root}` : '选择 Agent 接下来工作的项目文件夹'}>
-                  <button
-                    type="button"
-                    className={`workspace-picker ${sessionState?.workspace_status === 'missing' ? 'workspace-picker-missing' : ''}`}
-                    aria-label={sessionState?.workspace_root
-                      ? `当前工作区：${sessionState.workspace_root}，${sessionState.workspace_write ? '可写' : '只读'}，点击切换`
-                      : '选择工作区'}
-                    onClick={pickWorkspace}
-                  >
-                    <FolderOpenOutlined aria-hidden="true" />
-                    {sessionState?.workspace_root ? (
-                      <>
-                        <strong title={sessionState.workspace_root}>{compactWorkspacePath(sessionState.workspace_root)}</strong>
-                        <span className="workspace-status-dot" aria-hidden="true" />
-                      </>
-                    ) : (
-                      <strong>选择工作区</strong>
-                    )}
-                  </button>
-                </Tooltip>
-                <Dropdown
-                  trigger={['click']}
-                  placement="topLeft"
-                  menu={{
-                  items: [
-                    {
-                      key: 'permission-title',
-                      label: '当前会话权限',
-                      disabled: true,
-                    },
-                    ...[
-                      ['ask', '需确认', '敏感操作逐项确认'],
-                      ['medium', '中权限', '高风险操作仍需确认'],
-                      ['high', '高权限', '大多数操作自动执行'],
-                      ['full', '完全访问', '最高权限，仍保留安全拦截'],
-                    ].map(([key, label, description]) => ({
-                      key: `level:${key}`,
-                      label: (
-                        <span className="permission-menu-item">
-                          <span>
-                            <strong>{label}</strong>
-                            <small>{description}</small>
-                          </span>
-                          {permissionLevel === key && <CheckCircleFilled />}
-                        </span>
-                      ),
-                      onClick: () => updateSessionPermissions({ level: key }),
-                    })),
-                    { type: 'divider' as const },
-                    {
-                      key: 'sandbox-title',
-                      label: '文件沙箱',
-                      disabled: true,
-                    },
-                    ...[
-                      ['restricted', '工作区', '仅限当前工作区'],
-                      ['read_all', '全盘可读', '读取范围更广，写入仍受限'],
-                      ['none', '无沙箱', '整机访问，仅完全访问可用'],
-                    ].map(([key, label, description]) => ({
-                      key: `sandbox:${key}`,
-                      disabled: key === 'none' && permissionLevel !== 'full',
-                      label: (
-                        <span className="permission-menu-item">
-                          <span>
-                            <strong>{label}</strong>
-                            <small>{description}</small>
-                          </span>
-                          {sandboxMode === key && <CheckCircleFilled />}
-                        </span>
-                      ),
-                      onClick: () => updateSessionPermissions({ sandbox: key }),
-                    })),
-                  ],
-                  }}
-                >
-                  <Button
-                    type="text"
-                    className="permission-button"
-                    icon={<SafetyCertificateOutlined />}
-                    aria-label={`当前权限：${permissionLabel}`}
-                  >
-                    <span className="permission-button-label">{permissionLabel}</span>
-                  </Button>
-                </Dropdown>
-                <Select
-                  value={currentModel || undefined}
-                  placeholder={modelSelectPlaceholder}
-                  onChange={handleModelChange}
-                  options={modelOptions}
-                  className="model-select"
-                  style={{ width: modelSelectWidth }}
-                  popupMatchSelectWidth={false}
-                  variant="borderless"
-                />
-              </div>
-            </div>
-            <div className="composer-actions">
-              {isStreaming && (
-                <Tooltip title={interrupting ? '正在中断…' : '终止生成'}>
-                  <Button
-                    type="default"
-                    danger
-                    className="send-button stop-button"
-                    aria-label={interrupting ? '正在中断' : '终止生成'}
-                    icon={<StopOutlined />}
-                    loading={interrupting}
-                    onClick={stopStreaming}
-                  />
-                </Tooltip>
-              )}
-              <Tooltip title={isStreaming ? '排队发送' : `发送 (${sendShortcutLabel})`}>
-                <Button
-                  type="primary"
-                  className="send-button"
-                  aria-label={isStreaming ? '排队发送' : '发送'}
-                  icon={<ArrowUpOutlined />}
-                  disabled={!isStreaming && (!composerSendable || creatingSession)}
-                  onClick={() => sendMessage(resolvedComposerText)}
-                />
-              </Tooltip>
-            </div>
-          </div>
         </div>
       </div>
     </div>

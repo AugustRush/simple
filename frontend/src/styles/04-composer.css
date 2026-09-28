@@ -170,20 +170,31 @@
 
 /* A pending tool approval covers the composer instead of stacking above it.
  * The turn is waiting on a decision, not on the next message, so the input
- * area reads as unavailable: the cover is opaque and sits exactly over the
- * composer box, and the composer's own children are hidden rather than
- * removed so its height -- the box the cover spans -- does not move.
+ * area reads as unavailable rather than offering a box that is not the thing
+ * to answer.
  *
- * `.composer.approval-pending` takes no pointer events, and hiding its
- * children with `visibility: hidden` (which keeps their layout box) drops
- * the covered input out of both the tab order and the accessibility tree,
- * so the hidden input cannot be tabbed into while a decision is
- * outstanding; the approval bar is what answers.
+ * The cover is a SIBLING of the composer, absolutely laid over it, and that is
+ * load-bearing rather than tidy: with the bar inside the composer, taking the
+ * covered composer out of the pointer path and the tab order also reached the
+ * bar's own buttons -- 允许本次 stopped being clickable, and no unit test or
+ * type check can see that. As a sibling, the cover intercepts every click on
+ * its own and the composer underneath can be hidden with one declaration.
+ *
+ * `visibility: hidden` on the composer keeps its layout box, so the stage does
+ * not change height when the bar arrives, and it drops the covered input out
+ * of the tab order and the accessibility tree in one step. No `pointer-events`
+ * override appears anywhere in this file for that reason.
  *
  * The cover is a flex column anchored to the bottom: a bar taller than the
- * composer (an expanded command, 42vh) grows upward into the page rather
- * than being clipped. It also outranks the command popover's z-index 30, in
- * case a popover was still open when the prompt arrived. */
+ * composer (an expanded command, 42vh) grows upward into the page rather than
+ * being clipped. Its z-index outranks the command popover's 30, for a popover
+ * that was still open when the prompt arrived. */
+.composer-stage {
+  position: relative;
+  width: min(820px, 100%);
+  margin: 0 auto;
+}
+
 .approval-cover {
   position: absolute;
   inset: 0;
@@ -195,15 +206,6 @@
 }
 
 .composer.approval-pending {
-  border-color: transparent;
-  background: transparent;
-  box-shadow: none;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-  pointer-events: none;
-}
-
-.composer.approval-pending > *:not(.approval-cover) {
   visibility: hidden;
 }
 
