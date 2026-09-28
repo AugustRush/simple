@@ -119,17 +119,29 @@ export function useConfirm(deps: Deps) {
       }
       if (event.key === 'Escape') {
         event.preventDefault()
-        sendConfirm('deny')
+        // Past the deadline the server has already auto-denied, so there is
+        // no decision left to send: Esc clears the dead bar locally, the
+        // keyboard twin of the "知道了" button, instead of emitting a
+        // confirm_response for a token the server will only drop.
+        if (confirmDeadlineRef.current - Date.now() <= 0) {
+          dismissConfirm()
+        } else {
+          sendConfirm('deny')
+        }
         return
       }
       if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+        // Same deadline: the visible UI no longer offers an allow button
+        // after "已自动拒绝", so the shortcut must not quietly "answer"
+        // anyway -- the user could believe a late approval landed.
+        if (confirmDeadlineRef.current - Date.now() <= 0) return
         event.preventDefault()
         sendConfirm(event.shiftKey && confirmReq.allow_session ? 'allow_session' : 'allow_once')
       }
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [confirmReq, sendConfirm])
+  }, [confirmReq, sendConfirm, dismissConfirm])
 
   const confirmResourceDeletion = (
     resourceLabel: string,

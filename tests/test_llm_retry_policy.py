@@ -50,6 +50,25 @@ _THROTTLE_429_BODY = {
     }
 }
 
+# OpenAI's documented 429 for a spent billing quota.  Not from this project's
+# run history -- nothing here has hit an OpenAI quota yet -- but the wording is
+# what OpenAI documents it sends, it rides the `RateLimitError` class like the
+# zen body above, and missing it would burn the retry budget the exact same
+# way.  Both spellings are pinned: the prose ("exceeded your current quota")
+# and the `type` field ("insufficient_quota"), the stabler of the two.
+_OPENAI_QUOTA_429_BODY = {
+    "error": {
+        "message": (
+            "You exceeded your current quota, please check your plan and "
+            "billing details. For more information on this error, read the "
+            "docs: https://platform.openai.com/docs/guides/error-codes."
+        ),
+        "type": "insufficient_quota",
+        "param": None,
+        "code": "insufficient_quota",
+    }
+}
+
 # Verbatim from a live probe of the deepseek endpoint with `deepseek-v4.1-flash`.
 _WRONG_ENDPOINT_400_BODY = {
     "error": {
@@ -117,13 +136,17 @@ def test_request_level_throttling_and_connection_blips_still_retry():
 
 
 def test_account_level_denials_are_recognised_across_providers():
-    """Three providers, three spellings, one state: the account, not the request.
+    """Four providers, four spellings, one state: the account, not the request.
 
     `Arrearage` is dashscope's 400 for an unpaid account, `INSUFFICIENT_BALANCE`
     is ApiKeyFun's 403, and Anthropic phrases the same thing in prose.  None of
     them inherits `RateLimitError`, so the isinstance branch never sees them --
     they are matched by body, which is why the list has to be spelled out.
+    OpenAI rides the `RateLimitError` class like the zen body does, so the veto
+    must fire before the isinstance branch can claim it.
     """
+    import openai
+
     agent = _agent()
 
     arrearage = _status_error(
@@ -133,11 +156,17 @@ def test_account_level_denials_are_recognised_across_providers():
     anthropic_credit = Exception(
         "Error code: 400 - Your credit balance is too low to access the Anthropic API."
     )
+    openai_quota = _status_error(429, _OPENAI_QUOTA_429_BODY)
 
     assert agent._is_account_exhausted(arrearage) is True
     assert agent._is_account_exhausted(no_balance) is True
     assert agent._is_account_exhausted(anthropic_credit) is True
+    assert agent._is_account_exhausted(openai_quota) is True
+    assert isinstance(openai_quota, openai.RateLimitError), (
+        "the premise: the SDK class for this body says 'throttled'"
+    )
     assert agent._is_llm_retryable(arrearage) is False
+    assert agent._is_llm_retryable(openai_quota) is False
 
 
 def test_a_spent_quota_is_not_replayed_or_slept_on(monkeypatch):
@@ -201,6 +230,30 @@ def test_the_quota_message_quotes_the_reset_time_the_provider_supplied():
     assert "2026-09-23 00:03:07 +0800 CST" in message
     assert "账户" in message
     assert "AccountQuotaExceeded" in message, "the raw body must stay visible"
+
+
+def test_the_formatted_message_keeps_the_scheduler_veto_able_to_see_it():
+    """The retry veto is a chain, and the formatter is its middle link.
+
+    A failed agent run reaches the scheduler as ``RuntimeError(result.error)``
+    (agent/cli.py) where ``result.error`` is this formatter's output, and
+    ``SchedulerRuntime._automatic_retry_at`` re-reads that stored text with
+    ``is_account_exhausted_text`` to refuse the retry.  The Chinese prose
+    carries no marker, so that veto rides entirely on the ``原始错误：`` quote
+    keeping the raw body in -- trim the quote and the scheduler goes silently
+    back to spending a whole step per retry on a quota window that cannot
+    reopen.  Nothing else fails, which is exactly why this link needs its
+    own test rather than borrowing the one above.
+    """
+    from agent.shared import is_account_exhausted_text
+
+    agent = _agent()
+    message = agent._format_agent_error(_status_error(429, _QUOTA_429_BODY))
+
+    assert is_account_exhausted_text(message) is True, (
+        "the formatter must keep the raw body quoted: the scheduler's retry "
+        "veto reads the stored (formatted) error text, not the raw exception"
+    )
 
 
 def test_a_throttled_request_is_still_reported_as_itself():

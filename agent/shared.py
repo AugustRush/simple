@@ -219,6 +219,11 @@ DEFAULT_SESSION_END_FLUSH_TIMEOUT_SECONDS = 30.0
 # 429 body in this project's run history (opencode zen, 5-hour window),
 # `Arrearage` is dashscope's 400 and `INSUFFICIENT_BALANCE` ApiKeyFun's 403 (both
 # seen live), and `credit balance is too low` is Anthropic's documented wording.
+# OpenAI's spent-billing-quota 429 is in on that same standing -- documented
+# wording, not (yet) run history: the message reads "You exceeded your current
+# quota, please check your plan and billing details" and the `type` field says
+# `insufficient_quota`.  Both spellings are listed because the type field is the
+# stabler one should the prose ever be reworded.
 # A per-minute limit says "rate limit"/"requests per minute" and is deliberately
 # NOT in this list: that one clears in seconds and must keep retrying.
 #
@@ -231,6 +236,8 @@ ACCOUNT_EXHAUSTED_MARKERS: tuple[str, ...] = (
     "arrearage",
     "insufficient balance",
     "credit balance is too low",
+    "exceeded your current quota",
+    "insufficient quota",
 )
 
 
