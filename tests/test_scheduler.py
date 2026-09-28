@@ -761,6 +761,68 @@ def test_scheduler_service_queues_configured_retry_after_failure(tmp_path):
     assert runs[1].retry_of_run_id == runs[0].id
 
 
+def test_scheduler_service_does_not_queue_a_retry_for_a_spent_account(tmp_path):
+    """A configured retry is an opt-in, and it is not an opt-out of arithmetic.
+
+    The quota window is measured in hours and the backoff in seconds, so the
+    second attempt cannot succeed -- it only costs a whole step to prove it.
+    The configured policy here is the same one the test above uses, so the
+    difference in outcome is the error and nothing else.
+
+    This layer became worth fixing after measuring the real store: workflow
+    steps in it carry ``max_attempts`` 2 (9 steps) and 3 (2 steps), i.e. the
+    automatic retry is live, not theoretical.
+    """
+    from agent.scheduler import (
+        DeliveryTarget,
+        NewScheduledTask,
+        SchedulerService,
+        SchedulerStore,
+        TriggerSpec,
+    )
+
+    store = SchedulerStore(db_path=tmp_path / "scheduler.db")
+    task = store.create_task(
+        NewScheduledTask(
+            name="retry-spent-quota",
+            kind="agent_prompt",
+            trigger=TriggerSpec.once("2026-04-19T00:00:00+00:00", "UTC"),
+            payload={"prompt": "run"},
+            delivery_mode="standalone",
+            delivery_target=DeliveryTarget.standalone(),
+            retry_policy={"max_attempts": 2, "backoff_seconds": 30},
+        )
+    )
+
+    # Verbatim from this project's own run history.
+    quota_error = (
+        "Error code: 429 - {'error': {'code': 'AccountQuotaExceeded', "
+        "'message': 'You have exceeded the 5-hour usage quota. It will reset at "
+        "2026-09-23 00:03:07 +0800 CST.'}}"
+    )
+
+    async def exhausted_executor(task, run):
+        raise RuntimeError(quota_error)
+
+    async def unused(*args):
+        raise AssertionError("unused")
+
+    service = SchedulerService(
+        store=store,
+        agent_executor=exhausted_executor,
+        system_executor=unused,
+        delivery=unused,
+        lease_seconds=300,
+    )
+    asyncio.run(service.run_once(now=datetime(2026, 4, 19, tzinfo=timezone.utc)))
+
+    runs = store.list_runs(task.id)
+    assert [run.status for run in runs] == ["failed"], (
+        "the attempt budget must not be spent on a window that cannot reopen"
+    )
+    assert runs[0].error == quota_error, "the raw body is still recorded"
+
+
 def test_scheduler_service_honours_cancel_requested_by_another_instance(tmp_path):
     from agent.scheduler import (
         DeliveryTarget,

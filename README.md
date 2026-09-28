@@ -52,7 +52,7 @@ The setup wizard guides you through provider selection, API key configuration, a
 | **Run outcomes** | `succeeded` / `failed` / `unverified` / `skipped` — "we could not tell" is not "it failed" |
 | **Signals** | `emit_signal` wakes whatever subscribed, so a step can follow another without a clock |
 | **Unified event stream** | Every tool call, hook, and lifecycle fact is a replayable `RuntimeEvent` |
-| **LLM retry** | Transient API errors (rate limit, 5xx) retried 3x with exponential backoff |
+| **LLM retry** | Transient API errors (rate limit, 5xx) retried 3x with exponential backoff; a spent quota or empty balance is not retried |
 | **Config validation** | Startup warnings for typos and invalid values — never blocks startup |
 | **Named sessions** | `--name prod` for isolated session data with shared config by default |
 | **One writer per agent home** | A second process on the same home is refused rather than allowed to corrupt it |
@@ -466,7 +466,10 @@ Two rules hold it together:
   never looked" — so it gets its own status. Retries are opt-in
   (`retry_policy.max_attempts`, default `1`), and when a task does opt in only
   `failed` and `unverified` are retried: a `cancelled` run was cancelled on
-  purpose.
+  purpose. One failure is refused a retry even then — an error that says the
+  provider account itself cannot serve requests (spent plan quota, empty
+  balance). The backoff is in seconds and the quota window in hours, so the
+  second attempt can only spend a whole step to prove it fails the same way.
 
 A run can also carry the agent's own verdict on its work, and the combination
 is deliberately asymmetric: **either source can fail the run, and both must
@@ -1661,7 +1664,11 @@ Key properties:
   `schedule_run`, `schedule_cancel`, `workflow_update`) state what they are
   doing; both gates are capabilities on the tool (`requires_intent`,
   `requires_request`), not per-tool branches
-- **LLM retry**: transient API errors (rate limits, 5xx) retried with exponential backoff
+- **LLM retry**: transient API errors (rate limits, 5xx) retried with exponential backoff.
+  An account that is spent rather than throttled is not one of them: a spent
+  plan quota, an arrears notice, or an empty balance arrives on the same status
+  as a rate limit, and `agent.shared.ACCOUNT_EXHAUSTED_MARKERS` is what tells
+  the two apart — for the retry loop and for the scheduler that queues run retries
 
 ### Which tool schemas a turn is offered
 

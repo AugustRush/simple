@@ -1456,6 +1456,11 @@ RUN_UNVERIFIED_STATUS = "unverified"
 #: This is a list of *what a retry could help with*, not of what is wrong; the
 #: opt-in lives in ``retry_policy.max_attempts``, which defaults to 1, so no
 #: task retries unless somebody asked for it.
+#:
+#: A status in this list is necessary but not sufficient.  The error decides
+#: too: ``SchedulerRuntime._automatic_retry_at`` refuses to schedule one when
+#: the failure says the provider account cannot serve requests at all, since a
+#: second attempt would land in the same closed window.
 RETRYABLE_RUN_STATUSES: tuple[str, ...] = ("failed", RUN_UNVERIFIED_STATUS)
 
 

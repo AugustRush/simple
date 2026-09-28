@@ -501,7 +501,7 @@ class SchedulerService:
         )
 
     def _automatic_retry_at(
-        self, task, run, finished_at: datetime
+        self, task, run, finished_at: datetime, error: str
     ) -> Optional[datetime]:
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})
         retry_policy = snapshot.get("retry_policy")
@@ -510,6 +510,19 @@ class SchedulerService:
         max_attempts = max(1, int(retry_policy.get("max_attempts", 1) or 1))
         attempt = max(1, int(getattr(run, "attempt", 1) or 1))
         if attempt >= max_attempts:
+            return None
+        # A retry policy says "this step may fail for reasons a second try
+        # fixes".  An account that has run out of quota is not one of them: the
+        # second try lands in the same closed window, hours before it reopens,
+        # and costs a whole step to find that out.  The vocabulary is shared with
+        # the LLM retry loop rather than written twice.
+        if shared.is_account_exhausted_text(error):
+            logger.warning(
+                "Not scheduling an automatic retry for run %s: the provider "
+                "account cannot serve requests (%s)",
+                getattr(run, "id", "?"),
+                error[:200],
+            )
             return None
         base_delay = max(0, int(retry_policy.get("backoff_seconds", 30) or 0))
         return finished_at + timedelta(seconds=base_delay * (2 ** max(0, attempt - 1)))
@@ -765,7 +778,7 @@ class SchedulerService:
                 verification=verification,
                 products=products,
                 retry_at=(
-                    self._automatic_retry_at(task, run, finished_at)
+                    self._automatic_retry_at(task, run, finished_at, error)
                     if status in RETRYABLE_RUN_STATUSES
                     else None
                 ),
@@ -817,7 +830,7 @@ class SchedulerService:
                 # anybody, because nothing downstream runs on a failure.
                 products=self._measure_products(task, run),
                 retry_at=(
-                    self._automatic_retry_at(task, run, finished_at)
+                    self._automatic_retry_at(task, run, finished_at, str(exc))
                     if status in RETRYABLE_RUN_STATUSES
                     else None
                 ),

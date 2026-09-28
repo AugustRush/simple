@@ -209,6 +209,43 @@ DEFAULT_LLM_MAX_RETRIES = 3
 DEFAULT_LLM_RETRY_BASE_DELAY = 1.0
 DEFAULT_SESSION_END_FLUSH_TIMEOUT_SECONDS = 30.0
 
+# Body markers that mean the *account* ran out, as opposed to this one request
+# being throttled.  The two arrive on the same HTTP status -- a spent plan quota
+# is a 429, an empty balance can be a 400 or a 403 -- so the status cannot tell
+# them apart, and the consequence of confusing them is expensive: a quota that
+# resets in hours gets replayed through every retry layer there is.
+#
+# The words are not a guess.  `AccountQuotaExceeded` / `usage quota` is the real
+# 429 body in this project's run history (opencode zen, 5-hour window),
+# `Arrearage` is dashscope's 400 and `INSUFFICIENT_BALANCE` ApiKeyFun's 403 (both
+# seen live), and `credit balance is too low` is Anthropic's documented wording.
+# A per-minute limit says "rate limit"/"requests per minute" and is deliberately
+# NOT in this list: that one clears in seconds and must keep retrying.
+#
+# Separators are normalised before matching because one state has several
+# spellings -- `INSUFFICIENT_BALANCE` and `credit balance is too low` are the
+# same fact about the account.
+ACCOUNT_EXHAUSTED_MARKERS: tuple[str, ...] = (
+    "accountquotaexceeded",
+    "usage quota",
+    "arrearage",
+    "insufficient balance",
+    "credit balance is too low",
+)
+
+
+def is_account_exhausted_text(text: object) -> bool:
+    """True when *text* describes an account that cannot serve requests.
+
+    The single reading of :data:`ACCOUNT_EXHAUSTED_MARKERS`, shared by the LLM
+    retry loop (which must not replay it) and the scheduler (which must not
+    schedule a retry for it).  Two copies of this list would eventually disagree
+    about a provider, and the copy that ran last would decide.
+    """
+    lowered = str(text or "").lower().replace("_", " ").replace("-", " ")
+    return any(marker in lowered for marker in ACCOUNT_EXHAUSTED_MARKERS)
+
+
 CONTEXT_DIR = AGENT_HOME / "context"
 LATENCY_TRACE_ENV_VAR = "SIMPLE_TRACE_LATENCY"
 MAX_CATEGORIES = 15
@@ -691,6 +728,8 @@ __all__ = [
     "REGULAR_TOOL_TIMEOUT",
     "DEFAULT_LLM_MAX_RETRIES",
     "DEFAULT_LLM_RETRY_BASE_DELAY",
+    "ACCOUNT_EXHAUSTED_MARKERS",
+    "is_account_exhausted_text",
     "DEFAULT_SESSION_END_FLUSH_TIMEOUT_SECONDS",
     "CONTEXT_DIR",
     "LATENCY_TRACE_ENV_VAR",
