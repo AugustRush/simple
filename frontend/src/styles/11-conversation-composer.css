@@ -511,11 +511,8 @@ html[data-theme='light'] .app-main {
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .send-button.stop-button .anticon {
-    animation: none;
-  }
-}
+/* Reduced motion is handled in one place for the whole app; see
+ * `07-motion-responsive.css`. */
 
 @media (max-width: 768px) {
   .send-button {

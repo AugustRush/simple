@@ -36,7 +36,7 @@ import {
 const CARD_CONTROLS = '.ant-checkbox-wrapper, .ant-btn, .ant-dropdown, .ant-dropdown-trigger, .ant-typography-copy, .session-item-delete-actions, input'
 
 export function renderSessions(ctx: AppCtx) {
-  const { activeSession, allFilteredSessionsSelected, commitSessionTitle, createSession, creatingSession, deleteSelectedSessions, deleteSession, filteredSessions, handleSessionContainerClick, loadingSessions, pageMeta, pendingDeleteSessionId, renamingSession, revealSession, selectedSessionIds, sessionSearch, sessions, setPendingDeleteSessionId, setRenamingSession, setSelectedSessionIds, setSessionSearch } = ctx
+  const { activeSession, allFilteredSessionsSelected, commitSessionTitle, createSession, creatingSession, deleteSelectedSessions, deleteSession, filteredSessions, handleSessionContainerClick, loadingSessions, pendingDeleteSessionId, renamingSession, revealSession, selectedSessionIds, sessionSearch, sessions, setPendingDeleteSessionId, setRenamingSession, setSelectedSessionIds, setSessionSearch } = ctx
 
   // A selected id can outlive its session (deleted from the sidebar, or by
   // another tab); counting those would put a number on the delete button
@@ -253,11 +253,12 @@ export function renderSessions(ctx: AppCtx) {
 
   return (
     <div className="page-view">
-      <div className="page-head">
-        <div>
-          <h2>{pageMeta.sessions.title}</h2>
-          <p>{pageMeta.sessions.subtitle}</p>
-        </div>
+      {/* The top bar already carries the page name and its count; rendering them
+          here as well put the same sentence twice, forty pixels apart, which
+          reads as a rendering fault rather than as emphasis. What is left for
+          this row is the controls -- so they keep their own line instead of
+          riding up under the bar. */}
+      <div className="page-controls">
         <Space wrap>
           {filteredSessions.length > 0 && (
             <Checkbox

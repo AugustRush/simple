@@ -42,6 +42,39 @@
   to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
+/* Reduced motion, in one place.
+ *
+ * This used to be five separate `prefers-reduced-motion` blocks scattered
+ * across the partials, each opting one animation out. That is a trap: a new
+ * animation is accessible by default only if whoever adds it remembers to come
+ * find these blocks, and forgetting is invisible -- nothing fails, the motion
+ * simply plays for the reader who asked it not to.
+ *
+ * So the rule is stated once, broadly, here: under reduced motion nothing
+ * animates or transitions. The blocks that opted out individual animations are
+ * removed as redundant. The animations themselves are unchanged, so a reader
+ * without the preference gets the same page as before.
+ *
+ * Two properties cover everything here, and the engine honours both without a
+ * per-animation opt-out: `animation-duration` for keyframes and `transition-
+ * duration` for hover and state changes. `animation-iteration-count` goes to 1
+ * so a looping indicator settles into its final frame instead of freezing
+ * mid-breath at whatever opacity it held. Nothing in the app waits on
+ * `animationend` or `transitionend`, so `0s` would also be safe; `0.01ms` is
+ * used instead because it is the conventional spelling and stays correct if
+ * that ever stops being true.
+ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 /* Responsive */
 @media (max-width: 768px) {
   .app-sider:not(.ant-layout-sider-collapsed) {

@@ -64,15 +64,11 @@ html[data-theme='dark'] .settings-inline-save:disabled {
   border-color: #484850 !important;
   opacity: 1;
 }
-.composer-attachments { display:grid; grid-template-columns:repeat(auto-fill, minmax(190px, 1fr)); gap:7px; max-height:110px; margin:0 1px 7px; padding:0 1px 9px; overflow-x:hidden; overflow-y:auto; border-bottom:1px solid var(--border); scrollbar-gutter:stable; }
-.composer-attachment { display:flex; align-items:center; gap:8px; min-width:0; height:46px; padding:6px; border:1px solid var(--border); border-radius:8px; background:var(--surface-hover); }
-.composer-attachment > img, .composer-attachment-icon { display:grid; place-items:center; width:32px; height:32px; flex:0 0 32px; border-radius:6px; color:var(--text-secondary); background:var(--surface-raised); object-fit:cover; font-size:15px; }
-.composer-attachment-main { display:flex; flex:1 1 auto; min-width:0; flex-direction:column; gap:1px; }
-.composer-attachment-main strong, .composer-attachment-main small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.composer-attachment-main strong { color:var(--text); font-size:11px; font-weight:600; line-height:1.4; }
-.composer-attachment-main small { color:var(--text-muted); font-size:9px; line-height:1.35; }
-.composer-attachment-remove { display:grid; place-items:center; width:24px; height:24px; flex:0 0 24px; padding:0; border:0; border-radius:6px; color:var(--text-muted); background:transparent; cursor:pointer; transition:color .15s ease, background-color .15s ease; }
-.composer-attachment-remove:hover { color:var(--text); background:var(--surface-raised); }
+/* The composer's attachment chips are styled in `04-composer.css`, with the
+ * rest of the composer. They sat here for a while because this file is
+ * imported last and a later sheet silently owns whatever it declares --
+ * which is exactly how a two-line minified block goes unnoticed. Only the
+ * button's own hover is kept here, beside the other chip button states. */
 .workspace-status-tag { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-inline: 2px; }
 .workspace-status-missing { color: var(--danger, #b45309); border-color: currentColor; }
 .bubble-with-attachments { width:min(460px, calc(100vw - 120px)); }
@@ -304,6 +300,9 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
 .resource-delete-confirm .ant-modal-confirm-content { color:var(--text-secondary); }
 @media (max-width: 640px) {
   .schedule-detail-drawer .ant-drawer-content-wrapper { width:100vw !important; max-width:100vw; }
+  /* A full-width chip on a phone: the composer is narrower than two tracks, so
+   * the grid in `04-composer.css` would already collapse to one, but asking for
+   * it explicitly keeps the intent legible and survives a track-width change. */
   .composer-attachments { grid-template-columns:1fr; }
   .bubble-with-attachments { width:min(100%, calc(100vw - 72px)); }
   .message-attachments { grid-template-columns:1fr; }
@@ -537,9 +536,8 @@ html[data-theme='dark'] .status-interrupted, html[data-theme='dark'] .status-can
   to { opacity: 1; transform: translateY(0); }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .approval-bar { animation: none; }
-}
+/* Reduced motion is handled in one place for the whole app; see
+ * `07-motion-responsive.css`. */
 
 .approval-bar.approval-risk-medium { --risk-color: var(--amber); }
 .approval-bar.approval-risk-low { --risk-color: var(--green); }
@@ -1257,6 +1255,7 @@ html[data-theme='dark'] .status-skipped { color:#9a9aa2; }
 .composer-attachment-remove:active {
   color: var(--text);
   background: var(--primary-soft);
+  transition-duration: 0s;
 }
 
 /* The composer chips share one bordered strip, so they press by filling rather

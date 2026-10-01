@@ -13,7 +13,7 @@ import { useAutomation } from './useAutomation'
 type Deps = ReturnType<typeof useUi> & ReturnType<typeof useConversations> & ReturnType<typeof useExtensions> & ReturnType<typeof useSettings> & ReturnType<typeof useAutomation>
 
 export function useShell(deps: Deps) {
-  const { activeSession, applyCommand, automationTab, commandPaletteOpen, commands, connected, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
+  const { activeSession, applyCommand, automationTab, commandPaletteOpen, commands, connected, connecting, loadPlugins, loadScheduleRuns, loadSchedulerHealth, loadSchedules, loadSettings, loadSignals, loadSkills, loadWorkflows, paletteQuery, plugins, resetSettings, scheduleDetailOpen, schedulerWatchful, selectedSchedule, sessions, setAutomationTab, setClock, setCommandPaletteOpen, setPaletteQuery, setView, settingsDirty, skills, tokenDirty, unseenFailures, view } = deps
 
   // How often to ask the server again -- and, more to the point, that it is
   // asked at all.
@@ -255,9 +255,19 @@ export function useShell(deps: Deps) {
   const pageMeta: Record<string, { title: string; subtitle: string }> = {
     chat: {
       title: activeSession ? '当前对话' : '开始新的对话',
-      subtitle: activeSession
-        ? `${activeSession.slice(0, 12)} · ${connected ? '实时连接中' : '连接已断开'}`
-        : '与你的 AI Agent 开始一段对话',
+      // The connection state is a status, not a session name, and it is the
+      // part that changes -- so it stands alone rather than being welded to a
+      // session id the reader cannot act on.
+      subtitle: !activeSession
+        ? '与你的 AI Agent 开始一段对话'
+        // Three states, not two. A socket that has not opened yet is not a
+        // dropped one, and saying "连接已断开" before it has ever connected
+        // tells the reader something has gone wrong when nothing has.
+        : connected
+          ? '实时连接中'
+          : connecting
+            ? '正在连接…'
+            : '连接已断开',
     },
     sessions: {
       title: '会话管理',

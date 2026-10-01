@@ -220,6 +220,135 @@
   color: var(--text-muted);
 }
 
+/* ---- pending attachments ----
+ *
+ * These rules used to live in `12-sessions-scheduler.css`, minified onto one
+ * line each. Nothing was wrong with the composer for having them, but the file
+ * is imported last and is about a different page, so they read as part of
+ * someone else's work and were never revisited. They belong to the composer.
+ *
+ * The rhythm is the thing that was off. The strip had `margin-bottom: 7px` and
+ * `padding-bottom: 9px` and nothing above it at all, so the chips sat flush
+ * against the composer's own top border while the gap below them was sixteen
+ * pixels -- sixteen times the space above, which is what makes a two-line strip
+ * look like it is falling out of the box. One token's worth above and below,
+ * and the divider is what separates them.
+ *
+ * The tracks are a fixed band rather than `1fr`. Both of the obvious
+ * alternatives are wrong: `auto-fill` with `1fr` keeps the empty tracks, so
+ * two attachments in an 820px composer left a 250px hole beside them;
+ * `auto-fit` collapses those tracks but hands the freed width to the ones
+ * that remain, so the same two attachments stretched to 380px each. A bounded
+ * track keeps a chip the same size whether there is one or twelve, and lets the
+ * rest wrap.
+ */
+.composer-attachments {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(176px, 200px));
+  justify-content: start;
+  gap: 8px;
+  margin: 0 0 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  /* Two whole rows, and nothing more.
+   *
+   * `box-sizing: border-box`, so this height covers the padding too: a chip is
+   * 46px, the row pitch is 54px (46 + the 8px gap), two rows are 108px, and
+   * the 10px of padding above and below brings it to 128. Landing exactly on a
+   * row boundary matters because the third row is what a scroll container cuts
+   * -- a height that ends mid-chip reads as a rendering fault instead of as
+   * "there is more below".
+   */
+  max-height: 128px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
+}
+
+.composer-attachment {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  height: 46px;
+  padding: 6px;
+  /* A resting surface, not `--surface-hover`. That token is what a row lifts to
+   * when the pointer is on it; borrowing it for a permanent state made every
+   * attachment read as hovered, and left the chip's own hover nowhere to go. */
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+
+.composer-attachment > img,
+.composer-attachment-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: var(--surface);
+  object-fit: cover;
+  font-size: 15px;
+}
+
+.composer-attachment-main {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-direction: column;
+  /* Two lines of text need a little air between them to stay legible; the old
+   * 1px sat them almost on top of each other. */
+  gap: 2px;
+}
+
+.composer-attachment-main strong,
+.composer-attachment-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-attachment-main strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+/* Was 9px. Below about 11px the size and the " · 1 KB" tail stop being read as
+ * text and start being read as texture, which is the wrong thing for the one
+ * line that says what a file is and how big it is. */
+.composer-attachment-main small {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.composer-attachment-remove {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--text-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+/* The chip itself now rests on `--surface-raised`, so the button has to lift
+ * somewhere else. Pointing its hover at the same token would be invisible. */
+.composer-attachment-remove:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+
 .composer-footer {
   display: flex;
   align-items: center;

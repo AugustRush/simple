@@ -125,6 +125,22 @@
   border-radius: 11px;
   cursor: pointer;
   transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease;
+  /* Slides in from the sidebar's own edge rather than fading in place: the row
+   * is entering from the left, so the motion should agree with where it came
+   * from. Keyed by session id, so this plays on arrival and not on every
+   * re-render of the list. */
+  animation: session-item-in 0.24s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes session-item-in {
+  from {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 
 .session-item:hover {
@@ -165,13 +181,14 @@
 .session-item-status span.busy {
   background: var(--primary);
   animation: status-pulse 1.4s ease-in-out infinite;
+  /* The row slides in, and the dot is already pulsing when it does. Without a
+   * delay the two motions start together and read as one twitch rather than as
+   * an arrival followed by something happening in it. */
+  animation-delay: 0.24s;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .session-item-status span.busy {
-    animation: none;
-  }
-}
+/* Reduced motion is handled in one place for the whole app; see
+ * `07-motion-responsive.css`. */
 
 .session-item-main {
   flex: 1;

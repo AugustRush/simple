@@ -27,6 +27,18 @@
   font-size: 13px;
 }
 
+/* Controls that belong to the page but not to its heading row. The bar above
+   already names the page and counts it, so a page that repeats neither needs
+   its controls on their own line rather than riding up under the bar. */
+.page-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 20px;
+}
+
 .page-empty {
   margin-top: 80px;
 }
