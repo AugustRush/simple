@@ -77,6 +77,32 @@ export interface Message {
   streaming?: boolean
   queued?: boolean
   /**
+   * The record's own id (`message_id` from the server), when it has one.
+   *
+   * Distinct from `id`, which is this client's handle for the row. The record
+   * id is what lets an optimistic row be recognised once the transcript
+   * confirms it -- the same sentence sent twice in one turn is two messages,
+   * and only the id tells them apart.
+   */
+  messageId?: string
+  /** When the message was said, as the server recorded it. */
+  createdAt?: string
+  /**
+   * The row's position in the session's transcript, assigned by the server.
+   *
+   * Unique and stable, which is what makes it usable as this client's row key:
+   * a row keeps its identity across reloads, and an older page of the
+   * transcript is known to be older rather than guessed at.
+   */
+  seq?: number
+  /**
+   * Which tool call this row is, when the server said so.
+   *
+   * Two calls to the same tool can run at once, so a result is matched to its
+   * start by this rather than by name.
+   */
+  operationId?: string
+  /**
    * A message the user sent while a turn was already running.
    *
    * Set by the server on the recorded row (the message was folded into the

@@ -21,6 +21,16 @@ export interface AppCtx {
   expandedTraces: Record<string, boolean>
   toggleTraceExpanded: (id: string) => void
   messages: Message[]
+  /**
+   * True when the session is longer than the loaded window. The transcript says
+   * so and offers to page back rather than letting the reader assume they are
+   * looking at all of it.
+   */
+  hasMoreHistory: boolean
+  /** True while a page of earlier messages is being fetched. */
+  loadingHistory: boolean
+  /** Fetch the page of transcript before what is on screen, and prepend it. */
+  loadEarlierMessages: () => Promise<void>
   conversationTurns: Message[]
   conversationRailRef: MutableRefObject<HTMLDivElement | null>
   keepTurnSummary: () => void

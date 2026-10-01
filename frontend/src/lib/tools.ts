@@ -38,6 +38,26 @@ export function summariseToolDots(tools: Message[]): ToolDotSummary[] {
 }
 
 
+/**
+ * A user message that belongs to the turn already open, not to a new one.
+ *
+ * Two flags, one meaning.  ``queued`` is the local one: this message was sent
+ * while the agent was mid-reply, and the server has not answered yet about
+ * which queue it went into.  ``interjection`` is the server's: the message was
+ * folded into the turn that was running, so it is part of that turn's record.
+ * Both cases have to keep the turn open -- flushing on either one is what
+ * split a running turn in two and pushed its tool trace to the bottom.
+ *
+ * A message queued for a *later* turn (the restart queue) carries ``queued``
+ * too, and is also kept inside the open group while it waits: it has not
+ * started a turn yet, and the server's transcript will place it correctly once
+ * it does.
+ */
+export function isInTurnUserMessage(item: Message): boolean {
+  return item.role === 'user' && Boolean(item.queued || item.interjection)
+}
+
+
 export function confirmToolLabel(name?: string): string {
   const key = String(name || '').trim()
   if (!key) return '未知操作'

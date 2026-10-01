@@ -2,470 +2,33 @@
 
 import type { AppCtx } from '../app/AppCtx'
 import { ApprovalBar } from '../components/ApprovalBar'
+import { MessageList } from '../components/MessageList'
 import { TASK_INTERRUPTED_STATUSES, TASK_STATUS_LABELS } from '../constants'
 import { compactWorkspacePath, truncate } from '../lib/format'
-import { markdownToHtml } from '../lib/markdown'
-import { fileHref, mediaKindForUrl } from '../lib/media'
-import { subagentCounts } from '../lib/subagent'
-import { summariseToolDots, toolStateLabel } from '../lib/tools'
-import type { Message, SubAgentNote } from '../types'
+import { fileHref } from '../lib/media'
 import {
   ApiOutlined,
   ArrowDownOutlined,
   ArrowUpOutlined,
   CheckCircleFilled,
-  CloseOutlined,
+  ClockCircleOutlined,
   CodeOutlined,
-  CopyOutlined,
-  DownOutlined,
+  CloseOutlined,
   FileTextOutlined,
   FolderOpenOutlined,
   PaperClipOutlined,
   RobotOutlined,
   SafetyCertificateOutlined,
   StopOutlined,
-  UserOutlined,
 } from '@ant-design/icons'
 import { Avatar, Button, Dropdown, Input, Select, Tooltip } from 'antd'
 import React from 'react'
-import { createPortal } from 'react-dom'
 
 const { TextArea } = Input
 
-/** A user message that belongs to the turn already open, not to a new one.
- *
- * Two flags, one meaning.  ``queued`` is the local one: this message was sent
- * while the agent was mid-reply, and the server has not answered yet about
- * which queue it went into.  ``interjection`` is the server's: the message was
- * folded into the turn that was running, so it is part of that turn's record.
- * Both cases have to keep the turn open -- flushing on either one is what
- * split a running turn in two and pushed its tool trace to the bottom.
- *
- * A message queued for a *later* turn (the restart queue) carries ``queued``
- * too, and is also kept inside the open group while it waits: it has not
- * started a turn yet, and the server's transcript will place it correctly once
- * it does.
- */
-function isInTurnUserMessage(item: Message): boolean {
-  return item.role === 'user' && Boolean(item.queued || item.interjection)
-}
-
 export function renderChat(ctx: AppCtx) {
-  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
+  const { activateTurnIndex, activeSession, activity, attachApprovalCommand, awayFromLatest, chatScrollRef, commandIndex, commandItemRefs, composerRef, composerSendable, confirmDetailOpen, confirmOverflowing, confirmRemaining, confirmReq, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, creatingSession, currentModel, dismissConfirm, dismissTaskGuidance, expandedTraces, fileDragActive, fileInputRef, filteredCommands, focusComposer, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleModelChange, handleRailMouseMove, hasMoreHistory, hoveredTurn, hoveredTurnIndex, inlineCommandEmpty, inlineCommandOpen, input, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadingHistory, messages, modelOptions, modelSelectPlaceholder, modelSelectWidth, pendingAttachments, permissionLabel, permissionLevel, pickWorkspace, queueView, resolvedComposerText, resumingTaskId, sandboxMode, scheduleHideTurnSummary, sendConfirm, sendMessage, sendShortcutLabel, sessionState, setCommandDismissed, setCommandIndex, setCommandIndexPinned, setConfirmDetailOpen, setInput, setPendingAttachments, stopStreaming, toggleTraceExpanded, token, turnRefs, updateMessage, updateSessionPermissions, withdrawQueuedMessages } = ctx
 
-
-  const renderAttachment = (item: Message) => {
-    const media = item.link ? mediaKindForUrl(item.link) : 'file'
-    const label = (item.content || '附件').split(/[\\/]/).pop() || '附件'
-
-    if (media === 'image') {
-      return (
-        <div className="attachment-card attachment-image-card" key={item.id}>
-          <a href={item.link} target="_blank" rel="noreferrer" className="attachment-preview">
-            <img src={item.link} alt={label} loading="lazy" />
-          </a>
-          <div className="attachment-caption">
-            <FileTextOutlined />
-            <span title={label}>{label}</span>
-            <a href={item.link} target="_blank" rel="noreferrer">打开</a>
-          </div>
-        </div>
-      )
-    }
-
-    if (media === 'audio' || media === 'video') {
-      return (
-        <div className="attachment-card attachment-player-card" key={item.id}>
-          <div className="attachment-caption">
-            <FileTextOutlined />
-            <span title={label}>{label}</span>
-            <a href={item.link} target="_blank" rel="noreferrer">打开</a>
-          </div>
-          {media === 'audio' ? (
-            <audio className="attachment-player" controls preload="metadata" src={item.link} />
-          ) : (
-            <video className="attachment-player attachment-video" controls preload="metadata" src={item.link} />
-          )}
-        </div>
-      )
-    }
-
-    return (
-      <a className="attachment-file-card" href={item.link} target="_blank" rel="noreferrer" key={item.id}>
-        <span className="attachment-file-icon"><FileTextOutlined /></span>
-        <span className="attachment-file-main">
-          <strong title={label}>{label}</strong>
-          <small>附件 · 点击打开</small>
-        </span>
-        <DownOutlined className="attachment-file-arrow" rotate={-90} />
-      </a>
-    )
-  }
-
-  const renderToolEvent = (item: Message) => {
-    if (item.tool === 'attachment' || item.link) return renderAttachment(item)
-    return (
-      <div className="tool-event" key={item.id}>
-        <span className={`tool-event-dot ${item.toolState || 'done'}`} />
-        <span className="tool-event-name">{item.tool || '文件'}</span>
-        <span className="tool-event-state">{toolStateLabel(item.toolState)}</span>
-        {(item.content || item.link) && (
-          <div className="tool-event-details">
-            {item.content && <div className="tool-event-detail">{item.content}</div>}
-            {item.link && (
-              <a
-                className="tool-event-link"
-                href={item.link}
-                target="_blank"
-                rel="noreferrer"
-              >
-                <FileTextOutlined /> 打开文件
-              </a>
-            )}
-          </div>
-        )}
-      </div>
-    )
-  }
-
-  /**
-   * One batch's progress strip.
-   *
-   * Rendered inside the assistant row it belongs to rather than as a row of its
-   * own: a full-width block landing after the reply reads as a second message
-   * from the agent, which is what it looked like when it was a sibling row.
-   */
-  const renderSubAgentNote = (item: Message) => {
-    const note = item.subagent as SubAgentNote
-    const { done, total } = subagentCounts(note)
-    const roleCount = Math.max(note.roles.length, note.doneRoles.length, note.total)
-    const seconds = Math.max(0, (note.endedAt - note.startedAt) / 1000)
-    const latest = note.logs[note.logs.length - 1] || ''
-    const tone = note.failed > 0 ? 'failed' : note.running ? 'running' : 'done'
-    const stateText = note.running
-      ? roleCount > 0 ? `${roleCount} 个代理运行中` : '正在运行'
-      : note.failed > 0
-        ? roleCount > 0 ? `${roleCount} 个代理已结束` : '已结束'
-        : roleCount > 0 ? `${roleCount} 个代理已完成` : '已完成'
-    return (
-      <div key={item.id} className={`subagent-note subagent-note-${tone}`}>
-        <button
-          type="button"
-          className="subagent-note-head"
-          aria-expanded={!!note.open}
-          onClick={() =>
-            updateMessage(item.id, { subagent: { ...note, open: !note.open } })
-          }
-        >
-          <span className="subagent-note-dot" />
-          <span className="subagent-note-title">子代理协作</span>
-          <span className="subagent-note-state">{stateText}</span>
-          {note.failed > 0 && (
-            <span className="subagent-note-failed">{note.failed} 个失败</span>
-          )}
-          {note.running && latest && (
-            <span className="subagent-note-latest">{latest}</span>
-          )}
-          <span className="subagent-note-metrics">
-            {note.running ? `${done}/${total || '?'}` : `${seconds.toFixed(1)}s`}
-          </span>
-          <DownOutlined className="subagent-note-chevron" rotate={note.open ? 180 : 0} />
-        </button>
-        {note.open && (
-          <ol className="subagent-note-logs">
-            {note.logs.map((line, index) => (
-              <li key={`${item.id}-${index}`}>{line}</li>
-            ))}
-          </ol>
-        )}
-      </div>
-    )
-  }
-
-  /**
-   * The model's thinking for one turn, collapsed above the reply.
-   *
-   * Collapsed by default because it is not what the reader came for; the strip
-   * still has to move while it streams, so the dot pulses and the count climbs
-   * even shut. Opening it shows the text as it arrives — rendered verbatim in
-   * a pre-wrapped block rather than through the markdown renderer, because
-   * thinking is raw model text (newlines and asterisks are structural to it,
-   * not formatting) and a half-finished markdown document would reflow on
-   * every token.
-   *
-   * Returns null rather than an empty strip: a provider that does not think
-   * must leave no trace in the transcript.
-   */
-  const renderReasoningNote = (item: Message) => {
-    const text = item.reasoning || ''
-    if (!text) return null
-    const running = !!item.streaming
-    return (
-      <div className={`thinking-note ${running ? 'thinking-note-running' : ''}`}>
-        <button
-          type="button"
-          className="thinking-note-head"
-          aria-expanded={!!item.reasoningOpen}
-          onClick={() =>
-            updateMessage(item.id, { reasoningOpen: !item.reasoningOpen })
-          }
-        >
-          <span className="thinking-note-dot" />
-          <span className="thinking-note-title">思考过程</span>
-          <span className="thinking-note-state">{running ? '思考中' : '已思考'}</span>
-          <span className="thinking-note-metrics">{text.length} 字</span>
-          <DownOutlined
-            className="thinking-note-chevron"
-            rotate={item.reasoningOpen ? 180 : 0}
-          />
-        </button>
-        {item.reasoningOpen && <div className="thinking-note-body">{text}</div>}
-      </div>
-    )
-  }
-
-  const renderMessage = (
-    item: Message,
-    traceSummary?: React.ReactNode,
-    subagentNotes?: Message[],
-  ) => {
-    if (item.role === 'tool') return renderToolEvent(item)
-
-    if (item.role === 'subagent' && item.subagent) return renderSubAgentNote(item)
-
-    if (item.role === 'command' || item.role === 'error') {
-      return (
-        <div
-          key={item.id}
-          className={`system-note ${item.role === 'error' ? 'system-note-error' : ''}`}
-        >
-          <div
-            className="markdown"
-            dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, activeSession, token) }}
-          />
-        </div>
-      )
-    }
-
-    if (item.role === 'user' && isInTurnUserMessage(item)) {
-      // Said during the turn, not before it.  Rendered as an aside inside the
-      // turn: a "你" bubble here would read as a second request and push the
-      // turn's own trace below it, which is exactly the layout this replaced.
-      return (
-        <div key={item.id} className={`message-interjection ${item.queued ? 'is-pending' : ''}`}>
-          <span className="message-interjection-mark" aria-hidden="true">插话</span>
-          <div className="message-interjection-body">
-            <div
-              className="markdown"
-              dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, activeSession, token) }}
-            />
-          </div>
-          {item.queued && <span className="message-interjection-state">待读</span>}
-        </div>
-      )
-    }
-
-    const isUser = item.role === 'user'
-    return (
-      <div
-        key={item.id}
-        ref={isUser ? element => { turnRefs.current[item.id] = element } : undefined}
-        className={`message-row ${isUser ? 'message-row-user' : 'message-row-assistant'}`}
-      >
-        {!isUser && (
-          <Avatar className="message-avatar assistant" icon={<RobotOutlined />} />
-        )}
-        <div className="message-stack">
-          <div className={`message-meta ${traceSummary ? 'message-meta-trace' : ''}`}>
-            <span className="message-author">{isUser ? '你' : 'Simple Agent'}</span>
-            {item.queued && <span className="message-queued">排队中</span>}
-            {item.streaming && <span className="message-streaming">正在生成</span>}
-            {traceSummary}
-          </div>
-          {!isUser && renderReasoningNote(item)}
-          {!!subagentNotes?.length && (
-            <div className="message-subagents">
-              {subagentNotes.map(note => renderSubAgentNote(note))}
-            </div>
-          )}
-          <div className={`bubble ${isUser ? 'bubble-user' : 'bubble-assistant'} ${item.attachments?.length ? 'bubble-with-attachments' : ''}`}>
-            {item.attachments && item.attachments.length > 0 && (
-              <div className="message-attachments">
-                {item.attachments.map(attachment => {
-                  const href = fileHref(attachment.path, activeSession, token)
-                  return (
-                    <a className="message-attachment" key={attachment.id || attachment.path} href={href} target="_blank" rel="noreferrer">
-                      {attachment.kind === 'image' ? <img src={href} alt={attachment.filename} /> : <FileTextOutlined />}
-                      <span>{attachment.filename}</span>
-                    </a>
-                  )
-                })}
-              </div>
-            )}
-            <div
-              className="markdown"
-              dangerouslySetInnerHTML={{ __html: markdownToHtml(item.content, activeSession, token) }}
-            />
-            {item.streaming && (
-              <span className="typing-dots" aria-label="正在输入">
-                <i /><i /><i />
-              </span>
-            )}
-          </div>
-          {!isUser && item.content && (
-            <Button
-              type="text"
-              size="small"
-              className="message-copy"
-              icon={<CopyOutlined />}
-              onClick={() => copyMessage(item.content)}
-            >
-              复制
-            </Button>
-          )}
-        </div>
-        {isUser && (
-          <Avatar className="message-avatar user" icon={<UserOutlined />} />
-        )}
-      </div>
-    )
-  }
-
-  const renderToolTraceContent = (tools: Message[]) => {
-    const traceId = tools[0].id
-    const expanded = !!expandedTraces[traceId]
-    const dots = summariseToolDots(tools)
-    const summarised = dots.length < tools.length
-    return (
-      <div
-        className={`tool-trace ${expanded ? 'tool-trace-expanded' : ''}`}
-        key={`trace-${traceId}`}
-      >
-        <button
-          type="button"
-          className="tool-trace-summary"
-          onClick={() => toggleTraceExpanded(traceId)}
-        >
-          <span
-            className="tool-trace-dots"
-            aria-hidden="true"
-            title={summarised
-              ? `${tools.length} 步已归并为 ${dots.length} 段显示，每段取其中最严重的一步；点击展开可看全部`
-              : undefined}
-          >
-            {dots.map((dot, index) => (
-              <span
-                key={index}
-                className={`tool-dot ${dot.state}`}
-              />
-            ))}
-          </span>
-          <span className="tool-trace-label">工具轨迹 · {tools.length} 步</span>
-          <DownOutlined className="tool-trace-chevron" />
-        </button>
-        {expanded &&
-          createPortal(
-            <div
-              className="tool-trace-mask"
-              onClick={() => toggleTraceExpanded(traceId)}
-            >
-              <div
-                className="tool-trace-modal"
-                onClick={event => event.stopPropagation()}
-              >
-                <div className="tool-trace-modal-head">
-                  <span className="tool-trace-modal-title">
-                    工具轨迹 · {tools.length} 步
-                  </span>
-                  <button
-                    type="button"
-                    className="tool-trace-modal-close"
-                    onClick={() => toggleTraceExpanded(traceId)}
-                  >
-                    <CloseOutlined />
-                  </button>
-                </div>
-                <div className="tool-trace-modal-body">
-                  {tools.map(renderToolEvent)}
-                </div>
-              </div>
-            </div>,
-            document.body,
-          )}
-      </div>
-    )
-  }
-
-  const renderToolTrace = (tools: Message[]) => renderToolTraceContent(tools)
-
-  const renderMessageList = () => {
-    const nodes: React.ReactNode[] = []
-    // A turn is a user message plus everything up to the next one. Items are
-    // grouped without consulting local state so an assistant row received
-    // without its user message (another tab's turn, or a restored transcript)
-    // still owns its tool trace instead of orphaning it onto its own row.
-    let groupUser: Message | null = null
-    let groupItems: Message[] = []
-    let groupTools: Message[] = []
-    let groupNotes: Message[] = []
-
-    const flushTurn = () => {
-      if (groupUser) nodes.push(renderMessage(groupUser))
-      let traceAttached = false
-      let notesAttached = false
-      groupItems.forEach(item => {
-        const shouldAttachTrace =
-          !traceAttached && item.role === 'assistant' && groupTools.length > 0
-        // The strip belongs to the assistant row that produced it, so it is
-        // handed to that row rather than pushed as a row of its own.
-        const notes =
-          !notesAttached && item.role === 'assistant' ? groupNotes : undefined
-        if (notes?.length) notesAttached = true
-        if (shouldAttachTrace) {
-          nodes.push(renderMessage(item, renderToolTraceContent(groupTools), notes))
-          traceAttached = true
-        } else {
-          nodes.push(renderMessage(item, undefined, notes))
-        }
-      })
-      if (groupTools.length && !traceAttached) {
-        nodes.push(renderToolTrace(groupTools))
-      }
-      // A transcript can arrive without its assistant row (another tab's turn,
-      // or a restored session). The strip is the only record that a batch ran,
-      // so it must not disappear with the row it would have attached to.
-      if (!notesAttached) groupNotes.forEach(note => nodes.push(renderSubAgentNote(note)))
-      groupUser = null
-      groupItems = []
-      groupTools = []
-      groupNotes = []
-    }
-
-    messages.forEach(item => {
-      // A message the user sent *while a turn was running* is not a turn
-      // boundary: it belongs to the turn that is already open.  Flushing here
-      // split the running turn in half -- its tool trace was orphaned to the
-      // bottom of the new group, and the answer to the interjection ended up
-      // rendered above the interjection itself.  Two sources, one rule: the
-      // local `queued` flag while the turn is live, and the server's
-      // `interjection` flag once the record has it.
-      if (item.role === 'user' && !isInTurnUserMessage(item)) {
-        flushTurn()
-        groupUser = item
-      } else if (item.role === 'tool' && item.tool !== 'attachment' && !item.link) {
-        // Attachments (image/audio/video/file) are real inline content and
-        // must appear in the chat stream, not hidden inside the collapsible
-        // tool trace overlay. Regular tool-trace rows carry no ``link``.
-        groupTools.push(item)
-      } else if (item.role === 'subagent' && item.subagent) {
-        groupNotes.push(item)
-      } else {
-        groupItems.push(item)
-      }
-    })
-    flushTurn()
-    return nodes
-  }
 
   return (
     <div
@@ -546,6 +109,21 @@ export function renderChat(ctx: AppCtx) {
         onScroll={handleChatScroll}
       >
         <div className="chat-inner">
+          {/* Reaching the beginning of a long conversation is a click, not an
+              assumption: the server pages by sequence, so what is behind this
+              window is reachable rather than simply absent. */}
+          {hasMoreHistory && (
+            <div className="chat-history-earlier">
+              <Button
+                size="small"
+                icon={<ClockCircleOutlined rotate={180} />}
+                loading={loadingHistory}
+                onClick={() => { void loadEarlierMessages() }}
+              >
+                加载更早的消息
+              </Button>
+            </div>
+          )}
           {messages.length === 0 ? (
             <div className="chat-empty">
               <div className="chat-empty-mark">S</div>
@@ -577,7 +155,16 @@ export function renderChat(ctx: AppCtx) {
             </div>
           ) : (
             <>
-              {renderMessageList()}
+              <MessageList
+                messages={messages}
+                activeSession={activeSession}
+                token={token}
+                expandedTraces={expandedTraces}
+                turnRefs={turnRefs}
+                updateMessage={updateMessage}
+                copyMessage={copyMessage}
+                toggleTraceExpanded={toggleTraceExpanded}
+              />
               {isStreaming && !messages.some(item => item.streaming) && (
                 <div className="message-row message-row-assistant">
                   <Avatar className="message-avatar assistant" icon={<RobotOutlined />} />

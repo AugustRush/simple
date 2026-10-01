@@ -3,7 +3,7 @@ import { CONVERSATION_SUMMARY_HALF_HEIGHT, INTERRUPT_RETRY_MS, INTERRUPT_STUCK_M
 import { truncate } from '../lib/format'
 import { fileHref, withFileSession } from '../lib/media'
 import { findOpenSubAgentNote, foldSubAgentEvent, newSubAgentNote, sealSubAgentNotes } from '../lib/subagent'
-import { compareSessions, isSessionBusy } from '../lib/tools'
+import { compareSessions, isInTurnUserMessage, isSessionBusy } from '../lib/tools'
 import type { AttachmentInfo, CommandInfo, ConfirmRequest, Message, MessageRole, QueuedMessage, SessionInfo, SessionState, ToolState } from '../types'
 import { Modal } from 'antd'
 import type { TextAreaRef } from 'antd/es/input/TextArea'
@@ -62,26 +62,68 @@ export function useConversations(deps: Deps) {
   // chunks don't hit localStorage on every frame.
   const MAX_CACHED_SESSIONS = 6
 
+  // A browser's storage quota is for the whole origin, and this cache holds up
+  // to MAX_CACHED_SESSIONS of them. One very long conversation must not be able
+  // to crowd the others out, so each entry has its own ceiling and is trimmed
+  // from the oldest end -- the rows a reader actually sees are the recent ones,
+  // and the rest is one request away from the server.
+  const MAX_CACHED_BYTES = 384 * 1024
+
+  // Sessions whose last write was refused. Retrying a write the browser has
+  // already refused, every debounce tick, is wasted work; and leaving the
+  // session in the index while holding no data for it makes the index claim a
+  // cache that does not exist.
+  const uncacheableRef = useRef<Set<string>>(new Set())
+
   useEffect(() => {
     if (!activeSession) return
+    const sid = activeSession
+    if (uncacheableRef.current.has(sid)) return
     const t = setTimeout(() => {
+      // Sub-agent notes are live telemetry with no server-side record, so
+      // caching them would only produce a flash of stale strips on reload.
+      // Only the record's own rows are cached, so a reload replays exactly
+      // what the server can confirm.
+      const durable = messages.filter(item => item.role !== 'subagent')
+      let payload = JSON.stringify(durable)
+      if (payload.length > MAX_CACHED_BYTES) {
+        // Trim from the oldest end until it fits. The alternative -- not
+        // caching a long conversation at all -- costs the reader the instant
+        // restore on switch, which is the whole point of having the cache.
+        let keep = durable.length
+        while (keep > 1 && payload.length > MAX_CACHED_BYTES) {
+          keep = Math.floor(keep / 2)
+          payload = JSON.stringify(durable.slice(durable.length - keep))
+        }
+      }
       try {
-        // Sub-agent notes are live telemetry with no server-side record, so
-        // caching them would only produce a flash of stale strips on reload.
-        const durable = messages.filter(item => item.role !== 'subagent')
-        localStorage.setItem(`chat_messages:${activeSession}`, JSON.stringify(durable))
+        localStorage.setItem(`chat_messages:${sid}`, payload)
         const raw = localStorage.getItem('chat_messages:index')
         const index = (raw ? (JSON.parse(raw) as string[]) : []).filter(
-          id => id !== activeSession,
+          id => id !== sid,
         )
-        index.unshift(activeSession)
+        index.unshift(sid)
         while (index.length > MAX_CACHED_SESSIONS) {
           const evicted = index.pop()
           if (evicted) localStorage.removeItem(`chat_messages:${evicted}`)
         }
         localStorage.setItem('chat_messages:index', JSON.stringify(index))
       } catch {
-        // ignore storage errors
+        // A refused write used to be swallowed, which left the index listing a
+        // session whose transcript was never stored -- the cache silently
+        // stopped working for that conversation with nothing to show for it.
+        // Drop it from the index and stop retrying, so the failure is a missing
+        // cache entry (which the server read covers) rather than a stale one.
+        uncacheableRef.current.add(sid)
+        try {
+          const raw = localStorage.getItem('chat_messages:index')
+          const index = raw
+            ? (JSON.parse(raw) as string[]).filter(id => id !== sid)
+            : []
+          localStorage.setItem('chat_messages:index', JSON.stringify(index))
+        } catch {
+          // Storage is unavailable entirely; there is nothing left to correct.
+        }
       }
     }, 300)
     return () => clearTimeout(t)
@@ -100,6 +142,11 @@ export function useConversations(deps: Deps) {
 
   const [connected, setConnected] = useState(false)
 
+  // True from the moment a socket is opened until one has actually connected.
+  // Without it "not connected" has two meanings -- "still trying" and "dropped"
+  // -- and the status line can only report the second of them.
+  const [connecting, setConnecting] = useState(false)
+
   const [isStreaming, setIsStreaming] = useState(false)
 
   // True between the user asking to stop and the turn actually unwinding.
@@ -112,6 +159,9 @@ export function useConversations(deps: Deps) {
 
   const [creatingSession, setCreatingSession] = useState(false)
 
+  // Which traces are open, keyed by the trace's first row id. Those ids are
+  // the server's own message ids, so a key from one conversation can never
+  // match a trace in another and the state needs no per-session namespacing.
   const [expandedTraces, setExpandedTraces] = useState<Record<string, boolean>>({})
 
   const [hoveredTurn, setHoveredTurn] = useState<{ id: string; top: number } | null>(null)
@@ -125,6 +175,18 @@ export function useConversations(deps: Deps) {
   const sendShortcutLabel = sendShortcut === 'ctrl-enter' ? 'Ctrl/Cmd + Enter' : 'Enter'
 
   const [sessionState, setSessionState] = useState<SessionState | null>(null)
+
+  // The transcript is a window onto a longer conversation. ``hasMoreHistory``
+  // says there is more behind it and ``oldestSeq`` is the cursor that reaches
+  // it, so reaching the beginning of a long session is a button rather than a
+  // thing that silently was not loaded.
+  const [hasMoreHistory, setHasMoreHistory] = useState(false)
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const oldestSeqRef = useRef(0)
+
+  // How many rows one read asks for. The server bounds a single read; the
+  // limit is a page size here, not a cut-off.
+  const historyLimit = 200
 
   const [resumingTaskId, setResumingTaskId] = useState<string | null>(null)
 
@@ -167,6 +229,11 @@ export function useConversations(deps: Deps) {
   const idleSnapshotSeenRef = useRef(false)
 
   const streamIdRef = useRef<string | null>(null)
+
+  // The turn the open reply row belongs to. The server tags every stream event
+  // with the message id that started the turn, which is what keeps a late or
+  // retried event for another turn from being written into this row.
+  const streamTurnRef = useRef<string | null>(null)
 
   const messagesRef = useRef<Message[]>([])
 
@@ -313,7 +380,9 @@ export function useConversations(deps: Deps) {
           .then(resp => resp.json() as Promise<SessionState>)
           .catch(() => null)
         const [resp, state] = await Promise.all([
-          api(`/api/sessions/${encodeURIComponent(sid)}/messages`),
+          api(
+            `/api/sessions/${encodeURIComponent(sid)}/messages?limit=${historyLimit}`,
+          ),
           stateRequest,
         ])
         const data = await resp.json()
@@ -328,8 +397,18 @@ export function useConversations(deps: Deps) {
             // The backend only knows the path; the owner (this session) is
             // attached here so the gateway can authorise the read.
             const link = withFileSession(item.link || '', sid, token)
+            const recordId = String(item.message_id || '')
+            const seq = Number(item.seq || 0)
             return {
-              id: makeId(),
+              // Keyed by the row's place in the session's transcript, which is
+              // unique and stable: the server assigns it at write time, so a
+              // row keeps its identity across reloads (a fresh id per load
+              // remounts every row, replaying the whole entry animation) and a
+              // row with no message id -- a tool trace -- is still addressable.
+              id: seq > 0 ? `seq:${seq}` : `srv:${makeId()}`,
+              messageId: recordId || undefined,
+              createdAt: item.created_at || undefined,
+              seq: seq > 0 ? seq : undefined,
               role: (item.role as MessageRole) || 'assistant',
               content: item.content || '',
               link,
@@ -343,6 +422,9 @@ export function useConversations(deps: Deps) {
             }
           },
         )
+        // The window is the newest slice; the cursor pages further back.
+        setHasMoreHistory(data.has_more === true)
+        oldestSeqRef.current = Number(data.oldest_seq || 0)
         const current = messagesRef.current
         const hasLiveTransient = current.some(item =>
           item.streaming ||
@@ -369,27 +451,42 @@ export function useConversations(deps: Deps) {
           const runningSubagents = current.filter(
             item => item.role === 'subagent' && !!item.subagent?.running,
           )
+          // Reconcile by the record's own id first, and only fall back to the
+          // tool's name. Matching on the name alone let two concurrent calls to
+          // the same tool overwrite each other's row, and left a running row
+          // with no durable counterpart stranded at the bottom of the list.
           for (const tool of runningTools) {
-            const durableIndex = merged.findIndex(item =>
-              item.role === 'tool' &&
-              item.toolState === 'running' &&
-              item.tool === tool.tool,
-            )
+            const durableIndex = merged.findIndex(item => {
+              if (item.role !== 'tool' || item.toolState !== 'running') return false
+              if (tool.operationId && item.operationId) {
+                return item.operationId === tool.operationId
+              }
+              return item.tool === tool.tool
+            })
             if (durableIndex >= 0) merged[durableIndex] = tool
-            else merged.push(tool)
+            else merged.splice(Math.max(0, merged.length - 1), 0, tool)
           }
+          // The reply being written right now, and the notes describing this
+          // turn, belong at the end: they are the latest thing that happened.
+          // Appending them after the newest durable row is what keeps a
+          // mid-turn refresh from rendering a live row *above* recorded
+          // history it followed.
           merged.push(...runningSubagents)
           // Messages sent during this turn are not in the transcript yet -- the
           // record gets them when the turn ends -- so a refresh mid-turn would
-          // otherwise erase the reader's own words from the screen.
+          // otherwise erase the reader's own words from the screen. Matched by
+          // id: the same text twice in one turn is two messages, and content
+          // comparison would drop the second one from the screen.
+          const knownIds = new Set(
+            merged.map(item => item.messageId).filter(Boolean) as string[],
+          )
           const pendingInTurn = current.filter(
             item => item.role === 'user' && (item.queued || item.interjection),
           )
-          const knownContents = new Set(
-            merged.filter(item => item.role === 'user').map(item => item.content),
-          )
           for (const pending of pendingInTurn) {
-            if (!knownContents.has(pending.content)) merged.push(pending)
+            if (pending.messageId && knownIds.has(pending.messageId)) continue
+            if (pending.messageId) knownIds.add(pending.messageId)
+            merged.push(pending)
           }
           if (latestStream) merged.push(latestStream)
         }
@@ -409,8 +506,83 @@ export function useConversations(deps: Deps) {
         setMessages([])
       }
     },
-    [api, applyStreamingSnapshot, makeId, token],
+    [api, applyStreamingSnapshot, historyLimit, makeId, token],
   )
+
+  /**
+   * Fetch the page of transcript immediately before what is on screen, and
+   * prepend it.
+   *
+   * The rows carry the server's own sequence, so an older page is known to be
+   * older rather than guessed: it is prepended wholesale, and the rows already
+   * on screen -- including anything the socket has added since -- are left
+   * exactly where they are. Nothing is re-sorted and nothing is dropped, so
+   * paging cannot disturb a reader who is part-way through the conversation.
+   */
+  const loadEarlierMessages = useCallback(async () => {
+    const sid = activeSessionRef.current
+    const before = oldestSeqRef.current
+    if (!sid || !before || loadingHistory) return
+    setLoadingHistory(true)
+    try {
+      const resp = await api(
+        `/api/sessions/${encodeURIComponent(sid)}/messages`
+        + `?limit=${historyLimit}&before_seq=${before}`,
+      )
+      const data = await resp.json()
+      if (activeSessionRef.current !== sid) return
+      const older = (data.messages || []).map(
+        (item: any): Message => {
+          const link = withFileSession(item.link || '', sid, token)
+          const recordId = String(item.message_id || '')
+          const seq = Number(item.seq || 0)
+          return {
+            id: seq > 0 ? `seq:${seq}` : `srv:${makeId()}`,
+            messageId: recordId || undefined,
+            createdAt: item.created_at || undefined,
+            seq: seq > 0 ? seq : undefined,
+            role: (item.role as MessageRole) || 'assistant',
+            content: item.content || '',
+            link,
+            tool: item.tool,
+            toolState: item.toolState as ToolState | undefined,
+            attachments: Array.isArray(item.attachments) ? item.attachments : undefined,
+            interjection: item.interjection === true ? true : undefined,
+          }
+        },
+      )
+      if (!older.length) {
+        setHasMoreHistory(false)
+        return
+      }
+      // Keep the reader where they were: the pane is tall by exactly the rows
+      // added above it.
+      const container = chatScrollRef.current
+      const previousHeight = container?.scrollHeight ?? 0
+      const previousTop = container?.scrollTop ?? 0
+      const known = new Set(messagesRef.current.map(item => item.id))
+      const fresh = older.filter((item: Message) => !known.has(item.id))
+      if (!fresh.length) {
+        oldestSeqRef.current = Number(data.oldest_seq || before)
+        setHasMoreHistory(data.has_more === true)
+        return
+      }
+      messagesRef.current = [...fresh, ...messagesRef.current]
+      setMessages(messagesRef.current)
+      oldestSeqRef.current = Number(data.oldest_seq || before)
+      setHasMoreHistory(data.has_more === true)
+      if (container) {
+        requestAnimationFrame(() => {
+          const grown = container.scrollHeight - previousHeight
+          if (grown > 0) container.scrollTop = previousTop + grown
+        })
+      }
+    } catch {
+      messageApi.warning('加载更早的消息失败，请重试')
+    } finally {
+      setLoadingHistory(false)
+    }
+  }, [api, historyLimit, makeId, messageApi, token])
 
   const loadSessionState = useCallback(async (sid: string) => {
     const sendSeq = messageSendSeqRef.current
@@ -453,16 +625,21 @@ export function useConversations(deps: Deps) {
     }
   }, [api, applyStreamingSnapshot])
 
+  // Both hand React the ref's array directly. Copying it again would allocate a
+  // second array of every row on every call -- and `updateMessage` is called
+  // once per streamed token, so on a long conversation that copy is paid per
+  // chunk for nothing. The ref is only ever reassigned to a fresh array, never
+  // mutated in place, so handing it over is safe.
   const appendMessage = useCallback((next: Message) => {
     messagesRef.current = [...messagesRef.current, next]
-    setMessages([...messagesRef.current])
+    setMessages(messagesRef.current)
   }, [])
 
   const updateMessage = useCallback((id: string, patch: Partial<Message>) => {
     messagesRef.current = messagesRef.current.map(item =>
       item.id === id ? { ...item, ...patch } : item,
     )
-    setMessages([...messagesRef.current])
+    setMessages(messagesRef.current)
   }, [])
 
   const connectWs = useCallback(
@@ -483,9 +660,11 @@ export function useConversations(deps: Deps) {
       setConfirmReq(null)
       setConfirmDetailOpen(false)
       setConnected(false)
+      setConnecting(true)
       setActivity('正在连接…')
       setIsStreaming(false)
       streamIdRef.current = null
+      streamTurnRef.current = null
       const t = token
       const qs = t ? `?token=${encodeURIComponent(t)}` : ''
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
@@ -497,6 +676,7 @@ export function useConversations(deps: Deps) {
       ws.onopen = () => {
         if (wsRef.current !== ws || activeSessionRef.current !== sid) return
         setConnected(true)
+        setConnecting(false)
         setActivity('')
         const pending = pendingSendRef.current
         if (pending) {
@@ -517,20 +697,34 @@ export function useConversations(deps: Deps) {
         }
       }
 
-      ws.onclose = () => {
-        if (wsRef.current !== ws || activeSessionRef.current !== sid) return
+      // A dropped socket cannot deliver the turn's end, so the open row is
+      // retired here. Otherwise it keeps its "正在生成" label, its typing dots
+      // and a pulsing thinking note for a turn nobody is doing any more.
+      const sealOpenStream = (activityText: string) => {
+        setConnecting(false)
+        if (streamIdRef.current) {
+          updateMessage(streamIdRef.current, { streaming: false })
+          streamIdRef.current = null
+        }
+        streamTurnRef.current = null
+        if (messagesRef.current.some(item => item.role === 'subagent' && item.subagent?.running)) {
+          messagesRef.current = sealSubAgentNotes(messagesRef.current)
+          setMessages(messagesRef.current)
+        }
         setConnected(false)
         setResumingTaskId(null)
         setIsStreaming(false)
-        setActivity('连接已断开')
+        setActivity(activityText)
+      }
+
+      ws.onclose = () => {
+        if (wsRef.current !== ws || activeSessionRef.current !== sid) return
+        sealOpenStream('连接已断开')
       }
 
       ws.onerror = () => {
         if (wsRef.current !== ws || activeSessionRef.current !== sid) return
-        setConnected(false)
-        setResumingTaskId(null)
-        setIsStreaming(false)
-        setActivity('连接异常')
+        sealOpenStream('连接异常')
       }
 
       ws.onmessage = event => {
@@ -547,9 +741,19 @@ export function useConversations(deps: Deps) {
         // Thinking arrives before the first answer token, so this is often what
         // creates the assistant row — the same row `stream_chunk` will then
         // fill. It does not touch `content`: the note is not the reply.
+        // Every event carries the turn it belongs to. A row is only ever
+        // written by its own turn's events: without this check a reply for a
+        // restarted or withdrawn turn lands inside whichever reply happened to
+        // be on screen, and the reader sees one message appended to another.
+        const eventTurn = String(evt.turn_id || '')
+        const belongsToCurrentTurn = () =>
+          !eventTurn || !streamTurnRef.current || eventTurn === streamTurnRef.current
+
         if (evt.type === 'reasoning_chunk') {
           const chunk = String(evt.chunk || '')
           if (!chunk) return
+          if (!belongsToCurrentTurn()) return
+          if (eventTurn) streamTurnRef.current = eventTurn
           const existingId = streamIdRef.current
           if (!existingId) {
             const id = makeId()
@@ -568,6 +772,8 @@ export function useConversations(deps: Deps) {
         }
 
         if (evt.type === 'stream_chunk') {
+          if (!belongsToCurrentTurn()) return
+          if (eventTurn) streamTurnRef.current = eventTurn
           const existingId = streamIdRef.current
           if (!existingId) {
             const id = makeId()
@@ -590,6 +796,20 @@ export function useConversations(deps: Deps) {
           // A tab that comes back mid-turn gets the thinking too, so the note
           // does not empty itself under the reader's cursor.
           const reasoning = typeof evt.reasoning === 'string' ? evt.reasoning : undefined
+          // A snapshot for a turn this row is not showing replaces nothing: it
+          // starts its own row rather than overwriting a reply in progress.
+          if (!belongsToCurrentTurn()) {
+            if (!text) return
+            appendMessage({
+              id: makeId(),
+              role: 'assistant',
+              content: text,
+              streaming: true,
+              ...(reasoning !== undefined ? { reasoning } : {}),
+            })
+            return
+          }
+          if (eventTurn) streamTurnRef.current = eventTurn
           const existingId = streamIdRef.current
           if (existingId) {
             updateMessage(existingId, {
@@ -614,13 +834,14 @@ export function useConversations(deps: Deps) {
         }
 
         if (evt.type === 'turn_complete') {
-          if (streamIdRef.current) {
+          if (streamIdRef.current && belongsToCurrentTurn()) {
             updateMessage(streamIdRef.current, {
               content: evt.text || messagesRef.current.find(i => i.id === streamIdRef.current)?.content || '',
               streaming: false,
             })
             streamIdRef.current = null
           }
+          if (eventTurn && eventTurn === streamTurnRef.current) streamTurnRef.current = ''
           setIsStreaming(false)
           setActivity('')
           // The turn is over, so any prompt still on screen was answered or
@@ -629,7 +850,14 @@ export function useConversations(deps: Deps) {
           // A batch that never emitted ``batch_finished`` (interrupted, or an
           // older server) must not keep spinning forever.
           messagesRef.current = sealSubAgentNotes(messagesRef.current)
-          setMessages([...messagesRef.current])
+          setMessages(messagesRef.current)
+          // Re-read the record now that the turn is over. Everything the live
+          // socket showed for it exists there -- including the rows the server
+          // orders differently (all of a turn's tool rows ahead of its reply,
+          // which live delivery interleaves) -- so this is what stops the
+          // transcript from looking different after a refresh than it did while
+          // it was happening.
+          loadMessages(sid)
           loadSessions()
           loadSessionState(sid)
           const nextQueued = queuedMessagesRef.current.shift()
@@ -640,6 +868,27 @@ export function useConversations(deps: Deps) {
           return
         }
 
+        // Find the running row an event closes. By operation id when both
+        // sides have one: two calls to the same tool can be in flight at once,
+        // and matching on the name alone let the first one's result land on the
+        // second one's row.
+        const findRunningTool = () => {
+          const rows = messagesRef.current
+          const operationId = String(evt.operation_id || '')
+          if (operationId) {
+            const exact = rows.find(
+              item =>
+                item.role === 'tool' &&
+                item.toolState === 'running' &&
+                item.operationId === operationId,
+            )
+            if (exact) return exact
+          }
+          return [...rows]
+            .reverse()
+            .find(item => item.role === 'tool' && item.tool === evt.name && item.toolState === 'running')
+        }
+
         if (evt.type === 'tool_start') {
           setActivity(evt.name ? `正在执行 ${evt.name}` : '正在执行工具')
           appendMessage({
@@ -648,14 +897,13 @@ export function useConversations(deps: Deps) {
             content: '',
             tool: evt.name || 'tool',
             toolState: 'running',
+            operationId: String(evt.operation_id || '') || undefined,
           })
           return
         }
 
         if (evt.type === 'tool_end') {
-          const target = [...messagesRef.current]
-            .reverse()
-            .find(item => item.role === 'tool' && item.tool === evt.name && item.toolState === 'running')
+          const target = findRunningTool()
           if (target) {
             updateMessage(target.id, {
               toolState: 'done',
@@ -666,9 +914,7 @@ export function useConversations(deps: Deps) {
         }
 
         if (evt.type === 'tool_progress') {
-          const target = [...messagesRef.current]
-            .reverse()
-            .find(item => item.role === 'tool' && item.tool === evt.name && item.toolState === 'running')
+          const target = findRunningTool()
           if (target) {
             const progress =
               typeof evt.progress === 'string'
@@ -681,9 +927,7 @@ export function useConversations(deps: Deps) {
         }
 
         if (evt.type === 'tool_blocked') {
-          const target = [...messagesRef.current]
-            .reverse()
-            .find(item => item.role === 'tool' && item.tool === evt.name && item.toolState === 'running')
+          const target = findRunningTool()
           if (target) {
             updateMessage(target.id, {
               toolState: 'blocked',
@@ -736,26 +980,24 @@ export function useConversations(deps: Deps) {
             (typeof evt.content === 'string'
               ? evt.content
               : JSON.stringify(evt.content))
-          // A status is what the agent is doing *right now*, not something it
-          // said: it belongs in the activity line and nowhere else.  It used
-          // to be appended as a transcript row, which turned a transient
-          // acknowledgement -- and, for the queue notices, an English sentence
-          // written for a terminal -- into a permanent-looking message that
-          // vanished again on reload.  Command *output* still arrives as a
-          // status, so the row stays for it: only the queue notices, which the
-          // channel now sends as `message_queued`, are excluded, and they never
-          // reach this branch.
+          // A status is what the agent is doing *right now*, not
+          // something it said, and the server does not journal it. So it reads
+          // in the activity line and nowhere else: a transcript row here would
+          // be a line the record has no place for, which means it would be
+          // replayed from cache on the next open and then dropped by the
+          // server's read, leaving the transcript in a different order than the
+          // one the reader just watched. Command output arrives here too, so
+          // this is also where a command's output is shown while it runs.
           setActivity(truncate(text, 90))
-          appendMessage({ id: makeId(), role: 'command', content: text })
           return
         }
 
         if (evt.type === 'notification') {
-          appendMessage({
-            id: makeId(),
-            role: 'command',
-            content: `**${evt.title || '通知'}**${evt.body ? `\n${evt.body}` : ''}`,
-          })
+          // Also unjournalled and also not something the agent said: a notice,
+          // not a message.
+          messageApi.info(
+            evt.body ? `${evt.title || '通知'}：${evt.body}` : evt.title || '通知',
+          )
           return
         }
 
@@ -837,11 +1079,13 @@ export function useConversations(deps: Deps) {
           // typing dots and its thinking note pulsing for work nobody is doing.
           if (streamIdRef.current) {
             updateMessage(streamIdRef.current, { streaming: false })
+            streamIdRef.current = null
           }
+          streamTurnRef.current = null
           setActivity('')
           setConfirmReq(null)
           messagesRef.current = sealSubAgentNotes(messagesRef.current)
-          setMessages([...messagesRef.current])
+          setMessages(messagesRef.current)
           return
         }
 
@@ -859,7 +1103,7 @@ export function useConversations(deps: Deps) {
         }
       }
     },
-    [appendMessage, loadSessionState, loadSessions, makeId, token, updateMessage],
+    [appendMessage, loadMessages, loadSessionState, loadSessions, makeId, token, updateMessage],
   )
 
   const selectSession = useCallback(
@@ -873,6 +1117,7 @@ export function useConversations(deps: Deps) {
       setActiveSession(sid)
       setView('chat')
       streamIdRef.current = null
+      streamTurnRef.current = null
       setIsStreaming(false)
       setActivity('')
       // Restore the previous conversation instantly from the local cache, then
@@ -1101,7 +1346,7 @@ export function useConversations(deps: Deps) {
     )
     setQueuedMessages([...queuedMessagesRef.current])
     messagesRef.current = messagesRef.current.filter(item => item.id !== messageId)
-    setMessages([...messagesRef.current])
+    setMessages(messagesRef.current)
   }
 
   // Returns the withdrawn text, or '' when the server no longer had it.
@@ -1600,13 +1845,16 @@ export function useConversations(deps: Deps) {
     commandItemRefs.current[command.name]?.scrollIntoView({ block: 'nearest' })
   }, [commandIndex, filteredCommands, inlineCommandOpen])
 
-  const copyMessage = (content: string) => {
+  // Stable across renders on purpose. These reach memoised message rows as
+  // props, and a fresh function identity every render would defeat every one of
+  // them -- the rows would re-render exactly as they did before.
+  const copyMessage = useCallback((content: string) => {
     navigator.clipboard?.writeText(content).then(() => {
       messageApi.success('已复制')
     }).catch(() => {
       messageApi.error('复制失败')
     })
-  }
+  }, [messageApi])
 
   const applyCommand = (command: CommandInfo) => {
     setInput(`/${command.name} `)
@@ -1634,9 +1882,11 @@ export function useConversations(deps: Deps) {
     focusComposer()
   }
 
-  const toggleTraceExpanded = (id: string) => {
+  // Stable for the same reason as ``copyMessage``: it is a prop of every row that
+  // owns a tool trace.
+  const toggleTraceExpanded = useCallback((id: string) => {
     setExpandedTraces(prev => ({ ...prev, [id]: !prev[id] }))
-  }
+  }, [])
 
   // Sending must resolve a `/command` identically no matter which affordance
   // triggered it (Enter, the send button). An exact command name — or a
@@ -1733,7 +1983,12 @@ export function useConversations(deps: Deps) {
     }
   }
 
-  const conversationTurns = messages.filter(item => item.role === 'user')
+  // A turn, for the rail. A message sent *during* a turn is not one: counting
+  // it gave the rail two markers for one exchange and made "第 N 轮" name a
+  // number that no longer matched the turns above it.
+  const conversationTurns = messages.filter(
+    item => item.role === 'user' && !isInTurnUserMessage(item),
+  )
 
   // Keep a calm rhythm for short conversations, then compress the rail as
   // history grows so the indicator remains a compact page-edge affordance.
@@ -1809,5 +2064,5 @@ export function useConversations(deps: Deps) {
     if (hoverClearTimerRef.current) window.clearTimeout(hoverClearTimerRef.current)
   }
 
-  return { MAX_CACHED_SESSIONS, activateTurnIndex, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
+  return { MAX_CACHED_SESSIONS, activateTurnIndex, activeSession, activeSessionRef, activity, addFiles, allFilteredSessionsSelected, appendMessage, applyCommand, applyStreamingSnapshot, awayFromLatest, chatScrollRef, clearInterruptTimers, commandPrefixActive, commands, composerRef, composerSendable, connectWs, connected, connecting, continueTask, conversationGap, conversationMarkerRefs, conversationRailRef, conversationTurns, copyMessage, createSession, creatingSession, currentModel, currentModelRef, deleteSelectedSessions, deleteSession, dismissTaskGuidance, draftKey, drafts, dropQueuedLocally, expandedTraces, fileDragActive, fileInputRef, filteredCommands, filteredSessions, flushComposerFocus, focusComposer, followChatRef, handleChatDragLeave, handleChatDragOver, handleChatDrop, handleChatScroll, handleComposerKeyDown, handleComposerPaste, handleFilesSelected, handleRailMouseMove, handleSessionContainerClick, hasMoreHistory, historyLimit, hoverClearTimerRef, hoveredTurn, hoveredTurnIndex, idleSnapshotSeenRef, inlineCommandEmpty, inlineCommandOpen, input, interruptAttemptsRef, interruptTimersRef, interrupting, isStreaming, jumpToLatest, keepTurnSummary, loadEarlierMessages, loadMessages, loadMessagesRequestRef, loadSessionPermissions, loadSessionState, loadSessions, loadingHistory, loadingSessions, messageSendSeqRef, messages, messagesRef, pendingAttachments, pendingDeleteSessionId, pendingMessageIdRef, pendingModelRef, pendingSendRef, permissionLabel, permissionLevel, pickWorkspace, queueView, queuedMessages, queuedMessagesRef, railGeometryRef, renamingSession, commitSessionTitle, requestInterrupt, resolveComposerText, resolvedComposerText, resumingTaskId, revealSession, sandboxMode, scheduleHideTurnSummary, scrollChatToBottom, selectSession, selectedSessionIds, sendMessage, sendShortcut, sendShortcutLabel, sessionSearch, sessionState, sessions, setActiveSession, setActivity, setCommands, setConnected, setConnecting, setCreatingSession, setCurrentModel, setDrafts, setExpandedTraces, setHoveredTurn, setHoveredTurnIndex, setInput, setInterrupting, setIsStreaming, setLoadingSessions, setMessages, setPendingAttachments, setPendingDeleteSessionId, setPermissionLevel, setQueuedMessages, setRenamingSession, setResumingTaskId, setSandboxMode, setSelectedSessionIds, setSendShortcut, setSessionSearch, setSessionState, setSessions, stopStreaming, streamIdRef, taskActionRef, toggleTraceExpanded, turnRefs, updateMessage, updateSessionPermissions, uploadPendingAttachments, withdrawOneQueued, withdrawQueuedMessages } as const
 }
