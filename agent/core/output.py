@@ -375,16 +375,39 @@ class OutputSink(ABC):
         reporting a completed turn, because no turn happened.
         """
 
-    def on_tool_start(self, name: str, inputs: dict) -> None:
-        """Called immediately before a tool is executed."""
+    def on_tool_start(
+        self,
+        name: str,
+        inputs: dict,
+        *,
+        operation_id: str = "",
+    ) -> None:
+        """Called immediately before a tool is executed.
 
-    def on_tool_end(self, name: str, result: str) -> None:
+        ``operation_id`` identifies this one call. Sinks that keep per-tool
+        state should key it on that rather than on ``name``: two calls to the
+        same tool can be in flight at once.
+        """
+
+    def on_tool_end(
+        self,
+        name: str,
+        result: str,
+        *,
+        operation_id: str = "",
+    ) -> None:
         """Called immediately after a tool returns its result."""
 
     def on_tool_progress(self, name: str, progress: Mapping[str, Any]) -> None:
         """Called when a running tool reports progress."""
 
-    def on_tool_blocked(self, name: str, reason: str) -> None:
+    def on_tool_blocked(
+        self,
+        name: str,
+        reason: str,
+        *,
+        operation_id: str = "",
+    ) -> None:
         """Called when a plugin vetoes a tool call before execution."""
 
     async def on_tool_confirmation(
@@ -714,7 +737,13 @@ class CliOutputSink(OutputSink):
         self._tool_count = 0
 
     @_deferred_during_consent
-    def on_tool_start(self, name: str, inputs: dict) -> None:
+    def on_tool_start(
+        self,
+        name: str,
+        inputs: dict,
+        *,
+        operation_id: str = "",
+    ) -> None:
         self._close_reasoning_line()
         self._stop_activity()
         self._finish_open_line()
@@ -725,7 +754,13 @@ class CliOutputSink(OutputSink):
         self._set_activity(f"Running {name}…")
 
     @_deferred_during_consent
-    def on_tool_end(self, name: str, result: str) -> None:
+    def on_tool_end(
+        self,
+        name: str,
+        result: str,
+        *,
+        operation_id: str = "",
+    ) -> None:
         self._stop_activity()
         if self._tool_progress is not None:
             self._tool_progress.stop()
@@ -751,7 +786,13 @@ class CliOutputSink(OutputSink):
         self._set_activity("Processing results…")
 
     @_deferred_during_consent
-    def on_tool_blocked(self, name: str, reason: str) -> None:
+    def on_tool_blocked(
+        self,
+        name: str,
+        reason: str,
+        *,
+        operation_id: str = "",
+    ) -> None:
         self._stop_activity()
         self._finish_open_line()
         self._console.print(

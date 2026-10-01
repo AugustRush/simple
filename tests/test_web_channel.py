@@ -54,9 +54,24 @@ class _FakeStore:
     def list_session_titles(self):
         return dict(self._titles)
 
-    def recent_conversation_turns(self, session_id, limit=100):
-        turns = self._turns.get(session_id, [])
-        return turns[-limit:]
+    def transcript_window(self, *, session_id, limit=200, before_seq=0):
+        """Both tables in one order, the way the real store answers.
+
+        The fake has no events, so the window is just the turns in sequence
+        order, newest last, with ``has_more`` saying whether anything older is
+        outside the window.
+        """
+        turns = sorted(
+            self._turns.get(session_id, []), key=lambda turn: int(turn.seq or 0)
+        )
+        if before_seq > 0:
+            turns = [turn for turn in turns if int(turn.seq or 0) < before_seq]
+        window = turns[-limit:]
+        oldest = int(turns[0].seq or 0) if turns else 0
+        has_more = bool(turns) and int(turns[0].seq or 0) < (
+            int(window[0].seq or 0) if window else 0
+        )
+        return window, [], has_more
 
     def load_session_working_state(self, session_id):
         if self._working_state is None:
@@ -68,12 +83,20 @@ class _FakeStore:
         return SimpleNamespace(state=state)
 
 
-def _turn(role, content):
-    return SimpleNamespace(role=role, content=content)
+def _turn(role, content, seq=0, message_id=""):
+    return SimpleNamespace(
+        role=role,
+        content=content,
+        seq=seq,
+        message_id=message_id,
+        reply_to_id="",
+        metadata={},
+        created_at="2026-01-01 00:00:00.000000 UTC",
+    )
 
 
 def test_session_service_lists_live_and_durable_sessions():
-    store = _FakeStore({"abc123": [_turn("user", "hi")]})
+    store = _FakeStore({"abc123": [_turn("user", "hi", seq=1)]})
     live = {"live-1": SimpleNamespace(turn_count=2)}
     service = SessionService(store=store, live_states=live)
 
@@ -82,7 +105,20 @@ def test_session_service_lists_live_and_durable_sessions():
     assert sessions["live-1"]["turn_count"] == 2
     assert sessions["abc123"]["live"] is False
 
-    assert service.get_messages("abc123") == [{"role": "user", "content": "hi"}]
+    # One page: the messages, the cursor for paging back, and whether the
+    # conversation continues past it.
+    page = service.get_messages("abc123")
+    assert page["messages"] == [
+        {
+            "role": "user",
+            "content": "hi",
+            "seq": 1,
+            "created_at": "2026-01-01 00:00:00.000000 UTC",
+            "message_id": "",
+        }
+    ]
+    assert page["has_more"] is False
+    assert page["oldest_seq"] == 1
     assert service.create_session()
 
 
@@ -1345,7 +1381,221 @@ def test_web_session_runtime_restores_selected_workspace_write_grant(tmp_path, m
     assert result["file_access_policy"].workspace_write is True
 
 
-def test_session_service_recovers_legacy_events_by_turn_id(tmp_path):
+def test_tool_rows_land_between_the_request_and_the_reply(tmp_path):
+    """The order the reader saw live is the order the record reports.
+
+    Every row draws its position from one per-session counter, so a tool call
+    sits where it actually ran: after the request that caused it, before the
+    reply it fed. This is what the previous anchoring scheme could not say --
+    it placed a whole turn's tool rows directly under the request, which is a
+    reconstruction, and lost the interleaving that happened live.
+    """
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="看看 README",
+        channel="web",
+        message_id="turn-1",
+    )
+    for index, tool in enumerate(("read_file", "bash", "read_file")):
+        store.append_agent_event(
+            session_id="web-session",
+            turn_id="turn-1",
+            event_type="tool_completed",
+            payload={"operation_id": f"op-{index}", "tool_name": tool, "ok": True},
+        )
+    # The reply is journaled against the same turn, which is how the record
+    # learns what the turn produced.
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="看看 README",
+        assistant_content="README 讲安装配置",
+        channel="web",
+        message_id="turn-1",
+    )
+
+    page = SessionService(store=store).get_messages("web-session")
+
+    assert [item["role"] for item in page["messages"]] == [
+        "user",
+        "tool",
+        "tool",
+        "tool",
+        "assistant",
+    ]
+    # A single strictly increasing timeline: the two tables share one counter.
+    seqs = [item["seq"] for item in page["messages"]]
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == len(seqs)
+
+
+def test_a_turn_that_shares_one_timestamp_is_still_ordered(tmp_path):
+    """Ties in the timestamp cannot reorder a transcript.
+
+    A request and its reply are journaled in one call and therefore share a
+    ``created_at``. Ordering by time alone cannot separate them, nor place a
+    tool call between two rows written in the same instant -- which is why the
+    order comes from the sequence and not the clock.
+    """
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    # One explicit timestamp for the whole turn: the request, the tool call it
+    # caused and the reply all written within the same microsecond.
+    frozen = "2026-01-01 00:00:00.000000 UTC"
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="同一个时间戳",
+        channel="web",
+        message_id="turn-1",
+        created_at=frozen,
+    )
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="turn-1",
+        event_type="tool_completed",
+        payload={"operation_id": "op-1", "tool_name": "bash", "ok": True},
+        created_at=frozen,
+    )
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="同一个时间戳",
+        assistant_content="答复",
+        channel="web",
+        message_id="turn-1",
+        created_at=frozen,
+    )
+    with store._connect() as conn:
+        stamps = {
+            str(row["created_at"])
+            for row in conn.execute(
+                "SELECT created_at FROM conversation_turns"
+                " UNION ALL SELECT created_at FROM agent_events"
+            )
+        }
+    assert len(stamps) == 1, "the fixture must actually share one timestamp"
+
+    page = SessionService(store=store).get_messages("web-session")
+    assert [item["role"] for item in page["messages"]] == ["user", "tool", "assistant"]
+
+
+def test_one_session_never_reads_another_sessions_rows(tmp_path):
+    """Sequence numbers repeat across sessions, so every read is session-scoped.
+
+    A sequence is only unique within its own conversation -- two sessions both
+    number their rows from 1. Resolving a window's positions without also
+    asking which session they belong to hands back whichever rows happen to
+    carry the same number, so two conversations read as one.
+    """
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    for session_id in ("left", "right"):
+        for index in range(1, 4):
+            store.write_conversation_exchange(
+                session_id=session_id,
+                user_content=f"{session_id} request {index}",
+                assistant_content=f"{session_id} answer {index}",
+                channel="web",
+                message_id=f"{session_id}-{index}",
+            )
+
+    service = SessionService(store=store)
+    for session_id in ("left", "right"):
+        page = service.get_messages(session_id, limit=20)
+        assert page["messages"], session_id
+        for item in page["messages"]:
+            assert session_id in item["content"], (
+                f"{session_id} transcript contains another session's row: "
+                f"{item['content']!r}"
+            )
+
+
+def test_a_transcript_pages_backwards_with_a_cursor(tmp_path):
+    """A long conversation is paged, not cut off.
+
+    The window is the newest slice; ``oldest_seq`` is what the next request
+    pages from and ``has_more`` says whether the conversation continues. Without
+    it a reader had no way to reach the beginning of a long session.
+    """
+    from agent.memory.store import LTMStore
+
+    store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    for index in range(1, 13):
+        store.write_conversation_exchange(
+            session_id="web-session",
+            user_content=f"请求 {index}",
+            assistant_content=f"回答 {index}",
+            channel="web",
+            message_id=f"turn-{index}",
+        )
+    service = SessionService(store=store)
+
+    newest = service.get_messages("web-session", limit=6)
+    assert [item["content"] for item in newest["messages"]] == [
+        "请求 10",
+        "回答 10",
+        "请求 11",
+        "回答 11",
+        "请求 12",
+        "回答 12",
+    ]
+    assert newest["has_more"] is True
+
+    older = service.get_messages(
+        "web-session", limit=6, before_seq=newest["oldest_seq"]
+    )
+    assert [item["content"] for item in older["messages"]] == [
+        "请求 7",
+        "回答 7",
+        "请求 8",
+        "回答 8",
+        "请求 9",
+        "回答 9",
+    ]
+    # The second page picks up where the first stopped: the cursor is the
+    # oldest row of the previous page, not a count of pages.
+    assert older["oldest_seq"] < newest["oldest_seq"]
+    assert older["has_more"] is True
+
+    # Walk the whole conversation by cursor. This is the property that matters:
+    # no row is repeated and none is skipped, however many pages it takes, and
+    # every page but the last says there is more behind it.
+    newest_page = [newest]
+    while newest_page[-1]["has_more"]:
+        newest_page.append(
+            service.get_messages(
+                "web-session",
+                limit=6,
+                before_seq=newest_page[-1]["oldest_seq"],
+            )
+        )
+    assert all(page["has_more"] for page in newest_page[:-1])
+    assert newest_page[-1]["has_more"] is False
+
+    # Pages come back newest-window-first, so reading the conversation means
+    # reversing the pages -- and reversing them must reproduce it exactly.
+    collected: list[dict] = []
+    for page in reversed(newest_page):
+        collected.extend(page["messages"])
+    assert [item["content"] for item in collected] == [
+        content
+        for index in range(1, 13)
+        for content in (f"请求 {index}", f"回答 {index}")
+    ]
+
+
+def test_tool_events_written_to_another_session_are_not_shown(tmp_path):
+    """A transcript is scoped to its session.
+
+    Events carry a ``turn_id`` that is globally unique, which once let a row
+    recorded under a different session id be pulled into this conversation by
+    turn id alone. Ordering is now the session's own timeline, so a row is in
+    the transcript because it was written to that session -- not because some id
+    it happens to mention matches.
+    """
     from agent.memory.store import LTMStore
 
     store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
@@ -1354,35 +1604,18 @@ def test_session_service_recovers_legacy_events_by_turn_id(tmp_path):
         role="user",
         content="hello",
         channel="web",
-        message_id="turn-legacy",
-    )
-    store.append_conversation_turn(
-        session_id="web-session",
-        role="assistant",
-        content="done",
-        channel="web",
-        message_id="turn-legacy:completion:1",
-        reply_to_id="turn-legacy",
+        message_id="turn-1",
     )
     store.append_agent_event(
-        session_id="random-factory-session",
-        turn_id="turn-legacy",
-        event_type="tool_started",
-        payload={"operation_id": "tool-1", "tool_name": "search"},
-    )
-    store.append_agent_event(
-        session_id="random-factory-session",
-        turn_id="turn-legacy",
+        session_id="another-session",
+        turn_id="turn-1",
         event_type="tool_completed",
         payload={"operation_id": "tool-1", "tool_name": "search", "ok": True},
     )
 
-    messages = SessionService(store=store).get_messages("web-session")
+    page = SessionService(store=store).get_messages("web-session")
 
-    assert [item["tool"] for item in messages if item.get("role") == "tool"] == [
-        "search"
-    ]
-    assert messages[1]["role"] == "tool"
+    assert [item["role"] for item in page["messages"]] == ["user"]
 
 
 def test_session_service_restores_attachments_on_the_user_message(tmp_path):
@@ -1421,15 +1654,19 @@ def test_session_service_restores_attachments_on_the_user_message(tmp_path):
         payload={"name": "brief.pdf", "path": str(attachment)},
     )
 
-    messages = SessionService(store=store).get_messages("web-session")
+    page = SessionService(store=store).get_messages("web-session")
 
-    assert messages == [
-        {
-            "role": "user",
-            "content": "",
-            "attachments": metadata["attachments"],
-        }
-    ]
+    # The attachment rides on the user row. The record's own id, timestamp and
+    # sequence come back too: the first is how the client recognises this row as
+    # one it already rendered, the last is what places it in the transcript.
+    assert len(page["messages"]) == 1
+    row = page["messages"][0]
+    assert row["role"] == "user"
+    assert row["content"] == ""
+    assert row["attachments"] == metadata["attachments"]
+    assert row["message_id"] == "attachment-turn"
+    assert row["created_at"]
+    assert row["seq"] > 0
 
 
 def test_session_service_deduplicates_output_attachment_events_per_turn(tmp_path):
@@ -1454,9 +1691,11 @@ def test_session_service_deduplicates_output_attachment_events_per_turn(tmp_path
             payload={"name": "result.png", "path": str(attachment)},
         )
 
-    messages = SessionService(store=store).get_messages("web-session")
+    page = SessionService(store=store).get_messages("web-session")
 
-    attachments = [item for item in messages if item.get("tool") == "attachment"]
+    attachments = [
+        item for item in page["messages"] if item.get("tool") == "attachment"
+    ]
     assert len(attachments) == 1
 
 
@@ -1496,6 +1735,7 @@ def test_session_service_merges_continuations_without_moving_trace_or_attachment
         message_id="attachment-turn",
         assistant_message_id="attachment-turn:completion:1",
     )
+    # Written between the two replies, which is when the file was inspected.
     store.append_agent_event(
         session_id="web-session",
         turn_id="attachment-turn",
@@ -1521,13 +1761,21 @@ def test_session_service_merges_continuations_without_moving_trace_or_attachment
         assistant_message_id="attachment-turn:completion:2",
     )
 
-    messages = SessionService(store=store).get_messages("web-session")
+    page = SessionService(store=store).get_messages("web-session")
 
-    assert [item["role"] for item in messages] == ["user", "tool", "assistant"]
-    assert messages[0]["attachments"] == metadata["attachments"]
-    assert messages[1]["tool"] == "inspect_image"
-    assert messages[1]["toolState"] == "done"
-    assert messages[2]["content"] == "我先检查文件。\n\n检查完成，这是最终结论。"
+    # The request, the trace of the file it inspected, then the reply -- and
+    # the attachment rides on the request rather than appearing again as an
+    # output of the turn.
+    assert [item["role"] for item in page["messages"]] == [
+        "user",
+        "tool",
+        "assistant",
+    ]
+    assert page["messages"][0]["attachments"] == metadata["attachments"]
+    assert page["messages"][1]["tool"] == "inspect_image"
+    assert page["messages"][1]["toolState"] == "done"
+    # One assistant row: the two continuations answer the same turn.
+    assert page["messages"][2]["content"] == "我先检查文件。\n\n检查完成，这是最终结论。"
 
 
 def test_web_create_agent_schedule_with_structured_time(tmp_path, monkeypatch):
@@ -4380,18 +4628,91 @@ def test_a_session_rebuilt_after_a_provider_switch_does_not_inherit_the_old_clie
     assert transport.endpoint_for("deepseek-flash").client.provider == "deepseek"
 
 
-def test_a_recorded_interjection_is_exposed_as_in_turn_speech(tmp_path):
-    """The client needs the flag, and needs the tools to stay with their turn.
+def test_a_store_written_before_the_sequence_column_still_opens(tmp_path):
+    """A database that predates ``seq`` must be migrated, not rejected.
 
-    Without the flag an interjection row is indistinguishable from a turn
-    boundary, and the browser's grouping treats it as one -- splitting the very
-    turn that answered it.  Without excluding it from the orphan-placement
-    pool, the turn's tool rows would attach to the interjection instead of to
-    the request that opened the turn.
+    Every other test here builds its store from scratch, where the table is
+    created with the column already in it -- so none of them can see the case
+    that actually breaks an install. ``CREATE TABLE IF NOT EXISTS`` does nothing
+    to a table that already exists, so an existing database keeps its old shape
+    and anything referring to ``seq`` fails: in this store's history that put the
+    index creation inside the schema script, where it raised "no such column"
+    before the migration could add the column. A fresh database passed; only
+    existing ones failed, which is the worst possible shape for a bug to have.
+    """
+    import sqlite3
+
+    from agent.memory.store import LTMStore
+
+    # The database as it looked before the column existed.
+    context_dir = tmp_path / "context"
+    context_dir.mkdir(parents=True)
+    legacy = sqlite3.connect(context_dir / "palace.db")
+    legacy.executescript(
+        """
+        CREATE TABLE conversation_turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            channel TEXT NOT NULL DEFAULT '',
+            message_id TEXT NOT NULL DEFAULT '',
+            reply_to_id TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE agent_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            turn_id TEXT NOT NULL DEFAULT '',
+            event_type TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    legacy.execute(
+        "INSERT INTO conversation_turns"
+        " (session_id, role, content, channel, message_id, created_at)"
+        " VALUES ('old', 'user', '旧消息', 'web', 'old-1', '2026-01-01 00:00:00.000000 UTC')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    # Opening it must work, migrate it, and order what it already held.
+    store = LTMStore(context_dir=context_dir, memory_dir=tmp_path / "memory")
+    page = SessionService(store=store).get_messages("old")
+
+    assert [item["content"] for item in page["messages"]] == ["旧消息"]
+    assert page["messages"][0]["seq"] > 0
+    # And the migration is idempotent: reopening must not raise again.
+    SessionService(store=store).get_messages("old")
+
+
+def test_a_recorded_interjection_is_exposed_as_in_turn_speech(tmp_path):
+    """An interjection is the user's own words, said inside a turn.
+
+    It has to stay marked as such: an unmarked row is indistinguishable from a
+    turn boundary, and the browser's grouping reads it as one -- splitting the
+    very turn that answered it. Its place in the transcript comes from the
+    shared sequence, so it sits between the tool calls it interrupted and the
+    reply that addressed it without any row being attached to it.
     """
     from agent.memory.store import LTMStore
 
     store = LTMStore(context_dir=tmp_path / "context", memory_dir=tmp_path / "memory")
+    store.write_conversation_exchange(
+        session_id="web-session",
+        user_content="列出文件",
+        channel="web",
+        message_id="turn-1",
+    )
+    store.append_agent_event(
+        session_id="web-session",
+        turn_id="turn-1",
+        event_type="tool_completed",
+        payload={"operation_id": "tool-1", "tool_name": "list_files", "ok": True},
+    )
     store.write_conversation_exchange(
         session_id="web-session",
         user_content="列出文件",
@@ -4402,27 +4723,101 @@ def test_a_recorded_interjection_is_exposed_as_in_turn_speech(tmp_path):
             {"text": "顺便看一眼 markdown", "message_id": "inj-1", "urgency": "now"}
         ],
     )
-    store.append_agent_event(
-        session_id="web-session",
-        turn_id="turn-1",
-        event_type="tool_completed",
-        payload={"operation_id": "tool-1", "tool_name": "list_files", "ok": True},
-    )
 
-    messages = SessionService(store=store).get_messages("web-session")
+    page = SessionService(store=store).get_messages("web-session")
+    messages = page["messages"]
 
-    # The request that opened the turn, the turn's tool rows (attached to that
-    # request, not to the interjection), the interjection, then the answer that
-    # addressed it.
-    assert [item.get("role") for item in messages] == ["user", "tool", "user", "assistant"]
-    assert messages[1].get("tool") == "list_files"
-    assert messages[2].get("content") == "顺便看一眼 markdown"
-    assert messages[3].get("content") == "收到了"
+    # The request, the tool call it made, the words the user added while that
+    # was running, then the answer that addressed both.
+    assert [item["role"] for item in messages] == [
+        "user",
+        "tool",
+        "user",
+        "assistant",
+    ]
+    assert messages[1]["tool"] == "list_files"
+    assert messages[2]["content"] == "顺便看一眼 markdown"
+    assert messages[3]["content"] == "收到了"
 
     interjection = messages[2]
     assert interjection["interjection"] is True
-    # The client matches its optimistic row by the id the server was given, so
-    # the flag -- not the id -- is what has to survive the display projection.
-    assert "message_id" not in interjection
+    # The record id survives the display projection. It is what the client
+    # matches its optimistic row against: the same sentence sent twice in one
+    # turn is two messages, and content comparison would drop the second.
+    assert interjection["message_id"] == "inj-1"
+    assert messages[0]["message_id"] == "turn-1"
     # The ordinary user row is left alone: it is still a turn boundary.
     assert "interjection" not in messages[0]
+
+
+
+
+
+def test_socket_tool_events_carry_their_operation_id():
+    """Two calls to one tool must be tellable apart by the client.
+
+    Matching a result to its start by name alone lets the first call's result
+    land on the second call's row. The id is already known here -- the executor
+    generates one per call -- it just was not reaching the socket.
+    """
+    from agent.channels.web import WebOutputSink
+
+    sink = WebOutputSink(collect=True)
+    sink.on_tool_start("list_files", {"path": "."}, operation_id="op-1")
+    sink.on_tool_start("list_files", {"path": ".."}, operation_id="op-2")
+    sink.on_tool_end("list_files", "a", operation_id="op-1")
+    sink.on_tool_end("list_files", "b", operation_id="op-2")
+
+    started = [e for e in sink.events if e["type"] == "tool_start"]
+    ended = [e for e in sink.events if e["type"] == "tool_end"]
+    assert [e["operation_id"] for e in started] == ["op-1", "op-2"]
+    assert [e["operation_id"] for e in ended] == ["op-1", "op-2"]
+    assert [e["inputs"] for e in started] == [{"path": "."}, {"path": ".."}]
+
+
+def test_stream_events_carry_the_turn_they_belong_to():
+    """A late event for another turn must be recognisable as such.
+
+    Without the turn on the event the client can only assume every chunk belongs
+    to the reply on screen, which is how a restarted turn's answer ends up
+    appended to the previous one.
+    """
+    from agent.channels.web import WebOutputSink
+
+    sink = WebOutputSink(collect=True, turn_id="turn-1")
+    sink.on_stream_chunk("你好")
+    sink.on_reasoning_chunk("想一下")
+    sink.on_turn_complete("你好", [])
+    snapshot = sink.streaming_snapshot
+
+    for event in sink.events:
+        assert event["turn_id"] == "turn-1"
+    # The reconnect snapshot is not routed through ``_emit``, so it carries the
+    # turn separately -- and it must, or a tab returning mid-turn would restore
+    # a reply belonging to a turn it is not watching.
+    assert snapshot is None  # the turn already completed
+    assert sink.full_text == "你好"
+
+
+def test_a_snapshot_for_a_live_turn_names_its_turn():
+    from agent.channels.web import WebOutputSink
+
+    sink = WebOutputSink(collect=True, turn_id="turn-9")
+    sink.mark_turn_start()
+    sink.on_stream_chunk("半句")
+    snapshot = sink.streaming_snapshot
+    assert snapshot is not None
+    assert snapshot["turn_id"] == "turn-9"
+
+
+def test_turn_tags_are_omitted_when_unknown():
+    """An untagged event must not claim a turn it does not have.
+
+    Sending ``turn_id: ""`` would leave the client to compare an empty string
+    against the turn it is watching and, on some paths, treat it as a match.
+    """
+    from agent.channels.web import WebOutputSink
+
+    sink = WebOutputSink(collect=True)
+    sink.on_stream_chunk("hi")
+    assert all("turn_id" not in event for event in sink.events)

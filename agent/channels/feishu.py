@@ -512,7 +512,13 @@ class FeishuOutputSink(OutputSink):
         ):
             self._schedule(self._finish_turn_async(text), label="finish_turn")
 
-    def on_tool_start(self, name: str, inputs: dict) -> None:
+    def on_tool_start(
+        self,
+        name: str,
+        inputs: dict,
+        *,
+        operation_id: str = "",
+    ) -> None:
         if name in self._SUPPRESSED_TOOL_HINTS:
             return
         hint = f"{name}{_fmt_tool_inputs(name, inputs)}"
@@ -529,7 +535,13 @@ class FeishuOutputSink(OutputSink):
             return
         self._schedule(self._send_tool_hint_async(hint), label="send_tool_hint")
 
-    def on_tool_end(self, name: str, result: str) -> None:
+    def on_tool_end(
+        self,
+        name: str,
+        result: str,
+        *,
+        operation_id: str = "",
+    ) -> None:
         return
 
     def on_tool_progress(self, name: str, progress: dict[str, Any]) -> None:
@@ -588,7 +600,13 @@ class FeishuOutputSink(OutputSink):
     # retry on its own; no user-visible card needed.
     _SILENT_BLOCK_REASONS = ("Intent required", "Intent declaration too vague")
 
-    def on_tool_blocked(self, name: str, reason: str) -> None:
+    def on_tool_blocked(
+        self,
+        name: str,
+        reason: str,
+        *,
+        operation_id: str = "",
+    ) -> None:
         if any(prefix in reason for prefix in self._SILENT_BLOCK_REASONS):
             return  # recoverable: LLM handles internally, no user-visible card
         self._schedule(

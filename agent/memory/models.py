@@ -69,6 +69,12 @@ class ConversationTurn:
     reply_to_id: str = ""
     metadata: dict[str, Any] | None = None
     created_at: str = ""
+    #: Position in the session's single transcript timeline.  Assigned from a
+    #: counter shared with ``agent_events``, which is what makes a transcript
+    #: totally ordered -- the two tables' own autoincrement ids cannot be
+    #: compared with each other, and two rows written in the same exchange can
+    #: share a timestamp.
+    seq: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +87,7 @@ class ConversationTurn:
             "reply_to_id": self.reply_to_id,
             "metadata": self.metadata or {},
             "created_at": self.created_at,
+            "seq": self.seq,
         }
 
 
@@ -132,6 +139,9 @@ class AgentRuntimeEvent:
     payload: dict[str, Any]
     turn_id: str = ""
     created_at: str = ""
+    #: Position in the session's single transcript timeline, drawn from the
+    #: same counter as ``ConversationTurn.seq``.
+    seq: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,6 +151,7 @@ class AgentRuntimeEvent:
             "event_type": self.event_type,
             "payload": self.payload,
             "created_at": self.created_at,
+            "seq": self.seq,
         }
 
 

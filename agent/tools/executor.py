@@ -56,7 +56,6 @@ _active_tool_progress: contextvars.ContextVar[Any] = contextvars.ContextVar(
     default=None,
 )
 
-
 def report_tool_progress(
     *,
     status: str = "running",
@@ -423,7 +422,7 @@ class RegularToolExecutor:
                     reason=pre.message,
                 )
                 if sink:
-                    sink.on_tool_blocked(name, pre.message)
+                    sink.on_tool_blocked(name, pre.message, operation_id=operation_id)
                 else:
                     shared.CONSOLE.print(
                         f"\n[cyan]→ {name}[/cyan] "
@@ -448,7 +447,7 @@ class RegularToolExecutor:
             stale_timeout_seconds=self._stale_timeout_seconds,
         )
         if sink:
-            sink.on_tool_start(name, inputs)
+            sink.on_tool_start(name, inputs, operation_id=operation_id)
         else:
             shared.CONSOLE.print(f"\n[cyan]→ {name}[/cyan]{_fmt_tool_inputs(name, inputs)}")
 
@@ -460,7 +459,7 @@ class RegularToolExecutor:
                 {"ok": False, "error": intent_blocked, "intent_required": True}
             )
             if sink:
-                sink.on_tool_blocked(name, intent_blocked)
+                sink.on_tool_blocked(name, intent_blocked, operation_id=operation_id)
             self._emit(
                 "tool_blocked",
                 operation_id=operation_id,
@@ -529,7 +528,7 @@ class RegularToolExecutor:
         )
 
         if sink:
-            sink.on_tool_end(name, result)
+            sink.on_tool_end(name, result, operation_id=operation_id)
         else:
             shared.CONSOLE.print(
                 f"[dim]{result[:200]}{'...' if len(result) > 200 else ''}[/dim]"

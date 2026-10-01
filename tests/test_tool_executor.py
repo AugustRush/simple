@@ -22,17 +22,23 @@ class _FakeRegistry:
 
 
 class _RecordingSink:
+    """Records the tool callbacks, keeping each call's id.
+
+    The id is what tells two concurrent calls to the same tool apart, so it is
+    part of what the sink is handed rather than something it has to guess.
+    """
+
     def __init__(self):
         self.events = []
 
-    def on_tool_start(self, name, inputs):
-        self.events.append(("start", name, inputs))
+    def on_tool_start(self, name, inputs, *, operation_id=""):
+        self.events.append(("start", name, inputs, operation_id))
 
-    def on_tool_end(self, name, result):
-        self.events.append(("end", name, result))
+    def on_tool_end(self, name, result, *, operation_id=""):
+        self.events.append(("end", name, result, operation_id))
 
-    def on_tool_blocked(self, name, reason):
-        self.events.append(("blocked", name, reason))
+    def on_tool_blocked(self, name, reason, *, operation_id=""):
+        self.events.append(("blocked", name, reason, operation_id))
 
     def on_tool_progress(self, name, progress):
         self.events.append(("progress", name, progress))
@@ -56,13 +62,19 @@ def test_regular_tool_executor_calls_registry_and_sink():
 
     assert registry.calls == [("search", {"query": "runtime"})]
     assert json.loads(result) == {"ok": True, "name": "search"}
-    assert sink.events == [
+    # The sink sees one call id, on both ends of the same call.
+    assert [event[:3] for event in sink.events] == [
         ("start", "search", {"query": "runtime"}),
         ("end", "search", result),
     ]
+    call_id = sink.events[0][3]
+    assert call_id and sink.events[1][3] == call_id
     events = collector.drain()
     assert [event.name for event in events] == ["tool_started", "tool_completed"]
-    assert events[0].fields["operation_id"] == events[1].fields["operation_id"]
+    # The id the sink was given is the one the durable record uses, so a
+    # transcript row can be matched to the call that produced it.
+    assert events[0].fields["operation_id"] == call_id
+    assert events[1].fields["operation_id"] == call_id
     assert events[0].fields["timeout_seconds"] == 1800
 
 
@@ -95,7 +107,8 @@ def test_regular_tool_executor_honors_plugin_block():
     assert registry.calls == []
     assert json.loads(result) == {"ok": False, "blocked": True, "reason": "nope"}
     assert plugin_catalog.pre_event.tool_name == "shell"
-    assert sink.events == [("blocked", "shell", "nope")]
+    assert [event[:3] for event in sink.events] == [("blocked", "shell", "nope")]
+    assert sink.events[0][3]
 
 
 def test_regular_tool_executor_requires_structured_shell_intent():

@@ -154,13 +154,7 @@ def _session_order(item: dict[str, Any]) -> tuple[int, int, float]:
     return (0 if busy else 1, 0 if live else 1, -stamp)
 
 
-def _turn_ids(turns: Any) -> set[str]:
-    """The message ids of ``turns``, used to re-attach legacy events."""
-    return {
-        str(getattr(turn, "message_id", "") or "").strip()
-        for turn in turns or ()
-        if str(getattr(turn, "message_id", "") or "").strip()
-    }
+
 
 
 def _messages_from_turns(
@@ -210,13 +204,23 @@ def _messages_from_turns(
                         previous["content"] = content
                     elif not previous_content.startswith(content):
                         previous["content"] = f"{previous_content}\n\n{content}"
+                # A turn can be answered in several pieces -- the model calls a
+                # tool, says something, calls another, says the rest -- and the
+                # reader sees one reply for it. So this row is displayed where
+                # the turn *finished*, not where it first said something:
+                # keeping the earlier position would put the whole answer above
+                # the tool calls that produced it.
+                previous["seq"] = max(
+                    int(previous.get("seq") or 0), int(getattr(turn, "seq", 0) or 0)
+                )
                 continue
             item = {
                 "role": role,
                 "content": content,
+                "reply_to_id": reply_to_id,
+                "seq": int(getattr(turn, "seq", 0) or 0),
                 "created_at": str(getattr(turn, "created_at", "") or ""),
                 "message_id": str(getattr(turn, "message_id", "") or ""),
-                "reply_to_id": reply_to_id,
             }
             # A message the user sent *during* this turn.  The flag travels with
             # the row because the client has to render it as in-turn speech: an
@@ -232,52 +236,20 @@ def _messages_from_turns(
     return messages, persisted_attachment_paths
 
 
-def _append_durable_event_rows(
-    messages: list[dict[str, Any]],
+def _event_rows(
+    events: Any,
     *,
-    target_store: Any,
-    session_id: str,
-    limit: int,
-    turn_ids: set[str],
     persisted_attachment_paths: set[str],
     is_live: bool,
-) -> None:
-    """Rehydrate the durable tool/attachment rows into ``messages``.
+) -> list[dict[str, Any]]:
+    """Turn runtime events into one display row per operation.
 
-    Tool output is emitted as a live event, not as a conversation turn, so the
-    transcript alone cannot rebuild the trace.  One compact row is appended per
-    operation (and per output attachment), in event order.
+    A tool call emits start/progress/complete events; they describe a single
+    step, so they collapse into one row here. Output attachments become rows of
+    their own. Every row keeps its ``seq``, which is what lets the caller put
+    the whole transcript back in order.
     """
-    get_events = getattr(target_store, "recent_agent_events", None)
-    if not callable(get_events):
-        return
-    try:
-        events = get_events(session_id=session_id, limit=max(100, limit * 8))
-    except Exception:
-        events = []
-    # Recover events written by pre-fix Web runtimes under a factory
-    # staging session id. Turn ids are globally unique and still tie
-    # those events to the correct conversation.
-    get_events_for_turns = getattr(
-        target_store, "recent_agent_events_for_turns", None
-    )
-    if callable(get_events_for_turns) and turn_ids:
-        try:
-            legacy_events = get_events_for_turns(
-                turn_ids=turn_ids,
-                limit=max(100, limit * 8),
-            )
-            seen_event_ids = {
-                int(getattr(event, "id", 0) or 0) for event in events
-            }
-            events.extend(
-                event
-                for event in legacy_events
-                if int(getattr(event, "id", 0) or 0) not in seen_event_ids
-            )
-            events.sort(key=lambda event: int(getattr(event, "id", 0) or 0))
-        except Exception:
-            pass
+    rows: list[dict[str, Any]] = []
     tools: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     terminal_turns: set[str] = set()
@@ -306,16 +278,15 @@ def _append_durable_event_rows(
             if attachment_key in seen_output_attachments:
                 continue
             seen_output_attachments.add(attachment_key)
-            messages.append(
+            rows.append(
                 {
                     "role": "tool",
                     "content": str(payload.get("name") or payload.get("path") or ""),
                     "tool": "attachment",
                     "toolState": "done",
                     "created_at": str(getattr(event, "created_at", "") or ""),
-                    "turn_id": str(getattr(event, "turn_id", "") or ""),
-                    "link": "/api/files?path="
-                    + quote(attachment_path, safe=""),
+                    "seq": int(getattr(event, "seq", 0) or 0),
+                    "link": "/api/files?path=" + quote(attachment_path, safe=""),
                 }
             )
             continue
@@ -332,6 +303,7 @@ def _append_durable_event_rows(
                 "tool": str(payload.get("tool_name") or "tool"),
                 "toolState": "running",
                 "created_at": str(getattr(event, "created_at", "") or ""),
+                "seq": int(getattr(event, "seq", 0) or 0),
                 "turn_id": str(getattr(event, "turn_id", "") or ""),
             }
             tools[operation_id] = item
@@ -362,69 +334,40 @@ def _append_durable_event_rows(
                 and str(item.get("turn_id") or "") in terminal_turns
             ):
                 item["toolState"] = "interrupted"
-    messages.extend(tools[key] for key in order)
+    for key in order:
+        item = dict(tools[key])
+        # ``turn_id`` decided which terminal event retired a running row; the
+        # transcript itself is ordered by ``seq`` and no longer needs it.
+        item.pop("turn_id", None)
+        rows.append(item)
+    return rows
 
 
 def _order_display_messages(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Interleave tool rows into the transcript, then drop bookkeeping fields.
+    """Put a whole transcript window in its one true order.
 
-    Older runtime/attachment events may not have recorded a ``turn_id``.  They
-    are still durable, but previously all of them were appended at the very end
-    of the transcript after a restart.  Recover a sensible placement from the
-    event timestamp by attaching each orphan to the most recent user turn that
-    had already started.
+    Every row carries a ``seq`` drawn from a single per-session counter shared by
+    conversation turns and runtime events, so this is a sort rather than a
+    reconstruction: a tool call sits between the request that caused it and the
+    reply it fed because that is the order they were written in, not because a
+    heuristic placed them there.
+
+    This replaces the previous anchoring scheme, which put every tool row of a
+    turn directly under its opening request -- losing the interleaving that
+    happened live -- and had to guess at placement for rows whose turn had
+    scrolled out of the window.
+
+    ``seq``, ``created_at`` and ``message_id`` are all kept on the way out: the
+    first pages the transcript, the second dates a row, and the third lets a
+    client recognise a row it already rendered (the same sentence twice in one
+    turn is two messages, and text cannot tell them apart).
     """
-    turns_only = [item for item in messages if item.get("role") in ("user", "assistant")]
-    tools_only = [item for item in messages if item.get("role") == "tool"]
-
-    user_turns = [
-        item
-        for item in turns_only
-        if item.get("role") == "user"
-        and item.get("message_id")
-        # An interjection carries an id too, and it shares its turn's
-        # timestamp, so leaving it in this pool would let it collect the
-        # turn's orphaned tool rows -- the rows belong to the turn, which is
-        # the message that opened it.
-        and not item.get("interjection")
-    ]
-    for tool in tools_only:
-        if str(tool.get("turn_id") or ""):
-            continue
-        tool_created = str(tool.get("created_at") or "")
-        candidate = ""
-        for user in user_turns:
-            user_created = str(user.get("created_at") or "")
-            if not tool_created or not user_created or user_created <= tool_created:
-                candidate = str(user.get("message_id") or "")
-            else:
-                break
-        if not candidate and user_turns:
-            candidate = str(user_turns[-1].get("message_id") or "")
-        if candidate:
-            tool["turn_id"] = candidate
-
-    tools_by_turn: dict[str, list[dict[str, Any]]] = {}
-    for item in tools_only:
-        tools_by_turn.setdefault(str(item.get("turn_id") or ""), []).append(item)
-    ordered: list[dict[str, Any]] = []
-    for item in turns_only:
-        ordered.append(item)
-        if item.get("role") == "user":
-            message_id = str(item.get("message_id") or "")
-            if message_id:
-                ordered.extend(tools_by_turn.pop(message_id, []))
-    # Older events may not have a turn id; retain them at the end rather
-    # than dropping durable trace history.
-    for leftovers in tools_by_turn.values():
-        ordered.extend(leftovers)
+    ordered = sorted(messages, key=lambda item: int(item.get("seq") or 0))
     for item in ordered:
-        item.pop("created_at", None)
-        item.pop("message_id", None)
-        item.pop("reply_to_id", None)
         item.pop("turn_id", None)
+        item.pop("reply_to_id", None)
     return ordered
 
 
@@ -1065,30 +1008,43 @@ class SessionService:
     def get_messages(
         self,
         session_id: str,
-        limit: int = 100,
-    ) -> list[dict[str, Any]]:
-        """Return recent display messages and durable traces for ``session_id``."""
+        limit: int = 200,
+        before_seq: int = 0,
+    ) -> dict[str, Any]:
+        """One page of the transcript, in its single true order.
+
+        ``before_seq`` pages backwards: the store returns rows ordered by the
+        session-wide sequence and this reports the oldest one it saw, which is
+        the cursor for the next page back. ``has_more`` says whether the
+        conversation continues past it -- so a long session is paged rather
+        than silently cut off, and the UI can offer to load the rest.
+        """
         target_store = self._store_for_session(str(session_id or "").strip())
         if target_store is None:
-            return []
-        get_turns = getattr(target_store, "recent_conversation_turns", None)
-        if not callable(get_turns):
-            return []
-        try:
-            turns = get_turns(session_id=session_id, limit=limit)
-        except Exception:
-            return []
-        messages, persisted_attachment_paths = _messages_from_turns(turns)
-        _append_durable_event_rows(
-            messages,
-            target_store=target_store,
-            session_id=session_id,
+            return {"messages": [], "has_more": False, "oldest_seq": 0}
+        turns, events, has_more = target_store.transcript_window(
+            session_id=str(session_id or "").strip(),
             limit=limit,
-            turn_ids=_turn_ids(turns),
-            persisted_attachment_paths=persisted_attachment_paths,
-            is_live=session_id in self._live_states,
+            before_seq=before_seq,
         )
-        return _order_display_messages(messages)
+        messages, persisted_attachment_paths = _messages_from_turns(turns)
+        messages.extend(
+            _event_rows(
+                events,
+                persisted_attachment_paths=persisted_attachment_paths,
+                is_live=session_id in self._live_states,
+            )
+        )
+        ordered = _order_display_messages(messages)
+        oldest = min(
+            (int(item.get("seq") or 0) for item in ordered if int(item.get("seq") or 0) > 0),
+            default=0,
+        )
+        return {
+            "messages": ordered,
+            "has_more": has_more,
+            "oldest_seq": oldest,
+        }
 
     def session_data_path(self, session_id: str) -> Optional[Path]:
         """Materialize and return a Finder-friendly file for one session.
@@ -1130,7 +1086,16 @@ class SessionService:
             filename = f"session-{digest}.md"
             path = export_dir / filename
 
-            messages = self.get_messages(clean, limit=500)
+            # The export wants the whole conversation, so it pages until there is no more
+            # rather than reading one capped window and calling it the history.
+            messages: list[dict[str, Any]] = []
+            cursor = 0
+            while True:
+                page = self.get_messages(clean, limit=500, before_seq=cursor)
+                messages.extend(page["messages"])
+                if not page["has_more"] or not page["oldest_seq"]:
+                    break
+                cursor = page["oldest_seq"]
             live = self._live_states.get(clean)
             if not messages and live is not None:
                 raw_messages = getattr(getattr(live, "ctx", None), "messages", ())

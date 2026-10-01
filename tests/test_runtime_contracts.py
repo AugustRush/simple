@@ -1531,7 +1531,7 @@ def test_an_interjection_reaches_the_record_and_the_memory_pipeline(tmp_path):
     assert ("user", "这些文件里有 markdown 吗？") in staged
 
     # And the client is told, by flag rather than by prose.
-    display = SessionService(store=store).get_messages("web-session")
+    display = SessionService(store=store).get_messages("web-session")["messages"]
     assert [item["role"] for item in display] == ["user", "user", "assistant"]
     assert display[1]["interjection"] is True
     assert "interjection" not in display[0]

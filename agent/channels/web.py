@@ -470,6 +470,27 @@ class WebConfig:
     cors_origins: tuple[Any, ...] = field(default_factory=tuple)
 
 
+def _turn_tag(turn_id: str) -> dict[str, str]:
+    """The turn a socket event belongs to, omitted when unknown.
+
+    A client that cannot tell which turn produced an event has to assume every
+    event belongs to the one it is watching, which is how a reply delivered for
+    a withdrawn or restarted message ends up appended to the wrong turn.
+    """
+    clean = str(turn_id or "").strip()
+    return {"turn_id": clean} if clean else {}
+
+
+def _operation_tag(operation_id: str) -> dict[str, str]:
+    """The tool call an event belongs to, omitted when unknown.
+
+    Without it a client can only match a tool's result to its start by name, so
+    two concurrent calls to the same tool overwrite each other's rows.
+    """
+    clean = str(operation_id or "").strip()
+    return {"operation_id": clean} if clean else {}
+
+
 class WebOutputSink(OutputSink):
     """Serialises agent output events to JSON for a web client.
 
@@ -487,8 +508,12 @@ class WebOutputSink(OutputSink):
         on_attachment: Any = None,
         output_dir: Any = None,
         confirmation_handler: Any = None,
+        turn_id: str = "",
     ) -> None:
         self._websocket = websocket
+        # The user message this sink narrates. Carried on every event so the
+        # client can keep a late event out of the turn it does not belong to.
+        self._turn_id = str(turn_id or "").strip()
         self._collect = collect or websocket is None
         self._events: list[dict[str, Any]] = []
         self._attachments: list[str] = []
@@ -523,7 +548,7 @@ class WebOutputSink(OutputSink):
 
     def on_stream_chunk(self, chunk: str) -> None:
         self.full_text += chunk
-        self._emit({"type": "stream_chunk", "chunk": chunk})
+        self._emit({"type": "stream_chunk", "chunk": chunk, **_turn_tag(self._turn_id)})
 
     def on_reasoning_chunk(self, chunk: str) -> None:
         """Stream the model's thinking, kept out of ``full_text``.
@@ -535,7 +560,7 @@ class WebOutputSink(OutputSink):
         if not chunk:
             return
         self.reasoning_text += chunk
-        self._emit({"type": "reasoning_chunk", "chunk": chunk})
+        self._emit({"type": "reasoning_chunk", "chunk": chunk, **_turn_tag(self._turn_id)})
 
     def on_turn_complete(self, full_text: str, tool_calls: list[str]) -> None:
         if full_text:
@@ -547,6 +572,7 @@ class WebOutputSink(OutputSink):
                 "type": "turn_complete",
                 "text": self.full_text,
                 "tool_calls": list(tool_calls),
+                **_turn_tag(self._turn_id),
             }
         )
 
@@ -603,7 +629,7 @@ class WebOutputSink(OutputSink):
         # when a browser switches back to this session.
         if not self._turn_started or self._turn_complete_emitted or not self.full_text:
             return None
-        snapshot = {"type": "stream_snapshot", "text": self.full_text}
+        snapshot = {"type": "stream_snapshot", "text": self.full_text, **_turn_tag(self._turn_id)}
         if self.reasoning_text:
             # Carried so a tab switch during a thinking-heavy turn brings the
             # note back with the text, rather than emptying it mid-sentence.
@@ -638,23 +664,68 @@ class WebOutputSink(OutputSink):
         resent["timeout_seconds"] = max(1, int(remaining))
         return resent
 
-    def on_tool_start(self, name: str, inputs: dict) -> None:
-        self._emit({"type": "tool_start", "name": name, "inputs": dict(inputs)})
+    def on_tool_start(
+        self,
+        name: str,
+        inputs: dict,
+        *,
+        operation_id: str = "",
+    ) -> None:
+        self._emit(
+            {
+                "type": "tool_start",
+                "name": name,
+                "inputs": dict(inputs),
+                **_operation_tag(operation_id),
+                **_turn_tag(self._turn_id),
+            }
+        )
 
-    def on_tool_end(self, name: str, result: str) -> None:
-        self._emit({"type": "tool_end", "name": name, "result": result})
+    def on_tool_end(
+        self,
+        name: str,
+        result: str,
+        *,
+        operation_id: str = "",
+    ) -> None:
+        self._emit(
+            {
+                "type": "tool_end",
+                "name": name,
+                "result": result,
+                **_operation_tag(operation_id),
+                **_turn_tag(self._turn_id),
+            }
+        )
 
     def on_tool_progress(self, name: str, progress: Any) -> None:
+        payload = progress if isinstance(progress, dict) else {}
         self._emit(
             {
                 "type": "tool_progress",
                 "name": name,
                 "progress": _jsonable(progress),
+                **_operation_tag(str(payload.get("operation_id") or "")),
+                **_turn_tag(self._turn_id),
             }
         )
 
-    def on_tool_blocked(self, name: str, reason: str) -> None:
-        self._emit({"type": "tool_blocked", "name": name, "reason": reason})
+    def on_tool_blocked(
+        self,
+        name: str,
+        reason: str,
+        *,
+        operation_id: str = "",
+    ) -> None:
+        self._emit(
+            {
+                "type": "tool_blocked",
+                "name": name,
+                "reason": reason,
+                **_operation_tag(operation_id),
+                **_turn_tag(self._turn_id),
+            }
+        )
 
     def on_status(self, text: str, *, level: str = "info") -> None:
         self._emit({"type": "status", "text": text, "level": level})
@@ -3138,13 +3209,21 @@ class WebChannel(Channel):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         session_id = request.path_params["session_id"]
         try:
-            limit = max(1, min(int(request.query_params.get("limit", "100")), 500))
+            limit = max(1, min(int(request.query_params.get("limit", "200")), 500))
         except ValueError:
-            limit = 100
+            limit = 200
+        # The cursor for paging further back. Absent or zero means "the newest
+        # window"; anything else is the oldest sequence the client already has.
+        try:
+            before_seq = max(0, int(request.query_params.get("before_seq", "0")))
+        except ValueError:
+            before_seq = 0
         return JSONResponse(
             {
                 "session_id": session_id,
-                "messages": self._service().get_messages(session_id, limit=limit),
+                **self._service().get_messages(
+                    session_id, limit=limit, before_seq=before_seq
+                ),
             }
         )
 
@@ -3521,6 +3600,7 @@ class WebChannel(Channel):
                 session_id, path, name, turn_id=message_id
             ),
             output_dir=_web_session_output_dir(clean_sid),
+            turn_id=message_id,
         )
         sink.mark_turn_start()
         try:
@@ -3675,6 +3755,7 @@ class WebChannel(Channel):
                 websocket=websocket,
                 output_dir=_web_session_output_dir(clean_sid),
                 confirmation_handler=wait_for_confirmation,
+                turn_id=message_id,
             )
             sink.on_attachment = lambda path, name: self._record_attachment(
                 session_id, path, name, turn_id=message_id
