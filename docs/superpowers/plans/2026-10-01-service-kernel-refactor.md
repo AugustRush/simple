@@ -54,7 +54,8 @@ Measured after each stage, same command every time
 | T7d5 sub-agent context | 3 / 2926 | 4117 | `subagent_context.py` |
 | T7d6 payload boundaries | 3 / 2944 | 4105 | tests only |
 | T7d7 metadata inheritance | 3 / 2950 | 4084 | `propagate_sub_metadata` |
-| T7d8 run promotion | **3 / 2960** | **4067** | `promote_orchestration_runs` |
+| T7d8 run promotion | 3 / 2960 | 4067 | `promote_orchestration_runs` |
+| T7d9 sub-agent factory | **3 / 2978** | **4063** | `subagent_factory.py` |
 
 The FAILED set is byte-identical to
 `docs/superpowers/plans/2026-10-01-baseline-failures.txt` at every stage.  The
@@ -453,11 +454,27 @@ wrong into memory a later turn reads as *fact*:
 
 **What is left of Task 7.**  Two members, and they are one decision:
 
-- `_create_sub_agent` (15 `self.*`) and `_execute_agent` (**288 lines, 16
-  attributes**) — **one decision, not two**: `_execute_agent` is the single
-  primitive every runner calls, and extracting it means agreeing on how a
-  sub-agent is constructed and driven.  That is a design decision, and it is the
-  reason the plan ordered this group last.
+**Only `_execute_agent` remains** (288 lines, 16 attributes) — the single
+primitive every runner calls.  With the factory extracted it no longer needs a
+parent to build a child, so what is left is genuinely the loop's *policy*: step
+ceiling, retry handling, contract validation.  The interface proposal below is
+still the open decision; the extraction above is what makes it a smaller one.
+
+**Extraction 11 — the sub-agent factory.**
+`agent/core/subagent_factory.py` holds `AgentSettings` (the twelve inherited
+configuration values as one frozen contract), `settings_from` and
+`build_sub_agent`.  `_create_sub_agent` became a five-line call.  The fifteen
+attribute reaches are gone: the builder takes data, so `_execute_agent` no longer
+needs a parent to build a child.
+
+Two details are load-bearing and now tested:
+
+- **The transport is inherited, not rebuilt.**  It carries the model → provider
+  routing table, so rebuilding one from `client` would pin the sub-agent to the
+  *active* provider and a per-turn override naming another provider's model would
+  be posted to the wrong endpoint.
+- **The snapshot is frozen.**  A sub-agent runs with the limits the turn had when
+  it was spawned; a later config edit cannot change a running child's ceiling.
 
 ### The one decision left, written down so it can be settled
 

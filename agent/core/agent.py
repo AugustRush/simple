@@ -22,6 +22,11 @@ from agent.core.spawn_planning import (
     SpawnPlanner,
     promote_orchestration_runs,
 )
+from agent.core.subagent_factory import (
+    SubAgentSpec,
+    build_sub_agent,
+    settings_from,
+)
 from agent.core.subagent_context import (
     canonicalize_write_scope,
     compose_sub_system_prompt,
@@ -3520,32 +3525,23 @@ class BaseAgent:
         propagate_sub_metadata(sub_ctx, active_ctx)
 
     def _create_sub_agent(self, sub_registry: "ToolRegistry") -> "BaseAgent":
-        # Inherit the parent's transport rather than building one from
-        # ``self.client``.  The transport carries the model → provider routing
-        # table, and a sub-agent runs on the very model this turn resolved, so
-        # rebuilding it here would pin the sub-agent to the active provider:
-        # a per-turn override naming another provider's model (the composer
-        # dropdown offers every provider's models) would be sent to the active
-        # provider's endpoint and rejected with a 400.
-        sub_agent = BaseAgent(
-            self.client,
-            sub_registry,
-            model=self._effective_model(),
-            max_tokens=self.max_tokens,
-            api_format=self.api_format,
-            supports_vision=self.supports_vision,
-            context_window=self.context_window,
-            output_reserve=self.output_reserve,
-            transport=self._transport,
+        """Build one sub-agent from this agent's configuration.
+
+        See :mod:`agent.core.subagent_factory`.  The transport is inherited
+        deliberately: it carries the model -> provider routing table, and
+        rebuilding it from ``client`` would pin the sub-agent to the active
+        provider, rejecting a per-turn model override from another provider.
+        """
+        return build_sub_agent(
+            SubAgentSpec(
+                client=self.client,
+                transport=self._transport,
+                registry=sub_registry,
+                settings=settings_from(self),
+                context_manager=self._context_manager_for(),
+            ),
+            agent_type=BaseAgent,
         )
-        sub_agent.context_manager = self._context_manager_for()
-        sub_agent.max_parallel_agents = self.max_parallel_agents
-        sub_agent.sub_agent_timeout_seconds = self.sub_agent_timeout_seconds
-        sub_agent.sub_agent_retries = self.sub_agent_retries
-        sub_agent.max_tool_call_iterations = self.max_tool_call_iterations
-        sub_agent.max_truncation_continuations = self.max_truncation_continuations
-        sub_agent.result_content_max_chars = self.result_content_max_chars
-        return sub_agent
 
     async def _call_llm(
         self,
