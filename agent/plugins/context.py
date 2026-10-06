@@ -39,6 +39,13 @@ from typing import Any, Callable, Optional
 #: Distinguishes the absence of a default from a default of None.
 _MISSING = object()
 
+
+def _event_types_for(domain_name: str) -> tuple[type, ...]:
+    """The event types a domain covers, resolved at subscription time."""
+    from agent.core.event_domains import domain
+
+    return domain(domain_name).event_types
+
 __all__ = ["PluginContext", "PluginInstall"]
 
 
@@ -91,6 +98,30 @@ class PluginContext:
         self._install.provided = True
         if name not in self._install.provided_names:
             self._install.provided_names.append(name)
+
+    def on(self, domain: str, handler: Callable[[Any], Any]) -> Callable[[], None]:
+        """Subscribe *handler* to every event type in *domain*.
+
+        A subscription is an effect, so it goes through the same undo path as
+        ``provide`` and ``add_tool``: unloading the plugin removes it.  That is the
+        reason this is a method on the registration surface rather than another
+        hook name -- the catalog would otherwise need a fixed domain-to-method
+        mapping and a fourth convention to document, and a handler left on a bus
+        after its plugin is gone is called for ever.
+
+        *domain* is a name (``"turn"``, ``"llm"``, ``"tool"``) rather than a bus:
+        see :meth:`PluginCatalog.resolve_event_bus` for why.
+        """
+        bus = self._install.catalog.resolve_event_bus(domain)
+        event_types = _event_types_for(domain)
+        undo = [bus.on(event_type, handler) for event_type in event_types]
+
+        def unsubscribe() -> None:
+            for remove in undo:
+                remove()
+
+        self.on_unwind(unsubscribe)
+        return unsubscribe
 
     def resolve(self, name: str, default: Any = _MISSING) -> Any:
         """Resolve a service another plugin provided.

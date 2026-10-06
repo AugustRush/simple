@@ -50,6 +50,7 @@ __all__ = [
     "DOMAINS",
     "domain",
     "domain_names",
+    "bus_for",
     "TurnStarted",
     "TurnFinished",
     "LLMRequestStarted",
@@ -221,6 +222,30 @@ LLM = Domain(
 )
 
 DOMAINS: dict[str, Domain] = {d.name: d for d in (TOOL, TURN, LLM)}
+
+
+def bus_for(domain: Domain) -> EventBus:
+    """The bus *domain* publishes to.
+
+    Kept here, next to the domain table, so a new domain has one place to say
+    where it lives -- and so the answer is checkable rather than a convention a
+    subscriber has to guess.  Imported lazily because ``agent.core.events`` builds
+    its buses at import time and this module is imported from there.
+    """
+    from agent.core import events as buses
+
+    _BY_NAME = {
+        "tool": buses.TOOL_EVENTS,
+        "turn": buses.TURN_EVENTS,
+        "llm": buses.LLM_EVENTS,
+    }
+    try:
+        return _BY_NAME[domain.name]
+    except KeyError:
+        raise KeyError(
+            f"no bus registered for domain {domain.name!r}; known: "
+            f"{', '.join(sorted(_BY_NAME))}"
+        ) from None
 
 
 def domain(name: str) -> Domain:

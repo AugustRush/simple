@@ -1067,6 +1067,18 @@ class PluginCatalog:
         future = self._hook_executor.submit(hook, event)
         future.result(timeout=timeout)
 
+    def resolve_event_bus(self, domain_name: str) -> Any:
+        """The bus a domain publishes to, by name.
+
+        Named rather than passed so a plugin author writes ``ctx.on("turn", ...)``
+        and cannot register on the wrong bus -- a mistake whose only symptom is a
+        listener that is never called, which looks exactly like a plugin that
+        works.
+        """
+        from agent.core.event_domains import bus_for, domain
+
+        return bus_for(domain(domain_name))
+
     def resolve_service(self, name: str, default: Any = _NO_DEFAULT) -> Any:
         """A service some plugin provided, or *default*.
 
