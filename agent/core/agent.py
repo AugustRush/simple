@@ -20,6 +20,7 @@ from agent.config import _compose_system_prompt, _now
 from agent.core.context_assembler import ContextAssembler
 from agent.core.events import TOOL_EVENTS
 from agent.core.token_budget import TokenBudget
+from agent.core.tool_watchdog import ToolLoopOutcome, ToolLoopWatchdog
 from agent.core.llm_errors import (
     is_account_exhausted,
     is_content_filter_block,
@@ -194,27 +195,6 @@ class SubAgentProgressEvent:
 
 
 @dataclass(frozen=True)
-class ToolLoopOutcome:
-    progress_made: bool = False
-    artifact_changed: bool = False
-    needs_user: bool = False
-    retryable: bool = False
-    fatal: bool = False
-    unproductive: bool = True
-    intent_required: bool = False
-
-    def to_dict(self) -> dict[str, bool]:
-        return {
-            "progress_made": self.progress_made,
-            "artifact_changed": self.artifact_changed,
-            "needs_user": self.needs_user,
-            "retryable": self.retryable,
-            "fatal": self.fatal,
-            "unproductive": self.unproductive,
-            "intent_required": self.intent_required,
-        }
-
-
 class _TaskLocalContextStack:
     """Deprecated: kept only as a no-op shim for any third-party caller.
 
@@ -351,6 +331,13 @@ class BaseAgent:
         # `max_tokens` on purpose: the cap says how long one response may be,
         # the reserve says how much of the window the input may not take.  See
         # `_input_token_budget`.
+        # The tool-loop stuck-detection state machine (agent/core/tool_watchdog.py).
+        # One per agent: the thresholds are configuration; the per-turn counters
+        # live in the state dict the turn loop owns.
+        self._tool_watchdog = ToolLoopWatchdog(
+            repeat_threshold=self._TOOL_LOOP_REPEAT_THRESHOLD,
+            unproductive_threshold=self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD,
+        )
         self.output_reserve = output_reserve
         self.context_window = (
             context_window
@@ -2227,351 +2214,6 @@ class BaseAgent:
                 return summary
         return ""
 
-    @staticmethod
-    def _stable_tool_loop_key(value: Any) -> str:
-        try:
-            raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        except Exception:
-            raw = repr(value)
-        if len(raw) <= 600:
-            return raw
-        return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()
-
-    @classmethod
-    def _tool_use_signature(cls, tool_uses: list[dict]) -> str:
-        return cls._stable_tool_loop_key(
-            [
-                {
-                    "name": str(tool_use.get("name", "")),
-                    "input": tool_use.get("input", {}),
-                }
-                for tool_use in tool_uses
-            ]
-        )
-
-    # Fields whose values are typically large or vary across otherwise-identical
-    # calls (file content, search hits, raw bodies, base64 blobs, random ids,
-    # timestamps).  Including any of these in a tool-loop signature would
-    # either bloat it or — for varying values — make every call's signature
-    # unique and blind stuck-detection to genuine loops.
-    _SIGNATURE_NOISY_KEYS = frozenset({
-        # Bulky payloads
-        "content", "text", "body", "data", "bytes", "raw", "raw_bytes",
-        "preview", "summary_text", "full_content", "result_preview",
-        # Free-running identifiers / timestamps the agent does not control
-        "timestamp", "elapsed", "elapsed_ms", "elapsed_seconds",
-        "duration_ms", "duration_seconds",
-    })
-    # Suffixes that mark a field as a varying identifier or timestamp
-    # (e.g. ``task_id``, ``next_run_at``, ``started_at``, ``created_time``).
-    _SIGNATURE_NOISY_SUFFIXES = ("_id", "_at", "_time", "_ms", "_ns", "_us",
-                                 "_timestamp", "_uuid")
-    _SIGNATURE_VALUE_LIMIT = 200
-
-    @classmethod
-    def _signature_keep(cls, key: str) -> bool:
-        if key in cls._SIGNATURE_NOISY_KEYS:
-            return False
-        return not any(key.endswith(suffix) for suffix in cls._SIGNATURE_NOISY_SUFFIXES)
-
-    @classmethod
-    def _signature_value(cls, value: Any) -> Any:
-        """Shrink large values so they don't dominate a tool-loop signature."""
-        if isinstance(value, str) and len(value) > cls._SIGNATURE_VALUE_LIMIT:
-            return {"truncated": True, "len": len(value)}
-        if isinstance(value, (list, tuple)) and len(value) > 16:
-            return {"truncated": True, "count": len(value)}
-        return value
-
-    @classmethod
-    def _normalized_tool_result(cls, raw_result: str) -> Any:
-        """Strip noisy fields and cap large values so equal results compare equal.
-
-        Deny-list rather than allow-list: any structured field a tool adds
-        in the future is automatically included in dedup signatures unless
-        it matches a known noisy key or noisy-suffix pattern.
-        """
-        text = str(raw_result or "").strip()
-        if not text:
-            return {"empty": True}
-        try:
-            payload = json.loads(text)
-        except Exception:
-            return text[:600]
-        if not isinstance(payload, dict):
-            return payload
-        return {
-            key: cls._signature_value(value)
-            for key, value in payload.items()
-            if cls._signature_keep(key)
-        } or payload
-
-    @classmethod
-    def _tool_result_signature(cls, results: list[str]) -> str:
-        return cls._stable_tool_loop_key(
-            [cls._normalized_tool_result(result) for result in results]
-        )
-
-    @staticmethod
-    def _tool_result_looks_unproductive(raw_result: str) -> bool:
-        return BaseAgent._classify_tool_result(raw_result).unproductive
-
-    @staticmethod
-    def _classify_tool_result(raw_result: str) -> ToolLoopOutcome:
-        text = str(raw_result or "").strip()
-        if not text:
-            return ToolLoopOutcome(unproductive=True)
-        try:
-            payload = json.loads(text)
-        except Exception:
-            lower = text.lower()
-            unproductive = any(
-                marker in lower
-                for marker in (
-                    "timed out",
-                    "timeout",
-                    "not found",
-                    "permission denied",
-                    "requires confirmation",
-                    "blocked",
-                    "error",
-                )
-            )
-            retryable = "timeout" in lower or "timed out" in lower
-            return ToolLoopOutcome(
-                progress_made=not unproductive,
-                retryable=retryable,
-                fatal=unproductive and not retryable,
-                unproductive=unproductive,
-            )
-        if not isinstance(payload, dict):
-            return ToolLoopOutcome(progress_made=True, unproductive=False)
-        recoverable = payload.get("recoverable_by_agent") is True or bool(
-            payload.get("recovery_hint")
-        )
-        intent_required = payload.get("intent_required") is True or (
-            "intent" in str(payload.get("error", "")).lower()
-        )
-        needs_user = (
-            payload.get("requires_confirmation") is True
-            or intent_required
-        )
-        artifact_changed = any(
-            payload.get(key) not in (None, "", [], {})
-            for key in (
-                "artifact",
-                "artifacts",
-                "file",
-                "files",
-                "path",
-                "paths",
-                "written_files",
-                "created",
-                "updated",
-            )
-        )
-        if recoverable:
-            return ToolLoopOutcome(
-                progress_made=True,
-                artifact_changed=artifact_changed,
-                retryable=True,
-                unproductive=False,
-                intent_required=intent_required,
-            )
-        blocked = payload.get("blocked") is True
-        failed = payload.get("ok") is False or (
-            bool(payload.get("error")) and payload.get("ok") is not True
-        )
-        if needs_user or blocked or failed:
-            return ToolLoopOutcome(
-                artifact_changed=artifact_changed,
-                needs_user=needs_user,
-                fatal=not recoverable,
-                unproductive=True,
-                intent_required=intent_required,
-            )
-        meaningful_values = [
-            value for value in payload.values() if value not in (None, "", [], {})
-        ]
-        progress_made = bool(meaningful_values)
-        return ToolLoopOutcome(
-            progress_made=progress_made,
-            artifact_changed=artifact_changed,
-            unproductive=not progress_made,
-            intent_required=intent_required,
-        )
-
-    @classmethod
-    def _classify_tool_results(cls, results: list[str]) -> ToolLoopOutcome:
-        if not results:
-            return ToolLoopOutcome(unproductive=True)
-        outcomes = [cls._classify_tool_result(result) for result in results]
-        unproductive = all(outcome.unproductive for outcome in outcomes)
-        return ToolLoopOutcome(
-            progress_made=any(outcome.progress_made for outcome in outcomes),
-            artifact_changed=any(outcome.artifact_changed for outcome in outcomes),
-            needs_user=any(outcome.needs_user for outcome in outcomes),
-            retryable=any(outcome.retryable for outcome in outcomes),
-            fatal=all(outcome.fatal for outcome in outcomes if outcome.unproductive)
-            if unproductive
-            else any(outcome.fatal for outcome in outcomes),
-            unproductive=unproductive,
-            intent_required=all(outcome.intent_required for outcome in outcomes),
-        )
-
-    _looks_like_chinese = staticmethod(shared._looks_like_chinese)
-
-    @classmethod
-    def _tool_result_preview(cls, results: list[str], limit: int = 220) -> str:
-        previews: list[str] = []
-        for raw_result in results[:3]:
-            normalized = cls._normalized_tool_result(raw_result)
-            if isinstance(normalized, dict):
-                for key in (
-                    "recovery_hint",
-                    "error",
-                    "reason",
-                    "message",
-                    "status",
-                    "stderr",
-                    "stdout",
-                ):
-                    value = normalized.get(key)
-                    if value:
-                        previews.append(_preview_text(value, limit=limit))
-                        break
-                else:
-                    previews.append(_preview_text(normalized, limit=limit))
-            else:
-                previews.append(_preview_text(normalized, limit=limit))
-        return " | ".join(previews)[:limit]
-
-    @classmethod
-    def _build_tool_loop_stuck_response(
-        cls,
-        *,
-        user_message: str,
-        reason: str,
-        tool_uses: list[dict],
-        results: list[str],
-    ) -> str:
-        tool_names = ", ".join(str(tool_use.get("name", "")) for tool_use in tool_uses)
-        result_preview = cls._tool_result_preview(results)
-        if cls._looks_like_chinese(user_message):
-            if reason == "intent_required":
-                return "\n".join(
-                    [
-                        (
-                            "我先停一下：这次卡住的不是路径、权限或下载问题，"
-                            "而是内部工具安全规则没有被满足。"
-                        ),
-                        "",
-                        (
-                            f"当前观察：模型连续尝试调用 `{tool_names or 'unknown'}`，"
-                            "但这次调用没有满足该工具要求的 `intent`，所以被安全拦截。"
-                            "不同工具要求的不是同一件事：shell 要说明命令做什么、"
-                            "为什么必须运行；会留下长期产物的工具要逐字引用用户提出"
-                            "这个需求的原话——说明「为什么这样做有用」不算。"
-                        ),
-                        "",
-                        "合理的下一步是重新规划这一步：按要求补齐 `intent`；如果用户"
-                        "其实并没有提出过这个需求，就应该把它作为建议说出来问他，"
-                        "而不是继续空转。",
-                    ]
-                )
-            reason_text = {
-                "same_pair": "同一个工具请求连续产生相同结果",
-                "same_result": "工具结果重复且没有新信息",
-                "unproductive_rounds": "连续多轮工具调用失败或没有有效输出",
-                "same_batch_unproductive": "同一批工具持续返回无效结果",
-            }.get(reason, reason)
-            lines = [
-                (
-                    "我先停一下：我检测到本轮已经连续多次调用工具，"
-                    "但结果没有继续推进；继续自动尝试大概率只会耗到系统上限。"
-                ),
-                "",
-                (
-                    f"当前观察：最近一轮工具是 `{tool_names or 'unknown'}`；"
-                    f"触发原因是 {reason_text}。"
-                ),
-            ]
-            if result_preview:
-                lines.append(f"最近结果：{result_preview}")
-            lines.extend(
-                [
-                    "",
-                    "你可以直接回复选择下一步：",
-                    "1. 提供新的路径、权限、凭据或搜索方向后继续",
-                    "2. 让我基于已有结果先总结",
-                    "3. 告诉我该在几个可选方案里选哪个",
-                    "4. 停止这个任务",
-                ]
-            )
-            return "\n".join(lines)
-
-        if reason == "intent_required":
-            return "\n".join(
-                [
-                    (
-                        "I am pausing because the loop is blocked by the internal "
-                        "tool safety protocol, not by a missing path, permission, "
-                        "or credential."
-                    ),
-                    "",
-                    (
-                        f"Current signal: the model repeatedly tried to call "
-                        f"`{tool_names or 'unknown'}` without satisfying the `intent` "
-                        "that tool requires, so the calls were blocked. The tools do not "
-                        "all ask for the same thing: `shell` wants to be told what the "
-                        "command does and why it must run, while a tool whose result "
-                        "outlives the turn wants the user's own words quoted verbatim -- "
-                        "explaining why the action would be useful is not a substitute."
-                    ),
-                    "",
-                    (
-                        "The right next step is to re-plan this action: supply the "
-                        "`intent` it asks for, or -- if the user never actually asked for "
-                        "this -- propose it to them instead of retrying."
-                    ),
-                ]
-            )
-        reason_text = {
-            "same_pair": "the same tool request produced the same result repeatedly",
-            "same_result": "the tool results repeated without new information",
-            "unproductive_rounds": (
-                "several consecutive tool rounds failed or returned no useful output"
-            ),
-            "same_batch_unproductive": (
-                "the same tool batch kept returning unproductive results"
-            ),
-        }.get(reason, reason)
-        lines = [
-            (
-                "I am pausing here because the tool loop is no longer making "
-                "clear progress; continuing automatically would likely just "
-                "hit the hard iteration limit."
-            ),
-            "",
-            (
-                f"Current signal: latest tool batch was `{tool_names or 'unknown'}`; "
-                f"trigger was {reason_text}."
-            ),
-        ]
-        if result_preview:
-            lines.append(f"Latest result: {result_preview}")
-        lines.extend(
-            [
-                "",
-                "Please choose the next step:",
-                "1. Continue with a new path, permission, credential, or search direction",
-                "2. Summarize what we have so far",
-                "3. Tell me which option to pick",
-                "4. Stop this task",
-            ]
-        )
-        return "\n".join(lines)
-
     async def _run_tool_uses(
         self,
         tool_uses: list[dict],
@@ -2764,6 +2406,75 @@ class BaseAgent:
         if unproductive and state["batch_counts"][batch_sig] >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD:
             return "same_batch_unproductive"
         return ""
+
+    # ── Tool-loop stuck detection ────────────────────────────────────────
+
+    @staticmethod
+    # ── Tool-loop stuck detection ────────────────────────────────────────
+    #
+    # The detection state machine lives in agent/core/tool_watchdog.py.  These
+    # are the names the turn loop and the tests already use.
+
+    @staticmethod
+    def _new_watchdog_state() -> dict[str, Any]:
+        """See :meth:`agent.core.tool_watchdog.ToolLoopWatchdog.new_state`."""
+        return ToolLoopWatchdog.new_state()
+
+    def _check_tool_loop_stuck(
+        self,
+        state: dict[str, Any],
+        tool_uses: list[dict],
+        results: list[str],
+    ) -> str:
+        """See :meth:`agent.core.tool_watchdog.ToolLoopWatchdog.check`."""
+        return self._tool_watchdog.check(state, tool_uses, results)
+
+    @staticmethod
+    def _stable_tool_loop_key(value: Any) -> str:
+        return ToolLoopWatchdog.stable_key(value)
+
+    @staticmethod
+    def _tool_use_signature(tool_uses: list[dict]) -> str:
+        return ToolLoopWatchdog.tool_use_signature(tool_uses)
+
+    @staticmethod
+    def _tool_result_signature(results: list[str]) -> str:
+        return ToolLoopWatchdog.tool_result_signature(results)
+
+    @staticmethod
+    def _tool_result_looks_unproductive(raw_result: str) -> bool:
+        """Kept because tests and callers use it; a one-line reading of
+        :meth:`_classify_tool_result`."""
+        return ToolLoopWatchdog.classify_tool_result(raw_result).unproductive
+
+    @staticmethod
+    def _classify_tool_result(raw_result: str) -> ToolLoopOutcome:
+        return ToolLoopWatchdog.classify_tool_result(raw_result)
+
+    @staticmethod
+    def _classify_tool_results(results: list[str]) -> ToolLoopOutcome:
+        return ToolLoopWatchdog.classify_tool_results(results)
+
+    @staticmethod
+    def _tool_result_preview(results: list[str], limit: int = 220) -> str:
+        return ToolLoopWatchdog.result_preview(results, limit)
+
+    @classmethod
+    def _build_tool_loop_stuck_response(
+        cls,
+        *,
+        user_message: str,
+        reason: str,
+        tool_uses: list[dict],
+        results: list[str],
+    ) -> str:
+        """See :meth:`agent.core.tool_watchdog.ToolLoopWatchdog.build_stuck_response`."""
+        return ToolLoopWatchdog.build_stuck_response(
+            user_message=user_message,
+            reason=reason,
+            tool_uses=tool_uses,
+            results=results,
+        )
 
     def _inject_pending_interjections(
         self, ctx: "AgentContext", pending: list[dict]

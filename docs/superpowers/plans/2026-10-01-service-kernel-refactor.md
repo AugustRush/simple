@@ -31,13 +31,13 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 done; Task 7 in progress (2 of 4 extractions).** Tasks 8-10 not started.
+**Tasks 0-6 done; Task 7 in progress (3 of 4 extractions).** Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b |
+| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | **3 f / 2818 p** |
-| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | **4554** |
+| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | 3 f / 2818 p | **3 f / 2843 p** |
+| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | 4554 | **4265** |
 | FAILED set | baseline | identical | identical | identical | identical | identical | identical | identical |
 | Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same | +1 recorded |
 | Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 | 1 |
@@ -306,6 +306,37 @@ tests failed, not because they were anticipated.
 
 `_OUTPUT_CAP_MARGIN` moved with the code; the copy left in `agent.py` was
 deleted rather than left as a second definition of the same number.
+
+**Extraction 3 — tool-loop stuck detection.**
+`agent/core/tool_watchdog.py` holds `ToolLoopWatchdog` and `ToolLoopOutcome`
+(re-exported from `agent.core.agent`). Thirteen methods and three constants
+became one object with two thresholds. `agent/core/agent.py` is now **4265**
+lines — 4703 → 438 overall, a 9% reduction.
+
+**A real reachability defect was found while writing the tests.**
+`same_batch_unproductive` cannot fire at the default settings.  Both counters
+advance on the same unproductive rounds, but `unproductive_rounds` also counts
+rounds belonging to *other* batch signatures, so it is never behind; with one
+shared threshold the run-length rule always reports first.  The thresholds are
+now separable (`batch_threshold`, defaulting to the old shared value so
+behaviour is unchanged), the caveat is documented at the rule, and a test pins
+the default unreachability so the docstring stays true.
+
+**Three test expectations I wrote were wrong, and the code was right.**  Each is
+now documented at the assertion rather than silently "fixed":
+`fatal` is `all(...)` only when the batch is *unproductive* and `any(...)`
+otherwise (a mixed batch is fatal); the stop message renders the rule as prose
+rather than quoting the internal key at the user; and the occurrence rule needs
+its own threshold to be reached at all.
+
+**One self-inflicted error, and what caught it.**  A scripted block replacement
+deleted `_run_tool_uses` (the tool loop body) along with the methods it was
+meant to remove.  The integration tests hung — the loop with no watchdog — which
+is how it surfaced.  It was restored from `HEAD` and the whole suite re-run.
+The lesson recorded here: `git diff --stat` alone did not reveal it, because the
+deletion *looked* like the intended one; only the method-inventory diff
+(`git show HEAD:… | grep -c '^    def '`) showed a method missing that had not
+been moved.
 
 **Still to extract, in order:** token budget (`_input_token_budget`,
 `_estimate_input_tokens`, `_payload_overhead`, `_output_room`,
