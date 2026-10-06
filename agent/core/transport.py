@@ -1061,45 +1061,24 @@ class OpenAITransport(ModelTransport):
 # ─────────────────────────────────────────────────────────────────────────────
 # Factory
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# Dispatch moved to ``agent.core.providers``, where a wire format registers
+# instead of being branched on.  It stays importable from here because this is
+# where callers and tests have always reached for it, and moving a name is not
+# a reason to break them.
+#
+# The lookup is deferred rather than imported at module scope: ``providers``
+# imports the transport classes from this module, so a top-level import back
+# would be a cycle.  ``__getattr__`` is only consulted for names this module
+# does not define, which is exactly the compatibility case.
 
 
-def build_transport(
-    api_format: str,
-    client: Any,
-    thinking_effort: Any = None,
-    stream_usage: Any = True,
-    headers: Optional[dict[str, str]] = None,
-    provider_name: str = "",
-) -> ModelTransport:
-    """Single dispatch point — adding a provider here is the only place to edit.
+def __getattr__(name: str) -> Any:
+    if name == "build_transport":
+        from agent.core.providers import build_transport
 
-    ``thinking_effort`` is the provider's configured effort (see
-    ``shared.THINKING_EFFORTS``); omitted means "no opinion", which is what
-    keeps an unconfigured provider's requests byte-for-byte what they were.
-
-    ``stream_usage`` reaches only the OpenAI transport.  Anthropic's SDK reports
-    usage on the finished streamed message with no parameter to ask for it, so
-    there is nothing there to configure and passing the value on would be
-    carrying a name that is never read.
-
-    ``headers`` is the provider's configured extra request headers as written
-    (:func:`shared.provider_headers`); they are resolved per request, so a
-    value may still hold ``$NAME`` or ``{session}``.  They reach both formats:
-    the need is a property of the gateway, not of the wire format it speaks.
-    """
-    if api_format == "anthropic":
-        return AnthropicTransport(
-            client, thinking_effort, headers=headers, provider_name=provider_name
-        )
-    if api_format == "openai":
-        return OpenAITransport(
-            client,
-            thinking_effort,
-            stream_usage,
-            headers=headers,
-            provider_name=provider_name,
-        )
-    raise ValueError(f"unsupported api_format: {api_format!r}")
+        return build_transport
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class RoutingTransport(ModelTransport):
@@ -1545,7 +1524,11 @@ def build_routing_transport(
             active_cfg, default_format, client_factory, client_cache
         )
 
-    default_transport = build_transport(
+    # Resolved inside the function: the module-level name is a compatibility
+    # re-export, and a module-scope reference would not see it (see __getattr__).
+    from agent.core.providers import build_transport as _build_transport
+
+    default_transport = _build_transport(
         default_format,
         default_client,
         provider_thinking_effort(active_cfg) if active_cfg else None,
@@ -1580,7 +1563,7 @@ def build_routing_transport(
         else:
             transport = transports.get(name)
             if transport is None:
-                transport = build_transport(
+                transport = _build_transport(
                     api_format,
                     _client_for(provider_cfg, api_format),
                     provider_thinking_effort(provider_cfg),

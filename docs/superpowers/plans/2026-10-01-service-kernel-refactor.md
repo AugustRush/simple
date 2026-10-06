@@ -31,15 +31,15 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0 and 1 implemented 2026-10-01.** Tasks 2-10 not started.
+**Tasks 0, 1 and 2 implemented 2026-10-01.** Tasks 3-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | After Task 0 | After Task 1 |
-| --- | --- | --- | --- |
-| Full suite | 19 failed / 2641 passed | 19 failed / 2649 passed | **3 failed / 2687 passed** / 1 skipped |
-| FAILED set | see baseline file | byte-identical | byte-identical (see note) |
-| Module-level mutable state | undocumented | **49 entries**, guard-tested | unchanged |
-| Replaceable services | 1 hand-rolled (`exec/`) | 1 | **general mechanism + scoped, reversible replacement** |
+| | Baseline | After Task 0 | After Task 1 | After Task 2 |
+| --- | --- | --- | --- | --- |
+| Full suite | 19 failed / 2641 passed | 19 failed / 2649 passed | 3 failed / 2687 passed | **3 failed / 2705 passed** / 1 skipped |
+| FAILED set | see baseline file | byte-identical | byte-identical | byte-identical |
+| Module-level mutable state | undocumented | 49 entries, guard-tested | unchanged | +1 recorded (provider registry) |
+| Replaceable services | 1 hand-rolled (`exec/`) | 1 | general mechanism, scoped | **+1: wire formats register** |
 
 Command for every column: `.venv/bin/python -m pytest -q -p no:cacheprovider`.
 
@@ -54,9 +54,13 @@ probes, unchanged throughout.
 
 Test growth is accounted for exactly: Task 0 added 8
 (`tests/test_state_inventory.py`), Task 1 added 22
-(`tests/test_service_registry.py`). The four files Task 1 names
+(`tests/test_service_registry.py`), Task 2 added 18
+(`tests/test_provider_registry.py`). The four files Task 1 names
 (`test_service_registry`, `test_user_tools`, `test_subprocess_provider`,
-`test_user_tool_isolation`) run 77 passed with no failures.
+`test_user_tool_isolation`) run 77 passed; the six files Task 2 names
+(`test_provider_registry`, `test_provider_settings`, `test_model_routing`,
+`test_provider_headers`, `test_subprocess_provider`, `test_thinking_effort`,
+`test_usage_telemetry`) run 263 passed, all with no failures.
 
 > Note: `2026-09-22-scheduler-concurrency.md` records the suite at "16 failed"
 > under the older sandbox policy. That count is comparable to neither column
@@ -79,6 +83,36 @@ The property that motivated the task, asserted in
 `test_a_scoped_provider_replacement_reverts_on_unload`: a scope replaces the
 execution provider, every resolver sees the replacement, and on unload the
 original is back — with no call site told either time.
+
+### What Task 2 actually produced
+
+`agent/core/providers.py` (the registry) and one client-construction path:
+
+- `ProviderRegistry` — a wire format maps to a client factory and a transport
+  factory; refuses to shadow an existing format unless asked.
+- `UnknownApiFormatError` names the format asked for *and* every format that is
+  registered, because guessing between those two questions is the slow path.
+- The two built-in formats register through the same call an extension uses,
+  which is what keeps the extension path honest.
+- `resolve_api_key` is now written once. It had been written three times.
+
+**A real defect removed, not just tidied:** client construction lived in three
+places (`ModelClientFactory.from_config`, `bootstrap._provider_client_factory`,
+and the web channel's connection test) and they had drifted — the bootstrap copy
+silently produced an OpenAI client for an unrecognised format where the factory
+raised. Both now go through the registry, so an unknown format fails loudly
+whichever path reaches it. `tests/test_provider_registry.py` pins that.
+
+**Compatibility:** `build_transport` remains importable from
+`agent.core.transport` via a module-level `__getattr__`, because that is where
+callers and tests have always reached for it. The deferred lookup is not
+cosmetic — `providers` imports the transport classes, so a module-scope import
+back would be a cycle.
+
+**Ledger interaction:** the registry is a process-level singleton built by a
+constructor call, so the Task 0 scanner cannot see it. It was added to the
+ledger's non-scannable notes and assigned to Task 9, which is the mechanism
+working as designed rather than an exception to it.
 
 ### What Task 0 actually found
 
@@ -334,14 +368,14 @@ id, a client factory, and a transport factory, and leave the ABC shape alone.
 - Modify: `agent/bootstrap.py:717-732`
 - Test: `tests/test_provider_registry.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 A provider registered under a new `api_format` is selectable by
 `active_provider` without editing `build_transport`; a transport registered by
 an extension replaces the built-in for that format; an unknown format still
 raises, now naming the registered formats.
 
-- [ ] **Step 2: Implement registration**
+- [x] **Step 2: Implement registration**
 
 ```python
 def register_provider(
@@ -355,7 +389,7 @@ def register_provider(
 Built-ins (`anthropic`, `openai`) register through the same call, so the
 hardcoded branches are deleted rather than kept beside the table.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 ```bash
 .venv/bin/python -m pytest tests/test_provider_registry.py tests/test_provider_settings.py tests/test_model_routing.py tests/test_provider_headers.py tests/test_subprocess_provider.py -q

@@ -55,6 +55,16 @@ them would make the guard test assert something it never verified:
 - **``ContextVar`` declared inside a function.** ``runtime_event_buffer``
   (``agent/channels/base.py:562``) is created per channel runner, so it is
   function-local by construction rather than module state.
+- **A process-level singleton built by a constructor call.**
+  ``agent/core/providers.py:SHARED`` is the provider registry: the wire formats
+  the process knows, populated by two ``register`` calls at import.  It is
+  module-level mutable state by any useful definition -- Task 2 added it -- but
+  its shape is a ``ProviderRegistry()`` call rather than a scanned one.  It is
+  process-wide *on purpose*, for the same reason ``_DEFAULT_PROVIDER`` in
+  ``agent/exec/subprocess.py`` is: a wire format belongs to the process, not to
+  a session.  Recorded here, and assigned to Task 9, so the process-layout work
+  has the complete list to reason about rather than the list the scanner could
+  reach.
 
 Scope vocabulary
 ----------------

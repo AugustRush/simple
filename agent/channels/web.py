@@ -1571,8 +1571,8 @@ class WebChannel(Channel):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         name = str(request.path_params.get("provider_name") or "").strip()
         from agent.config import load_config
-        from agent.bootstrap import _provider_client_factory
-        from agent.core.transport import build_transport, provider_stream_usage
+        from agent.core.providers import build_client, build_transport
+        from agent.core.transport import provider_stream_usage
         from agent.shared import provider_headers
 
         cfg, _ = load_config()
@@ -1589,7 +1589,7 @@ class WebChannel(Channel):
 
         started = time.perf_counter()
         try:
-            client = _provider_client_factory(provider_cfg, api_format)
+            client = build_client(provider_cfg, api_format)
             transport = build_transport(
                 api_format,
                 client,

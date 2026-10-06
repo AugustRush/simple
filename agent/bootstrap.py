@@ -103,25 +103,16 @@ def _project_memory_scope(workspace_root: Path) -> str:
 
 
 def _provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
-    """One SDK client for a non-active provider (used by RoutingTransport)."""
-    import anthropic
+    """One client for a non-active provider (used by RoutingTransport).
 
-    raw_key = str(provider_cfg.get("api_key", "") or "")
-    if raw_key.startswith("$"):
-        raw_key = os.environ.get(raw_key[1:], "")
-    if api_format == "anthropic":
-        kwargs: dict[str, Any] = {"api_key": raw_key}
-        base_url = provider_cfg.get("base_url")
-        if base_url:
-            kwargs["base_url"] = base_url
-        return anthropic.AsyncAnthropic(**kwargs)
-    import openai as openai_lib
+    Delegates to the provider registry, which is now the single place a client
+    is constructed.  This function previously carried its own copy, and the
+    copy had drifted: an unrecognised format silently became an OpenAI client
+    here while ``ModelClientFactory.from_config`` raised for the same input.
+    """
+    from agent.core.providers import build_client
 
-    kwargs = {"api_key": raw_key}
-    base_url = provider_cfg.get("base_url")
-    if base_url:
-        kwargs["base_url"] = base_url
-    return openai_lib.AsyncOpenAI(**kwargs)
+    return build_client(provider_cfg, api_format)
 
 
 def _web_session_home(session_id: str) -> Path:

@@ -10,7 +10,6 @@ import os
 import re
 from typing import TYPE_CHECKING, Any, Optional
 
-import anthropic
 from rich.panel import Panel
 from rich.prompt import Prompt
 
@@ -381,9 +380,9 @@ class ModelClientFactory:
         """
         Returns (client, active_model, max_tokens).
 
-        client is either:
-          - anthropic.AsyncAnthropic        (api_format == "anthropic")
-          - openai.AsyncOpenAI              (api_format == "openai")
+        ``client`` is whatever the registry's client factory builds for the
+        provider's ``api_format`` -- an SDK client for the two shipped formats,
+        and anything an extension registered for a format of its own.
         """
         providers = cfg.get("providers", {})
         active_name = cfg.get("active_provider", "anthropic")
@@ -399,45 +398,21 @@ class ModelClientFactory:
             )
 
         api_format = provider_cfg.get("api_format", "openai")
-        raw_key = provider_cfg.get("api_key", "")
-        base_url = provider_cfg.get("base_url", None)
         model, max_tokens = ModelClientFactory.active_model_and_tokens(cfg)
 
-        # Resolve api key:
-        #   "$ENV_VAR" → read from environment (optional fallback)
-        #   anything else → use as literal value (including empty string for no-auth)
-        if raw_key.startswith("$"):
-            env_name = raw_key[1:]
-            api_key = os.environ.get(env_name, "")
-            if not api_key:
-                raise RuntimeError(
-                    f"API key env var '{env_name}' not set "
-                    f"(provider: {active_name}). "
-                    f"Run: export {env_name}=..."
-                )
-        else:
-            api_key = raw_key
+        # One client construction, in the provider registry.  This used to be
+        # a branch here plus a second copy in bootstrap plus a third in the web
+        # channel's connection test, and the copies had already drifted: the
+        # bootstrap one fell through to OpenAI for an unknown format where this
+        # one raised.
+        from agent.core.providers import build_client
 
-        if api_format == "anthropic":
-            kwargs: dict = {"api_key": api_key}
-            if base_url:
-                kwargs["base_url"] = base_url
-            client = anthropic.AsyncAnthropic(**kwargs)
-        elif api_format == "openai":
-            try:
-                import openai as openai_lib
-            except ImportError:
-                raise RuntimeError(
-                    "openai package not installed. Run: pip install openai"
-                )
-            kwargs = {"api_key": api_key}
-            if base_url:
-                kwargs["base_url"] = base_url
-            client = openai_lib.AsyncOpenAI(**kwargs)
-        else:
+        try:
+            client = build_client({**provider_cfg, "name": active_name}, api_format)
+        except ValueError as exc:
             raise RuntimeError(
                 f"Unknown api_format '{api_format}' for provider '{active_name}'"
-            )
+            ) from exc
 
         if announce:
             shared.CONSOLE.print(
