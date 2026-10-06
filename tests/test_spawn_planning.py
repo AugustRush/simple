@@ -267,6 +267,38 @@ def test_extra_fields_are_merged_last() -> None:
     assert payload["ok"] == "override"
 
 
+def test_tool_calls_are_capped_at_a_hundred() -> None:
+    """A runaway sub-agent must not hand the parent an unbounded list."""
+    result = SubtaskResult(
+        id="s", ok=True, content="c", tool_calls_made=[f"t{i}" for i in range(250)]
+    )
+    payload = json.loads(_planner().spawn_result_payload(_spec(), result))
+    assert len(payload["tool_calls_made"]) == 100
+
+
+def test_content_is_bounded_by_the_configured_limit() -> None:
+    result = SubtaskResult(id="s", ok=True, content="x" * 10_000, tool_calls_made=[])
+    payload = json.loads(_planner().spawn_result_payload(_spec(), result))
+    assert len(payload["content"]) <= 4000
+
+
+def test_an_artifact_reference_is_carried_through() -> None:
+    result = SubtaskResult(
+        id="s", ok=True, content="c", tool_calls_made=[], artifact_ref="out/x.md"
+    )
+    payload = json.loads(_planner().spawn_result_payload(_spec(), result))
+    assert payload["artifact_ref"] == "out/x.md"
+
+
+def test_an_absent_artifact_reference_is_omitted() -> None:
+    payload = json.loads(
+        _planner().spawn_result_payload(
+            _spec(), SubtaskResult(id="s", ok=True, content="c", tool_calls_made=[])
+        )
+    )
+    assert "artifact_ref" not in payload
+
+
 # ── Coordination mode ────────────────────────────────────────────────────────
 
 
