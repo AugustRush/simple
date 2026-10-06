@@ -67,6 +67,7 @@ from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
 from agent.core.llm_attempt import obtain_response
 from agent.core.tool_batch import run_tool_batch
+from agent.core.tool_loop_decision import handle_stuck_loop
 from agent.core.stream_tracking import (
     StreamEmissionTracker as _StreamEmissionTracker,
 )
@@ -2901,36 +2902,20 @@ class BaseAgent:
                                     ),
                                 )
 
-                        stuck_reason = self._check_tool_loop_stuck(
-                            watchdog, tool_uses, results,
+                        _stuck = handle_stuck_loop(
+                            agent=self,
+                            ctx=ctx,
+                            watchdog=watchdog,
+                            tool_uses=tool_uses,
+                            results=results,
+                            user_message=user_message,
+                            tool_calls_made=tool_calls_made,
+                            step_index=_step_index,
+                            interaction_log=_interaction_log,
                         )
-                        if stuck_reason:
-                            result_text = self._build_tool_loop_stuck_response(
-                                user_message=user_message,
-                                reason=stuck_reason,
-                                tool_uses=tool_uses,
-                                results=results,
-                            )
-                            ctx.messages.append(
-                                {"role": "assistant", "content": result_text}
-                            )
+                        if _stuck.stuck:
                             trace_status = "tool_loop_stuck"
-                            _interaction_log(
-                                "tool_loop_watchdog_stopped",
-                                agent_id=ctx.agent_id,
-                                step=_step_index + 1,
-                                reason=stuck_reason,
-                                tool_uses=len(tool_uses),
-                                tool_names=",".join(
-                                    tu["name"] for tu in tool_uses[:5]
-                                ),
-                                tool_outcome=watchdog.get("last_outcome", {}),
-                            )
-                            return AgentResult(
-                                agent_id=ctx.agent_id,
-                                content=result_text,
-                                tool_calls_made=tool_calls_made,
-                            )
+                            return _stuck.final_result
                         _step_index += 1
                         continue
                     else:
