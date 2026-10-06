@@ -221,7 +221,9 @@
     "_readme": "Per-plugin enable/disable. Use the plugin name as key. Set enabled=false to disable a plugin without removing it.",
     "_example_disabled": {
       "enabled": false
-    }
+    },
+    "_profile": "default",
+    "_profile_readme": "Named plugin composition. 'default' loads every plugin not disabled below. Declared in agent/plugins/profiles.py; an unknown name fails startup rather than silently loading the default."
   },
   "skills": {
     "_readme": "Per-skill enable/disable. Use the skill id as key (the directory name, e.g. 'skill-manager'). Set enabled=false to switch a skill off without deleting it; it then leaves the prompt's skill list, its slash command and activate_skill. Absent means enabled.",

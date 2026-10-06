@@ -9,6 +9,8 @@ was asked for is a configuration bug, not a safer default.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from agent.plugins.profiles import (
@@ -230,5 +232,102 @@ def test_the_catalog_still_honours_a_disabled_plugin(tmp_path) -> None:
     )
     try:
         assert catalog.discover_and_load() == []
+    finally:
+        catalog.close()
+
+
+# ── Selecting a profile ──────────────────────────────────────────────────────
+
+
+def test_the_profile_is_named_by_a_reserved_key() -> None:
+    from agent.plugins.profile_selection import PROFILE_KEY, profile_name_from_config
+
+    assert PROFILE_KEY.startswith("_"), "reserved, so it is not read as a plugin"
+    assert profile_name_from_config({PROFILE_KEY: DEFAULT_PROFILE_NAME}) == DEFAULT_PROFILE_NAME
+
+
+def test_no_config_means_the_default_profile() -> None:
+    from agent.plugins.profile_selection import profile_name_from_config
+
+    assert profile_name_from_config(None) == DEFAULT_PROFILE_NAME
+    assert profile_name_from_config({}) == DEFAULT_PROFILE_NAME
+
+
+def test_a_blank_name_means_unstated_not_a_profile_called_blank() -> None:
+    """An empty string is what a form leaves behind."""
+    from agent.plugins.profile_selection import PROFILE_KEY, profile_name_from_config
+
+    assert profile_name_from_config({PROFILE_KEY: ""}) == DEFAULT_PROFILE_NAME
+    assert profile_name_from_config({PROFILE_KEY: "   "}) == DEFAULT_PROFILE_NAME
+
+
+def test_a_non_string_name_is_treated_as_unstated() -> None:
+    from agent.plugins.profile_selection import PROFILE_KEY, profile_name_from_config
+
+    assert profile_name_from_config({PROFILE_KEY: 7}) == DEFAULT_PROFILE_NAME
+
+
+def test_the_name_is_trimmed() -> None:
+    from agent.plugins.profile_selection import PROFILE_KEY, profile_name_from_config
+
+    assert profile_name_from_config({PROFILE_KEY: "  default  "}) == DEFAULT_PROFILE_NAME
+
+
+def test_an_unknown_selected_profile_raises_at_construction() -> None:
+    """Not a fallback: a narrowed composition must not quietly get everything."""
+    from agent import PluginCatalog
+
+    with pytest.raises(KnownProfileError):
+        PluginCatalog(
+            builtin_dir=Path("/tmp/does-not-matter"),
+            plugin_config={"_profile": "nope"},
+        )
+
+
+def test_a_known_selected_profile_is_accepted() -> None:
+    from agent import PluginCatalog
+
+    catalog = PluginCatalog(
+        builtin_dir=Path("/tmp/does-not-matter"),
+        plugin_config={"_profile": DEFAULT_PROFILE_NAME},
+    )
+    try:
+        assert catalog._plugin_profile is DEFAULT_PROFILE
+    finally:
+        catalog.close()
+
+
+def test_the_reserved_key_is_not_looked_up_as_a_plugin() -> None:
+    """Looking up ``_profile`` as a plugin would be wrong the moment one is named that."""
+    state = resolve_plugin_state("_profile", config={"_profile": "default"})
+    assert state.enabled is True, "a reserved companion is not a disabled plugin"
+
+
+def test_a_reserved_key_does_not_appear_as_config() -> None:
+    state = resolve_plugin_state("_anything", config={"_anything": {"x": 1}})
+    assert state.config == {}
+
+
+def test_the_catalog_reads_the_reserved_key_end_to_end(tmp_path) -> None:
+    """The whole path: config -> profile -> which plugins load."""
+    from agent import PluginCatalog
+
+    plugin_dir = tmp_path / "plugins" / "p"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text(
+        "def register():\n"
+        "    class P:\n"
+        "        name = 'p'\n"
+        "        def setup(self, ctx):\n"
+        "            pass\n"
+        "    return P()\n",
+        encoding="utf-8",
+    )
+    catalog = PluginCatalog(
+        builtin_dir=tmp_path / "plugins",
+        plugin_config={"_profile": DEFAULT_PROFILE_NAME},
+    )
+    try:
+        assert catalog.discover_and_load() == ["p"]
     finally:
         catalog.close()

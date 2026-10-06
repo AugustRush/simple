@@ -16,7 +16,8 @@ from typing import Any, Callable, Optional
 from agent import shared
 from agent.core.events import TOOL_EVENTS, ToolPostExecute, ToolPreExecute
 from agent.core.output import _active_event_collector
-from agent.plugins.profiles import DEFAULT_PROFILE, resolve_plugin_state
+from agent.plugins.profile_selection import profile_from_config
+from agent.plugins.profiles import resolve_plugin_state
 
 CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
@@ -969,10 +970,11 @@ class PluginCatalog:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
         self._plugin_config = plugin_config or {}
-        #: The composition to load under.  The default profile expresses no
-        #: opinion, so an existing caller sees exactly the plugins it saw before
-        #: this module existed -- see agent/plugins/profiles.py.
-        self._plugin_profile = DEFAULT_PROFILE
+        #: The composition to load under, named by the ``plugins`` section's
+        #: reserved ``_profile`` key.  Resolved once, at construction: an unknown
+        #: name raises here rather than silently loading the default set, so a
+        #: run under a narrowed composition cannot quietly get everything.
+        self._plugin_profile = profile_from_config(self._plugin_config)
         self._turn_hook_timeout_seconds = max(0.0, float(turn_hook_timeout_seconds))
         self._reload_lock = asyncio.Lock()
         self._hook_executor = ThreadPoolExecutor(

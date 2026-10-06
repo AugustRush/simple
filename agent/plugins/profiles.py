@@ -145,6 +145,21 @@ def profile_names() -> tuple[str, ...]:
     return tuple(PROFILES)
 
 
+def _configured_entry(
+    config: Optional[Mapping[str, Any]], plugin: str
+) -> Any:
+    """The configuration entry for *plugin*, ignoring reserved companions.
+
+    A key starting with ``_`` is a companion to the section rather than a plugin
+    in it -- ``_profile`` names the composition, ``_readme`` documents the shape.
+    Looking one up as a plugin would be harmless today and wrong the moment a
+    plugin is *named* ``_profile``, which the convention exists to prevent.
+    """
+    if not config or plugin.startswith("_"):
+        return None
+    return config.get(plugin)
+
+
 def _entry_enabled(raw: Any) -> Optional[bool]:
     """The ``enabled`` flag from one configuration entry, or None if unstated."""
     if not isinstance(raw, Mapping):
@@ -170,7 +185,7 @@ def resolve_plugin_state(
     """
     active = profile if profile is not None else DEFAULT_PROFILE
 
-    configured = (config or {}).get(plugin) if config else None
+    configured = _configured_entry(config, plugin)
     if _entry_enabled(configured) is False:
         # An operator turned this off.  A profile is a composition within what is
         # permitted, not a way around that.
