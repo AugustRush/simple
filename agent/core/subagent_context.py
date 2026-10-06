@@ -33,7 +33,11 @@ from typing import Any, Callable, Optional
 
 from agent.pathing import canonicalize_user_path, resolve_workspace_path
 
-__all__ = ["canonicalize_write_scope", "compose_sub_system_prompt"]
+__all__ = [
+    "canonicalize_write_scope",
+    "compose_sub_system_prompt",
+    "propagate_sub_metadata",
+]
 
 
 def canonicalize_write_scope(
@@ -96,3 +100,45 @@ def compose_sub_system_prompt(
     if system_suffix:
         sys_prompt += f"\n\n{system_suffix}"
     return sys_prompt, active_context
+
+#: Metadata keys a sub-agent inherits from the turn that spawned it.
+#:
+#: A whitelist rather than a copy, because ``metadata`` also carries per-turn
+#: state that must *not* travel: the parent's retrieval injections, its model
+#: override, and its own operation bookkeeping.  Copying everything would give a
+#: sub-agent its parent's turn -- several run at once, so they would share and
+#: overwrite each other's entries.
+_INHERITED_METADATA_KEYS = (
+    "skill_catalog",
+    "required_skills",
+    "cancel_token",
+    "context_manager",
+    "session_id",
+)
+
+#: Keys whose value is copied shallowly, so a child mutating its list cannot
+#: rewrite the parent's.
+_COPIED_METADATA_KEYS = frozenset({"required_skills"})
+
+
+def propagate_sub_metadata(
+    sub_ctx: Any,
+    active_ctx: Any = None,
+) -> None:
+    """Give *sub_ctx* the parts of the parent turn it legitimately inherits.
+
+    ``session_id`` is in the list for a specific reason: without it the child
+    turn has no session of its own, and anything that needs one -- the
+    per-conversation request header a gateway may require -- falls back to a
+    per-process value, so the main turn and its sub-agents would report two
+    different conversations for one conversation's work.
+    """
+    if not active_ctx:
+        return
+    for key in _INHERITED_METADATA_KEYS:
+        if key not in active_ctx.metadata:
+            continue
+        value = active_ctx.metadata[key]
+        if key in _COPIED_METADATA_KEYS:
+            value = list(value)
+        sub_ctx.metadata[key] = value

@@ -21,6 +21,7 @@ from agent.core.spawn_planning import PlannerDeps, SpawnPlanner
 from agent.core.subagent_context import (
     canonicalize_write_scope,
     compose_sub_system_prompt,
+    propagate_sub_metadata,
 )
 from agent.core.output_contract import (
     normalize_output_contract,
@@ -3511,30 +3512,8 @@ class BaseAgent:
         sub_ctx: AgentContext,
         active_ctx: Optional[AgentContext],
     ) -> None:
-        # Propagate skill metadata so sub-agents can also activate skills.
-        if active_ctx:
-            if "skill_catalog" in active_ctx.metadata:
-                sub_ctx.metadata["skill_catalog"] = active_ctx.metadata[
-                    "skill_catalog"
-                ]
-            if "required_skills" in active_ctx.metadata:
-                sub_ctx.metadata["required_skills"] = list(
-                    active_ctx.metadata["required_skills"]
-                )
-            if "cancel_token" in active_ctx.metadata:
-                sub_ctx.metadata["cancel_token"] = active_ctx.metadata["cancel_token"]
-            if "context_manager" in active_ctx.metadata:
-                sub_ctx.metadata["context_manager"] = active_ctx.metadata[
-                    "context_manager"
-                ]
-            # The conversation this sub-agent is running inside.  Without it the
-            # child turn has no session of its own, and anything that needs one
-            # -- the per-conversation request header a gateway may require --
-            # falls back to a per-process value, so the main turn and its
-            # sub-agents would report two different conversations for one
-            # conversation's work.
-            if "session_id" in active_ctx.metadata:
-                sub_ctx.metadata["session_id"] = active_ctx.metadata["session_id"]
+        """See :func:`agent.core.subagent_context.propagate_sub_metadata`."""
+        propagate_sub_metadata(sub_ctx, active_ctx)
 
     def _create_sub_agent(self, sub_registry: "ToolRegistry") -> "BaseAgent":
         # Inherit the parent's transport rather than building one from

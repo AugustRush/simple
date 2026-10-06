@@ -31,7 +31,7 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 done.  Task 7 is 8 of 9 extractions done.**  Tasks 8-10 not started.
+**Tasks 0-6 done.  Task 7 is 9 of 10 extractions done.**  Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
 Measured after each stage, same command every time
@@ -52,7 +52,8 @@ Measured after each stage, same command every time
 | T7c stuck detection | 3 / 2843 | 4265 | `tool_watchdog.py` |
 | T7d1-4 text/contract/planning/runners | 3 / 2908 | 4169 | `bounded_text.py`, `output_contract.py`, `spawn_planning.py` |
 | T7d5 sub-agent context | 3 / 2926 | 4117 | `subagent_context.py` |
-| T7d6 payload boundaries | **3 / 2944** | **4105** | tests only |
+| T7d6 payload boundaries | 3 / 2944 | 4105 | tests only |
+| T7d7 metadata inheritance | **3 / 2950** | **4084** | `propagate_sub_metadata` |
 
 The FAILED set is byte-identical to
 `docs/superpowers/plans/2026-10-01-baseline-failures.txt` at every stage.  The
@@ -427,12 +428,21 @@ two methods.  The property those two protect is the one a sub-agent gets wrong
 parent's active context, and a stub skill catalog is rejected by type before it
 reaches the prompt builder.
 
-**What is left of Task 7.**  Four members, and the split is now sharp:
+**Extraction 9 — metadata inheritance.**
+`propagate_sub_metadata` moved to `subagent_context.py`, which completes the
+cheap half of the group.  What it protects is a whitelist, and the whitelist is a
+contract that was buried in a 4k-line class: `skill_catalog`, `required_skills`,
+`cancel_token`, `context_manager`, `session_id` travel; per-turn state does not,
+because several sub-agents run at once and a wholesale copy would have them share
+and overwrite each other's entries.  `required_skills` is copied rather than
+shared so a child's append cannot rewrite the parent's list.
 
-- `_propagate_sub_metadata` (0 `self.*`) — mechanical, not yet done.
-- `_promote_orchestration_runs` (1) — writes session memory; needs a store seam.
+**What is left of Task 7.**  Three members, and the split is sharp:
+
+- `_promote_orchestration_runs` (1 `self.*`) — writes session memory; needs a
+  store seam before it can move.
 - `_create_sub_agent` (15) and `_execute_agent` (**288 lines, 16 attributes**) —
-  these are one decision, not two: `_execute_agent` is the single primitive every
+  **one decision, not two**: `_execute_agent` is the single primitive every
   runner calls, and extracting it means agreeing on how a sub-agent is
   constructed and driven.  That is a design decision, and it is the reason the
   plan ordered this group last.  Measured coupling

@@ -253,3 +253,94 @@ def test_the_agent_methods_agree_with_the_functions(tmp_path: Path) -> None:
     prompt, ctx = agent._compose_sub_system_prompt(registry, "suffix")
     assert isinstance(prompt, str)
     assert prompt.endswith("suffix")
+
+
+# ── Metadata inheritance ─────────────────────────────────────────────────────
+#
+# The whitelist is the contract.  Copying ``metadata`` wholesale would hand a
+# sub-agent its parent's turn: several run at once, so they would share and
+# overwrite each other's per-turn entries.
+
+
+def _meta(**values) -> SimpleNamespace:
+    return SimpleNamespace(metadata=dict(values))
+
+
+def test_the_inherited_keys_travel() -> None:
+    from agent.core.subagent_context import propagate_sub_metadata
+
+    catalog, token, manager = object(), object(), object()
+    sub = _meta()
+    propagate_sub_metadata(
+        sub,
+        _meta(
+            skill_catalog=catalog,
+            required_skills=["a", "b"],
+            cancel_token=token,
+            context_manager=manager,
+            session_id="s-1",
+        ),
+    )
+    assert sub.metadata["skill_catalog"] is catalog
+    assert sub.metadata["required_skills"] == ["a", "b"]
+    assert sub.metadata["cancel_token"] is token
+    assert sub.metadata["context_manager"] is manager
+    assert sub.metadata["session_id"] == "s-1"
+
+
+def test_a_required_skills_list_is_copied_not_shared() -> None:
+    """A child appending to it must not rewrite the parent's list."""
+    from agent.core.subagent_context import propagate_sub_metadata
+
+    parent = _meta(required_skills=["a"])
+    sub = _meta()
+    propagate_sub_metadata(sub, parent)
+    sub.metadata["required_skills"].append("b")
+    assert parent.metadata["required_skills"] == ["a"]
+
+
+def test_per_turn_state_does_not_travel() -> None:
+    """The reason this is a whitelist rather than a copy."""
+    from agent.core.subagent_context import propagate_sub_metadata
+
+    sub = _meta()
+    propagate_sub_metadata(
+        sub,
+        _meta(
+            model_override="other-model",
+            required_skills_preset=["x"],
+            _provider_step=7,
+            scheduler_run_id="run-1",
+            session_id="s-1",
+        ),
+    )
+    assert sub.metadata == {"session_id": "s-1"}
+
+
+def test_absorbing_keys_are_skipped_when_absent() -> None:
+    from agent.core.subagent_context import propagate_sub_metadata
+
+    sub = _meta()
+    propagate_sub_metadata(sub, _meta(session_id="s-1"))
+    assert sub.metadata == {"session_id": "s-1"}
+
+
+def test_no_active_context_is_a_no_op() -> None:
+    from agent.core.subagent_context import propagate_sub_metadata
+
+    sub = _meta()
+    propagate_sub_metadata(sub, None)
+    assert sub.metadata == {}
+
+
+def test_the_agent_still_delegates_metadata_propagation() -> None:
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    parent = _meta(session_id="s-9", model_override="m")
+    child = _meta()
+    agent._propagate_sub_metadata(child, parent)
+    assert child.metadata == {"session_id": "s-9"}
+    assert "model_override" not in child.metadata
