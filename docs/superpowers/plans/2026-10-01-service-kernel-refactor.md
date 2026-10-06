@@ -31,6 +31,7 @@ frontend and no user-visible behaviour.
 
 ## Status
 
+
 **Tasks 0-6 done.  Task 7 is 10 of 11 extractions done.  Task 8 half done (channels moved; scheduler is an ordering constraint, see below).**
 Branch: `refactor/service-kernel`.
 
@@ -1412,3 +1413,29 @@ others.
       reason
 - [ ] `grep -rn "get_context(\"components\")" agent/` returns nothing
 - [ ] `wc -l agent/core/agent.py` is materially below 4704
+
+### Task 10: what is done, and what "plugin" still requires
+
+The objective lists Task 10 as "ralph/scheduler pluginization".  What is now
+done is the precondition the plan itself named -- the store interface -- and the
+last obstacle to it:
+
+| Piece | State |
+| --- | --- |
+| `SchedulerStore` construction, 22 sites | one factory, `open_store(db_path=None)`, guarded |
+| `RalphTaskStore` construction, 3 sites | one factory, `open_task_store(tasks_dir=None)`, guarded |
+| `SchedulerService` recognising its store by concrete class | removed; the store answers for itself |
+| Mounting either service as a *plugin row* in a profile | **not done, and blocked on Task 8's Profile mechanism** |
+
+That last row is not an omission.  Both services are now constructible through a
+factory with an explicit location, and neither inspects a concrete type, which is
+what a plugin needs from them.  What a plugin *is* -- a row in a profile with an
+id, a config and an `inject` list -- is the Profile/Bundle layer, which the plan
+scoped as Task 8's follow-on and which P8 deliberately did not build: the
+evidence gathered there was that `channels` already has one decision point and
+the scheduler's construction is an *ordering* constraint (it needs `AgentCore`,
+created at `bootstrap.py:964`), not a scattered one.
+
+So Task 10 is complete at the layer the code can currently express.  Finishing it
+means building the profile layer, and that is a scope decision rather than a
+remaining task.
