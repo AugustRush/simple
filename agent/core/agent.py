@@ -17,6 +17,19 @@ from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt, _now
+from agent.core.output_contract import (
+    normalize_output_contract,
+    output_contract_path_resolver,
+    string_list,
+    validate_output_contract,
+    with_output_contract,
+)
+from agent.core.bounded_text import (
+    append_named_block,
+    bounded_json,
+    bounded_structured,
+    bounded_text,
+)
 from agent.core.context_assembler import ContextAssembler
 from agent.core.events import TOOL_EVENTS
 from agent.core.token_budget import TokenBudget
@@ -661,31 +674,18 @@ class BaseAgent:
         heading: str,
         lines: list[str],
     ) -> str:
-        if not lines:
-            return base_text
-        extra = f"{heading}\n" + "\n".join(lines)
-        if not base_text:
-            return extra
-        return f"{base_text}\n\n{extra}"
+        """See :func:`agent.core.bounded_text.append_named_block`."""
+        return append_named_block(base_text, heading, lines)
 
     @staticmethod
     def _bounded_json(value: Any, limit: int = 2400) -> str:
-        serialized = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
-        if len(serialized) <= limit:
-            return serialized
-        return serialized[: max(0, limit - 32)].rstrip() + "... [truncated]"
+        """See :func:`agent.core.bounded_text.bounded_json`."""
+        return bounded_json(value, limit)
 
     @staticmethod
     def _bounded_text(value: Any, limit: int) -> str:
-        text = str(value or "")
-        if len(text) <= limit:
-            return text
-        return text[: max(0, limit - 24)].rstrip() + "... [truncated]"
+        """See :func:`agent.core.bounded_text.bounded_text`."""
+        return bounded_text(value, limit)
 
     def _result_content_limit(self) -> int:
         return min(
@@ -698,18 +698,8 @@ class BaseAgent:
 
     @classmethod
     def _bounded_structured(cls, value: Any, limit: int = 2400) -> Any:
-        serialized = json.dumps(
-            value,
-            ensure_ascii=False,
-            sort_keys=True,
-            default=str,
-        )
-        if len(serialized) <= limit:
-            return value
-        return {
-            "_truncated": True,
-            "preview": serialized[: max(0, limit - 64)].rstrip(),
-        }
+        """See :func:`agent.core.bounded_text.bounded_structured`."""
+        return bounded_structured(value, limit)
 
     def _with_upstream_summaries(
         self,
@@ -925,7 +915,8 @@ class BaseAgent:
 
     @staticmethod
     def _normalize_output_contract(output_contract: dict[str, Any] | None) -> dict[str, Any]:
-        return contracts.OutputContract.parse(output_contract).to_dict()
+        """See :func:`agent.core.output_contract.normalize_output_contract`."""
+        return normalize_output_contract(output_contract)
 
     @classmethod
     def _with_output_contract(
@@ -934,29 +925,12 @@ class BaseAgent:
         expected_output: str,
         output_contract: dict[str, Any] | None,
     ) -> str:
-        contract = contracts.OutputContract.parse(output_contract)
-        if not expected_output and not contract:
-            return task
-        return cls._append_named_block(
-            task,
-            "Expected output contract:",
-            contracts.contract_instructions(expected_output, contract),
-        )
+        """See :func:`agent.core.output_contract.with_output_contract`."""
+        return with_output_contract(task, expected_output, output_contract)
 
     def _resolve_output_contract_path(self, raw_path: str) -> Path:
-        output_dir_str = self.registry.get_context("output_dir")
-        output_dir = Path(output_dir_str) if output_dir_str else None
-        if output_dir is not None:
-            candidate = Path(raw_path).expanduser()
-            if not candidate.is_absolute():
-                return (output_dir / candidate).resolve(strict=False)
-        workspace_root = self.workspace_root or Path.cwd()
-        resolved, _root_kind = resolve_workspace_path(
-            raw_path,
-            workspace_root=workspace_root,
-            output_dir=output_dir,
-        )
-        return resolved
+        """Kept because it is the resolver the validator used to call directly."""
+        return self._output_contract_path_resolver()(raw_path)
 
     def _validate_output_contract(
         self,
@@ -965,22 +939,31 @@ class BaseAgent:
         expected_output: str,
         output_contract: dict[str, Any] | None,
     ) -> tuple[bool, str, dict[str, Any] | None, str | None]:
-        result = contracts.validate(
+        """See :func:`agent.core.output_contract.validate_output_contract`.
+
+        The path resolver is built here from this agent's registry context and
+        workspace root, which is the dependency that used to be read inside the
+        validator.
+        """
+        return validate_output_contract(
             content,
             expected_output=expected_output,
-            contract=contracts.OutputContract.parse(output_contract),
-            resolve_path=self._resolve_output_contract_path,
+            output_contract=output_contract,
+            resolve_path=self._output_contract_path_resolver(),
         )
-        return (
-            result.ok,
-            result.content,
-            result.structured_content,
-            result.error,
+
+    def _output_contract_path_resolver(self):
+        """A resolver bound to this agent's output dir and workspace root."""
+        output_dir_str = self.registry.get_context("output_dir")
+        return output_contract_path_resolver(
+            output_dir=Path(output_dir_str) if output_dir_str else None,
+            workspace_root=self.workspace_root,
         )
 
     @staticmethod
     def _string_list(value: Any) -> list[str]:
-        return contracts.string_list(value)
+        """See :func:`agent.core.output_contract.string_list`."""
+        return string_list(value)
 
     @staticmethod
     def _looks_like_implementation_work(role: str, task: str) -> bool:

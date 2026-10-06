@@ -31,7 +31,7 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 done; Task 7 in progress (3 of 4 extractions).** Tasks 8-10 not started.
+**Tasks 0-6 done; Task 7 in progress (5 extractions done, orchestration core remaining).** Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
 | | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c |
@@ -328,6 +328,40 @@ now documented at the assertion rather than silently "fixed":
 otherwise (a mixed batch is fatal); the stop message renders the rule as prose
 rather than quoting the internal key at the user; and the occurrence rule needs
 its own threshold to be reached at all.
+
+**Extraction 4 — model-facing text helpers.**
+`agent/core/bounded_text.py`: `append_named_block`, `bounded_json`,
+`bounded_text`, `bounded_structured`.  They were static methods called from three
+unrelated concerns (sub-agent prompt building, handoff summaries, output-contract
+validation), which is what made them free functions.  The two truncation markers
+are asserted to differ, because collapsing them would silently change what a
+model sees.
+
+**Extraction 5 — output contracts.**
+`agent/core/output_contract.py`.  This one needed a real dependency change:
+`_resolve_output_contract_path` read the output directory out of
+`self.registry` and the fallback root out of `self.workspace_root`, which is why
+the group could not simply be moved.  The validator now takes a `resolve_path`
+callable and the agent supplies its own — so a validator's behaviour no longer
+depends on what else is running.
+
+Two expectations of mine were wrong here and the code was right, both now
+documented at the assertion:
+
+- The contract vocabulary is `format` / `required_keys` / `required_files`, **not
+  JSON Schema**, and a `json` contract reads the `<deliverable>` block rather
+  than the whole answer.
+- An absolute path is **not** honoured unconditionally: one outside the allowed
+  roots is refused.  "Absolute wins" is what a reader would assume, so the
+  refusal is now a test with its reason attached.
+
+**Where Task 7 actually stands.**  Five extractions are done and `agent.py` is
+4248 lines (4703 → 4248, -455).  The **orchestration core is not**: the
+spawn/dispatch group (8 methods, 19 `self` attributes), the runner group (8
+methods, 13 attributes) and the sub-agent group (6 methods, **29 attributes**)
+are still on `BaseAgent`.  Measured coupling puts the sub-agent group far above
+the others, which is why the plan ordered it last and why it has not been forced
+through.
 
 **One self-inflicted error, and what caught it.**  A scripted block replacement
 deleted `_run_tool_uses` (the tool loop body) along with the methods it was
