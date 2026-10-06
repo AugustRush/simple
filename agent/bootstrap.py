@@ -336,7 +336,13 @@ async def _build_web_session_components(
     )
     session_components["turn_runner"] = TurnRunner(session_components)
     session_components["agent_core"] = AgentCore(session_components)
-    registry.set_context("components", session_components)
+    # Named dependencies; see the note on the global bootstrap path above.
+    registry.set_context("command_router", session_components.get("command_router"))
+    registry.set_context("skill_catalog", session_components.get("skill_catalog"))
+    registry.set_context("registry", registry)
+    _session_mcp = session_components.get("mcp_client")
+    if _session_mcp is not None:
+        registry.set_context("mcp_client", _session_mcp)
     return session_components
 
 
@@ -978,8 +984,15 @@ async def _build_components_async(
     # list_installed_plugins) can trigger hot-reload through the registry
     # context.  Same dict so reload sees subsequent updates in place.
     registry.set_context("plugin_catalog", plugin_catalog)
-    registry.set_context("components", components)
-    registry.set_context("mcp_client", mcp_client)
+    # Named dependencies rather than the whole ``components`` dict.  The
+    # container made every service boundary optional on the tool side: a reader
+    # could reach around whatever it had been given, and two of them did.  Only
+    # four keys were ever read through it, and they are these.
+    registry.set_context("command_router", command_router)
+    registry.set_context("skill_catalog", skill_catalog)
+    registry.set_context("registry", registry)
+    if mcp_client is not None:
+        registry.set_context("mcp_client", mcp_client)
     if mcp_client is not None and mcp_server_configs:
         components["mcp_task"] = asyncio.create_task(
             _connect_mcp_in_background(

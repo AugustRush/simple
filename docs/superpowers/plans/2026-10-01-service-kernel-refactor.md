@@ -31,15 +31,16 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-3 implemented 2026-10-01.** Tasks 4-10 not started.
+**Tasks 0-4 implemented 2026-10-01.** Tasks 5-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | Task 0 | Task 1 | Task 2 | Task 3 |
-| --- | --- | --- | --- | --- | --- |
-| Full suite | 19 failed / 2641 passed | 19 failed / 2649 passed | 3 failed / 2687 passed | 3 failed / 2705 passed | **3 failed / 2730 passed** / 1 skipped |
-| FAILED set | see baseline file | byte-identical | byte-identical | byte-identical | byte-identical |
-| Module-level mutable state | undocumented | 49 entries, guard-tested | unchanged | +1 recorded | unchanged |
-| Tool-set scopes | 3 mechanisms | 3 | 3 | 3 | **1 (`ToolView` + `derive`)** |
+| | Baseline | Task 0 | Task 1 | Task 2 | Task 3 | Task 4 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Full suite | 19 failed / 2641 passed | 19 failed / 2649 passed | 3 failed / 2687 passed | 3 failed / 2705 passed | 3 failed / 2730 passed | **3 failed / 2737 passed** / 1 skipped |
+| FAILED set | baseline file | byte-identical | byte-identical | byte-identical | byte-identical | byte-identical |
+| Module-level mutable state | undocumented | 49 entries | unchanged | +1 recorded | unchanged | unchanged |
+| Tool-set scopes | 3 mechanisms | 3 | 3 | 3 | 1 (`ToolView`+`derive`) | 1 |
+| Component container reachable from tools | yes | yes | yes | yes | yes | **no** |
 
 Command for every column: `.venv/bin/python -m pytest -q -p no:cacheprovider`.
 
@@ -148,6 +149,35 @@ shape rather than by key name covers the next list someone adds.
 
 `fork()` remains, as a thin wrapper over the same call, because callers and four
 test files use it.
+
+### What Task 4 actually produced
+
+The `components` backdoor is gone, and both readers now name what they use.
+
+The finding that made this cheap: `PluginCatalog.reload` reads exactly **four**
+keys out of the container -- `command_router`, `skill_catalog`, `mcp_client`,
+`registry` (every `components.get(` in `agent/plugins/catalog.py`). Both
+bootstrap paths now provide those four under their own names, and
+`_reload_plugins` rebuilds the four-key dict it passes on. So the plugin manager
+now declares four dependencies instead of receiving everything, and the
+`user_tools` reader declares two (`user_tool_catalog`, `user_tools_enabled`).
+
+`mcp_client` is only set when it is not `None`; a missing key already read as
+`None` through `get_context`, so behaviour is unchanged.
+
+Two things went wrong while writing the guard test, and both are worth
+recording because the first version *passed* while checking nothing:
+
+1. It blanked string literals wholesale, which deleted the `"components"` it was
+   searching for. A source guard that cannot fail is worse than none.
+2. It re-tokenised each file once **per line**, making it quadratic and hanging
+   on the largest module (the 4.7k-line `agent.py`).
+
+The guard now blanks comments and multi-line string interiors only, keeps the
+opening delimiter so indentation survives, and matches the *call shape*
+(`(get|set)_context("components"`) rather than the bare word, because error
+text in `agent/tools/files.py` legitimately says "components". Verified by
+reintroducing the backdoor: the guard reports the exact file and line.
 
 ### What Task 0 actually found
 
@@ -484,17 +514,17 @@ exists. Replacing it with declared injection is the point of the task; adding a
 - Modify: `agent/bootstrap.py:989-991`
 - Test: `tests/test_service_registry.py` (extend)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 A test asserting `get_context("components")` returns nothing for any registered
 tool context, so the backdoor cannot be reintroduced silently.
 
-- [ ] **Step 2: Replace both readers with declared dependencies**
+- [x] **Step 2: Replace both readers with declared dependencies**
 
 Each reader names the services it needs; the bootstrap provides exactly those.
 Remove the `set_context("components", ...)` line.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 ```bash
 .venv/bin/python -m pytest tests/test_builtin_tools.py tests/test_user_tools.py tests/test_plugin_catalog.py -q

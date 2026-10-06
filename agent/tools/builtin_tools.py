@@ -2670,14 +2670,27 @@ class BuiltinTools:
         }
 
     async def _reload_plugins(self) -> dict:
-        """Trigger PluginCatalog.reload using the components dict stashed on the registry context."""
+        """Trigger a plugin reload from the four names the reload actually reads.
+
+        This used to hand ``PluginCatalog.reload`` the whole component
+        container.  The reload reads exactly four keys of it --
+        ``command_router``, ``skill_catalog``, ``mcp_client`` and ``registry``
+        -- so the container is rebuilt from those names here, and the
+        requirements are now legible at the call site instead of implied by a
+        container that could also have been used for anything else.
+        """
         plugin_catalog = self.registry.get_context("plugin_catalog")
-        components = self.registry.get_context("components")
-        if plugin_catalog is None or components is None:
+        if plugin_catalog is None:
             return {
                 "ok": False,
-                "error": "plugin_catalog/components not wired into registry context",
+                "error": "plugin_catalog not wired into registry context",
             }
+        components = {
+            "command_router": self.registry.get_context("command_router"),
+            "skill_catalog": self.registry.get_context("skill_catalog"),
+            "mcp_client": self.registry.get_context("mcp_client"),
+            "registry": self.registry.get_context("registry"),
+        }
         try:
             return await plugin_catalog.reload(components)
         except Exception as exc:

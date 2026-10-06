@@ -607,12 +607,18 @@ def installed_dependencies(root: Optional[Path] = None) -> list[str]:
 
 
 def resolve_catalog(registry) -> tuple[Any, bool]:
-    """Return ``(catalog, user_tools_enabled)`` for the running session."""
+    """Return ``(catalog, user_tools_enabled)`` for the running session.
+
+    Two named dependencies rather than the whole component container.  The
+    container was reachable through ``registry.get_context("components")``,
+    which meant this function's real requirements were invisible: a reader
+    could not tell which of the sixty-odd bootstrap results it used, and
+    neither could a reviewer.
+    """
     from agent.tools.runtime import UserToolCatalog
 
-    components = registry.get_context("components") or {}
-    catalog = components.get("user_tool_catalog") if components else None
-    enabled = bool(components.get("user_tools_enabled", False)) if components else False
+    catalog = registry.get_context("user_tool_catalog")
+    enabled = bool(registry.get_context("user_tools_enabled", False))
     if catalog is None:
         catalog = UserToolCatalog()
     return catalog, enabled
