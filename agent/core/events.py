@@ -50,6 +50,8 @@ __all__ = [
     "ToolPostExecute",
     "ToolPreExecute",
     "TOOL_EVENTS",
+    "TURN_EVENTS",
+    "LLM_EVENTS",
 ]
 
 
@@ -178,3 +180,20 @@ class EventBus:
 #: registered by the plugin catalog when it loads; a composition that never
 #: mounts plugins simply has no listeners.
 TOOL_EVENTS = EventBus()
+
+#: The bus the turn loop publishes to.
+#:
+#: A second module-level bus rather than a second *kind* of bus: the bus already
+#: dispatches by exact event class, so a listener for ``TurnStarted`` never sees a
+#: tool event even though both live in this process.  Separate names exist so a
+#: reader can see which pipeline a listener is joining; they are deliberately the
+#: same class, because a domain is vocabulary rather than transport (see
+#: ``agent/core/event_domains.py``).
+#:
+#: Module-level for the same reason as ``TOOL_EVENTS``: the turn loop is built per
+#: agent, and the scheduler builds its own, so a bus owned by one construction
+#: would leave a plugin's listener unreachable from the other.
+TURN_EVENTS = EventBus()
+
+#: The bus the model-call path publishes to.
+LLM_EVENTS = EventBus()

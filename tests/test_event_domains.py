@@ -27,6 +27,7 @@ from agent.core.event_domains import (
     TURN,
     Domain,
     LLMRequestStarted,
+    LLMResponseParsed,
     LLMResponseReceived,
     TurnFinished,
     TurnStarted,
@@ -92,7 +93,12 @@ def test_a_domain_serialises() -> None:
     payload = LLM.to_payload()
     assert payload["name"] == "llm"
     assert payload["blocking"] is False
-    assert payload["events"] == ["LLMRequestStarted", "LLMResponseReceived"]
+    assert payload["events"] == [
+        "LLMRequestStarted",
+        "LLMResponseReceived",
+        "LLMResponseParsed",
+        "LLMRetryScheduled",
+    ]
 
 
 # ── Only the tool domain blocks ──────────────────────────────────────────────
@@ -227,11 +233,11 @@ def test_turn_events_carry_what_a_listener_needs() -> None:
 
 def test_llm_events_carry_what_a_listener_needs() -> None:
     started = LLMRequestStarted(agent_id="a", model="m", tools_offered=2)
-    assert started.attempt == 1, "a first call is attempt one"
-    received = LLMResponseReceived(
-        agent_id="a", stop_reason="tool_use", duration_ms=12.5, tool_uses=1
-    )
-    assert received.tool_uses == 1
+    assert started.tools_offered == 2
+    received = LLMResponseReceived(agent_id="a", duration_ms=12.5)
+    assert received.duration_ms == 12.5
+    parsed = LLMResponseParsed(agent_id="a", stop_reason="tool_use", tool_uses=1)
+    assert parsed.tool_uses == 1
 
 
 def test_events_are_frozen() -> None:

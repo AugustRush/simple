@@ -54,6 +54,8 @@ __all__ = [
     "TurnFinished",
     "LLMRequestStarted",
     "LLMResponseReceived",
+    "LLMResponseParsed",
+    "LLMRetryScheduled",
 ]
 
 
@@ -91,24 +93,65 @@ class TurnFinished:
 class LLMRequestStarted:
     """A model call is about to be made.
 
-    ``attempt`` is one-based and counts the *retries* of this step: a transient
-    failure that is retried announces a second request, which is what makes a
-    flaky provider visible to a listener without it parsing logs.
+    Emitted by the call itself, not by the retry wrapper, because two callers
+    reach the model without that wrapper (a continuation and the direct path at
+    ``agent.py:2001``).  Announcing from the wrapper would have missed them.
     """
 
     agent_id: str
     model: str
     tools_offered: int
-    attempt: int = 1
+
+
+@dataclass(frozen=True)
+class LLMRetryScheduled:
+    """A transient failure is about to be retried after a delay.
+
+    A separate event rather than a second :class:`LLMRequestStarted` with a higher
+    ``attempt``, because the attempt count is only knowable inside the retry
+    wrapper while the request is only knowable inside the call.  Merging them
+    would mean passing one of the two through a context variable, or emitting one
+    of them twice.
+    """
+
+    agent_id: str
+    model: str
+    attempt: int
+    delay_seconds: float
+    error: str
 
 
 @dataclass(frozen=True)
 class LLMResponseReceived:
-    """A model call returned."""
+    """A model call returned.
+
+    Deliberately carries no ``stop_reason``.  The call knows a response arrived and
+    how long it took, but the normalised stop reason is produced by the transport's
+    parser, which runs later -- reading a field off the provider's own object here
+    would report the *provider's* vocabulary (``"stop"``, ``"tool_calls"``) under a
+    name the rest of the codebase reads as normalised.  A test caught exactly that:
+    the field came back empty because the attribute lives on a choice, not on the
+    response.
+
+    The parsed form is :class:`LLMResponseParsed`.
+    """
+
+    agent_id: str
+    duration_ms: float
+    tool_calls: int = 0
+
+
+@dataclass(frozen=True)
+class LLMResponseParsed:
+    """The response was understood: stop reason and tool calls are known.
+
+    Separate from :class:`LLMResponseReceived` because the two happen at different
+    layers, and collapsing them would force one of the layers to state something it
+    does not know.
+    """
 
     agent_id: str
     stop_reason: str
-    duration_ms: float
     tool_uses: int = 0
 
 
@@ -168,7 +211,12 @@ TURN = Domain(
 
 LLM = Domain(
     name="llm",
-    event_types=(LLMRequestStarted, LLMResponseReceived),
+    event_types=(
+        LLMRequestStarted,
+        LLMResponseReceived,
+        LLMResponseParsed,
+        LLMRetryScheduled,
+    ),
     blocking=False,
 )
 

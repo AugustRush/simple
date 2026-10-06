@@ -65,6 +65,15 @@ from agent.core.llm_errors import (
 from agent.core.payload_shape import describe_payload, head_fingerprint
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
+from agent.core.event_domains import (
+    TurnFinished,
+    TurnStarted,
+    LLMRequestStarted,
+    LLMResponseParsed,
+    LLMResponseReceived,
+    LLMRetryScheduled,
+)
+from agent.core.events import LLM_EVENTS, TURN_EVENTS
 from agent.core.llm_attempt import obtain_response
 from agent.core.tool_batch import run_tool_batch
 from agent.core.tool_loop_decision import handle_stuck_loop
@@ -185,6 +194,47 @@ def _emit_event(name: str, **fields: object) -> None:
     collector = _active_event_collector.get()
     if collector is not None:
         collector.emit(name, **fields)
+
+
+def _active_agent_id() -> str:
+    """The agent id of the turn in flight, or a marker when there is none.
+
+    The model-call path can run outside a turn -- a continuation, a probe -- and
+    ``"unknown"`` is honest where inventing an id would make two unrelated calls
+    look like one agent's.
+    """
+    ctx = _active_agent_context.get()
+    return str(getattr(ctx, "agent_id", "") or "unknown")
+
+
+def _schedule_domain_event(bus: Any, event_type: type, **fields: object) -> None:
+    """Publish from a synchronous call site, if a loop is running.
+
+    ``_parse_response`` is synchronous and on the hot path, so it cannot await.
+    When there is no running loop there is nothing to deliver to -- a listener only
+    exists inside a turn, which runs on a loop -- and scheduling then would leak a
+    coroutine.
+    """
+    if bus is None or not bus.has_listeners(event_type):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(bus.emit(event_type(**fields)))
+
+
+async def _emit_domain_event(bus: Any, event_type: type, **fields: object) -> None:
+    """Publish one typed event, if anyone is listening.
+
+    The ``has_listeners`` check is not an optimisation detail: this sits on the hot
+    path of every turn, and a turn must not pay for a feature nobody mounted.  The
+    bus isolates a listener that raises, so a subscriber cannot break the turn it
+    observes -- which is the property that makes mounting a plugin safe.
+    """
+    if bus is None or not bus.has_listeners(event_type):
+        return
+    await bus.emit(event_type(**fields))
 
 
 async def _execute_regular_tool_calls(
@@ -359,6 +409,11 @@ class BaseAgent:
         # The tool-loop stuck-detection state machine (agent/core/tool_watchdog.py).
         # One per agent: the thresholds are configuration; the per-turn counters
         # live in the state dict the turn loop owns.
+        #: Where this agent's turn and model-call events go.  The module-level
+        #: buses, so a listener mounted by a plugin reaches every agent, including
+        #: the scheduler's own.  Settable for a test that wants a private one.
+        self._event_bus = TURN_EVENTS
+        self._llm_event_bus = LLM_EVENTS
         self._tool_watchdog = ToolLoopWatchdog(
             repeat_threshold=self._TOOL_LOOP_REPEAT_THRESHOLD,
             unproductive_threshold=self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD,
@@ -1259,6 +1314,15 @@ class BaseAgent:
             tools,
             output_max_tokens=output_max_tokens,
         )
+        model = self._effective_model(ctx)
+        await _emit_domain_event(
+            self._llm_event_bus,
+            LLMRequestStarted,
+            agent_id=_active_agent_id(),
+            model=model,
+            tools_offered=len(tools or ()),
+        )
+        started_at = time.perf_counter()
         response = await self._transport.create(
             model=self._effective_model(ctx),
             # Not the configured cap: the cap this call can afford depends on
@@ -1275,6 +1339,12 @@ class BaseAgent:
             tools=tools,
         )
         self._observe_provider_usage(ctx, response)
+        await _emit_domain_event(
+            self._llm_event_bus,
+            LLMResponseReceived,
+            agent_id=_active_agent_id(),
+            duration_ms=(time.perf_counter() - started_at) * 1000,
+        )
         return response
 
     def _retrieval_token_budget(
@@ -1674,9 +1744,22 @@ class BaseAgent:
     def _parse_response(
         self, response: Any, ctx: Optional["AgentContext"] = None
     ) -> tuple[str, str, list[dict]]:
-        return self._transport.parse_response(
+        stop_reason, text, tool_uses = self._transport.parse_response(
             response, model=self._effective_model(ctx) if ctx else None
         )
+        # Announced from the parser because this is where the normalised vocabulary
+        # exists; see ``LLMResponseParsed``.  Fire-and-forget: this is a sync method
+        # on the hot path, and the bus delivers to listeners that must not be able
+        # to change the turn.
+        if self._llm_event_bus.has_listeners(LLMResponseParsed):
+            self._schedule_domain_event(
+                self._llm_event_bus,
+                LLMResponseParsed,
+                agent_id=_active_agent_id(),
+                stop_reason=stop_reason,
+                tool_uses=len(tool_uses or ()),
+            )
+        return stop_reason, text, tool_uses
 
     def _response_completion_error(
         self, response: Any, ctx: Optional["AgentContext"] = None
@@ -2037,6 +2120,17 @@ class BaseAgent:
                 logger.warning(
                     "LLM API error (attempt %d/%d), retrying in %.1fs: %s",
                     attempt + 1, self.llm_max_retries, delay, exc,
+                )
+                await _emit_domain_event(
+                    self._llm_event_bus,
+                    LLMRetryScheduled,
+                    agent_id=_active_agent_id(),
+                    model=_active_agent_context.get().metadata.get("_model", "")
+                    if _active_agent_context.get() is not None
+                    else "",
+                    attempt=attempt + 1,
+                    delay_seconds=delay,
+                    error=str(exc),
                 )
                 await asyncio.sleep(delay)
         raise last_exc  # type: ignore[misc]
@@ -2971,6 +3065,14 @@ class BaseAgent:
             # returns -- can tell a between-turns call from a mid-turn one.
             ctx.metadata.pop(_TURN_IN_PROGRESS_KEY, None)
 
+            await _emit_domain_event(
+                self._event_bus,
+                TurnFinished,
+                agent_id=ctx.agent_id,
+                status=state.trace_status,
+                steps=state.steps,
+            )
+
         return AgentResult(
             agent_id=ctx.agent_id,
             content=state.result_text,
@@ -3005,6 +3107,13 @@ class BaseAgent:
         trace_status = "ok"
         trace_error: str | None = None
         steps = 0
+        await _emit_domain_event(
+            self._event_bus,
+            TurnStarted,
+            agent_id=ctx.agent_id,
+            tools_enabled=bool(ctx.tools_enabled),
+            streamed=bool(stream_callback),
+        )
         _interaction_log(
             "turn_started",
             agent_id=ctx.agent_id,
