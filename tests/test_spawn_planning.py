@@ -17,7 +17,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.core.spawn_planning import PlannerDeps, SpawnPlanner
+from agent.core.agent import _active_orchestration_runs
+from agent.core.spawn_planning import (
+    MAX_PROMOTED_SUMMARY_CHARS,
+    PlannerDeps,
+    SpawnPlanner,
+    promote_orchestration_runs,
+)
 from agent.orchestration.planner import OrchestrationDecision
 from agent.orchestration.runtime import SubtaskResult, SubtaskSpec
 
@@ -466,3 +472,138 @@ def test_the_agent_still_parses_directives_and_summarizes() -> None:
     assert agent._summarize_subtask_result("x" * 100, limit=40).endswith("...")
     parsed = agent._parse_rendezvous_directive('{"stop": true}', known_ids={"a"})
     assert parsed is not None and parsed.stop is True
+
+
+# ── Promoting run summaries into memory ──────────────────────────────────────
+#
+# Three filters, each of which exists because the alternative put something
+# wrong into memory a later turn reads as fact.
+
+
+class _Entry:
+    """Records what was promoted, standing in for the memory layer's class."""
+
+    def __init__(self, **fields) -> None:
+        self.__dict__.update(fields)
+
+
+class _Store:
+    def __init__(self) -> None:
+        self.entries: list = []
+
+    def add_entry(self, entry) -> None:
+        self.entries.append(entry)
+
+
+class _Manager:
+    def __init__(self, session_id: str = "s-1") -> None:
+        self.staging = SimpleNamespace(session_id=session_id)
+        self.store = _Store()
+
+
+def _promote(manager, runs):
+    return promote_orchestration_runs(
+        manager,
+        runs,
+        now="2026-01-01 00:00 UTC",
+        new_id=lambda: "id-1",
+        entry_type=_Entry,
+    )
+
+
+def _ran(result_id: str, ok: bool = True, **kwargs) -> SubtaskResult:
+    return SubtaskResult(
+        id=result_id,
+        ok=ok,
+        content=kwargs.pop("content", "the finding"),
+        tool_calls_made=[],
+        **kwargs,
+    )
+
+
+def _run(*results) -> dict:
+    return {"run_id": "r-1", "results": list(results)}
+
+
+def test_a_successful_summary_is_promoted() -> None:
+    manager = _Manager()
+    written = _promote(manager, [_run(_ran("a"))])
+    assert written == 1
+    entry = manager.store.entries[0]
+    assert "the finding" in entry.content
+    assert entry.scope == "session:s-1"
+    assert entry.memory_type == "orchestration_summary"
+
+
+def test_a_failed_result_is_not_promoted() -> None:
+    """A failed sub-agent's text is not a finding.
+
+    Promoting it would put a former error into the memory a later turn reads as
+    fact -- the most damaging thing this function can do.
+    """
+    manager = _Manager()
+    assert _promote(manager, [_run(_ran("a", ok=False))]) == 0
+    assert manager.store.entries == []
+
+
+def test_an_empty_summary_is_not_promoted() -> None:
+    """It would occupy a retrieval slot while carrying no information."""
+    manager = _Manager()
+    assert _promote(manager, [_run(_ran("a", content="   "))]) == 0
+
+
+def test_a_long_summary_is_bounded() -> None:
+    """This text joins a later turn's context, so it cannot be unbounded."""
+    manager = _Manager()
+    _promote(manager, [_run(_ran("a", content="x" * 9000))])
+    entry = manager.store.entries[0]
+    body = entry.content.split("\n", 1)[1]
+    assert len(body) == MAX_PROMOTED_SUMMARY_CHARS
+
+
+def test_the_summary_is_read_from_summary_or_content() -> None:
+    manager = _Manager()
+    _promote(manager, [_run(_ran("a", content="fallback", summary="preferred"))])
+    assert "preferred" in manager.store.entries[0].content
+
+
+def test_a_non_subtask_result_is_skipped() -> None:
+    manager = _Manager()
+    assert _promote(manager, [_run("not a result")]) == 0
+
+
+def test_the_run_id_and_result_id_appear_in_the_entry() -> None:
+    """So a later reader can trace a memory back to the run that produced it."""
+    manager = _Manager()
+    _promote(manager, [_run(_ran("subtask-7"))])
+    content = manager.store.entries[0].content
+    assert "r-1" in content
+    assert "subtask-7" in content
+
+
+def test_several_results_in_one_run_are_all_promoted() -> None:
+    manager = _Manager()
+    assert _promote(manager, [_run(_ran("a"), _ran("b"))]) == 2
+
+
+def test_no_context_manager_promotes_nothing() -> None:
+    """The no-session case: nothing to attribute the memory to."""
+    assert promote_orchestration_runs(
+        None, [_run(_ran("a"))], now="t", new_id=lambda: "i", entry_type=_Entry
+    ) == 0
+
+
+def test_the_agent_still_delegates_promotion() -> None:
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    manager = _Manager()
+    agent._context_manager_for = lambda ctx=None: manager  # type: ignore[assignment]
+    token = _active_orchestration_runs.set([_run(_ran("a"))])
+    try:
+        agent._promote_orchestration_runs()
+    finally:
+        _active_orchestration_runs.reset(token)
+    assert len(manager.store.entries) == 1

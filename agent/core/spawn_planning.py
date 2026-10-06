@@ -44,7 +44,12 @@ from agent.orchestration.runtime import (
     SubtaskSpec,
 )
 
-__all__ = ["PlannerDeps", "SpawnPlanner"]
+__all__ = [
+    "MAX_PROMOTED_SUMMARY_CHARS",
+    "PlannerDeps",
+    "SpawnPlanner",
+    "promote_orchestration_runs",
+]
 
 #: Modes a batch may explicitly declare.
 SUPPORTED_COORDINATION_MODES = frozenset({"parallel", "pipeline", "rendezvous"})
@@ -314,3 +319,73 @@ class SpawnPlanner:
         if len(spawn_calls) > 1:
             return "parallel"
         return "direct"
+
+# ── Promoting run summaries into session memory ──────────────────────────────
+
+#: Longest summary promoted into session memory.  Bounded because this text
+#: becomes part of a later turn's context, and an unbounded promotion would
+#: push out the conversation it is meant to inform.
+MAX_PROMOTED_SUMMARY_CHARS = 1600
+
+
+def promote_orchestration_runs(
+    context_manager: Any,
+    runs: list[dict],
+    *,
+    now: str,
+    new_id: Callable[[], str],
+    entry_type: type,
+) -> int:
+    """Write bounded, successful run summaries into session memory.
+
+    Returns how many entries were written, so a caller can tell "nothing to
+    promote" from "promotion ran and found nothing eligible" without reading
+    the store back.
+
+    Three filters, each of which exists for a reason found the hard way:
+
+    - **``result.ok``** -- a failed sub-agent's text is not a finding, and
+      promoting it would put a former error into the permanent memory a later
+      turn reads as fact.
+    - **non-empty after stripping** -- an empty summary carries no information
+      and would occupy a slot that retrieval ranks.
+    - **a length bound** -- this text joins a later turn's context, so an
+      unbounded promotion competes with the conversation it is meant to inform.
+
+    ``now``, ``new_id`` and ``entry_type`` are arguments rather than imports so
+    the promotion can be exercised without a store, a clock, or the memory
+    layer's entry class.
+    """
+    if not context_manager:
+        return 0
+    session_id = context_manager.staging.session_id
+    written = 0
+    for run in runs:
+        run_id = str(run.get("run_id") or "")
+        for result in run.get("results", []):
+            if not isinstance(result, SubtaskResult) or not result.ok:
+                continue
+            summary = str(result.summary or result.content or "").strip()
+            if not summary:
+                continue
+            summary = summary[:MAX_PROMOTED_SUMMARY_CHARS]
+            context_manager.store.add_entry(
+                entry_type(
+                    id=new_id(),
+                    content=(
+                        f"orchestration run {run_id} [{result.id}] summary:\n"
+                        f"{summary}"
+                    ),
+                    importance=0.45,
+                    category="episodes",
+                    entity="orchestration",
+                    memory_type="orchestration_summary",
+                    scope=f"session:{session_id}",
+                    source_session=session_id,
+                    confidence=0.6,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            written += 1
+    return written

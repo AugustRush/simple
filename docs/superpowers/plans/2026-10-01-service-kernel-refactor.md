@@ -31,7 +31,7 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 done.  Task 7 is 9 of 10 extractions done.**  Tasks 8-10 not started.
+**Tasks 0-6 done.  Task 7 is 10 of 11 extractions done; one decision remains.**  Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
 Measured after each stage, same command every time
@@ -53,7 +53,8 @@ Measured after each stage, same command every time
 | T7d1-4 text/contract/planning/runners | 3 / 2908 | 4169 | `bounded_text.py`, `output_contract.py`, `spawn_planning.py` |
 | T7d5 sub-agent context | 3 / 2926 | 4117 | `subagent_context.py` |
 | T7d6 payload boundaries | 3 / 2944 | 4105 | tests only |
-| T7d7 metadata inheritance | **3 / 2950** | **4084** | `propagate_sub_metadata` |
+| T7d7 metadata inheritance | 3 / 2950 | 4084 | `propagate_sub_metadata` |
+| T7d8 run promotion | **3 / 2960** | **4067** | `promote_orchestration_runs` |
 
 The FAILED set is byte-identical to
 `docs/superpowers/plans/2026-10-01-baseline-failures.txt` at every stage.  The
@@ -437,10 +438,26 @@ because several sub-agents run at once and a wholesale copy would have them shar
 and overwrite each other's entries.  `required_skills` is copied rather than
 shared so a child's append cannot rewrite the parent's list.
 
-**What is left of Task 7.**  Three members, and the split is sharp:
+**Extraction 10 — promoting run summaries into memory.**
+`promote_orchestration_runs` moved to `spawn_planning.py` with the store, clock
+and entry class supplied as arguments, so it can be exercised without a store, a
+clock, or the memory layer's entry class.  The three filters it enforces are now
+each pinned by a test, and each exists because the alternative put something
+wrong into memory a later turn reads as *fact*:
 
-- `_promote_orchestration_runs` (1 `self.*`) — writes session memory; needs a
-  store seam before it can move.
+- ``result.ok`` — a failed sub-agent's text is not a finding;
+- non-empty after stripping — an empty summary would occupy a retrieval slot
+  while carrying no information;
+- a length bound — this text joins a later turn's context, so unbounded
+  promotion competes with the conversation it is meant to inform.
+
+**What is left of Task 7.**  Two members, and they are one decision:
+
+- `_create_sub_agent` (15 `self.*`) and `_execute_agent` (**288 lines, 16
+  attributes**) — **one decision, not two**: `_execute_agent` is the single
+  primitive every runner calls, and extracting it means agreeing on how a
+  sub-agent is constructed and driven.  That is a design decision, and it is the
+  reason the plan ordered this group last.
 - `_create_sub_agent` (15) and `_execute_agent` (**288 lines, 16 attributes**) —
   **one decision, not two**: `_execute_agent` is the single primitive every
   runner calls, and extracting it means agreeing on how a sub-agent is

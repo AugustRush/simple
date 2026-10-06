@@ -17,7 +17,11 @@ from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt, _now
-from agent.core.spawn_planning import PlannerDeps, SpawnPlanner
+from agent.core.spawn_planning import (
+    PlannerDeps,
+    SpawnPlanner,
+    promote_orchestration_runs,
+)
 from agent.core.subagent_context import (
     canonicalize_write_scope,
     compose_sub_system_prompt,
@@ -3884,40 +3888,19 @@ class BaseAgent:
         return payload
 
     def _promote_orchestration_runs(self) -> None:
-        """Promote only bounded, successful run summaries into session memory."""
-        active_runs = _active_orchestration_runs.get() or []
-        context_manager = self._context_manager_for()
-        if not context_manager:
-            return
-        session_id = context_manager.staging.session_id
-        for run in active_runs:
-            run_id = str(run.get("run_id") or "")
-            for result in run.get("results", []):
-                if not isinstance(result, SubtaskResult) or not result.ok:
-                    continue
-                summary = str(result.summary or result.content or "").strip()
-                if not summary:
-                    continue
-                summary = summary[:1600]
-                now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                context_manager.store.add_entry(
-                    LTMEntry(
-                        id=shared._new_id(),
-                        content=(
-                            f"orchestration run {run_id} [{result.id}] summary:\n"
-                            f"{summary}"
-                        ),
-                        importance=0.45,
-                        category="episodes",
-                        entity="orchestration",
-                        memory_type="orchestration_summary",
-                        scope=f"session:{session_id}",
-                        source_session=session_id,
-                        confidence=0.6,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
+        """Promote only bounded, successful run summaries into session memory.
+
+        See :func:`agent.core.spawn_planning.promote_orchestration_runs`; the
+        store, clock and entry class are supplied here rather than imported
+        there, so the promotion can be tested without any of them.
+        """
+        promote_orchestration_runs(
+            self._context_manager_for(),
+            _active_orchestration_runs.get() or [],
+            now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            new_id=shared._new_id,
+            entry_type=LTMEntry,
+        )
 
     def register_spawn_capability(
         self, base_system_prompt: str, workspace_root: Optional[Path] = None
