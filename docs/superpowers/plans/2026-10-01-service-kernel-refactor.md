@@ -31,19 +31,35 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 done; Task 7 in progress (6 extractions done; runners and sub-agent groups remain).** Tasks 8-10 not started.
+**Tasks 0-6 done.  Task 7 is 8 of 9 extractions done.**  Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c | T7d1-4 | T7d5 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | 3 f / 2818 p | 3 f / 2843 p | 3 f / 2877 p | 3 f / 2908 p | 3 f / 2926 p | **3 f / 2944 p** |
-| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | 4554 | 4265 | 4248 | 4169 | 4117 | **4105** |
-| FAILED set | baseline | identical | identical | identical | identical | identical | identical | identical |
-| Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same | +1 recorded |
-| Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 | 1 |
-| Component container reachable from tools | yes | yes | yes | yes | yes | no | no | no |
-| Plugin unload | 5 paths, 2 leaks | — | — | — | — | — | 1 path, 0 leaks | same |
-| Executor depends on the plugin catalog | yes | yes | yes | yes | yes | yes | yes | **no** |
+Measured after each stage, same command every time
+(`.venv/bin/python -m pytest -q -p no:cacheprovider`):
+
+| Stage | Full suite | `agent/core/agent.py` | Headline change |
+| --- | --- | --- | --- |
+| Baseline | 19 failed / 2641 passed | 4704 | — |
+| T0 state ledger | 19 / 2649 | 4704 | 49 pieces of escaping state recorded + guarded |
+| T1 service registry | 3 / 2687 | 4704 | scoped, reversible registration |
+| T2 provider registry | 3 / 2705 | 4704 | a wire format is registered, not dispatched |
+| T3 tool views | 3 / 2730 | 4704 | 3 scopes → 1 (`ToolView` + `derive`) |
+| T4 container backdoor | 3 / 2737 | 4703 | `get_context("components")` gone |
+| T5 plugin unload | 3 / 2753 | 4703 | 5 unload paths → 1; 2 documented leaks closed |
+| T6 tool events | 3 / 2772 | 4703 | executor no longer holds the plugin catalog |
+| T7a error classification | 3 / 2803 | 4657 | `llm_errors.py` |
+| T7b window arithmetic | 3 / 2818 | 4554 | `token_budget.py` |
+| T7c stuck detection | 3 / 2843 | 4265 | `tool_watchdog.py` |
+| T7d1-4 text/contract/planning/runners | 3 / 2908 | 4169 | `bounded_text.py`, `output_contract.py`, `spawn_planning.py` |
+| T7d5 sub-agent context | 3 / 2926 | 4117 | `subagent_context.py` |
+| T7d6 payload boundaries | **3 / 2944** | **4105** | tests only |
+
+The FAILED set is byte-identical to
+`docs/superpowers/plans/2026-10-01-baseline-failures.txt` at every stage.  The
+19 → 3 drop between T0 and T1 is **not this work**: the run environment's file
+policy changed from `workspace-write` to `danger-full-access`, and all 16 sandbox
+failures vanished with it.  Both baselines are recorded separately, with that
+reason, rather than the number being quietly adjusted.
 
 Command for every column: `.venv/bin/python -m pytest -q -p no:cacheprovider`.
 
