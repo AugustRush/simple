@@ -33,6 +33,7 @@ from .models import (
     produces_for_run,
 )
 from .store import SchedulerStore
+from .store_call import call_store_method
 
 
 UTC = timezone.utc
@@ -76,29 +77,16 @@ class SchedulerService:
         self._running = False
 
     async def _store_call(self, method_name: str, *args, **kwargs):
-        """Run SQLite work off-loop using a connection owned by that thread."""
-        if type(self.store) is not SchedulerStore:
-            operation = asyncio.create_task(
-                asyncio.to_thread(getattr(self.store, method_name), *args, **kwargs)
-            )
-        else:
+        """Run store work off-loop, on the store's own terms.
 
-            def invoke():
-                thread_store = SchedulerStore(db_path=self.store.db_path)
-                try:
-                    return getattr(thread_store, method_name)(*args, **kwargs)
-                finally:
-                    thread_store.close()
-
-            operation = asyncio.create_task(asyncio.to_thread(invoke))
-        try:
-            return await asyncio.shield(operation)
-        except asyncio.CancelledError:
-            # A thread cannot be cancelled. Wait for it so a claim/complete
-            # cannot commit after the scheduler has reported itself stopped.
-            with contextlib.suppress(Exception):
-                await operation
-            raise
+        This used to test ``type(self.store) is not SchedulerStore`` and open a
+        thread-owned connection itself when the store was the SQLite one.  The
+        question -- "call the store directly, or on a copy that owns its own
+        connection?" -- is now the store's own answer via
+        ``_calling_in_thread()``, because only the SQLite store knows its
+        connection is thread-bound.  See agent/scheduler/store_call.py.
+        """
+        return await call_store_method(self.store, method_name, *args, **kwargs)
 
     def _free_slots(self) -> int:
         """How many runs may be claimed right now without having to queue.

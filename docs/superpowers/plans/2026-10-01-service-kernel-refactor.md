@@ -1265,6 +1265,43 @@ ignore that and break a contract the tests already rely on.  The factory's own
 default (the shared scheduler directory) is still exercised, for callers that
 have no opinion.
 
+## Task 10, third slice: the thread-affinity decision moved into the store
+
+I had flagged `SchedulerService._store_call`'s
+``type(self.store) is not SchedulerStore`` as a decision needing a choice between
+two designs.  Measuring the package first changed that: **it is the only
+concrete-class test in the whole scheduler package, and `self.store` appears in
+only four lines** (the assignment plus the three of that branch).  A decision
+that small did not need to be escalated -- it needed the knowledge put where it
+belongs.
+
+**The knowledge is the store's, not the scheduler's.**  Only `SchedulerStore`
+knows its SQLite connection is thread-bound, so it now answers for itself:
+
+```python
+# agent/scheduler/store.py
+def _calling_in_thread(self) -> "SchedulerStore":
+    if type(self) is SchedulerStore:
+        return SchedulerStore(db_path=self.db_path)
+    return self
+```
+
+`agent/scheduler/store_call.py` asks that question and calls the answer, so
+`_store_call` is one delegation and the scheduler has no branch and no class test.
+
+**One thing kept deliberately, including its wart:** the check is by *identity*,
+not ``isinstance``, so a `SchedulerStore` subclass returns itself and inherits the
+parent's connection -- the same thread-affinity hazard the old class test had.
+Narrowing it here would be a behavioural change wearing a refactor's clothes, and
+the point was to move *where* the decision lives, not to alter *what* it decides.
+The test asserts the identity behaviour explicitly, with a control showing the
+base class is not identity-preserving.
+
+Two guards now stand over this: `test_the_scheduler_contains_no_concrete_store_test`
+parses `runtime.py` and fails on any `type(...) is SchedulerStore` or
+`isinstance(..., SchedulerStore)`, and `test_the_scheduler_still_constructs_no_store`
+keeps the construction seam from the first slice intact.
+
 ## Task 10: ralph and scheduler as plugins — the boundary, measured
 
 Task 10 needs a store interface before either service can become a plugin.  The

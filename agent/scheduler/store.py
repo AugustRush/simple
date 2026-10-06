@@ -548,6 +548,22 @@ class SchedulerStore:
         self._ensure_schema()
 
     @_synchronized
+    def _calling_in_thread(self) -> "SchedulerStore":
+        """A store for this thread to call, owning its own connection.
+
+        A SQLite connection cannot be used from another thread, so the scheduler
+        asks the store how it wants to be called rather than testing its class.
+        Identity -- ``type(self) is SchedulerStore`` -- so a subclass keeps
+        inheriting the parent's connection, exactly as the old class test did:
+        this hook moves *where* the decision lives, not *what* it decides.
+
+        Callers own the returned store and should ``close()`` it; the task does,
+        in a ``finally``.
+        """
+        if type(self) is SchedulerStore:
+            return SchedulerStore(db_path=self.db_path)
+        return self
+
     def close(self) -> None:
         self._conn.close()
 
