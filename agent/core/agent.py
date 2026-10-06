@@ -22,6 +22,7 @@ from agent.core.spawn_planning import (
     SpawnPlanner,
     promote_orchestration_runs,
 )
+from agent.core.subagent_run import run_with_retries
 from agent.core.subagent_factory import (
     SubAgentSpec,
     build_sub_agent,
@@ -3676,119 +3677,48 @@ class BaseAgent:
                 },
             )
         )
-        # Only auto-retry read-only profiles — implementation workers may
-        # have written files or produced side effects that a retry cannot
-        # roll back.  "full" profile is excluded for the same reason.
-        retries = int(self.sub_agent_retries)
-        if capability_profile not in {"read_only", "research"}:
-            retries = 0
-        max_attempts = max(0, retries) + 1
-        result = None
-        started_at = time.monotonic()  # overwritten per attempt; init for type-checker
-        # sub_agent_timeout_seconds bounds the whole subtask, not each attempt.
-        # Giving every retry a fresh full timeout would let one subtask consume
-        # attempts x timeout of wall clock while still reporting the
-        # single-attempt figure as its deadline.
-        total_budget = float(self.sub_agent_timeout_seconds)
-        budget_deadline = time.monotonic() + total_budget
-        failure_payload: dict[str, Any] | None = None
-        for attempt in range(1, max_attempts + 1):
-            remaining_budget = budget_deadline - time.monotonic()
-            if attempt > 1 and remaining_budget <= 0:
-                # Budget exhausted — stop retrying instead of overrunning it.
-                break
-            if attempt > 1:
-                sub_ctx = _fresh_sub_ctx()
-                self._emit_subagent_event(
-                    SubAgentProgressEvent(
-                        kind="agent_retry",
-                        role=role,
-                        task=shaped_task,
-                        message=f"{role} retry {attempt}/{max_attempts}",
-                        metrics={
-                            "capability_profile": capability_profile,
-                            "attempt": attempt,
-                            "max_attempts": max_attempts,
-                        },
-                    )
-                )
-            started_at = time.monotonic()
-            try:
-                result = await asyncio.wait_for(
-                    sub_agent.send_message(sub_ctx, shaped_task),
-                    timeout=max(0.0, budget_deadline - time.monotonic()),
-                )
-                break  # success — exit retry loop
-            except asyncio.TimeoutError:
-                partial = ""
-                for msg in reversed(sub_ctx.messages):
-                    if msg.get("role") == "assistant" and msg.get("content"):
-                        partial = str(msg["content"])[:500]
-                        break
-                spent = time.monotonic() + total_budget - budget_deadline
-                payload: dict[str, Any] = {
-                    "ok": False,
-                    "role": role,
-                    "task": shaped_task,
-                    "timed_out": True,
-                    "error": (
-                        f"sub-agent exhausted its {total_budget:g}s budget after "
-                        f"{spent:.1f}s across {attempt} attempt(s)"
-                    ),
-                }
-                if partial:
-                    payload["partial_content"] = partial
-                failure_payload = payload
-                # A timeout consumes the remaining budget, so there is nothing
-                # left to retry with; report instead of silently overrunning.
-                elapsed = time.monotonic() - started_at
-                self._emit_subagent_event(
-                    SubAgentProgressEvent(
-                        kind="agent_failed",
-                        role=role,
-                        task=shaped_task,
-                        message=payload["error"],
-                        metrics={
-                            "capability_profile": capability_profile,
-                            "write_scope_count": len(normalized_scope),
-                            "duration_seconds": elapsed,
-                            "attempts": attempt,
-                        },
-                    )
-                )
-                return payload
-            except Exception as e:
-                payload = {
-                    "ok": False,
-                    "role": role,
-                    "task": shaped_task,
-                    "error": f"sub-agent failed: {self._format_agent_error(e)}",
-                }
-                failure_payload = payload
-                if attempt < max_attempts:
-                    # Retry a transient failure only while budget remains; the
-                    # check at the top of the loop enforces that.
-                    continue
-                elapsed = time.monotonic() - started_at
-                self._emit_subagent_event(
-                    SubAgentProgressEvent(
-                        kind="agent_failed",
-                        role=role,
-                        task=shaped_task,
-                        message=payload["error"],
-                        metrics={
-                            "capability_profile": capability_profile,
-                            "write_scope_count": len(normalized_scope),
-                            "duration_seconds": elapsed,
-                            "attempts": attempt,
-                        },
-                    )
-                )
-                return payload
+        # The context in flight, kept in a cell the loop's callbacks share.
+        # A retry must run on a *fresh* context (see _fresh_sub_ctx), so the
+        # attempt being sent and the attempt being read for partial text must
+        # be the same one -- capturing the initial `sub_ctx` in both closures
+        # made a retry send the new context and salvage text from the old.
+        _current: dict[str, AgentContext] = {"ctx": sub_ctx}
 
+        def _new_context() -> AgentContext:
+            ctx = _fresh_sub_ctx()
+            _current["ctx"] = ctx
+            return ctx
+
+        outcome = await run_with_retries(
+            role=role,
+            shaped_task=shaped_task,
+            capability_profile=capability_profile,
+            write_scope_count=len(normalized_scope),
+            configured_retries=self.sub_agent_retries,
+            timeout_seconds=self.sub_agent_timeout_seconds,
+            send=lambda: sub_agent.send_message(_current["ctx"], shaped_task),
+            fresh_context=_new_context,
+            current_context=lambda: _current["ctx"],
+            emit=lambda **fields: self._emit_subagent_event(
+                SubAgentProgressEvent(
+                    kind=fields.pop("kind"),
+                    role=fields.pop("role"),
+                    task=fields.pop("task"),
+                    message=fields.pop("message", ""),
+                    metrics=fields.pop("metrics", None) or {},
+                )
+            ),
+            format_error=self._format_agent_error,
+        )
+        result = outcome.result
+        failure_payload = outcome.payload
+        started_at = outcome.started_at
         if result is None:
-            # The loop exited without success: either the budget ran out before
-            # a retry could start, or the last attempt failed.
+            # No attempt succeeded: either the budget ran out before a retry
+            # could start, or the last attempt failed.  This is a conditional
+            # return, not an unconditional one -- an earlier version of this
+            # splice lost that distinction and reported "no result" for every
+            # successful sub-agent.
             return failure_payload or {
                 "ok": False,
                 "role": role,

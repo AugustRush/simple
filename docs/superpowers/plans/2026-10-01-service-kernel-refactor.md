@@ -55,7 +55,8 @@ Measured after each stage, same command every time
 | T7d6 payload boundaries | 3 / 2944 | 4105 | tests only |
 | T7d7 metadata inheritance | 3 / 2950 | 4084 | `propagate_sub_metadata` |
 | T7d8 run promotion | 3 / 2960 | 4067 | `promote_orchestration_runs` |
-| T7d9 sub-agent factory | **3 / 2978** | **4063** | `subagent_factory.py` |
+| T7d9 sub-agent factory | 3 / 2978 | 4063 | `subagent_factory.py` |
+| T7d10 retry loop + budget | **3 / 2997** | **3993** | `subagent_run.py` |
 
 The FAILED set is byte-identical to
 `docs/superpowers/plans/2026-10-01-baseline-failures.txt` at every stage.  The
@@ -475,6 +476,38 @@ Two details are load-bearing and now tested:
   be posted to the wrong endpoint.
 - **The snapshot is frozen.**  A sub-agent runs with the limits the turn had when
   it was spawned; a later config edit cannot change a running child's ceiling.
+
+**Extraction 12 — the sub-agent retry loop.**
+`agent/core/subagent_run.py` holds `run_with_retries` and `retries_for_profile`.
+111 of `_execute_agent`'s 288 lines were this loop, and measuring it first is
+what made the extraction safe: it reached exactly four attributes of its parent,
+so the rest became arguments -- including the function that performs one attempt,
+which is what makes the retry policy testable with a scripted callable instead of
+a live model.
+
+**A defect the extraction introduced, and a guard that caught it.**  The first
+version accepted `fresh_context` and never called it, so a retry inherited the
+failed attempt's conversation: the model would be asked to continue a
+conversation it had already answered, and the parent would read two attempts as
+one turn.  The test that caught it pinned the *count* of contexts built (one
+before the loop, one per retry) -- an assertion that only exists because the
+extraction made the loop observable.  Two further splice errors were caught the
+same way: an unconditional `return` where the original had a conditional one
+(every successful sub-agent reported "no result"), and a stale failure payload
+surviving a later success.
+
+**The budget rules are now pinned by tests** rather than inferred from comments:
+
+- `sub_agent_timeout_seconds` bounds the whole subtask, so a retry cannot
+  multiply the wall clock it may consume (asserted with a hanging `send`);
+- a timeout ends the loop instead of retrying, because it already spent the
+  budget it would retry with;
+- only `read_only` and `research` retry at all -- an implementation worker may
+  have written files a retry cannot roll back;
+- partial text from a timed-out attempt is salvaged, and an empty one is omitted
+  rather than stored as `""`.
+
+`agent/core/agent.py` is now **3993** lines -- 4703 to 3993, a 15% reduction.
 
 ### The one decision left, written down so it can be settled
 
