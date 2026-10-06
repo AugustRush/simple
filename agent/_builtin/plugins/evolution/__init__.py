@@ -25,6 +25,8 @@ per-invocation overlay provides ``command_context`` and the current session
 
 from __future__ import annotations
 
+from agent.runtime.system_prompt import publish_system_prompt
+
 import json
 import re
 import uuid
@@ -290,14 +292,13 @@ class EvolutionPlugin:
         new_prompt = await self._engine.rewrite_system_prompt()
         system_prompt = self._compose_prompt(new_prompt, components)
         components["base_system_prompt"] = new_prompt
-        components["system_prompt"] = system_prompt
+        # One publisher: this writes the mapping and follows the live context,
+        # which is what the hand-written pair below used to do.
+        publish_system_prompt(components, system_prompt)
         state = self._current_state(components)
         if state is not None:
             state.base_system_prompt_override = new_prompt
             state.system_prompt_override = system_prompt
-        ctx = self._current_ctx(components)
-        if ctx is not None:
-            ctx.system_prompt = system_prompt
         return CommandResult(response_text="System prompt updated.")
 
     async def _handle_generate_tool(self, raw_cmd: str, components: dict) -> Any:
@@ -342,12 +343,9 @@ class EvolutionPlugin:
         if base_prompt is None:
             base_prompt = components.get("base_system_prompt", "")
         system_prompt = self._compose_prompt(base_prompt, components)
-        components["system_prompt"] = system_prompt
+        publish_system_prompt(components, system_prompt)
         if state is not None:
             state.system_prompt_override = system_prompt
-        ctx = self._current_ctx(components)
-        if ctx is not None:
-            ctx.system_prompt = system_prompt
         summary = str(
             outcome.get("summary_text")
             or f"Tool '{outcome.get('tool_id', '')}' created."

@@ -19,6 +19,7 @@ from typing import (
 )
 
 from agent.runtime.services import MissingServiceError, ServiceRegistry
+from agent.runtime.system_prompt import publish_system_prompt
 from agent.core.attachments import MessageAttachment
 from agent.core.output import (
     EventCollector,
@@ -569,7 +570,7 @@ class AgentCore:
             skill_catalog=skill_catalog,
             plugin_catalog=self._plugin_catalog(),
         )
-        self._components.values["system_prompt"] = shared_refreshed
+        publish_system_prompt(self._components.values, shared_refreshed)
 
         if state.base_system_prompt_override is not None:
             refreshed = agent_module._compose_system_prompt(

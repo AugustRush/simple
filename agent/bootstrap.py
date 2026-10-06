@@ -24,6 +24,7 @@ from agent.commands import (
     register_builtin_commands,
 )
 from agent.commands.composition import ensure_command_router
+from agent.runtime.system_prompt import refresh_system_prompt
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime import AgentCore, TurnRunner
@@ -429,19 +430,13 @@ def _empty_mcp_status(configured_servers: int = 0) -> dict[str, int]:
 
 
 def _refresh_components_system_prompt(components: dict) -> str:
-    refreshed = _compose_system_prompt(
-        components.get("base_system_prompt", ""),
-        components.get("registry"),
-        components.get("workspace_root"),
-        components.get("output_dir"),
-        skill_catalog=components.get("skill_catalog"),
-        plugin_catalog=components.get("plugin_catalog"),
-    )
-    components["system_prompt"] = refreshed
-    ctx = components.get("ctx")
-    if ctx is not None:
-        ctx.system_prompt = refreshed
-    return refreshed
+    """Recompose the prompt and publish it.
+
+    The composition stays here (see agent/runtime/system_prompt.py for why the
+    *publish* is shared and the *compose* is not), but the write goes through one
+    function so it cannot drift from the other publishers.
+    """
+    return refresh_system_prompt(components)
 
 
 async def _connect_mcp_in_background(
