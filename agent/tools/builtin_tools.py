@@ -3831,10 +3831,8 @@ class BuiltinTools:
 
     def _schedule_store(self) -> SchedulerStore:
         if self._cached_schedule_store is None:
-            from agent.scheduler import SchedulerStore
-            self._cached_schedule_store = SchedulerStore(
-                db_path=shared.SCHEDULER_DB_FILE
-            )
+            from agent.scheduler import open_store
+            self._cached_schedule_store = open_store()
         return self._cached_schedule_store
 
     def _schedule_target(self, delivery_mode: Optional[str] = None):

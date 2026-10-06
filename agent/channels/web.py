@@ -1794,9 +1794,9 @@ class WebChannel(Channel):
         connection rather than widening the builder's contract for one
         validation.
         """
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
-        probe = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        probe = open_store()
         try:
             return probe.describe_signal_problem(name)
         finally:
@@ -2135,10 +2135,10 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
         from agent.scheduler.profiles import profile_payloads
 
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             unseen = store.unacknowledged_attention_counts()
             workflows = []
@@ -2170,10 +2170,10 @@ class WebChannel(Channel):
             body = await request.json()
             if not isinstance(body, dict):
                 raise ValueError("body must be an object")
-            from agent.scheduler import SchedulerStore
+            from agent.scheduler import open_store
 
             workflow = self._workflow_from_body(body)
-            store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            store = open_store()
             try:
                 created = store.create_workflow(workflow)
                 return self._workflow_response(store, created)
@@ -2191,10 +2191,10 @@ class WebChannel(Channel):
             body = await request.json()
             if not isinstance(body, dict):
                 raise ValueError("body must be an object")
-            from agent.scheduler import SchedulerStore
+            from agent.scheduler import open_store
 
             workflow_id = str(request.path_params["workflow_id"])
-            store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            store = open_store()
             try:
                 existing = store.get_workflow(workflow_id)
                 if existing is None:
@@ -2214,10 +2214,10 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
         workflow_id = str(request.path_params["workflow_id"])
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             if store.get_workflow(workflow_id) is None:
                 return JSONResponse({"error": "workflow not found"}, status_code=404)
@@ -2242,10 +2242,10 @@ class WebChannel(Channel):
         from starlette.responses import JSONResponse
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
         from agent.scheduler.profiles import profile_payloads
 
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             # One snapshot for the whole response: the per-task counts on the
             # cards, the badge number, and the rows behind it all read from
@@ -2287,14 +2287,14 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
         task_id = str(request.path_params["task_id"])
         try:
             limit = max(1, min(int(request.query_params.get("limit", "50")), 100))
         except ValueError:
             limit = 50
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             task = store.get_task(task_id)
             if task is None:
@@ -2318,11 +2318,11 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
         task_id = str(request.path_params["task_id"])
         run_id = str(request.path_params["run_id"])
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             if store.get_task(task_id) is None:
                 return JSONResponse({"error": "task not found"}, status_code=404)
@@ -2376,11 +2376,11 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
         task_id = str(request.path_params["task_id"])
         run_id = str(request.path_params["run_id"])
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             run = store.get_run(task_id, run_id)
         finally:
@@ -2416,11 +2416,11 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
         task_id = str(request.path_params["task_id"])
         run_id = str(request.path_params["run_id"])
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             run = store.get_run(task_id, run_id)
         finally:
@@ -2446,10 +2446,10 @@ class WebChannel(Channel):
             body = await request.json()
             if not isinstance(body, dict):
                 raise ValueError("body must be an object")
-            from agent.scheduler import SchedulerStore
+            from agent.scheduler import open_store
 
             task = self._schedule_from_body(body)
-            store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            store = open_store()
             try:
                 created = store.create_task(task)
             finally:
@@ -2461,8 +2461,8 @@ class WebChannel(Channel):
     async def _delete_schedule(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
         if not self._authorized(request): return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        from agent.scheduler import open_store
+        store = open_store()
         try:
             task_id = str(request.path_params["task_id"])
             task = store.get_task(task_id)
@@ -2483,8 +2483,8 @@ class WebChannel(Channel):
         try: body = await request.json()
         except Exception: return JSONResponse({"error": "invalid json body"}, status_code=400)
         if not isinstance(body, dict) or "enabled" not in body: return JSONResponse({"error": "enabled is required"}, status_code=400)
-        from agent.scheduler import SchedulerStore
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        from agent.scheduler import open_store
+        store = open_store()
         try:
             task_id = str(request.path_params["task_id"])
             try:
@@ -2508,9 +2508,9 @@ class WebChannel(Channel):
             body = await request.json()
             if not isinstance(body, dict):
                 raise ValueError("body must be an object")
-            from agent.scheduler import SchedulerStore, mirror_step_edit, step_owns_no_trigger
+            from agent.scheduler import open_store, mirror_step_edit, step_owns_no_trigger
 
-            store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+            store = open_store()
             try:
                 task_id = str(request.path_params["task_id"])
                 existing = store.get_task(task_id)
@@ -2565,7 +2565,7 @@ class WebChannel(Channel):
         action = str(body.get("action", "")).strip().lower()
         if action not in {"enable", "disable", "delete"}:
             return JSONResponse({"error": "unsupported bulk action"}, status_code=400)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
         completed: list[str] = []
         # One convention for both kinds of skip: the sentence that says why.
@@ -2573,7 +2573,7 @@ class WebChannel(Channel):
         # the only reader here counts them -- while the reasons worth having
         # are the ones the store writes, which are already sentences.
         skipped: list[dict[str, str]] = []
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             for task_id in ids:
                 task = store.get_task(task_id)
@@ -2677,9 +2677,9 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             acknowledged = store.acknowledge_run(
                 str(request.path_params["task_id"]),
@@ -2717,9 +2717,9 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             return JSONResponse(_attention_payload(store))
         finally:
@@ -2738,9 +2738,9 @@ class WebChannel(Channel):
         if not isinstance(body, dict):
             return JSONResponse({"error": "invalid json body"}, status_code=400)
         task_id = str(body.get("task_id") or "").strip()
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             cleared = store.acknowledge_attention(task_id or None)
             return JSONResponse(
@@ -2773,11 +2773,11 @@ class WebChannel(Channel):
         accident.
         """
         from starlette.responses import JSONResponse
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             emissions = store.signal_names()
             subscribers: dict[str, int] = {}
@@ -3152,9 +3152,9 @@ class WebChannel(Channel):
         The path is never taken from the query string; it is re-read from the
         run so a forged ``path`` cannot point at an unrelated local file.
         """
-        from agent.scheduler import SchedulerStore
+        from agent.scheduler import open_store
 
-        store = SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+        store = open_store()
         try:
             run = store.get_run(task_id, run_id)
         except Exception:

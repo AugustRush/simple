@@ -4032,3 +4032,28 @@ class SchedulerStore:
             if key in blocked and key in tasks:
                 paired.append((key, tasks[key]))
         return paired
+
+
+def open_store(db_path: Optional[Path] = None) -> "SchedulerStore":
+    """The one place a ``SchedulerStore`` is constructed.
+
+    Why this exists
+    ---------------
+    ``SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)`` was written out in
+    twenty-two places -- twenty in the web channel alone, one in the CLI and one
+    in a builtin tool -- and every one of them resolved the same module-level
+    global, which ``_set_agent_home`` rewrites at runtime.  Twenty-two readers of
+    one mutable global is the same shape as the ``components`` backdoor that
+    Task 4 removed, and it has the same consequence: the database a caller talks
+    to is a property of the process, not of the caller, and there is no seam at
+    which a test or another composition can point somewhere else.
+
+    The parameter is therefore the point.  ``None`` keeps the configured default,
+    which is what every existing call site wanted, and an explicit path lets a
+    caller -- a test, a second instance, a future plugin -- choose its own.
+
+    Callers own the returned store and must ``close()`` it; this does not manage
+    a connection pool, because two of the call sites deliberately hold one open
+    for the life of a service.
+    """
+    return SchedulerStore(db_path=db_path)

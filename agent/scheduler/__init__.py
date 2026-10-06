@@ -80,7 +80,7 @@ from .editing import (
     trigger_to_body,
 )
 from .runtime import SchedulerService
-from .store import SchedulerStore
+from .store import SchedulerStore, open_store
 from .unattended import ConsentDecision, UnattendedAudit, UnattendedOutputSink
 
 __all__ = [
@@ -122,6 +122,7 @@ __all__ = [
     "SchedulerDelivery",
     "SchedulerService",
     "SchedulerStore",
+    "open_store",
     "TERMINAL_RUN_STATUSES",
     "TaskRun",
     "Workflow",

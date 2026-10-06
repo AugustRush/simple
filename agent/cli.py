@@ -515,7 +515,10 @@ def _missing_feishu_dependency_hint() -> str:
 
 
 def _scheduler_store() -> SchedulerStore:
-    return SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)
+    """This process's scheduler store.  See agent.scheduler.open_store."""
+    from agent.scheduler import open_store
+
+    return open_store()
 
 
 def _scheduler_delivery_target(

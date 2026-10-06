@@ -1205,6 +1205,41 @@ decision for the plan's owner; the evidence for it is now in the suite.
 
 ---
 
+## Task 10, first slice: the store construction seam (done)
+
+The plan said Task 10 needs a store interface first.  Measuring the *construction*
+side rather than the interface side changed the picture: this was the same debt
+Task 4 removed for the component container, one layer down.
+
+**`SchedulerStore(db_path=shared.SCHEDULER_DB_FILE)` was written out in
+twenty-two places** -- twenty in `agent/channels/web.py`, one in `agent/cli.py`,
+one in `agent/tools/builtin_tools.py` -- and every one resolved the same
+module-level global, which `_set_agent_home` rewrites at runtime.  Twenty-two
+readers of one mutable global means the database a caller talks to is a property
+of the *process*, not of the caller, and there is no seam at which a test or
+another composition can point elsewhere.
+
+That is now `agent/scheduler/open_store(db_path=None)`, which is also the first
+store interface Task 10 needs: an explicit path parameter, and exactly one place
+that names the concrete class.  The guard is source-level, because a
+construction in a branch the tests do not exercise is precisely the case to
+catch:
+
+- `test_only_the_scheduler_package_constructs_the_store` — fails on any
+  `SchedulerStore(...)` outside `agent/scheduler`.  Verified by reintroducing one
+  in `builtin_tools.py`; it reported the module.
+- `test_no_module_resolves_the_scheduler_path_directly` — fails on a
+  `shared.SCHEDULER_DB_FILE` read outside the package, with one narrow exemption:
+  a tool that *reports* which database it used (a `"db_path": str(...)` display
+  value) is telling the user where their data went, not driving scheduler
+  behaviour.  The exemption is a regex on that shape so it cannot absorb a
+  construction.
+
+**Still open, and unchanged by this:** `SchedulerService._store_call` tests
+`type(self.store) is SchedulerStore` to decide thread affinity.  See the note
+below — that is a different question (what the scheduler may *assume* about a
+store) from where the store *comes from*, which is what this slice settled.
+
 ## Task 10: ralph and scheduler as plugins — the boundary, measured
 
 Task 10 needs a store interface before either service can become a plugin.  The
