@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 from agent import shared
 from agent.core.events import TOOL_EVENTS, ToolPostExecute, ToolPreExecute
 from agent.core.output import _active_event_collector
+from agent.plugins.profiles import DEFAULT_PROFILE, resolve_plugin_state
 
 CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
@@ -968,6 +969,10 @@ class PluginCatalog:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
         self._plugin_config = plugin_config or {}
+        #: The composition to load under.  The default profile expresses no
+        #: opinion, so an existing caller sees exactly the plugins it saw before
+        #: this module existed -- see agent/plugins/profiles.py.
+        self._plugin_profile = DEFAULT_PROFILE
         self._turn_hook_timeout_seconds = max(0.0, float(turn_hook_timeout_seconds))
         self._reload_lock = asyncio.Lock()
         self._hook_executor = ThreadPoolExecutor(
@@ -1082,11 +1087,17 @@ class PluginCatalog:
     # ── Discovery ─────────────────────────────────────────────────────────────
 
     def _is_plugin_enabled(self, name: str) -> bool:
-        """Check config.json plugins section for enabled status."""
-        pcfg = self._plugin_config.get(name, {})
-        if isinstance(pcfg, dict):
-            return pcfg.get("enabled", True)
-        return True
+        """Whether this plugin loads in this composition.
+
+        Resolved through :mod:`agent.plugins.profiles` rather than read out of the
+        raw ``plugins`` section, so the decision has a name, a default and a
+        documented precedence.  The old body understood one key and stated none of
+        that: the default was load-everything, and the only way to know what a run
+        would load was to read the file it happened to be handed.
+        """
+        return resolve_plugin_state(
+            name, config=self._plugin_config, profile=self._plugin_profile
+        ).enabled
 
     def discover_and_load(self) -> list[str]:
         """Scan plugin directories and load all valid plugins.

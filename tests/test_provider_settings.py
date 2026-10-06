@@ -50,7 +50,16 @@ def _provider_keys_read_by_the_loader() -> dict[str, set[str]]:
 
 
 #: ``pcfg`` there is a *plugin's* config, not a provider entry.
-_NOT_A_PROVIDER = {"agent/plugins/catalog.py": {"enabled"}}
+#:
+#: ``profiles.py`` is listed because the plugin-config read moved there: the scan
+#: identifies a provider entry by its variable name, and ``resolve_plugin_state``
+#: names its parameter ``config``.  The list is keyed by path, so moving a read
+#: between files means editing it -- which is why the entry is asserted below
+#: rather than left as a bare exemption.
+_NOT_A_PROVIDER = {
+    "agent/plugins/catalog.py": {"enabled"},
+    "agent/plugins/profiles.py": {"enabled"},
+}
 
 
 def test_provider_fields_are_the_keys_the_code_reads():

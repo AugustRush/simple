@@ -1,0 +1,211 @@
+"""Which plugins load, declared rather than inferred.
+
+The problem this replaces
+-------------------------
+"What loads" lived in one place, ``config.json``'s ``plugins`` section, read by
+one method that understood exactly one key:
+
+    pcfg = self._plugin_config.get(name, {})
+    return pcfg.get("enabled", True)
+
+That is not wrong, it is *unstated*.  The default is load-everything, the section
+is per-plugin rather than per-composition, and the only way to know what a given
+run will load is to read the file it happened to be handed.  The web channel even
+reaches in and replaces ``catalog._plugin_config`` wholesale, so the answer can
+change while the process runs.
+
+The shape, borrowed from ``PERMISSION_PROFILES``
+------------------------------------------------
+``agent/scheduler/profiles.py`` already solved this problem for permissions: a
+frozen dataclass per row, a table keyed by name, an explicit fail-closed fallback,
+and a ``to_payload()`` so the UI never hardcodes the list.  This is the same shape
+for plugins, which is why it is a table and a resolver rather than new logic in
+the catalog:
+
+- :class:`PluginEntry` -- one plugin's intent: enabled, disabled, or overridden
+  with config;
+- :data:`DEFAULT_PROFILE` -- what a composition gets when it names nothing, which
+  is what happens today;
+- :class:`PluginProfile` -- a named composition: a list of entries that override
+  the default.
+
+Additive on purpose
+-------------------
+A profile overrides; it does not replace.  Two reasons, both concrete: a profile
+that omitted a plugin would be indistinguishable from one that disabled it, and
+disabling is a thing this project genuinely wants (the ``_example_disabled`` key in
+``config.example.json`` exists for it).  Overriding keeps the file's existing
+meaning while making a composition nameable.
+
+Disabled wins over enabled
+--------------------------
+When a plugin is turned off in the configuration, no profile re-enables it.  A
+profile is a composition *within* what is permitted, not a way around an operator's
+decision, and the alternative -- last write wins -- would make "off" depend on load
+order.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Optional
+
+__all__ = [
+    "DEFAULT_PROFILE_NAME",
+    "DEFAULT_PROFILE",
+    "PluginEntry",
+    "PluginProfile",
+    "KnownProfileError",
+    "resolve_plugin_state",
+    "profile_names",
+]
+
+#: The profile a composition gets when it names none.
+DEFAULT_PROFILE_NAME = "default"
+
+#: The key the configuration uses for the plugins section, named once.
+PLUGINS_KEY = "plugins"
+
+
+class KnownProfileError(ValueError):
+    """Raised for a profile *name* that does not exist.
+
+    Deliberately not a fallback.  ``resolve_permission_profile`` fails closed to
+    ``read_only`` because a permission typo must not widen authority; here a
+    typo would silently load the default set, and "I asked for a profile and got
+    a different one" is a configuration bug that should be loud.
+    """
+
+    def __init__(self, name: str, known: tuple[str, ...]) -> None:
+        super().__init__(
+            f"unknown plugin profile {name!r}; known: {', '.join(known) or '(none)'}"
+        )
+        self.name = name
+        self.known = known
+
+
+@dataclass(frozen=True)
+class PluginEntry:
+    """One plugin's intended state within a composition."""
+
+    plugin: str
+    enabled: bool = True
+    config: Mapping[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, Any]:
+        """Public shape, so a UI never hardcodes the fields."""
+        return {
+            "plugin": self.plugin,
+            "enabled": self.enabled,
+            "config": dict(self.config),
+        }
+
+
+@dataclass(frozen=True)
+class PluginProfile:
+    """A named composition: which plugins load, and with what configuration."""
+
+    key: str
+    label: str
+    summary: str
+    entries: tuple[PluginEntry, ...] = ()
+
+    @property
+    def plugins(self) -> tuple[str, ...]:
+        """The plugins this profile turns on, in declaration order."""
+        return tuple(entry.plugin for entry in self.entries if entry.enabled)
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "label": self.label,
+            "summary": self.summary,
+            "plugins": list(self.plugins),
+        }
+
+
+#: The named compositions.  One row today, because the point of this change is
+#: the mechanism: a profile is data, and adding the second one is a table edit.
+PROFILES: dict[str, PluginProfile] = {
+    DEFAULT_PROFILE_NAME: PluginProfile(
+        key=DEFAULT_PROFILE_NAME,
+        label="默认",
+        summary="加载所有未被配置禁用的插件。",
+        entries=(),
+    ),
+}
+
+#: What a composition gets when it names no profile.  Same object as the single
+#: table row so "the default" cannot drift from "the profile called default".
+DEFAULT_PROFILE = PROFILES[DEFAULT_PROFILE_NAME]
+
+
+def profile_names() -> tuple[str, ...]:
+    """Known profile names, in declaration order."""
+    return tuple(PROFILES)
+
+
+def _entry_enabled(raw: Any) -> Optional[bool]:
+    """The ``enabled`` flag from one configuration entry, or None if unstated."""
+    if not isinstance(raw, Mapping):
+        return None
+    value = raw.get("enabled")
+    return value if isinstance(value, bool) else None
+
+
+def resolve_plugin_state(
+    plugin: str,
+    *,
+    config: Optional[Mapping[str, Any]] = None,
+    profile: Optional[PluginProfile] = None,
+) -> PluginEntry:
+    """The state one plugin should load in.
+
+    ``config`` is the ``plugins`` section of the configuration; ``profile`` is the
+    composition.  Both are optional, and their absence is meaningful rather than
+    an error: a composition with neither loads everything, which is what the code
+    did before this module existed and is therefore the only safe default.
+
+    Disabled always wins -- see the module docstring.
+    """
+    active = profile if profile is not None else DEFAULT_PROFILE
+
+    configured = (config or {}).get(plugin) if config else None
+    if _entry_enabled(configured) is False:
+        # An operator turned this off.  A profile is a composition within what is
+        # permitted, not a way around that.
+        return PluginEntry(plugin=plugin, enabled=False)
+
+    declared = next(
+        (entry for entry in active.entries if entry.plugin == plugin), None
+    )
+    if declared is not None:
+        merged = dict(declared.config)
+        # Explicit configuration outranks a profile default: the operator's file
+        # is the more specific statement about this installation.
+        if isinstance(configured, Mapping):
+            merged.update(
+                {k: v for k, v in configured.items() if k != "enabled"}
+            )
+        return PluginEntry(
+            plugin=plugin, enabled=declared.enabled, config=merged
+        )
+
+    # Not named by the profile and not disabled: keep the historical behaviour.
+    inherited = (
+        {k: v for k, v in configured.items() if k != "enabled"}
+        if isinstance(configured, Mapping)
+        else {}
+    )
+    return PluginEntry(plugin=plugin, enabled=True, config=inherited)
+
+
+def resolve_profile(name: str) -> PluginProfile:
+    """The profile called *name*, or raise.
+
+    See :class:`KnownProfileError` for why this does not fall back.
+    """
+    try:
+        return PROFILES[name]
+    except KeyError:
+        raise KnownProfileError(name, profile_names()) from None
