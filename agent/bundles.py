@@ -51,6 +51,8 @@ __all__ = [
     "bundle_names",
     "resolve_bundle",
     "apply_bundle",
+    "config_loader_for",
+    "loader_for_name",
 ]
 
 
@@ -191,3 +193,38 @@ def apply_bundle(
         for item in active.patches
     )
     return apply_patch(config, patches)
+
+
+def config_loader_for(bundle: Optional[Bundle] = None):
+    """A zero-argument loader that reads the config and applies *bundle*.
+
+    The shape the scheduler wants: it calls a loader once per run because a run is
+    a fresh execution whose settings should come from disk, and this wraps that
+    read in the composition.  Kept here rather than inlined at the call site so
+    the "apply a bundle per run" behaviour is one testable thing, and so a caller
+    that forgets the closure does not silently get an uncomposed run.
+    """
+    import agent.config as config_module
+
+    def loader() -> dict[str, Any]:
+        return config_module.load_config_for_run({}, bundle=bundle)
+
+    return loader
+
+
+def loader_for_name(name: Any) -> Any:
+    """A loader for a bundle *name*, or an uncomposed one when unnamed.
+
+    Resolving the name happens here, at wiring time, so an unknown name is a
+    startup failure naming the typo -- not a run that quietly proceeded without
+    the composition it was asked for.
+
+    Anything that is not a non-blank string counts as unnamed, rather than being
+    stringified.  A ``typer`` option defaults to an ``OptionInfo`` sentinel when a
+    command function is called directly -- as tests do -- and coercing that into
+    the name ``"<typer.models.OptionInfo object at 0x...>"`` would fail lookup
+    with a message about a bundle nobody named.
+    """
+    if not isinstance(name, str) or not name.strip():
+        return config_loader_for(None)
+    return config_loader_for(resolve_bundle(name.strip()))

@@ -232,3 +232,81 @@ def test_the_fallback_is_not_mutated_by_a_bundle(monkeypatch) -> None:
     fallback = {"scheduler": {"poll_seconds": 30, "lease_seconds": 300}}
     load_config_for_run(fallback, bundle=resolve_bundle("unattended"))
     assert fallback["scheduler"]["poll_seconds"] == 30
+
+
+# ── The CLI entry ────────────────────────────────────────────────────────────
+
+
+def test_a_loader_applies_its_bundle(monkeypatch) -> None:
+    """The loader is what the scheduler calls once per run."""
+    from agent.bundles import config_loader_for
+
+    loader = config_loader_for(resolve_bundle("unattended"))
+    out = loader()
+    assert out["scheduler"]["poll_seconds"] == 10
+
+
+def test_a_loader_with_no_bundle_composes_nothing(monkeypatch) -> None:
+    """It still reads the file; it just adds nothing to what it read."""
+    import agent.config as config_module
+    from agent.bundles import config_loader_for
+
+    monkeypatch.setattr(
+        config_module, "_read_config_file", lambda: {"scheduler": {"poll_seconds": 30}}
+    )
+    out = config_loader_for(None)()
+    assert out == {"scheduler": {"poll_seconds": 30}}
+
+
+def test_an_unnamed_bundle_resolves_to_an_uncomposed_loader() -> None:
+    from agent.bundles import loader_for_name
+
+    for blank in (None, "", "   "):
+        assert callable(loader_for_name(blank))
+
+
+def test_a_named_bundle_resolves_to_a_composing_loader() -> None:
+    from agent.bundles import loader_for_name
+
+    assert loader_for_name("unattended")()["scheduler"]["poll_seconds"] == 10
+
+
+def test_an_unknown_name_fails_at_wiring_time() -> None:
+    """Not per run: a typo must stop startup, not quietly uncompose every run."""
+    from agent.bundles import loader_for_name
+
+    with pytest.raises(KnownBundleError):
+        loader_for_name("nonexistent")
+
+
+def test_the_name_is_trimmed_before_resolving() -> None:
+    from agent.bundles import loader_for_name
+
+    assert loader_for_name("  unattended  ")()["scheduler"]["poll_seconds"] == 10
+
+
+def test_the_gateway_accepts_a_bundle_flag() -> None:
+    """The flag exists and is documented, so the mechanism is reachable."""
+    from typer.testing import CliRunner
+
+    from agent.cli import app
+
+    result = CliRunner().invoke(app, ["gateway", "--help"])
+    assert "--bundle" in result.stdout
+    assert "unattended" in result.stdout
+
+
+def test_the_gateway_passes_the_loader_to_the_scheduler() -> None:
+    """Source-level: the flag has to reach the service, not just be parsed.
+
+    A parsed-and-ignored option is worse than no option: the user believes the
+    composition is in effect.
+    """
+    import inspect
+
+    import agent.cli as cli_module
+
+    source = inspect.getsource(cli_module.gateway)
+    assert "config_loader=loader_for_name(bundle)" in source, (
+        "the gateway parses --bundle but does not hand it to the scheduler"
+    )

@@ -7415,8 +7415,12 @@ def test_gateway_starts_background_scheduler(monkeypatch):
         max_concurrent_runs,
         signal_max_depth=None,
         components=None,
+        config_loader=None,
     ):
         assert max_concurrent_runs == 3
+        # Accepted because the gateway now passes it; asserted so a future change
+        # that stops passing it fails here rather than silently uncomposing runs.
+        assert callable(config_loader), "the gateway must hand the run loader over"
         return _FakeService(), _FakeStore(), {"scheduler_components": True}
 
     async def fake_close_components(components):
@@ -7474,8 +7478,10 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
         max_concurrent_runs,
         signal_max_depth=None,
         components=None,
+        config_loader=None,
     ):
         assert max_concurrent_runs == 3
+        assert callable(config_loader), "the gateway must hand the run loader over"
         observed["scheduler"] = components
         return _FakeService(), _FakeStore(), None
 

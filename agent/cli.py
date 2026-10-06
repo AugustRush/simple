@@ -32,6 +32,7 @@ from agent import shared
 from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.commands.composition import ensure_command_router
+from agent.bundles import loader_for_name
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.runtime.lock import AgentHomeBusyError, acquire_agent_home_lock
 from agent.scheduler.models import (
@@ -1495,6 +1496,15 @@ def gateway(
     name: Optional[str] = typer.Option(
         None, "--name", help="Session name (default: ~/.agent)"
     ),
+    bundle: Optional[str] = typer.Option(
+        None,
+        "--bundle",
+        help=(
+            "Named composition for this process's scheduled runs, e.g. "
+            "'unattended' (see agent/bundles.py). Applied to each run's own copy "
+            "of the config, so the file on disk is not changed."
+        ),
+    ),
 ):
     """Start all configured external channels (Feishu, etc.).
 
@@ -1506,6 +1516,10 @@ def gateway(
         simple gateway --name prod    # data -> ~/.agent-prod/, config shared from ~/.agent
         simple gateway --name dev     # data -> ~/.agent-dev/
         simple gateway                # data -> ~/.agent/
+
+    Use --bundle to run under a named composition (see ``agent/bundles.py``).
+    It is applied to the copy each scheduled run builds, so the configuration
+    file keeps the operator's settings and only this process's runs differ.
     """
     if isinstance(name, str):
         agent_module._set_agent_home(shared.session_home(name))
@@ -1553,6 +1567,12 @@ def gateway(
                 max_concurrent_runs=scheduler_max_concurrent,
                 signal_max_depth=scheduler_signal_depth,
                 components=components,
+                # A run is a fresh execution, so a composition belongs here rather
+                # than in the file: the operator's settings stay on disk and only
+                # this process's runs differ.  ``loader_for_name`` resolves the
+                # name now, so a typo fails at startup instead of each run
+                # quietly proceeding uncomposed.
+                config_loader=loader_for_name(bundle),
             )
             components["scheduler_service"] = service
             scheduler_task = asyncio.create_task(service.run_forever())
