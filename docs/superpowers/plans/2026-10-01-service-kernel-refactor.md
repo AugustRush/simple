@@ -458,6 +458,55 @@ wrong into memory a later turn reads as *fact*:
   primitive every runner calls, and extracting it means agreeing on how a
   sub-agent is constructed and driven.  That is a design decision, and it is the
   reason the plan ordered this group last.
+
+### The one decision left, written down so it can be settled
+
+`_execute_agent` is 288 lines and reaches 16 attributes; `_create_sub_agent` is
+27 lines reaching 15.  They are the single primitive every runner calls
+(`run_parallel_subtasks`, `run_pipeline_subtasks`, `run_rendezvous_subtasks` all
+arrive here), so the interface chosen for them is the interface ralph and the
+scheduler would eventually reuse — which is why it is a decision rather than a
+move.
+
+**What is actually in the 288 lines**, in order: resolve the scoped context
+manager; compose the sub-agent system prompt from the sub-registry; build the
+sub-agent; drive up to `max_tool_call_iterations` steps of model-request →
+tool-execute → append; summarize the result; run the output-contract validation;
+assemble and return a payload dict.  Only three of those need anything the caller
+cannot supply as a value: *call the model once*, *execute a tool batch*, and
+*report progress*.
+
+**Proposed shape** — a `SubAgentRunner` in `agent/core/subagent_runner.py`:
+
+```python
+@dataclass(frozen=True)
+class RunnerDeps:
+    settings: Any                 # read live: max_* limits, timeouts, retries
+    registry: Any                 # for the sub-registry view
+    call_model: Callable          # one model request -> (stop_reason, text, tools)
+    execute_tools: Callable       # one tool batch -> list[str] of results
+    emit: Callable                # progress / sub-agent events
+    summarize: Callable           # optional LLM summarize, already on the agent
+    build_context: Callable       # sub-registry -> (system_prompt, AgentContext)
+
+class SubAgentRunner:
+    async def run(self, **kwargs) -> dict: ...      # what _execute_agent returns
+```
+
+`BaseAgent._execute_agent` becomes a one-line delegation, exactly as the ten
+previous extractions did, and the loop's *policy* (step ceiling, retry handling,
+contract validation) becomes testable with a scripted `call_model` — which is the
+part of a sub-agent that is currently hardest to test and most likely to break.
+
+**The alternative, if that interface is not wanted:** extract only
+`_promote_orchestration_runs`-style leaves and leave `_execute_agent` in place,
+recording it as a known limit.  That is defensible — it is one method, it is the
+most stateful thing in the class, and the file is already 636 lines shorter — but
+it means the sub-agent loop stays untestable without a live model, and
+`Task 10` (ralph/scheduler as plugins) cannot reuse the primitive.
+
+I have not taken either path: both are interface decisions, and the ten
+extractions so far were all behaviour-preserving moves.
 - `_create_sub_agent` (15) and `_execute_agent` (**288 lines, 16 attributes**) —
   **one decision, not two**: `_execute_agent` is the single primitive every
   runner calls, and extracting it means agreeing on how a sub-agent is
