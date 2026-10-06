@@ -31,13 +31,13 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 done; Task 7 in progress (5 extractions done, orchestration core remaining).** Tasks 8-10 not started.
+**Tasks 0-6 done; Task 7 in progress (6 extractions done; runners and sub-agent groups remain).** Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c |
+| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c | T7d1 | T7d2 | T7d3 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | 3 f / 2818 p | **3 f / 2843 p** |
-| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | 4554 | **4265** |
+| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | 3 f / 2818 p | 3 f / 2843 p | 3 f / 2877 p | **3 f / 2908 p** |
+| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | 4554 | 4265 | 4248 | **4169** |
 | FAILED set | baseline | identical | identical | identical | identical | identical | identical | identical |
 | Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same | +1 recorded |
 | Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 | 1 |
@@ -355,13 +355,31 @@ documented at the assertion:
   roots is refused.  "Absolute wins" is what a reader would assume, so the
   refusal is now a test with its reason attached.
 
-**Where Task 7 actually stands.**  Five extractions are done and `agent.py` is
-4248 lines (4703 → 4248, -455).  The **orchestration core is not**: the
-spawn/dispatch group (8 methods, 19 `self` attributes), the runner group (8
-methods, 13 attributes) and the sub-agent group (6 methods, **29 attributes**)
-are still on `BaseAgent`.  Measured coupling puts the sub-agent group far above
-the others, which is why the plan ordered it last and why it has not been forced
-through.
+**Extraction 6 — spawn-batch planning.**
+`agent/core/spawn_planning.py` holds `SpawnPlanner`: capability-profile choice,
+the per-turn agent ceiling, spawn-call→spec construction, the result payload, and
+the coordination mode.  Six methods, none of which performed I/O.  Their 19
+`self` attributes are declared once in `PlannerDeps` (8 fields) instead of
+reached for individually, and the decision rules moved by mechanical rewrite
+rather than being restated.
+
+**An init-order defect was caught by the suite, not by me.**  The planner was
+first assembled where the token budget is wired — before
+`self.max_parallel_agents` is assigned — and **143 tests failed** with
+`AttributeError: 'BaseAgent' object has no attribute 'max_parallel_agents'` on
+construction.  Moved to after the assignment; all 143 passed without further
+change.  Worth recording because it is the whole value of the baseline: a
+mis-ordered assignment is invisible in review and loud in the suite.
+
+**Where Task 7 actually stands.**  Six extractions are done and `agent.py` is
+4169 lines (4703 → 4169, -534, a 11% reduction).  The **runner group** (8 methods,
+13 attributes) and the **sub-agent group** (6 methods, **29 attributes**) are
+still on `BaseAgent`.  Measured coupling puts the sub-agent group far above
+everything else extracted so far, which is why the plan ordered it last and why
+it has not been forced through: it holds `registry`, `client`, `_transport`,
+`context_manager`, `plugin_catalog`, `workspace_root` and a dozen configuration
+values, and forcing it would be the kind of move that produces a wrapper class
+rather than a boundary.
 
 **One self-inflicted error, and what caught it.**  A scripted block replacement
 deleted `_run_tool_uses` (the tool loop body) along with the methods it was

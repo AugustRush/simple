@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Optional, TYPE_CHECKING
 import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt, _now
+from agent.core.spawn_planning import PlannerDeps, SpawnPlanner
 from agent.core.output_contract import (
     normalize_output_contract,
     output_contract_path_resolver,
@@ -372,6 +373,22 @@ class BaseAgent:
         self.context_manager: Optional[ContextManager] = None
         self.plugin_catalog: Optional["PluginCatalog"] = None
         self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
+
+        # Spawn-batch planning (agent/core/spawn_planning.py).  Assigned
+        # before anything can call it; helpers are handed over as bound
+        # methods so a caller cannot tell the move happened.
+        self._spawn_planner = SpawnPlanner(
+            PlannerDeps(
+                settings=self,
+                max_parallel_agents=self.max_parallel_agents,
+                string_list=self._string_list,
+                normalize_output_contract=self._normalize_output_contract,
+                mapping_dict=self._mapping_dict,
+                bounded_text=self._bounded_text,
+                bounded_structured=self._bounded_structured,
+                result_content_limit=self._result_content_limit,
+            )
+        )
         self.sub_agent_timeout_seconds = shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS
         self.sub_agent_retries = shared.DEFAULT_SUB_AGENT_RETRIES
         # 0 = derive from max_parallel_agents (see _max_agents_per_turn).
@@ -967,27 +984,7 @@ class BaseAgent:
 
     @staticmethod
     def _looks_like_implementation_work(role: str, task: str) -> bool:
-        text = f"{role} {task}".lower()
-        tokens = (
-            "implement",
-            "implementation",
-            "engineer",
-            "developer",
-            "coder",
-            "patch",
-            "fix",
-            "edit",
-            "modify",
-            "refactor",
-            "code",
-            "file",
-            "实现",
-            "修复",
-            "修改",
-            "重构",
-            "编码",
-        )
-        return any(token in text for token in tokens)
+        return SpawnPlanner.looks_like_implementation_work(role, task)
 
     def _default_capability_profile(
         self,
@@ -997,13 +994,9 @@ class BaseAgent:
         *,
         orchestration_mode: str,
     ) -> str:
-        if explicit:
-            return explicit.strip().lower()
-        if orchestration_mode == "direct":
-            return "full"
-        if self._looks_like_implementation_work(role, task):
-            return "implementation"
-        return "read_only"
+        return self._spawn_planner.default_capability_profile(
+            role, task, explicit, orchestration_mode=orchestration_mode
+        )
 
     def _spawn_tool_use_to_spec(
         self,
@@ -1012,44 +1005,14 @@ class BaseAgent:
         index: int,
         orchestration_decision: OrchestrationDecision,
     ) -> SubtaskSpec:
-        tool_input = tool_use.get("input", {})
-        role = str(tool_input.get("role", "assistant") or "assistant")
-        task = str(tool_input.get("task", "") or "")
-        spec_id = str(
-            tool_input.get("id")
-            or tool_use.get("id")
-            or f"spawn-{index}"
-        )
-        depends_on = self._string_list(tool_input.get("depends_on"))
-        explicit_profile = str(tool_input.get("capability_profile", "") or "").strip()
-        return SubtaskSpec(
-            id=spec_id,
-            role=role,
-            task=task,
-            depends_on=depends_on,
-            expected_output=str(tool_input.get("expected_output", "") or ""),
-            system_suffix=str(tool_input.get("system_suffix", "") or ""),
-            output_contract=self._normalize_output_contract(
-                self._mapping_dict(tool_input.get("output_contract"))
-            ),
-            write_scope=self._string_list(tool_input.get("write_scope")),
-            capability_profile=self._default_capability_profile(
-                role,
-                task,
-                explicit_profile,
-                orchestration_mode=orchestration_decision.mode,
-            ),
-            early_exit=bool(tool_input.get("early_exit", False)),
-            timeout_seconds=float(tool_input.get("timeout_seconds", 0) or 0),
-            continue_on_failure=bool(tool_input.get("continue_on_failure", False)),
+        """See :meth:`agent.core.spawn_planning.SpawnPlanner.spawn_tool_use_to_spec`."""
+        return self._spawn_planner.spawn_tool_use_to_spec(
+            tool_use, index=index, orchestration_decision=orchestration_decision
         )
 
     def _max_agents_per_turn(self) -> int:
         """Total sub-agents one turn may run, independent of concurrency."""
-        configured = int(getattr(self, "max_agents_per_turn", 0) or 0)
-        if configured > 0:
-            return configured
-        return max(8, int(self.max_parallel_agents) * 4)
+        return self._spawn_planner.max_agents_per_turn()
 
     def _spawn_result_payload(
         self,
@@ -1058,28 +1021,8 @@ class BaseAgent:
         *,
         extra: dict[str, Any] | None = None,
     ) -> str:
-        content_limit = self._result_content_limit()
-        payload: dict[str, Any] = {
-            "ok": result.ok,
-            "role": self._bounded_text(spec.role, 200),
-            "task": self._bounded_text(spec.task, 1000),
-            "content": self._bounded_text(
-                result.content or "(no output)",
-                content_limit,
-            ),
-            "tool_calls_made": result.tool_calls_made[:100],
-        }
-        if result.structured_content is not None:
-            payload["structured_content"] = self._bounded_structured(
-                result.structured_content
-            )
-        if result.error:
-            payload["error"] = self._bounded_text(result.error, 1000)
-        if result.artifact_ref:
-            payload["artifact_ref"] = result.artifact_ref
-        if extra:
-            payload.update(extra)
-        return json.dumps(payload, ensure_ascii=False)
+        """See :meth:`agent.core.spawn_planning.SpawnPlanner.spawn_result_payload`."""
+        return self._spawn_planner.spawn_result_payload(spec, result, extra=extra)
 
     async def _run_orchestrated_spawn_calls(
         self,
@@ -1201,30 +1144,8 @@ class BaseAgent:
         self,
         spawn_calls: list[tuple[int, dict]],
     ) -> str:
-        explicit_modes = {
-            str(tu.get("input", {}).get("coordination_mode", "") or "").strip().lower()
-            for _, tu in spawn_calls
-        }
-        explicit_modes.discard("")
-        supported_modes = {"parallel", "pipeline", "rendezvous"}
-        unsupported_modes = explicit_modes - supported_modes
-        if unsupported_modes:
-            raise ValueError(
-                "unsupported coordination_mode: "
-                + ", ".join(sorted(unsupported_modes))
-            )
-        if len(explicit_modes) > 1:
-            raise ValueError(
-                "conflicting coordination_mode values: "
-                + ", ".join(sorted(explicit_modes))
-            )
-        if explicit_modes:
-            return next(iter(explicit_modes))
-        if any(self._string_list(tu.get("input", {}).get("depends_on")) for _, tu in spawn_calls):
-            return "pipeline"
-        if len(spawn_calls) > 1:
-            return "parallel"
-        return "direct"
+        """See :meth:`agent.core.spawn_planning.SpawnPlanner.execution_mode_from_spawn_calls`."""
+        return self._spawn_planner.execution_mode_from_spawn_calls(spawn_calls)
 
     @staticmethod
     async def _call_with_optional_telemetry(
