@@ -160,13 +160,18 @@ def test_the_consumer_is_untouched_by_the_provider_unloading(plugins: Path) -> N
 # ── Ordering, stated rather than assumed ─────────────────────────────────────
 
 
-def test_a_consumer_loaded_before_the_provider_does_not_see_it(tmp_path: Path) -> None:
-    """Plugins load in name order, and there is no re-resolution after the fact.
+def test_without_inject_a_consumer_loaded_first_sees_nothing(tmp_path: Path) -> None:
+    """``ctx.resolve`` at setup time is eager: no declaration, no ordering help.
 
-    Recorded rather than fixed: deferred activation -- a plugin that waits for a
-    service and starts when it appears -- is the ``inject`` mechanism, which this
-    task does not yet build.  Until then the ordering rule is real and a plugin
-    author has to know it, so it is asserted here instead of left implicit.
+    This is the counterpart to ``tests/test_plugin_inject.py``, and it is the
+    reason ``inject`` exists rather than being a convenience.  A plugin that
+    declares nothing is activated when it is reached, in name order, and reads
+    whatever exists at that moment -- so a consumer sorted before its provider
+    resolves the absent default.
+
+    Declaring ``inject = ("greeter",)`` is what buys the wait.  Asserting the
+    undeclared behaviour keeps the contrast visible: the mechanism is opt-in, and
+    a plugin author who omits it gets exactly what they asked for.
     """
     root = tmp_path / "plugins"
     _write_plugin(root / "aaa-consumer", CONSUMER_BEFORE_PROVIDER)

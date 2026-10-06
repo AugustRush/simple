@@ -924,6 +924,22 @@ async def _call_hook_with_timeout(
 _NO_DEFAULT = object()
 
 
+@dataclass
+class _PendingPlugin:
+    """A discovered plugin whose ``inject`` is not satisfied yet.
+
+    Holds what is needed to load it later, and the names it is waiting for so the
+    wait can be reported rather than silently doing nothing.
+    """
+
+    name: str
+    plugin_dir: Path
+    source: str
+    name_hint: str
+    source_dir_name: str
+    inject: tuple[str, ...]
+
+
 class PluginCatalog:
     """Discovers, loads, and orchestrates agent plugins from disk.
 
@@ -978,6 +994,9 @@ class PluginCatalog:
         # everything a plugin registered through ``setup(ctx)``, so unloading is
         # "dispose the scope", not "enumerate the five kinds of contribution".
         self._installs: dict[str, Any] = {}
+        #: Installs created but not yet activated, because they declared an
+        #: ``inject`` the composition does not (yet) supply.  Keyed by name.
+        self._pending: dict[str, Any] = {}
         # Backs those scopes.  A plugin-provided service lands here and is
         # removed with the plugin rather than with the process.
         #
@@ -1082,9 +1101,15 @@ class PluginCatalog:
            into its own plugin load.
 
         Failures in individual plugins are reported but do not abort startup.
-        Returns a list of successfully loaded plugin names.
+
+        Returns the names of plugins that actually **activated**, which is not
+        the same as the plugins discovered: one that declares an ``inject`` the
+        composition does not supply stays pending and registers nothing, so
+        listing it as loaded would be a lie the caller acts on.  Use
+        :meth:`pending_report` to see what it is waiting for.
         """
         self._plugins.clear()
+        self._pending.clear()
         self._slash_commands.clear()
         self._slash_command_metadata.clear()
         self._slash_command_owners.clear()
@@ -1190,6 +1215,15 @@ class PluginCatalog:
         if install is not None and install.unloaded:
             return {"ok": False, "error": f"already unloaded: {plugin_name}"}
 
+        # Dependents first, because a plugin that declared ``inject`` on
+        # something this one provides would otherwise be left holding a service
+        # whose owner is gone.  Unloading a dependency therefore unloads whatever
+        # declared itself dependent on it -- which is the meaning of the
+        # declaration, not a side effect.
+        dependents = self._dependents_of(plugin_name)
+        for dependent in dependents:
+            self.unload_plugin(dependent)
+
         plugin, meta = self._plugins.get(plugin_name, (None, None))
 
         # 1. The end hook, before anything is torn down.
@@ -1283,6 +1317,21 @@ class PluginCatalog:
 
         # Check enable/disable in config
         if not self._is_plugin_enabled(plugin_name):
+            return
+
+        # Dependency gate, before anything is registered.  A plugin that is not
+        # ready must contribute *nothing*, and by the time ``_install_plugin``
+        # runs at the end of this method the declarative assets -- slash
+        # commands, skills, MCP configs, agent definitions -- are already in
+        # place.  Deferring there would leave exactly the half-loaded state the
+        # gate exists to prevent.
+        if self._defer_if_unmet(
+            plugin_name,
+            plugin_dir,
+            source=source,
+            name_hint=name_hint,
+            source_dir_name=source_dir_name,
+        ):
             return
 
         plugin: Any = None
@@ -1393,6 +1442,116 @@ class PluginCatalog:
         # plugin's own registration sees a catalog that already holds them.
         self._install_plugin(plugin_name, plugin, meta)
 
+    def _provided_names(self, plugin_name: str) -> set[str]:
+        """Service names a plugin currently offers.
+
+        Read back from the registry by comparing against what its scope
+        registered -- the scope is the record of what it provided, so this needs
+        no second bookkeeping that could drift from it.
+        """
+        install = self._installs.get(plugin_name)
+        if install is None:
+            return set()
+        return set(install.provided_names)
+
+    def _dependents_of(self, plugin_name: str) -> list[str]:
+        """Active plugins whose ``inject`` names something this one provides."""
+        offered = self._provided_names(plugin_name)
+        if not offered:
+            return []
+        return sorted(
+            name
+            for name, install in self._installs.items()
+            if name != plugin_name
+            and not install.unloaded
+            and offered.intersection(install.inject)
+        )
+
+    def _defer_if_unmet(
+        self,
+        plugin_name: str,
+        plugin_dir: Path,
+        *,
+        source: str = "",
+        name_hint: str = "",
+        source_dir_name: str = "",
+    ) -> bool:
+        """Record a not-yet-satisfiable plugin as pending and stop loading it.
+
+        The declared ``inject`` is read from the module-level ``register()``
+        factory's product, which means importing the plugin -- but not running
+        ``setup``.  Importing is the only way to know what it needs, and a module
+        that does work on import was already a plugin that does work on import.
+
+        Returns True when the caller must stop, so the plugin registers no
+        declarative assets: a pending plugin that had already added a slash
+        command would still be pending *and* visible, which is the state this
+        avoids.
+        """
+        declared_name, inject = self._declared_inject(plugin_dir, plugin_name)
+        if not inject:
+            return False
+        plugin_name = declared_name
+        if all(self._services.has(dep) for dep in inject):
+            return False
+        # What is kept is how to load the plugin again, not a half-built install.
+        # Activation re-runs the whole load, because a pending plugin registered
+        # no declarative assets and its ``setup`` never ran -- there is nothing
+        # partial to resume from.
+        self._pending[plugin_name] = _PendingPlugin(
+            name=plugin_name,
+            plugin_dir=plugin_dir,
+            source=source,
+            name_hint=name_hint,
+            source_dir_name=source_dir_name,
+            inject=inject,
+        )
+        self._plugins.pop(plugin_name, None)
+        return True
+
+    def _declared_inject(
+        self, plugin_dir: Path, fallback_name: str = "",
+    ) -> tuple[str, tuple[str, ...]]:
+        """``(name, inject)`` as declared by a plugin's ``register()`` product.
+
+        Read by importing the module and calling its factory, because that is
+        where ``name`` and ``inject`` both live.
+
+        This imports the plugin a second time -- ``_load_one_plugin`` imports it
+        again when it is ready -- and calling ``register()`` twice is a real
+        constraint on plugin authors, recorded in the tests rather than left
+        implicit: ``register()`` must be safe to call more than once and must not
+        do work beyond constructing the plugin object.  The cost is confined to
+        plugins that declare ``inject``, since a plugin with none never reaches
+        this probe.
+
+        A plugin that will not import declares nothing, so it is not deferred
+        here and the loader proper reports its failure.
+        """
+        empty = (fallback_name, ())
+        init_file = plugin_dir / "__init__.py"
+        if not init_file.exists():
+            return empty
+        mod_name = f"_agent_plugin_inject_probe_{abs(hash(str(plugin_dir)))}"
+        try:
+            spec = importlib.util.spec_from_file_location(
+                mod_name, init_file,
+                submodule_search_locations=[str(plugin_dir)],
+            )
+            if spec is None or spec.loader is None:
+                return empty
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[mod_name] = module
+            spec.loader.exec_module(module)
+            plugin = module.register() if hasattr(module, "register") else None
+        except Exception:
+            return empty
+        finally:
+            sys.modules.pop(mod_name, None)
+        declared_name = str(getattr(plugin, "name", "") or fallback_name)
+        inject = tuple(str(item) for item in (getattr(plugin, "inject", ()) or ()))
+        return declared_name, inject
+
     def _install_plugin(self, plugin_name: str, plugin: Any, meta: PluginMeta) -> None:
         """Create the install record and run a plugin's ``setup(ctx)``.
 
@@ -1407,17 +1566,94 @@ class PluginCatalog:
         install = PluginInstall(
             plugin_name, plugin, meta, self, scope=scope
         )
-        setup = getattr(plugin, "setup", None)
+        if not self._activate(install):
+            return
+        # A plugin that just offered a service may have unblocked others; one
+        # that offered nothing cannot have.  Checking on every load instead would
+        # activate a waiting plugin the moment *any* later plugin loaded, even one
+        # it does not depend on.
+        if install.provided:
+            self._flush_pending()
+
+    def _activate(self, install: Any) -> bool:
+        """Run a plugin's ``setup`` if its declared dependencies exist.
+
+        Returns whether it activated.  A plugin that is not ready is recorded as
+        pending rather than activated: its ``setup`` has not run, so it holds no
+        registrations, and its scope is still empty.  That is what makes
+        deferring safe instead of a half-loaded state.
+        """
+        unmet = [name for name in install.inject if not self._services.has(name)]
+        if unmet:
+            install.pending = True
+            self._pending[install.name] = install
+            return False
+        setup = getattr(install.plugin, "setup", None)
         if callable(setup):
             try:
                 setup(install.ctx)
             except Exception as exc:
-                scope.dispose()
+                install.scope.dispose()
+                # Forgotten rather than retried: a ``setup`` that raised will
+                # raise again, and a retry loop would be a hang with extra steps.
+                self._pending.pop(install.name, None)
+                # And not left *recorded* either: ``_load_one_plugin`` writes the
+                # plugin into ``_plugins`` before ``setup`` runs, so a failed
+                # setup would otherwise be listed as loaded while holding no
+                # install and no registrations.
+                self._plugins.pop(install.name, None)
                 shared.CONSOLE.print(
-                    f"[yellow]Plugin '{plugin_name}' setup failed: {exc}[/yellow]"
+                    f"[yellow]Plugin '{install.name}' setup failed: {exc}[/yellow]"
                 )
-                return
-        self._installs[plugin_name] = install
+                return False
+        install.pending = False
+        self._installs[install.name] = install
+        self._pending.pop(install.name, None)
+        return True
+
+    def _flush_pending(self) -> None:
+        """Load every pending plugin whose dependencies now exist.
+
+        Re-runs the ordinary loader rather than resuming anything, because a
+        pending plugin registered no declarative assets and its ``setup`` never
+        ran -- there is no partial state to resume from.  Iterative with a
+        worklist: a plugin that activates may provide something a later pending
+        plugin waits for, and that chain must be followed without the call stack
+        growing with it.
+        """
+        progress = True
+        while progress:
+            progress = False
+            for name, pending in list(self._pending.items()):
+                if any(not self._services.has(dep) for dep in pending.inject):
+                    continue
+                del self._pending[name]
+                before = len(self._plugins)
+                self._load_one_plugin(
+                    pending.plugin_dir,
+                    source=pending.source,
+                    name_hint=pending.name_hint,
+                    source_dir_name=pending.source_dir_name,
+                    slash_command_owners=self._slash_command_owners,
+                )
+                if len(self._plugins) > before:
+                    progress = True
+
+    def pending_plugins(self) -> list[str]:
+        """Names of plugins waiting for a service the composition does not supply."""
+        return sorted(self._pending)
+
+    def pending_report(self) -> dict[str, list[str]]:
+        """What each pending plugin is waiting for, by name.
+
+        Reported rather than logged and forgotten: a plugin that never activates
+        registers nothing, and "nothing happened" is the hardest kind of silence
+        to debug.
+        """
+        return {
+            name: [dep for dep in pending.inject if not self._services.has(dep)]
+            for name, pending in sorted(self._pending.items())
+        }
 
     # ── Declarative commands / agents (Claude Code convention) ──────────
 

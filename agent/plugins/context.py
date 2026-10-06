@@ -84,6 +84,13 @@ class PluginContext:
                 f"plugin {self._install.name!r} has no scope to register into"
             )
         scope.provide(name, value, replace=replace)
+        # Only a *newly offered* service can unblock a waiting plugin, so the
+        # catalog is told here rather than re-checking after every load.  The
+        # flag is read and cleared by the catalog once setup returns, so a
+        # provider registers and unblocks in one pass.
+        self._install.provided = True
+        if name not in self._install.provided_names:
+            self._install.provided_names.append(name)
 
     def resolve(self, name: str, default: Any = _MISSING) -> Any:
         """Resolve a service another plugin provided.
@@ -183,9 +190,27 @@ def _drop_identity(items: list, entry: tuple) -> None:
 
 
 class PluginInstall:
-    """One loaded plugin: its object, its scope, and its catalog."""
+    """One loaded plugin: its object, its scope, and its catalog.
 
-    __slots__ = ("name", "plugin", "meta", "catalog", "scope", "ctx", "unloaded")
+    ``inject`` is what the plugin declared it needs; ``pending`` is whether it is
+    waiting for those to exist.  A pending install has run no ``setup``, so it
+    holds no registrations and its scope is empty -- which is what makes
+    deferring safe rather than a half-loaded state.
+    """
+
+    __slots__ = (
+        "name",
+        "plugin",
+        "meta",
+        "catalog",
+        "scope",
+        "ctx",
+        "unloaded",
+        "inject",
+        "pending",
+        "provided",
+        "provided_names",
+    )
 
     def __init__(
         self,
@@ -210,6 +235,18 @@ class PluginInstall:
         self.scope = scope if scope is not None else ServiceScope(_NullRegistry())
         self.ctx = PluginContext(self)
         self.unloaded = False
+        #: Required service names, from the plugin object's ``inject``.
+        self.inject: tuple[str, ...] = tuple(
+            str(item) for item in (getattr(plugin, "inject", ()) or ())
+        )
+        #: True until every injected name resolves.
+        self.pending: bool = False
+        #: Set by ``ctx.provide`` during this install's setup; read and cleared
+        #: by the catalog to decide whether waiting plugins should be re-checked.
+        self.provided: bool = False
+        #: Names this install offered, so unloading it can find its dependents
+        #: without a second record that could drift from the scope.
+        self.provided_names: list[str] = []
 
 
 class _NullRegistry:
