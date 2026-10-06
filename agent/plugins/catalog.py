@@ -91,6 +91,28 @@ class AgentPlugin:
         register_slash_commands() -> dict[str, Callable]
             Return {name: async handler(raw_cmd, components)}.
 
+    Lifecycle (the resource-owning half):
+        setup(ctx) -> None
+            Synchronous.  Called once after the plugin's declarative assets are
+            registered.  Register everything through *ctx* and it unwinds with
+            the plugin: ``ctx.add_slash_command``, ``ctx.add_bundled_skill``,
+            ``ctx.add_bundled_mcp``, ``ctx.add_agent_definition``,
+            ``ctx.add_tool``, and ``ctx.on_unwind`` for anything else.
+
+            Prefer this to the ``register_*`` methods for anything with a
+            lifetime.  What is registered here is removed by
+            :meth:`PluginCatalog.unload_plugin` without the catalog needing to
+            know what kind of thing it was.
+
+        teardown() -> None
+            Synchronous.  Called when the plugin unloads, after
+            ``on_session_end`` has fired and after the setup scope has unwound.
+            For what a scope cannot express: closing a subprocess handle,
+            flushing a file, joining a thread.
+
+            This is the hook the old code had no equivalent of, which is why a
+            removed plugin's MCP subprocess used to stay alive until shutdown.
+
     Command hooks (plugin.json):
         Hooks may also be declared in ``plugin.json`` under a ``hooks`` key as
         external commands.  These run as subprocesses with event data on stdin
@@ -946,6 +968,63 @@ class PluginCatalog:
         # Key format: "plugin:<plugin>:<agent>".  Value: dict with keys
         # ``name``, ``description``, ``body``, ``plugin``, ``path``.
         self._agent_defs: dict[str, dict[str, Any]] = {}
+        # name → PluginInstall.  The install owns the scope that unwinds
+        # everything a plugin registered through ``setup(ctx)``, so unloading is
+        # "dispose the scope", not "enumerate the five kinds of contribution".
+        self._installs: dict[str, Any] = {}
+        # Backs those scopes.  A plugin-provided service lands here and is
+        # removed with the plugin rather than with the process.
+        #
+        # Imported here rather than at module scope: ``agent.runtime`` pulls in
+        # ``agent.runtime.contracts``, which imports the skill catalog, which
+        # imports the tool registry, which imports this module.  A lazy import
+        # breaks that cycle at the one point where it is not needed yet.
+        from agent.runtime.services import ServiceRegistry
+
+        self._services = ServiceRegistry()
+
+    def _run_hook_sync(self, hook: Callable, event: Any, timeout: float) -> None:
+        """Run one plugin hook to completion from synchronous code.
+
+        Unload is synchronous -- ``discover_and_load`` is, and reload calls
+        unload from inside itself -- so a hook cannot simply be awaited.  Two
+        cases, because there is no single call that works for both:
+
+        - **No running loop.**  The common case for a tool or a CLI command.
+          ``asyncio.run`` drives it, including the async-hook and timeout
+          machinery.
+        - **A running loop.**  ``asyncio.run`` cannot be used: it leaves the
+          coroutine unawaited and warns.  A sync hook is called directly here,
+          bounded by nothing, and an async hook is skipped rather than left
+          pending -- a plugin that must run async teardown has
+          ``ctx.on_unwind``, which is invoked synchronously by the scope.
+        """
+        if inspect.iscoroutinefunction(hook):
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                shared.CONSOLE.print(
+                    f"[dim]Plugin session_end skipped: an async hook cannot be "
+                    f"driven from inside a running event loop[/dim]"
+                )
+                return
+            asyncio.run(
+                _call_hook_with_timeout(
+                    hook,
+                    event,
+                    timeout_seconds=timeout,
+                    executor=self._hook_executor,
+                )
+            )
+            return
+        # A sync hook: run it on the plugin pool, bounded by the timeout.
+        if timeout <= 0:
+            hook(event)
+            return
+        future = self._hook_executor.submit(hook, event)
+        future.result(timeout=timeout)
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
@@ -1022,10 +1101,16 @@ class PluginCatalog:
     def _remove_plugin_owned_state(
         self,
         plugin_name: str,
-        slash_command_owners: dict[str, str],
+        slash_command_owners: Optional[dict[str, str]] = None,
     ) -> None:
-        """Remove every catalog asset owned by one replaced plugin."""
+        """Remove every catalog asset owned by one plugin.
 
+        The unload path's asset half.  Kept as a name because the same-name
+        replacement path calls it, and delegating rather than duplicating means
+        a sixth kind of contribution is added in one place.
+        """
+        if slash_command_owners is None:
+            slash_command_owners = self._slash_command_owners
         for cmd_key, owner in tuple(slash_command_owners.items()):
             if owner != plugin_name:
                 continue
@@ -1045,6 +1130,95 @@ class PluginCatalog:
         }
         self._plugin_source_dirs.pop(plugin_name, None)
         self._plugins.pop(plugin_name, None)
+
+    def unload_plugin(self, plugin_name: str) -> dict:
+        """Unload one plugin: fire its end hook, unwind its scope, tear it down.
+
+        The one code path for unloading, in the only order that lets a plugin
+        release everything it holds:
+
+        1. ``on_session_end`` -- while its registrations still exist, because a
+           hook that cannot see its own resources cannot clean them up.  This
+           is the leak the old eviction had: a plugin removed by ``reload``
+           never got this call at all.
+        2. the scope -- every registration made through ``setup``'s ``ctx``.
+        3. ``teardown`` -- the escape hatch for what a scope cannot express,
+           such as the MCP subprocess handle the old code documented as
+           unclosable.
+        4. the catalog assets and the module cache entry.
+
+        Returns a summary rather than raising, because the callers are tools and
+        HTTP handlers that have to report a result either way.
+        """
+        install = self._installs.get(plugin_name)
+        if install is None and plugin_name not in self._plugins:
+            return {"ok": False, "error": f"no such plugin: {plugin_name}"}
+        if install is not None and install.unloaded:
+            return {"ok": False, "error": f"already unloaded: {plugin_name}"}
+
+        plugin, meta = self._plugins.get(plugin_name, (None, None))
+
+        # 1. The end hook, before anything is torn down.
+        if plugin is not None and hasattr(plugin, "on_session_end"):
+            self._fire_session_end_for(plugin, meta, plugin_name)
+
+        # 2. The scope: everything registered through setup's ctx.
+        if install is not None:
+            install.unloaded = True
+            try:
+                install.scope.dispose()
+            except Exception as exc:
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{plugin_name}' scope unwind error: {exc}[/dim]"
+                )
+
+        # 3. The plugin's own teardown, for what a scope cannot own.
+        teardown = getattr(plugin, "teardown", None)
+        if callable(teardown):
+            try:
+                teardown()
+            except Exception as exc:
+                shared.CONSOLE.print(
+                    f"[dim]Plugin '{plugin_name}' teardown error: {exc}[/dim]"
+                )
+
+        # 4. Assets and the import cache.  The module entry is dropped so a
+        #    re-install picks up code changes on disk, matching what reload did.
+        self._remove_plugin_owned_state(plugin_name)
+        self._installs.pop(plugin_name, None)
+        sys.modules.pop(f"_agent_plugin_{plugin_name}", None)
+        return {"ok": True, "unloaded": plugin_name}
+
+    def _fire_session_end_for(
+        self, plugin: Any, meta: Optional[PluginMeta], plugin_name: str
+    ) -> None:
+        """Fire one plugin's ``on_session_end``, honouring its timeout.
+
+        Synchronous because the hook itself may be sync or async and
+        ``_call_hook_with_timeout`` runs sync hooks on the dedicated plugin pool
+        and drives coroutine hooks to completion.  Unload is therefore
+        symmetric with :meth:`discover_and_load`, which is also synchronous; a
+        plugin needing async teardown has ``ctx.on_unwind`` for it.
+
+        A copy of the per-plugin body of :meth:`fire_session_end` rather than a
+        call to it, because that method iterates every plugin and this one must
+        touch exactly one.
+        """
+        timeout = self._hook_timeout(meta, "on_session_end") if meta else (
+            self._turn_hook_timeout_seconds
+        )
+        event = SessionEvent(messages=[], tools_used=[], session_id="")
+        try:
+            self._run_hook_sync(plugin.on_session_end, event, timeout)
+        except asyncio.TimeoutError:
+            shared.CONSOLE.print(
+                f"[dim]Plugin '{plugin_name}' session_end timed out after "
+                f"{timeout:.2f}s[/dim]"
+            )
+        except Exception as exc:
+            shared.CONSOLE.print(
+                f"[dim]Plugin session_end error ({plugin_name}): {exc}[/dim]"
+            )
 
     def _load_one_plugin(
         self,
@@ -1177,6 +1351,39 @@ class PluginCatalog:
             # Compile matchers per-entry below; the legacy per-event matcher
             # cache is not used for CC-style multi-entry events.
         meta.path = plugin_dir
+
+        # The lifecycle half.  Recorded for every plugin -- even one with no
+        # ``setup`` and no ``teardown`` -- so that unloading is one code path
+        # rather than "unload if it happens to be the new kind of plugin".
+        # ``setup`` runs last, after the declarative assets are in place, so a
+        # plugin's own registration sees a catalog that already holds them.
+        self._install_plugin(plugin_name, plugin, meta)
+
+    def _install_plugin(self, plugin_name: str, plugin: Any, meta: PluginMeta) -> None:
+        """Create the install record and run a plugin's ``setup(ctx)``.
+
+        A plugin that fails in ``setup`` is not left half-registered: the scope
+        is disposed, which unwinds whatever it managed to register, and the
+        install is not recorded.  Surfacing the error beats a plugin that is
+        listed as loaded and contributes nothing.
+        """
+        from agent.plugins.context import PluginInstall
+
+        scope = self._services.scope()
+        install = PluginInstall(
+            plugin_name, plugin, meta, self, scope=scope
+        )
+        setup = getattr(plugin, "setup", None)
+        if callable(setup):
+            try:
+                setup(install.ctx)
+            except Exception as exc:
+                scope.dispose()
+                shared.CONSOLE.print(
+                    f"[yellow]Plugin '{plugin_name}' setup failed: {exc}[/yellow]"
+                )
+                return
+        self._installs[plugin_name] = install
 
     # ── Declarative commands / agents (Claude Code convention) ──────────
 
@@ -1325,13 +1532,13 @@ class PluginCatalog:
         all slash commands, agent definitions, and bundled assets, and adds
         any newly-declared MCP servers to the running ``mcp_client``.
 
-        Limitations (v1):
-        - Cannot disconnect an MCP stdio process for a removed plugin —
-          its tools are unregistered from the ToolRegistry so the model
-          no longer sees them, but the subprocess stays alive until the
-          agent shuts down.
-        - Plugin ``on_session_end`` hooks are NOT fired on eviction; reload
-          is a developer-facing notification, not a clean shutdown.
+        Eviction now goes through :meth:`unload_plugin`, so a removed plugin's
+        ``on_session_end`` fires, its scope unwinds, and its ``teardown`` gets a
+        chance to close what a scope cannot -- the two leaks this method used to
+        document.  What reload still cannot do is reload a plugin's code
+        in-place for the plugins that stay loaded: it clears the import cache
+        and re-discovers, so a changed plugin is a new object with a new scope,
+        while the old one is unloaded first.
 
         Returns a summary dict suitable for surfacing to the user.
         """
@@ -1354,11 +1561,18 @@ class PluginCatalog:
             "plugin_source_dirs": dict(self._plugin_source_dirs),
             "agent_defs": dict(self._agent_defs),
         }
-        # Drop sys.modules entries so re-imported Python plugins pick up
-        # any code changes on disk.  Safe to drop for plugins that were
-        # never python-only (no-op).
-        for name in old_plugin_names:
-            sys.modules.pop(f"_agent_plugin_{name}", None)
+        # Unload every currently-loaded plugin before re-discovering, so a
+        # plugin that is about to disappear gets its end hook, its scope
+        # unwind, and its teardown.  Without this, eviction was a table rebuild
+        # that left the plugin's non-registration resources behind -- the
+        # documented MCP-subprocess leak.
+        #
+        # Unloading all of them rather than only the removed set is deliberate:
+        # re-discovery re-creates every plugin from a freshly imported module,
+        # so each one genuinely becomes a new install, and the old install's
+        # scope must not stay open beside it.
+        for name in sorted(old_plugin_names):
+            self.unload_plugin(name)
 
         # Re-discover.  This clears all internal state and rebuilds it.
         loaded = self.discover_and_load()

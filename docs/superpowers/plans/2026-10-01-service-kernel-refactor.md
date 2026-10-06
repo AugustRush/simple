@@ -31,16 +31,17 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-4 implemented 2026-10-01.** Tasks 5-10 not started.
+**Tasks 0-5 implemented 2026-10-01.** Tasks 6-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | Task 0 | Task 1 | Task 2 | Task 3 | Task 4 |
-| --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 failed / 2641 passed | 19 failed / 2649 passed | 3 failed / 2687 passed | 3 failed / 2705 passed | 3 failed / 2730 passed | **3 failed / 2737 passed** / 1 skipped |
-| FAILED set | baseline file | byte-identical | byte-identical | byte-identical | byte-identical | byte-identical |
-| Module-level mutable state | undocumented | 49 entries | unchanged | +1 recorded | unchanged | unchanged |
-| Tool-set scopes | 3 mechanisms | 3 | 3 | 3 | 1 (`ToolView`+`derive`) | 1 |
-| Component container reachable from tools | yes | yes | yes | yes | yes | **no** |
+| | Baseline | Task 0 | Task 1 | Task 2 | Task 3 | Task 4 | Task 5 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | **3 f / 2753 p** / 1 skipped |
+| FAILED set | baseline | identical | identical | identical | identical | identical | identical |
+| Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same |
+| Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 |
+| Component container reachable from tools | yes | yes | yes | yes | yes | no | no |
+| Plugin unload | 5 code paths, 2 leaks | — | — | — | — | — | **1 path, 0 leaks** |
 
 Command for every column: `.venv/bin/python -m pytest -q -p no:cacheprovider`.
 
@@ -178,6 +179,52 @@ opening delimiter so indentation survives, and matches the *call shape*
 (`(get|set)_context("components"`) rather than the bare word, because error
 text in `agent/tools/files.py` legitimately says "components". Verified by
 reintroducing the backdoor: the guard reports the exact file and line.
+
+### What Task 5 actually produced
+
+`agent/plugins/context.py` and a real unload path, so a plugin's contributions
+unwind instead of being rebuilt around.
+
+- `PluginContext` is what `setup(ctx)` is handed: `add_slash_command`,
+  `add_bundled_skill`, `add_bundled_mcp`, `add_agent_definition`, `add_tool`,
+  and `on_unwind` for anything else. Each records its own undo on a
+  `ServiceScope` (Task 1), so the catalog never enumerates the kinds.
+- `PluginInstall` holds the plugin, its scope, and its unloaded flag.
+- `PluginCatalog.unload_plugin(name)` is now **the** unload path: fire
+  `on_session_end`, dispose the scope, call `teardown`, remove the assets, drop
+  the module cache entry. Synchronous, matching `discover_and_load`, which
+  reload calls it from.
+- `reload` unloads every loaded plugin before re-discovering. Unloading all of
+  them rather than only the removed set is deliberate: re-discovery re-imports
+  every module, so each plugin genuinely becomes a new install and the old
+  scope must not stay open beside it.
+
+**Both documented leaks are closed**, and the test names them:
+
+| Old limitation (`catalog.py:1328-1334`) | Now |
+| --- | --- |
+| "Cannot disconnect an MCP stdio process for a removed plugin ... the subprocess stays alive until the agent shuts down" | `teardown()` runs on unload; the test's handle is closed |
+| "Plugin `on_session_end` hooks are NOT fired on eviction" | fired on unload, including eviction through `reload` |
+
+`teardown` is not a failure of the scope design. A scope can only undo what was
+registered *through* it; a plugin that started a subprocess has to say so
+itself. What was missing was a moment to say it in, and that is what unload
+provides. The order is fixed and tested: hook, scope, teardown — the hook runs
+while the plugin's registrations still exist, and teardown last because it is
+most likely to need the plugin whole.
+
+**One honest limitation remains.** An *async* `on_session_end` cannot be driven
+when unload is called from inside a running event loop (`asyncio.run` leaves the
+coroutine unawaited). Sync hooks run normally, bounded by their timeout; an
+async hook in that situation is skipped with a dim log line, and a plugin that
+needs async teardown has `ctx.on_unwind`. Recorded rather than hidden: the
+alternative was a synchronous facade that silently did not run the hook.
+
+**A cycle had to be broken twice.** `agent.plugins.context` needs
+`agent.runtime.services`, but `agent.runtime` imports `contracts`, which imports
+the skill catalog, which imports the tool registry, which imports
+`agent.plugins.catalog`. Both imports are therefore function-local, with the
+reason written where a reader will hit it.
 
 ### What Task 0 actually found
 
@@ -548,7 +595,7 @@ impossible.
   (reload), `:1328-1334` (delete the two documented leaks)
 - Test: `tests/test_plugin_lifecycle.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 One plugin contributes: a tool, a slash command, a bundled skill, a hook, and an
 MCP server. Assert that after unload: the tool name is absent from
@@ -556,7 +603,7 @@ MCP server. Assert that after unload: the tool name is absent from
 absent from the catalog, the hook no longer fires, and the MCP subprocess
 handle is closed. Assert `on_session_end` **does** fire on eviction.
 
-- [ ] **Step 2: Give `AgentPlugin` a lifecycle**
+- [x] **Step 2: Give `AgentPlugin` a lifecycle**
 
 Add a `setup(ctx)` / `teardown()` pair. Everything registered in `setup` goes
 through a `ServiceScope`; `teardown` is the escape hatch for what a scope cannot
@@ -564,14 +611,14 @@ express (a subprocess handle). Default implementations must keep the existing
 duck-typed hooks working, since plugins are loaded from user directories and
 cannot be broken by this change.
 
-- [ ] **Step 3: Make reload a scope unwind**
+- [x] **Step 3: Make reload a scope unwind**
 
 `reload()` becomes: unwind the old scopes, then re-discover. Keep the
 `sys.modules` clear (`:1360-1361`) — Python module-level state is real and
 clearing it is correct; the scope handles everything registered *through* the
 plugin.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 ```bash
 .venv/bin/python -m pytest tests/test_plugin_catalog.py tests/test_plugin_lifecycle.py -q
