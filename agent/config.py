@@ -17,6 +17,7 @@ import agent as agent_module
 from agent import shared
 
 if TYPE_CHECKING:
+    from agent.bundles import Bundle
     from agent.plugins.catalog import PluginCatalog
     from agent.skills.catalog import SkillCatalog
     from agent.tools.runtime import ToolRegistry
@@ -914,7 +915,11 @@ def load_config(*, warn: bool = True) -> tuple[dict, bool]:
     return raw, first_run
 
 
-def load_config_for_run(fallback: dict) -> dict:
+def load_config_for_run(
+    fallback: dict,
+    *,
+    bundle: Optional["Bundle"] = None,
+) -> dict:
     """The config a scheduled run should use, or *fallback* if unreadable.
 
     The file on disk when it parses, because that is the copy the user edits
@@ -925,9 +930,23 @@ def load_config_for_run(fallback: dict) -> dict:
     keys), so a run would fail with an authentication error pointing at the
     wrong thing entirely.  Nothing is printed here for the same reason the
     warnings are silenced: this runs once per scheduled run.
+
+    *bundle* applies a named composition on top of whatever was read.  A run is
+    where a composition belongs -- "unattended" is a statement about how this
+    execution behaves, not about the file on disk -- so the file keeps the user's
+    settings and the bundle changes only this run's copy.
+
+    An unreadable file plus a bundle applies the bundle to *fallback* rather than
+    skipping it: the caller asked for a composition, and silently running without
+    one is the failure mode bundles exist to remove.
     """
     raw = _read_config_file()
-    return raw if raw is not None else dict(fallback)
+    base = raw if raw is not None else dict(fallback)
+    if bundle is None:
+        return base
+    from agent.bundles import apply_bundle
+
+    return apply_bundle(base, bundle)
 
 
 def save_config(cfg: dict):
