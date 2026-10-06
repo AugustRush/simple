@@ -31,15 +31,15 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0, 1 and 2 implemented 2026-10-01.** Tasks 3-10 not started.
+**Tasks 0-3 implemented 2026-10-01.** Tasks 4-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | After Task 0 | After Task 1 | After Task 2 |
-| --- | --- | --- | --- | --- |
-| Full suite | 19 failed / 2641 passed | 19 failed / 2649 passed | 3 failed / 2687 passed | **3 failed / 2705 passed** / 1 skipped |
-| FAILED set | see baseline file | byte-identical | byte-identical | byte-identical |
-| Module-level mutable state | undocumented | 49 entries, guard-tested | unchanged | +1 recorded (provider registry) |
-| Replaceable services | 1 hand-rolled (`exec/`) | 1 | general mechanism, scoped | **+1: wire formats register** |
+| | Baseline | Task 0 | Task 1 | Task 2 | Task 3 |
+| --- | --- | --- | --- | --- | --- |
+| Full suite | 19 failed / 2641 passed | 19 failed / 2649 passed | 3 failed / 2687 passed | 3 failed / 2705 passed | **3 failed / 2730 passed** / 1 skipped |
+| FAILED set | see baseline file | byte-identical | byte-identical | byte-identical | byte-identical |
+| Module-level mutable state | undocumented | 49 entries, guard-tested | unchanged | +1 recorded | unchanged |
+| Tool-set scopes | 3 mechanisms | 3 | 3 | 3 | **1 (`ToolView` + `derive`)** |
 
 Command for every column: `.venv/bin/python -m pytest -q -p no:cacheprovider`.
 
@@ -55,7 +55,8 @@ probes, unchanged throughout.
 Test growth is accounted for exactly: Task 0 added 8
 (`tests/test_state_inventory.py`), Task 1 added 22
 (`tests/test_service_registry.py`), Task 2 added 18
-(`tests/test_provider_registry.py`). The four files Task 1 names
+(`tests/test_provider_registry.py`), Task 3 added 25
+(`tests/test_tool_scope.py`). The four files Task 1 names
 (`test_service_registry`, `test_user_tools`, `test_subprocess_provider`,
 `test_user_tool_isolation`) run 77 passed; the six files Task 2 names
 (`test_provider_registry`, `test_provider_settings`, `test_model_routing`,
@@ -113,6 +114,40 @@ back would be a cycle.
 constructor call, so the Task 0 scanner cannot see it. It was added to the
 ledger's non-scannable notes and assigned to Task 9, which is the mechanism
 working as designed rather than an exception to it.
+
+### What Task 3 actually produced
+
+`ToolView` and `ToolRegistry.derive` in `agent/tools/runtime.py`, and
+`BaseAgent._create_sub_registry` rewritten as one `derive` call.
+
+The three scopes differed only in **which tools they accept**, so the difference
+is now data and the copy is written once:
+
+| Scope | Rule |
+| --- | --- |
+| whole-process | `ToolView()` — accepts everything |
+| per web session | `exclude_source_prefixes=("runtime:spawn",)` |
+| per sub-agent | `capabilities_include=<profile bound>`, `capabilities_exclude={"orchestration"}` |
+
+Three semantics were preserved deliberately rather than tidied, because each is
+load-bearing and none was documented:
+
+1. **An empty `capabilities_include` admits nothing**, not everything. Judged by
+   subset alone it would be a wildcard that reads as the strictest setting.
+2. **A tool declaring no capabilities is excluded from a bounded view.** Unknown
+   is not the same as safe; the sub-agent profiles depended on this.
+3. **`capabilities_exclude` is applied after `capabilities_include`**, so a
+   broader inclusion cannot re-admit what a narrower rule removed.
+
+One behaviour was found *while* collapsing them and had to be preserved
+explicitly: `derive` clones mutable context containers on the way in, inherited
+ones included. The old sub-agent path cloned two named lists by hand
+(`shell_blocked_commands`, `shell_allowed_commands`); a child appending to a
+list it merely inherited would otherwise have rewritten the parent's. Cloning by
+shape rather than by key name covers the next list someone adds.
+
+`fork()` remains, as a thin wrapper over the same call, because callers and four
+test files use it.
 
 ### What Task 0 actually found
 
@@ -412,21 +447,21 @@ as the underlying namespace, since `_DEFAULT_TOOL_CAPABILITIES` is keyed by
 - Modify: `agent/core/agent.py:4030-4077` (`_create_sub_registry`)
 - Test: `tests/test_tool_scope.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 The same three isolation cases, expressed through one API: a process-wide
 registry; a session view excluding a source prefix; a capability-filtered child
 view that cannot spawn. Plus: disposing a view does not disturb the parent, and
 the parent sees no child tools.
 
-- [ ] **Step 2: Implement views on top of `ServiceScope`**
+- [x] **Step 2: Implement views on top of `ServiceScope`**
 
 `ctx.tools.view(...)` returns a child backed by `ServiceScope`. `fork()` and
 `_create_sub_registry` become thin wrappers so existing call sites keep working
 in this task; delete the wrappers in Task 5 once a plugin exercises the new
 path.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 ```bash
 .venv/bin/python -m pytest tests/test_tool_executor.py tests/test_builtin_tools.py tests/test_skill_tools.py tests/test_user_tool_isolation.py tests/test_orchestration.py tests/test_web_channel.py -q

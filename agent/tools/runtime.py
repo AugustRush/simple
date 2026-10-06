@@ -138,6 +138,51 @@ class ToolDef:
     authorizer: Optional[Callable[[dict, "ToolRegistry"], Optional[dict]]] = None
 
 
+@dataclass(frozen=True)
+class ToolView:
+    """A lens over a :class:`ToolRegistry`: which of its tools a copy exposes.
+
+    The three scopes this codebase already needed -- a whole-process registry, a
+    per-session registry with one source family removed, and a per-sub-agent
+    registry bounded by capability -- differ only in *which tools they accept*.
+    Everything else they do is the same copy, so the difference is data.
+
+    Every field is a separate narrowing and all of them compose: a tool is
+    exposed only when each specified rule admits it.  ``exclude_source_prefixes``
+    and ``capabilities_exclude`` are applied after ``capabilities_include``, so
+    a broader inclusion can never re-admit something a narrower rule removed.
+    """
+
+    #: Final say.  ``None`` accepts whatever the other rules accept.
+    accepts: Optional[Callable[[ToolDef], bool]] = None
+    #: Drop tools whose ``source`` starts with any of these.
+    exclude_source_prefixes: tuple[str, ...] = ()
+    #: The capability bound for a bounded view.  ``None`` is unconstrained; an
+    #: empty frozenset admits nothing at all, because "no capability is within
+    #: this bound" and "this view is unbounded" have to be different answers.
+    capabilities_include: Optional[frozenset[str]] = None
+    #: Drop any tool carrying one of these capabilities.
+    capabilities_exclude: frozenset[str] = frozenset()
+
+    def accepts_tool(self, tool: "ToolDef") -> bool:
+        if self.accepts is not None and not self.accepts(tool):
+            return False
+        for prefix in self.exclude_source_prefixes:
+            if tool.source.startswith(prefix):
+                return False
+        if self.capabilities_include is not None:
+            # A tool that declares nothing is not admitted to a bounded view.
+            # Unknown is not the same as safe, and the sub-agent profiles
+            # depended on that reading.
+            if not tool.capabilities:
+                return False
+            if not tool.capabilities.issubset(self.capabilities_include):
+                return False
+        if self.capabilities_exclude & tool.capabilities:
+            return False
+        return True
+
+
 # JSON Schema keywords this registry can validate deterministically.  Schemas
 # using any other keyword fall back to legacy behavior instead of pretending
 # they were fully validated.
@@ -563,6 +608,51 @@ class ToolRegistry:
             return override[key]
         return self._context.get(key, default)
 
+    def derive(
+        self,
+        view: ToolView,
+        context: Optional[dict[str, Any]] = None,
+    ) -> "ToolRegistry":
+        """The registry a scope sees: *view*'s tools, over this context.
+
+        The single implementation behind every tool-set restriction this
+        codebase needs -- ``fork`` for a session, the sub-agent construction in
+        ``BaseAgent``, and anything a plugin scope adds later.  Keeping one
+        implementation matters because the alternative was three, and a rule
+        that lived in only one of them read as a rule everywhere.
+
+        Tool definitions are shared rather than copied: they are immutable after
+        registration for the lifetime of a config revision, and a bound tool
+        method has to keep pointing at its owner registry (``call`` installs
+        this view's context as a ContextVar override while invoking it).
+        """
+        derived = type(self)(console=self.console)
+        derived._tools = {
+            name: tool
+            for name, tool in self._tools.items()
+            if view.accepts_tool(tool)
+        }
+        # Clone the mutable containers on the way in -- inherited and
+        # overridden alike -- so neither a child's edit nor a parent's later
+        # edit reaches the other.  Scalar context values (a policy object, a
+        # path string) are shared on purpose: they are read-only by convention
+        # and copying them would break identity checks.
+        derived._context = {
+            key: (
+                type(value)(value)
+                if isinstance(value, (list, dict, set))
+                else value
+            )
+            for key, value in self._context.items()
+        }
+        if context:
+            for key, value in context.items():
+                if isinstance(value, (list, dict, set)):
+                    value = type(value)(value)
+                derived._context[key] = value
+        derived._prompt_generation = self._prompt_generation
+        return derived
+
     def fork(
         self,
         context: Optional[dict[str, Any]] = None,
@@ -571,26 +661,13 @@ class ToolRegistry:
     ) -> "ToolRegistry":
         """Create a cheap session view over the registered tool functions.
 
-        Tool definitions are immutable after registration for the lifetime of
-        a config revision, so a shallow copy is sufficient. Bound tool methods
-        continue to use their owner registry; ``call`` already installs this
-        view's context as a ContextVar override while invoking them.
+        Kept as its own name because callers and tests use it; the behaviour is
+        :meth:`derive` with a source-prefix view.
         """
-
-        forked = type(self)(console=self.console)
-        forked._tools = {
-            name: tool
-            for name, tool in self._tools.items()
-            if not any(
-                tool.source.startswith(prefix)
-                for prefix in exclude_source_prefixes
-            )
-        }
-        forked._context = dict(self._context)
-        if context:
-            forked._context.update(context)
-        forked._prompt_generation = self._prompt_generation
-        return forked
+        return self.derive(
+            ToolView(exclude_source_prefixes=tuple(exclude_source_prefixes)),
+            context,
+        )
 
     def unregister_by_source_prefix(self, prefix: str) -> None:
         for name in [

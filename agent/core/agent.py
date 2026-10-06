@@ -40,7 +40,7 @@ from agent.plugins.catalog import PluginCatalog
 from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
-from agent.tools.runtime import ToolRegistry
+from agent.tools.runtime import ToolRegistry, ToolView
 from agent.usage import extract_provider_usage
 from agent.security.content_filter import (
     ContentFilter,
@@ -4032,10 +4032,13 @@ class BaseAgent:
         capability_profile: str = "full",
         write_scope: list[str] | None = None,
     ) -> "ToolRegistry":
-        # Snapshot the registry to avoid RuntimeError if tools are added
-        # concurrently (e.g. via /generate-tool while a spawn batch runs).
-        tools_snapshot = dict(self.registry._tools)
-        sub_registry = ToolRegistry(console=shared.CONSOLE)
+        """The registry a sub-agent sees: one declared view of the parent's.
+
+        This used to build a fresh registry and filter by hand, so the session
+        scope and the sub-agent scope implemented the same copy twice and a
+        rule could live in only one of them.  It is now the parent's own
+        ``derive`` call, and the profile is what chooses the view.
+        """
         normalized_profile = str(capability_profile or "").strip().lower()
         if normalized_profile not in CAPABILITY_PROFILES:
             raise ValueError(
@@ -4048,33 +4051,24 @@ class BaseAgent:
             allowed_capabilities = {"read", "output_write"}
             if write_scope:
                 allowed_capabilities.add("workspace_write")
-        for name, tool_def in tools_snapshot.items():
-            # Sub-agents must never spawn further sub-agents — exclude any
-            # orchestration-capable tool by capability, not by name.
-            if "orchestration" in tool_def.capabilities:
-                continue
-            if allowed_capabilities is not None:
-                if not tool_def.capabilities:
-                    continue
-                if not tool_def.capabilities.issubset(allowed_capabilities):
-                    continue
-            sub_registry._tools[name] = tool_def
-        # Copy the context dict, cloning only the mutable containers
-        # (shell_blocked_commands list) rather than deep-copying the
-        # entire dict.  write_scope and capability_profile are always
-        # overwritten per-sub-agent, so they do not need deep copies.
-        parent_ctx = self.registry._context
-        sub_registry._context = dict(parent_ctx)
-        blocked = parent_ctx.get("shell_blocked_commands")
-        if isinstance(blocked, list):
-            sub_registry._context["shell_blocked_commands"] = list(blocked)
-        allowed = parent_ctx.get("shell_allowed_commands")
-        if isinstance(allowed, list):
-            sub_registry._context["shell_allowed_commands"] = list(allowed)
+
+        context: dict[str, Any] = {"capability_profile": normalized_profile}
         if write_scope:
-            sub_registry._context["write_scope"] = list(write_scope)
-        sub_registry._context["capability_profile"] = normalized_profile
-        return sub_registry
+            context["write_scope"] = list(write_scope)
+        return self.registry.derive(
+            ToolView(
+                capabilities_include=(
+                    None
+                    if allowed_capabilities is None
+                    else frozenset(allowed_capabilities)
+                ),
+                # Sub-agents must never spawn further sub-agents -- excluded by
+                # capability rather than by name, so a differently-named
+                # spawner falls under the same rule.
+                capabilities_exclude=frozenset({"orchestration"}),
+            ),
+            context=context,
+        )
 
     def _compose_sub_system_prompt(
         self,
