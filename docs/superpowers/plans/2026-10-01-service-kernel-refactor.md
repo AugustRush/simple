@@ -57,7 +57,8 @@ Measured after each stage, same command every time
 | T7d8 run promotion | 3 / 2960 | 4067 | `promote_orchestration_runs` |
 | T7d9 sub-agent factory | 3 / 2978 | 4063 | `subagent_factory.py` |
 | T7d10 retry loop + budget | 3 / 2997 | 3993 | `subagent_run.py` |
-| T7d11 sub-agent preparation | **3 / 3014** | **3986** | `subagent_prepare.py` |
+| T7d11 sub-agent preparation | 3 / 3014 | 3986 | `subagent_prepare.py` |
+| T7d12 result finalization | **3 / 3036** | **3948** | `subagent_finalize.py` |
 
 The FAILED set is byte-identical to
 `docs/superpowers/plans/2026-10-01-baseline-failures.txt` at every stage.  The
@@ -535,6 +536,33 @@ removed `_fresh_sub_ctx` along with the block it was replacing, so every spawn
 returned `name '_fresh_sub_ctx' is not defined` -- 18 tests red.  Restored.  The
 pattern across three rounds is consistent enough to state: **the splice risk is
 never the block being replaced, it is the helper defined immediately after it.**
+
+**Extraction 14 — result finalization.**  With this, `_execute_agent` is
+orchestration rather than implementation: **288 lines → 167**, and every one of
+its remaining `self.*` references is a callable handed to an extracted function.
+
+`agent/core/subagent_finalize.py` splits the last part in two, because only one
+half has a side effect: `build_result_payload` is pure, and
+`finalize_sub_agent` takes the store.  That separation is what makes the
+interesting rules testable without a database.
+
+**A real defect the split exposed.**  The original minted the memory entry's id
+*before* the store write, inside the suppression context, so a failed write still
+left `memory_entry_id` and `payload["artifact_ref"]` pointing at an entry that
+was never stored -- a caller would then fail to retrieve it, with no indication
+why.  The id is now only recorded after the write succeeds.  Nothing failed
+before the change because no existing test made the store raise; the new
+finalizer test does.
+
+**Two behaviours recorded rather than tidied**, both pre-existing and now pinned:
+
+- **The sub-agent's own error overwrites a contract failure.**  A run that both
+  failed and missed its contract reports the *cause*; the contract miss is a
+  consequence.  The precedence was easy to invert while moving the code.
+- **`"(no output)"` is a pre-validation default, not a guarantee.**  A successful
+  validation replaces `payload["content"]` with whatever the validator returned,
+  so an empty answer with no contract ends up as the empty string.  The marker
+  still does its job on the failure path, where nothing overwrites it.
 
 ### The one decision left, written down so it can be settled
 

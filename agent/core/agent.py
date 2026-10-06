@@ -22,6 +22,10 @@ from agent.core.spawn_planning import (
     SpawnPlanner,
     promote_orchestration_runs,
 )
+from agent.core.subagent_finalize import (
+    build_result_payload,
+    finalize_sub_agent,
+)
 from agent.core.subagent_prepare import prepare_sub_agent
 from agent.core.subagent_run import run_with_retries
 from agent.core.subagent_factory import (
@@ -3718,29 +3722,14 @@ class BaseAgent:
                 "task": shaped_task,
                 "error": "sub-agent produced no result",
             }
-        payload: dict[str, Any] = {
-            "ok": result.error is None,
-            "role": role,
-            "task": shaped_task,
-            "content": result.content or "(no output)",
-            "tool_calls_made": result.tool_calls_made,
-        }
-        contract_ok, contract_content, structured_content, contract_error = (
-            self._validate_output_contract(
-                result.content or "",
-                expected_output=expected_output,
-                output_contract=normalized_output_contract,
-            )
+        payload = build_result_payload(
+            result=result,
+            role=role,
+            shaped_task=shaped_task,
+            expected_output=expected_output,
+            output_contract=normalized_output_contract,
+            validate_output_contract=self._validate_output_contract,
         )
-        if not contract_ok:
-            payload["ok"] = False
-            payload["error"] = contract_error
-        else:
-            payload["content"] = contract_content
-            if structured_content is not None:
-                payload["structured_content"] = structured_content
-        if result.error:
-            payload["error"] = result.error
         elapsed = time.monotonic() - started_at
         self._emit_subagent_event(
             SubAgentProgressEvent(
@@ -3760,50 +3749,23 @@ class BaseAgent:
                 },
             )
         )
-        # Summarize overly long results to keep the parent's context window
-        # bounded.  Full content is preserved in the staging buffer for
-        # later retrieval via LTM, so the parent can always look up details.
-        full_content = payload["content"]
-        result_content_limit = self._result_content_limit()
-        if len(full_content) > result_content_limit:
-            summary = await self._summarize_text(
-                full_content, role, shaped_task
-            )
-            payload["content"] = summary
-        # Persist sub-agent findings directly to LTM rather than the
-        # staging buffer.  Staging is reserved for real user/assistant
-        # conversation turns; sub-agent traces must not be mixed in or
-        # consolidation will extract them as user-visible episodes.
-        context_manager = self._context_manager_for()
-        if context_manager and payload["ok"]:
-            with shared._suppress_with_log("LTM write for sub-agent result failed; turn continues"):
-                content_to_store = full_content
-                entry_id = shared._new_id()
-                now = datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%d %H:%M UTC"
-                )
-                context_manager.store.add_entry(
-                    LTMEntry(
-                        id=entry_id,
-                        content=(
-                            f"sub-agent [{role}] task: {shaped_task[:500]}\n\n"
-                            f"result: {content_to_store}"
-                        ),
-                        importance=0.5,
-                        category="episodes",
-                        entity=role,
-                        memory_type="sub_agent_observation",
-                        scope=(f"run:{run_id}" if run_id else "run:untracked"),
-                        status="active",
-                        source_session=(
-                            context_manager.staging.session_id or ""
-                        ),
-                        confidence=0.7,
-                        created_at=now,
-                        updated_at=now,
-                    )
-                )
-                payload["artifact_ref"] = entry_id
+        # The full text goes to memory, the summary to the parent; see
+        # agent/core/subagent_finalize.py for why they differ.
+        finalized = await finalize_sub_agent(
+            payload,
+            full_content=payload["content"],
+            role=role,
+            shaped_task=shaped_task,
+            run_id=run_id,
+            content_limit=self._result_content_limit(),
+            summarize=self._summarize_text,
+            context_manager=self._context_manager_for(),
+            new_id=shared._new_id,
+            now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            entry_type=LTMEntry,
+            suppress=shared._suppress_with_log,
+        )
+        payload = finalized.payload
         return payload
 
     def _promote_orchestration_runs(self) -> None:
