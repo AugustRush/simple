@@ -78,26 +78,29 @@ def test_regular_tool_executor_calls_registry_and_sink():
     assert events[0].fields["timeout_seconds"] == 1800
 
 
-def test_regular_tool_executor_honors_plugin_block():
-    class _Blocked:
-        action = "block"
-        message = "nope"
+def test_regular_tool_executor_honors_a_blocking_listener():
+    """The gate is now a bus listener, not a catalog the executor holds."""
+    from agent.core.events import EventBus, ToolPostExecute, ToolPreExecute
 
-    class _PluginCatalog:
-        async def fire_pre_tool(self, event):
-            self.pre_event = event
-            return _Blocked()
+    seen: list = []
+    bus = EventBus()
 
-        async def fire_post_tool(self, event):
-            raise AssertionError("blocked tools should not fire post hooks")
+    def gate(event):
+        seen.append(event)
+        return "nope"
+
+    def must_not_run(event):  # pragma: no cover - asserted by not being called
+        raise AssertionError("blocked tools should not fire post hooks")
+
+    bus.on(ToolPreExecute, gate)
+    bus.on(ToolPostExecute, must_not_run)
 
     registry = _FakeRegistry()
-    plugin_catalog = _PluginCatalog()
     sink = _RecordingSink()
     token = _active_sink.set(sink)
     try:
         result = asyncio.run(
-            RegularToolExecutor(registry, plugin_catalog=plugin_catalog).run(
+            RegularToolExecutor(registry, event_bus=bus).run(
                 {"name": "shell", "input": {"command": "rm -rf /"}}
             )
         )
@@ -106,7 +109,7 @@ def test_regular_tool_executor_honors_plugin_block():
 
     assert registry.calls == []
     assert json.loads(result) == {"ok": False, "blocked": True, "reason": "nope"}
-    assert plugin_catalog.pre_event.tool_name == "shell"
+    assert seen[0].tool_name == "shell"
     assert [event[:3] for event in sink.events] == [("blocked", "shell", "nope")]
     assert sink.events[0][3]
 

@@ -31,17 +31,18 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-5 implemented 2026-10-01.** Tasks 6-10 not started.
+**Tasks 0-6 implemented 2026-10-01.** Tasks 7-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | Task 0 | Task 1 | Task 2 | Task 3 | Task 4 | Task 5 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | **3 f / 2753 p** / 1 skipped |
-| FAILED set | baseline | identical | identical | identical | identical | identical | identical |
-| Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same |
-| Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 |
-| Component container reachable from tools | yes | yes | yes | yes | yes | no | no |
-| Plugin unload | 5 code paths, 2 leaks | — | — | — | — | — | **1 path, 0 leaks** |
+| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | **3 f / 2772 p** / 1 skipped |
+| FAILED set | baseline | identical | identical | identical | identical | identical | identical | identical |
+| Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same | +1 recorded |
+| Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 | 1 |
+| Component container reachable from tools | yes | yes | yes | yes | yes | no | no | no |
+| Plugin unload | 5 paths, 2 leaks | — | — | — | — | — | 1 path, 0 leaks | same |
+| Executor depends on the plugin catalog | yes | yes | yes | yes | yes | yes | yes | **no** |
 
 Command for every column: `.venv/bin/python -m pytest -q -p no:cacheprovider`.
 
@@ -212,6 +213,42 @@ itself. What was missing was a moment to say it in, and that is what unload
 provides. The order is fixed and tested: hook, scope, teardown — the hook runs
 while the plugin's registrations still exist, and teardown last because it is
 most likely to need the plugin whole.
+
+### What Task 6 actually produced
+
+`agent/core/events.py` (two typed events and a bus) and one wiring change in
+`agent/core/agent.py`, replacing `RegularToolExecutor(..., plugin_catalog=...)`
+with `event_bus=TOOL_EVENTS`.
+
+The direction of the dependency is now one way. The executor publishes typed
+events and names nothing about plugins; `PluginCatalog` subscribes in its
+constructor and adapts each event to the existing hook chain, so `on_pre_tool`,
+`on_post_tool`, and the `plugin.json` command hooks all run exactly as before.
+`grep -n plugin agent/tools/executor.py` now returns one comment.
+
+**Both existing semantics are preserved and pinned by tests**, because a
+behaviour change smuggled in under a refactor is the failure mode this task is
+most exposed to:
+
+| Behaviour | Where it came from | Pinned by |
+| --- | --- | --- |
+| First refusal wins; later listeners do not run | `catalog.py:1819-1849` | `test_the_first_block_wins_and_later_listeners_do_not_run` |
+| `ToolPostExecute` is observational; a return value is ignored | `executor.py:538` | `test_a_post_listener_return_value_is_ignored_by_the_executor` |
+
+A listener refuses by returning a truthy reason, so `None` means "no opinion" —
+the only default a listener can have. The refusal reason from the listener that
+blocked is what reaches the model, which the short-circuit test asserts
+explicitly.
+
+**Defaults are chosen for isolation.** `RegularToolExecutor(event_bus=None)`
+publishes nowhere, so an executor built by a test is isolated by construction;
+production passes the shared `TOOL_EVENTS` bus explicitly. `PluginCatalog`
+defaults to that same bus and unsubscribes in `close()`, which is asserted —
+without it a reloaded catalog would gate every tool twice.
+
+**The import cycle simplified as a side effect.** `agent/tools/executor.py` no
+longer imports `agent.plugins.catalog` at all, removing one edge from the cycle
+that Task 5 had to work around.
 
 **One honest limitation remains.** An *async* `on_session_end` cannot be driven
 when unload is called from inside a running event loop (`asyncio.run` leaves the
@@ -647,17 +684,17 @@ one the typed version keeps — do not silently "fix" either.
 - Modify: `agent/plugins/catalog.py:1822-1894`
 - Test: `tests/test_tool_executor.py` (extend)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 The executor observes a typed `ToolPreExecute` object and blocks on it, with no
 `PluginCatalog` in scope.
 
-- [ ] **Step 2: Define the two event types and dispatch them**
+- [x] **Step 2: Define the two event types and dispatch them**
 
 `ToolPreExecute` and `ToolPostExecute` as dataclasses. `RuntimeEvent` stays as
 it is (`agent/core/output.py:1075-1087`) for lifecycle facts.
 
-- [ ] **Step 3: Verify**
+- [x] **Step 3: Verify**
 
 ```bash
 .venv/bin/python -m pytest tests/test_tool_executor.py tests/test_plugin_catalog.py -q

@@ -15,7 +15,7 @@ from agent.core.output import (
     _consent_pending,
     _fmt_tool_inputs,
 )
-from agent.plugins.catalog import PostToolEvent, PreToolEvent
+from agent.core.events import ToolPostExecute, ToolPreExecute
 
 # Tools opt into the intent-before-action protocol by declaring the
 # ``requires_intent`` capability.  Today only ``shell`` does (its command
@@ -90,12 +90,17 @@ class RegularToolExecutor:
         self,
         registry: Any,
         *,
-        plugin_catalog: Any = None,
+        event_bus: Any = None,
         timeout_seconds: float | None = None,
         stale_timeout_seconds: float | None = None,
     ) -> None:
         self._registry = registry
-        self._plugin_catalog = plugin_catalog
+        # The bus this executor publishes to, or None for "publish nowhere".
+        #
+        # Defaults to None rather than to the module-level TOOL_EVENTS bus so
+        # that an executor built by a test is isolated by construction.  The
+        # production construction in BaseAgent passes the shared bus.
+        self._event_bus = event_bus
         self._timeout_seconds = (
             shared.REGULAR_TOOL_TIMEOUT
             if timeout_seconds is None
@@ -410,26 +415,29 @@ class RegularToolExecutor:
         sink = _active_sink.get()
         operation_id = self._operation_id()
 
-        if self._plugin_catalog:
-            pre = await self._plugin_catalog.fire_pre_tool(
-                PreToolEvent(tool_name=name, tool_kwargs=inputs)
+        if self._event_bus is not None:
+            # The gates a plugin installs are listeners on this bus, not a
+            # catalog the executor holds.  First refusal wins; see
+            # agent/core/events.py for why that is preserved.
+            reason = await self._event_bus.emit_pre_execute(
+                ToolPreExecute(tool_name=name, arguments=inputs)
             )
-            if pre.action == "block":
+            if reason:
                 self._emit(
                     "tool_blocked",
                     operation_id=operation_id,
                     tool_name=name,
-                    reason=pre.message,
+                    reason=reason,
                 )
                 if sink:
-                    sink.on_tool_blocked(name, pre.message, operation_id=operation_id)
+                    sink.on_tool_blocked(name, reason, operation_id=operation_id)
                 else:
                     shared.CONSOLE.print(
                         f"\n[cyan]→ {name}[/cyan] "
-                        f"[yellow](blocked by plugin: {pre.message})[/yellow]"
+                        f"[yellow](blocked: {reason})[/yellow]"
                     )
                 return json.dumps(
-                    {"ok": False, "blocked": True, "reason": pre.message}
+                    {"ok": False, "blocked": True, "reason": reason}
                 )
 
         declared_timeout = self._tool_timeout(inputs)
@@ -534,8 +542,10 @@ class RegularToolExecutor:
                 f"[dim]{result[:200]}{'...' if len(result) > 200 else ''}[/dim]"
             )
 
-        if self._plugin_catalog:
-            await self._plugin_catalog.fire_post_tool(
-                PostToolEvent(tool_name=name, tool_kwargs=inputs, result=result)
+        if self._event_bus is not None:
+            # Observational: a listener's return value is dropped on purpose,
+            # matching fire_post_tool's contract at the old call site.
+            await self._event_bus.emit(
+                ToolPostExecute(tool_name=name, arguments=inputs, result=result)
             )
         return result

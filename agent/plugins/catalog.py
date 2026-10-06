@@ -14,6 +14,7 @@ import sys
 from typing import Any, Callable, Optional
 
 from agent import shared
+from agent.core.events import TOOL_EVENTS, ToolPostExecute, ToolPreExecute
 from agent.core.output import _active_event_collector
 
 CONSOLE = shared.CONSOLE
@@ -942,6 +943,7 @@ class PluginCatalog:
         user_dir: Optional[Path] = None,
         plugin_config: Optional[dict] = None,
         turn_hook_timeout_seconds: float = shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
+        event_bus: Any = None,
     ) -> None:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
@@ -982,6 +984,15 @@ class PluginCatalog:
         from agent.runtime.services import ServiceRegistry
 
         self._services = ServiceRegistry()
+        # The tool-event subscription.  This is what replaces the executor
+        # holding this catalog: the executor publishes ToolPreExecute /
+        # ToolPostExecute to a bus, and the plugin hooks run as listeners.
+        # Defaults to the shared bus so production wiring needs no changes.
+        self._event_bus = event_bus if event_bus is not None else TOOL_EVENTS
+        self._event_subscriptions: list[Callable[[], None]] = [
+            self._event_bus.on(ToolPreExecute, self._on_tool_pre_execute),
+            self._event_bus.on(ToolPostExecute, self._on_tool_post_execute),
+        ]
 
     def _run_hook_sync(self, hook: Callable, event: Any, timeout: float) -> None:
         """Run one plugin hook to completion from synchronous code.
@@ -1517,6 +1528,9 @@ class PluginCatalog:
         be interrupted, so this does not wait for them — a plugin that hangs
         would otherwise hold up shutdown indefinitely.
         """
+        for unsubscribe in self._event_subscriptions:
+            unsubscribe()
+        self._event_subscriptions.clear()
         self._hook_executor.shutdown(wait=False, cancel_futures=True)
 
     async def reload(self, components: dict) -> dict:
@@ -2008,6 +2022,31 @@ class PluginCatalog:
                 shared.CONSOLE.print(
                     f"[dim]Plugin session_end error ({meta.name}): {exc}[/dim]"
                 )
+
+    async def _on_tool_pre_execute(self, event: ToolPreExecute) -> Optional[str]:
+        """Bus listener for :class:`ToolPreExecute`.
+
+        Adapts the typed event to the existing hook chain rather than
+        duplicating it, so a plugin's ``on_pre_tool`` and its ``plugin.json``
+        command hooks keep running exactly as before.  Returns the refusal
+        reason, or None.
+        """
+        result = await self.fire_pre_tool(
+            PreToolEvent(tool_name=event.tool_name, tool_kwargs=event.arguments)
+        )
+        if result.action == "block":
+            return result.message or "blocked"
+        return None
+
+    async def _on_tool_post_execute(self, event: ToolPostExecute) -> None:
+        """Bus listener for :class:`ToolPostExecute`; purely observational."""
+        await self.fire_post_tool(
+            PostToolEvent(
+                tool_name=event.tool_name,
+                tool_kwargs=event.arguments,
+                result=event.result,
+            )
+        )
 
     async def fire_pre_tool(self, event: PreToolEvent) -> HookResult:
         """Fire before a tool call; first blocking result short-circuits the chain.

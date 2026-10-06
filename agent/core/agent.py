@@ -18,6 +18,7 @@ import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt, _now
 from agent.core.context_assembler import ContextAssembler
+from agent.core.events import TOOL_EVENTS
 from agent.core.payload_shape import describe_payload, head_fingerprint
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
@@ -2738,9 +2739,13 @@ class BaseAgent:
             (idx, tu) for idx, tu in enumerate(tool_uses) if not _is_orchestration(tu)
         ]
         if regular_calls:
+            # The executor publishes tool events; the plugin catalog is one
+            # subscriber among possible others.  Passing the shared bus is what
+            # keeps a plugin's on_pre_tool gate in force without the tool
+            # execution layer naming the plugin machinery.
             regular_executor = RegularToolExecutor(
                 self.registry,
-                plugin_catalog=self.plugin_catalog,
+                event_bus=TOOL_EVENTS,
             )
             regular_results = await _execute_regular_tool_calls(
                 regular_calls, regular_executor
