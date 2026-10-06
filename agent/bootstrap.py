@@ -26,7 +26,13 @@ from agent.commands import (
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime import AgentCore, TurnRunner
-from agent.ralph import RalphIterationResult, RalphService, RalphTaskStore, RalphVerifier
+from agent.ralph import (
+    RalphIterationResult,
+    RalphService,
+    RalphTaskStore,
+    RalphVerifier,
+    open_task_store,
+)
 from agent.tools.files import FileService, resolve_file_access_config
 
 BaseAgent = agent_module.BaseAgent
@@ -998,7 +1004,7 @@ async def _build_components_async(
 
     components["ralph_service"] = RalphService(
         turn_executor=_execute_ralph_iteration,
-        store=RalphTaskStore(agent_module.TASKS_DIR),
+        store=open_task_store(agent_module.TASKS_DIR),
         verifier=RalphVerifier(
             workspace_root=workspace_root,
             output_dir=output_dir,

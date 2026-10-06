@@ -30,6 +30,7 @@ from .store import (
     RalphTaskCorruptError,
     RalphTaskNotFoundError,
     RalphTaskStore,
+    open_task_store,
     RalphTaskStoreIOError,
     TaskNotFoundError,
 )
@@ -84,6 +85,7 @@ __all__ = [
     "RalphTaskCorruptError",
     "RalphTaskNotFoundError",
     "RalphTaskStore",
+    "open_task_store",
     "RalphTaskStoreIOError",
     "RalphTaskStatus",
     "RalphValidationError",

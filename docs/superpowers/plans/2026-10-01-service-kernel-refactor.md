@@ -1240,6 +1240,31 @@ catch:
 below — that is a different question (what the scheduler may *assume* about a
 store) from where the store *comes from*, which is what this slice settled.
 
+## Task 10, second slice: the Ralph task store seam
+
+The same shape as the scheduler store, one layer down and much smaller:
+`RalphTaskStore` was constructed in three modules, and two of them were
+convenience wrappers in `agent/__init__.py` that each built a throwaway instance
+to save or load a single task, reading a module-level `TASKS_DIR` that
+`_set_agent_home` rewrites.
+
+Three sites is a tidy-up, not a defect -- but the *shape* is what matters for
+Task 10, so it is recorded the same way: a plugin cannot replace a store it does
+not construct, and a caller cannot point elsewhere while the path comes from a
+global.
+
+`agent.ralph.open_task_store(tasks_dir=None)` is now the only construction site,
+with the same guard pattern as the scheduler's (source-level, verified by
+reintroducing a construction in `bootstrap.py`).
+
+**One design point, decided explicitly rather than by accident:** the wrappers
+pass `TASKS_DIR` in rather than letting the factory resolve its own default.
+`agent.TASKS_DIR` is the *live* value `_set_agent_home` repoints, and the existing
+wrapper test monkeypatches it; a factory reading its own global would silently
+ignore that and break a contract the tests already rely on.  The factory's own
+default (the shared scheduler directory) is still exercised, for callers that
+have no opinion.
+
 ## Task 10: ralph and scheduler as plugins — the boundary, measured
 
 Task 10 needs a store interface before either service can become a plugin.  The

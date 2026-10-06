@@ -6,6 +6,7 @@ import stat
 import uuid
 from pathlib import Path
 
+from agent import shared
 from agent.pathing import path_contains
 
 from .models import RalphTask, RalphValidationError, validate_task_id
@@ -215,3 +216,18 @@ __all__ = [
     "RalphTaskStoreIOError",
     "TaskNotFoundError",
 ]
+
+
+def open_task_store(tasks_dir: str | Path | None = None) -> "RalphTaskStore":
+    """The one place a ``RalphTaskStore`` is constructed.
+
+    Same shape as ``agent.scheduler.open_store``: an explicit location, and a
+    single place that names the concrete class, so a caller -- a test, a second
+    instance, a future plugin -- can point somewhere else without the store
+    resolving a module-level global behind its back.
+
+    ``None`` uses the configured Ralph task directory, which is the shared
+    scheduler directory.  The two are the same location by design: Ralph tasks
+    live beside scheduled tasks, not in a directory of their own.
+    """
+    return RalphTaskStore(tasks_dir if tasks_dir is not None else shared.SCHEDULER_DIR)

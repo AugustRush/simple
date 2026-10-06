@@ -147,6 +147,7 @@ from .ralph import (
     RalphTaskStatus,
     RalphValidationError,
     RalphVerifier,
+    open_task_store,
     VerificationResult,
     VerificationStatus,
     parse_ralph_command,
@@ -154,14 +155,20 @@ from .ralph import (
 
 
 def _save_ralph_task(task: RalphTask) -> None:
-    """Atomically persist task state to disk."""
-    RalphTaskStore(TASKS_DIR).save(task)
+    """Atomically persist task state to disk.
+
+    The directory is passed explicitly rather than resolved inside the factory:
+    this module's ``TASKS_DIR`` is the live value ``_set_agent_home`` rewrites,
+    and callers (and tests) repoint it.  A factory that read its own global
+    would ignore that.
+    """
+    open_task_store(TASKS_DIR).save(task)
 
 
 def _load_ralph_task(task_id: str) -> Optional[RalphTask]:
     """Load a previously persisted task, or None if not found."""
     try:
-        return RalphTaskStore(TASKS_DIR).load(task_id)
+        return open_task_store(TASKS_DIR).load(task_id)
     except (RalphStoreError, RalphValidationError):
         return None
 
