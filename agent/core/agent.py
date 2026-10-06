@@ -65,6 +65,10 @@ from agent.core.llm_errors import (
 from agent.core.payload_shape import describe_payload, head_fingerprint
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
+from agent.core.llm_attempt import obtain_response
+from agent.core.stream_tracking import (
+    StreamEmissionTracker as _StreamEmissionTracker,
+)
 from agent.memory.consolidation import estimate_message_tokens
 from agent.memory.system import ContextLimitError, ContextManager, LTMEntry
 from agent.orchestration.runtime import (
@@ -246,48 +250,6 @@ class _TaskLocalContextStack:
 _ = _TaskLocalContextStack  # publicly importable for any third-party caller
 
 
-class _StreamEmissionTracker:
-    """Wraps a turn's stream callbacks and remembers whether anything reached
-    the user.
-
-    Retrying an LLM call replays it from the beginning.  For a *streaming*
-    call that means every chunk is pushed to the sink a second time, and
-    sinks are append-only: the CLI has already written the first attempt's
-    text to the terminal, so there is nothing to take back.  A transient
-    error after the first chunk therefore has to surface as a failure rather
-    than silently produce a doubled reply.
-
-    One flag covers both channels — the answer and the thinking — because
-    the sink cannot unsay either, and thinking is precisely the emission a
-    thinking-heavy turn has produced when it dies before the first answer
-    token.
-
-    The wrappers are plain callables, not coroutine functions, so they work
-    for sync and async callbacks alike — transports await the *result* when
-    it is awaitable rather than inspecting the callable.
-    """
-
-    __slots__ = ("_callback", "emitted")
-
-    def __init__(self, callback: Callable[[str], Any]):
-        self._callback = callback
-        self.emitted = False
-
-    def nothing_emitted(self) -> bool:
-        return not self.emitted
-
-    def __call__(self, chunk: str) -> Any:
-        if chunk:
-            self.emitted = True
-        return self._callback(chunk)
-
-    def wrap_reasoning(self, callback: Callable[[str], Any]) -> Callable[[str], Any]:
-        """The reasoning channel, counted against the same no-replay rule."""
-        def reasoning(chunk: str) -> Any:
-            if chunk:
-                self.emitted = True
-            return callback(chunk)
-        return reasoning
 
 
 @dataclass
@@ -2799,84 +2761,28 @@ class BaseAgent:
                     response_started_at = time.perf_counter()
                     heartbeat.operation("LLM", self._effective_model(ctx))
                     recovered = filter_recovery.take_pending_response()
-                    if recovered is not None:
-                        response = recovered
-                        streamed_text = ""
-                    elif pending_tool_response is not None:
-                        response = pending_tool_response
-                        pending_tool_response = None
-                        streamed_text = ""
-                    else:
-                        # Wrap the LLM call as a task and register a cleanup
-                        # so /now (force-cancel) aborts the HTTP request mid-flight.
-                        # Graceful cancel waits for the call to finish naturally.
-                        if stream_callback:
-                            tracked_callback = _StreamEmissionTracker(stream_callback)
-                            # The reasoning channel is resolved here rather
-                            # than inside _stream_response so the tracker can
-                            # wrap it: reasoning arrives ahead of the first
-                            # answer token, so it is exactly the emission that
-                            # has to veto a replay.
-                            sink = _active_sink.get()
-                            raw_reasoning = (
-                                getattr(sink, "sync_reasoning_cb", None)
-                                if sink is not None
-                                else None
-                            )
-                            reasoning_callback = (
-                                tracked_callback.wrap_reasoning(raw_reasoning)
-                                if raw_reasoning is not None
-                                else None
-                            )
-                            llm_task = asyncio.create_task(
-                                self._with_llm_retry(
-                                    self._stream_response,
-                                    ctx,
-                                    tools,
-                                    tracked_callback,
-                                    reasoning_callback,
-                                    can_retry=tracked_callback.nothing_emitted,
-                                )
-                            )
-                        else:
-                            llm_task = asyncio.create_task(
-                                self._with_llm_retry(self._create, ctx, tools)
-                            )
-
-                        def _abort_llm(level: str) -> None:
-                            if not llm_task.done():
-                                llm_task.cancel()
-
-                        active_token = shared._active_cancel_token.get()
-                        _llm_deregister = (
-                            active_token.register_cleanup("llm_call", _abort_llm)
-                            if active_token is not None
-                            else (lambda: None)
-                        )
-                        try:
-                            try:
-                                llm_result = await llm_task
-                            except asyncio.CancelledError:
-                                if active_token is None or not active_token.is_cancelled:
-                                    raise
-                                trace_status = "cancelled"
-                                trace_error = "Turn cancelled by user"
-                                return AgentResult(
-                                    agent_id=ctx.agent_id,
-                                    content=(
-                                        result_text
-                                        or shared._cancelled_by_user_text(user_message)
-                                    ),
-                                    tool_calls_made=tool_calls_made,
-                                    error=trace_error,
-                                )
-                        finally:
-                            _llm_deregister()
-                        if stream_callback:
-                            response, streamed_text = llm_result
-                        else:
-                            response = llm_result
-                            streamed_text = ""
+                    _attempt = await obtain_response(
+                        agent=self,
+                        ctx=ctx,
+                        tools=tools,
+                        user_message=user_message,
+                        recovered=recovered,
+                        pending_tool_response=pending_tool_response,
+                        stream_callback=stream_callback,
+                        trace_status=trace_status,
+                        trace_error=trace_error,
+                        result_text=result_text,
+                        tool_calls_made=tool_calls_made,
+                        active_sink=_active_sink.get(),
+                        cancel_token=ctx.metadata.get("cancel_token"),
+                    )
+                    if _attempt.early_result is not None:
+                        return _attempt.early_result
+                    response = _attempt.response
+                    streamed_text = _attempt.streamed_text
+                    pending_tool_response = _attempt.pending_tool_response
+                    trace_status = _attempt.trace_status
+                    trace_error = _attempt.trace_error
                     response, structured_output_error = (
                         await self._recover_incomplete_tool_response(
                             ctx,
