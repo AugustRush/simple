@@ -66,6 +66,7 @@ from agent.core.payload_shape import describe_payload, head_fingerprint
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
 from agent.core.llm_attempt import obtain_response
+from agent.core.tool_batch import run_tool_batch
 from agent.core.stream_tracking import (
     StreamEmissionTracker as _StreamEmissionTracker,
 )
@@ -2837,70 +2838,25 @@ class BaseAgent:
                         )
                         tool_calls_made.extend(tu["name"] for tu in tool_uses)
                         step_tool_calls = len(tool_uses)
-                        tool_use_started_at = time.perf_counter()
-                        tool_names = ", ".join(
-                            tu["name"] for tu in tool_uses[:3]
-                        ) + (f" +{len(tool_uses) - 3}" if len(tool_uses) > 3 else "")
-                        heartbeat.operation(
-                            "tools", tool_names, current_tool=tool_names
+                        _batch = await run_tool_batch(
+                            agent=self,
+                            ctx=ctx,
+                            tool_uses=tool_uses,
+                            orchestration_decision=orchestration_decision,
+                            intent_text=text or streamed_text or "",
+                            tool_result_history=tool_result_history,
+                            step_index=_step_index,
+                            active_assistant_text=_out._active_assistant_text,
+                            filter_tool_results=filter_tool_results,
+                            trace_latency=_trace_latency,
+                            interaction_log=_interaction_log,
+                            logger=logger,
                         )
-                        try:
-                            results = await self._run_tool_uses(
-                                tool_uses,
-                                orchestration_decision=orchestration_decision,
-                            )
-                        finally:
-                            _out._active_assistant_text.reset(_intent_token)
-                        _trace_latency(
-                            "tool_uses_finished",
-                            agent_id=ctx.agent_id,
-                            step=_step_index + 1,
-                            total_tool_uses=len(tool_uses),
-                            spawn_calls=sum(
-                                1 for tool_use in tool_uses
-                                if "orchestration" in self.registry.tool_capabilities(tool_use["name"])
-                            ),
-                            regular_calls=sum(
-                                1 for tool_use in tool_uses
-                                if "orchestration" not in self.registry.tool_capabilities(tool_use["name"])
-                            ),
-                            duration_ms=f"{(time.perf_counter() - tool_use_started_at) * 1000:.1f}",
-                        )
-                        _interaction_log(
-                            "tool_batch_finished",
-                            agent_id=ctx.agent_id,
-                            step=_step_index + 1,
-                            tool_uses=len(tool_uses),
-                            duration_ms=f"{(time.perf_counter() - tool_use_started_at) * 1000:.1f}",
-                        )
-                        tool_result_history.extend(
-                            (tu["name"], self._extract_summary_text(res))
-                            for tu, res in zip(tool_uses, results)
-                        )
-                        # Content filter: screen tool results before API submission.
-                        # Flagged results get summarized to avoid triggering provider
-                        # content policy filters on subsequent API calls.
-                        filtered_results, risky_indices = filter_tool_results(
-                            self.content_filter,
-                            tool_uses,
-                            results,
-                            threshold=self._content_filter_threshold,
-                        )
-                        if risky_indices:
-                            await self.content_filter.learn_and_persist(
-                                [results[i] for i in risky_indices]
-                            )
-                            logger.info(
-                                "Content filter flagged %d/%d tool results as risky: %s",
-                                len(risky_indices), len(results),
-                                [tool_uses[i]["name"] for i in risky_indices],
-                            )
-                        restart_message = self._clear_context_restart_message(
-                            tool_uses, results
-                        )
-                        if restart_message is not None:
+                        results = _batch.results
+                        filtered_results = _batch.filtered_results
+                        if _batch.restart_message is not None:
                             ctx.messages[:] = [
-                                {"role": "user", "content": restart_message}
+                                {"role": "user", "content": _batch.restart_message}
                             ]
                             filter_recovery.forget_submission()
                             _step_index += 1
