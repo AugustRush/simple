@@ -136,6 +136,33 @@ _active_orchestration_runs: contextvars.ContextVar[Optional[list[dict[str, Any]]
 )
 
 
+class _TurnLoopState:
+    """One turn's step-loop state.
+
+    A plain object the caller owns and passes in, rather than attributes on
+    ``self``: ``send_message`` may run several turns concurrently on one agent
+    instance, and ``self`` is shared between them.  Storing this state on the
+    instance let one turn read another's ``trace_status`` and
+    ``pending_tool_response``, which a concurrent-session test caught.
+    """
+
+    __slots__ = (
+        "pending_tool_response",
+        "result_text",
+        "trace_status",
+        "trace_error",
+        "steps",
+    )
+
+    def __init__(self) -> None:
+        self.pending_tool_response: Any = None
+        self.result_text = ""
+        self.trace_status = "ok"
+        self.trace_error: Optional[str] = None
+        self.steps = 0
+
+
+
 def _trace_latency(stage: str, **fields: object) -> None:
     shared._trace_latency("agent", stage, **fields)
 
@@ -2610,90 +2637,40 @@ class BaseAgent:
             )
         return result_text, None, None
 
-    async def send_message(
+    async def _run_turn_loop(
         self,
-        ctx: "AgentContext",
+        ctx: AgentContext,
         user_message: str,
-        stream_callback: Optional[Callable[[str], None]] = None,
-        attachments: tuple[MessageAttachment, ...] = (),
-    ) -> "AgentResult":
-        """Run one turn.
+        attachments: Any,
+        stream_callback: Any,
+        *,
+        max_steps: int,
+        orchestration_token: Any,
+        filter_recovery: Any,
+        watchdog: Any,
+        tool_calls_made: list,
+        tool_result_history: list,
+        heartbeat: Any,
+        turn_started_at: float,
+        active_ctx_token: Any,
+        cancel_token_token: Any,
+        session_id_token: Any,
+        state: "_TurnLoopState",
+    ) -> AgentResult:
+        """Run a turn's step loop, with its own teardown.
 
-        ``stream_callback`` receives the answer as it is produced.  The model's
-        thinking, when the provider produces any, goes to the turn's sink
-        instead (see ``_stream_response``): it is a sink capability rather than
-        a stream the caller asks for, so this signature did not have to grow a
-        second callback that every caller would then have to accept.
+        The loop and the ``finally`` are one unit: the cleanup restores three
+        contextvars and clears the turn's markers, and a step that returns early
+        must still run it.  That is why this is a method rather than a helper --
+        a helper's ``return`` would exit the helper.
+
+        The step state that ``send_message`` used to keep in locals arrives in
+        ``state``.  It is deliberately not on ``self``: ``send_message`` can run
+        several turns concurrently on one agent instance, so an attribute would
+        let one turn read another's ``trace_status`` or ``pending_tool_response``.
+        Locals were correct for that reason, and a mutable holder keeps them
+        correct while making them visible to the caller.
         """
-        tool_calls_made: list[str] = []
-        tool_result_history: list[tuple[str, str]] = []
-        result_text = ""
-        watchdog = self._new_watchdog_state()
-        orchestration_token = None
-        if not ctx.metadata.get("_orchestration_child"):
-            orchestration_token = _active_orchestration_runs.set([])
-        filter_recovery = _ContentFilterRecovery()
-        turn_started_at = time.perf_counter()
-        trace_status = "ok"
-        trace_error: str | None = None
-        steps = 0
-        _interaction_log(
-            "turn_started",
-            agent_id=ctx.agent_id,
-            tools_enabled=ctx.tools_enabled,
-            stream=bool(stream_callback),
-            message_len=len(user_message),
-            message_preview=_preview_text(user_message),
-        )
-        _trace_latency(
-            "send_message_started",
-            agent_id=ctx.agent_id,
-            tools_enabled=ctx.tools_enabled,
-            stream=bool(stream_callback),
-            message_len=len(user_message),
-        )
-
-        # Set the active agent context so built-in tools (e.g. clear_context)
-        # can access the current ctx.messages.  Done before the try so the
-        # token is always bound when the finally clause reaches reset().
-        _active_ctx_token = _active_agent_context.set(ctx)
-        # Publish the cancel token via ContextVar so any tool deep in the
-        # call stack (shell subprocess, LLM transport) can register a cleanup
-        # without us having to thread the token through every API.
-        _cancel_token_token = shared._active_cancel_token.set(
-            ctx.metadata.get("cancel_token")
-        )
-        # The conversation this turn belongs to, for the same reason and for one
-        # more: a gateway that asks for "one stable id per conversation" in a
-        # request header gets it from here.  Set for the span of the turn by
-        # both the interactive paths and the scheduler, whose runs each carry
-        # their own `scheduler:<task>:<run>` id, so a scheduled run is one
-        # conversation to the provider just as it is to us.
-        _session_id_token = shared._active_session_id.set(
-            str(ctx.metadata.get("session_id") or "") or None
-        )
-
-        # B1: wrap ALL mutations (prompt injection, messages append, stack push)
-        # inside the try/finally so they are always cleaned up on error.
-        # Start the per-turn heartbeat here so it sees the active sink.
-        from agent.core.output import _active_sink as _hb_sink_var
-
-        heartbeat_writer: HeartbeatWriter | None = None
-        if ctx.metadata.get("heartbeat_enabled", True) is not False:
-            heartbeat_writer = HeartbeatWriter(
-                session_id=str(ctx.metadata.get("session_id") or ctx.agent_id),
-                agent_id=ctx.agent_id,
-                path=ctx.metadata.get("heartbeat_path"),
-            )
-        heartbeat = TurnHeartbeat(
-            writer=heartbeat_writer,
-            interval_seconds=float(ctx.metadata.get("heartbeat_interval", 5.0) or 5.0),
-            turn_id=str(ctx.metadata.get("turn_id") or ""),
-            pending_messages=lambda: len(ctx.metadata.get("pending_messages") or []),
-            sink_provider=_hb_sink_var.get,
-        )
-        await heartbeat.__aenter__()
-
         try:
             ctx.metadata[_TURN_IN_PROGRESS_KEY] = True
             orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
@@ -2712,22 +2689,22 @@ class BaseAgent:
             # Set when a truncation continuation comes back asking for tools:
             # the next iteration adopts that response without a model call and
             # runs it through the normal tool branch.
-            pending_tool_response: Any = None
+            state.pending_tool_response: Any = None
             while True:
                 if _step_index == max_steps:
-                    trace_status = "tool_loop_exceeded"
-                    trace_error = (
+                    state.trace_status = "tool_loop_exceeded"
+                    state.trace_error = (
                         f"Tool-call loop exceeded {max_steps} "
                         "iterations; possible model loop detected."
                     )
                     return AgentResult(
                         agent_id=ctx.agent_id,
-                        content=result_text,
+                        content=state.result_text,
                         tool_calls_made=tool_calls_made,
-                        error=trace_error,
+                        error=state.trace_error,
                     )
-                steps = _step_index + 1
-                ctx.metadata["_provider_step"] = steps
+                state.steps = _step_index + 1
+                ctx.metadata["_provider_step"] = state.steps
                 tools = list(ctx.metadata.get("_selected_tools") or [])
 
                 # Drain the interjection mailbox: any user messages that
@@ -2747,18 +2724,18 @@ class BaseAgent:
                 # orphans a subprocess or loses its turn record.
                 cancel_token = ctx.metadata.get("cancel_token")
                 if cancel_token is not None and cancel_token.is_cancelled:
-                    trace_status = "cancelled"
-                    trace_error = "Turn cancelled by user"
+                    state.trace_status = "cancelled"
+                    state.trace_error = "Turn cancelled by user"
                     return AgentResult(
                         agent_id=ctx.agent_id,
-                        content=result_text or shared._cancelled_by_user_text(user_message),
+                        content=state.result_text or shared._cancelled_by_user_text(user_message),
                         tool_calls_made=tool_calls_made,
-                        error=trace_error,
+                        error=state.trace_error,
                     )
 
-                _emit_event("step_started", step=steps)
+                _emit_event("step_started", step=state.steps)
                 step_tool_calls = 0
-                status_at_step_start = trace_status
+                status_at_step_start = state.trace_status
                 try:
                     response_started_at = time.perf_counter()
                     heartbeat.operation("LLM", self._effective_model(ctx))
@@ -2769,11 +2746,11 @@ class BaseAgent:
                         tools=tools,
                         user_message=user_message,
                         recovered=recovered,
-                        pending_tool_response=pending_tool_response,
+                        pending_tool_response=state.pending_tool_response,
                         stream_callback=stream_callback,
-                        trace_status=trace_status,
-                        trace_error=trace_error,
-                        result_text=result_text,
+                        trace_status=state.trace_status,
+                        trace_error=state.trace_error,
+                        result_text=state.result_text,
                         tool_calls_made=tool_calls_made,
                         active_sink=_active_sink.get(),
                         cancel_token=ctx.metadata.get("cancel_token"),
@@ -2782,9 +2759,9 @@ class BaseAgent:
                         return _attempt.early_result
                     response = _attempt.response
                     streamed_text = _attempt.streamed_text
-                    pending_tool_response = _attempt.pending_tool_response
-                    trace_status = _attempt.trace_status
-                    trace_error = _attempt.trace_error
+                    state.pending_tool_response = _attempt.pending_tool_response
+                    state.trace_status = _attempt.trace_status
+                    state.trace_error = _attempt.trace_error
                     response, structured_output_error = (
                         await self._recover_incomplete_tool_response(
                             ctx,
@@ -2793,11 +2770,11 @@ class BaseAgent:
                         )
                     )
                     if structured_output_error is not None:
-                        trace_status = "continuation_error"
-                        trace_error = structured_output_error
+                        state.trace_status = "continuation_error"
+                        state.trace_error = structured_output_error
                         return AgentResult(
                             agent_id=ctx.agent_id,
-                            content=streamed_text or result_text,
+                            content=streamed_text or state.result_text,
                             tool_calls_made=tool_calls_made,
                             error=structured_output_error,
                         )
@@ -2825,7 +2802,7 @@ class BaseAgent:
 
                     if stop_reason == "tool_use" and tool_uses:
                         if text:
-                            result_text = text
+                            state.result_text = text
                         assistant_tool_message = self._assistant_message(
                             response, text, ctx
                         )
@@ -2914,28 +2891,28 @@ class BaseAgent:
                             interaction_log=_interaction_log,
                         )
                         if _stuck.stuck:
-                            trace_status = "tool_loop_stuck"
+                            state.trace_status = "tool_loop_stuck"
                             return _stuck.final_result
                         _step_index += 1
                         continue
                     else:
-                        result_text, continuation_error, continuation_tool_response = (
+                        state.result_text, continuation_error, continuation_tool_response = (
                             await self._handle_end_turn(
                                 ctx,
                                 response,
                                 text,
                                 streamed_text,
-                                result_text,
+                                state.result_text,
                                 tool_result_history,
                                 tools,
                             )
                         )
                         if continuation_error is not None:
-                            trace_status = "continuation_error"
-                            trace_error = continuation_error
+                            state.trace_status = "continuation_error"
+                            state.trace_error = continuation_error
                             return AgentResult(
                                 agent_id=ctx.agent_id,
-                                content=result_text,
+                                content=state.result_text,
                                 tool_calls_made=tool_calls_made,
                                 error=continuation_error,
                             )
@@ -2945,7 +2922,7 @@ class BaseAgent:
                             # loop execute the calls through the normal tool
                             # path.  The continuation was a model call, so it
                             # is charged a step like any other.
-                            pending_tool_response = continuation_tool_response
+                            state.pending_tool_response = continuation_tool_response
                             _step_index += 1
                             continue
                         break
@@ -2962,7 +2939,7 @@ class BaseAgent:
                         if recovered_response is not None:
                             filter_recovery.pending_response = recovered_response
                             filter_recovery.forget_submission()
-                            trace_status = "content_filter_recovered"
+                            state.trace_status = "content_filter_recovered"
                             _interaction_log(
                                 "content_filter_recovered",
                                 agent_id=ctx.agent_id,
@@ -2970,26 +2947,26 @@ class BaseAgent:
                             )
                             continue
                         # Recovery failed — let the error propagate
-                        trace_status = "content_filter_unrecoverable"
-                        trace_error = (
+                        state.trace_status = "content_filter_unrecoverable"
+                        state.trace_error = (
                             "Content filter blocked the request and recovery failed. "
                             "Consider switching to a different provider "
                             "(e.g. /model anthropic or /model openai) for "
                             "this task."
                         )
-                        result_text = trace_error
+                        state.result_text = state.trace_error
                         ctx.messages.append(
-                            {"role": "assistant", "content": trace_error}
+                            {"role": "assistant", "content": state.trace_error}
                         )
                         break
 
-                    trace_status = "exception"
-                    trace_error = self._format_agent_error(e)
+                    state.trace_status = "exception"
+                    state.trace_error = self._format_agent_error(e)
                     return AgentResult(
                         agent_id=ctx.agent_id,
                         content="",
                         tool_calls_made=tool_calls_made,
-                        error=trace_error,
+                        error=state.trace_error,
                     )
                 finally:
                     # Every exit from a step passes here — `continue`, `break`,
@@ -2999,46 +2976,46 @@ class BaseAgent:
                     # only when *this* step is what changed it.
                     _emit_event(
                         "step_ended",
-                        step=steps,
+                        step=state.steps,
                         tool_calls=step_tool_calls,
                         status=(
-                            trace_status
-                            if trace_status != status_at_step_start
+                            state.trace_status
+                            if state.trace_status != status_at_step_start
                             else "ok"
                         ),
                     )
         finally:
             if orchestration_token is not None:
-                if trace_status in {"ok", "content_filter_recovered"}:
+                if state.trace_status in {"ok", "content_filter_recovered"}:
                     with shared._suppress_with_log(
                         "orchestration summary promotion failed"
                     ):
                         self._promote_orchestration_runs()
                 _active_orchestration_runs.reset(orchestration_token)
-            _active_agent_context.reset(_active_ctx_token)
-            shared._active_cancel_token.reset(_cancel_token_token)
-            shared._active_session_id.reset(_session_id_token)
+            _active_agent_context.reset(active_ctx_token)
+            shared._active_cancel_token.reset(cancel_token_token)
+            shared._active_session_id.reset(session_id_token)
             await heartbeat.stop(
-                status=trace_status if trace_status != "ok" else "finished",
-                detail=trace_status,
+                status=state.trace_status if state.trace_status != "ok" else "finished",
+                detail=state.trace_status,
             )
             _interaction_log(
                 "turn_finished",
                 agent_id=ctx.agent_id,
-                status=trace_status,
-                error=trace_error,
-                steps=steps,
+                status=state.trace_status,
+                error=state.trace_error,
+                steps=state.steps,
                 tool_calls=len(tool_calls_made),
-                content_len=len(result_text),
-                content_preview=_preview_text(result_text),
+                content_len=len(state.result_text),
+                content_preview=_preview_text(state.result_text),
                 duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
             )
             _trace_latency(
                 "send_message_finished",
                 agent_id=ctx.agent_id,
-                status=trace_status,
-                error=trace_error,
-                steps=steps,
+                status=state.trace_status,
+                error=state.trace_error,
+                steps=state.steps,
                 tool_calls=len(tool_calls_made),
                 duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
             )
@@ -3061,9 +3038,113 @@ class BaseAgent:
 
         return AgentResult(
             agent_id=ctx.agent_id,
-            content=result_text,
+            content=state.result_text,
             tool_calls_made=tool_calls_made,
-            error=trace_error,
+            error=state.trace_error,
+        )
+
+    async def send_message(
+        self,
+        ctx: "AgentContext",
+        user_message: str,
+        stream_callback: Optional[Callable[[str], None]] = None,
+        attachments: tuple[MessageAttachment, ...] = (),
+    ) -> "AgentResult":
+        """Run one turn.
+
+        ``stream_callback`` receives the answer as it is produced.  The model's
+        thinking, when the provider produces any, goes to the turn's sink
+        instead (see ``_stream_response``): it is a sink capability rather than
+        a stream the caller asks for, so this signature did not have to grow a
+        second callback that every caller would then have to accept.
+        """
+        tool_calls_made: list[str] = []
+        tool_result_history: list[tuple[str, str]] = []
+        result_text = ""
+        watchdog = self._new_watchdog_state()
+        orchestration_token = None
+        if not ctx.metadata.get("_orchestration_child"):
+            orchestration_token = _active_orchestration_runs.set([])
+        filter_recovery = _ContentFilterRecovery()
+        turn_started_at = time.perf_counter()
+        trace_status = "ok"
+        trace_error: str | None = None
+        steps = 0
+        _interaction_log(
+            "turn_started",
+            agent_id=ctx.agent_id,
+            tools_enabled=ctx.tools_enabled,
+            stream=bool(stream_callback),
+            message_len=len(user_message),
+            message_preview=_preview_text(user_message),
+        )
+        _trace_latency(
+            "send_message_started",
+            agent_id=ctx.agent_id,
+            tools_enabled=ctx.tools_enabled,
+            stream=bool(stream_callback),
+            message_len=len(user_message),
+        )
+
+        # Set the active agent context so built-in tools (e.g. clear_context)
+        # can access the current ctx.messages.  Done before the try so the
+        # token is always bound when the finally clause reaches reset().
+        _active_ctx_token = _active_agent_context.set(ctx)
+        # Publish the cancel token via ContextVar so any tool deep in the
+        # call stack (shell subprocess, LLM transport) can register a cleanup
+        # without us having to thread the token through every API.
+        _cancel_token_token = shared._active_cancel_token.set(
+            ctx.metadata.get("cancel_token")
+        )
+        # The conversation this turn belongs to, for the same reason and for one
+        # more: a gateway that asks for "one stable id per conversation" in a
+        # request header gets it from here.  Set for the span of the turn by
+        # both the interactive paths and the scheduler, whose runs each carry
+        # their own `scheduler:<task>:<run>` id, so a scheduled run is one
+        # conversation to the provider just as it is to us.
+        _session_id_token = shared._active_session_id.set(
+            str(ctx.metadata.get("session_id") or "") or None
+        )
+
+        # B1: wrap ALL mutations (prompt injection, messages append, stack push)
+        # inside the try/finally so they are always cleaned up on error.
+        # Start the per-turn heartbeat here so it sees the active sink.
+        from agent.core.output import _active_sink as _hb_sink_var
+
+        heartbeat_writer: HeartbeatWriter | None = None
+        if ctx.metadata.get("heartbeat_enabled", True) is not False:
+            heartbeat_writer = HeartbeatWriter(
+                session_id=str(ctx.metadata.get("session_id") or ctx.agent_id),
+                agent_id=ctx.agent_id,
+                path=ctx.metadata.get("heartbeat_path"),
+            )
+        heartbeat = TurnHeartbeat(
+            writer=heartbeat_writer,
+            interval_seconds=float(ctx.metadata.get("heartbeat_interval", 5.0) or 5.0),
+            turn_id=str(ctx.metadata.get("turn_id") or ""),
+            pending_messages=lambda: len(ctx.metadata.get("pending_messages") or []),
+            sink_provider=_hb_sink_var.get,
+        )
+        await heartbeat.__aenter__()
+
+        state = _TurnLoopState()
+        return await self._run_turn_loop(
+            ctx,
+            user_message,
+            attachments,
+            stream_callback,
+            max_steps=max(1, int(self.max_tool_call_iterations)),
+            orchestration_token=orchestration_token,
+            filter_recovery=filter_recovery,
+            watchdog=watchdog,
+            tool_calls_made=tool_calls_made,
+            tool_result_history=tool_result_history,
+            heartbeat=heartbeat,
+            turn_started_at=turn_started_at,
+            active_ctx_token=_active_ctx_token,
+            cancel_token_token=_cancel_token_token,
+            session_id_token=_session_id_token,
+            state=state,
         )
 
     @staticmethod
