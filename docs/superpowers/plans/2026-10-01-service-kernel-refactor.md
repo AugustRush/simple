@@ -1205,6 +1205,59 @@ decision for the plan's owner; the evidence for it is now in the suite.
 
 ---
 
+## Task 10: ralph and scheduler as plugins — the boundary, measured
+
+Task 10 needs a store interface before either service can become a plugin.  The
+measurement below was taken so the next attempt does not have to re-derive it.
+
+| Service | Methods | Store surface it actually uses |
+| --- | --- | --- |
+| `RalphService` | 9 | `list_tasks`, `load`, `save` — three methods, no node types |
+| `SchedulerService` | 26 | `db_path`, plus it **constructs `SchedulerStore` itself** |
+
+`RalphService` is the easy half and could be given a `Protocol` today.
+
+**`SchedulerService` contains the real decision**, at
+`agent/scheduler/runtime.py:82`:
+
+```python
+async def _store_call(self, method_name, *args, **kwargs):
+    if type(self.store) is not SchedulerStore:          # concrete-class test
+        ...  asyncio.to_thread(getattr(self.store, method_name), ...)
+    else:
+        def invoke():
+            thread_store = SchedulerStore(db_path=self.store.db_path)  # built here
+            ...
+```
+
+This is not scattered state; it is one trade-off expressed as a type test.  A
+SQLite connection cannot be used from another thread, so when the store *is* a
+`SchedulerStore` every call gets a thread-owned connection, and any other store is
+simply called in a worker thread.  A `Protocol` therefore has to answer a
+question the code currently answers by identity:
+
+> **Does a non-SQLite store own its own thread-safety, or must the scheduler
+> provide it?**
+
+Getting that wrong does not fail loudly -- it removes the connection isolation
+that the `type(...) is` branch exists to provide, and the symptom would be
+intermittent SQLite errors under concurrent runs.
+
+**Both halves or neither.**  Giving `RalphService` a `Protocol` while
+`SchedulerService` keeps testing its store by concrete class would leave Task 10
+looking done and behaving half-done, which is worse than leaving it visibly
+outstanding.
+
+**What would settle it.**  Either (a) the scheduler owns threading for every
+store, in which case the `Protocol` needs a `db_path`-like handle or a
+`thread_local()` method, or (b) stores declare their own thread-affinity, in
+which case the `Protocol` needs something like `is_thread_affine` and
+`SchedulerStore` returns True.  (b) is closer to what the code does today and
+keeps the SQLite knowledge inside the SQLite store; (a) is closer to what a plugin
+author would expect.  That is the decision, and it is the plan owner's.
+
+---
+
 ## Task 9: One place decides what loads
 
 Finding 2: schedulers and channels are built outside bootstrap, and the other
