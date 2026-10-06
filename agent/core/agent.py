@@ -18,6 +18,10 @@ import agent as agent_module
 from agent import shared
 from agent.config import _compose_system_prompt, _now
 from agent.core.spawn_planning import PlannerDeps, SpawnPlanner
+from agent.core.subagent_context import (
+    canonicalize_write_scope,
+    compose_sub_system_prompt,
+)
 from agent.core.output_contract import (
     normalize_output_contract,
     output_contract_path_resolver,
@@ -1107,16 +1111,13 @@ class BaseAgent:
         return await runner(*args, **kwargs)
 
     def _canonicalize_write_scope(self, raw_scope: str) -> Path:
-        if self.workspace_root is not None:
-            output_dir_str = self.registry.get_context("output_dir")
-            output_dir = Path(output_dir_str) if output_dir_str else None
-            resolved, _root_kind = resolve_workspace_path(
-                raw_scope,
-                workspace_root=self.workspace_root,
-                output_dir=output_dir,
-            )
-            return resolved
-        return canonicalize_user_path(raw_scope, base_dir=Path.cwd())
+        """See :func:`agent.core.subagent_context.canonicalize_write_scope`."""
+        output_dir_str = self.registry.get_context("output_dir")
+        return canonicalize_write_scope(
+            raw_scope,
+            workspace_root=self.workspace_root,
+            output_dir=Path(output_dir_str) if output_dir_str else None,
+        )
 
     async def run_parallel_subtasks(
         self,
@@ -3494,29 +3495,16 @@ class BaseAgent:
         sub_registry: "ToolRegistry",
         system_suffix: str = "",
     ) -> tuple[str, Optional[AgentContext]]:
-        # Always build system prompt from base_system_prompt + sub_registry
-        # so it reflects only the tools the sub-agent actually has, and does NOT
-        # include transient per-turn LTM injections from the parent's active context.
-        output_dir_str = sub_registry._context.get("output_dir")
-        output_dir_path = Path(output_dir_str) if output_dir_str else None
-        active_ctx = self.current_context()
-        # Only pass a real SkillCatalog instance — metadata may contain test
-        # stubs or other objects that lack the summary_lines() method.
-        skill_catalog_for_prompt: Optional[SkillCatalog] = None
-        if active_ctx:
-            sc = active_ctx.metadata.get("skill_catalog")
-            if isinstance(sc, SkillCatalog):
-                skill_catalog_for_prompt = sc
-        sys_prompt = _compose_system_prompt(
-            self._base_system_prompt,
+        """See :func:`agent.core.subagent_context.compose_sub_system_prompt`."""
+        return compose_sub_system_prompt(
             sub_registry,
-            self.workspace_root,
-            output_dir=output_dir_path,
-            skill_catalog=skill_catalog_for_prompt,
+            base_system_prompt=self._base_system_prompt,
+            workspace_root=self.workspace_root,
+            active_context=self.current_context(),
+            system_suffix=system_suffix,
+            compose=_compose_system_prompt,
+            skill_catalog_type=SkillCatalog,
         )
-        if system_suffix:
-            sys_prompt += f"\n\n{system_suffix}"
-        return sys_prompt, active_ctx
 
     @staticmethod
     def _propagate_sub_metadata(

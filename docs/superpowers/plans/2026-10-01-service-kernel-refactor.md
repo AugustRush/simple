@@ -34,10 +34,10 @@ frontend and no user-visible behaviour.
 **Tasks 0-6 done; Task 7 in progress (6 extractions done; runners and sub-agent groups remain).** Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c | T7d1 | T7d2 | T7d3 | T7d4 |
+| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c | T7d1-4 | T7d5 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | 3 f / 2818 p | 3 f / 2843 p | 3 f / 2877 p | 3 f / 2908 p | **3 f / 2926 p** |
-| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | 4554 | 4265 | 4248 | 4169 | **4117** |
+| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | 3 f / 2818 p | 3 f / 2843 p | 3 f / 2877 p | 3 f / 2908 p | 3 f / 2926 p | **3 f / 2944 p** |
+| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | 4554 | 4265 | 4248 | 4169 | 4117 | **4105** |
 | FAILED set | baseline | identical | identical | identical | identical | identical | identical | identical |
 | Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same | +1 recorded |
 | Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 | 1 |
@@ -392,10 +392,34 @@ the remaining two pure functions in it were moved:
 **Where Task 7 actually stands.**  Seven extractions are done and `agent.py` is
 4117 lines (4703 → 4117, -586, a 12% reduction).
 
-**What is left, and it is one group.**  Only the **sub-agent group** remains
-(6 methods, **29** `self` attributes): `_execute_agent`,
-`_create_sub_agent`, `_compose_sub_system_prompt`, `_propagate_sub_metadata`,
-`_canonicalize_write_scope`, `_promote_orchestration_runs`.  Measured coupling
+**Extraction 8 — the two cheap members of the sub-agent group.**
+Measuring the group per-method rather than as a whole changed the plan.  It is
+not uniformly coupled:
+
+| Method | Lines | `self.*` |
+| --- | --- | --- |
+| `_canonicalize_write_scope` | 11 | 2 |
+| `_compose_sub_system_prompt` | 28 | 3 |
+| `_propagate_sub_metadata` | 28 | 0 |
+| `_create_sub_agent` | 27 | 15 |
+| `_execute_agent` | **288** | **16** |
+
+So `agent/core/subagent_context.py` takes the two cheapest — path resolution and
+prompt composition — and `_execute_agent` now calls two free functions instead of
+two methods.  The property those two protect is the one a sub-agent gets wrong
+*silently*: its system prompt is built from **its own** registry, never the
+parent's active context, and a stub skill catalog is rejected by type before it
+reaches the prompt builder.
+
+**What is left of Task 7.**  Four members, and the split is now sharp:
+
+- `_propagate_sub_metadata` (0 `self.*`) — mechanical, not yet done.
+- `_promote_orchestration_runs` (1) — writes session memory; needs a store seam.
+- `_create_sub_agent` (15) and `_execute_agent` (**288 lines, 16 attributes**) —
+  these are one decision, not two: `_execute_agent` is the single primitive every
+  runner calls, and extracting it means agreeing on how a sub-agent is
+  constructed and driven.  That is a design decision, and it is the reason the
+  plan ordered this group last.  Measured coupling
 puts it far above everything extracted so far: it holds `registry`, `client`,
 `_transport`, `context_manager`, `plugin_catalog`, `workspace_root`, and a dozen
 configuration values, and `_execute_agent` is the single primitive every runner
