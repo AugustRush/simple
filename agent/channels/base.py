@@ -15,10 +15,9 @@ from rich.console import Console
 
 from agent import shared
 from agent.shared import CancelToken
+from agent.commands.composition import ensure_command_router
 from agent.commands import (
     CommandCoordinator,
-    CommandRouter,
-    register_builtin_commands,
 )
 from agent.core.output import CliOutputSink, OutputSink
 from agent.core.attachments import MessageAttachment
@@ -548,16 +547,7 @@ class ChannelRunner:
         agent_core = components.get("agent_core")
         if agent_core is None:
             agent_core = AgentCore(RuntimeComponents(components))
-        router = components.get("command_router")
-        if router is None:
-            router = CommandRouter(skill_catalog=components.get("skill_catalog"))
-            register_builtin_commands(router)
-            plugin_catalog = components.get("plugin_catalog")
-            if plugin_catalog is not None and hasattr(
-                plugin_catalog, "get_slash_commands"
-            ):
-                router.register_plugin_catalog(plugin_catalog)
-            components["command_router"] = router
+        router = ensure_command_router(components)
         runtime_event_buffer: contextvars.ContextVar[list[RuntimeEvent] | None] = (
             contextvars.ContextVar("channel_runtime_event_buffer", default=None)
         )

@@ -23,6 +23,7 @@ from agent.commands import (
     CommandRouter,
     register_builtin_commands,
 )
+from agent.commands.composition import ensure_command_router
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime import AgentCore, TurnRunner
@@ -1015,11 +1016,8 @@ async def _build_components_async(
     )
     components["turn_runner"] = TurnRunner(components)
     components["agent_core"] = AgentCore(components)
-    command_router = CommandRouter(skill_catalog=skill_catalog)
-    register_builtin_commands(command_router)
-    if hasattr(plugin_catalog, "get_slash_commands"):
-        command_router.register_plugin_catalog(plugin_catalog)
-    components["command_router"] = command_router
+    # One constructor for all four former sites; see agent/commands/composition.py.
+    command_router = ensure_command_router(components)
 
     def _command_coordinator_factory(
         *,

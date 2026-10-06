@@ -25,6 +25,7 @@ from urllib.parse import quote
 
 from agent import shared
 from agent.channels.base import Channel, IncomingMessage
+from agent.commands.composition import ensure_command_router
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
 from agent.core.output import OutputSink
 from agent.pathing import path_contains
@@ -1300,20 +1301,7 @@ class WebChannel(Channel):
         return False
 
     def _ensure_router(self) -> Any:
-        router = self._components.get("command_router")
-        if router is not None:
-            return router
-        from agent.commands import CommandRouter, register_builtin_commands
-
-        router = CommandRouter(skill_catalog=self._components.get("skill_catalog"))
-        register_builtin_commands(router)
-        plugin_catalog = self._components.get("plugin_catalog")
-        if plugin_catalog is not None and hasattr(
-            plugin_catalog, "get_slash_commands"
-        ):
-            router.register_plugin_catalog(plugin_catalog)
-        self._components["command_router"] = router
-        return router
+        return ensure_command_router(self._components)
 
     # -- HTTP endpoints -------------------------------------------------------
 

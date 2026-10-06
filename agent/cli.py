@@ -31,6 +31,7 @@ import agent as agent_module
 from agent import shared
 from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
+from agent.commands.composition import ensure_command_router
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.runtime.lock import AgentHomeBusyError, acquire_agent_home_lock
 from agent.scheduler.models import (
@@ -1274,12 +1275,7 @@ async def _interactive_loop_body(
         )
     else:
         if router is None:
-            router = CommandRouter(skill_catalog=components.get("skill_catalog"))
-            register_builtin_commands(router)
-            get_commands = getattr(plugin_catalog, "get_slash_commands", None)
-            if callable(get_commands):
-                router.register_plugin_catalog(plugin_catalog)
-            components["command_router"] = router
+            router = ensure_command_router(components)
         coordinator = CommandCoordinator(
             _agent_core_for_components(components),
             router,
