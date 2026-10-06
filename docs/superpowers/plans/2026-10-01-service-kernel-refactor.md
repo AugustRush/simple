@@ -31,7 +31,7 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 done.  Task 7 is 10 of 11 extractions done; one decision remains.**  Tasks 8-10 not started.
+**Tasks 0-6 done.  Task 7 is 10 of 11 extractions done.  Task 8 half done (channels moved; scheduler is an ordering constraint, see below).**
 Branch: `refactor/service-kernel`.
 
 Measured after each stage, same command every time
@@ -1067,6 +1067,36 @@ wc -l agent/core/agent.py
 .venv/bin/python -m pytest tests/test_agent_decomposition.py tests/test_agent_integration.py tests/test_orchestration.py tests/test_core_defect_regressions.py tests/test_llm_retry_policy.py -q
 .venv/bin/python -m pytest -q -p no:cacheprovider --tb=no
 ```
+
+---
+
+## Task 8 status: half done, half is an ordering constraint
+
+**Channels — done.** `build_gateway_channels` now lives in `agent/bootstrap.py`,
+the composition module, and `agent/channels/base.py` re-exports the old name so
+`agent/__init__`, `cli` and four test modules are unaffected.  It was already the
+single decision point (one function holding the `web` and `feishu` switches);
+what changed is the layer it sits in, and that a test now prevents a second
+construction site from appearing:
+
+- `test_only_the_builder_constructs_a_channel` reads every module under `agent/`
+  and fails on a `WebChannel(...)`/`FeishuChannel(...)`/`CliChannel(...)` call
+  anywhere else.  Verified by introducing one in `cli.py`: it reported
+  `agent/cli.py: WebChannel(...)`.
+- `test_the_builder_itself_does_construct_channels` is the control that keeps
+  the guard from being vacuous.
+
+**Scheduler — not done, and it is an ordering constraint rather than a scattered
+decision.** `SchedulerService` needs an `agent_executor` built on `AgentCore`,
+which `_build_components_async` creates at `:964` — near the end.  So the
+scheduler cannot be constructed where the rest of composition happens, and moving
+it would mean either constructing `AgentCore` earlier (a real behaviour change to
+startup ordering) or giving the scheduler a late-bound executor.
+
+`test_the_scheduler_is_not_here_and_that_is_recorded` fails the day a
+`build_scheduler_service` entry point appears, so this note cannot go stale
+silently.  Closing Task 8 as "channels done, scheduler constrained" is a
+decision for the plan's owner; the evidence for it is now in the suite.
 
 ---
 

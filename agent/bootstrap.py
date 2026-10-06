@@ -102,6 +102,56 @@ def _project_memory_scope(workspace_root: Path) -> str:
     return f"project:{digest}"
 
 
+def build_gateway_channels(cfg: dict) -> list[Channel]:
+    """Every channel a configuration enables, in one place.
+
+    This lived in ``agent/channels/base.py``, where it was already the only
+    decision point -- a single function holding the ``web`` and ``feishu``
+    switches -- but the wrong layer: which channels a configuration runs is a
+    *composition* decision, and composition happens here.  The channel module
+    now re-exports the name so existing importers are unaffected.
+
+    A channel whose dependency is missing is reported and skipped rather than
+    aborting startup: a gateway with a broken Feishu install should still serve
+    its web channel.  Unknown keys in a channel's config section are filtered
+    against its dataclass fields, so a stale key in ``config.json`` is ignored
+    rather than raising at construction.
+    """
+    channels: list[Channel] = []
+    feishu_cfg = cfg.get("channels", {}).get("feishu", {})
+    web_cfg = cfg.get("channels", {}).get("web", {})
+    if web_cfg.get("enabled"):
+        try:
+            from agent.channels.web import WebChannel, WebConfig  # noqa: PLC0415
+
+            known_fields = WebConfig.__dataclass_fields__
+            filtered = {k: v for k, v in web_cfg.items() if k in known_fields}
+            channels.append(WebChannel(WebConfig(**filtered)))
+            shared.CONSOLE.print("[dim]Web channel enabled[/dim]")
+        except ImportError as exc:
+            shared.CONSOLE.print(
+                f"[red]Web channel requires starlette/uvicorn: {exc}[/red]"
+            )
+        except Exception as exc:
+            shared.CONSOLE.print(f"[red]Web channel init failed: {exc}[/red]")
+    if feishu_cfg.get("enabled"):
+        try:
+            from agent.channels.feishu import FeishuChannel, FeishuConfig  # noqa: PLC0415
+
+            known_fields = FeishuConfig.__dataclass_fields__
+            filtered = {k: v for k, v in feishu_cfg.items() if k in known_fields}
+            channels.append(FeishuChannel(FeishuConfig(**filtered)))
+            shared.CONSOLE.print("[dim]Feishu channel enabled[/dim]")
+        except ImportError:
+            shared.CONSOLE.print(
+                f"[red]{agent_module._missing_feishu_dependency_hint()}[/red]"
+            )
+        except Exception as exc:
+            shared.CONSOLE.print(f"[red]Feishu channel init failed: {exc}[/red]")
+
+    return channels
+
+
 def _provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
     """One client for a non-active provider (used by RoutingTransport).
 

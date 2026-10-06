@@ -716,42 +716,16 @@ class ChannelRunner:
         return _handle
 
 
-def _build_gateway_channels(cfg: dict) -> list[Channel]:
-    import agent as agent_module
+def _build_gateway_channels(cfg: dict) -> list["Channel"]:
+    """Re-exported from :func:`agent.bootstrap.build_gateway_channels`.
 
-    channels: list[Channel] = []
-    feishu_cfg = cfg.get("channels", {}).get("feishu", {})
-    web_cfg = cfg.get("channels", {}).get("web", {})
-    if web_cfg.get("enabled"):
-        try:
-            from agent.channels.web import WebChannel, WebConfig  # noqa: PLC0415
+    The decision of which channels a configuration runs belongs with the rest of
+    composition, not with the channel implementations; this name stays because
+    callers (``agent/__init__``, ``cli``, four test modules) reach for it here.
+    """
+    from agent.bootstrap import build_gateway_channels
 
-            known_fields = WebConfig.__dataclass_fields__
-            filtered = {k: v for k, v in web_cfg.items() if k in known_fields}
-            channels.append(WebChannel(WebConfig(**filtered)))
-            agent_module.CONSOLE.print("[dim]Web channel enabled[/dim]")
-        except ImportError as exc:
-            agent_module.CONSOLE.print(
-                f"[red]Web channel requires starlette/uvicorn: {exc}[/red]"
-            )
-        except Exception as exc:
-            agent_module.CONSOLE.print(f"[red]Web channel init failed: {exc}[/red]")
-    if feishu_cfg.get("enabled"):
-        try:
-            from agent.channels.feishu import FeishuChannel, FeishuConfig  # noqa: PLC0415
-
-            known_fields = FeishuConfig.__dataclass_fields__
-            filtered = {k: v for k, v in feishu_cfg.items() if k in known_fields}
-            channels.append(FeishuChannel(FeishuConfig(**filtered)))
-            agent_module.CONSOLE.print("[dim]Feishu channel enabled[/dim]")
-        except ImportError:
-            agent_module.CONSOLE.print(
-                f"[red]{agent_module._missing_feishu_dependency_hint()}[/red]"
-            )
-        except Exception as exc:
-            agent_module.CONSOLE.print(f"[red]Feishu channel init failed: {exc}[/red]")
-
-    return channels
+    return build_gateway_channels(cfg)
 
 
 __all__ = [
