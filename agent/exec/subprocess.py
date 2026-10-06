@@ -302,14 +302,38 @@ def _signal_group(process, sig: int) -> None:
 #: injection idiom — and fall back to this when nothing was injected.
 _DEFAULT_PROVIDER = LocalSubprocessProvider()
 
+#: Registry-context key under which a
+#: :class:`~agent.runtime.services.ServiceRegistry` may be attached.  When
+#: present it is consulted second, after the direct ``subprocess_provider``
+#: key, so a caller can scope its replacement and get the previous provider
+#: back on unload.
+_SERVICES_KEY = "services"
+
+
+def _resolve_service(registry, name: str):
+    """Look *name* up in registry context, then in an attached service registry.
+
+    Two lookups rather than one because the direct key has to keep working:
+    roughly fifty call sites already read registry context, and an injection
+    path that only the new mechanism honoured would replace working behaviour
+    with a second convention.  The service registry is where the *scoped* form
+    lives.
+    """
+    if registry is not None:
+        injected = registry.get_context(name)
+        if injected is not None:
+            return injected
+        services = registry.get_context(_SERVICES_KEY)
+        if services is not None:
+            found = services.get(name)
+            if found is not None:
+                return found
+    return None
+
 
 def provider_from(registry) -> SubprocessProvider:
     """The injected provider, or the local one."""
-    if registry is not None:
-        injected = registry.get_context("subprocess_provider")
-        if injected is not None:
-            return injected
-    return _DEFAULT_PROVIDER
+    return _resolve_service(registry, "subprocess_provider") or _DEFAULT_PROVIDER
 
 
 __all__ = [

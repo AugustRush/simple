@@ -31,28 +31,54 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Task 0 implemented 2026-10-01.** Tasks 1-10 not started.
+**Tasks 0 and 1 implemented 2026-10-01.** Tasks 2-10 not started.
+Branch: `refactor/service-kernel`.
 
-| | Before | After |
-| --- | --- | --- |
-| Full suite | 19 failed / 2641 passed / 1 skipped | 19 failed / **2649** passed / 1 skipped |
-| FAILED set | — | **byte-identical** to the baseline file |
-| Module-level mutable state | undocumented | **49 entries** in a machine-readable ledger, guard-tested |
-| Guard catch rate | — | a probe global introduced into `agent/runtime/` is rejected by name and line |
+| | Baseline | After Task 0 | After Task 1 |
+| --- | --- | --- | --- |
+| Full suite | 19 failed / 2641 passed | 19 failed / 2649 passed | **3 failed / 2687 passed** / 1 skipped |
+| FAILED set | see baseline file | byte-identical | byte-identical (see note) |
+| Module-level mutable state | undocumented | **49 entries**, guard-tested | unchanged |
+| Replaceable services | 1 hand-rolled (`exec/`) | 1 | **general mechanism + scoped, reversible replacement** |
 
-Command for both columns:
-`.venv/bin/python -m pytest -q -p no:cacheprovider`.
+Command for every column: `.venv/bin/python -m pytest -q -p no:cacheprovider`.
 
-The +8 passed is exactly the eight tests in `tests/test_state_inventory.py`.
-All 19 failures are pre-existing and environment-caused (11 × `sandbox_apply`,
-3 × console-width probing, 2 × user-tool isolation under sandbox, 1 ×
-output-dir sandbox write, 1 × user tool plugin load). The frozen list lives at
-`docs/superpowers/plans/2026-10-01-baseline-failures.txt`; the failure set is
-the only acceptable one at the end of every task in this plan.
+**The 19 → 3 drop is not this work.** The run environment's file policy changed
+from `workspace-write` to `danger-full-access` between the Task 0 and Task 1
+measurements, and all 16 sandbox failures vanished with it — `sandbox-exec` can
+now apply its profile where before every one failed with
+`sandbox-exec: sandbox_apply: Operation not permitted`. The baseline file
+records both measurements separately, with that reason, rather than adjusting a
+number. The three remaining failures are the `test_cli_ui` console-width
+probes, unchanged throughout.
 
-> Note: `2026-09-22-scheduler-concurrency.md` records the same suite at "16
-> failed". The three extra are the `test_cli_ui` console-width tests, which are
-> sensitive to the terminal this suite is invoked from.
+Test growth is accounted for exactly: Task 0 added 8
+(`tests/test_state_inventory.py`), Task 1 added 22
+(`tests/test_service_registry.py`). The four files Task 1 names
+(`test_service_registry`, `test_user_tools`, `test_subprocess_provider`,
+`test_user_tool_isolation`) run 77 passed with no failures.
+
+> Note: `2026-09-22-scheduler-concurrency.md` records the suite at "16 failed"
+> under the older sandbox policy. That count is comparable to neither column
+> above.
+
+### What Task 1 actually produced
+
+`agent/runtime/services.py` (the primitive) and a `provider_from` that uses it:
+
+- `ServiceRegistry` — flat name → service, refuses silent overwrite, resolves
+  with `MissingServiceError` instead of `None`.
+- `ServiceScope` — unwinds in reverse order, exactly once, idempotently, and a
+  failing teardown does not strand the others.
+- `ServiceView` — a read-only dict-like view, so the ~48 existing
+  `get_context` readers migrate without changing shape.
+- `provider_from` consults the direct `subprocess_provider` key first and an
+  attached service registry second, so both old and new injection work.
+
+The property that motivated the task, asserted in
+`test_a_scoped_provider_replacement_reverts_on_unload`: a scope replaces the
+execution provider, every resolver sees the replacement, and on unload the
+original is back — with no call site told either time.
 
 ### What Task 0 actually found
 
@@ -244,14 +270,14 @@ idiom.
 - Modify: `agent/tools/runtime.py:557-564` (`set_context`/`get_context` delegate)
 - Test: `tests/test_service_registry.py`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Cover: a registered provider is returned; an unregistered name raises a named
 error rather than returning `None`; registering twice without `replace=True`
 raises; a provider registered inside a disposable scope disappears when the
 scope exits.
 
-- [ ] **Step 2: Implement the resolver**
+- [x] **Step 2: Implement the resolver**
 
 `agent/runtime/services.py`, no imports from `agent.tools`, `agent.memory`, or
 `agent.core`:
@@ -271,7 +297,7 @@ class ServiceRegistry:
 Unwinding is reverse-registration-order, and is the only mechanism Task 2 and
 Task 8 may use.
 
-- [ ] **Step 3: Re-express `provider_from` on top of it**
+- [x] **Step 3: Re-express `provider_from` on top of it**
 
 `provider_from(registry)` keeps its signature and its
 `subprocess_provider` key, so both call sites
@@ -279,7 +305,7 @@ Task 8 may use.
 are untouched. The registry context dict becomes a delegating view so the other
 ~48 `get_context` readers keep working unchanged.
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 ```bash
 .venv/bin/python -m pytest tests/test_service_registry.py tests/test_user_tools.py -q
