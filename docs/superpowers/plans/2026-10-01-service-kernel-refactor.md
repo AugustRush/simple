@@ -56,7 +56,8 @@ Measured after each stage, same command every time
 | T7d7 metadata inheritance | 3 / 2950 | 4084 | `propagate_sub_metadata` |
 | T7d8 run promotion | 3 / 2960 | 4067 | `promote_orchestration_runs` |
 | T7d9 sub-agent factory | 3 / 2978 | 4063 | `subagent_factory.py` |
-| T7d10 retry loop + budget | **3 / 2997** | **3993** | `subagent_run.py` |
+| T7d10 retry loop + budget | 3 / 2997 | 3993 | `subagent_run.py` |
+| T7d11 sub-agent preparation | **3 / 3014** | **3986** | `subagent_prepare.py` |
 
 The FAILED set is byte-identical to
 `docs/superpowers/plans/2026-10-01-baseline-failures.txt` at every stage.  The
@@ -508,6 +509,32 @@ surviving a later success.
   rather than stored as `""`.
 
 `agent/core/agent.py` is now **3993** lines -- 4703 to 3993, a 15% reduction.
+
+**Extraction 13 — sub-agent preparation.**
+`agent/core/subagent_prepare.py` resolves everything about a sub-agent that does
+not depend on a model call: the write scope, the canonical output contract, the
+contract-shaped task, the plugin role body, the sub-registry, the sub-agent, and
+the system prompt.  It is built **once**, before the retry loop, because those are
+pure functions of the arguments -- two attempts seeing two registries would mean
+two different tool schemas for one subtask.
+
+Two findings from writing the tests:
+
+- **The three normalizations have to agree.**  The write scope feeds both the
+  capability profile and the registry view; the output contract is read by both
+  the prompt builder and the validator.  If either pair disagrees, one side
+  silently sees an empty value -- which is why the preparation resolves each
+  once and returns it rather than letting consumers re-derive.
+- **The write-scope filter is string-shaped, not value-shaped.**  It is
+  `if str(item).strip()`, so `None` survives as the string `"None"`.  Recorded
+  and tested rather than narrowed: this is pre-existing behaviour moved verbatim,
+  and changing what a tool call may declare is a decision, not an extraction.
+
+**Another splice error, caught the same way as the last one.**  The replacement
+removed `_fresh_sub_ctx` along with the block it was replacing, so every spawn
+returned `name '_fresh_sub_ctx' is not defined` -- 18 tests red.  Restored.  The
+pattern across three rounds is consistent enough to state: **the splice risk is
+never the block being replaced, it is the helper defined immediately after it.**
 
 ### The one decision left, written down so it can be settled
 

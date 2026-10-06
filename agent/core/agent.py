@@ -22,6 +22,7 @@ from agent.core.spawn_planning import (
     SpawnPlanner,
     promote_orchestration_runs,
 )
+from agent.core.subagent_prepare import prepare_sub_agent
 from agent.core.subagent_run import run_with_retries
 from agent.core.subagent_factory import (
     SubAgentSpec,
@@ -3616,36 +3617,28 @@ class BaseAgent:
         existed when _execute_subtask_spec called spawn_agent via
         registry.call().
         """
-        normalized_scope = [str(item) for item in (write_scope or []) if str(item).strip()]
-        normalized_output_contract = self._normalize_output_contract(output_contract)
-        # If the role names a plugin-declared agent (``plugin:<P>:<A>``),
-        # prepend its markdown body to system_suffix so the sub-agent inherits
-        # the plugin author's role definition.
-        if role.startswith("plugin:") and self.plugin_catalog is not None:
-            defn = self.plugin_catalog.get_agent_definition(role)
-            if defn is not None:
-                agent_body = str(defn.get("body", "")).strip()
-                if agent_body:
-                    system_suffix = (
-                        f"{agent_body}\n\n{system_suffix}".strip()
-                        if system_suffix
-                        else agent_body
-                    )
-        shaped_task = self._with_output_contract(
-            task,
-            expected_output,
-            normalized_output_contract,
-        )
-        # sub_registry / sub_agent / sys_prompt are pure functions of the
-        # input arguments — build once and reuse across retry attempts.
-        # Only sub_ctx (which carries mutable conversation state) must be
-        # rebuilt per attempt to avoid contamination from a failed run.
-        sub_registry = self._create_sub_registry(
+        prepared = prepare_sub_agent(
+            role=role,
+            task=task,
+            system_suffix=system_suffix,
+            expected_output=expected_output,
+            output_contract=output_contract,
+            write_scope=write_scope,
             capability_profile=capability_profile,
-            write_scope=normalized_scope,
+            plugin_catalog=self.plugin_catalog,
+            normalize_output_contract=self._normalize_output_contract,
+            with_output_contract=self._with_output_contract,
+            create_sub_registry=self._create_sub_registry,
+            create_sub_agent=self._create_sub_agent,
+            compose_system_prompt=self._compose_sub_system_prompt,
         )
-        sub_agent = self._create_sub_agent(sub_registry)
-        sys_prompt, active_ctx = self._compose_sub_system_prompt(sub_registry, system_suffix)
+        normalized_scope = list(prepared.normalized_scope)
+        normalized_output_contract = prepared.output_contract
+        shaped_task = prepared.shaped_task
+        sub_registry = prepared.sub_registry
+        sub_agent = prepared.sub_agent
+        sys_prompt = prepared.system_prompt
+        active_ctx = prepared.active_context
 
         def _fresh_sub_ctx() -> AgentContext:
             ctx = AgentContext(role=role, system_prompt=sys_prompt)
