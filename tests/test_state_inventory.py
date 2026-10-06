@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.runtime.state_ledger import BY_SYMBOL, LEDGER, unconverged
+from agent.runtime.state_ledger import BY_SYMBOL, LEDGER, outstanding, unjustified
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_ROOT = REPO_ROOT / "agent"
@@ -300,7 +300,16 @@ def test_critical_entries_are_accounted_for() -> None:
         assert symbol in BY_SYMBOL, f"{symbol} vanished from the ledger"
 
 
-def test_no_unconverged_entries_without_reason() -> None:
-    """``unconverged()`` is the ledger's own debt list; keep it honest."""
-    for entry in unconverged():
+def test_every_ledger_entry_is_scheduled_or_justified() -> None:
+    """No entry may be both unplanned and unexplained.
+
+    The two lists are complementary and both must stay empty of surprises:
+    scheduled work has a convergence target, kept state has an argument.
+    """
+    for entry in outstanding():
         assert entry.convergence in {"service", "explicit", "scope"}, entry
+        # Scheduled work names its task.  A per-entry ``reason`` is required
+        # only for state that is being *kept* -- the 19 path constants share
+        # one explanation and restating it 19 times would be noise.
+        assert entry.task is not None, f"{entry.symbol} is scheduled without a task"
+    assert not unjustified()

@@ -136,17 +136,17 @@ LEDGER: tuple[StateEntry, ...] = (
                "Feeds the provider {session} header. Session identity belongs to the "
                "session service, not to a ContextVar."),
     # ── Session-keyed tables (session scope, process storage) ────────────────
-    StateEntry("_session_allowlist", "agent/security/shell.py", 231, "CONTAINER", "session", "service", None,
+    StateEntry("_session_allowlist", "agent/security/shell.py", 231, "CONTAINER", "session", "service", 9,
                "Shell approval allowlist, keyed by (scope, command)."),
-    StateEntry("_pending_tokens", "agent/security/shell.py", 232, "CONTAINER", "session", "service", None,
+    StateEntry("_pending_tokens", "agent/security/shell.py", 232, "CONTAINER", "session", "service", 9,
                "Shell confirmation tokens awaiting a human reply."),
-    StateEntry("_pending_session_scope", "agent/security/shell.py", 237, "CONTAINER", "session", "service", None,
+    StateEntry("_pending_session_scope", "agent/security/shell.py", 237, "CONTAINER", "session", "service", 9,
                "'Always allow this command' marks travelling with their token."),
-    StateEntry("_session_auto_approve", "agent/security/shell.py", 238, "CONTAINER", "session", "service", None,
+    StateEntry("_session_auto_approve", "agent/security/shell.py", 238, "CONTAINER", "session", "service", 9,
                "Scopes a human opted into auto-approval."),
-    StateEntry("_session_permission_levels", "agent/security/shell.py", 239, "CONTAINER", "session", "service", None,
+    StateEntry("_session_permission_levels", "agent/security/shell.py", 239, "CONTAINER", "session", "service", 9,
                "Per-scope shell permission level."),
-    StateEntry("_session_sandbox_modes", "agent/security/shell.py", 240, "CONTAINER", "session", "service", None,
+    StateEntry("_session_sandbox_modes", "agent/security/shell.py", 240, "CONTAINER", "session", "service", 9,
                "Per-scope sandbox mode."),
     StateEntry("_PENDING", "agent/security/plugin_approval.py", 20, "CONTAINER", "session", "service", 5,
                "Plugin installs awaiting human approval, TTL 5 minutes."),
@@ -219,6 +219,17 @@ def entries_for_task(task: int) -> tuple[StateEntry, ...]:
     return tuple(e for e in LEDGER if e.task == task)
 
 
-def unconverged() -> tuple[StateEntry, ...]:
-    """Entries that are neither converged nor explicitly justified."""
-    return tuple(e for e in LEDGER if e.convergence != "stays" and not e.reason)
+def outstanding() -> tuple[StateEntry, ...]:
+    """The ledger's debt list: entries with a convergence plan, not yet done.
+
+    Distinct from a *problem*: every one of these carries the ``reason`` that
+    names its target, so the list is work scheduled rather than work forgotten.
+    ``test_ledger_records_where_state_is_owned`` is what catches the other
+    case -- an entry that neither converges nor justifies itself.
+    """
+    return tuple(e for e in LEDGER if e.convergence != "stays")
+
+
+def unjustified() -> tuple[StateEntry, ...]:
+    """Entries marked ``stays`` without an argument for keeping them."""
+    return tuple(e for e in LEDGER if e.convergence == "stays" and not e.reason)

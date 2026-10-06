@@ -601,10 +601,18 @@ switches are in four different shapes. Until this is one function, "profile"
 cannot mean anything, so this task is the prerequisite for any profile work and
 does not itself introduce profiles.
 
+This task also owns the six session-keyed shell authorisation tables
+(`agent/security/shell.py:231-240`: allowlist, pending tokens, pending session
+scope, auto-approve, permission levels, sandbox modes). They are session state
+held in module-level dicts, so per-session isolation cannot be honest until
+they become a service; the state ledger assigns them here rather than to a task
+of their own, because they have to move the same time as the layout does.
+
 **Files:**
 - Modify: `agent/bootstrap.py:424-1002`
 - Modify: `agent/cli.py:1024-1033`, `:1539-1559`
 - Modify: `agent/channels/base.py:719-754`
+- Modify: `agent/security/shell.py:231-240` (six session tables → one service)
 - Test: `tests/test_agent_integration.py` (extend)
 
 - [ ] **Step 1: Write a failing test** asserting a single call returns the full
