@@ -31,13 +31,13 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 done; Task 7 in progress (1 of 4 extractions).** Tasks 8-10 not started.
+**Tasks 0-6 done; Task 7 in progress (2 of 4 extractions).** Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a |
+| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | **3 f / 2803 p** |
-| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | **4657** |
+| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | **3 f / 2818 p** |
+| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | **4554** |
 | FAILED set | baseline | identical | identical | identical | identical | identical | identical | identical |
 | Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same | +1 recorded |
 | Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 | 1 |
@@ -276,6 +276,36 @@ The guard caught that automatically, which is the mechanism working.
 > **A delegation is not automatically safe.** `test_the_agent_methods_agree_with_the_functions`
 > asserts the agent's methods still call the functions, because the extraction's
 > failure mode is a wrapper that silently stops wrapping.
+
+**Extraction 2 — context-window arithmetic.**
+`agent/core/token_budget.py` holds `TokenBudget`, which absorbs
+`_input_token_budget`, `_estimate_input_tokens`, `_estimate_raw_body_tokens`,
+`_payload_overhead`, `_output_room`, `_retrieval_token_budget` and
+`_configured_output_cap`. `agent/core/agent.py` is now **4554** lines.
+
+This one is worth more than the line count, because the two bugs it encodes are
+easy to reintroduce and were expensive to find:
+
+- **The head is priced by the head's own measurement.** Re-deriving it through
+  the body's calibration factor let a *body* change re-price a byte-identical
+  *head* mid-turn — measured as 82588 → 68382 tokens, triggering emergency
+  compaction the payload never needed.
+- **The reserve is not the configured cap.** Letting the cap set the reserve gave
+  a provider configured for long answers the smallest usable context.
+
+Both are now asserted directly in `tests/test_token_budget.py`, without an agent.
+
+**Two design points came from tests, not from taste.** `TokenBudget` reads
+`context_window`, `output_reserve` and `max_retrieval_tokens` **live** through a
+settings object rather than copying them, because `tests/test_consolidation.py`
+sets all three on a live agent and the web channel resizes its window per
+session — a copied value silently ignores the override. And `_token_budget` is a
+**lazy property** rather than an `__init__` assignment, because a test subclass
+skips `__init__` entirely to reach the arithmetic. Both were found because the
+tests failed, not because they were anticipated.
+
+`_OUTPUT_CAP_MARGIN` moved with the code; the copy left in `agent.py` was
+deleted rather than left as a second definition of the same number.
 
 **Still to extract, in order:** token budget (`_input_token_budget`,
 `_estimate_input_tokens`, `_payload_overhead`, `_output_room`,

@@ -19,6 +19,7 @@ from agent import shared
 from agent.config import _compose_system_prompt, _now
 from agent.core.context_assembler import ContextAssembler
 from agent.core.events import TOOL_EVENTS
+from agent.core.token_budget import TokenBudget
 from agent.core.llm_errors import (
     is_account_exhausted,
     is_content_filter_block,
@@ -67,13 +68,6 @@ _UPSTREAM_SUMMARY_BUDGET = 2400
 _UPSTREAM_DETAIL_BUDGET = 2400
 _UPSTREAM_STRUCTURED_BUDGET = 1200
 _RENDEZVOUS_INPUT_BUDGET = 6000
-
-#: Slack left between the estimated request and the window when deriving the
-#: per-call output cap.  The estimate is a character heuristic that the provider
-#: corrects after the fact, so the cap is clamped a little below the literal
-#: remaining room rather than exactly at it: overshooting the window is a hard
-#: provider error, while undershooting costs a few tokens of answer length.
-_OUTPUT_CAP_MARGIN = 256
 
 #: Set on ``ctx.metadata`` for the duration of one turn, and read by
 #: ``BaseAgent._post_turn_maintenance``.  That method performs the only two
@@ -1375,15 +1369,33 @@ class BaseAgent:
 
     # ── Format-aware API helpers ──────────────────────────────────────────
 
-    def _configured_output_cap(self, output_max_tokens: int | None) -> int:
-        """The cap this call would send if the window had room for all of it.
+    @property
+    def _token_budget(self) -> TokenBudget:
+        """The window arithmetic, built on first use.
 
-        ``None`` means "the configured cap".  Resolving that to a number before
-        the budget is computed is the conflation this separation exists to
-        remove: the same number then also becomes the input budget's reserve, so
-        a provider configured for long answers gets the smallest usable context.
+        Lazy rather than assigned in ``__init__`` for two reasons.  A subclass
+        that skips ``__init__`` (there is one in the tests, which wants the
+        arithmetic and nothing else) still gets a working object.  And the
+        budget reads ``context_window`` / ``output_reserve`` live, so a caller
+        that resizes the window after construction does not have to remember to
+        rebuild this.
         """
-        return self.max_tokens if output_max_tokens is None else int(output_max_tokens)
+        budget = getattr(self, "_token_budget_instance", None)
+        if budget is None:
+            budget = TokenBudget(
+                # Both resolved on use rather than captured: a subclass that
+                # skips __init__ has neither, and only the path that needs one
+                # should require it.
+                context_manager_for=lambda ctx: self._context_manager_for(ctx),
+                assembler_for=lambda: self.context_assembler,
+                settings=self,
+            )
+            self._token_budget_instance = budget
+        return budget
+
+    def _configured_output_cap(self, output_max_tokens: int | None) -> int:
+        """See :meth:`agent.core.token_budget.TokenBudget.configured_output_cap`."""
+        return self._token_budget.configured_output_cap(output_max_tokens)
 
     async def _create(
         self,
@@ -1424,100 +1436,18 @@ class BaseAgent:
         tools: Optional[list[dict]] = None,
         current_user_content: Any = "",
     ) -> int:
-        """How much of the window automatic retrieval may claim.
-
-        Retrieval rides in the turn's own message, so an unbounded injection
-        cannot occupy room permanently -- compaction can drop it -- but it is
-        still charged in full on the call that carries it, and a large enough
-        one drives the input budget negative and hard-fails the turn.  A
-        fraction of the window keeps that failure impossible by construction
-        rather than relying on stored memories staying short.
-        """
-        configured = int(getattr(self, "max_retrieval_tokens", 0) or 0)
-        if ctx is not None and tools is not None:
-            budget = self.context_assembler.allocate(
-                context_window=self.context_window,
-                # The reserve, not the configured cap: retrieval competes with
-                # the conversation for the same window, and sizing that window
-                # by the output *cap* starved retrieval to roughly a ninth of
-                # what it should have had (about 1k against about 9k here).
-                output_tokens=self.output_reserve,
-                system_prompt=ctx.system_prompt,
-                tools=tools,
-                # One home for the head's price: the same measured,
-                # fingerprint-locked value the input budget uses, so retrieval
-                # sizing cannot price the head with the body's calibration
-                # factor behind the budget's back.
-                static_tokens=self._payload_overhead(ctx, tools),
-                current_messages=ctx.messages,
-                current_user_content=current_user_content,
-                estimate=lambda messages: self._estimate_input_tokens(messages, ctx=ctx),
-                configured_retrieval_tokens=configured,
-            )
-            ctx.metadata["context_budget"] = {
-                "static_tokens": budget.static_tokens,
-                "message_tokens": budget.message_tokens,
-                "retrieval_tokens": budget.retrieval_tokens,
-                "input_tokens": budget.input_tokens,
-                "selected_tools": len(tools),
-            }
-            return budget.retrieval_tokens
-        if configured > 0:
-            return configured
-        usable = max(0, int(self.context_window) - int(self.output_reserve))
-        return max(1024, int(usable * shared.RETRIEVAL_BUDGET_FRACTION))
+        """See :meth:`agent.core.token_budget.TokenBudget.retrieval_token_budget`."""
+        return self._token_budget.retrieval_token_budget(
+            ctx, tools, current_user_content
+        )
 
     def _payload_overhead(self, ctx: "AgentContext", tools: list[dict]) -> int:
-        """Tokens the provider bills that are not in ``ctx.messages``.
+        """See :meth:`agent.core.token_budget.TokenBudget.payload_overhead`."""
+        return self._token_budget.payload_overhead(ctx, tools)
 
-        The system prompt and the tool schemas ride in every request and are
-        charged on every call, so they are part of what the window has to hold
-        even though they never appear in ``ctx.messages``.  Measuring them in
-        one place is what keeps the input budget and the output cap from
-        disagreeing about what the request already costs.
-
-        The price itself comes from the memory engine and is locked to the
-        head's bytes (``ConsolidationEngine.estimate_head_tokens``).  It used to
-        be re-derived here through the shared calibration factor, which let a
-        body-composition change re-price a byte-identical head mid-turn and
-        shrink the input budget by tens of thousands of tokens -- measured on a
-        real session as 82588 -> 68382 with the head fingerprint unchanged,
-        triggering emergency compaction the payload never needed.
-        """
-        context_manager = self._context_manager_for(ctx)
-        consolidation = getattr(context_manager, "consolidation", None)
-        estimate_head = getattr(consolidation, "estimate_head_tokens", None)
-        if callable(estimate_head):
-            return estimate_head(
-                head_fingerprint(ctx.system_prompt, tools),
-                ctx.system_prompt,
-                tools,
-            )
-        overhead_messages = [
-            {"role": "system", "content": ctx.system_prompt},
-            {
-                "role": "system",
-                "content": json.dumps(tools, ensure_ascii=False, sort_keys=True),
-            },
-        ]
-        return self._estimate_input_tokens(overhead_messages, ctx=ctx)
-
-    def _output_room(
-        self, ctx: "AgentContext", tools: list[dict]
-    ) -> int:
-        """Tokens the window can still give to the response.
-
-        The window holds the system prompt, the tool schemas, the messages *and*
-        the answer, so the answer's ceiling is whatever is left after the first
-        three.  This is what makes a per-call cap possible without shrinking the
-        conversation: the cap follows the input rather than deciding it.
-        """
-        return (
-            self.context_window
-            - self._payload_overhead(ctx, tools)
-            - self._estimate_input_tokens(ctx.messages, ctx=ctx)
-            - _OUTPUT_CAP_MARGIN
-        )
+    def _output_room(self, ctx: "AgentContext", tools: list[dict]) -> int:
+        """See :meth:`agent.core.token_budget.TokenBudget.output_room`."""
+        return self._token_budget.output_room(ctx, tools)
 
     def _input_token_budget(
         self,
@@ -1526,19 +1456,10 @@ class BaseAgent:
         *,
         output_max_tokens: int | None = None,
     ) -> int:
-        # The reserve is what the input budget holds back for the answer, and it
-        # is not the configured cap: a cap is a ceiling on one response, not a
-        # claim on the window, so letting it set the reserve meant a provider
-        # configured for long answers silently got the smallest context.  When
-        # the caller names a specific output budget, that is the room it must
-        # leave instead -- the two are the same question asked from opposite
-        # ends.
-        reserve = (
-            self.output_reserve
-            if output_max_tokens is None
-            else int(output_max_tokens)
+        """See :meth:`agent.core.token_budget.TokenBudget.input_token_budget`."""
+        return self._token_budget.input_token_budget(
+            ctx, tools, output_max_tokens=output_max_tokens
         )
-        return self.context_window - reserve - self._payload_overhead(ctx, tools)
 
     def _estimate_input_tokens(
         self,
@@ -1546,36 +1467,12 @@ class BaseAgent:
         *,
         ctx: Optional["AgentContext"] = None,
     ) -> int:
-        context_manager = self._context_manager_for(ctx)
-        consolidation = getattr(context_manager, "consolidation", None)
-        estimate = getattr(consolidation, "estimate_tokens", None)
-        if callable(estimate):
-            return estimate(messages)
-        # No manager to borrow an estimator from.  Use the same CJK-aware model
-        # the manager would have used, rather than
-        # `len(json.dumps) / CHARS_PER_TOKEN`: that older fallback counted a
-        # Chinese character as a quarter of a token, so it under-reported
-        # exactly the payloads most likely to be too large -- and because the
-        # budget is derived from this same estimator, it moved the wall along
-        # with the measurement instead of correcting anything.
-        return estimate_message_tokens(messages)
+        """See :meth:`agent.core.token_budget.TokenBudget.estimate_input_tokens`."""
+        return self._token_budget.estimate_input_tokens(messages, ctx=ctx)
 
     def _estimate_raw_body_tokens(self, ctx: "AgentContext") -> int:
-        """The body's cost under the raw character heuristic, uncorrected.
-
-        The split-aware calibration path compares the provider's count against
-        the raw estimate so the learned correction stays a property of the
-        estimator rather than feeding the factor its own output.  Falls back to
-        the free function, which is already calibration-free, so the no-manager
-        path (where the calibrated and raw estimates coincide) stays
-        self-consistent.
-        """
-        context_manager = self._context_manager_for(ctx)
-        consolidation = getattr(context_manager, "consolidation", None)
-        raw = getattr(consolidation, "estimate_tokens_raw", None)
-        if callable(raw):
-            return raw(ctx.messages)
-        return estimate_message_tokens(ctx.messages)
+        """See :meth:`agent.core.token_budget.TokenBudget.estimate_raw_body_tokens`."""
+        return self._token_budget.estimate_raw_body_tokens(ctx)
 
     @staticmethod
     def _protected_turn_messages(ctx: "AgentContext") -> list[dict]:
