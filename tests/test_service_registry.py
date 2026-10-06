@@ -281,3 +281,30 @@ def test_a_scoped_provider_replacement_reverts_on_unload() -> None:
         assert provider_from(holder) is replacement
 
     assert provider_from(holder) is original
+
+
+# ── The registry as the runtime's container ──────────────────────────────────
+
+
+def test_a_registry_can_adopt_a_caller_s_own_dict() -> None:
+    """So a mapping built by bootstrap and a registry are the *same* storage.
+
+    Copying would mean a caller's later assignment to the mapping is invisible to
+    the registry -- which matters because bootstrap assigns directly into the
+    component dict while it is being assembled.
+    """
+    storage = {"agent": "the-agent"}
+    registry = ServiceRegistry.adopt(storage)
+    assert registry.get("agent") == "the-agent"
+
+    storage["late"] = "added later"
+    assert registry.get("late") == "added later", "the registry must see the write"
+
+    registry.provide("through.registry", 1, replace=False)
+    assert storage["through.registry"] == 1, "and the mapping must see the registry"
+
+
+def test_adopt_does_not_copy() -> None:
+    storage: dict = {}
+    ServiceRegistry.adopt(storage)
+    assert storage == {}, "adopt must not seed the caller's dict"

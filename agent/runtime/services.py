@@ -148,6 +148,21 @@ class ServiceRegistry:
         self._services: dict[str, Any] = dict(initial) if initial else {}
         self._open_scopes: list[ServiceScope] = []
 
+    @classmethod
+    def adopt(cls, storage: dict[str, Any]) -> "ServiceRegistry":
+        """Wrap a dict the caller already owns, instead of copying it.
+
+        The runtime builds its component mapping incrementally and assigns into
+        it directly, then hands it to :class:`RuntimeComponents`.  Copying here
+        would silently split the two: a later assignment to the mapping would be
+        invisible to the registry and vice versa.  Adopting makes the mapping and
+        the container the same storage, which is what lets the dict-based call
+        sites and ``require()`` agree during the migration.
+        """
+        registry = cls()
+        registry._services = storage
+        return registry
+
     # -- resolution -------------------------------------------------------
 
     _MISSING = object()

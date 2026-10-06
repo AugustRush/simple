@@ -18,6 +18,7 @@ from typing import (
     overload,
 )
 
+from agent.runtime.services import MissingServiceError, ServiceRegistry
 from agent.core.attachments import MessageAttachment
 from agent.core.output import (
     EventCollector,
@@ -99,12 +100,38 @@ class TurnResult:
 
 @dataclass(frozen=True)
 class RuntimeComponents:
-    """Typed access wrapper for bootstrapped runtime dependencies."""
+    """Typed access wrapper for bootstrapped runtime dependencies.
+
+    ``require`` resolves through a :class:`~agent.runtime.services.ServiceRegistry`
+    rather than reading a plain mapping, so this is the runtime's *container* and
+    not only a typed view of a dict.  The registry adopts ``values`` in place, so
+    the many call sites that read or assign the mapping directly and the ones that
+    call ``require`` are looking at the same storage while the migration runs.
+
+    The error contract is deliberately unchanged: a missing component still
+    raises ``KeyError`` with the same message, because callers and tests match on
+    it.  :class:`MissingServiceError` carries better semantics for new code; this
+    keeps the old surface honest rather than quietly re-typing an exception
+    callers already handle.
+    """
 
     values: Mapping[str, Any]
+    #: The container behind :attr:`values`.  Not an init argument: it is derived,
+    #: and a caller that could pass one could pass one that disagrees with
+    #: ``values``.  A declared field rather than a property because a frozen
+    #: dataclass's ``object.__setattr__`` does not honour a property without a
+    #: setter -- it raises, which is how this was found.
+    services: ServiceRegistry = field(init=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "values", self.values)
+        if isinstance(self.values, dict):
+            # Adopt in place, so the mapping and the container are one storage.
+            object.__setattr__(self, "services", ServiceRegistry.adopt(self.values))
+        else:
+            # A frozen mapping has nothing to adopt; a private registry is the
+            # honest answer, and direct writes were never possible on it anyway.
+            object.__setattr__(self, "services", ServiceRegistry(dict(self.values)))
 
     @overload
     def require(self, name: str) -> Any: ...
@@ -114,8 +141,10 @@ class RuntimeComponents:
 
     def require(self, name: str, expected_type: type[T] | None = None) -> Any:
         try:
-            value = self.values[name]
-        except KeyError as exc:
+            value = self.services.get(name)
+        except MissingServiceError as exc:
+            # Same exception type and message as before: this moved *where* the
+            # lookup happens, not what a caller sees when it fails.
             raise KeyError(f"missing runtime component: {name}") from exc
         if expected_type is not None and not isinstance(value, expected_type):
             raise TypeError(
