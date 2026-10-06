@@ -200,6 +200,12 @@ LEDGER: tuple[StateEntry, ...] = (
                "Per-path write locks keyed by (root kind, root path, relative path). "
                "The keys are paths, so the table is process-wide by nature; narrowing "
                "it per agent would weaken the lock rather than scope it."),
+    StateEntry("_RETRYABLE_CLASSES", "agent/core/llm_errors.py", 42, "REBOUND", "process", "stays", None,
+               "The tuple of SDK error classes worth retrying, built once on first "
+               "use from whichever SDKs are importable. Process-wide is correct: the "
+               "answer depends on installed packages, not on any agent, and asking "
+               "per-agent would rebuild the same tuple. Extracted from BaseAgent in "
+               "Task 7, where it was a class attribute."),
     StateEntry("_system_prompt_cache_key", "agent/config.py", 1152, "REBOUND", "process", "service", 2,
                "Static system-prompt segment cache; last writer wins across agents."),
     StateEntry("_system_prompt_cache_value", "agent/config.py", 1153, "REBOUND", "process", "service", 2),

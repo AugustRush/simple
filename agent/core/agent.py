@@ -19,6 +19,13 @@ from agent import shared
 from agent.config import _compose_system_prompt, _now
 from agent.core.context_assembler import ContextAssembler
 from agent.core.events import TOOL_EVENTS
+from agent.core.llm_errors import (
+    is_account_exhausted,
+    is_content_filter_block,
+    is_llm_retryable,
+    merge_continuation_text,
+    retryable_llm_classes,
+)
 from agent.core.payload_shape import describe_payload, head_fingerprint
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.output import CliOutputSink, _active_event_collector, _active_sink
@@ -1936,16 +1943,12 @@ class BaseAgent:
 
     @staticmethod
     def _merge_continuation_text(prefix: str, continuation: str) -> str:
-        """Append continuation text while trimming simple duplicated overlap."""
-        if not prefix:
-            return continuation
-        if not continuation:
-            return prefix
-        max_overlap = min(len(prefix), len(continuation), 64)
-        for size in range(max_overlap, 0, -1):
-            if prefix.endswith(continuation[:size]):
-                return prefix + continuation[size:]
-        return prefix + continuation
+        """Append continuation text while trimming simple duplicated overlap.
+
+        Delegates to :mod:`agent.core.llm_errors`; kept as a method because the
+        truncation-recovery path in this class reads better that way.
+        """
+        return merge_continuation_text(prefix, continuation)
 
     @staticmethod
     def _build_continuation_context(ctx: "AgentContext") -> "AgentContext":
@@ -2137,80 +2140,31 @@ class BaseAgent:
             )
         return text or exc.__class__.__name__
 
-    _retryable_llm_classes_cache: tuple[type[BaseException], ...] | None = None
 
     @staticmethod
+    @staticmethod
     def _is_account_exhausted(exc: Exception) -> bool:
-        """True when the provider says the *account* ran out, not this request.
+        """See :func:`agent.core.llm_errors.is_account_exhausted`."""
+        return is_account_exhausted(exc)
 
-        These states (a spent plan quota, an empty balance) arrive as
-        ``RateLimitError``/``APIStatusError`` instances, so the isinstance check
-        alone would classify them retryable and spend the whole retry budget --
-        plus the backoff sleeps -- on a window that cannot reopen for hours.
+    @staticmethod
+    def _retryable_llm_classes() -> tuple[type[BaseException], ...]:
+        """See :func:`agent.core.llm_errors.retryable_llm_classes`."""
+        return retryable_llm_classes()
 
-        The vocabulary lives in :mod:`agent.shared` because the scheduler retry
-        decision needs the same answer from the *stored* error text; see
-        :func:`agent.shared.is_account_exhausted_text`.
+    @staticmethod
+    def _is_llm_retryable(exc: Exception) -> bool:
+        """See :func:`agent.core.llm_errors.is_llm_retryable`.
+
+        Account-level exhaustion is checked first there; that ordering is the
+        reason this predicate exists as its own function.
         """
-        return shared.is_account_exhausted_text(exc)
-
-    @classmethod
-    def _retryable_llm_classes(cls) -> tuple[type[BaseException], ...]:
-        """Lazy-import SDK error classes once and cache as an isinstance tuple."""
-        if cls._retryable_llm_classes_cache is not None:
-            return cls._retryable_llm_classes_cache
-        classes: list[type[BaseException]] = [
-            asyncio.TimeoutError, TimeoutError, ConnectionError,
-        ]
-        for module_name, names in (
-            ("anthropic", ("APIConnectionError", "APITimeoutError",
-                           "RateLimitError", "InternalServerError")),
-            ("openai", ("APIConnectionError", "APITimeoutError",
-                        "RateLimitError", "InternalServerError")),
-        ):
-            try:
-                module = __import__(module_name)
-            except ImportError:
-                continue
-            for name in names:
-                klass = getattr(module, name, None)
-                if isinstance(klass, type) and issubclass(klass, BaseException):
-                    classes.append(klass)
-        cls._retryable_llm_classes_cache = tuple(classes)
-        return cls._retryable_llm_classes_cache
-
-    @classmethod
-    def _is_llm_retryable(cls, exc: Exception) -> bool:
-        """Return True for transient errors worth retrying.
-
-        Primary: isinstance against known SDK error classes (anthropic / openai).
-        Fallback: match unambiguous HTTP-error tokens for third-party providers
-        whose errors don't inherit from those SDK classes (DeepSeek, Ollama, etc.).
-        Avoids matching ambiguous words like "timeout" or "connection" that
-        can appear inside non-transient error messages.
-
-        Account-level exhaustion is checked *first*: those errors arrive as
-        ``RateLimitError`` instances, so the isinstance branch below would
-        otherwise claim them and burn the retry budget on a quota window that
-        cannot reopen for hours.
-        """
-        if cls._is_account_exhausted(exc):
-            return False
-        if isinstance(exc, cls._retryable_llm_classes()):
-            return True
-        error_msg = str(exc).lower()
-        retryable_tokens = (
-            " 429", " 500", " 502", " 503", " 504",
-            "rate limit", "too many requests",
-            "service unavailable", "overloaded",
-        )
-        return any(token in error_msg for token in retryable_tokens)
+        return is_llm_retryable(exc)
 
     @staticmethod
     def _is_content_filter_block(exc: Exception) -> bool:
-        """Return True when the provider rejected the request due to content policy."""
-        error_msg = str(exc).lower()
-        return "content exists risk" in error_msg or "content filter" in error_msg
+        """See :func:`agent.core.llm_errors.is_content_filter_block`."""
+        return is_content_filter_block(exc)
 
     @staticmethod
     def _build_summarized_tool_results(

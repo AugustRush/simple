@@ -111,12 +111,13 @@ def test_a_spent_plan_quota_is_not_retryable():
     says "this account is done until 00:03 tomorrow"."""
     import openai
 
-    agent = _agent()
+    from agent.core.llm_errors import is_llm_retryable
+
     quota = _status_error(429, _QUOTA_429_BODY)
 
     # The premise of the defect: the class the SDK picked says "throttled".
     assert isinstance(quota, openai.RateLimitError)
-    assert agent._is_llm_retryable(quota) is False
+    assert is_llm_retryable(quota) is False
 
 
 def test_request_level_throttling_and_connection_blips_still_retry():
@@ -127,10 +128,10 @@ def test_request_level_throttling_and_connection_blips_still_retry():
     """
     import openai
 
-    agent = _agent()
+    from agent.core.llm_errors import is_llm_retryable
 
-    assert agent._is_llm_retryable(_status_error(429, _THROTTLE_429_BODY)) is True
-    assert agent._is_llm_retryable(
+    assert is_llm_retryable(_status_error(429, _THROTTLE_429_BODY)) is True
+    assert is_llm_retryable(
         openai.APIConnectionError(request=None)  # type: ignore[arg-type]
     ) is True
 
@@ -147,7 +148,7 @@ def test_account_level_denials_are_recognised_across_providers():
     """
     import openai
 
-    agent = _agent()
+    from agent.core.llm_errors import is_account_exhausted, is_llm_retryable
 
     arrearage = _status_error(
         400, {"error": {"code": "Arrearage", "message": "Access denied, please make sure your account is in good standing"}}
@@ -158,15 +159,15 @@ def test_account_level_denials_are_recognised_across_providers():
     )
     openai_quota = _status_error(429, _OPENAI_QUOTA_429_BODY)
 
-    assert agent._is_account_exhausted(arrearage) is True
-    assert agent._is_account_exhausted(no_balance) is True
-    assert agent._is_account_exhausted(anthropic_credit) is True
-    assert agent._is_account_exhausted(openai_quota) is True
+    assert is_account_exhausted(arrearage) is True
+    assert is_account_exhausted(no_balance) is True
+    assert is_account_exhausted(anthropic_credit) is True
+    assert is_account_exhausted(openai_quota) is True
     assert isinstance(openai_quota, openai.RateLimitError), (
         "the premise: the SDK class for this body says 'throttled'"
     )
-    assert agent._is_llm_retryable(arrearage) is False
-    assert agent._is_llm_retryable(openai_quota) is False
+    assert is_llm_retryable(arrearage) is False
+    assert is_llm_retryable(openai_quota) is False
 
 
 def test_a_spent_quota_is_not_replayed_or_slept_on(monkeypatch):

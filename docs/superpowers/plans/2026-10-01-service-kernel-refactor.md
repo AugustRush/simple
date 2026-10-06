@@ -31,12 +31,13 @@ frontend and no user-visible behaviour.
 
 ## Status
 
-**Tasks 0-6 implemented 2026-10-01.** Tasks 7-10 not started.
+**Tasks 0-6 done; Task 7 in progress (1 of 4 extractions).** Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | **3 f / 2772 p** / 1 skipped |
+| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | **3 f / 2803 p** |
+| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | **4657** |
 | FAILED set | baseline | identical | identical | identical | identical | identical | identical | identical |
 | Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same | +1 recorded |
 | Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 | 1 |
@@ -249,6 +250,39 @@ without it a reloaded catalog would gate every tool twice.
 **The import cycle simplified as a side effect.** `agent/tools/executor.py` no
 longer imports `agent.plugins.catalog` at all, removing one edge from the cycle
 that Task 5 had to work around.
+
+### What Task 7 has produced so far (extraction 1 of 4)
+
+Order is by extraction cost, cheapest first, as the plan requires.
+
+**Extraction 1 — error classification and continuation merging.**
+`agent/core/llm_errors.py` holds five pure functions lifted out of `BaseAgent`:
+`is_llm_retryable`, `is_account_exhausted`, `retryable_llm_classes`,
+`is_content_filter_block`, `merge_continuation_text`. `agent/core/agent.py`
+went 4703 → **4657** lines, and its methods are now thin delegations.
+
+The reason this mattered is not the line count. Nine test functions in
+`tests/test_llm_retry_policy.py` were building a full
+`BaseAgent(object(), ToolRegistry(), model=..., api_format=...)` to call methods
+that touch no instance state. Those tests now import the functions, and
+`tests/test_llm_errors.py` tests the classification directly — no agent, no
+registry, no model client — including a parametrised table of the retryable and
+non-retryable tokens that would have been tedious to write against an object.
+
+The `_retryable_llm_classes` cache moved from a class attribute to a
+module-level `global`, so it is now a ledger entry rather than a hidden cache.
+The guard caught that automatically, which is the mechanism working.
+
+> **A delegation is not automatically safe.** `test_the_agent_methods_agree_with_the_functions`
+> asserts the agent's methods still call the functions, because the extraction's
+> failure mode is a wrapper that silently stops wrapping.
+
+**Still to extract, in order:** token budget (`_input_token_budget`,
+`_estimate_input_tokens`, `_payload_overhead`, `_output_room`,
+`_retrieval_token_budget`), then the tool-loop watchdog, then orchestration
+(`run_parallel_subtasks:1280`, `run_pipeline_subtasks:1296`,
+`run_rendezvous_subtasks:1325`, `_execute_agent:4217`) — which lives on
+`BaseAgent`, not in `agent/orchestration/`, and is therefore the expensive one.
 
 **One honest limitation remains.** An *async* `on_session_end` cannot be driven
 when unload is called from inside a running event loop (`asyncio.run` leaves the
