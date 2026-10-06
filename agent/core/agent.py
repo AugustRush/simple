@@ -2200,72 +2200,7 @@ class BaseAgent:
 
     # ── Tool-loop stuck detection ────────────────────────────────────────
 
-    @staticmethod
-    def _new_watchdog_state() -> dict[str, Any]:
-        """Per-turn dedup state for tool-loop stuck-detection."""
-        return {
-            "last_pair_sig": "",
-            "last_result_sig": "",
-            "same_pair": 0,
-            "same_result": 0,
-            "unproductive_rounds": 0,
-            "batch_counts": {},
-            "last_outcome": {},
-        }
 
-    def _check_tool_loop_stuck(
-        self,
-        state: dict[str, Any],
-        tool_uses: list[dict],
-        results: list[str],
-    ) -> str:
-        """Update watchdog state and return a stuck-reason string, or ''.
-
-        Pure single-pass over the new batch:
-        - compute batch + result signatures
-        - update run-length counters and per-signature occurrence counts
-        - test the threshold rules in priority order
-
-        Extracted from send_message so the body of the tool loop reads as
-        intent (a function call) instead of mechanism (60 lines of counters).
-        """
-        batch_sig = self._tool_use_signature(tool_uses)
-        result_sig = self._tool_result_signature(results)
-        pair_sig = (batch_sig, result_sig)
-
-        state["batch_counts"][batch_sig] = state["batch_counts"].get(batch_sig, 0) + 1
-
-        if pair_sig == state["last_pair_sig"]:
-            state["same_pair"] += 1
-        else:
-            state["same_pair"] = 1
-            state["last_pair_sig"] = pair_sig
-        if result_sig == state["last_result_sig"]:
-            state["same_result"] += 1
-        else:
-            state["same_result"] = 1
-            state["last_result_sig"] = result_sig
-
-        outcome = self._classify_tool_results(results)
-        state["last_outcome"] = outcome.to_dict()
-        unproductive = outcome.unproductive
-        intent_required = outcome.intent_required
-        if unproductive or state["same_pair"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
-            state["unproductive_rounds"] += 1
-        else:
-            state["unproductive_rounds"] = 0
-
-        if intent_required and state["same_result"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
-            return "intent_required"
-        if state["same_pair"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
-            return "same_pair"
-        if unproductive and state["same_result"] >= self._TOOL_LOOP_REPEAT_THRESHOLD:
-            return "same_result"
-        if state["unproductive_rounds"] >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD:
-            return "unproductive_rounds"
-        if unproductive and state["batch_counts"][batch_sig] >= self._TOOL_LOOP_UNPRODUCTIVE_THRESHOLD:
-            return "same_batch_unproductive"
-        return ""
 
     # ── Tool-loop stuck detection ────────────────────────────────────────
 
