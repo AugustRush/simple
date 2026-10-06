@@ -920,6 +920,10 @@ async def _call_hook_with_timeout(
     return await _maybe_await_with_timeout(result, timeout_seconds)
 
 
+#: Distinguishes the absence of a default from a default of None.
+_NO_DEFAULT = object()
+
+
 class PluginCatalog:
     """Discovers, loads, and orchestrates agent plugins from disk.
 
@@ -1036,6 +1040,25 @@ class PluginCatalog:
             return
         future = self._hook_executor.submit(hook, event)
         future.result(timeout=timeout)
+
+    def resolve_service(self, name: str, default: Any = _NO_DEFAULT) -> Any:
+        """A service some plugin provided, or *default*.
+
+        The read half of :meth:`PluginContext.provide`.  It goes through the
+        catalog's registry rather than a single install's scope so a plugin sees
+        everything loaded before it, not just its own registrations.
+
+        A missing name with *no* default raises, because a silent ``None`` is how
+        an absent dependency turns into an ``AttributeError`` three frames away
+        from the thing that was actually missing.  ``default=None`` is a value and
+        returns ``None`` -- the two had to be distinguished, which is what the
+        sentinel is for.
+        """
+        from agent.runtime.services import MissingServiceError
+
+        if default is _NO_DEFAULT:
+            return self._services.get(name)  # raises MissingServiceError
+        return self._services.get(name, default)
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 

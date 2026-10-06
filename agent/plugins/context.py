@@ -36,6 +36,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+#: Distinguishes the absence of a default from a default of None.
+_MISSING = object()
+
 __all__ = ["PluginContext", "PluginInstall"]
 
 
@@ -62,6 +65,35 @@ class PluginContext:
         for the next release to get a hook for it.
         """
         self._install.scope.on_unwind(handler)
+
+    # -- services, which is what makes this declarative ---------------------
+
+    def provide(self, name: str, value: Any, *, replace: bool = False) -> None:
+        """Offer *name* to other plugins and to the runtime.
+
+        The registration primitive already existed (``ServiceScope``); this is
+        the way a plugin reaches it.  The service is unwound with the plugin, and
+        any other plugin can resolve it through
+        :meth:`PluginCatalog.resolve_service` -- which is the difference between
+        a plugin that fills a slot the catalog knew about and a plugin that hands
+        something to its neighbours.
+        """
+        scope = self._install.scope
+        if scope is None:  # pragma: no cover - installs always carry a scope
+            raise RuntimeError(
+                f"plugin {self._install.name!r} has no scope to register into"
+            )
+        scope.provide(name, value, replace=replace)
+
+    def resolve(self, name: str, default: Any = _MISSING) -> Any:
+        """Resolve a service another plugin provided.
+
+        Reads through the catalog rather than this install's scope, so a plugin
+        sees services from plugins loaded before it -- not only its own.
+        """
+        if default is _MISSING:
+            return self._install.catalog.resolve_service(name)
+        return self._install.catalog.resolve_service(name, default)
 
     # -- the five kinds of contribution --------------------------------------
 
