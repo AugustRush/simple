@@ -34,10 +34,10 @@ frontend and no user-visible behaviour.
 **Tasks 0-6 done; Task 7 in progress (6 extractions done; runners and sub-agent groups remain).** Tasks 8-10 not started.
 Branch: `refactor/service-kernel`.
 
-| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c | T7d1 | T7d2 | T7d3 |
+| | Baseline | T0 | T1 | T2 | T3 | T4 | T5 | T6 | T7a | T7b | T7c | T7d1 | T7d2 | T7d3 | T7d4 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | 3 f / 2818 p | 3 f / 2843 p | 3 f / 2877 p | **3 f / 2908 p** |
-| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | 4554 | 4265 | 4248 | **4169** |
+| Full suite | 19 f / 2641 p | 19 f / 2649 p | 3 f / 2687 p | 3 f / 2705 p | 3 f / 2730 p | 3 f / 2737 p | 3 f / 2753 p | 3 f / 2772 p | 3 f / 2803 p | 3 f / 2818 p | 3 f / 2843 p | 3 f / 2877 p | 3 f / 2908 p | **3 f / 2926 p** |
+| `agent/core/agent.py` lines | 4704 | 4704 | 4704 | 4704 | 4704 | 4703 | 4703 | 4703 | 4657 | 4554 | 4265 | 4248 | 4169 | **4117** |
 | FAILED set | baseline | identical | identical | identical | identical | identical | identical | identical |
 | Module-level mutable state | undocumented | 49 entries | same | +1 recorded | same | same | same | +1 recorded |
 | Tool-set scopes | 3 | 3 | 3 | 3 | 1 | 1 | 1 | 1 |
@@ -371,7 +371,37 @@ construction.  Moved to after the assignment; all 143 passed without further
 change.  Worth recording because it is the whole value of the baseline: a
 mis-ordered assignment is invisible in review and loud in the suite.
 
-**Where Task 7 actually stands.**  Six extractions are done and `agent.py` is
+**Extraction 7 — the runner group, and why it needed no work.**
+The three runners (`run_parallel_subtasks`, `run_pipeline_subtasks`,
+`run_rendezvous_subtasks`) were **already thin wrappers**: they pass
+`self._execute_subtask_spec`, `self._canonicalize_write_scope` and
+`self._emit_runtime_progress_event` as injected callables to the free functions
+in `agent/orchestration/runtime.py`, which do the scheduling.  There was nothing
+to extract — the injection seam the plan proposed already existed.  This is
+recorded because "the group needed no work" is a finding, not an omission, and
+the remaining two pure functions in it were moved:
+
+- `summarize_subtask_result` — a truncation helper, now next to the payload
+  builder it feeds.
+- `parse_rendezvous_directive` — ~58 lines of normalizing a model's free-form
+  JSON.  It is the one place a text contract is enforced, and it is now tested
+  against fences, malformed input, true-like spellings of ``stop``, and unknown
+  ids in ``continue_with``.  Those cases were previously reachable only through
+  a live rendezvous round.
+
+**Where Task 7 actually stands.**  Seven extractions are done and `agent.py` is
+4117 lines (4703 → 4117, -586, a 12% reduction).
+
+**What is left, and it is one group.**  Only the **sub-agent group** remains
+(6 methods, **29** `self` attributes): `_execute_agent`,
+`_create_sub_agent`, `_compose_sub_system_prompt`, `_propagate_sub_metadata`,
+`_canonicalize_write_scope`, `_promote_orchestration_runs`.  Measured coupling
+puts it far above everything extracted so far: it holds `registry`, `client`,
+`_transport`, `context_manager`, `plugin_catalog`, `workspace_root`, and a dozen
+configuration values, and `_execute_agent` is the single primitive every runner
+calls.  Extracting it means agreeing on an interface for constructing and
+driving a sub-agent, which is a design decision rather than a move — the plan
+ordered it last for exactly this reason, and it has not been forced through.
 4169 lines (4703 → 4169, -534, a 11% reduction).  The **runner group** (8 methods,
 13 attributes) and the **sub-agent group** (6 methods, **29 attributes**) are
 still on `BaseAgent`.  Measured coupling puts the sub-agent group far above

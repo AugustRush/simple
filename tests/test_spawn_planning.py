@@ -333,3 +333,104 @@ def test_the_agent_methods_agree_with_the_planner() -> None:
     assert json.loads(
         agent._spawn_result_payload(_spec(), SubtaskResult(id="s", ok=True, content="c", tool_calls_made=[]))
     )["content"] == "c"
+
+
+# ── Rendezvous directive parsing ─────────────────────────────────────────────
+#
+# The model's output is free-form, so every field is normalized rather than
+# trusted.  These cases are the whole contract.
+
+
+def _parse(text, known=("a", "b")):
+    return SpawnPlanner.parse_rendezvous_directive(text, known_ids=set(known))
+
+
+def test_a_plain_json_object_parses() -> None:
+    directive = _parse('{"summary": "done", "stop": true}')
+    assert directive is not None
+    assert directive.summary == "done"
+    assert directive.stop is True
+
+
+def test_a_fenced_code_block_is_unwrapped() -> None:
+    """Models emit markdown fences around JSON; that is not a parse error."""
+    directive = _parse('```json\n{"summary": "x", "stop": false}\n```')
+    assert directive is not None
+    assert directive.summary == "x"
+
+
+def test_a_bare_fence_is_unwrapped() -> None:
+    directive = _parse('```\n{"summary": "x"}\n```')
+    assert directive is not None
+
+
+@pytest.mark.parametrize("text", ["", "   ", "not json", "[1,2,3]", '"a string"'])
+def test_unparseable_input_returns_none(text: str) -> None:
+    """None rather than a guess, so the caller uses its deterministic fallback."""
+    assert _parse(text) is None
+
+
+def test_stop_accepts_only_true_like_values() -> None:
+    """``stop`` decides whether the loop continues, so it must not be truthy-loose."""
+    assert _parse('{"stop": true}').stop is True
+    assert _parse('{"stop": "yes"}').stop is True
+    assert _parse('{"stop": "1"}').stop is True
+    assert _parse('{"stop": 1}').stop is True
+    assert _parse('{"stop": false}').stop is False
+    assert _parse('{"stop": "maybe"}').stop is False
+    assert _parse('{"stop": null}').stop is False
+    assert _parse('{"summary": "x"}').stop is False
+
+
+def test_continue_with_is_filtered_to_known_ids() -> None:
+    """An unknown id would ask a runner to continue something that does not exist."""
+    assert _parse('{"continue_with": ["a", "zzz"]}').continue_with == ["a"]
+
+
+def test_an_unknown_single_id_becomes_none() -> None:
+    assert _parse('{"continue_with": "zzz"}').continue_with is None
+
+
+def test_an_empty_selection_becomes_none() -> None:
+    """None means "keep everyone", which is safer than an empty continue list."""
+    assert _parse('{"continue_with": []}').continue_with is None
+    assert _parse('{"continue_with": ["  "]}').continue_with is None
+
+
+def test_a_single_known_string_is_accepted() -> None:
+    assert _parse('{"continue_with": "b"}').continue_with == ["b"]
+
+
+def test_an_unsupported_continue_type_becomes_none() -> None:
+    assert _parse('{"continue_with": 7}').continue_with is None
+
+
+# ── Subtask result summarization ─────────────────────────────────────────────
+
+
+def test_short_content_is_its_own_summary() -> None:
+    assert SpawnPlanner.summarize_subtask_result("short") == "short"
+
+
+def test_long_content_is_truncated_with_an_ellipsis() -> None:
+    summary = SpawnPlanner.summarize_subtask_result("x" * 100, limit=40)
+    assert len(summary) <= 40
+    assert summary.endswith("...")
+
+
+def test_none_summarizes_to_empty() -> None:
+    assert SpawnPlanner.summarize_subtask_result(None) == ""
+
+
+# ── The agent still delegates these too ──────────────────────────────────────
+
+
+def test_the_agent_still_parses_directives_and_summarizes() -> None:
+    import agent as agent_module
+
+    agent = agent_module.BaseAgent(
+        object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
+    )
+    assert agent._summarize_subtask_result("x" * 100, limit=40).endswith("...")
+    parsed = agent._parse_rendezvous_directive('{"stop": true}', known_ids={"a"})
+    assert parsed is not None and parsed.stop is True

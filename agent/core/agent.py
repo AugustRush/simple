@@ -680,10 +680,8 @@ class BaseAgent:
 
     @staticmethod
     def _summarize_subtask_result(content: str, limit: int = 400) -> str:
-        text = str(content or "").strip()
-        if len(text) <= limit:
-            return text
-        return text[: limit - 3].rstrip() + "..."
+        """See :meth:`agent.core.spawn_planning.SpawnPlanner.summarize_subtask_result`."""
+        return SpawnPlanner.summarize_subtask_result(content, limit)
 
     @staticmethod
     def _append_named_block(
@@ -873,58 +871,8 @@ class BaseAgent:
         *,
         known_ids: set[str],
     ) -> RendezvousDirective | None:
-        """Parse and normalize a rendezvous synthesis response.
-
-        The model's output is free-form, so every field is validated and
-        normalized instead of being trusted verbatim: ``stop`` only becomes
-        True for an explicit true-like value, ``continue_with`` is filtered to
-        known subtask ids (falling back to "keep everyone" when the selection
-        is empty or unknown), and anything malformed returns None so the
-        caller uses its deterministic fallback.
-        """
-        text = str(resp_text or "").strip()
-        if text.startswith("```"):
-            text = text.split("\n", 1)[-1]
-            if text.endswith("```"):
-                text = text[:-3].strip()
-        if not text:
-            return None
-        try:
-            data = json.loads(text)
-        except Exception:
-            return None
-        if not isinstance(data, dict):
-            return None
-        summary = str(data.get("summary", "") or "")
-        raw_stop = data.get("stop")
-        if isinstance(raw_stop, bool):
-            stop = raw_stop
-        elif isinstance(raw_stop, str):
-            stop = str(raw_stop).strip().lower() in {"true", "yes", "1"}
-        elif isinstance(raw_stop, (int, float)):
-            stop = bool(raw_stop)
-        else:
-            stop = False
-        raw_continue = data.get("continue_with")
-        if raw_continue is None:
-            continue_with = None
-        elif isinstance(raw_continue, str):
-            continue_with = [raw_continue] if raw_continue in known_ids else None
-        elif isinstance(raw_continue, list):
-            selected = [
-                str(item)
-                for item in raw_continue
-                if str(item or "").strip()
-            ]
-            known = [item for item in selected if item in known_ids]
-            continue_with = known or None
-        else:
-            continue_with = None
-        return RendezvousDirective(
-            summary=summary,
-            stop=stop,
-            continue_with=continue_with,
-        )
+        """See :meth:`agent.core.spawn_planning.SpawnPlanner.parse_rendezvous_directive`."""
+        return SpawnPlanner.parse_rendezvous_directive(resp_text, known_ids=known_ids)
 
     @staticmethod
     def _mapping_dict(value: Any) -> dict[str, Any]:
