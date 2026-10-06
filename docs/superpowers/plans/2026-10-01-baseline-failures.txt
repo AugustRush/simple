@@ -1,0 +1,39 @@
+# Frozen baseline failure set — measured 2026-10-01
+
+Command: `.venv/bin/python -m pytest -q -p no:cacheprovider --tb=no`
+Result: **19 failed / 2641 passed / 1 skipped** in 68.49s
+
+Every entry below is pre-existing and environment-caused. Any run whose FAILED
+set differs from this list has been changed by the work in progress.
+
+Reason groups:
+
+- `sandbox_apply` — `sandbox-exec: sandbox_apply: Operation not permitted`
+  (11 tests)
+- `console width` — terminal-size probing in this invocation environment
+  (3 tests)
+- `user tool plugin load` — pre-existing; also noted in
+  `2026-09-22-scheduler-concurrency.md`
+- `output-dir sandbox write`, `user tool isolation` — same sandbox cause
+
+```
+tests/test_agent_integration.py::test_build_components_loads_user_tool_plugins
+tests/test_builtin_tools.py::test_shell_allows_output_dir_writes
+tests/test_cli_ui.py::test_console_width_check_is_throttled
+tests/test_cli_ui.py::test_console_width_follows_terminal_resize
+tests/test_cli_ui.py::test_console_width_survives_a_failing_terminal_probe
+tests/test_sandbox_conformance.py::test_sandbox_allows_only_scoped_workspace_writes
+tests/test_sandbox_conformance.py::test_sandbox_allows_output_writes
+tests/test_sandbox_conformance.py::test_sandbox_allows_workspace_reads
+tests/test_sandbox_conformance.py::test_sandbox_allows_writes_to_application_support
+tests/test_sandbox_conformance.py::test_sandbox_allows_writes_to_user_cache_dirs
+tests/test_sandbox_conformance.py::test_sandbox_denies_agent_home_but_reopens_output
+tests/test_sandbox_conformance.py::test_sandbox_denies_credentials_and_reopens_scoped_workspace
+tests/test_sandbox_conformance.py::test_sandbox_denies_reading_credentials
+tests/test_sandbox_conformance.py::test_sandbox_denies_writes_to_shell_rc_files
+tests/test_sandbox_conformance.py::test_sandbox_keeps_ssh_readable_by_default
+tests/test_sandbox_conformance.py::test_sandbox_opens_host_temp_and_denies_internal_output
+tests/test_sandbox_conformance.py::test_sandbox_read_all_mode_reads_outside_workspace
+tests/test_user_tool_isolation.py::test_tools_still_run_under_every_sandbox_mode[read_all]
+tests/test_user_tool_isolation.py::test_tools_still_run_under_every_sandbox_mode[restricted]
+```
