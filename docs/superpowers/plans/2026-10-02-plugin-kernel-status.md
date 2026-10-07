@@ -226,16 +226,43 @@ two differences -- the signature (`components` became required last round) and t
 local import.  The two describing helpers came across at 19 -> 19 and 56 -> 56 with zero
 differences.
 
+## Why the Scheduler cannot become a plugin the way Ralph did
+
+Three measurements, one of them from a change I made and then reverted.
+
+**The store is injected, not owned.**  The obvious move was "the service closes the
+store it was built with", which removes a `close()` from two `finally` blocks.  It was
+wrong, and the suite said so:
+
+    await service.shutdown()
+    runs = store.list_runs(task.id)      # sqlite3.ProgrammingError: closed database
+
+A caller may legitimately read the store after the service stops -- the tests do, and so
+would a command reporting what a run recorded.  The service was *given* the store; two
+call sites closing two stores they each created is not duplicated ownership, it is two
+owners.  Reverted.
+
+**The run executor needs the whole mapping, and a context resolves names.**  A run may
+build a fresh runtime (`_build_components_async(run_cfg, ...)`) when the config changed
+on disk, and otherwise uses the composition mapping as-is.  A plugin's `ctx` resolves
+individual services, not the mapping.  So the plugin is blocked on a choice: a mapping
+accessor in the kernel -- the escape hatch the plan argues against -- or a
+**runtime-factory service** that answers "build me a runtime for this config".  The
+second is the shape the plan wants; it does not exist yet.
+
+**`shutdown()` is async and `dispose()` is sync.**  So a plugin could register
+`store.close` on its scope but not `await service.shutdown()`, splitting teardown
+between the plugin and the caller -- which is what the current code already does, only
+with the store added.
+
+Conclusion: the Scheduler needs a runtime-factory service before it can be a plugin, and
+that is the next piece of work rather than a `SchedulerPlugin` class.
+
 ## Next step, in order
 
-1. **The Scheduler as a plugin.**  Its parameters are single-sourced now
-   (`agent/scheduler/settings.py`), which was the first prerequisite.  The second is
-   `setup` being synchronous: `_build_scheduler_service` is `async`, so the plugin either
-   needs a synchronous builder or starts a task.  It also returns a triple --
-   `(service, store, components)` where `components` is non-`None` only when the builder
-   built its own -- and that flag exists to tell the caller **who tears down**.  A scope
-   answers that question, so the plugin should own all three and the `finally` block
-   that closes them by hand should go.
+1. **A runtime-factory service**, so a scheduled run can say "build me a runtime for
+   this config" without being handed a mapping.  That is the remaining prerequisite for
+   `SchedulerPlugin`; the store's lifetime and the sync `setup` are already settled.
 2. **Phase 6, the channel plugins** (CLI / Web / Feishu) -- measured next, and for the
    same reason Phase 5 was: to find out which of the three is genuinely a component.
 3. **`BaseAgent` is still 2,530 lines** and still holds the sub-agent machinery, the
