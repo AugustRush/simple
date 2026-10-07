@@ -32,6 +32,7 @@ from agent import shared
 from agent.core.output import CliOutputSink
 from agent.commands import CommandCoordinator, CommandRouter, register_builtin_commands
 from agent.commands.composition import ensure_command_router
+from agent.runtime.services import require_service, resolve
 from agent.bundles import loader_for_name
 from agent.runtime import AgentCore, RuntimeComponents, RuntimeSessionState, TurnInput
 from agent.runtime.lock import AgentHomeBusyError, acquire_agent_home_lock
@@ -1216,8 +1217,11 @@ async def _interactive_loop_body(
 ):
     """Main interactive chat loop."""
     global _current_cancel_token
-    agent: BaseAgent = components["agent"]
-    plugin_catalog: PluginCatalog = components.get("plugin_catalog")  # type: ignore[assignment]
+    # Computed in a container view of the same mapping, so these are service
+    # *lookups* rather than dict pokes.  See agent/runtime/core_services.py:
+    # the difference is what makes a name replaceable.
+    agent: BaseAgent = require_service(components, "agent")
+    plugin_catalog: PluginCatalog = resolve(components, "plugin_catalog")  # type: ignore[assignment]
     if plugin_catalog is None:
         plugin_catalog = PluginCatalog(
             builtin_dir=shared.PLUGINS_DIR,
@@ -1232,7 +1236,7 @@ async def _interactive_loop_body(
         components["plugin_catalog"] = plugin_catalog
     system_prompt = components["system_prompt"]
     ctx_mgr = _build_cli_context_manager(components)
-    skill_catalog: SkillCatalog = components["skill_catalog"]
+    skill_catalog: SkillCatalog = require_service(components, "skill_catalog")
 
     ctx = AgentContext(system_prompt=system_prompt)
     consolidation_cfg = (cfg.get("context") or {}).get("consolidation", {}) or {}
@@ -2061,7 +2065,7 @@ def memory_tidy():
 
     async def _run():
         components = await agent_module._build_components_async(cfg)
-        mem: MemoryPalace = components["memory"]
+        mem: MemoryPalace = require_service(components, "memory")
         mem.force_tidy()
         try:
             await mem.tidy()

@@ -134,6 +134,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/channels/base.py",
             "agent/channels/web.py",
             "agent/cli.py",
+            "agent/commands/builtin.py",
             "agent/config.py",
             "agent/core/agent.py",
             "agent/runtime/contracts.py",
@@ -160,7 +161,6 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/bootstrap.py",
         ),
         consumers=(
-            "agent/bootstrap.py",
             "agent/runtime/contracts.py",
         ),
         summary="Executes one turn against AgentCore, with continuation accounting.",
@@ -176,6 +176,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/bootstrap.py",
             "agent/channels/base.py",
             "agent/cli.py",
+            "agent/commands/builtin.py",
         ),
         summary="The long-term store behind the context manager.",
     ),

@@ -87,6 +87,7 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
             continue
         rel = str(path.relative_to(REPO_ROOT))
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        assignment_targets = _is_assignment_target(tree)
         for node in ast.walk(tree):
             # **Every** dict literal, anywhere -- not only ones bound by an
             # assignment.  Bootstrap delivers the component mapping from a
@@ -131,8 +132,35 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                     # the container first, so the key is the argument after it.
                     note(readers, _component_key(node), rel)
             elif isinstance(node, ast.Subscript):
+                # Two exclusions, both learned from false positives:
+                #
+                # * a subscript that is an assignment *target* is a write, and
+                #   counting it as a read too made ``ctx.metadata["skill_catalog"]
+                #   = catalog`` look like a consumer of the service;
+                # * a ``*metadata*`` mapping is not a component mapping.  The
+                #   runtime keeps a per-turn metadata dict carrying some of the
+                #   same names, and treating it as a service read put files in the
+                #   ledger that never resolve a service at all.
+                if id(node) in assignment_targets:
+                    continue
+                if _string_key(node) is None:
+                    continue
+                receiver = ast.unparse(node.value)
+                if "metadata" in receiver:
+                    continue
                 note(readers, _string_key(node), rel)
     return writers, readers
+
+
+def _is_assignment_target(tree: ast.AST) -> set[int]:
+    """Line numbers of subscript nodes that are assignment targets."""
+    targets: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript):
+                    targets.add(id(target))
+    return targets
 
 
 # ── The ledger is well formed ────────────────────────────────────────────────
