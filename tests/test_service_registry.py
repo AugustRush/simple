@@ -308,3 +308,35 @@ def test_adopt_does_not_copy() -> None:
     storage: dict = {}
     ServiceRegistry.adopt(storage)
     assert storage == {}, "adopt must not seed the caller's dict"
+
+
+# ── The registry as a component container ────────────────────────────────────
+
+
+def test_resolve_reads_a_registry() -> None:
+    """The kernel's registry is a legitimate container, not only a stand-in for one.
+
+    The agent loop holds its composition as a registry now, so ``resolve`` and
+    ``require_service`` have to accept it -- otherwise every read inside a plugin
+    would have to go through a second shape for no reason.
+    """
+    from agent.kernel.service import ServiceRegistry, resolve
+
+    registry = ServiceRegistry()
+    registry.provide("agent", "the agent")
+    assert resolve(registry, "agent", None) == "the agent"
+    assert resolve(registry, "absent", None) is None
+
+
+def test_require_service_reads_a_registry_and_raises_for_a_missing_name() -> None:
+    from agent.kernel.service import (
+        MissingServiceError,
+        ServiceRegistry,
+        require_service,
+    )
+
+    registry = ServiceRegistry()
+    registry.provide("agent", "the agent")
+    assert require_service(registry, "agent") == "the agent"
+    with pytest.raises(MissingServiceError):
+        require_service(registry, "absent")

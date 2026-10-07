@@ -1290,6 +1290,17 @@ class PluginCatalog:
             return self._services.get(name)  # raises MissingServiceError
         return self._services.get(name, default)
 
+    def mount(self, plugin: Any) -> Any:
+        """Mount a plugin the catalog did not discover, and return its install.
+
+        The composition root uses this for the services that are plugins but not
+        files: the agent loop, and anything else the runtime mounts itself.  Public
+        rather than reaching into the host, because the host is the catalog's own --
+        a caller that pokes ``_host`` breaks on any stand-in for this class, which is
+        exactly what happened to a test double when the loop was first mounted.
+        """
+        return self._host.load(plugin)
+
     @property
     def _installs(self) -> dict[str, Any]:
         """The loaded plugins, owned by the kernel host."""

@@ -314,4 +314,10 @@ def require_service(components: Any, name: str) -> Any:
     values = getattr(components, "values", None)
     if isinstance(values, Mapping):
         return values[name]
+    if isinstance(components, ServiceRegistry):
+        # The kernel's own registry, reached without ``require`` because it is the
+        # storage rather than a view over one.  Its ``get`` already raises for a
+        # missing name, so the error a caller sees is the same one the other two
+        # shapes produce.
+        return components.get(name)
     return components[name]

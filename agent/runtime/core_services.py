@@ -166,14 +166,19 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         summary="The turn runner's owner: skill refresh, maintenance, session state.",
     ),
     CoreService(
-        name="turn_runner",
+        name="agent_loop",
         owners=(
-            "agent/bootstrap.py",
+            "agent/runtime/contracts.py",
         ),
         consumers=(
             "agent/runtime/contracts.py",
         ),
-        summary="Executes one turn against AgentCore, with continuation accounting.",
+        summary=(
+            "Executes one turn against the agent, with continuation accounting. "
+            "Provided by the TurnRunner plugin, which is why its owner is the "
+            "module that defines it rather than the composition root: the loop "
+            "offers itself, the root only mounts it."
+        ),
     ),
     CoreService(
         name="memory",

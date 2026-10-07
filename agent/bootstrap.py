@@ -392,7 +392,6 @@ async def _build_web_session_components(
             "_shares_global_runtime": True,
         }
     )
-    session_components["turn_runner"] = TurnRunner(session_components)
     session_components["agent_core"] = AgentCore(session_components)
     # Named dependencies; see the note on the global bootstrap path above.
     registry.set_context("command_router", session_components.get("command_router"))
@@ -953,8 +952,13 @@ async def _build_components_async(
     )
     agent.context_manager = ctx_manager
 
-    components = {
-        **_partial_components,
+    # Updated **in place** rather than copied into a new dict.  The plugin catalog's
+    # kernel adopts this mapping as its service storage, so a copy would leave two
+    # namespaces that diverge for everything added after the catalog was built:
+    # ``agent``, ``system_prompt``, ``context_manager`` and ``mcp_client`` would be
+    # invisible to a plugin's ``inject``, and the "one namespace" the container is
+    # for would be true only of the entries that happened to exist earlier.
+    _partial_components.update({
         "max_tokens": max_tokens,
         "base_system_prompt": base_system_prompt,
         "system_prompt": system_prompt,
@@ -965,7 +969,15 @@ async def _build_components_async(
         "mcp_status": mcp_status,
         "mcp_task": None,
         "config_revision": 0,
-    }
+    })
+    components = _partial_components
+    # The agent loop is mounted like any other plugin, into the composition's own
+    # host, so it activates only once ``agent`` and ``system_prompt`` exist -- which
+    # is why this is here rather than beside the catalog.  Mounting it means a
+    # composition replaces the loop by providing ``agent_loop`` itself, and a
+    # composition with no agent has no loop rather than one that fails on the first
+    # turn.
+    plugin_catalog.mount(TurnRunner())
     # WebChannel uses this hook to provision one independent agent home per
     # browser session under ``~/.agent/web/sessions/<session-id>``.
     async def _session_components_factory(session_id: str) -> dict:
@@ -1014,7 +1026,6 @@ async def _build_components_async(
         context_factory=_new_ralph_context,
         context_manager=ctx_manager,
     )
-    components["turn_runner"] = TurnRunner(components)
     components["agent_core"] = AgentCore(components)
     # One constructor for all four former sites; see agent/commands/composition.py.
     command_router = ensure_command_router(components)

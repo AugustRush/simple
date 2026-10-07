@@ -365,13 +365,84 @@ class RuntimeSessionState:
 
 
 class TurnRunner:
-    """Executes one normalized turn through the current agent implementation."""
+    """Executes one normalized turn through the current agent implementation.
 
-    def __init__(self, components: RuntimeComponents | Mapping[str, Any]) -> None:
-        if isinstance(components, RuntimeComponents):
-            self._components = components
-        else:
-            self._components = RuntimeComponents(components)
+    A **plugin**, not a helper the composition news up.  The difference is what
+    happens when its collaborators are missing: as a plugin its ``inject`` is
+    checked before it activates, so a composition with no ``agent`` has no agent
+    loop at all -- a visible gap at composition time.  Constructed ad hoc, it would
+    exist and fail at the first turn instead, which moves the same misconfiguration
+    from startup into a user's first message.
+
+    It provides itself as ``agent_loop``, so a composition replaces the loop by
+    providing that name -- which is what "the agent loop is a plugin" means in
+    practice, rather than only that it lives in a plugin-shaped class.
+    """
+
+    #: The name this plugin is loaded and replaced under.
+    name = "agent_loop"
+
+    #: What must exist before a turn can run.  ``agent`` because a turn is run *on*
+    #: an agent, and ``system_prompt`` because the request is assembled through it.
+    #: The optional collaborators (``plugin_catalog``, ``post_turn_maintenance``) are
+    #: deliberately *not* injected: they may legitimately be absent in a minimal
+    #: composition, and a loop that refused to load without them would make the
+    #: minimal composition impossible to express.
+    inject = ("agent", "system_prompt")
+
+    def __init__(self) -> None:
+        self._ctx: Any = None
+        self._services: Any = None
+
+    @classmethod
+    def bind(cls, components: Any) -> "TurnRunner":
+        """The stock loop over *components*, for a composition that mounted none.
+
+        Not the plugin path -- ``setup`` is -- but the one the runtime falls back to,
+        so a runtime assembled by hand (tests, the channel runner) keeps working
+        without having to mount the loop first.
+        """
+        loop = cls()
+        loop._services = (
+            components if isinstance(components, RuntimeComponents)
+            else RuntimeComponents(components)
+        )
+        return loop
+
+    def setup(self, ctx: Any) -> None:
+        """Bind the loop to its composition and offer it as ``agent_loop``."""
+        self._ctx = ctx
+        ctx.provide("agent_loop", self, replace=True)
+
+    def teardown(self) -> None:
+        # Dropped so a replaced or unloaded loop cannot be reached through a stale
+        # reference held by a caller that resolved it before the replacement.
+        self._ctx = None
+        self._services = None
+
+    @property
+    def _components(self) -> RuntimeComponents:
+        """The composition, as a container.
+
+        Kept as a property because every read below is a *service* read: the loop
+        resolves collaborators by name, and a plugin that held the raw mapping would
+        be a second way to reach services -- the coupling ``inject`` exists to make
+        visible.
+        """
+        if self._ctx is not None:
+            return self._ctx.services
+        if self._services is not None:
+            # Bound through :meth:`bind` rather than mounted as a plugin.
+            return (
+                self._services.services
+                if isinstance(self._services, RuntimeComponents)
+                else self._services
+            )
+        raise RuntimeError(
+            "TurnRunner has no composition: it was neither mounted as a plugin "
+            "(agent_loop) nor bound to one.  Use TurnRunner.bind(components) or "
+            "load it as a plugin."
+        )
 
 
     async def run(
@@ -489,10 +560,23 @@ class AgentCore:
 
 
     def _turn_runner(self) -> Any:
-        turn_runner = resolve(self._components, "turn_runner")
-        if turn_runner is None or isinstance(turn_runner, TurnRunner):
-            return TurnRunner(self._components)
-        return turn_runner
+        """The mounted agent loop, or the stock one bound to this composition.
+
+        The service wins when a composition mounted a loop: that is what makes the
+        loop replaceable by providing ``agent_loop``.  A composition that mounted
+        none still runs turns, through the stock loop bound to the same container --
+        the same shape as ``post_turn_maintenance`` falling back to the default, and
+        the reason a hand-assembled runtime does not have to know that the loop is
+        now a plugin.
+
+        What it must not do is invent a *different* container: the fallback is bound
+        to these components, so the loop it produces sees exactly the services the
+        composition supplied.
+        """
+        loop = resolve(self._components, "agent_loop")
+        if loop is not None:
+            return loop
+        return TurnRunner.bind(self._components)
 
     def _skill_catalog(self) -> Any:
         return resolve(self._components, "skill_catalog")
@@ -880,7 +964,7 @@ class AgentCore:
                     completion_runner = self._turn_runner()
                     complete_turn = getattr(completion_runner, "complete_turn", None)
                     if not callable(complete_turn):
-                        complete_turn = TurnRunner(self._components).complete_turn
+                        complete_turn = TurnRunner.bind(self._components).complete_turn
                     completion_input = TurnInput(
                         text=(turn_input.text if iteration_index == 0 else iteration_prompt),
                         session_id=turn_input.session_id,

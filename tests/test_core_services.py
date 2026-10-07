@@ -82,14 +82,19 @@ def _component_key(node: ast.Call) -> str | None:
 def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """``(writers, readers)`` per core service name, by file.
 
-    Three write mechanisms are counted, because the source uses all three and a
-    scanner that knew only one reported four services as never written:
+    Four write mechanisms are counted, because the source uses all four and a
+    scanner that knew fewer reported services as never written:
 
     - ``mapping["name"] = value`` -- the obvious one;
     - a ``{"name": value}`` **dict literal**, which is how bootstrap builds the
       component mapping it hands over;
     - ``registry.set_context("name", value)`` -- the tool registry's own key-value
-      seam, which is a different mechanism carrying the same names.
+      seam, which is a different mechanism carrying the same names;
+    - ``ctx.provide("name", value)`` -- **how a plugin offers a service**, and the
+      one mechanism this scanner was blind to.  It is the newest and now the
+      primary path, so a ledger built without it reported every plugin-provided
+      service as written by nothing.  A blind spot here is worse than a missing
+      entry: it makes the guard insist that a *correct* tree is wrong.
 
     A read is any ``.get`` or subscript with the name as a literal key.
     """
@@ -126,6 +131,13 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                 attr = func.attr if isinstance(func, ast.Attribute) else ""
                 name_id = func.id if isinstance(func, ast.Name) else ""
                 if attr == "set_context":
+                    note(writers, _string_key(node), rel)
+                elif attr == "provide":
+                    # ``ctx.provide("x", v)`` / ``registry.provide("x", v)``.  The
+                    # name is the first argument, which is the same position
+                    # ``_string_key`` already reads -- ``provide`` is not the mirror
+                    # of ``get`` in that respect, and a second helper for it would
+                    # have been a duplicate carrying a wrong explanation.
                     note(writers, _string_key(node), rel)
                 elif attr in ("get", "pop", "require", "lookup", "resolve"):
                     # ``lookup``/``resolve`` tolerate absence, ``require`` does
@@ -347,8 +359,8 @@ def test_the_scan_detects_a_runtime_components_lookup() -> None:
     _writers, readers = _scan()
     runtime = "agent/runtime/contracts.py"
     found = {name for name, files in readers.items() if runtime in files}
-    assert "turn_runner" in found, (
-        f"{runtime} resolves turn_runner through the container; scan found "
+    assert "agent_loop" in found, (
+        f"{runtime} resolves the agent loop through the container; scan found "
         f"{sorted(found)}"
     )
 
@@ -431,7 +443,7 @@ def test_declared_names_match_the_documented_set() -> None:
         "plugin_catalog",
         "registry",
         "skill_catalog",
-        "turn_runner",
+        "agent_loop",
     }
 
 
@@ -604,3 +616,32 @@ def test_the_vocabulary_covers_agent_itself() -> None:
     entry = entry_for("agent")
     assert entry.owners == ("agent/bootstrap.py",)
     assert "agent/commands/builtin.py" in entry.consumers
+
+
+def test_the_scan_detects_a_provide_call_as_a_write() -> None:
+    """Control: the fourth write mechanism is the one being relied on now.
+
+    A plugin offering a service does it with ``ctx.provide("name", value)``, so a
+    scanner that missed this shape would report every plugin-provided service as
+    written by nothing -- and the guard would insist that a *correct* tree is wrong.
+    Asserted on the key rule directly, because the failure is a rule that quietly
+    stops matching, which no assertion about the tree would notice.
+    """
+    source = 'def setup(ctx):\n    ctx.provide("agent_loop", self, replace=True)\n'
+    call = next(
+        node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
+    )
+    assert _string_key(call) == "agent_loop"
+
+
+def test_a_provide_of_a_non_literal_name_is_not_counted() -> None:
+    """Only literal names are attributable; a computed one cannot be checked.
+
+    The counterpart of the test above: without this, a rule that matched *any*
+    ``provide`` and defaulted the key to something would look like it worked.
+    """
+    source = "def setup(ctx, name):\n    ctx.provide(name, 1)\n"
+    call = next(
+        node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
+    )
+    assert _string_key(call) is None

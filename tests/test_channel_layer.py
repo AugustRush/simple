@@ -543,7 +543,7 @@ def test_channel_runner_passes_attachments_to_turn_input(tmp_path):
     runner = ChannelRunner(
         channels=[],
         components={
-            "turn_runner": _FakeTurnRunner(),
+            "agent_loop": _FakeTurnRunner(),
             "skill_catalog": CleanSkillCatalog(),
             "system_prompt": "system",
             "agent": object(),
@@ -961,7 +961,7 @@ def test_channel_runner_uses_turn_runner_when_provided():
             "plugin_catalog": None,
             "context_manager": None,
             "system_prompt": "system",
-            "turn_runner": turn_runner,
+            "agent_loop": turn_runner,
         },
         cfg={},
     )

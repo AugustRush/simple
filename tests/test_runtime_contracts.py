@@ -117,7 +117,7 @@ def test_turn_runner_delegates_to_agent_and_normalizes_result():
 
     agent = _FakeAgent()
     components = RuntimeComponents({"agent": agent})
-    runner = TurnRunner(components)
+    runner = TurnRunner.bind(components)
     stream_callback = object()
     ctx = object()
 
@@ -370,7 +370,7 @@ def test_turn_runner_complete_turn_records_state_and_maintenance():
             "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
         }
     )
-    runner = TurnRunner(components)
+    runner = TurnRunner.bind(components)
 
     asyncio.run(
         runner.complete_turn(
@@ -415,7 +415,7 @@ def test_turn_runner_complete_turn_records_state_and_maintenance():
 
 def test_turn_runner_uses_turn_id_as_the_journal_identity():
     maintenance_calls = []
-    runner = TurnRunner(
+    runner = TurnRunner.bind(
         {
             "agent": object(),
             "system_prompt": "system",
@@ -448,7 +448,7 @@ def test_turn_runner_uses_turn_id_as_the_journal_identity():
 
 def test_turn_runner_complete_turn_passes_error_to_maintenance():
     maintenance_calls = []
-    runner = TurnRunner(
+    runner = TurnRunner.bind(
         {
             "agent": object(),
             "system_prompt": "system",
@@ -776,7 +776,7 @@ def test_turn_runner_complete_turn_uses_live_component_updates():
         "system_prompt": "old",
         "post_turn_maintenance": lambda **kwargs: maintenance_calls.append(kwargs),
     }
-    runner = TurnRunner(values)
+    runner = TurnRunner.bind(values)
     state = RuntimeSessionState(ctx=object())
 
     values["system_prompt"] = "new"
@@ -810,7 +810,7 @@ def test_agent_core_uses_live_component_prompt_for_existing_session():
     core = AgentCore(
         {
             "system_prompt": "new",
-            "turn_runner": _FakeTurnRunner(),
+            "agent_loop": _FakeTurnRunner(),
         }
     )
     state = RuntimeSessionState(ctx=_Ctx())
@@ -922,7 +922,7 @@ def test_agent_core_handles_prompt_hooks_turn_loop_and_plugin_continue():
             "registry": object(),
             "skill_catalog": _SkillCatalog(),
             "plugin_catalog": plugin_catalog,
-            "turn_runner": turn_runner,
+            "agent_loop": turn_runner,
         }
     )
 
@@ -1024,7 +1024,7 @@ def test_agent_core_prompt_submit_metadata_uses_canonical_turn_identity():
             "agent": object(),
             "system_prompt": "system",
             "plugin_catalog": plugin_catalog,
-            "turn_runner": _FakeTurnRunner(),
+            "agent_loop": _FakeTurnRunner(),
         }
     )
 
@@ -1074,7 +1074,7 @@ def test_agent_core_publishes_runtime_heartbeat_identity(tmp_path):
         {
             "agent": object(),
             "system_prompt": "system",
-            "turn_runner": runner,
+            "agent_loop": runner,
             "output_dir": tmp_path / "output",
         }
     )
@@ -1139,7 +1139,7 @@ def test_agent_core_returns_blocked_execution_with_reason_without_running_turn()
             "agent": object(),
             "system_prompt": "system",
             "plugin_catalog": _PluginCatalog(),
-            "turn_runner": _FakeTurnRunner(),
+            "agent_loop": _FakeTurnRunner(),
         }
     )
 
@@ -1195,7 +1195,7 @@ def test_agent_core_records_error_reported_runtime_event():
         {
             "agent": object(),
             "system_prompt": "system",
-            "turn_runner": _FakeTurnRunner(),
+            "agent_loop": _FakeTurnRunner(),
         }
     )
 
@@ -1246,7 +1246,7 @@ def test_agent_core_records_failed_runtime_event_when_runner_raises():
         {
             "agent": object(),
             "system_prompt": "system",
-            "turn_runner": _FakeTurnRunner(),
+            "agent_loop": _FakeTurnRunner(),
         }
     )
 
@@ -1313,7 +1313,7 @@ def test_agent_core_does_not_complete_turn_twice_when_completion_raises():
             "system_prompt": "system",
             "base_system_prompt": "system",
             "registry": object(),
-            "turn_runner": _FakeTurnRunner(),
+            "agent_loop": _FakeTurnRunner(),
         }
     )
 
@@ -1352,7 +1352,7 @@ def test_agent_core_handles_minimal_context_without_metadata_when_no_skill_catal
         {
             "agent": object(),
             "system_prompt": "system",
-            "turn_runner": _FakeTurnRunner(),
+            "agent_loop": _FakeTurnRunner(),
         }
     )
     # AgentContext contract: handle_turn refreshes ctx.system_prompt every
@@ -1424,7 +1424,7 @@ def test_agent_core_normalizes_explicit_skill_requests_before_prompt_hooks():
             "registry": object(),
             "skill_catalog": _SkillCatalog(),
             "plugin_catalog": plugin_catalog,
-            "turn_runner": turn_runner,
+            "agent_loop": turn_runner,
         }
     )
 

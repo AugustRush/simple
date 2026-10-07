@@ -303,7 +303,7 @@ user-invocable: true
     registry = components["registry"]
     prompt = components["system_prompt"]
 
-    assert components["turn_runner"].__class__.__name__ == "TurnRunner"
+    assert components["agent_loop"].__class__.__name__ == "TurnRunner"
     assert components["command_router"].classify(
         "/help", channel_name="cli"
     ).kind == "command"
@@ -361,6 +361,11 @@ user-invocable: true
     monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
     class _PluginCatalog:
+        def mount(self, plugin):
+            # The composition root mounts internal services here; a stand-in that
+            # cannot accept one is not a stand-in for the catalog any more.
+            return None
+
         def get_bundled_skills(self):
             return [("webwright", plugin_skill_root)]
 
@@ -7988,7 +7993,7 @@ def test_turn_runner_appends_attachment_context_for_text_model(tmp_path):
         mime_type="image/png",
         local_path=image,
     )
-    runner = TurnRunner(RuntimeComponents({"agent": _FakeAgent()}))
+    runner = TurnRunner.bind(RuntimeComponents({"agent": _FakeAgent()}))
     ctx = agent_module.AgentContext(system_prompt="system")
 
     result = asyncio.run(
@@ -8429,7 +8434,7 @@ def test_interactive_loop_routes_turn_through_runtime_runner(monkeypatch, tmp_pa
         "registry": agent_module.ToolRegistry(),
         "output_dir": tmp_path / "output",
         "plugin_catalog": _FakePluginCatalog(),
-        "turn_runner": turn_runner,
+        "agent_loop": turn_runner,
     }
 
     asyncio.run(agent_module._interactive_loop(components, _minimal_cfg()))
@@ -8747,7 +8752,7 @@ def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
         "agent": _ExplodingAgent(),
         "system_prompt": "system",
         "skill_catalog": _FakeSkillCatalog(),
-        "turn_runner": turn_runner,
+        "agent_loop": turn_runner,
     }
 
     monkeypatch.setattr(agent_module, "load_config", lambda: (_minimal_cfg(), False))
@@ -8865,7 +8870,7 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
         "system_prompt": "system",
         "skill_catalog": _CLEAN_SKILL_CATALOG,
         "output_dir": tmp_path,
-        "turn_runner": turn_runner,
+        "agent_loop": turn_runner,
     }
 
     service, _store, _components = asyncio.run(

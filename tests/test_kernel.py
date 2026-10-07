@@ -801,3 +801,62 @@ def test_replacing_a_pending_plugin_works_too() -> None:
     assert host.pending() == ("needs_leaf",)
     host.load(NeedsLeaf(), replace=True)
     assert host.pending() == ("needs_leaf",), "still one waiter, not two"
+
+
+# ── A service that is also a plugin, and a composition that mounted none ─────
+
+
+def test_a_mounted_plugin_can_be_replaced_by_name() -> None:
+    """The value of "the agent loop is a plugin": a composition replaces it by
+    providing ``agent_loop``, not by editing the runtime.
+
+    Both plugins are named ``agent_loop`` -- the name is the *seam*, so a
+    replacement necessarily has the same one.  Which is also why replacement
+    unloads the incumbent rather than shadowing it: there is exactly one plugin by
+    that name at a time, and no way to ask which of two live ones is in effect.
+    """
+
+    class Stock:
+        name = "agent_loop"
+        inject = ("agent",)
+
+        def setup(self, ctx):
+            ctx.provide("agent_loop", "stock loop")
+
+    class Better:
+        name = "agent_loop"
+        inject = ("agent",)
+
+        def setup(self, ctx):
+            ctx.provide("agent_loop", "better loop")
+
+    host = PluginHost()
+    host.services.provide("agent", "an agent")
+    host.load(Stock())
+    assert host.services.get("agent_loop") == "stock loop"
+
+    host.load(Better(), replace=True)
+    assert host.services.get("agent_loop") == "better loop"
+    assert host.loaded() == ("agent_loop",), "one loop, not two"
+
+    host.unload("agent_loop")
+    assert not host.services.has("agent_loop"), "and it goes with its plugin"
+
+
+def test_a_plugin_injecting_an_absent_service_never_activates() -> None:
+    """So a composition with no agent has no loop, rather than one that fails on
+    the first turn -- a misconfiguration moved from startup into a user's message.
+    """
+    host = PluginHost()
+
+    class Loop:
+        name = "agent_loop"
+        inject = ("agent",)
+
+        def setup(self, ctx):
+            ctx.provide("agent_loop", "stock loop")
+
+    host.load(Loop())
+    assert host.pending() == ("agent_loop",)
+    assert host.services.get("agent_loop", None) is None
+    assert host.waiting_for() == {"agent_loop": ("agent",)}

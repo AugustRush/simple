@@ -906,7 +906,7 @@ def test_evolution_prompt_override_survives_next_agent_core_turn(monkeypatch):
         "output_dir": "/output",
         "skill_catalog": None,
         "plugin_catalog": None,
-        "turn_runner": runner,
+        "agent_loop": runner,
     }
     state = RuntimeSessionState(
         ctx=SimpleNamespace(system_prompt="COMPOSED::shared base", metadata={})

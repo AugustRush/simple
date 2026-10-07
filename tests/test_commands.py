@@ -637,7 +637,7 @@ def test_skill_prompt_dirty_refreshes_shared_and_evolved_sessions(monkeypatch) -
         "workspace_root": "/workspace",
         "output_dir": "/output",
         "skill_catalog": DirtyOnceSkills(),
-        "turn_runner": runner,
+        "agent_loop": runner,
     }
     core = AgentCore(components)
     evolved = RuntimeSessionState(
