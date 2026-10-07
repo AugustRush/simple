@@ -19,8 +19,8 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 1 Plugin Kernel | **done** | `agent/kernel/` — Context / Plugin / Service / Event / Scope / Lifecycle, 53 tests in `tests/test_kernel.py` |
 | 2 Service Injection | **done** | ToolRegistry ✅ `registry`, Session ✅ `context_manager`, Model ✅ `llm` |
 | 3 Agent Loop Plugin | **done** | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
-| 4 Capability Layer | mechanism ready | the scoped service view is the mechanism it needs; `PluginAssets` is its first user |
-| 5 Execution Plugins | not started | Workflow / Ralph / Orchestration / Scheduler |
+| 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
+| 5 Execution Plugins | **1 of 4, and 2 of the 4 have no separable boundary** | Ralph ✅ mounted as a plugin; Scheduler / Orchestration / Workflow measured, see below |
 | 6 Channel Plugins | not started | CLI / Web / Feishu |
 | 7 Profile / Bundle / patch | partial | profiles and bundles exist from earlier work; patch semantics not unified |
 
@@ -157,11 +157,38 @@ owner of the model adapter, which would have made the ledger lie about the code,
 and a ledger that lies is worse than one that omits: it tells the next reader that
 the domain table owns provider dispatch.
 
+## Phase 5, measured: two of the four are not separable
+
+The plan lists Workflow / Ralph / Orchestration / Scheduler as execution plugins.  Measured
+one at a time, they are four different things:
+
+| Piece | What it is now | Verdict |
+|---|---|---|
+| **Ralph** | a service `commands/builtin.py` already resolved, built **inline and unconditionally** by `bootstrap` | **was a plugin waiting to happen** -- now `agent/ralph/plugin.py`, `inject` names all seven dependencies, a composition without it has no `ralph_service` |
+| **Scheduler** | a service built by `_build_scheduler_service` in `cli.py`, parameters from `cfg["scheduler"]` **and CLI flags** (`poll_seconds or sched_cfg.get(...)`) | separable, but its parameters have two sources -- config and argv -- so a plugin needs the *effective* values at setup, not the ones on disk |
+| **Orchestration** | a **function library plus a planner**: `run_parallel_subtasks`, `run_pipeline_subtasks`, `run_rendezvous_round`, `validate_subtask_specs`, `OrchestrationPlanner`, and a `contracts` type module, all imported at module scope by `agent/core/agent.py` | **not a component**: it is the loop's own implementation. A plugin boundary here means the loop resolving its planner and runners through the container -- ~30 call sites in `agent.py` alone |
+| **Workflow** | a data model (`Workflow`, `WorkflowStep`, `validate_workflow_graph`) plus persistence **on the scheduler store** (`store.list_workflows()`), read by a tool and by the web channel | **not a component**: splitting it out means splitting the scheduler store, which invents a boundary where none exists |
+
+Two consequences worth stating plainly.
+
+**Ralph was the only one where being a plugin changes what a composition can be.** It was
+unconditional, so making it a plugin removed something that was always there. The Scheduler
+is already conditional -- the interactive path starts it only if configured -- so the same
+move there is an identity change rather than a capability change.
+
+**Orchestration and Workflow are part of the agent loop and the scheduler respectively, not
+peers of them.** Forcing the plugin shape would produce a plugin whose only member is the
+thing it was carved out of, and the carvature would be visible in every caller. That is the
+plan's table reading as a taxonomy where the code has a composition; the taxonomy should
+give way.
+
 ## Next step, in order
 
-1. **Phase 4, the capability layer**, on the scoped service view that already exists
-   (`PluginAssets` is its first user). Tools, commands and skills become capabilities
-   a service exposes rather than a universal abstraction.
-2. **`BaseAgent` is still 2,530 lines** and still holds the sub-agent machinery, the
+1. **The Scheduler as a plugin**, once the effective parameters have one source.  The
+   CLI currently merges argv over config at two call sites; the plugin needs that
+   resolution to happen once, before setup, and reach it as data.
+2. **Phase 6, the channel plugins** (CLI / Web / Feishu) -- measured next, and for the
+   same reason Phase 5 was: to find out which of the three is genuinely a component.
+3. **`BaseAgent` is still 2,530 lines** and still holds the sub-agent machinery, the
    tool-execution entry points and the streaming entry point. Those are the next
    things to leave it -- each is a plugin by the plan's table, and none is blocked.
