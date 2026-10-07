@@ -835,7 +835,14 @@ _LOOP_OWNED = (
 #: loop reads *now*: dropping them would silently change which members count as
 #: shared, and the struct assertion would then pass on a wrong struct.
 _ALREADY_MOVED = (
+    "_build_continuation_context",
     "_build_summarized_tool_results",
+    "_continue_truncated_response",
+    "_handle_end_turn",
+    "_merge_continuation_text",
+    "_parse_response",
+    "_response_completion_error",
+    "_synthesize_tool_only_response",
     "_build_user_message_content",
     "_next_structured_output_budget",
     "_recover_incomplete_tool_response",

@@ -220,7 +220,11 @@ def test_the_agent_methods_agree_with_the_functions() -> None:
     assert agent._is_account_exhausted(throttled) is is_account_exhausted(throttled)
     assert agent._is_content_filter_block(throttled) is is_content_filter_block(throttled)
     assert agent._retryable_llm_classes() is retryable_llm_classes()
-    assert agent._merge_continuation_text("a", "ab") == merge_continuation_text("a", "ab")
+    # ``_merge_continuation_text`` used to be checked here too.  It is gone rather
+    # than kept in agreement: it only delegated, and its caller now calls the module
+    # function directly.  One fewer delegation is the direction this refactor moves,
+    # so the assertion goes with it instead of being pointed at a method that should
+    # not come back.
 
 
 def _fake_response(status_code: int):

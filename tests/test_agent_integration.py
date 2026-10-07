@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 from agent.core.turn_loop import (
+    CONTINUE_PROMPT,
     build_user_message_content,
+    continue_truncated_response,
     plan_orchestration,
     prepare_turn,
     recover_incomplete_tool_response,
@@ -7214,7 +7216,7 @@ def test_auto_continue_carries_tools_and_runs_continuation_tool_calls(monkeypatc
     continue_index = next(
         index
         for index, message in enumerate(final_messages)
-        if message.get("content") == agent_module.BaseAgent._CONTINUE_PROMPT
+        if message.get("content") == CONTINUE_PROMPT
     )
     assert final_messages[continue_index + 1]["role"] == "assistant"
     assert final_messages[continue_index + 1]["tool_calls"][0]["id"] == "call-1"
@@ -7264,7 +7266,7 @@ def test_truncation_continuation_hands_tool_calls_back_with_its_conversation(
     )
 
     merged, error, tool_response = asyncio.run(
-        agent._continue_truncated_response(ctx, "partial", [tool_schema])
+        continue_truncated_response(agent._loop_deps(), ctx, "partial", [tool_schema])
     )
 
     assert error is None
@@ -7273,7 +7275,7 @@ def test_truncation_continuation_hands_tool_calls_back_with_its_conversation(
     assert seen_tools == [[tool_schema]]
     assert ctx.messages == [
         {"role": "user", "content": "hello"},
-        {"role": "user", "content": agent_module.BaseAgent._CONTINUE_PROMPT},
+        {"role": "user", "content": CONTINUE_PROMPT},
     ]
 
 
@@ -7882,7 +7884,7 @@ def test_truncation_continuation_preserves_request_model_override():
     )
 
     text, error, tool_response = asyncio.run(
-        agent._continue_truncated_response(ctx, "partial", [])
+        continue_truncated_response(agent._loop_deps(), ctx, "partial", [])
     )
 
     assert error is None

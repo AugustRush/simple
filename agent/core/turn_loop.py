@@ -38,9 +38,15 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from agent.config import _now
+from agent.core.event_domains import LLMResponseParsed
 from agent.core.attachments import MessageAttachment, format_attachment_context
-from agent.core.turn_context import TURN_REQUEST_KEY
+from agent.core.turn_context import (
+    TURN_REQUEST_KEY,
+    active_agent_id,
+    schedule_domain_event,
+)
 from agent.core.retry import with_llm_retry
+from agent.core.llm_errors import merge_continuation_text
 from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlanner
 from agent.security.content_filter import summarize_tool_result
 from agent.skills.catalog import SkillCatalog
@@ -493,3 +499,213 @@ async def recover_incomplete_tool_response(
             f"committed after retrying with max_tokens={current_budget}. Reduce the "
             "single tool payload or increase the provider context/output budget.",
         )
+async def handle_end_turn(
+        deps: "LoopDeps",
+        ctx: "AgentContext",
+        response: Any,
+        text: str,
+        streamed_text: str,
+        prior_text: str,
+        tool_result_history: list[tuple[str, str]],
+        tools: list[dict],
+    ) -> tuple[str, Optional[str], Optional[Any]]:
+        """Finalize a non-tool-use response.
+
+        Returns ``(result_text, continuation_error, tool_response)``.  Picks
+        the best text (parsed > streamed > prior), promotes a tool's
+        ``summary_text`` if the model returned nothing, appends the assistant
+        entry, attempts truncation continuation when the transport reports
+        one, and falls back to an apology when the response is entirely
+        empty.  ``continuation_error`` is non-None only when continuation
+        still failed; ``tool_response`` is non-None only when the continuation
+        came back asking for tools, in which case the caller must run that
+        response through its step loop instead of ending the turn.
+        """
+        result_text = text or streamed_text or prior_text
+        if not result_text and tool_result_history:
+            result_text = synthesize_tool_only_response(tool_result_history)
+        ctx.messages.append(
+            deps.transport.build_final_message(
+                response, result_text, model=deps.effective_model(ctx)
+            )
+        )
+
+        completion_error = response_completion_error(deps, response, ctx)
+        if completion_error:
+            result_text, continuation_error, tool_response = (
+                await continue_truncated_response(deps, 
+                    ctx, result_text, tools
+                )
+            )
+            if tool_response is None:
+                # Only a continuation that ended in text finalises the
+                # truncated message.  One that came back with tool calls has
+                # already replaced the history with its own conversation,
+                # whose last message is the continue prompt, not this
+                # response's entry.
+                ctx.messages[-1] = deps.transport.build_final_message(
+                    response, result_text, model=deps.effective_model(ctx)
+                )
+            return result_text, continuation_error, tool_response
+
+        # Silent stop with no text and no tool history is almost always a
+        # safety-filtered or malformed response; speak up so the user isn't
+        # left wondering whether anything happened.
+        if not result_text and not tool_result_history:
+            result_text = (
+                "I received your message but was unable to "
+                "generate a response. Please try rephrasing "
+                "your request or checking if it triggered a "
+                "content policy filter."
+            )
+        return result_text, None, None
+
+
+async def continue_truncated_response(
+        deps: "LoopDeps",
+        ctx: "AgentContext",
+        partial_text: str,
+        tools: list[dict],
+    ) -> tuple[str, Optional[str], Optional[Any]]:
+        """Try to complete a truncated final response with bounded follow-up calls.
+
+        The continuation carries the turn's own tools.  A continuation sent
+        without them cannot produce a native tool call, and a model that wants
+        one anyway writes it as text in its own markup -- which is how a garbled
+        token-delimiter dump once became a turn's final answer.  A continuation
+        that comes back asking for tools is not an answer at all: it is the
+        step the truncated response was cut out of, so its conversation is
+        adopted into ``ctx`` and its response is returned as the third element
+        for the caller's step loop to execute through the normal tool path.
+        """
+        merged = partial_text
+        continuation_ctx = build_continuation_context(ctx)
+        attempts = 0
+        for _ in range(max(0, int(deps.max_truncation_continuations))):
+            attempts += 1
+            continuation_ctx.messages.append(
+                {"role": "user", "content": CONTINUE_PROMPT}
+            )
+            response = await deps.create(continuation_ctx, tools)
+            stop_reason, text, tool_uses = parse_response(deps, 
+                response, continuation_ctx
+            )
+            if stop_reason == "tool_use" and tool_uses:
+                # The calls were issued against the continuation's message
+                # list -- the continue prompt, and whatever compaction the
+                # continuation's own call had to do -- so that list, not the
+                # pre-continuation one, is the history the tool results must
+                # attach to for the next request to read coherently.
+                ctx.messages[:] = continuation_ctx.messages
+                return merged, None, response
+            merged = merge_continuation_text(merged, text)
+            continuation_error = response_completion_error(deps, 
+                response, continuation_ctx
+            )
+            if continuation_error is None:
+                return merged, None, None
+            continuation_ctx.messages.append(
+                deps.transport.build_final_message(
+                    response, text, model=deps.effective_model(continuation_ctx)
+                )
+            )
+        return (
+            merged,
+            f"Model response remained truncated after "
+            f"{attempts} auto-continue attempts",
+            None,
+        )
+
+
+def synthesize_tool_only_response(
+        tool_history: list[tuple[str, str]]
+    ) -> str:
+        """Promote a successful tool's own ``summary_text`` to the turn reply.
+
+        ``tool_history`` stores ``(tool_name, summary_text_or_empty)`` per
+        call (the parsing happens at append time so this list stays small).
+        The most recent non-empty summary wins.  Used when the model
+        produced only tool calls and no closing text — without this, the
+        user would see silence.
+        """
+        for _tool_name, summary in reversed(tool_history):
+            if summary:
+                return summary
+        return ""
+
+
+def build_continuation_context(ctx: "AgentContext") -> "AgentContext":
+        """Create the minimal context needed for bounded auto-continue requests.
+
+        ``_provider_step``, ``turn_id`` and ``_orchestration_child`` ride along
+        so the continuation's provider call is attributed to the step and turn
+        it belongs to rather than being logged as a fresh foreground step one;
+        the turn-request reference rides along so an emergency compaction
+        inside the continuation cannot evict the request the turn exists to
+        answer.
+        """
+        # Imported here rather than at module scope: ``AgentContext`` lives in
+        # ``agent/core/agent.py``, which imports this module, so a module-level
+        # import would be a cycle.  The class is nine fields and its only runtime
+        # use in this file is this constructor.  Moving it down instead would mean
+        # moving ``DEFAULT_SYSTEM_PROMPT`` out of ``agent/__init__.py`` as well,
+        # because the field default reads it -- a larger change than the cycle it
+        # would remove.
+        from agent.core.agent import AgentContext
+
+        return AgentContext(
+            agent_id=ctx.agent_id,
+            role=ctx.role,
+            messages=list(ctx.messages),
+            system_prompt=ctx.system_prompt,
+            tools_enabled=ctx.tools_enabled,
+            metadata={
+                key: ctx.metadata[key]
+                for key in (
+                    "model_override",
+                    "context_manager",
+                    "session_id",
+                    "turn_id",
+                    "_provider_step",
+                    "_orchestration_child",
+                    TURN_REQUEST_KEY,
+                )
+                if key in ctx.metadata
+            },
+        )
+
+
+def parse_response(
+        deps: "LoopDeps", response: Any, ctx: Optional["AgentContext"] = None
+    ) -> tuple[str, str, list[dict]]:
+        stop_reason, text, tool_uses = deps.transport.parse_response(
+            response, model=deps.effective_model(ctx) if ctx else None
+        )
+        # Announced from the parser because this is where the normalised vocabulary
+        # exists; see ``LLMResponseParsed``.  Fire-and-forget: this is a sync method
+        # on the hot path, and the bus delivers to listeners that must not be able
+        # to change the turn.
+        if deps.llm_event_bus.has_listeners(LLMResponseParsed):
+            schedule_domain_event(
+                deps.llm_event_bus,
+                LLMResponseParsed,
+                agent_id=active_agent_id(),
+                stop_reason=stop_reason,
+                tool_uses=len(tool_uses or ()),
+            )
+        return stop_reason, text, tool_uses
+
+
+def response_completion_error(
+        deps: "LoopDeps", response: Any, ctx: Optional["AgentContext"] = None
+    ) -> Optional[str]:
+        return deps.transport.completion_error(
+            response, model=deps.effective_model(ctx) if ctx else None
+        )
+
+
+CONTINUE_PROMPT = (
+        "Continue exactly from where you left off. "
+        "Do not repeat previous text. "
+        "Do not restart the answer."
+    )
