@@ -8859,6 +8859,27 @@ def test_chat_command_delegates_turn_to_agent_core(monkeypatch):
     assert kwargs == {}
 
 
+class _StubRuntimeFactory:
+    """Hands every run the components a test built, and records the cfg it was asked for.
+
+    Stands in for `RuntimeFactory`, which would build a real runtime from the config: the
+    executor's business is what it does with the runtime it is handed, not how one is
+    built, and building a real one here would put the whole composition inside a test
+    about turn routing.
+    """
+
+    def __init__(self, components):
+        self.components = components
+        self.built: list = []
+
+    async def build(self, cfg, *, announce=True, resource_home=None):
+        self.built.append({"cfg": cfg, "announce": announce, "resource_home": resource_home})
+        return self.components
+
+    async def close(self, components):
+        return None
+
+
 def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch, tmp_path):
     import types
 
@@ -8908,11 +8929,16 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
             lease_seconds=30,
             max_concurrent_runs=1,
             components=components,
+            runtime_factory=_StubRuntimeFactory(components),
         )
     )
-    task = types.SimpleNamespace(name="daily", payload={"prompt": "hello"})
+    # A run with durable ids takes the isolated path -- the real one.  These tests used
+    # to pass `object()`, which fell into a branch that reused the service's own
+    # components; the branch existed for lightweight executors and is gone.
+    task = types.SimpleNamespace(id="task-1", name="daily", payload={"prompt": "hello"})
+    run = types.SimpleNamespace(id="run-1", config_snapshot={})
 
-    result = asyncio.run(service.agent_executor(task, object()))
+    result = asyncio.run(service.agent_executor(task, run))
 
     assert result.text_output == "scheduled reply\nsecond line"
     assert result.summary == "scheduled reply"
@@ -8970,14 +8996,17 @@ def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_
             lease_seconds=30,
             max_concurrent_runs=1,
             components=components,
+            runtime_factory=_StubRuntimeFactory(components),
         )
     )
     task = types.SimpleNamespace(
+        id="task-1",
         name="daily",
         payload={"prompt": "scheduled prompt"},
     )
+    run = types.SimpleNamespace(id="run-1", config_snapshot={})
 
-    result = asyncio.run(service.agent_executor(task, object()))
+    result = asyncio.run(service.agent_executor(task, run))
 
     assert result.text_output == "scheduled core reply\nsecond line"
     assert result.summary == "scheduled core reply"

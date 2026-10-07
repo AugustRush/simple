@@ -11,6 +11,14 @@ reachable from ``agent/scheduler``, and a scheduler module importing the CLI wou
 cycle.  Two helpers moved first for the same reason --
 :func:`agent.scheduler.store.scheduler_store` and
 :func:`agent.runtime.contracts.agent_core_for_components`.
+
+Every run now builds its runtime through the injected ``runtime_factory``.  There used to
+be a branch: a run whose task and record both lacked durable ids reused the composition's
+own mapping, "for lightweight third-party/test executors".  Only two tests exercised it
+and both could take the real path, so it is gone -- and with it the last thing that
+required a plugin to be handed a whole component mapping.  What the builder reads from
+one is now four keys: ``output_dir`` at construction, and ``registry``,
+``workspace_root``, ``memory`` while a run executes.  Those are service names.
 """
 
 from __future__ import annotations
@@ -314,45 +322,39 @@ def build_scheduler_service(
         if not workspace.is_dir():
             raise RuntimeError(f"Scheduled task workspace does not exist: {workspace}")
 
-        isolated_runtime = hasattr(task, "id") and hasattr(run, "id")
-        if isolated_runtime:
-            run_output = delivery.output_root / task_id / run_id / "artifacts"
-            run_output.mkdir(parents=True, exist_ok=True)
-            # Read what is configured *now*, not what was configured when this
-            # service started: a scheduled run is a fresh execution, and the
-            # settings that decide where it talks to are the ones on disk.  See
-            # the `config_loader` note in `_build_scheduler_service`.
-            #
-            # `load_config_for_run` rather than `load_config`: the latter
-            # substitutes the built-in defaults for a file it cannot parse,
-            # which for a run would mean providers nobody configured (and no
-            # keys) -- an authentication error naming the wrong problem -- and
-            # it prints the config's warnings, which on this path would repeat
-            # once per run.
-            current_cfg = (
-                config_loader()
-                if config_loader is not None
-                else agent_module.load_config_for_run(cfg)
-            )
-            run_cfg = dict(current_cfg)
-            run_cfg["workspace_root"] = str(workspace)
-            run_cfg["output_dir"] = str(run_output)
-            run_cfg = apply_profile_to_config(run_cfg, profile)
-            resource_home = AGENT_HOME
-            registry = components.get("registry")
-            if registry is not None:
-                configured_resource_home = registry.get_context("resource_home")
-                if configured_resource_home:
-                    resource_home = Path(str(configured_resource_home)).expanduser()
-            run_components = await factory.build(
-                run_cfg,
-                announce=False,
-                resource_home=resource_home,
-            )
-        else:
-            # Lightweight third-party/test executors may not provide durable
-            # ids. Preserve their historical shared-runtime behavior.
-            run_components = components
+        run_output = delivery.output_root / task_id / run_id / "artifacts"
+        run_output.mkdir(parents=True, exist_ok=True)
+        # Read what is configured *now*, not what was configured when this
+        # service started: a scheduled run is a fresh execution, and the
+        # settings that decide where it talks to are the ones on disk.  See
+        # the `config_loader` note in `_build_scheduler_service`.
+        #
+        # `load_config_for_run` rather than `load_config`: the latter
+        # substitutes the built-in defaults for a file it cannot parse,
+        # which for a run would mean providers nobody configured (and no
+        # keys) -- an authentication error naming the wrong problem -- and
+        # it prints the config's warnings, which on this path would repeat
+        # once per run.
+        current_cfg = (
+            config_loader()
+            if config_loader is not None
+            else agent_module.load_config_for_run(cfg)
+        )
+        run_cfg = dict(current_cfg)
+        run_cfg["workspace_root"] = str(workspace)
+        run_cfg["output_dir"] = str(run_output)
+        run_cfg = apply_profile_to_config(run_cfg, profile)
+        resource_home = AGENT_HOME
+        registry = components.get("registry")
+        if registry is not None:
+            configured_resource_home = registry.get_context("resource_home")
+            if configured_resource_home:
+                resource_home = Path(str(configured_resource_home)).expanduser()
+        run_components = await factory.build(
+            run_cfg,
+            announce=False,
+            resource_home=resource_home,
+        )
         session_id = f"scheduler:{task_id}:{run_id}"
         context_policy = str(
             snapshot.get("context_policy")
@@ -479,11 +481,9 @@ def build_scheduler_service(
             content = result.text or ""
             report = audit.report()
             if report:
-                audit_path = (
-                    audit.write_report(run_output / "unattended-audit.md")
-                    if isolated_runtime
-                    else None
-                )
+                # Always written: every run has an artifacts directory now, where it
+                # used to depend on whether the executor had durable ids.
+                audit_path = audit.write_report(run_output / "unattended-audit.md")
                 if audit_path is not None:
                     report += f"审计明细：{audit_path}\n"
                 content = f"{content}\n\n{report}" if content.strip() else report
@@ -502,8 +502,7 @@ def build_scheduler_service(
         finally:
             if self_report_token is not None:
                 _active_run_self_report.reset(self_report_token)
-            if isolated_runtime:
-                await factory.close(run_components)
+            await factory.close(run_components)
 
     async def _system_executor(task, run):
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})
