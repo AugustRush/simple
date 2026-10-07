@@ -32,6 +32,25 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_ROOT = REPO_ROOT / "agent"
 
 
+def _is_metadata_receiver(node: ast.AST) -> bool:
+    """Whether *node* is a per-turn metadata mapping rather than a component one.
+
+    The runtime keeps ``ctx.metadata`` / ``ctx_metadata`` carrying some of the same
+    names as the services -- ``skill_catalog``, ``context_manager`` -- so a scan
+    that treats any matching key as a service read reports files that never resolve
+    a service at all.  Written once and used by both access shapes (subscript and
+    ``.get``) because the first version of this exclusion covered only subscripts
+    and left seven false positives behind.
+    """
+    if isinstance(node, ast.Call):
+        # ``ctx.metadata.get`` -> look at ``ctx.metadata``.
+        node = node.func.value if isinstance(node.func, ast.Attribute) else node.func
+    # Unparse the node *itself*: for an attribute that yields the full dotted name
+    # (``ctx.metadata``), where unparsing ``.value`` would yield only the root
+    # (``ctx``) and silently miss the name being looked for.
+    return "metadata" in ast.unparse(node)
+
+
 def _string_key(node: ast.Call | ast.Subscript) -> str | None:
     """The literal string key of a ``.get("k")`` / ``["k"]`` expression."""
     if isinstance(node, ast.Call):
@@ -109,11 +128,13 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                 if attr == "set_context":
                     note(writers, _string_key(node), rel)
                 elif attr in ("get", "pop", "require", "lookup", "resolve"):
-                    # ``lookup``/``resolve`` are the container accessors that
-                    # tolerate absence; ``require`` is the one that does not.  All
-                    # of them are container-mediated reads, which is the property
-                    # this scanner is checking for.
-                    note(readers, _string_key(node), rel)
+                    # ``lookup``/``resolve`` tolerate absence, ``require`` does
+                    # not; all are container-mediated reads, which is the property
+                    # being checked.  A metadata mapping is excluded because it
+                    # carries some of the same names without being a component
+                    # mapping -- see :func:`_is_metadata_receiver`.
+                    if not _is_metadata_receiver(func.value):
+                        note(readers, _string_key(node), rel)
                 elif attr == "_core":
                     # ``self._core("x")`` on the plugin catalog: an attribute
                     # call, so it never reaches the bare-name branch below.
@@ -145,8 +166,7 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                     continue
                 if _string_key(node) is None:
                     continue
-                receiver = ast.unparse(node.value)
-                if "metadata" in receiver:
+                if _is_metadata_receiver(node.value):
                     continue
                 note(readers, _string_key(node), rel)
     return writers, readers
@@ -331,6 +351,53 @@ def test_the_scan_detects_a_runtime_components_lookup() -> None:
         f"{runtime} resolves turn_runner through the container; scan found "
         f"{sorted(found)}"
     )
+
+
+def test_a_metadata_read_is_not_counted_as_a_service_read() -> None:
+    """Control for the exclusion that removed seven false positives.
+
+    ``core/subagent_context.py`` reads ``active_context.metadata.get(
+    "skill_catalog")`` -- a per-turn copy, not the service -- and nothing else for
+    that name.  Counting it put the file in the ledger as a consumer of a service
+    it never resolves, and because the ledger is generated from this scan the error
+    was invisible: an inflated consumer list fails no functional test.
+
+    A real file is used rather than a synthetic one so the control cannot pass
+    while the rule fails on the code that motivated it.
+    """
+    _writers, readers = _scan()
+    metadata_only = "agent/core/subagent_context.py"
+    assert metadata_only not in readers.get("skill_catalog", set()), (
+        f"{metadata_only} reads skill_catalog only from per-turn metadata, so it "
+        f"is not a consumer of the service"
+    )
+
+
+def test_the_metadata_rule_accepts_both_access_shapes() -> None:
+    """The rule itself, for both shapes -- the first version covered only one.
+
+    Subscripts were excluded first and seven ``.get`` calls were left behind, so
+    the two are asserted together: a rule that handles one shape is how that
+    happened.
+    """
+    import ast
+
+    from tests.test_core_services import _is_metadata_receiver
+
+    def receivers(source: str) -> list[bool]:
+        tree = ast.parse(source)
+        out = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+                out.append(_is_metadata_receiver(node.value))
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                out.append(_is_metadata_receiver(node.func.value))
+        return out
+
+    assert receivers("ctx.metadata['skill_catalog']") == [True]
+    assert receivers("ctx.metadata.get('skill_catalog')") == [True]
+    assert receivers("components['skill_catalog']") == [False]
+    assert receivers("components.get('skill_catalog')") == [False]
 
 
 def test_the_scan_detects_the_shared_resolve_helper() -> None:

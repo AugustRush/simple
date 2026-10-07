@@ -28,6 +28,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping, MutableMapping
 
+from agent.runtime.services import resolve
+
 __all__ = ["publish_system_prompt", "refresh_system_prompt"]
 
 #: The component key readers agree on.
@@ -81,12 +83,16 @@ def refresh_system_prompt(
         if base_prompt is not None
         else components.get(BASE_PROMPT_KEY, "")
     )
+    # The three services resolve through the container; ``workspace_root`` and
+    # ``output_dir`` are paths the runtime looks up by name, not services, so they
+    # keep the plain mapping read.  The vocabulary is in
+    # ``agent/runtime/core_services.py``.
     composed = _compose_system_prompt(
         base,
-        components.get("registry"),
+        resolve(components, "registry"),
         components.get("workspace_root"),
         components.get("output_dir"),
-        skill_catalog=components.get("skill_catalog"),
-        plugin_catalog=components.get("plugin_catalog"),
+        skill_catalog=resolve(components, "skill_catalog"),
+        plugin_catalog=resolve(components, "plugin_catalog"),
     )
     return publish_system_prompt(components, composed)
