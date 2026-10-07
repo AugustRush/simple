@@ -22,7 +22,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
 | 5 Execution Plugins | **2 of 4 done, 2 have no separable boundary** | Ralph ✅ and Scheduler ✅ mounted as plugins; Orchestration / Workflow measured, see below |
 | 6 Channel Plugins | **web + feishu done; CLI is not a channel** | `channels` is a capability service any plugin can contribute to; `CliChannel` is a stub that raises |
-| 7 Profile / Bundle / patch | partial | profiles and bundles exist from earlier work; patch semantics not unified |
+| 7 Profile / Bundle / patch | **done** | bundles were already patches; a profile's effect is now `config_patches`, applied by the same `apply_patch`, and validated against `DEFAULT_CONFIG` like a bundle's |
 
 Commits, oldest first:
 
@@ -315,6 +315,31 @@ asserted that only `agent/bootstrap.py` calls `WebChannel(...)`.  The compositio
 longer constructs a channel at all, so the single module is now
 `agent/channels/plugin.py` -- still one module, still asserted, plus a second assertion
 that the composition actually mounts the plugins it reads.
+
+## Phase 7: patch semantics were two mechanisms, and now they are one
+
+`agent/config_patch.py` holds `PatchEntry` and `apply_patch` -- a dotted path, a value,
+and a deep copy so the input is untouched.  Measured against it:
+
+| Piece | Was | Now |
+|---|---|---|
+| **Bundle** | already patches (`Bundle.patches`, `apply_bundle`) | unchanged |
+| **Profile** | four hand-written assignments in `apply_profile_to_config`: copy a section, copy a sub-section, assign two keys, copy another section, assign two more | `PermissionProfile.config_patches` -- the same four as data, applied by `apply_patch` |
+
+They were the same concept in two forms, and that had a cost beyond taste: bundles have
+`test_every_patch_names_a_declared_path`, which exists because **two invented paths
+slipped through a first draft** -- `channels.web.enabled` and
+`orchestration.sub_agent_retries`, neither of which exists, and a guessed path is
+invisible because assigning to a key that was never there succeeds.  Profiles had no such
+check, because a hand-written assignment is not a path to check.
+
+Now they do, and it is the same check.  `apply_patch`'s deep copy is also strictly
+stronger than what the profile path promised: it copies sections the profile does not
+touch, where the hand-written version copied only the two it did.
+
+`allow_new=True`, for the reason bundles use it: the scheduler's run path can be handed a
+last-known-good config from anywhere, and refusing an absent section there would drop the
+posture exactly when the config was unreadable.
 
 ## Next step, in order
 

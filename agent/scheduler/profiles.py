@@ -41,6 +41,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from agent.config_patch import PatchEntry, apply_patch
+
 
 @dataclass(frozen=True)
 class PermissionProfile:
@@ -62,6 +64,34 @@ class PermissionProfile:
     shell_level: str
     shell_sandbox: str
     requires_workspace_root: bool
+
+    @property
+    def config_patches(self) -> tuple[PatchEntry, ...]:
+        """This profile's effect on a config, as patches.
+
+        It used to be imperative: four statements in
+        :func:`apply_profile_to_config` doing dict surgery by hand -- copy the section,
+        copy the sub-section, assign two keys, copy another section, assign two more.
+        That is the *same concept* as a bundle's patch list, expressed in a second way,
+        and the two could not be checked together: a bundle's paths are validated against
+        the declared config by a test, and these were validated by nothing but the four
+        assignments happening to agree with the file.
+
+        ``allow_new`` for the reason bundles use it (see :func:`agent.bundles.apply_bundle`):
+        a caller's fallback config need not contain every section a profile touches, and
+        the strict check that matters is the one against ``DEFAULT_CONFIG`` --
+        ``tests/test_scheduler_profiles.py`` asserts every path here against it.
+        """
+        if not self.overrides_config:
+            return ()
+        return (
+            PatchEntry("file_access.workspace.read", True, allow_new=True),
+            PatchEntry(
+                "file_access.workspace.write", self.workspace_write, allow_new=True
+            ),
+            PatchEntry("permissions.shell_level", self.shell_level, allow_new=True),
+            PatchEntry("permissions.shell_sandbox", self.shell_sandbox, allow_new=True),
+        )
 
     def to_payload(self) -> dict[str, Any]:
         """Public shape for the API, so the UI never hardcodes the list."""
@@ -161,20 +191,12 @@ def apply_profile_to_config(cfg: dict, profile: PermissionProfile) -> dict:
     rather than replaced so a run-level override cannot leak back into the
     process-wide configuration the other channels are using.
     """
-    resolved = dict(cfg)
-    if not profile.overrides_config:
-        return resolved
-    file_access = dict(resolved.get("file_access") or {})
-    workspace_access = dict(file_access.get("workspace") or {})
-    workspace_access["read"] = True
-    workspace_access["write"] = profile.workspace_write
-    file_access["workspace"] = workspace_access
-    resolved["file_access"] = file_access
-    permissions = dict(resolved.get("permissions") or {})
-    permissions["shell_level"] = profile.shell_level
-    permissions["shell_sandbox"] = profile.shell_sandbox
-    resolved["permissions"] = permissions
-    return resolved
+    # One implementation, shared with bundles: the profile's effect is data
+    # (`config_patches`), and the same applier that handles a bundle handles it.  The
+    # copy is deep, which is what the docstring above promises -- a shallow one would
+    # share the nested sections and let a run's override leak into the process-wide
+    # configuration.
+    return apply_patch(cfg, profile.config_patches)
 
 
 def describe_profile_for_prompt(profile: PermissionProfile) -> str:

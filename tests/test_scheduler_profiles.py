@@ -16,6 +16,7 @@ expensive to lose in production:
 from __future__ import annotations
 
 import asyncio
+import copy
 from pathlib import Path
 from uuid import uuid4
 
@@ -27,6 +28,7 @@ from agent.scheduler import (
     UnattendedOutputSink,
 )
 from agent.scheduler.profiles import (
+    PERMISSION_PROFILES,
     FALLBACK_PROFILE_KEY,
     apply_profile_to_config,
     describe_profile_for_prompt,
@@ -308,3 +310,95 @@ def test_api_rejects_a_profile_it_does_not_know():
 
     with pytest.raises(ValueError, match="不支持的权限策略"):
         channel._schedule_from_body(_schedule_body(permission_profile="root"))
+
+
+# ── A profile's effect on config is patches, and the paths are declared ──────
+
+
+def test_every_profile_patch_names_a_declared_path() -> None:
+    """The check bundles have had, and profiles did not.
+
+    A profile's config effect used to be four hand-written assignments.  A guessed key
+    was invisible for the same reason a guessed bundle path was: assigning to a mapping
+    that never had the key succeeds, and the setting silently does nothing.  Bundles got
+    ``test_every_patch_names_a_declared_path`` after two invented paths slipped through;
+    this is that check, and it is only *possible* now that a profile's effect is data.
+    """
+    from agent.config import DEFAULT_CONFIG
+    from agent.config_patch import UnknownConfigPath
+
+    for key, profile in PERMISSION_PROFILES.items():
+        for patch in profile.config_patches:
+            node: Any = DEFAULT_CONFIG
+            try:
+                for part in patch.path.split("."):
+                    node = node[part]
+            except (KeyError, TypeError) as exc:
+                pytest.fail(f"profile {key!r} patches {patch.path!r}: {exc}")
+
+
+def test_a_profile_that_overrides_nothing_has_no_patches() -> None:
+    """``inherit`` applies nothing, and says so as an empty tuple rather than a flag.
+
+    The old form returned early on ``overrides_config``; the patches form makes the same
+    statement as data, so a caller cannot apply the fields while forgetting the flag.
+    """
+    inherit = PERMISSION_PROFILES["inherit"]
+    assert inherit.overrides_config is False
+    assert inherit.config_patches == ()
+
+
+def test_applying_a_profile_is_pure() -> None:
+    """Nested sections are copied, so a run's override cannot leak into the process.
+
+    The property the hand-written version promised in its docstring and got by copying
+    each section it touched.  ``apply_patch`` copies deeply, which is strictly stronger:
+    a section the profile does not touch is also not shared.
+    """
+    from agent.config import DEFAULT_CONFIG
+    from agent.scheduler.profiles import apply_profile_to_config
+
+    before = copy.deepcopy(DEFAULT_CONFIG)
+    result = apply_profile_to_config(DEFAULT_CONFIG, PERMISSION_PROFILES["workspace_write"])
+
+    assert DEFAULT_CONFIG == before, "the input must not be mutated"
+    assert result is not DEFAULT_CONFIG
+    assert result["file_access"] is not DEFAULT_CONFIG["file_access"], (
+        "a shared section is how a run-level override leaks back"
+    )
+
+
+def test_the_patches_say_what_the_hand_written_version_did() -> None:
+    """The four effects, asserted individually rather than as a config equality.
+
+    A config equality would pass while the mechanism was the hand-written one, which is
+    exactly the state this replaced.  Naming the four makes the statement about the
+    profile's *posture*, which is what a reader is checking.
+    """
+    from agent.config import DEFAULT_CONFIG
+    from agent.scheduler.profiles import apply_profile_to_config
+
+    result = apply_profile_to_config(DEFAULT_CONFIG, PERMISSION_PROFILES["workspace_write"])
+    assert result["file_access"]["workspace"]["read"] is True
+    assert result["file_access"]["workspace"]["write"] is True
+    assert result["permissions"]["shell_level"] == "high"
+    assert result["permissions"]["shell_sandbox"] == "read_all"
+
+    read_only = apply_profile_to_config(DEFAULT_CONFIG, PERMISSION_PROFILES["read_only"])
+    assert read_only["file_access"]["workspace"]["read"] is True
+    assert read_only["file_access"]["workspace"]["write"] is False
+    assert read_only["permissions"]["shell_level"] == "ask"
+
+
+def test_a_profile_applies_to_a_config_that_lacks_the_sections() -> None:
+    """``allow_new``, for the reason bundles need it.
+
+    A caller's fallback config need not contain every section a profile touches -- the
+    scheduler's run path can be handed a last-known-good config from anywhere -- and
+    refusing there would drop the posture exactly when the config was unreadable.
+    """
+    from agent.scheduler.profiles import apply_profile_to_config
+
+    result = apply_profile_to_config({}, PERMISSION_PROFILES["read_only"])
+    assert result["file_access"]["workspace"]["write"] is False
+    assert result["permissions"]["shell_level"] == "ask"
