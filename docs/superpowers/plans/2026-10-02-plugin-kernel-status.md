@@ -570,6 +570,49 @@ provides one, so the process-wide one is what `AgentPlugin` would own, and the s
 keeps building its own -- which is right, because a session's agent is not a
 composition-time thing.
 
+## Open: `AgentPlugin` -- attempted, reverted, and what it hit
+
+The move was written and **reverted**, not because the design is wrong but because the
+last three failures were not diagnosed within the round.  What it established is worth
+keeping, because the next attempt starts here.
+
+**What works.**  The plugin builds the agent and wires it:
+
+    inject = ("cfg", "client", "registry", "model", "max_tokens", "api_format",
+              "llm", "context_manager", "plugin_catalog")
+
+Every tuning value is `cfg` with a `shared.*` default, and the three derived constructor
+arguments are pure functions of `cfg`.  The plugin was verified in isolation: it activates,
+provides a `BaseAgent`, and reports no error.
+
+**Four things had to move with it, and each was a real blocker:**
+
+1. `project_memory_scope` -- `bootstrap` local, needed by `SessionPlugin` (done).
+2. `active_context_window`, `active_output_reserve`, `bounded_int` -- `bootstrap` locals,
+   needed by the agent's construction.  Pure functions of one config; they belong in
+   `agent/config.py` beside `provider_supports_vision`.
+3. `max_tokens` -- the composition computes it before the mount but **added it to the
+   mapping after**.  The plugin waited on it and stayed pending.  It belongs in the literal.
+4. `register_spawn_capability` -- called **above** the mount, so it resolved `agent` before
+   anything provided it.  It has to be called on the resolved agent, below.
+
+**The finding worth the round on its own**: `ctx.get("registry")` returns a
+**`ScopedTools` view**, not the registry -- correct per Phase 4, and it broke the agent,
+which registers with `register(name, description, parameters, fn, source=...)`.  The view
+accepted only a tool object.  It now accepts **both conventions** and honours an explicit
+`source`, because a caller that already has one is registering at run time rather than
+contributing -- `spawn_agent` carries `runtime:spawn` so the runtime's tools can be removed
+by prefix, and overwriting that with the plugin's name would silently re-tag it.
+
+**What was left**, with the failures measured:
+
+- `KeyError: 'supports_vision'` -- the closed-set scan expects that key in the mapping and
+  the scan's anchors also broke (`test_the_component_scan_finds_the_mappings`).
+- `assert None == 'glm-5.3-flash'` -- the session rebuild test: a session agent's model
+  came back `None`.  Not diagnosed.
+
+Neither is understood, and a regression whose cause is not understood is not committed.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

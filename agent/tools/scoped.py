@@ -59,32 +59,41 @@ class ScopedTools:
 
     def register(
         self,
-        tool: Any = None,
-        *,
-        name: str | None = None,
+        tool_or_name: Any = None,
         description: str | None = None,
         parameters: dict | None = None,
         fn: Callable[..., Any] | None = None,
+        *,
+        name: str | None = None,
         capabilities: Any = None,
         replace: bool = True,
+        source: str | None = None,
     ) -> str:
         """Contribute a tool, removed when this plugin unloads.
 
-        Two shapes, because both are in use: pass a **tool object** (anything with
-        ``name``/``fn``) as the plan's example does, or pass the registry's own
-        keyword arguments.  The object form reads
-        ``ctx.tools.register(CreateIssue(github))``.
+        Two calling conventions, because this view stands where the registry stands.  A
+        **tool object** as the first argument is the plan's form --
+        ``ctx.tools.register(CreateIssue(github))`` -- and the registry's own positional
+        form (``name, description, parameters, fn``) is what code written against
+        ``ToolRegistry`` uses.  Refusing the second would make this view *almost* a
+        registry, which is the kind of near-miss that only shows up when somebody swaps
+        one for the other.
 
-        ``replace`` defaults to *True* here, unlike the registry's own default.  A
-        plugin re-registering on reload is the ordinary case -- the catalog reloads,
-        the plugin registers the same tool again -- and the registry's refusal to
-        replace exists to catch two *different* sources claiming a name.  A plugin
-        claiming its own name again is not that, and the alternative is every plugin
-        author writing ``replace=True`` to say so.
+        ``replace`` defaults to *True*, unlike the registry's own default: a plugin
+        re-registering on reload is ordinary, and the registry's refusal exists to catch
+        two *different* sources claiming a name, which a plugin claiming its own is not.
 
-        Returns the tool's name, so a caller can log or unregister it without
-        repeating the string.
+        ``source`` overrides the derived ``plugin:<name>``.  A caller that already has one
+        is not contributing -- the agent's ``spawn_agent`` carries ``runtime:spawn`` so the
+        runtime's tools can be removed by prefix -- and overwriting it with the plugin's
+        name would silently re-tag it.
         """
+        if isinstance(tool_or_name, str):
+            name = tool_or_name
+            tool = None
+        else:
+            tool = tool_or_name
+
         if tool is not None:
             name = name or getattr(tool, "name", None)
             description = (
@@ -95,7 +104,10 @@ class ScopedTools:
             parameters = (
                 parameters
                 if parameters is not None
-                else (getattr(tool, "parameters", None) or {"type": "object", "properties": {}})
+                else (
+                    getattr(tool, "parameters", None)
+                    or {"type": "object", "properties": {}}
+                )
             )
             fn = fn if fn is not None else getattr(tool, "fn", tool)
             capabilities = (
@@ -114,13 +126,16 @@ class ScopedTools:
             description or "",
             parameters or {"type": "object", "properties": {}},
             fn,
-            source=self.owner,
+            source=source or self.owner,
             capabilities=capabilities,
             replace=replace,
         )
-        # By source prefix rather than by name: one plugin may contribute several
-        # tools, and the prefix is what identifies them as a group.
-        self._ctx.on_unwind(lambda: self._registry.unregister_by_source_prefix(self.owner))
+        # By source prefix rather than by name: one plugin may contribute several tools,
+        # and the prefix is what identifies them as a group.  An explicit `source` is that
+        # prefix too, so a caller that tagged its own tools gets them removed together.
+        self._ctx.on_unwind(
+            lambda: self._registry.unregister_by_source_prefix(source or self.owner)
+        )
         return name
 
     # -- reading -------------------------------------------------------------

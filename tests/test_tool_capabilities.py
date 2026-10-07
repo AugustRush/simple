@@ -543,3 +543,66 @@ def test_ralph_declares_everything_it_reaches_for() -> None:
         "workspace_root", "output_dir", "cfg",
     }
     assert RalphPlugin.name == "ralph"
+
+
+def _scoped_view(registry, name="demo"):
+    """A view built the way the kernel builds one, so `owner` is real."""
+    from agent.kernel.plugin import PluginHost
+    from agent.kernel.service import ServiceRegistry
+
+    class _Plugin:
+        pass
+
+    _Plugin.name = name
+
+    def setup(ctx):
+        ctx.provide("tools_view", ctx.get("registry"))
+
+    _Plugin.setup = staticmethod(setup)
+    _Plugin.inject = ("registry",)
+
+    mapping = {"registry": registry}
+    host = PluginHost(services=ServiceRegistry.adopt(mapping))
+    host.load(_Plugin())
+    return mapping["tools_view"]
+
+
+def test_a_scoped_view_accepts_the_registry_positional_convention() -> None:
+    """A view that stands where the registry stands must be usable as one.
+
+    ``BaseAgent.register_spawn_capability`` registers through the registry's own
+    convention -- ``register(name, description, parameters, fn, source=...)``.  Handed a
+    scoped view, that call raised ``TypeError``: the view accepted only a tool object, so
+    it was *almost* a registry, and the near-miss appeared only where the two were swapped.
+    """
+    registry = ToolRegistry()
+    view = _scoped_view(registry)
+
+    view.register(
+        "spawn_agent",
+        "Spawn a sub-agent.",
+        {"type": "object", "properties": {}},
+        lambda **_: None,
+        source="runtime:spawn",
+    )
+
+    assert "spawn_agent" in registry.list_tools()
+    assert registry._tools["spawn_agent"].source == "runtime:spawn"
+
+
+def test_a_scoped_view_still_takes_a_tool_object() -> None:
+    """Control: the plan's form keeps working, and its source is the plugin's name."""
+    class _Tool:
+        name = "create_issue"
+        description = "Open one."
+        parameters = {"type": "object", "properties": {}}
+
+        def fn(self, **_):
+            return "ok"
+
+    registry = ToolRegistry()
+    view = _scoped_view(registry, name="github")
+    view.register(_Tool())
+
+    assert "create_issue" in registry.list_tools()
+    assert registry._tools["create_issue"].source == "plugin:github"
