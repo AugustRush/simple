@@ -113,14 +113,19 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                     # of them are container-mediated reads, which is the property
                     # this scanner is checking for.
                     note(readers, _string_key(node), rel)
+                elif attr == "_core":
+                    # ``self._core("x")`` on the plugin catalog: an attribute
+                    # call, so it never reaches the bare-name branch below.
+                    note(readers, _string_key(node), rel)
                 elif name_id in ("_component", "_service", "_required"):
-                    # ``_component(context, "x")`` in the commands package, and
+                    # Four accessors, all resolving through a container:
+                    # ``_component(context, "x")`` in the commands package;
                     # ``_service(components, "x")`` / ``_required(components, "x")``
-                    # in the runtime layer.  All three resolve through the
-                    # container -- the helpers exist so a caller states whether
-                    # absence is tolerated rather than implying it through a dict
-                    # accessor -- and all three take the mapping first, so the key
-                    # is the argument after it.
+                    # in the runtime layer; and ``self._core("x")`` on the plugin
+                    # catalog.  They exist so a caller *states* whether absence is
+                    # tolerated rather than implying it through the choice of dict
+                    # accessor.  Each takes the container first, so the key is the
+                    # argument after it.
                     note(readers, _component_key(node), rel)
             elif isinstance(node, ast.Subscript):
                 note(readers, _string_key(node), rel)
@@ -259,6 +264,25 @@ def test_the_scan_detects_a_container_mediated_read() -> None:
         f"reported none of them; the scanner is blind to the indirect read"
     )
     assert "skill_catalog" in found, f"expected skill_catalog among {sorted(found)}"
+
+
+def test_the_scan_detects_a_plugin_catalog_core_read() -> None:
+    """Control for the fourth accessor, added because the guard caught its absence.
+
+    After ``plugins/catalog.py`` was migrated, the consumer check reported it as
+    no longer reading ``registry``/``skill_catalog``/``mcp_client`` -- correctly,
+    because the scan did not know ``self._core(...)``.  That is the failure mode
+    this control exists to make impossible to miss: the guard saying "the ledger is
+    wrong" and reality saying "the scanner is blind" look the same until one of
+    them is tested.
+    """
+    _writers, readers = _scan()
+    catalog = "agent/plugins/catalog.py"
+    found = {name for name, files in readers.items() if catalog in files}
+    assert "skill_catalog" in found, (
+        f"{catalog} reads core services through self._core(...); scan found "
+        f"{sorted(found)}"
+    )
 
 
 def test_the_scan_detects_a_runtime_components_lookup() -> None:

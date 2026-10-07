@@ -1014,6 +1014,11 @@ class PluginCatalog:
         from agent.runtime.services import ServiceRegistry
 
         self._services = ServiceRegistry()
+        #: The *core* services, in a container of their own.  Distinct from
+        #: ``_services`` above, which holds what plugins provide: the two are
+        #: different populations, and conflating them would let a plugin's service
+        #: shadow a core one by name.  Set by ``register_core_services``.
+        self._core_services: Any = None
         # The tool-event subscription.  This is what replaces the executor
         # holding this catalog: the executor publishes ToolPreExecute /
         # ToolPostExecute to a bus, and the plugin hooks run as listeners.
@@ -1066,6 +1071,38 @@ class PluginCatalog:
             return
         future = self._hook_executor.submit(hook, event)
         future.result(timeout=timeout)
+
+    def register_core_services(self, components: Any) -> None:
+        """Point this catalog at the runtime's container for core services.
+
+        Its own :attr:`_services` holds what plugins *provide*; this holds what
+        the runtime *has*.  Called by whoever wires the catalog up, so the four
+        reads in ``_reload_locked`` resolve through the container rather than
+        through a ``components`` mapping -- which is what makes a core service
+        replaceable from a plugin's point of view.
+        """
+        from agent.runtime.contracts import RuntimeComponents
+
+        self._core_services = (
+            components
+            if isinstance(components, RuntimeComponents)
+            else RuntimeComponents(components)
+        )
+
+    def _core(self, name: str, default: Any = None) -> Any:
+        """One core service, absence tolerated.
+
+        Returns *default* rather than raising, matching the ``components.get``
+        it replaces: every call site branches on a missing value, and a
+        composition legitimately has no ``mcp_client``.  The container is what
+        makes the absence *distinguishable* for a caller that wants that.
+        """
+        if self._core_services is None:
+            # Not wired: an unsupported way to run, but a missing call to
+            # ``register_core_services`` must not turn into an AttributeError in
+            # the middle of a reload.
+            return default
+        return self._core_services.lookup(name, default)
 
     def resolve_event_bus(self, domain_name: str) -> Any:
         """The bus a domain publishes to, by name.
@@ -1824,6 +1861,13 @@ class PluginCatalog:
             return await self._reload_locked(components)
 
     async def _reload_locked(self, components: dict) -> dict:
+        # The caller hands over the runtime's components on every reload, so this
+        # is where the container gets bound.  Doing it here rather than asking
+        # every caller to remember a second call keeps the existing API: a reload
+        # with components is a reload that can resolve them.
+        if components is not None:
+            self.register_core_services(components)
+
         """Re-scan plugin directories and apply diffs in place.
 
         Re-imports Python plugins (sys.modules cache cleared), re-registers
@@ -1878,7 +1922,7 @@ class PluginCatalog:
         added = new_plugin_names - old_plugin_names
         removed = old_plugin_names - new_plugin_names
 
-        command_router = components.get("command_router")
+        command_router = self._core("command_router")
         if command_router is not None:
             try:
                 command_router.register_plugin_catalog(self)
@@ -1901,7 +1945,7 @@ class PluginCatalog:
 
         # Reload skill catalog: clear and rewalk both user/builtin trees,
         # then re-attach every plugin's bundled skills root.
-        skill_catalog = components.get("skill_catalog")
+        skill_catalog = self._core("skill_catalog")
         if skill_catalog is not None:
             try:
                 skill_catalog.load_all()
@@ -1924,8 +1968,8 @@ class PluginCatalog:
         # MCP: connect newly-declared servers; unregister tools belonging
         # to plugins that were removed.  We cannot kill the stdio process
         # for the latter — see the docstring limitation.
-        mcp_client = components.get("mcp_client")
-        registry = components.get("registry")
+        mcp_client = self._core("mcp_client")
+        registry = self._core("registry")
         new_mcp_servers: list[dict] = [
             cfg for pname, cfg in self._bundled_mcp
             if (pname, cfg.get("name", "?")) not in old_mcp
