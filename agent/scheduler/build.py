@@ -242,7 +242,13 @@ def build_scheduler_service(
     lease_seconds: int,
     max_concurrent_runs: int,
     signal_max_depth: int = DEFAULT_SIGNAL_MAX_DEPTH,
-    components: dict,
+    # The four services this reads, named.  `memory` has no default because it was a hard
+    # subscript when this took a mapping: a composition that cannot supply it must fail
+    # at construction with the name of what is missing, not inside a run with a KeyError.
+    memory: Any,
+    output_dir: Any = None,
+    workspace_root: Any = None,
+    registry: Any = None,
     config_loader: Optional[Callable[[], dict]] = None,
     runtime_factory: Any = None,
 ):
@@ -264,7 +270,7 @@ def build_scheduler_service(
     store = scheduler_store()
     delivery = SchedulerDelivery(
         cfg=cfg,
-        output_root=(components.get("output_dir") or DEFAULT_OUTPUT_DIR)
+        output_root=(output_dir or DEFAULT_OUTPUT_DIR)
         / "scheduler",
     )
 
@@ -306,7 +312,7 @@ def build_scheduler_service(
             snapshot.get("workspace_root")
             or getattr(task, "workspace_root", "")
             or cfg.get("workspace_root")
-            or components.get("workspace_root")
+            or workspace_root
             or ""
         ).strip()
         if not explicit_workspace:
@@ -345,7 +351,6 @@ def build_scheduler_service(
         run_cfg["output_dir"] = str(run_output)
         run_cfg = apply_profile_to_config(run_cfg, profile)
         resource_home = AGENT_HOME
-        registry = components.get("registry")
         if registry is not None:
             configured_resource_home = registry.get_context("resource_home")
             if configured_resource_home:
@@ -511,9 +516,9 @@ def build_scheduler_service(
             payload = task.payload
         job_name = str(payload.get("job_name", "")).strip()
         if job_name == "memory_tidy":
-            memory: MemoryPalace = components["memory"]
-            memory.force_tidy()
-            await memory.tidy()
+            memory_palace: MemoryPalace = memory
+            memory_palace.force_tidy()
+            await memory_palace.tidy()
             return ExecutionResult(
                 summary="memory tidied",
                 text_output="",

@@ -303,26 +303,36 @@ def test_the_builder_is_synchronous() -> None:
     )
 
 
-def test_the_builder_requires_components_rather_than_building_them() -> None:
-    """``components=None`` used to mean "build me a runtime", and the return value
-    carried a flag saying whether the caller should close it.
+def test_the_builder_takes_the_services_it_reads_rather_than_a_mapping() -> None:
+    """``components`` used to be a parameter, and the builder read four keys from it.
 
-    A flag whose only job is to answer "who tears this down" is the bookkeeping a scope
-    exists to remove.  The gateway always passed its own components; the one caller that
-    did not now builds them itself and closes them itself.
+    The guard here used to be "it must require ``components``", which was about the
+    ownership flag: a builder that could omit them was one that would build them.  That
+    is settled, so the assertion moved to the stronger form -- the mapping is gone
+    entirely and the four names it read are parameters.
+
+    ``memory`` has no default because it was a **hard subscript**.  A composition that
+    cannot supply it must fail at construction naming the missing service, rather than
+    inside a run as a ``KeyError`` -- which is also why it is the one name a
+    ``SchedulerPlugin`` would have to declare in ``inject``.
     """
     fn = _builder_signature()
     args = [a.arg for a in fn.args.args] + [a.arg for a in fn.args.kwonlyargs]
-    assert "components" in args, "the parameter must still exist"
-    components = next(
-        a for a in fn.args.kwonlyargs if a.arg == "components"
+    assert "components" not in args, (
+        "the builder takes the services it reads, not the mapping: a plugin handed a "
+        "mapping is a plugin holding the whole composition"
     )
-    assert components.annotation is not None, (
-        "components is required now; an unannotated or defaulted parameter would let a "
-        "caller omit it and mean 'build me one' again"
+    for name in ("memory", "output_dir", "workspace_root", "registry"):
+        assert name in args, f"{name} is read by the builder and must be a parameter"
+
+    # Keyed by name: `zip` over `ast.arg` objects gives a dict keyed by the nodes,
+    # so every lookup raised KeyError rather than finding the default.
+    defaults = {a.arg: d for a, d in zip(fn.args.kwonlyargs, fn.args.kw_defaults)}
+    assert defaults["memory"] is None, (
+        "memory was a hard subscript; it must stay required so a composition without it "
+        "fails at construction naming the service"
     )
 
-    # It returns the service and the store, and nothing for the caller to close.
     returns = [node for node in ast.walk(fn) if isinstance(node, ast.Return) and node.value]
     for node in returns:
         if isinstance(node.value, ast.Tuple):

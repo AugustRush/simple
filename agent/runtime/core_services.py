@@ -70,7 +70,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         consumers=(
             "agent/_builtin/plugins/evolution/__init__.py",
             "agent/bootstrap.py",
-            "agent/scheduler/build.py",
+            "agent/cli.py",
             "agent/commands/builtin.py",
             "agent/plugins/catalog.py",
             "agent/runtime/contracts.py",

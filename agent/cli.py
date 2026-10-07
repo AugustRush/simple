@@ -1089,7 +1089,7 @@ def gateway(
                 lease_seconds=scheduler_lease,
                 max_concurrent_runs=scheduler_max_concurrent,
                 signal_max_depth=scheduler_signal_depth,
-                components=components,
+                **_scheduler_services(components),
                 # A run is a fresh execution, so a composition belongs here rather
                 # than in the file: the operator's settings stay on disk and only
                 # this process's runs differ.  ``loader_for_name`` resolves the
@@ -1478,6 +1478,26 @@ def schedule_delete(task_id: str = typer.Argument(..., help="Task id")):
     shared.CONSOLE.print(f"[green]Deleted[/green] {task_id}")
 
 
+def _scheduler_services(components: dict) -> dict:
+    """The four services the scheduler's builder reads, pulled out of a mapping.
+
+    The builder used to take the mapping itself, which meant a plugin had to be handed
+    the whole composition.  It reads four names -- see
+    :func:`agent.scheduler.build.build_scheduler_service` -- and this is the one place
+    that knows which, so the two call sites cannot disagree about it.
+
+    ``memory`` is required by the builder and is passed through as ``None`` when absent,
+    so the builder's own error names the missing service instead of this raising a
+    ``KeyError`` at a call site that has nothing to do with memory.
+    """
+    return {
+        "memory": components.get("memory"),
+        "output_dir": components.get("output_dir"),
+        "workspace_root": components.get("workspace_root"),
+        "registry": components.get("registry"),
+    }
+
+
 @app.command()
 def scheduler(
     poll_seconds: Optional[float] = typer.Option(None, "--poll-seconds", min=0.1),
@@ -1513,7 +1533,7 @@ def scheduler(
                 lease_seconds=effective_lease,
                 max_concurrent_runs=effective_max_concurrent,
                 signal_max_depth=effective_signal_depth,
-                components=components,
+                **_scheduler_services(components),
             )
         except BaseException:
             await agent_module._close_components(components)

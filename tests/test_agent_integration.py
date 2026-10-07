@@ -7430,8 +7430,13 @@ def test_gateway_starts_background_scheduler(monkeypatch):
         lease_seconds,
         max_concurrent_runs,
         signal_max_depth=None,
-        components=None,
+        *,
+        memory=None,
+        output_dir=None,
+        workspace_root=None,
+        registry=None,
         config_loader=None,
+        runtime_factory=None,
     ):
         assert max_concurrent_runs == 3
         # Accepted because the gateway now passes it; asserted so a future change
@@ -7499,12 +7504,24 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
         lease_seconds,
         max_concurrent_runs,
         signal_max_depth=None,
-        components=None,
+        *,
+        memory=None,
+        output_dir=None,
+        workspace_root=None,
+        registry=None,
         config_loader=None,
+        runtime_factory=None,
     ):
         assert max_concurrent_runs == 3
         assert callable(config_loader), "the gateway must hand the run loader over"
-        observed["scheduler"] = components
+        # The builder takes the services it reads rather than the mapping, so "reused the
+        # primary's components" is a statement about those four objects.
+        observed["scheduler"] = {
+            "memory": memory,
+            "output_dir": output_dir,
+            "workspace_root": workspace_root,
+            "registry": registry,
+        }
         return _FakeService(), _FakeStore()
 
     async def fake_close_components(components):
@@ -7522,7 +7539,12 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
     cli_module.gateway()
 
     assert observed["primary"] is primary_components
-    assert observed["scheduler"] is primary_components
+    assert observed["scheduler"] == {
+        "memory": primary_components.get("memory"),
+        "output_dir": primary_components.get("output_dir"),
+        "workspace_root": primary_components.get("workspace_root"),
+        "registry": primary_components.get("registry"),
+    }, "the scheduler must run on the primary's own services, not fresh ones"
 
 
 def test_configure_runtime_logging_enables_interaction_loggers(monkeypatch):
@@ -8928,7 +8950,10 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
             poll_seconds=1,
             lease_seconds=30,
             max_concurrent_runs=1,
-            components=components,
+            memory=None,
+            output_dir=components.get("output_dir"),
+            workspace_root=components.get("workspace_root"),
+            registry=components.get("registry"),
             runtime_factory=_StubRuntimeFactory(components),
         )
     )
@@ -8995,7 +9020,10 @@ def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_
             poll_seconds=1,
             lease_seconds=30,
             max_concurrent_runs=1,
-            components=components,
+            memory=None,
+            output_dir=components.get("output_dir"),
+            workspace_root=components.get("workspace_root"),
+            registry=components.get("registry"),
             runtime_factory=_StubRuntimeFactory(components),
         )
     )
@@ -9084,7 +9112,10 @@ def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
             poll_seconds=1,
             lease_seconds=30,
             max_concurrent_runs=1,
-            components=primary,
+            memory=primary.get("memory"),
+            output_dir=primary.get("output_dir"),
+            workspace_root=primary.get("workspace_root"),
+            registry=primary.get("registry"),
             config_loader=lambda: cfg,
         )
     )
@@ -9183,7 +9214,9 @@ def test_scheduler_agent_executor_hands_the_run_its_upstream_results(
             poll_seconds=1,
             lease_seconds=30,
             max_concurrent_runs=1,
-            components={"output_dir": tmp_path, "workspace_root": tmp_path},
+            memory=None,
+            output_dir=tmp_path,
+            workspace_root=tmp_path,
             config_loader=_minimal_cfg,
         )
     )
@@ -9313,7 +9346,8 @@ def test_scheduler_agent_executor_grants_workspace_writes_and_states_the_envelop
             poll_seconds=1,
             lease_seconds=30,
             max_concurrent_runs=1,
-            components={"output_dir": tmp_path},
+            memory=None,
+            output_dir=tmp_path,
             config_loader=lambda: cfg,
         )
     )
@@ -9374,7 +9408,8 @@ def test_scheduler_agent_executor_refuses_write_profile_without_a_workspace(
             poll_seconds=1,
             lease_seconds=30,
             max_concurrent_runs=1,
-            components={"output_dir": tmp_path},
+            memory=None,
+            output_dir=tmp_path,
             config_loader=lambda: cfg,
         )
     )
@@ -10515,7 +10550,9 @@ def test_a_scheduled_run_reads_the_config_on_disk_not_the_startup_snapshot(
             poll_seconds=1,
             lease_seconds=30,
             max_concurrent_runs=1,
-            components={"output_dir": tmp_path, "workspace_root": tmp_path},
+            memory=None,
+            output_dir=tmp_path,
+            workspace_root=tmp_path,
         )
     )
 

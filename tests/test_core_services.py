@@ -79,6 +79,38 @@ def _component_key(node: ast.Call) -> str | None:
     return None
 
 
+def _is_service_passthrough(node: ast.Dict) -> bool:
+    """Whether *node* is "pull these names out of a mapping" rather than a composition.
+
+    The shape is exact and narrow: every value is ``something.get("<its own key>")``.
+    ``{"memory": components.get("memory"), ...}`` is a helper handing four services on;
+    it reads the mapping and provides nothing, and counting it as a writer made the
+    ledger say ``cli.py`` constructs the memory service.
+
+    A value-shape rule rather than a positional one -- "only dicts assigned to a
+    ``*components*`` name" -- because the existing rule is deliberately broad: bootstrap
+    delivers its component mapping from a ``return {...}``, so a scanner that looked only
+    at assignments missed ``memory`` entirely.  Narrowing by position would restore that
+    blind spot; narrowing by value does not.
+    """
+    if not node.keys:
+        return False
+    for key_node, value in zip(node.keys, node.values):
+        if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+            return False
+        call = value
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "get"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == key_node.value
+        ):
+            return False
+    return True
+
+
 def _is_event_bus_table(node: ast.Dict) -> bool:
     """Whether a dict literal maps names to event **buses** rather than services.
 
@@ -144,7 +176,11 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
             # missed ``memory`` entirely while reporting the ledger as correct,
             # because the guard and the ledger shared the same blind spot.
             if isinstance(node, ast.Dict):
-                if not _is_event_bus_table(node):
+                # A *provider* is not "any dict that mentions a service name".  A helper
+                # that pulls names out of a mapping is a reader, and counting it made the
+                # ledger claim cli.py constructs the memory service -- a ledger that names
+                # a writer which only reads tells the next reader not to replace it.
+                if not _is_event_bus_table(node) and not _is_service_passthrough(node):
                     for key_node in node.keys:
                         if isinstance(key_node, ast.Constant):
                             note(writers, key_node.value, rel)
