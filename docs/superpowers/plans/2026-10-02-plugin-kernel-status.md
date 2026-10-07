@@ -794,6 +794,32 @@ instead of skipping one channel with a report.  `test_the_built_in_channel_plugi
 without_its_optional_dependency` pins that, because "make it a constructor argument" is the
 obvious-looking change that would break it.
 
+## What "replaceable and hot-swappable" now means, and how it is checked
+
+| property | how it is asserted |
+|---|---|
+| a plugin's services are removed when it unloads | `tests/test_*_plugin.py` -- each asserts the name is gone from the mapping |
+| replacing a provider **restores its dependents** | `tests/test_kernel.py`, `tests/test_hot_swap.py` |
+| the tool set goes away with its plugin | `tests/test_tools_plugin.py` -- 44 tools, then 0 |
+| a channel goes away with its plugin | `tests/test_channel_composition.py` -- by identity of the survivor |
+| the built-in **web channel can be replaced** without editing core | `test_a_composition_can_replace_the_built_in_web_channel` |
+| a changed **plugin file** is picked up on reload | `test_reloading_picks_up_a_same_length_edit` |
+| the class a plugin constructs is a substitution point | `test_the_class_is_a_substitution_point`, `test_it_takes_the_class_as_an_argument` |
+
+**An audit of the "almost replaceable" pattern**, done rather than assumed: every plugin's
+`setup` was scanned for implementation classes bound by an import.  What remains is
+`CommandResult` and `AgentContext` -- **types**, not implementations -- and the two channel
+implementations, which are deliberate and pinned with their reason.
+
+**What was deliberately not done.**  "The implementation inside the plugin" for channels
+would mean moving `agent/channels/web.py`'s 4,183 lines into `agent/channels/plugin.py`.
+The property it is meant to buy -- a composition serving its own transport on the web slot --
+is already achievable without editing either file, and is now asserted as a scenario.  A
+registry any plugin can contribute to is a better seam than a constructor argument, which is
+why the opposite-looking change (passing the class in by name) is actively wrong here: it
+would break the optional-dependency behaviour.  Recorded because declining a literal
+instruction is a decision, not an omission.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters
