@@ -75,16 +75,19 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
         rel = str(path.relative_to(REPO_ROOT))
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
+            # **Every** dict literal, anywhere -- not only ones bound by an
+            # assignment.  Bootstrap delivers the component mapping from a
+            # ``return {...}``, and a scanner that looked only at assignments
+            # missed ``memory`` entirely while reporting the ledger as correct,
+            # because the guard and the ledger shared the same blind spot.
+            if isinstance(node, ast.Dict):
+                for key_node in node.keys:
+                    if isinstance(key_node, ast.Constant):
+                        note(writers, key_node.value, rel)
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Subscript):
                         note(writers, _string_key(target), rel)
-                # Every dict literal in the assigned value, at any depth.
-                for inner in ast.walk(node.value):
-                    if isinstance(inner, ast.Dict):
-                        for key_node in inner.keys:
-                            if isinstance(key_node, ast.Constant):
-                                note(writers, key_node.value, rel)
             elif isinstance(node, ast.Call):
                 func = node.func
                 attr = func.attr if isinstance(func, ast.Attribute) else ""
@@ -221,6 +224,7 @@ def test_declared_names_match_the_documented_set() -> None:
         "agent_core",
         "context_manager",
         "mcp_client",
+        "memory",
         "plugin_catalog",
         "registry",
         "skill_catalog",

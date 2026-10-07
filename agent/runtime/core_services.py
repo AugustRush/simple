@@ -68,8 +68,12 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/tools/builtin_tools.py",
         ),
         consumers=(
+            "agent/_builtin/plugins/evolution/__init__.py",
+            "agent/bootstrap.py",
+            "agent/cli.py",
             "agent/commands/builtin.py",
             "agent/plugins/catalog.py",
+            "agent/runtime/contracts.py",
             "agent/runtime/system_prompt.py",
         ),
         summary="The tool registry: definitions, capabilities, and the context keys below.",
@@ -84,8 +88,11 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/tools/builtin_tools.py",
         ),
         consumers=(
+            "agent/_builtin/plugins/evolution/__init__.py",
+            "agent/bootstrap.py",
             "agent/channels/base.py",
             "agent/channels/web.py",
+            "agent/cli.py",
             "agent/commands/builtin.py",
             "agent/commands/composition.py",
             "agent/core/agent.py",
@@ -103,8 +110,11 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/cli.py",
         ),
         consumers=(
+            "agent/_builtin/plugins/evolution/__init__.py",
+            "agent/bootstrap.py",
             "agent/channels/base.py",
             "agent/channels/web.py",
+            "agent/cli.py",
             "agent/commands/builtin.py",
             "agent/commands/composition.py",
             "agent/config.py",
@@ -120,11 +130,13 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/runtime/contracts.py",
         ),
         consumers=(
+            "agent/bootstrap.py",
             "agent/channels/base.py",
             "agent/channels/web.py",
             "agent/cli.py",
             "agent/config.py",
             "agent/core/agent.py",
+            "agent/runtime/contracts.py",
             "agent/tools/builtin_tools.py",
         ),
         summary="The memory system: staging, retrieval, consolidation, per session.",
@@ -135,6 +147,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/bootstrap.py",
         ),
         consumers=(
+            "agent/bootstrap.py",
             "agent/channels/base.py",
             "agent/cli.py",
             "agent/commands/builtin.py",
@@ -146,8 +159,25 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         owners=(
             "agent/bootstrap.py",
         ),
-        consumers=("agent/runtime/contracts.py",),
+        consumers=(
+            "agent/bootstrap.py",
+            "agent/runtime/contracts.py",
+        ),
         summary="Executes one turn against AgentCore, with continuation accounting.",
+    ),
+    CoreService(
+        name="memory",
+        owners=(
+            "agent/bootstrap.py",
+            "agent/config.py",
+        ),
+        consumers=(
+            "agent/_builtin/plugins/evolution/__init__.py",
+            "agent/bootstrap.py",
+            "agent/channels/base.py",
+            "agent/cli.py",
+        ),
+        summary="The long-term store behind the context manager.",
     ),
     CoreService(
         name="mcp_client",
@@ -156,6 +186,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/tools/builtin_tools.py",
         ),
         consumers=(
+            "agent/bootstrap.py",
             "agent/config.py",
             "agent/plugins/catalog.py",
         ),
