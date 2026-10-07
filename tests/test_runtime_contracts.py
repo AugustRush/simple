@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from agent.core.interjections import inject_pending_interjections
 from agent.runtime import (
     AgentCore,
     RuntimeComponents,
@@ -606,7 +607,7 @@ def test_a_later_turn_does_not_rejournal_the_previous_turns_interjection(tmp_pat
     def run_turn(message_id: str, user_content: str, interjections=()):
         agent._prepare_turn(ctx, user_content, ())
         if interjections:
-            agent._inject_pending_interjections(ctx, list(interjections))
+            inject_pending_interjections(ctx, list(interjections), agent.registry)
         BaseAgent._post_turn_maintenance(
             ctx_mgr=manager,
             agent=agent,
@@ -689,7 +690,9 @@ def test_a_continuation_round_does_not_rewrite_the_turns_interjection(tmp_path):
 
     # Round one: drained mid-round, so it belongs to round one's record.
     boundary("原始请求")
-    agent._inject_pending_interjections(ctx, [{"text": "没有 id 的插话"}])
+    inject_pending_interjections(
+            ctx, [{"text": "没有 id 的插话"}], agent.registry
+        )
     finish("原始请求", 1)
 
     # Round two of the *same* turn: same turn id, a second assistant row.
@@ -1499,9 +1502,10 @@ def test_an_interjection_reaches_the_record_and_the_memory_pipeline(tmp_path):
     ctx = agent_module.AgentContext(system_prompt="sys")
 
     # What the running turn does when the mailbox is drained.
-    agent._inject_pending_interjections(
+    inject_pending_interjections(
         ctx,
         [{"text": "这些文件里有 markdown 吗？", "message_id": "inj-1", "urgency": "now"}],
+        agent.registry,
     )
 
     class _Agent:

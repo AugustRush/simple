@@ -97,6 +97,7 @@ from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlan
 from agent.pathing import canonicalize_user_path, resolve_workspace_path
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
+from agent.core.interjections import inject_pending_interjections
 from agent.runtime.services import resolve
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
@@ -134,7 +135,7 @@ _TURN_IN_PROGRESS_KEY = "_turn_in_progress"
 #: what the turn was asked to do, and the only reliable way to name that message
 #: is to keep the object: the alternative -- "the newest message that looks like
 #: a user request" -- is falsified by an interjection, which is a real user
-#: message appended *after* the request (see ``_inject_pending_interjections``).
+#: message appended *after* the request (see ``agent.core.interjections``).
 _TURN_REQUEST_KEY = "_turn_request_message"
 
 # Context variable so built-in tools can access the active AgentContext
@@ -2382,88 +2383,6 @@ class BaseAgent:
             results=results,
         )
 
-    def _inject_pending_interjections(
-        self, ctx: "AgentContext", pending: list[dict]
-    ) -> None:
-        """Drain the per-session mailbox into ctx.messages as a user_interjection.
-
-        ``pending`` is shared mutable state owned by RuntimeSessionState — we
-        list-copy then ``clear()`` in place so the channel handler's
-        subsequent appends only see fresh entries.  Each entry contributes
-        one ``<user_interjection>`` block; an instruction footer tells the
-        LLM how to handle it (continue, adjust, summarize, stop).
-        """
-        drained = list(pending)
-        pending.clear()
-        if not drained:
-            return
-        blocks: list[str] = []
-        interjected: list[str] = []
-        #: (entry, text) pairs, kept alongside the rendered blocks: the record
-        #: written at turn end needs the id and the urgency of each one, and
-        #: re-deriving them from `drained` afterwards would have to skip the
-        #: same blanks twice, in step.
-        read: list[tuple[dict[str, Any], str]] = []
-        for entry in drained:
-            text = str(entry.get("text", "") or "").strip()
-            if not text:
-                continue
-            interjected.append(text)
-            read.append((entry, text))
-            who = str(entry.get("from_user", "") or "user")
-            urgency = str(entry.get("urgency", "normal") or "normal")
-            arrived = entry.get("arrived_at")
-            when = ""
-            if isinstance(arrived, (int, float)):
-                from datetime import datetime as _dt
-                when = _dt.fromtimestamp(arrived).strftime("%H:%M:%S")
-            attrs = f' from="{who}" urgency="{urgency}"'
-            if when:
-                attrs += f' at="{when}"'
-            blocks.append(f"<user_interjection{attrs}>\n{text}\n</user_interjection>")
-        if not blocks:
-            return
-        footer = (
-            "\n\nThe user interjected during your in-progress task. "
-            "Briefly acknowledge what you heard, then decide: continue / "
-            "adjust direction / pause and ask for clarification / stop and "
-            "summarize what you have so far.  Treat urgency=\"now\" as "
-            "explicit interruption (read and respond first); urgency="
-            "\"normal\" as info added in passing (acknowledge and "
-            "incorporate when sensible)."
-        )
-        ctx.messages.append({
-            "role": "user",
-            "content": "\n\n".join(blocks) + footer,
-        })
-        # Held for the turn's record rather than only for the payload: the model
-        # reads these mid-turn and answers them in the same turn, so a
-        # transcript without them shows an answer to a question nobody can see
-        # -- which is what the durable record used to do, since only the message
-        # that *opened* the turn was journaled.  The record is written at turn
-        # end from this list; it is not cleared here because one turn may drain
-        # the mailbox several times, and every drained message is part of what
-        # the turn answered.
-        recorded = ctx.metadata.setdefault("_turn_interjections", [])
-        if isinstance(recorded, list):
-            for entry, text in read:
-                recorded.append(
-                    {
-                        "text": text,
-                        "message_id": str(entry.get("message_id") or ""),
-                        "urgency": str(entry.get("urgency") or "normal"),
-                        "arrived_at": entry.get("arrived_at"),
-                    }
-                )
-        # An interjection is the user asking for something *during* this turn,
-        # so it belongs to what this turn was asked to do.  Leaving it out would
-        # make a tool refuse an instruction the user had just typed, which reads
-        # as the agent ignoring them.
-        earlier = str(self.registry.get_context("turn_request") or "")
-        addition = "\n".join(interjected)
-        self.registry.set_context(
-            "turn_request", f"{earlier}\n{addition}" if earlier else addition
-        )
 
     def _prepare_turn(
         self,
@@ -2762,7 +2681,7 @@ class BaseAgent:
                 # absent), so this is a no-op for them.
                 pending = ctx.metadata.get("pending_messages")
                 if pending:
-                    self._inject_pending_interjections(ctx, pending)
+                    inject_pending_interjections(ctx, pending, self.registry)
 
                 # Cooperative cancellation.  This is the step boundary that
                 # `/cancel graceful` promises to stop at: the check sits

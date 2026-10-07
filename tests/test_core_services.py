@@ -708,3 +708,39 @@ def test_an_empty_dict_is_not_a_bus_table() -> None:
     empty = ast.parse("c = {}")
     literal = next(n for n in ast.walk(empty) if isinstance(n, ast.Dict))
     assert not _is_event_bus_table(literal)
+
+
+# ── An extraction must leave one implementation, not two ─────────────────────
+
+
+def test_the_interjection_drain_lives_in_one_place() -> None:
+    """The loop's drain is a module function and no longer an agent method.
+
+    Guards the specific way an extraction goes wrong here: the method is rewritten
+    to delegate, or kept "for compatibility", and two implementations drift.  The
+    moved code is call-site-reached from the loop, so a stale copy would still be
+    the one a caller outside the loop hit.
+
+    Also asserts the dependency is a parameter: the function read ``self.registry``
+    before, which made the dependency invisible in its signature.
+    """
+    agent_tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    methods = {
+        node.name
+        for node in ast.walk(agent_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "_inject_pending_interjections" not in methods, (
+        "the drain is still defined on BaseAgent as well as in "
+        "agent/core/interjections.py; two implementations is the failure this "
+        "extraction was supposed to avoid"
+    )
+
+    module_tree = ast.parse((REPO_ROOT / "agent/core/interjections.py").read_text(encoding="utf-8"))
+    func = next(
+        node for node in ast.walk(module_tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "inject_pending_interjections"
+    )
+    assert [arg.arg for arg in func.args.args] == ["ctx", "pending", "registry"], (
+        "the registry has to be a parameter, not reached through a 'self'"
+    )

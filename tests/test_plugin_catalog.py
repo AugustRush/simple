@@ -9,6 +9,8 @@ import time
 import textwrap
 from pathlib import Path
 
+from agent.core.interjections import inject_pending_interjections
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -3090,7 +3092,7 @@ def test_inject_pending_interjections_drains_and_clears_in_place():
          "arrived_at": _t.time(), "urgency": "now"},
     ]
 
-    agent._inject_pending_interjections(ctx, pending)
+    inject_pending_interjections(ctx, pending, agent.registry)
 
     assert pending == []  # cleared in place
     assert len(ctx.messages) == 1
@@ -3114,7 +3116,7 @@ def test_inject_pending_interjections_skips_empty_mailbox():
     agent = agent_module.BaseAgent(
         object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
     )
-    agent._inject_pending_interjections(ctx, [])
+    inject_pending_interjections(ctx, [], agent.registry)
     assert ctx.messages == []
 
 
@@ -3130,7 +3132,7 @@ def test_inject_skips_blank_text_entries():
         {"text": "   ", "from_user": "", "urgency": "normal"},
         {"text": "real msg", "from_user": "", "urgency": "normal"},
     ]
-    agent._inject_pending_interjections(ctx, pending)
+    inject_pending_interjections(ctx, pending, agent.registry)
     assert len(ctx.messages) == 1
     assert "real msg" in ctx.messages[0]["content"]
     # Blank entry produces no block
@@ -3154,9 +3156,10 @@ def test_interjection_counts_as_part_of_what_the_turn_was_asked():
     )
     registry.set_context("turn_request", "帮我看看这个仓库")
 
-    agent._inject_pending_interjections(
+    inject_pending_interjections(
         ctx,
         [{"text": "顺便每天早上九点提醒我看盘", "from_user": "", "urgency": "normal"}],
+        agent.registry,
     )
 
     request = registry.get_context("turn_request")
@@ -3492,7 +3495,7 @@ def test_draining_an_interjection_keeps_it_for_the_turns_record():
         object(), registry, model="fake-model", api_format="openai"
     )
 
-    agent._inject_pending_interjections(
+    inject_pending_interjections(
         ctx,
         [
             {"text": "  ", "urgency": "normal"},  # blank: nothing to record
@@ -3503,6 +3506,7 @@ def test_draining_an_interjection_keeps_it_for_the_turns_record():
                 "arrived_at": 1758700000.0,
             },
         ],
+        agent.registry,
     )
 
     held = ctx.metadata["_turn_interjections"]
@@ -3523,8 +3527,8 @@ def test_a_second_drain_in_one_turn_appends_rather_than_replaces():
         object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
     )
 
-    agent._inject_pending_interjections(ctx, [{"text": "第一句"}])
-    agent._inject_pending_interjections(ctx, [{"text": "第二句"}])
+    inject_pending_interjections(ctx, [{"text": "第一句"}], agent.registry)
+    inject_pending_interjections(ctx, [{"text": "第二句"}], agent.registry)
 
     assert [entry["text"] for entry in ctx.metadata["_turn_interjections"]] == [
         "第一句",
@@ -3552,7 +3556,9 @@ def test_the_interjection_ledger_belongs_to_one_turn():
         object(), agent_module.ToolRegistry(), model="fake-model", api_format="openai"
     )
 
-    agent._inject_pending_interjections(ctx, [{"text": "没有 id 的插话"}])
+    inject_pending_interjections(
+        ctx, [{"text": "没有 id 的插话"}], agent.registry
+    )
     assert [entry["text"] for entry in ctx.metadata["_turn_interjections"]] == [
         "没有 id 的插话"
     ]

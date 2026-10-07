@@ -179,8 +179,13 @@ CONTEXT_KEYS: tuple[ContextKey, ...] = (
     # ── per-turn and per-scope ──
     ContextKey(
         key="turn_request",
-        writers=("agent/core/agent.py",),
-        readers=("agent/core/agent.py",),
+        # Two writers, and the pair is the point: the turn loop records what the
+        # turn was asked to do, and the interjection drain *appends* to it when the
+        # user says something mid-turn.  Moved here with the drain rather than
+        # replacing the original writer -- the guard caught the first attempt, which
+        # had dropped the loop's own write.
+        writers=("agent/core/agent.py", "agent/core/interjections.py"),
+        readers=("agent/core/interjections.py",),
     ),
     ContextKey(
         key="capability_profile",
