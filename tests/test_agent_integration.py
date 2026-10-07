@@ -12,6 +12,7 @@ from agent.core.turn_loop import (
     build_user_message_content,
     plan_orchestration,
     prepare_turn,
+    recover_incomplete_tool_response,
 )
 
 
@@ -5954,7 +5955,7 @@ def test_truncated_tool_protocol_retries_with_larger_safe_output_budget():
     original_messages = list(ctx.messages)
 
     response, error = asyncio.run(
-        agent._recover_incomplete_tool_response(
+        recover_incomplete_tool_response(agent._loop_deps(), 
             ctx,
             [],
             "partial-tool-call",
@@ -6020,7 +6021,7 @@ def test_truncated_tool_protocol_fails_without_committing_partial_history():
     original_messages = list(ctx.messages)
 
     _response, error = asyncio.run(
-        agent._recover_incomplete_tool_response(ctx, [], "partial")
+        recover_incomplete_tool_response(agent._loop_deps(), ctx, [], "partial")
     )
 
     assert "Structured tool output remained truncated" in error

@@ -835,7 +835,10 @@ _LOOP_OWNED = (
 #: loop reads *now*: dropping them would silently change which members count as
 #: shared, and the struct assertion would then pass on a wrong struct.
 _ALREADY_MOVED = (
+    "_build_summarized_tool_results",
     "_build_user_message_content",
+    "_next_structured_output_budget",
+    "_recover_incomplete_tool_response",
     "_image_content_block",
     "_plan_orchestration",
     "_prepare_turn",
@@ -845,6 +848,17 @@ _ALREADY_MOVED = (
     "_tool_result_messages",
     "_with_llm_retry",
 )
+
+
+#: Members only the loop reads that nevertheless **stay on the agent**, and so are
+#: carried by the struct rather than moving with the loop.  Each is a seam the suite
+#: patches on the instance -- ``agent._create = fake`` appears thirty-eight times --
+#: and a struct built from the transport instead would go around the patch, which is
+#: how those tests would silently stop intercepting the model.
+#:
+#: Named explicitly because the guard's default rule is the opposite one: a member
+#: only the loop reads is one the loop takes with it.
+_AGENT_SEAMS = ("create", "retry_policy")
 
 
 def _loop_dependency_surface() -> tuple[set[str], set[str]]:
@@ -908,6 +922,10 @@ def _loop_dependency_surface() -> tuple[set[str], set[str]]:
     # owned member as missing.
     shared = needed & owned_elsewhere
     loop_only = needed - owned_elsewhere
+    # A seam stays on the agent, so it is borrowed by the loop even though nothing
+    # else reads it.
+    shared |= {name for name in _AGENT_SEAMS if name in needed}
+    loop_only -= set(_AGENT_SEAMS)
     return shared, loop_only
 
 

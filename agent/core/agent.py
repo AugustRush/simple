@@ -110,7 +110,9 @@ from agent.core.retry import RetryPolicy, with_llm_retry
 from agent.core.turn_loop import (
     LoopDeps,
     assistant_message,
+    build_summarized_tool_results,
     prepare_turn,
+    recover_incomplete_tool_response,
     tool_result_messages,
 )
 from agent.runtime.services import resolve
@@ -1610,72 +1612,7 @@ class BaseAgent:
             is_retryable=self._is_llm_retryable,
         )
 
-    def _next_structured_output_budget(
-        self,
-        ctx: "AgentContext",
-        tools: list[dict],
-        current_budget: int,
-    ) -> int:
-        """The larger cap to retry a truncated structured output with.
 
-        Bounded by the room the window actually has, which is the same quantity
-        the per-call cap is derived from -- measuring it any other way is how the
-        escalation ends up asking for more output than the window can hold.
-
-        The old form reached it through
-        ``current_budget + max(0, input_budget - estimate - 256)``, with
-        ``input_budget`` shrunk by ``current_budget``.  That expression equals
-        the room when the room is the larger of the two and ``current_budget``
-        otherwise, so it is *not* the same number: measured on this machine, a
-        request leaving 61413 tokens of room under a 64000 cap returned 64000
-        there and 61413 here.  What is preserved is the escalation *decision*,
-        because the caller retries only when this exceeds ``current_budget`` --
-        below that both forms decline, and above it both return the room.
-        Writing it as the room removes the dependence on ``current_budget``
-        appearing in the budget's reserve, and never names a cap the window
-        cannot hold.
-        """
-        desired = max(current_budget * 2, current_budget + 4096)
-        return min(desired, max(1, self._output_room(ctx, tools)))
-
-    async def _recover_incomplete_tool_response(
-        self,
-        ctx: "AgentContext",
-        tools: list[dict],
-        response: Any,
-    ) -> tuple[Any, Optional[str]]:
-        """Retry truncated structured output without committing partial protocol."""
-        model = self._effective_model(ctx)
-        if not self._transport.has_incomplete_tool_calls(response, model=model):
-            return response, None
-        current_budget = int(self.max_tokens)
-        attempts = min(2, max(0, int(self.max_truncation_continuations)))
-        for _ in range(attempts):
-            next_budget = self._next_structured_output_budget(
-                ctx,
-                tools,
-                current_budget,
-            )
-            if next_budget <= current_budget:
-                break
-            current_budget = next_budget
-            response = await with_llm_retry(
-                self._retry_policy(),
-                self._create,
-                ctx,
-                tools,
-                output_max_tokens=current_budget,
-            )
-            if not self._transport.has_incomplete_tool_calls(
-                response, model=model
-            ):
-                return response, None
-        return (
-            response,
-            "Structured tool output remained truncated; no complete tool call was "
-            f"committed after retrying with max_tokens={current_budget}. Reduce the "
-            "single tool payload or increase the provider context/output budget.",
-        )
 
     def _parse_response(
         self, response: Any, ctx: Optional["AgentContext"] = None
@@ -1912,19 +1849,6 @@ class BaseAgent:
         """See :func:`agent.core.llm_errors.is_content_filter_block`."""
         return is_content_filter_block(exc)
 
-    @staticmethod
-    def _build_summarized_tool_results(
-        tool_uses: list[dict],
-        results: list[str],
-    ) -> str:
-        """Build a text summary of tool results for recovery after content filter block."""
-        lines = ["[Tool results summarized — original output triggered content filter]\n"]
-        for tu, res in zip(tool_uses, results):
-            summary = summarize_tool_result(
-                tu["name"], res, include_preview=False
-            )
-            lines.append(f"- {tu['name']}: {str(summary)[:400]}")
-        return "\n".join(lines)
 
     async def _recover_from_content_filter(
         self,
@@ -1973,7 +1897,7 @@ class BaseAgent:
 
         # Append a summarized user message instead
         if tool_uses and results:
-            summary = self._build_summarized_tool_results(tool_uses, results)
+            summary = build_summarized_tool_results(tool_uses, results)
             ctx.messages.append({"role": "user", "content": summary})
             logger.info(
                 "Content filter recovery: rolled back %d messages, "
@@ -2437,7 +2361,8 @@ class BaseAgent:
                     state.trace_status = _attempt.trace_status
                     state.trace_error = _attempt.trace_error
                     response, structured_output_error = (
-                        await self._recover_incomplete_tool_response(
+                        await recover_incomplete_tool_response(
+                            deps,
                             ctx,
                             tools,
                             response,

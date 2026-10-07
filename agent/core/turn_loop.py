@@ -40,7 +40,9 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 from agent.config import _now
 from agent.core.attachments import MessageAttachment, format_attachment_context
 from agent.core.turn_context import TURN_REQUEST_KEY
+from agent.core.retry import with_llm_retry
 from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlanner
+from agent.security.content_filter import summarize_tool_result
 from agent.skills.catalog import SkillCatalog
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -139,6 +141,14 @@ class LoopDeps:
     content_filter: Any
     format_agent_error: Callable[..., Any]
 
+    #: How this agent makes a model call, and its retry policy.  Carried as the
+    #: *agent's own* callables rather than as a :class:`ModelCall` and a
+    #: :class:`RetryPolicy`, because ``_create`` is a seam thirty-eight tests patch
+    #: on the instance: a struct built from the transport would go around the patch
+    #: and those tests would silently stop intercepting the model.
+    create: Callable[..., Any]
+    retry_policy: Any
+
     @classmethod
     def of(cls, agent: Any) -> "LoopDeps":
         """Read the surface off *agent*.
@@ -169,6 +179,8 @@ class LoopDeps:
             llm_event_bus=agent._llm_event_bus,
             content_filter=agent.content_filter,
             format_agent_error=agent._format_agent_error,
+            create=agent._create,
+            retry_policy=agent._retry_policy(),
         )
 def prepare_turn(
         deps: "LoopDeps",
@@ -400,3 +412,84 @@ def plan_orchestration(
         )
 
 
+def next_structured_output_budget(
+        deps: "LoopDeps",
+        ctx: "AgentContext",
+        tools: list[dict],
+        current_budget: int,
+    ) -> int:
+        """The larger cap to retry a truncated structured output with.
+
+        Bounded by the room the window actually has, which is the same quantity
+        the per-call cap is derived from -- measuring it any other way is how the
+        escalation ends up asking for more output than the window can hold.
+
+        The old form reached it through
+        ``current_budget + max(0, input_budget - estimate - 256)``, with
+        ``input_budget`` shrunk by ``current_budget``.  That expression equals
+        the room when the room is the larger of the two and ``current_budget``
+        otherwise, so it is *not* the same number: measured on this machine, a
+        request leaving 61413 tokens of room under a 64000 cap returned 64000
+        there and 61413 here.  What is preserved is the escalation *decision*,
+        because the caller retries only when this exceeds ``current_budget`` --
+        below that both forms decline, and above it both return the room.
+        Writing it as the room removes the dependence on ``current_budget``
+        appearing in the budget's reserve, and never names a cap the window
+        cannot hold.
+        """
+        desired = max(current_budget * 2, current_budget + 4096)
+        return min(desired, max(1, deps.output_room(ctx, tools)))
+
+
+def build_summarized_tool_results(
+        tool_uses: list[dict],
+        results: list[str],
+    ) -> str:
+        """Build a text summary of tool results for recovery after content filter block."""
+        lines = ["[Tool results summarized — original output triggered content filter]\n"]
+        for tu, res in zip(tool_uses, results):
+            summary = summarize_tool_result(
+                tu["name"], res, include_preview=False
+            )
+            lines.append(f"- {tu['name']}: {str(summary)[:400]}")
+        return "\n".join(lines)
+
+
+async def recover_incomplete_tool_response(
+        deps: "LoopDeps",
+        ctx: "AgentContext",
+        tools: list[dict],
+        response: Any,
+    ) -> tuple[Any, Optional[str]]:
+        """Retry truncated structured output without committing partial protocol."""
+        model = deps.effective_model(ctx)
+        if not deps.transport.has_incomplete_tool_calls(response, model=model):
+            return response, None
+        current_budget = int(deps.max_tokens)
+        attempts = min(2, max(0, int(deps.max_truncation_continuations)))
+        for _ in range(attempts):
+            next_budget = next_structured_output_budget(deps, 
+                ctx,
+                tools,
+                current_budget,
+            )
+            if next_budget <= current_budget:
+                break
+            current_budget = next_budget
+            response = await with_llm_retry(
+                deps.retry_policy,
+                deps.create,
+                ctx,
+                tools,
+                output_max_tokens=current_budget,
+            )
+            if not deps.transport.has_incomplete_tool_calls(
+                response, model=model
+            ):
+                return response, None
+        return (
+            response,
+            "Structured tool output remained truncated; no complete tool call was "
+            f"committed after retrying with max_tokens={current_budget}. Reduce the "
+            "single tool payload or increase the provider context/output budget.",
+        )
