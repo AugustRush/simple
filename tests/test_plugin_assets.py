@@ -239,3 +239,97 @@ def test_the_owner_is_readable_for_reporting() -> None:
     from the view, since the view is all the plugin has."""
     assets, _ = _assets(_Catalog(), "github")
     assert assets.owner == "github"
+
+
+# ── The declarative loaders return their undos ───────────────────────────────
+
+
+def _catalog_paths(tmp_path):
+    """A plugin directory with one command file and one agent file."""
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    (commands / "review.md").write_text(
+        "---\ndescription: reviews\n---\nReview $ARGUMENTS\n", encoding="utf-8"
+    )
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "auditor.md").write_text(
+        "---\nname: auditor\ndescription: audits\n---\nAudit things\n", encoding="utf-8"
+    )
+    return tmp_path
+
+
+def test_command_files_return_an_undo_each(tmp_path) -> None:
+    """The loader can reverse what it registered, without knowing the plugin name."""
+    from agent.plugins.catalog import PluginCatalog
+
+    root = _catalog_paths(tmp_path)
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        owners: dict = {}
+        undos = catalog._load_command_files(root, "p", owners)
+        assert len(undos) == 1
+        assert "p:review" in catalog._slash_commands
+        assert owners["p:review"] == "p"
+
+        undos[0]()
+        assert "p:review" not in catalog._slash_commands
+        assert "p:review" not in catalog._slash_command_metadata
+        assert "p:review" not in owners, "attribution went with the registration"
+    finally:
+        catalog.close()
+
+
+def test_agent_files_return_an_undo_each(tmp_path) -> None:
+    from agent.plugins.catalog import PluginCatalog
+
+    root = _catalog_paths(tmp_path)
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        undos = catalog._load_agent_files(root, "p")
+        assert len(undos) == 1
+        assert "plugin:p:auditor" in catalog._agent_defs
+
+        undos[0]()
+        assert "plugin:p:auditor" not in catalog._agent_defs
+    finally:
+        catalog.close()
+
+
+def test_two_agent_files_get_independent_undos(tmp_path) -> None:
+    """The closure must bind per iteration, not share the loop variable.
+
+    A late-bound key removes only the last definition, which stays invisible until
+    a plugin contributes two agents -- so it is asserted with two.
+    """
+    from agent.plugins.catalog import PluginCatalog
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    for stem in ("one", "two"):
+        (agents / f"{stem}.md").write_text(
+            f"---\nname: {stem}\n---\nbody\n", encoding="utf-8"
+        )
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        undos = catalog._load_agent_files(tmp_path, "p")
+        assert len(undos) == 2
+        undos[0]()
+        remaining = set(catalog._agent_defs)
+        assert len(remaining) == 1, f"exactly one should remain, got {remaining}"
+    finally:
+        catalog.close()
+
+
+def test_no_files_returns_no_undos(tmp_path) -> None:
+    """A plugin with no declarative assets contributes nothing to undo."""
+    from agent.plugins.catalog import PluginCatalog
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    catalog = PluginCatalog(builtin_dir=tmp_path)
+    try:
+        assert catalog._load_command_files(empty, "p", {}) == []
+        assert catalog._load_agent_files(empty, "p") == []
+    finally:
+        catalog.close()

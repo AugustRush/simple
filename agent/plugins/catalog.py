@@ -1754,8 +1754,14 @@ class PluginCatalog:
         plugin_name: str,
         slash_command_owners: dict[str, str],
         command_paths: list[str] | None = None,
-    ) -> None:
+    ) -> list[Callable[[], None]]:
         """Register every ``commands/*.md`` as a namespaced slash command.
+
+        Returns the undo for each registration rather than removing them later by
+        plugin name: a caller that can reverse what it just did does not need to be
+        told which plugin it was acting for, and a sixth kind of contribution
+        cannot be added without its undo (the failure the name-filtering version
+        had: a registration with no matching filter outlives its plugin).
 
         The command key is always ``<plugin>:<stem>`` (matches Claude Code's
         ``/plugin:command`` namespace).  The handler returns a string built
@@ -1766,8 +1772,9 @@ class PluginCatalog:
         paths = command_paths if command_paths else (
             ["commands"] if (plugin_dir / "commands").is_dir() else []
         )
+        undos: list[Callable[[], None]] = []
         if not paths:
-            return
+            return undos
         from agent.skills.catalog import parse_skill_markdown
 
         cmd_files: list[Path] = []
@@ -1815,17 +1822,26 @@ class PluginCatalog:
             )
             slash_command_owners[cmd_key] = plugin_name
 
+            def forget(key: str = cmd_key) -> None:
+                self._slash_commands.pop(key, None)
+                self._slash_command_metadata.pop(key, None)
+                slash_command_owners.pop(key, None)
+
+            undos.append(forget)
+        return undos
+
     def _load_agent_files(
         self,
         plugin_dir: Path,
         plugin_name: str,
         agent_paths: list[str] | None = None,
-    ) -> None:
+    ) -> list[Callable[[], None]]:
+        undos: list[Callable[[], None]] = []
         paths = agent_paths if agent_paths else (
             ["agents"] if (plugin_dir / "agents").is_dir() else []
         )
         if not paths:
-            return
+            return undos
         from agent.skills.catalog import parse_skill_markdown
 
         agent_files: list[Path] = []
@@ -1856,6 +1872,11 @@ class PluginCatalog:
                 "body": body,
                 "path": agent_file,
             }
+            # ``k=key`` binds per iteration: a late-bound key would remove only the
+            # last definition the loop registered, which is the classic closure bug
+            # and invisible until a plugin contributes two agents.
+            undos.append(lambda k=key: self._agent_defs.pop(k, None))
+        return undos
 
     def get_agent_definition(self, ref: str) -> Optional[dict]:
         """Lookup an agent definition by ``plugin:<plugin>:<agent>`` key.
