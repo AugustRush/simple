@@ -196,3 +196,66 @@ def test_providing_twice_without_replace_is_refused(plugins: Path) -> None:
     registry.provide("mine", object())
     with pytest.raises(ValueError):
         registry.provide("mine", object())
+
+
+# ── The model adapter is a service ───────────────────────────────────────────
+
+
+class _Adapter:
+    """A stand-in model transport: the seam already existed as an ABC."""
+
+    api_format = "anthropic"
+
+    def endpoint_for(self, model):
+        return f"endpoint:{model}"
+
+    async def create(self, **kwargs):
+        return "answered by the composition's adapter"
+
+    def parse_response(self, *args, **kwargs):
+        return ("end_turn", "text", [])
+
+    def has_incomplete_tool_calls(self, *args, **kwargs):
+        return False
+
+
+class _Own:
+    api_format = "anthropic"
+
+    def endpoint_for(self, model):
+        return "the agent's own"
+
+
+def test_an_agent_uses_the_adapter_its_composition_named() -> None:
+    """``llm`` is the plan's model plugin seam.
+
+    ``ModelTransport`` was already an ABC with three implementations, so the
+    *interface* seam existed.  What did not is that a composition could choose one
+    without editing the code that builds the agent -- which is the difference
+    between a dependency that is injected and one that is *named*.
+    """
+    from agent.core.agent import BaseAgent
+
+    replacement = _Adapter()
+    agent = BaseAgent(
+        client=object(),
+        registry=object(),
+        model="m",
+        api_format="anthropic",
+        transport=_Own(),
+        services={"llm": replacement},
+    )
+    assert agent._transport is replacement
+    assert agent._transport.endpoint_for("m") == "endpoint:m"
+
+
+def test_an_agent_without_a_composition_keeps_the_adapter_it_was_given() -> None:
+    """The one escape hatch, and it is explicit: an agent built outside a
+    composition has no service to resolve and is not silently given one."""
+    from agent.core.agent import BaseAgent
+
+    own = _Own()
+    agent = BaseAgent(
+        client=object(), registry=object(), model="m", transport=own,
+    )
+    assert agent._transport is own

@@ -329,6 +329,10 @@ async def _build_web_session_components(
     session_client_cache_key = provider_client_cache_key(
         session_provider_cfg, session_transport.api_format
     )
+    # Created before the agent, like the global root's mapping: the session agent
+    # reads ``llm`` from it at construction, and the rest is added below.
+    session_components = dict(global_components)
+    session_components["llm"] = session_transport
     agent = BaseAgent(
         session_transport.default.client,
         registry,
@@ -339,6 +343,7 @@ async def _build_web_session_components(
         context_window=session_context_window,
         output_reserve=session_output_reserve,
         transport=session_transport,
+        services=session_components,
     )
     for name in (
         "max_parallel_agents",
@@ -367,7 +372,6 @@ async def _build_web_session_components(
         plugin_catalog=global_components.get("plugin_catalog"),
     )
 
-    session_components = dict(global_components)
     session_components.update(
         {
             "cfg": session_cfg,
@@ -781,6 +785,34 @@ async def _build_components_async(
     client_cache_key = provider_client_cache_key(
         (providers or {}).get(client_provider, {}), api_format
     )
+    # ── The composition mapping ──────────────────────────────────────────────
+    # Created **before** the agent, and populated as the rest is built, because
+    # everything below is a participant in it.  A mapping assembled after the agent
+    # existed cannot be read by the agent: it would have to be handed over
+    # afterwards, which is a second way for a participant to receive its
+    # composition, and the point of a service container is that there is one.
+    #
+    # ``llm`` is the model adapter.  It is provided here rather than only passed as
+    # a constructor argument so that a composition replaces the model plugin by
+    # providing this name -- the plan's ``llm`` seam, and the edge the agent loop
+    # declares.
+    _partial_components: dict = {
+        "client": client,
+        "client_provider": client_provider,
+        "client_cache_key": client_cache_key,
+        "model": model,
+        "api_format": api_format,
+        "memory": memory,
+        "registry": registry,
+        "skill_catalog": skill_catalog,
+        "user_tool_catalog": user_tool_catalog,
+        "output_dir": output_dir,
+        "workspace_root": workspace_root,
+        "file_access_policy": file_policy,
+        "file_service": file_service,
+        "llm": routing_transport,
+        "cfg": cfg,
+    }
     agent = BaseAgent(
         client,
         registry,
@@ -791,6 +823,7 @@ async def _build_components_async(
         context_window=context_window,
         output_reserve=output_reserve,
         transport=routing_transport,
+        services=_partial_components,
     )
     agent.max_parallel_agents = max(
         1,
@@ -860,6 +893,7 @@ async def _build_components_async(
         if isinstance(user_tools_cfg, dict)
         else False
     )
+    _partial_components["user_tools_enabled"] = user_tools_enabled
     # Two admission modes, never zero.  Enabling user_tools trusts the whole
     # directory; leaving it off still loads the individual tools the user
     # approved by hand, so a tool created and confirmed in an earlier session
@@ -890,29 +924,8 @@ async def _build_components_async(
         if evo_cfg.get("enabled", True)
         else None
     )
+    _partial_components["evolution"] = evolution
 
-    # Build a partial components dict so plugins can self-initialize via
-    # on_session_start(); the dict is updated in-place after discover_and_load.
-    # It is also what the plugin catalog's kernel adopts as its service storage,
-    # so plugins and the runtime share one namespace rather than two.
-    _partial_components: dict = {
-        "client": client,
-        "client_provider": client_provider,
-        "client_cache_key": client_cache_key,
-        "model": model,
-        "api_format": api_format,
-        "memory": memory,
-        "registry": registry,
-        "evolution": evolution,
-        "skill_catalog": skill_catalog,
-        "user_tool_catalog": user_tool_catalog,
-        "user_tools_enabled": user_tools_enabled,
-        "output_dir": output_dir,
-        "workspace_root": workspace_root,
-        "file_access_policy": file_policy,
-        "file_service": file_service,
-        "cfg": cfg,
-    }
     # ── Plugin Catalog ────────────────────────────────────────────────────────
     # Constructed after the partial components because the kernel adopts them.
     plugin_catalog = PluginCatalog(

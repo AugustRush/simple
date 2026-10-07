@@ -79,6 +79,31 @@ def _component_key(node: ast.Call) -> str | None:
     return None
 
 
+def _is_event_bus_table(node: ast.Dict) -> bool:
+    """Whether a dict literal maps names to event **buses** rather than services.
+
+    The domain table keeps ``{"turn": TURN_EVENTS, "llm": LLM_EVENTS, ...}``, and
+    a service named after a domain -- ``llm`` is now one -- makes that literal look
+    like a component mapping.  It is not: it says which bus a domain publishes to.
+
+    Recognised by its values, all of which are ``*_EVENTS`` bus references.  That
+    is a project-wide naming convention (``TOOL_EVENTS``, ``TURN_EVENTS``,
+    ``LLM_EVENTS``) rather than a guess about the variable's own name, and a
+    component mapping never has that shape -- its values are clients, registries and
+    managers.
+
+    Without this the ledger would have to list ``event_domains.py`` as a *writer* of
+    the ``llm`` service, which is a ledger that lies about the code.
+    """
+    values = [value for value in node.values]
+    if not values:
+        return False
+    return all(
+        isinstance(value, ast.Attribute) and value.attr.endswith("_EVENTS")
+        for value in values
+    )
+
+
 def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """``(writers, readers)`` per core service name, by file.
 
@@ -119,9 +144,10 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
             # missed ``memory`` entirely while reporting the ledger as correct,
             # because the guard and the ledger shared the same blind spot.
             if isinstance(node, ast.Dict):
-                for key_node in node.keys:
-                    if isinstance(key_node, ast.Constant):
-                        note(writers, key_node.value, rel)
+                if not _is_event_bus_table(node):
+                    for key_node in node.keys:
+                        if isinstance(key_node, ast.Constant):
+                            note(writers, key_node.value, rel)
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Subscript):
@@ -444,6 +470,7 @@ def test_declared_names_match_the_documented_set() -> None:
         "registry",
         "skill_catalog",
         "agent_loop",
+        "llm",
     }
 
 
@@ -645,3 +672,39 @@ def test_a_provide_of_a_non_literal_name_is_not_counted() -> None:
         node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call)
     )
     assert _string_key(call) is None
+
+
+def test_an_event_bus_table_is_not_a_component_mapping() -> None:
+    """Control for the exclusion that keeps ``llm`` out of the wrong ledger row.
+
+    The domain table keeps ``{"turn": TURN_EVENTS, "llm": LLM_EVENTS}``, and ``llm``
+    is now also a service name -- so the "every dict literal is a component mapping"
+    rule listed ``agent/core/event_domains.py`` as a *writer* of the model adapter.
+    A ledger that lists a file which does not write the service is worse than one
+    that omits it: it tells the next reader that the domain table owns the model.
+    """
+    bus_table = ast.parse('_BY = {"llm": buses.LLM_EVENTS, "turn": buses.TURN_EVENTS}')
+    literal = next(n for n in ast.walk(bus_table) if isinstance(n, ast.Dict))
+    assert _is_event_bus_table(literal)
+
+
+def test_a_component_mapping_is_not_mistaken_for_a_bus_table() -> None:
+    """The exclusion has to be narrow, or it would hide real writers.
+
+    Asserted on bootstrap's own shape: values that are clients and registries, not
+    bus references.
+    """
+    mapping = ast.parse('c = {"llm": transport, "agent": agent}')
+    literal = next(n for n in ast.walk(mapping) if isinstance(n, ast.Dict))
+    assert not _is_event_bus_table(literal)
+
+
+def test_an_empty_dict_is_not_a_bus_table() -> None:
+    """An empty literal carries no evidence either way, so it stays a mapping.
+
+    Asserted because ``all([])`` is ``True``: the predicate would otherwise classify
+    every empty dict as a bus table and silently stop counting writes from one.
+    """
+    empty = ast.parse("c = {}")
+    literal = next(n for n in ast.walk(empty) if isinstance(n, ast.Dict))
+    assert not _is_event_bus_table(literal)

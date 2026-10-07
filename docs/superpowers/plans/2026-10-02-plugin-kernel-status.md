@@ -17,8 +17,8 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 |---|---|---|
 | 0 Baseline | done | 3 accepted failures, byte-identical across every commit; see `2026-10-01-baseline-failures.txt` |
 | 1 Plugin Kernel | **done** | `agent/kernel/` — Context / Plugin / Service / Event / Scope / Lifecycle, 53 tests in `tests/test_kernel.py` |
-| 2 Service Injection | **2 of 3 done** | ToolRegistry ✅ `registry`, Session ✅ `context_manager`, **Model ✗ — see below** |
-| 3 Agent Loop Plugin | **first step done** | `agent_loop` is a plugin with declared `inject`; the loop *body* is still in `BaseAgent` — blocked on Phase 2's Model piece |
+| 2 Service Injection | **done** | ToolRegistry ✅ `registry`, Session ✅ `context_manager`, Model ✅ `llm` |
+| 3 Agent Loop Plugin | first step done | `agent_loop` is a plugin with declared `inject`; the loop *body* is still in `BaseAgent` — the blocker is gone, the move is next |
 | 4 Capability Layer | mechanism ready | the scoped service view is the mechanism it needs; `PluginAssets` is its first user |
 | 5 Execution Plugins | not started | Workflow / Ralph / Orchestration / Scheduler |
 | 6 Channel Plugins | not started | CLI / Web / Feishu |
@@ -35,6 +35,8 @@ d680eb3  Phase 2b Install.ctx / ctx.bus / ctx.on_unwind
 491da1d  Phase 2e declarative loaders return their undos
 955a51f  Phase 2f catalog delegates its lifecycle to the kernel host
 24e8de1  Phase 3a the agent loop is a plugin (agent_loop)
+f128e88  status doc: the measured blockers
+<this>   Phase 2g the model adapter is a service (llm)
 ```
 
 ## What the kernel is, and what it deliberately is not
@@ -56,38 +58,41 @@ know their names to privilege them and not knowing them is the point.
   `Domain.attach(ctx, listener)` is the call, and the domain table owns the answer
   to "which bus" (there are three, one per domain).
 
-## Measured blocker: the Model adapter cannot become a service yet
+## The Model adapter is a service (`llm`)
 
-Phase 2 names three services — ToolRegistry, Session, Model. The first two are
-done. The third was attempted and **reverted**, and the measurements below are the
-reason. They are recorded here because the attempt is what produced them.
+Two obstacles were measured, an attempt was reverted, and the third attempt
+resolved both.  What changed between them is worth recording, because the first
+attempt failed for a reason that looked mechanical and was not.
 
-What exists already: `ModelTransport` is an ABC with three implementations
-(`AnthropicTransport`, `OpenAITransport`, `RoutingTransport`), and `BaseAgent`
-takes one by constructor argument. So the *seam* is real. What is missing is that a
-composition cannot replace it without editing the code that builds the agent.
+**Obstacle 1 — the mapping did not exist when the agent was built.** `bootstrap`
+constructed the global `BaseAgent` around line 800 and assembled the `components`
+mapping around line 973; the session root had the same shape.  The first attempt
+tried to hand the mapping over afterwards, which needs a post-hoc bind — a second
+way for a participant to receive its composition.
 
-Two obstacles, both structural rather than mechanical:
+The fix was to **create the mapping first and populate it as the rest is built**,
+which is what a composition root is for.  Every value the mapping needed already
+existed before the agent; the two that did not (`evolution`, `user_tools_enabled`)
+are added to the same dict in place, at the point they are built.  So this was a
+*move of one dict literal*, not a reordering of the root's logic — which is why it
+was safe, and why the earlier attempt was not.
 
-1. **The composition mapping does not exist when the global agent is built.**
-   `bootstrap` constructs the global `BaseAgent` around line 800 and assembles the
-   `components` mapping around line 973. Passing the mapping to the agent is
-   therefore impossible without reordering the composition root — and the mapping
-   is also what the plugin catalog's kernel *adopts*, so reordering it moves where
-   plugins become visible.
+**Obstacle 2 — the adapter was assigned directly in 8+ test sites.** The first
+attempt made `_transport` a property resolving the container on every access, which
+removes the setter and broke those sites (17 failures).
 
-2. **The adapter is assigned directly in 8+ places** (`agent._transport = fake`),
-   all of them in tests that swap in a stand-in after construction. Making
-   `_transport` a resolving property removes the setter and breaks them.
+The fix was to resolve **once, at construction**, and keep `_transport` a plain
+attribute.  Replacing the adapter *after* an agent is built is not something a
+composition does — it builds both — so a per-call lookup was resolution on the hot
+path of every request for a value that cannot change.  Composition-time resolution
+is enough for the plan's requirement, and it left the 8 test sites alone.
 
-   Measured fallout of the attempt: 24 failures from `components` being undefined
-   at the construction site and 17 from the missing setter.
+That is the general lesson: "the container wins, resolved on every access" is not
+the same requirement as "the container decides", and only the second was needed.
 
-If the next attempt keeps the property, those 8 sites need a deliberate answer:
-either a setter that assigns the fallback (two ways to set the adapter) or the
-tests building a composition instead. The second is the honest one and is more
-work; the first reintroduces exactly the ambiguity the container is meant to
-remove.
+Measured fallout of the *first* attempt: 24 failures from `components` being
+undefined at the construction site, 17 from the missing setter.  The second attempt
+had none.
 
 ## Measured blocker: the loop body cannot move out of `BaseAgent` yet
 
@@ -101,9 +106,10 @@ helpers plus `max_tool_call_iterations`. Measured coupling of those helpers:
   `_recover_incomplete_tool_response`, `_tool_result_messages`);
 - the rest reach the context manager, the registry, or both.
 
-So the loop's real dependency is the composition's model and session pieces, which
-is the same blocker as above. Per the plan's own ordering, Phase 2's Model work is
-the prerequisite — not an optional detour.
+So the loop's real dependency is the composition's model and session pieces — both
+now services (`llm`, `context_manager`), which means the six transport-reaching
+helpers can become the loop's own declared dependencies. The move is the next step
+rather than a blocked one.
 
 ### A measurement bug worth remembering
 
@@ -116,13 +122,25 @@ were shown" — and the plan was briefly to extract a function on the strength o
 Any scan used to justify a refactor has to print the whole set it is testing for,
 or it is a validation that cannot fail.
 
+### A second false positive, from naming a service `llm`
+
+Naming the model adapter `llm` made the scanner report
+`agent/core/event_domains.py` as a *writer* of it, because the domain table keeps
+`{"turn": TURN_EVENTS, "llm": LLM_EVENTS}` and the rule was "every dict literal is a
+component mapping". It is a domain-to-bus lookup table.
+
+Excluded by the shape of its values — all `*_EVENTS` bus references, which a
+component mapping never has. The alternative was to list `event_domains.py` as an
+owner of the model adapter, which would have made the ledger lie about the code,
+and a ledger that lies is worse than one that omits: it tells the next reader that
+the domain table owns provider dispatch.
+
 ## Next step, in order
 
-1. **Make the model adapter a service.** Resolve obstacle 1 by giving the
-   composition root its mapping earlier, or by making the agent's adapter lookup
-   lazy in a way that does not need the mapping at construction. Resolve obstacle 2
-   by moving the 8 test sites onto a composition rather than an assignment.
-2. **Then** move the loop body: with `llm` and `context_manager` as services, the
-   six transport-reaching helpers become the loop's own dependencies and
-   `_run_turn_loop` can move into the `agent_loop` plugin.
-3. **Then** Phase 4's capability layer, on the scoped view that already exists.
+1. **Move the loop body into the `agent_loop` plugin.** Its dependencies are now
+   named: `llm` and `context_manager` are services, and the six helpers that reach
+   the transport have a seam to reach it through. Extract
+   `_run_turn_loop` + `send_message` with the helpers that belong to the loop, and
+   declare the dependency edges on the plugin rather than reaching into the agent.
+2. **Then** Phase 4's capability layer, on the scoped service view that already
+   exists (`PluginAssets` is its first user).

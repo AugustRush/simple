@@ -97,6 +97,7 @@ from agent.orchestration.planner import OrchestrationDecision, OrchestrationPlan
 from agent.pathing import canonicalize_user_path, resolve_workspace_path
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
+from agent.runtime.services import resolve
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
 from agent.tools.runtime import ToolRegistry, ToolView
@@ -395,7 +396,16 @@ class BaseAgent:
         context_window: int | None = None,
         output_reserve: int = shared.DEFAULT_OUTPUT_RESERVE,
         transport: Optional["ModelTransport"] = None,
+        services: Any = None,
     ):
+        #: The composition this agent participates in, when there is one.  Read at
+        #: construction to resolve the model adapter **by name**, so which model
+        #: plugin is in effect is the composition's decision rather than this
+        #: class's.  Resolved once rather than per call: replacing the adapter after
+        #: the agent is built is not something a composition does -- it builds both
+        #: -- and a per-call lookup would be a resolution on the hot path of every
+        #: request for a value that cannot change.
+        self._services = services
         self.client = client
         self.registry = registry
         self.api_format = api_format
@@ -434,6 +444,13 @@ class BaseAgent:
         if transport is None:
             from agent.core.transport import build_transport
             transport = build_transport(api_format, client)
+        # The composition's ``llm`` service wins when it provided one; the argument
+        # is what an agent built outside a composition uses.  A composition always
+        # provides it, so in practice there is one path -- the named one.
+        if services is not None:
+            named = resolve(services, "llm", None)
+            if named is not None:
+                transport = named
         self._transport: "ModelTransport" = transport
         self.context_assembler = ContextAssembler()
         self.context_manager: Optional[ContextManager] = None

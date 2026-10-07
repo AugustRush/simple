@@ -181,6 +181,21 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         ),
     ),
     CoreService(
+        name="llm",
+        owners=(
+            "agent/bootstrap.py",
+        ),
+        consumers=(
+            "agent/core/agent.py",
+        ),
+        summary=(
+            "The model adapter: the one place provider dispatch happens.  An ABC "
+            "with three implementations, so the seam existed before the container "
+            "did; naming it is what lets a composition choose one without editing "
+            "the code that builds the agent."
+        ),
+    ),
+    CoreService(
         name="memory",
         owners=(
             "agent/bootstrap.py",
