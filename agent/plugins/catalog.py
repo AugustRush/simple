@@ -944,6 +944,26 @@ async def _call_hook_with_timeout(
 _NO_DEFAULT = object()
 
 
+def _add_bundled(store: list, entry: Any) -> Any:
+    """Append *entry* to *store* and return the undo that takes it back.
+
+    By identity, not equality: two plugins may contribute an equal-looking skills root
+    or MCP config, and removing the wrong one would silently disable a plugin that is
+    still loaded.  Written as a pair because the alternative -- appending here and
+    remembering to remove there -- is the bookkeeping a scope exists to remove, and the
+    one place it survived.
+    """
+    store.append(entry)
+
+    def forget() -> None:
+        for index, item in enumerate(store):
+            if item is entry:
+                del store[index]
+                return
+
+    return forget
+
+
 class _CatalogPlugin:
     """Adapts a discovered plugin object to the kernel's protocol.
 
@@ -990,15 +1010,16 @@ class _CatalogPlugin:
 
     @property
     def inject(self) -> tuple[str, ...]:
-        """The plugin's dependencies, plus the contribution service.
+        """The plugin's declared dependencies, and nothing added.
 
-        ``assets`` is added rather than required of the author: gating on ``inject``
-        cannot express "a service provided during your own setup", so the adapter
-        declares it and the catalog provides it up front.  A plugin therefore
-        reaches ``ctx.assets`` without having to know the service exists.
+        The adapter used to prepend ``assets`` -- a contribution service the catalog
+        provided up front -- because gating on ``inject`` cannot express "a service
+        provided during your own setup".  That service is gone: measurement showed no
+        plugin ever called it (its only caller was this adapter), so a plugin that
+        wants to contribute a command or a role declares ``inject = ("commands",)`` or
+        ``("agents",)`` and gets the real registry.
         """
-        declared = tuple(str(d) for d in (getattr(self._plugin, "inject", ()) or ()))
-        return ("assets",) + declared
+        return tuple(str(d) for d in (getattr(self._plugin, "inject", ()) or ()))
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1035,17 +1056,23 @@ class _CatalogPlugin:
         meta = self._meta
         plugin_dir = self._plugin_dir
 
+        # Skills and MCP configs are the two contributions with no service of their
+        # own: each has exactly one production reader (bootstrap, at composition time)
+        # and no plugin asks for them by name.  So the append and its undo are written
+        # here rather than behind a service that only this method would call.
         for skills_rel in meta.skills:
             skills_path = (plugin_dir / skills_rel).resolve()
             if skills_path.is_dir():
-                ctx.assets.add_bundled_skill(skills_path)
+                ctx.on_unwind(
+                    _add_bundled(catalog._bundled_skills, (self.name, skills_path))
+                )
 
         for mcp_cfg in meta.mcp_servers:
             if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
-                ctx.assets.add_bundled_mcp(mcp_cfg)
+                ctx.on_unwind(_add_bundled(catalog._bundled_mcp, (self.name, mcp_cfg)))
         for mcp_cfg in _read_mcp_json(plugin_dir, self.name):
             if isinstance(mcp_cfg, dict) and mcp_cfg.get("name"):
-                ctx.assets.add_bundled_mcp(mcp_cfg)
+                ctx.on_unwind(_add_bundled(catalog._bundled_mcp, (self.name, mcp_cfg)))
 
         for undo in catalog._load_command_files(
             plugin_dir, self.name, meta.commands
@@ -1076,7 +1103,14 @@ class _CatalogPlugin:
                         f"'{cmd_key}' conflicts with plugin "
                         f"'{existing}' -- overriding[/yellow]"
                     )
-                ctx.assets.add_slash_command(cmd_key, handler)
+                ctx.on_unwind(
+                    catalog._commands.add(
+                        cmd_key,
+                        handler,
+                        metadata=_command_metadata(handler),
+                        owner=self.name,
+                    )
+                )
 
     def __getattr__(self, item: str) -> Any:
         # Only reached for names this adapter does not define, which is exactly the
@@ -1172,13 +1206,13 @@ class PluginCatalog:
         _registry = ServiceRegistry.adopt(components) if isinstance(components, dict) else ServiceRegistry()
         self._host = PluginHost(services=_registry)
         self._services = self._host.services
-        #: The contribution service, provided once.  Named ``assets`` -- a valid
-        #: identifier, so a plugin reaches it as ``ctx.assets``; ``plugin.assets``
-        #: would be an attribute chain, not an attribute.  One instance, because
-        #: every view of it is a view of the same contribution lists.
-        from agent.plugins.assets import PluginAssets
-
-        self._host.services.provide("assets", PluginAssets(self))
+        #: The capability services, provided so a plugin reaches them by name.
+        #: ``ctx.commands`` and ``ctx.agents`` are the plan's idiom -- a plugin
+        #: registers a capability *on a service* -- and they replace the ``assets``
+        #: contribution service, which no plugin ever called: its only caller was this
+        #: catalog's own adapter, and two of its five methods had no caller at all.
+        self._host.services.provide("commands", self._commands)
+        self._host.services.provide("agents", self._agent_defs)
         #: The *core* services, in a container of their own.  Distinct from
         #: ``_services`` above, which holds what plugins provide: the two are
         #: different populations, and conflating them would let a plugin's service

@@ -38,6 +38,10 @@ def _full_plugin_source(name: str = "everything") -> str:
 
         class Everything:
             name = "{name}"
+            # The two capability services this plugin registers on.  Declared, not
+            # assumed: reaching a service you did not declare is what the context
+            # refuses, and that is the point of the declaration.
+            inject = ("commands", "agents")
             version = "1.0"
 
             def __init__(self):
@@ -52,12 +56,14 @@ def _full_plugin_source(name: str = "everything") -> str:
             def setup(self, ctx):
                 self.ctx = ctx
                 self.LOG.append("setup")
-                ctx.assets.add_slash_command("everything", self._handle)
-                ctx.assets.add_bundled_skill("/tmp/skills/everything")
-                ctx.assets.add_bundled_mcp({{"name": "everything-mcp", "command": "true"}})
-                ctx.assets.add_agent_definition(
-                    "helper", {{"description": "a helper", "model": "m"}}
-                )
+                # Two kinds through the services a plugin reaches by name...
+                ctx.commands.add("everything", self._handle)
+                ctx.agents.add("helper", {{"description": "a helper", "model": "m"}})
+                # ...and the other two declaratively, from the plugin directory.  A
+                # skill root and an MCP config are declared in ``plugin.json`` /
+                # ``.mcp.json``: measurement showed no Python plugin ever contributed
+                # one, and the contribution service that made it possible had exactly
+                # one caller -- the catalog's own loader.
                 # An arbitrary registration, to prove the scope is general and
                 # not four special cases wearing one name.
                 ctx.on_unwind(lambda: self.LOG.append("unwound-extra"))
@@ -82,6 +88,13 @@ def catalog_and_plugin(tmp_path):
 
     plugins_dir = tmp_path / "plugins"
     _write_plugin(plugins_dir / "everything", _full_plugin_source())
+    # The declarative half, so the fixture really does contribute all four kinds.
+    (plugins_dir / "everything" / "skills").mkdir()
+    (plugins_dir / "everything" / "plugin.json").write_text(
+        '{"name": "everything", "skills": ["skills"], '
+        '"mcpServers": [{"name": "everything-mcp", "command": "true"}]}',
+        encoding="utf-8",
+    )
     catalog = PluginCatalog(builtin_dir=plugins_dir)
     loaded = catalog.discover_and_load()
     assert loaded == ["everything"], loaded
@@ -106,13 +119,13 @@ def test_setup_ran_and_registered_a_slash_command(catalog_and_plugin) -> None:
 
 def test_the_bundled_assets_are_registered(catalog_and_plugin) -> None:
     catalog, _ = catalog_and_plugin
-    assert ("everything", Path("/tmp/skills/everything")) in [
-        (name, Path(path)) for name, path in catalog.get_bundled_skills()
-    ]
+    assert any(
+        name == "everything" for name, _path in catalog.get_bundled_skills()
+    ), "the declarative skill root"
     assert any(
         name == "everything" and cfg.get("name") == "everything-mcp"
         for name, cfg in catalog.get_bundled_mcp()
-    )
+    ), "the declarative MCP config"
     assert catalog.get_agent_definition("plugin:everything:helper") is not None
 
 
