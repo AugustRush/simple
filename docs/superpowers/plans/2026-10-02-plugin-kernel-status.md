@@ -598,25 +598,35 @@ composition root, and all four were already pure functions of one config or one 
 plugin waited on it; and `register_spawn_capability` below the mounts, because it resolves
 the agent.
 
-## The last item: Orchestration
+## The last item: Orchestration -- measured, and it is not a service
 
-Measured, and the measurement changed the answer.  Its two parts are:
+The objective lists Orchestration among the things to turn into a plugin.  It is not one,
+and the reason is **not** size or boundaries: **its input is per-call state**.
 
-- **`OrchestrationPlanner`** -- constructed at `agent/core/turn_loop.py:456` as
-  `OrchestrationPlanner.from_skill_catalog(skill_catalog)`.  That is **inside the
-  agent-loop plugin**, from a service it already receives.
-- **`SpawnPlanner`** -- constructed in `BaseAgent.__init__` with
-  `PlannerDeps(settings=self, ...)`, which is the agent handing *itself* to the planner.
+`plan_orchestration` (in the agent-loop plugin) builds an `OrchestrationPlanner` on every
+turn from `ctx.metadata["skill_catalog"]`, and that key is written by **four different
+driving paths**:
 
-So neither is a composition-level cluster of the kind Memory, Session, Scheduler and Ralph
-were.  One is already inside a plugin; the other depends **into** the agent, so a plugin
-providing it would have to be built after the agent and the agent re-wired after being
-provided -- the reverse of the ordering rule every other move followed.
+| path | where |
+|---|---|
+| the runtime's per-turn context | `agent/runtime/contracts.py:833` |
+| Ralph's loop | `agent/ralph/plugin.py:93` |
+| the CLI loop | `agent/cli.py:883` |
+| a channel session | `agent/channels/base.py:646` |
 
-The literal step is still available and is small: `OrchestrationPlanner` is built per turn
-from `skill_catalog`, so it could be a service the agent-loop plugin injects instead of
-constructing.  That would make it a plugin in name as well as in effect.  It is **not**
-done, so this document does not claim it.
+A composition-time `orchestration` service would be built against **one** of them, and the
+other three would be silently ignored.  That is a behaviour change, not a refactor -- and
+it is exactly the failure shape this refactor has been avoiding all along ("a plugin that
+imports its own answer cannot be told").
+
+The other part, `SpawnPlanner`, is constructed in `BaseAgent.__init__` with
+`PlannerDeps(settings=self, ...)`: the agent handing *itself* in.  Its dependency points
+**into** the agent, so a plugin providing it would have to be built after the agent and the
+agent re-wired afterwards -- the reverse of the ordering rule every other move followed.
+
+`tests/test_orchestration_seam.py` pins both claims, so they are falsifiable rather than
+assertions in a document: it fails if the planner stops reading the call's metadata, or if
+the four writers stop being four.
 
 ## Next step, in order
 
