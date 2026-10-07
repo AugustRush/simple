@@ -33,6 +33,7 @@ from __future__ import annotations
 import pytest
 
 from agent.kernel.plugin import PluginHost
+from agent.ralph.plugin import RalphPlugin
 from agent.tools.runtime import ToolRegistry
 
 
@@ -465,3 +466,80 @@ def test_a_plugin_registers_a_command_and_a_role_by_injecting_them(tmp_path) -> 
         assert catalog._agent_defs.keys() == ()
     finally:
         catalog.close()
+
+
+# ── An execution piece as a plugin: Ralph ────────────────────────────────────
+
+
+def _ralph_deps(**overrides):
+    """The services Ralph declares, so a test can mount it without a whole runtime."""
+    values = {
+        "agent": object(),
+        "system_prompt": "sys",
+        "skill_catalog": object(),
+        "context_manager": object(),
+        "workspace_root": "/tmp",
+        "output_dir": "/tmp",
+        "cfg": {},
+    }
+    values.update(overrides)
+    host = PluginHost()
+    for name, value in values.items():
+        if value is not None:
+            host.services.provide(name, value)
+    return host
+
+
+def test_an_execution_piece_is_absent_until_it_is_mounted() -> None:
+    """The point of Ralph being a plugin: a composition can not have one.
+
+    It was already a *service* -- ``commands/builtin.py`` resolves ``ralph_service`` --
+    but ``bootstrap`` built it inline, so every process got a Ralph, its task store and
+    its verifier whether or not anybody ran ``/ralph``.  Now the absence is a state a
+    composition can be in, and ``/ralph`` reports a missing service instead of
+    half-working.
+    """
+    host = _ralph_deps()
+    assert host.services.get("ralph_service", None) is None
+
+    host.load(RalphPlugin())
+    assert type(host.services.get("ralph_service", None)).__name__ == "RalphService"
+
+
+def test_unloading_ralph_takes_the_service_away() -> None:
+    host = _ralph_deps()
+    host.load(RalphPlugin())
+    host.unload("ralph")
+    assert host.services.get("ralph_service", None) is None
+
+
+def test_ralph_waits_rather_than_half_activating() -> None:
+    """Six dependencies unmet, so it registers nothing.
+
+    A composition with no workspace cannot verify anything, and a Ralph that activated
+    anyway would fail at the first check -- which is the failure mode ``inject`` exists
+    to move from turn time to composition time.
+    """
+    host = _ralph_deps(system_prompt=None, skill_catalog=None, context_manager=None,
+                       workspace_root=None, output_dir=None, cfg=None)
+    host.load(RalphPlugin())
+    assert host.pending() == ("ralph",)
+    assert host.services.get("ralph_service", None) is None
+    assert set(host.waiting_for()["ralph"]) == {
+        "system_prompt", "skill_catalog", "context_manager",
+        "workspace_root", "output_dir", "cfg",
+    }
+
+
+def test_ralph_declares_everything_it_reaches_for() -> None:
+    """A short list would mean it reached for the rest behind the context's back.
+
+    Ralph composes the others: it drives turns through the agent, verifies against the
+    filesystem, and builds its iteration context from the system prompt and the skill
+    catalog.  Each of those is a name in ``inject``, so a missing one is visible.
+    """
+    assert set(RalphPlugin.inject) == {
+        "agent", "system_prompt", "skill_catalog", "context_manager",
+        "workspace_root", "output_dir", "cfg",
+    }
+    assert RalphPlugin.name == "ralph"

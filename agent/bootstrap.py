@@ -27,6 +27,7 @@ from agent.commands.composition import ensure_command_router
 from agent.runtime.system_prompt import refresh_system_prompt
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
+from agent.ralph.plugin import RalphPlugin
 from agent.runtime import AgentCore, TurnRunner
 from agent.ralph import (
     RalphIterationResult,
@@ -1008,37 +1009,11 @@ async def _build_components_async(
     components["session_store_factory"] = lambda _session_id: ctx_store
     components["use_memory_worker_pool"] = True
 
-    async def _execute_ralph_iteration(
-        iter_ctx: Any,
-        prompt: str,
-        *,
-        cancel_token: Any = None,
-        model_override: str | None = None,
-    ) -> RalphIterationResult:
-        result = await agent.send_message(iter_ctx, prompt)
-        return RalphIterationResult(
-            iteration=1,
-            summary=result.content or "",
-            tool_calls=tuple(result.tool_calls_made or ()),
-            error=result.error,
-        )
-
-    def _new_ralph_context() -> Any:
-        iter_ctx = agent_module.AgentContext(system_prompt=system_prompt)
-        iter_ctx.metadata["skill_catalog"] = skill_catalog
-        return iter_ctx
-
-    components["ralph_service"] = RalphService(
-        turn_executor=_execute_ralph_iteration,
-        store=open_task_store(agent_module.TASKS_DIR),
-        verifier=RalphVerifier(
-            workspace_root=workspace_root,
-            output_dir=output_dir,
-            blocked_commands=tuple(cfg.get("shell_blocked_commands", ())),
-        ),
-        context_factory=_new_ralph_context,
-        context_manager=ctx_manager,
-    )
+    # Ralph is mounted as a plugin rather than built here.  It was already a *service*
+    # -- ``commands/builtin.py`` resolves ``ralph_service`` -- so what this changes is
+    # that a composition can choose not to have one, and that its dependencies are
+    # declared rather than closed over.
+    plugin_catalog.mount(RalphPlugin())
     components["agent_core"] = AgentCore(components)
     # One constructor for all four former sites; see agent/commands/composition.py.
     command_router = ensure_command_router(components)

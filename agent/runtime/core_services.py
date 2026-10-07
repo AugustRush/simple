@@ -82,9 +82,6 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         name="skill_catalog",
         owners=(
             "agent/bootstrap.py",
-            "agent/channels/base.py",
-            "agent/cli.py",
-            "agent/runtime/contracts.py",
             "agent/tools/builtin_tools.py",
         ),
         consumers=(
@@ -140,7 +137,6 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         name="context_manager",
         owners=(
             "agent/bootstrap.py",
-            "agent/runtime/contracts.py",
         ),
         consumers=(
             "agent/bootstrap.py",

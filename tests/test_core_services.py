@@ -151,6 +151,14 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Subscript):
+                        # The same exclusion the read path makes, and its absence here
+                        # was inflating the ledger: ``ctx.metadata["skill_catalog"] = x``
+                        # copies a reference into a per-turn mapping, and counting it as
+                        # a write made three files look like they construct the skill
+                        # catalog.  A ledger that says a file owns a service it only
+                        # references makes the next reader avoid replacing it.
+                        if _is_metadata_receiver(target.value):
+                            continue
                         note(writers, _string_key(target), rel)
             elif isinstance(node, ast.Call):
                 func = node.func
@@ -1393,7 +1401,11 @@ _COMPONENT_KEYS: dict[str, str] = {
     "mcp_status": "what the MCP connection attempts did",
     "mcp_task": "the background MCP connect task",
     "memory": "the memory palace",
-    "ralph_service": "the Ralph task service",
+    # Mounted as a plugin now (agent/ralph/plugin.py), so bootstrap no longer writes
+    # it into the mapping.  Kept in this table rather than removed: `_COMPONENT_KEYS`
+    # documents what a composition can *contain*, and Ralph is one of those -- the
+    # entry moving from "bootstrap writes it" to "a plugin provides it" is exactly the
+    # kind of change this table exists to make visible.
     "evolution": "the evolution engine, or None",
     "system_prompt": "the composed system prompt",
     "user_tool_catalog": "user-contributed tools",
@@ -1410,6 +1422,14 @@ _COMPONENT_KEYS: dict[str, str] = {
     "session_store_factory": "builds a session's store",
     "use_memory_worker_pool": "whether to share the memory worker pool",
     "_shares_global_runtime": "marks a session mapping as a copy of the global one",
+}
+
+
+#: Keys a plugin provides rather than the composition root writing them into a
+#: mapping.  Named separately so the "written by bootstrap" set stays a set of what
+#: bootstrap builds, while the table above can still describe the whole composition.
+_PLUGIN_PROVIDED: dict[str, str] = {
+    "ralph_service": "agent/ralph/plugin.py",
 }
 
 
@@ -1476,7 +1496,7 @@ def test_the_component_mapping_is_a_closed_set() -> None:
     A new key fails this test until it is described, which is the point.
     """
     keys = _component_mapping_keys()
-    declared = set(_COMPONENT_KEYS)
+    declared = set(_COMPONENT_KEYS) - set(_PLUGIN_PROVIDED)
     missing = sorted(keys - declared)
     stale = sorted(declared - keys)
     assert not missing and not stale, (
@@ -1498,3 +1518,29 @@ def test_the_component_scan_finds_the_mappings() -> None:
     # Named keys, from each of the two write forms.
     for expected in ("agent", "registry", "cfg", "max_tokens"):
         assert expected in keys, f"{expected} is written by bootstrap; scan missed it"
+
+
+def test_a_metadata_write_is_not_counted_as_a_service_write() -> None:
+    """Control for the exclusion that corrected four false owners.
+
+    ``ctx.metadata["skill_catalog"] = x`` copies a reference into a per-turn mapping.
+    The read path excluded metadata receivers and the write path did not, so three
+    files were listed as *owners* of ``skill_catalog`` and one of ``context_manager``
+    on the strength of a copy.  A ledger that says a file constructs a service it only
+    references makes the next reader avoid replacing it -- which is the opposite of
+    what the ledger is for.
+    """
+    source = 'ctx.metadata["skill_catalog"] = x\ncomponents["skill_catalog"] = y\n'
+    tree = ast.parse(source)
+    counted = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Subscript):
+                    if _is_metadata_receiver(target.value):
+                        continue
+                    counted.append(_string_key(target))
+    assert counted == ["skill_catalog"], (
+        "the metadata write must be skipped and the component write counted; "
+        f"counted {counted}"
+    )
