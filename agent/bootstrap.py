@@ -381,9 +381,9 @@ async def _build_web_session_components(
             # config on disk, and inheriting any of these would leave it
             # half-built against the config the process started with.
             "client": session_transport.default.client,
-            "client_provider": session_provider,
             "client_cache_key": session_client_cache_key,
             "model": session_model,
+            "client_provider": session_provider,
             "max_tokens": session_max_tokens,
             "registry": registry,
             "agent": agent,
@@ -798,7 +798,6 @@ async def _build_components_async(
     # declares.
     _partial_components: dict = {
         "client": client,
-        "client_provider": client_provider,
         "client_cache_key": client_cache_key,
         "model": model,
         "api_format": api_format,
@@ -810,6 +809,7 @@ async def _build_components_async(
         "workspace_root": workspace_root,
         "file_access_policy": file_policy,
         "file_service": file_service,
+        "client_provider": client_provider,
         "llm": routing_transport,
         "cfg": cfg,
     }

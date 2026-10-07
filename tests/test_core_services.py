@@ -1349,3 +1349,152 @@ def test_the_superseded_plugin_interface_is_gone() -> None:
         elif "from .context import" in text and path.parent == plugin_pkg:
             offenders.append(str(path.relative_to(REPO_ROOT)))
     assert not offenders, f"the superseded context is imported again: {offenders}"
+
+
+# ── The component mapping is a closed, reviewed set ──────────────────────────
+
+#: Every key ``bootstrap`` puts into a component mapping, and who reads it.
+#:
+#: A **closed list** rather than a scan for readers, and the difference matters: an
+#: earlier version of this guard searched the source for reads and required each key to
+#: have one.  It reported ``client_provider`` as write-only and the key was deleted --
+#: but ``_build_web_session_components`` writes it and a test reads it back off the
+#: returned mapping, through a variable named ``result`` that no reader-scan would
+#: recognise.  The deletion was caught by the test suite, not by the guard.
+#:
+#: A check with false negatives is worse than no check when it gates a deletion: it
+#: does not merely miss a problem, it *authorises* one.  So this asserts the set
+#: instead.  Adding a key or removing one is now a deliberate edit to this table,
+#: which is where the question "who reads it" gets asked by a person.
+_COMPONENT_KEYS: dict[str, str] = {
+    # identity and model
+    "agent": "the agent a turn runs on",
+    "agent_core": "the command coordinator's core",
+    "base_system_prompt": "the head of the system prompt",
+    "client": "the provider client",
+    "client_cache_key": "keys the shared client cache",
+    "client_provider": "the active provider's name; read back off a web session",
+    "model": "the model name in effect",
+    # Written for every composition and, as of this table's writing, **not read back off
+    # a mapping**: the provider format is read from config dicts (``provider_cfg``) and
+    # from the agent's own ``api_format`` attribute.  Recorded rather than deleted
+    # because the previous deletion in this area was wrong -- a reader-scan missed a
+    # mapping handed to a caller and read through a local name -- and the honest state
+    # of a key like this is "described, reader unknown" rather than "removed".
+    "api_format": "the provider's format; no mapping reader found (see the note)",
+    "max_tokens": "the output ceiling the session was built with",
+    "llm": "the model adapter service",
+    # services
+    "registry": "the tool registry",
+    "context_manager": "the session log",
+    "skill_catalog": "the skill catalog",
+    "plugin_catalog": "the plugin catalog",
+    "mcp_client": "the MCP client",
+    "mcp_status": "what the MCP connection attempts did",
+    "mcp_task": "the background MCP connect task",
+    "memory": "the memory palace",
+    "ralph_service": "the Ralph task service",
+    "evolution": "the evolution engine, or None",
+    "system_prompt": "the composed system prompt",
+    "user_tool_catalog": "user-contributed tools",
+    "user_tools_enabled": "whether they are loaded",
+    "file_service": "the file service",
+    "file_access_policy": "the file policy",
+    # construction and paths
+    "cfg": "the config this composition was built against",
+    "output_dir": "where output is written",
+    "workspace_root": "the workspace",
+    "config_revision": "bumped to force a session rebuild",
+    "command_coordinator_factory": "builds a session's coordinator",
+    "session_components_factory": "builds a session's components",
+    "session_store_factory": "builds a session's store",
+    "use_memory_worker_pool": "whether to share the memory worker pool",
+    "_shares_global_runtime": "marks a session mapping as a copy of the global one",
+}
+
+
+def _component_mapping_keys() -> set[str]:
+    """Keys ``bootstrap`` puts into a component mapping.
+
+    Only the mappings it *builds*: the literals assigned to a ``*components*`` name
+    and the ``update({...})`` calls that extend one.
+    """
+    tree = ast.parse((REPO_ROOT / "agent/bootstrap.py").read_text(encoding="utf-8"))
+    keys: set[str] = set()
+
+    def collect(literal: ast.Dict) -> None:
+        keys.update(
+            key.value for key in literal.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        )
+
+    for node in ast.walk(tree):
+        # ``AnnAssign`` as well as ``Assign``: ``_partial_components: dict = {...}`` is
+        # annotated, and a scan that knew only the bare form missed the largest
+        # mapping in the file -- it reported memory, skill_catalog and
+        # user_tool_catalog as "described but not written", which is the scan being
+        # wrong rather than the table.
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            assigned = node.targets if isinstance(node, ast.Assign) else [node.target]
+            targets = [t.id for t in assigned if isinstance(t, ast.Name)]
+            if any("components" in name for name in targets) and isinstance(node.value, ast.Dict):
+                collect(node.value)
+            # ``components["x"] = ...`` -- one key at a time, and the form most of the
+            # services are added in.
+            for target in assigned:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and "components" in target.value.id
+                    and isinstance(target.slice, ast.Constant)
+                    and isinstance(target.slice.value, str)
+                ):
+                    keys.add(target.slice.value)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "update"
+            and isinstance(node.func.value, ast.Name)
+            and "components" in node.func.value.id
+        ):
+            for node_arg in node.args:
+                if isinstance(node_arg, ast.Dict):
+                    collect(node_arg)
+    return keys
+
+
+def test_the_component_mapping_is_a_closed_set() -> None:
+    """Adding or removing a component is a deliberate edit, not a side effect.
+
+    Two reasons this is asserted as a set rather than by scanning for readers.  The
+    first is that the scan cannot see every reader -- a mapping handed to a caller and
+    read back through a local name is invisible to it -- so it produces the *unsafe*
+    kind of error when it is wrong.  The second is that the question worth asking is
+    not "does any line read this" but "does this belong in the composition", and that
+    is a question a person answers once, here, rather than a scan answering wrongly.
+
+    A new key fails this test until it is described, which is the point.
+    """
+    keys = _component_mapping_keys()
+    declared = set(_COMPONENT_KEYS)
+    missing = sorted(keys - declared)
+    stale = sorted(declared - keys)
+    assert not missing and not stale, (
+        "the component mapping and this table disagree\n"
+        f"  written but undescribed: {missing}\n"
+        f"  described but not written: {stale}\n\n"
+        "Describe the new key and who reads it, or stop writing it."
+    )
+
+
+def test_the_component_scan_finds_the_mappings() -> None:
+    """Control: a scan that found nothing would pass the assertion above.
+
+    The failure mode of a source scan is a rule that quietly stops matching, and with
+    ``missing`` and ``stale`` both empty that reads as a pass.
+    """
+    keys = _component_mapping_keys()
+    assert len(keys) >= 28, f"the scan found too few keys: {sorted(keys)}"
+    # Named keys, from each of the two write forms.
+    for expected in ("agent", "registry", "cfg", "max_tokens"):
+        assert expected in keys, f"{expected} is written by bootstrap; scan missed it"
