@@ -26,6 +26,7 @@ from agent.core.spawn_planning import (
 )
 from agent.orchestration.planner import OrchestrationDecision
 from agent.orchestration.runtime import SubtaskResult, SubtaskSpec
+from agent.core.turn_loop import promote_turn_orchestration_runs
 
 
 def _planner(**settings) -> SpawnPlanner:
@@ -603,7 +604,7 @@ def test_the_agent_still_delegates_promotion() -> None:
     agent._context_manager_for = lambda ctx=None: manager  # type: ignore[assignment]
     token = _active_orchestration_runs.set([_run(_ran("a"))])
     try:
-        agent._promote_orchestration_runs()
+        promote_turn_orchestration_runs(agent._loop_deps())
     finally:
         _active_orchestration_runs.reset(token)
     assert len(manager.store.entries) == 1

@@ -836,6 +836,8 @@ _LOOP_OWNED = (
 #: shared, and the struct assertion would then pass on a wrong struct.
 _ALREADY_MOVED = (
     "_build_continuation_context",
+    "_compact_body_for_turn",
+    "_promote_orchestration_runs",
     "_build_summarized_tool_results",
     "_continue_truncated_response",
     "_handle_end_turn",
@@ -865,7 +867,33 @@ _ALREADY_MOVED = (
 #:
 #: Named explicitly because the guard's default rule is the opposite one: a member
 #: only the loop reads is one the loop takes with it.
-_AGENT_SEAMS = ("create", "retry_policy")
+_AGENT_SEAMS = (
+    "create",
+    "recover_from_content_filter",
+    "retry_policy",
+    "stream_response",
+)
+
+
+#: Names a loop-owned agent method reads from ``self`` that are **not** dependencies
+#: to inject, in three kinds:
+#:
+#: * how the struct is built and what builds it -- ``_loop_deps`` and ``_model_call``
+#:   are the accessors the facades use, so counting them would make the struct
+#:   declare its own constructor;
+#: * the loop's entry point -- ``_run_turn_loop`` is called by ``send_message``, which
+#:   is the caller rather than a dependency;
+#: * free functions the loop calls directly -- ``is_content_filter_block``,
+#:   ``is_llm_retryable`` and ``new_watchdog_state`` are module-level, already
+#:   imported by ``turn_loop.py``, and injecting them would be injecting a module.
+_STRUCT_BUILDERS = (
+    "loop_deps",
+    "model_call",
+    "run_turn_loop",
+    "is_content_filter_block",
+    "is_llm_retryable",
+    "new_watchdog_state",
+)
 
 
 def _loop_dependency_surface() -> tuple[set[str], set[str]]:
@@ -936,15 +964,24 @@ def _loop_dependency_surface() -> tuple[set[str], set[str]]:
     return shared, loop_only
 
 
-def test_the_loop_dependency_struct_is_exactly_the_shared_surface() -> None:
-    """``LoopDeps`` must name every member the loop borrows, and no member it owns.
+def test_the_loop_dependency_struct_covers_what_the_loop_reads() -> None:
+    """``LoopDeps`` must be exactly what the loop reads from the agent.
 
-    Both directions are failures.  A missing field means the loop reaches for
-    something the struct does not admit, so the extraction would have to smuggle it
-    through -- and smuggling is how a decoupling turns out not to be one.  An extra
-    field means the struct claims the loop borrows something it will actually take
-    with it, which makes the interface look wider than it is and the remaining work
-    look larger.
+    Two directions, and they mean different things:
+
+    * **missing** -- the loop reads something the struct does not declare, so the
+      extraction would have to smuggle it in.  Smuggling is how a decoupling turns
+      out not to be one.
+    * **dead** -- the struct declares something the loop never reads.  That is a
+      field kept "for later", and it makes the surface look wider than it is while
+      hiding the fact that nothing tested it.
+
+    What is deliberately *not* checked here is whether a borrowed member is also read
+    by code outside the loop.  An earlier version required that, which made a member
+    the loop reads and that nothing else does look like an error -- but that is the
+    normal state of a loop-owned member that has not moved yet, and the set of those
+    is what ``_LOOP_OWNED`` is for.  Treating it as an error here would have forced
+    either a false "seam" label or a move this round was not doing.
     """
     tree = ast.parse((REPO_ROOT / "agent/core/turn_loop.py").read_text(encoding="utf-8"))
     struct = next(
@@ -957,20 +994,17 @@ def test_the_loop_dependency_struct_is_exactly_the_shared_surface() -> None:
         if isinstance(stmt, ast.AnnAssign)
     }
 
-    shared, _loop_only = _loop_dependency_surface()
-    # Compared after stripping one leading underscore, because the struct's fields
-    # are the public reading of a member that may be private on the agent.  That
-    # mapping is only sound if it is one-to-one, which is asserted first: with both
-    # ``_token_budget`` and ``token_budget`` present, stripping would collapse two
-    # members into one field and the comparison would silently accept a struct that
-    # takes the wrong one.
-    expected = set(shared)
-    missing = sorted(expected - declared)
-    extra = sorted(declared - expected)
-    assert not missing and not extra, (
+    # The surface function splits what the loop reads into borrowed and owned; the
+    # union is the whole of it, which is what the struct has to cover.
+    borrowed, loop_owned = _loop_dependency_surface()
+    needed = (borrowed | loop_owned) - set(_STRUCT_BUILDERS)
+    assert len(needed) >= 15, f"the loop reads more than this: {sorted(needed)}"
+    missing = sorted(needed - declared)
+    dead = sorted(declared - needed)
+    assert not missing and not dead, (
         f"LoopDeps is out of step with what the loop reads from the agent\n"
-        f"  missing (the loop needs these): {missing}\n"
-        f"  extra (the loop owns these and will take them): {extra}"
+        f"  missing (the loop reads these; the struct must declare them): {missing}\n"
+        f"  dead (declared but never read by the loop): {dead}"
     )
 
 

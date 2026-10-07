@@ -101,6 +101,8 @@ from agent.core.interjections import inject_pending_interjections
 from agent.core.turn_context import (
     TURN_REQUEST_KEY as _TURN_REQUEST_KEY,
     active_agent_context as _active_agent_context,
+    active_orchestration_runs as _active_orchestration_runs,
+    emit_event as _emit_event,
     active_agent_id as _active_agent_id,
     emit_domain_event as _emit_domain_event,
     schedule_domain_event as _schedule_domain_event,
@@ -111,10 +113,14 @@ from agent.core.turn_loop import (
     LoopDeps,
     assistant_message,
     build_summarized_tool_results,
+    compact_body_for_turn,
     handle_end_turn,
     parse_response,
     prepare_turn,
+    promote_turn_orchestration_runs,
     recover_incomplete_tool_response,
+    recover_from_content_filter,
+    stream_response,
     tool_result_messages,
 )
 from agent.runtime.services import resolve
@@ -157,9 +163,6 @@ _TURN_IN_PROGRESS_KEY = "_turn_in_progress"
 #: message appended *after* the request (see ``agent.core.interjections``).
 
 # Context variable so built-in tools can access the active AgentContext
-_active_orchestration_runs: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
-    contextvars.ContextVar("active_orchestration_runs", default=None)
-)
 
 
 class _TurnLoopState:
@@ -201,16 +204,6 @@ def _interaction_log(event: str, **fields: object) -> None:
     shared._interaction_log("agent", event, **fields)
 
 
-def _emit_event(name: str, **fields: object) -> None:
-    """Record a runtime event when a turn collector is listening.
-
-    Observation must never be able to break the turn it observes, so a
-    missing collector is a no-op rather than an error.  Mirrors
-    ``ToolExecutor._emit`` and ``_emit_consolidation``.
-    """
-    collector = _active_event_collector.get()
-    if collector is not None:
-        collector.emit(name, **fields)
 
 
 
@@ -1273,53 +1266,6 @@ class BaseAgent:
         message = ctx.metadata.get(_TURN_REQUEST_KEY)
         return [message] if isinstance(message, dict) else []
 
-    def _compact_body_for_turn(self, ctx: "AgentContext") -> None:
-        """Cut the body to a low-water mark once, before the turn's first call.
-
-        Compaction rewrites the front of the body, and the front is the one
-        thing a provider's prefix cache can reuse.  Doing it here rather than
-        inside the provider loop is what keeps the rest of a turn append-only:
-        a turn that cuts mid-flight both loses context the model was actively
-        using and pays for a fresh prefix on every step that follows, whereas a
-        single cut at the boundary leaves every step an append.
-
-        `_prepare_provider_context` keeps its own call as an emergency fallback
-        for a step whose own tool results overflow the window.  That is rare
-        precisely because this cut leaves half the budget free, and it stays
-        because the alternative is a hard failure in the middle of a turn.
-        """
-        tools = ctx.metadata.get("_selected_tools")
-        if not isinstance(tools, list):
-            return
-        budget = self._input_token_budget(ctx, tools)
-        if budget <= 0:
-            return
-        messages_before = len(ctx.messages)
-        protected = self._protected_turn_messages(ctx)
-        context_manager = self._context_manager_for(ctx)
-        compact = getattr(context_manager, "compact_messages", None)
-        if callable(compact):
-            ctx.messages = compact(
-                ctx.messages, input_token_budget=budget, protected=protected
-            )
-        else:
-            # A manager is optional here, exactly as it is in
-            # `_prepare_provider_context`: fitting a request into the window is
-            # a property of the request rather than of memory, so
-            # `fit_to_budget` is the same algorithm without the instance.  Runs
-            # with no manager (the scheduler's `stateless` policy) and callers
-            # that supply a retrieval-only stand-in both land here.
-            ctx.messages = ContextManager.fit_to_budget(
-                ctx.messages,
-                input_token_budget=budget,
-                estimate_tokens=estimate_message_tokens,
-                protected=protected,
-            )
-        if len(ctx.messages) != messages_before:
-            # Read and cleared by the first `_prepare_provider_context` of the
-            # turn, so the recorded row says "this call paid full price for its
-            # history" only on the call that actually did.
-            ctx.metadata["_body_compacted_pending"] = True
 
     def _prepare_provider_context(
         self,
@@ -1545,6 +1491,35 @@ class BaseAgent:
             "providers.<name>.stream_usage to false.[/yellow]"
         )
 
+    async def _stream_response(
+        self,
+        ctx: "AgentContext",
+        tools: list[dict],
+        callback: Any,
+        reasoning_callback: Any = None,
+    ) -> Any:
+        """Streaming model call.  A facade: see :meth:`_create` for why.
+
+        ``agent/core/llm_attempt.py`` calls it and four tests patch it, so the name
+        has to stay reachable on the instance.  The logic is in
+        ``agent/core/turn_loop.py``.
+        """
+        return await stream_response(
+            self._loop_deps(), ctx, tools, callback, reasoning_callback
+        )
+
+    async def _recover_from_content_filter(
+        self, ctx: "AgentContext", tool_uses: list, results: list
+    ) -> Any:
+        """Content-filter recovery.  A facade: see :meth:`_create` for why.
+
+        A test replaces it to drive the recovery path without provoking a real
+        filter block, so the name has to stay reachable on the instance.
+        """
+        return await recover_from_content_filter(
+            self._loop_deps(), ctx, tool_uses, results
+        )
+
     async def _create(
         self,
         ctx: "AgentContext",
@@ -1729,92 +1704,6 @@ class BaseAgent:
         return is_content_filter_block(exc)
 
 
-    async def _recover_from_content_filter(
-        self,
-        ctx: "AgentContext",
-        tool_uses: list[dict] | None,
-        results: list[str] | None,
-    ) -> Any | None:
-        """Attempt recovery after a content filter rejection.
-
-        Strategy: roll back the last round of messages from ctx.messages,
-        replace the offending tool results with safe summaries, and retry
-        the API call once. If it still fails, return None.
-        """
-        # Learn from the actual rejection only when attribution is unambiguous.
-        # A provider rejection is request-level; labeling every result in a
-        # multi-tool batch as risky poisons unrelated outputs.
-        if tool_uses and results:
-            if len(results) == 1:
-                await self.content_filter.learn_and_persist([results[0]])
-            else:
-                logger.info(
-                    "Content filter recovery skipped classifier learning for "
-                    "ambiguous multi-tool batch of %d results",
-                    len(results),
-                )
-
-        # Roll back: remove the last assistant message and its tool results.
-        # The last message(s) in ctx.messages are the tool_result entries,
-        # preceded by the assistant tool_use message.
-        messages_before = len(ctx.messages)
-        dropped_roles: list[str] = []
-        if tool_uses:
-            # The transport knows how many trailing tool-result messages it
-            # appended for this batch; +1 for the preceding assistant turn.  The
-            # count comes from the batch itself, not from how many calls were
-            # requested: a short `results` appends fewer messages, and cutting
-            # by call count would take one message of real history with it.
-            result_msg_count = self._transport.tool_result_rollback_count(
-                tool_uses, results, model=self._effective_model(ctx)
-            )
-            cut = result_msg_count + 1
-            dropped_roles = [
-                str(message.get("role", "?")) for message in ctx.messages[-cut:]
-            ]
-            del ctx.messages[-cut:]
-
-        # Append a summarized user message instead
-        if tool_uses and results:
-            summary = build_summarized_tool_results(tool_uses, results)
-            ctx.messages.append({"role": "user", "content": summary})
-            logger.info(
-                "Content filter recovery: rolled back %d messages, "
-                "replaced with summarized tool results",
-                len(dropped_roles),
-            )
-
-        if dropped_roles:
-            # This is the one path that rewrites context the model has already
-            # seen.  Without an event here the turn's event stream and
-            # ctx.messages disagree, and "never retrieved" becomes
-            # indistinguishable from "retrieved, then rolled back".
-            _emit_event(
-                "context_rolled_back",
-                reason="content_filter",
-                messages_before=messages_before,
-                messages_after=len(ctx.messages),
-                messages_dropped=len(dropped_roles),
-                dropped_roles=",".join(dropped_roles),
-                tool_names=",".join(tu["name"] for tu in (tool_uses or [])),
-                replaced_with="summary" if (tool_uses and results) else "nothing",
-            )
-
-        # Retry once with the cleaned messages
-        try:
-            tools = list(ctx.metadata.get("_selected_tools") or [])
-            return await self._create(ctx, tools)
-        except Exception as retry_exc:
-            if self._is_content_filter_block(retry_exc):
-                logger.warning(
-                    "Content filter recovery retry also blocked — "
-                    "summarized results still triggered filter"
-                )
-            else:
-                logger.warning(
-                    "Content filter recovery retry failed: %s", retry_exc
-                )
-            return None
 
 
     @staticmethod
@@ -2078,7 +1967,7 @@ class BaseAgent:
             # Cut once, here, so every step below is an append.  See
             # `_compact_body_for_turn` for why the position of this call is what
             # decides whether a turn's steps share a cacheable prefix.
-            self._compact_body_for_turn(ctx)
+            compact_body_for_turn(deps, ctx)
 
             # D1: bounded step loop — prevents infinite model loops.
             # Vocabulary: a *step* is one model request plus the tools that
@@ -2396,7 +2285,7 @@ class BaseAgent:
                     with shared._suppress_with_log(
                         "orchestration summary promotion failed"
                     ):
-                        self._promote_orchestration_runs()
+                        promote_turn_orchestration_runs(deps)
                 _active_orchestration_runs.reset(orchestration_token)
             _active_agent_context.reset(active_ctx_token)
             shared._active_cancel_token.reset(cancel_token_token)
@@ -2772,42 +2661,6 @@ class BaseAgent:
                         )
                         ctx.metadata["_has_provider_checkpoint"] = True
 
-    async def _stream_response(
-        self,
-        ctx: "AgentContext",
-        tools: list[dict],
-        callback: Callable[[str], Any],
-        reasoning_callback: Optional[Callable[[str], Any]] = None,
-    ) -> tuple[Any, str]:
-        """Stream response and return (full_response, collected_text).
-
-        ``callback`` may be a plain sync function or an async coroutine
-        function; the transport handles both.  ``reasoning_callback`` is the
-        turn's sink channel for the model's thinking — resolved by the caller
-        (see ``send_message``), which needs it under the same emission
-        tracking as the answer, since a replay would double either.
-
-        Sub-agents never reach this method, because they are never given a
-        stream callback.  That is also what keeps their thinking out of the
-        parent's note: several run at once, and their fragments interleaved
-        would read as one confused train of thought.
-        """
-        self._prepare_provider_context(ctx, tools)
-        response, text = await self._transport.stream(
-            model=self._effective_model(ctx),
-            # Derived per call by `_prepare_provider_context`: a request that
-            # nearly fills the window has to leave itself less room for the
-            # answer than a short one does.  Falls back to the configured cap
-            # when that method took an early return.
-            max_tokens=int(ctx.metadata.pop("_output_cap", self.max_tokens)),
-            system=ctx.system_prompt,
-            messages=ctx.messages,
-            tools=tools,
-            callback=callback,
-            reasoning_callback=reasoning_callback,
-        )
-        self._observe_provider_usage(ctx, response)
-        return response, text
 
     # ── Sub-agent construction helpers (used by _execute_agent and
     # register_spawn_capability) ───────────────────────────────────────
@@ -3117,20 +2970,6 @@ class BaseAgent:
         payload = finalized.payload
         return payload
 
-    def _promote_orchestration_runs(self) -> None:
-        """Promote only bounded, successful run summaries into session memory.
-
-        See :func:`agent.core.spawn_planning.promote_orchestration_runs`; the
-        store, clock and entry class are supplied here rather than imported
-        there, so the promotion can be tested without any of them.
-        """
-        promote_orchestration_runs(
-            self._context_manager_for(),
-            _active_orchestration_runs.get() or [],
-            now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-            new_id=shared._new_id,
-            entry_type=LTMEntry,
-        )
 
     def register_spawn_capability(
         self, base_system_prompt: str, workspace_root: Optional[Path] = None

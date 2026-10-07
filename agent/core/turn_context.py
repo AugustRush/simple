@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from agent.core.output import _active_event_collector
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -33,8 +34,15 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: beside them rather than in ``agent.py``.
 TURN_REQUEST_KEY = "_turn_request_message"
 
+#: This turn's orchestration run records; moves with the orchestration driver.
+active_orchestration_runs: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
+    contextvars.ContextVar("active_orchestration_runs", default=None)
+)
+
 __all__ = [
     "TURN_REQUEST_KEY",
+    "active_orchestration_runs",
+    "emit_event",
     "active_agent_context",
     "active_agent_id",
     "emit_domain_event",
@@ -91,3 +99,15 @@ async def emit_domain_event(bus: Any, event_type: type, **fields: object) -> Non
     if bus is None or not bus.has_listeners(event_type):
         return
     await bus.emit(event_type(**fields))
+
+
+def emit_event(name: str, **fields: object) -> None:
+    """Record a runtime event when a turn collector is listening.
+
+    Observation must never be able to break the turn it observes, so a
+    missing collector is a no-op rather than an error.  Mirrors
+    ``ToolExecutor._emit`` and ``_emit_consolidation``.
+    """
+    collector = _active_event_collector.get()
+    if collector is not None:
+        collector.emit(name, **fields)

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from agent.core.turn_loop import (
     CONTINUE_PROMPT,
+    promote_turn_orchestration_runs,
     build_user_message_content,
     continue_truncated_response,
     plan_orchestration,
@@ -2768,7 +2769,7 @@ def test_orchestration_promotes_only_bounded_session_summary(tmp_path):
         ]
     )
     try:
-        agent._promote_orchestration_runs()
+        promote_turn_orchestration_runs(agent._loop_deps())
     finally:
         _active_orchestration_runs.reset(token)
 

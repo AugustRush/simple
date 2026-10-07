@@ -131,8 +131,10 @@ LEDGER: tuple[StateEntry, ...] = (
                "BaseAgent: the loop has to ask which agent is in flight, and "
                "importing that from agent.py would be a cycle. Re-exported under "
                "the old private name so the twelve callers did not change."),
-    StateEntry("_active_orchestration_runs", "agent/core/agent.py", 91, "CONTEXTVAR", "turn", "explicit", 8,
-               "This turn's orchestration run records; moves with the orchestration driver."),
+    StateEntry("active_orchestration_runs", "agent/core/turn_context.py", 38, "CONTEXTVAR", "turn", "explicit", 8,
+               "This turn's orchestration run records; moves with the orchestration driver. "
+               "Sank into agent/core/turn_context.py with the other turn-scoped state when the "
+               "turn loop moved out of BaseAgent, and is re-exported under the old private name."),
     StateEntry("_active_schedule_target", "agent/tools/runtime.py", 25, "CONTEXTVAR", "turn", "explicit", 7,
                "Delivery target when the turn answers a scheduled run."),
     StateEntry("_active_signal_context", "agent/tools/runtime.py", 34, "CONTEXTVAR", "turn", "stays", None,
