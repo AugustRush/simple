@@ -1452,7 +1452,11 @@ _COMPONENT_KEYS: dict[str, str] = {
         "the channels a composition runs; provided so a plugin can contribute one, which"
         " was the contribution it could not make"
     ),
-    "memory": "the memory palace",
+    "memory": "the memory palace; provided by MemoryPlugin",
+    "ltm_store": (
+        "the long-term store; provided by MemoryPlugin, resolved by ContextManager and "
+        "by the web channel's session-store factory"
+    ),
     "runtime_factory": (
         "builds a runtime for a config; read by a scheduled run, which needs one built "
         "from the config on disk rather than the one it started in"
@@ -1487,6 +1491,8 @@ _COMPONENT_KEYS: dict[str, str] = {
 _PLUGIN_PROVIDED: dict[str, str] = {
     "ralph_service": "agent/ralph/plugin.py",
     "evolution": "agent/_builtin/plugins/evolution/__init__.py",
+    "memory": "agent/memory/plugin.py",
+    "ltm_store": "agent/memory/plugin.py",
 }
 
 

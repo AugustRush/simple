@@ -370,9 +370,22 @@ user-invocable: true
     monkeypatch.setattr(agent_module, "DEFAULT_OUTPUT_DIR", tmp_path / "output")
 
     class _PluginCatalog:
+        def __init__(self, **kwargs):
+            # The mapping the composition hands the real catalog, and which it adopts as
+            # its registry.  Kept because `mount` has to *run* a plugin, not just accept
+            # it: the composition root mounts providers whose services the code below
+            # resolves, so a stand-in that swallowed them would fail downstream with a
+            # `KeyError` naming a service nobody offered.
+            self.components = kwargs.get("components")
+
         def mount(self, plugin):
-            # The composition root mounts internal services here; a stand-in that
-            # cannot accept one is not a stand-in for the catalog any more.
+            # The composition root mounts internal providers here; a stand-in that cannot
+            # run one is not a stand-in for the catalog any more.
+            from agent.kernel.plugin import PluginHost
+            from agent.kernel.service import ServiceRegistry
+
+            host = PluginHost(services=ServiceRegistry.adopt(self.components))
+            host.load(plugin)
             return None
 
         def get_bundled_skills(self):
@@ -392,7 +405,7 @@ user-invocable: true
     monkeypatch.setattr(
         bootstrap_mod,
         "PluginCatalog",
-        lambda *args, **kwargs: _PluginCatalog(),
+        lambda *args, **kwargs: _PluginCatalog(*args, **kwargs),
     )
 
     components = agent_module._build_components(cfg)

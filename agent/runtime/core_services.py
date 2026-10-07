@@ -193,7 +193,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
     CoreService(
         name="memory",
         owners=(
-            "agent/bootstrap.py",
+            "agent/memory/plugin.py",
             "agent/config.py",
         ),
         consumers=(

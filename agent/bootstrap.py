@@ -28,6 +28,7 @@ from agent.runtime.system_prompt import refresh_system_prompt
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.channels.registry import ChannelRegistry
+from agent.memory.plugin import MemoryPlugin
 from agent.ralph.plugin import RalphPlugin
 from agent.runtime.factory import RuntimeFactory
 from agent.runtime import AgentCore, TurnRunner
@@ -39,6 +40,7 @@ from agent.ralph import (
     open_task_store,
 )
 from agent.tools.files import FileService, resolve_file_access_config
+from agent.runtime.services import require_service
 
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
@@ -562,76 +564,6 @@ async def _build_components_async(
     ctx_cfg = cfg.get("context", {})
     storage_cfg = ctx_cfg.get("storage", ctx_cfg)  # fallback: flat cfg for compat
     cons_cfg = ctx_cfg.get("consolidation", ctx_cfg)  # fallback: flat cfg for compat
-
-    ctx_store = LTMStore(
-        context_dir=context_dir,
-        max_categories=storage_cfg.get("max_categories", max_categories),
-        memory_dir=memory_dir,
-    )
-    assistant_identity_cfg = cfg.get("assistant_identity", {})
-    assistant_name = str(assistant_identity_cfg.get("name", "") or "").strip()
-    assistant_role = str(assistant_identity_cfg.get("role", "") or "").strip()
-    if assistant_name:
-        ctx_store.add_fact_assertion(
-            FactAssertion(
-                id=f"bootstrap-assistant-name-{assistant_name.lower()}",
-                subject="assistant",
-                predicate="name",
-                value=assistant_name,
-                source_kind="bootstrap",
-                source_id="config.assistant_identity.name",
-            )
-        )
-    if assistant_role:
-        ctx_store.add_fact_assertion(
-            FactAssertion(
-                id=f"bootstrap-assistant-role-{assistant_role.lower().replace(' ', '_')}",
-                subject="assistant",
-                predicate="role",
-                value=assistant_role,
-                source_kind="bootstrap",
-                source_id="config.assistant_identity.role",
-            )
-        )
-    memory = MemoryPalace(
-        tidy_interval=mem_cfg.get("tidy_interval_seconds", shared.MEMORY_TIDY_INTERVAL),
-        tidy_threshold=mem_cfg.get("tidy_file_threshold", shared.MEMORY_TIDY_FILE_THRESHOLD),
-        base_dir=memory_dir,
-        context_dir=context_dir,
-        store=ctx_store,
-    )
-    ctx_manager = ContextManager(
-        store=ctx_store,
-        retriever=LocalRetriever(),
-        consolidation=ConsolidationEngine(
-            store=ctx_store,
-            max_categories=storage_cfg.get("max_categories", max_categories),
-            decay_factor=storage_cfg.get("decay_factor", decay_factor),
-            sleep_token_ratio=cons_cfg.get("token_ratio", sleep_token_ratio),
-            keep_last_messages=cons_cfg.get("keep_last_messages", 6),
-            max_source_tokens=cons_cfg.get(
-                "max_source_tokens", shared.CONSOLIDATION_MAX_SOURCE_TOKENS
-            ),
-            max_chunks_per_run=cons_cfg.get("max_chunks_per_run", 2),
-            output_tokens=cons_cfg.get("output_tokens", 512),
-            chars_per_token=cons_cfg.get("token_estimation", {}).get(
-                "chars_per_token", float(chars_per_token)
-            ),
-            cjk_chars_per_token=cons_cfg.get("token_estimation", {}).get(
-                "cjk_chars_per_token", 1.0
-            ),
-        ),
-        idle_seconds=cons_cfg.get("idle_seconds", 300),
-        min_messages=cons_cfg.get("min_messages", 4),
-        staging_turn_threshold=cons_cfg.get(
-            "staging_turn_threshold", shared.STAGING_TURN_THRESHOLD
-        ),
-        staging_token_threshold=cons_cfg.get(
-            "staging_token_threshold", shared.STAGING_TOKEN_THRESHOLD
-        ),
-        route_keywords=ctx_cfg.get("route_keywords"),
-        project_scope=_project_memory_scope(workspace_root),
-    )
     if announce:
         # A posture nobody can see is a posture nobody maintains.  Running
         # unsandboxed is a deliberate, temporary choice that lives in a
@@ -735,7 +667,6 @@ async def _build_components_async(
         "client_cache_key": client_cache_key,
         "model": model,
         "api_format": api_format,
-        "memory": memory,
         "registry": registry,
         "skill_catalog": skill_catalog,
         "user_tool_catalog": user_tool_catalog,
@@ -747,6 +678,7 @@ async def _build_components_async(
         "llm": routing_transport,
         "cfg": cfg,
     }
+    components = _partial_components
     agent = BaseAgent(
         client,
         registry,
@@ -883,10 +815,48 @@ async def _build_components_async(
     )
     _partial_components["plugin_catalog"] = plugin_catalog
     loaded_plugins = plugin_catalog.discover_and_load()
+    # Mounted before the blocks below, because those resolve what these provide.  Ralph
+    # and Memory are the two plugins the composition root mounts itself; everything else
+    # is discovered from disk.
+    plugin_catalog.mount(RalphPlugin())
+    plugin_catalog.mount(MemoryPlugin())
+
+    ctx_manager = ContextManager(
+        store=require_service(components, "ltm_store"),
+        retriever=LocalRetriever(),
+        consolidation=ConsolidationEngine(
+            store=require_service(components, "ltm_store"),
+            max_categories=storage_cfg.get("max_categories", max_categories),
+            decay_factor=storage_cfg.get("decay_factor", decay_factor),
+            sleep_token_ratio=cons_cfg.get("token_ratio", sleep_token_ratio),
+            keep_last_messages=cons_cfg.get("keep_last_messages", 6),
+            max_source_tokens=cons_cfg.get(
+                "max_source_tokens", shared.CONSOLIDATION_MAX_SOURCE_TOKENS
+            ),
+            max_chunks_per_run=cons_cfg.get("max_chunks_per_run", 2),
+            output_tokens=cons_cfg.get("output_tokens", 512),
+            chars_per_token=cons_cfg.get("token_estimation", {}).get(
+                "chars_per_token", float(chars_per_token)
+            ),
+            cjk_chars_per_token=cons_cfg.get("token_estimation", {}).get(
+                "cjk_chars_per_token", 1.0
+            ),
+        ),
+        idle_seconds=cons_cfg.get("idle_seconds", 300),
+        min_messages=cons_cfg.get("min_messages", 4),
+        staging_turn_threshold=cons_cfg.get(
+            "staging_turn_threshold", shared.STAGING_TURN_THRESHOLD
+        ),
+        staging_token_threshold=cons_cfg.get(
+            "staging_token_threshold", shared.STAGING_TOKEN_THRESHOLD
+        ),
+        route_keywords=ctx_cfg.get("route_keywords"),
+        project_scope=_project_memory_scope(workspace_root),
+    )
 
 
     builtin_tools_cls(
-        memory,
+        require_service(components, "memory"),
         registry,
         context_manager=ctx_manager,
         workspace_root=workspace_root,
@@ -983,7 +953,6 @@ async def _build_components_async(
         "mcp_task": None,
         "config_revision": 0,
     })
-    components = _partial_components
     # The agent loop is mounted like any other plugin, into the composition's own
     # host, so it activates only once ``agent`` and ``system_prompt`` exist -- which
     # is why this is here rather than beside the catalog.  Mounting it means a
@@ -1005,14 +974,15 @@ async def _build_components_async(
         )
 
     components["session_components_factory"] = _session_components_factory
-    components["session_store_factory"] = lambda _session_id: ctx_store
+    components["session_store_factory"] = lambda _session_id: require_service(
+        components, "ltm_store"
+    )
     components["use_memory_worker_pool"] = True
 
     # Ralph is mounted as a plugin rather than built here.  It was already a *service*
     # -- ``commands/builtin.py`` resolves ``ralph_service`` -- so what this changes is
     # that a composition can choose not to have one, and that its dependencies are
     # declared rather than closed over.
-    plugin_catalog.mount(RalphPlugin())
     components["agent_core"] = AgentCore(components)
     # One constructor for all four former sites; see agent/commands/composition.py.
     command_router = ensure_command_router(components)
