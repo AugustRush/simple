@@ -9,6 +9,14 @@ has no equivalent at all, for a reason recorded below.
 
 These tests hold two things in place: the decision lives with composition, and
 nothing else constructs a channel.
+
+**Where "the builder" is changed with the channel plugins.**  Channels are no longer
+constructed in ``bootstrap``: each built-in is a plugin that registers on the
+``channels`` service, which is what lets a third party contribute one -- something no
+plugin could do before, since the gateway's set was a branch per built-in in the
+composition root.  So the single place that constructs a channel moved to
+``agent/channels/plugin.py``, and this file follows it rather than being relaxed: one
+module, asserted, still.
 """
 
 from __future__ import annotations
@@ -22,7 +30,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 _CHANNEL_CLASSES = ("WebChannel", "FeishuChannel", "CliChannel")
 
 #: The one module allowed to name them in a call.
-_BUILDER_MODULE = "agent/bootstrap.py"
+#:
+#: It was ``agent/bootstrap.py`` until the channels became plugins; the composition root
+#: no longer constructs a channel at all -- it mounts the plugins and reads the registry.
+_BUILDER_MODULE = "agent/channels/plugin.py"
+
+#: The composition point, which the builder above is reached through.
+_COMPOSITION_MODULE = "agent/bootstrap.py"
 
 
 def _call_sites(source: str) -> list[str]:
@@ -79,10 +93,31 @@ def test_only_the_builder_constructs_a_channel() -> None:
 
 
 def test_the_builder_itself_does_construct_channels() -> None:
-    """Control: the guard above is vacuous if the builder is not detected."""
+    """Control: the guard above is vacuous if the construction site is not detected."""
     source = (REPO_ROOT / _BUILDER_MODULE).read_text(encoding="utf-8")
     found = set(_call_sites(source))
     assert {"WebChannel", "FeishuChannel"} <= found, found
+
+
+def test_the_composition_mounts_a_channel_plugin() -> None:
+    """The other half: one module may construct, and the composition must reach it.
+
+    A guard that only forbids construction elsewhere passes just as well when nothing
+    constructs a channel at all, which is why the two are asserted together.
+    """
+    source = (REPO_ROOT / _COMPOSITION_MODULE).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    mounted = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "agent.channels.plugin"
+        for alias in node.names
+    }
+    assert {"WebChannelPlugin", "FeishuChannelPlugin"} <= mounted, (
+        "build_gateway_channels must mount the channel plugins; found "
+        f"{sorted(mounted)}"
+    )
+    assert "ChannelRegistry" in source, "and read the registry they contribute to"
 
 
 def test_the_switch_reads_the_config_section() -> None:
@@ -124,3 +159,101 @@ def test_the_scheduler_is_not_here_and_that_is_recorded() -> None:
         "the scheduler now has a composition entry point -- update the plan's "
         "Task 8 note, which says the ordering constraint prevents one"
     )
+
+
+# ── A channel a plugin contributes ───────────────────────────────────────────
+
+
+def test_a_plugin_can_contribute_a_channel() -> None:
+    """The gap this closed, asserted directly.
+
+    A plugin could contribute a tool, a slash command, a sub-agent role, an MCP config
+    and a skill root.  It could not contribute a **channel**: the gateway's set was a
+    branch per built-in in ``bootstrap``, so a third party's transport had to be added
+    there.  Web and Feishu are now the first users of the registry rather than special
+    cases in it, and this is a third user with no branch anywhere.
+    """
+    from agent.channels.registry import ChannelRegistry
+    from agent.kernel.plugin import PluginHost
+
+    class _ThirdPartyChannel:
+        pass
+
+    class _TheirPlugin:
+        name = "acme.transport"
+        inject = ("channels",)
+
+        def setup(self, ctx):
+            ctx.channels.add(_ThirdPartyChannel())
+
+    registry = ChannelRegistry()
+    host = PluginHost()
+    host.services.provide("channels", registry)
+
+    assert registry.all() == ()
+    host.load(_TheirPlugin())
+    assert len(registry.all()) == 1
+    assert registry.owners() == ("acme.transport",)
+
+    host.unload("acme.transport")
+    assert registry.all() == (), "the channel went with the plugin that contributed it"
+
+
+def test_a_disabled_channel_contributes_nothing_but_stays_mounted() -> None:
+    """The switch stays in the config rather than moving into the composition root.
+
+    Mounting a channel plugin only when its section says ``enabled`` would put the
+    decision back in ``build_gateway_channels`` -- which is where it was, one branch per
+    channel.  Mounted unconditionally, the plugin reads its own section and contributes
+    nothing when it is off.
+    """
+    from agent.channels.plugin import WebChannelPlugin
+    from agent.channels.registry import ChannelRegistry
+    from agent.kernel.plugin import PluginHost
+
+    registry = ChannelRegistry()
+    host = PluginHost()
+    host.services.provide("channels", registry)
+    host.services.provide("cfg", {"channels": {"web": {"enabled": False}}})
+
+    host.load(WebChannelPlugin())
+    assert registry.all() == ()
+    assert host.pending() == (), "mounted and inert, not pending"
+
+
+def test_two_channels_from_one_plugin_both_survive() -> None:
+    """A list, not a mapping keyed by name.
+
+    A composition may run two web channels on different ports, and a registry keyed by
+    name would refuse the second -- so the undo removes by identity, and removing one
+    leaves the other.
+    """
+    from agent.channels.registry import ChannelRegistry
+    from agent.kernel.plugin import PluginHost
+
+    class _TheirPlugin:
+        name = "acme.transport"
+        inject = ("channels",)
+
+        def __init__(self):
+            self.made = []
+
+        def setup(self, ctx):
+            for _ in range(2):
+                channel = object()
+                self.made.append(channel)
+                ctx.channels.add(channel)
+
+    registry = ChannelRegistry()
+    host = PluginHost()
+    host.services.provide("channels", registry)
+
+    host.load(_TheirPlugin())
+    assert len(registry.all()) == 2
+
+    # Removing one leaves the other: an undo that removed by position would take the
+    # wrong one, and the symptom would be a transport stopping that nobody unloaded.
+    first = registry.all()[0]
+    registry.remove(first)
+    assert len(registry.all()) == 1
+    assert registry.all()[0] is not first

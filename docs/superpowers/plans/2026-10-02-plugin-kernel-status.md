@@ -21,7 +21,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 3 Agent Loop Plugin | **done** | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
 | 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
 | 5 Execution Plugins | **2 of 4 done, 2 have no separable boundary** | Ralph ✅ and Scheduler ✅ mounted as plugins; Orchestration / Workflow measured, see below |
-| 6 Channel Plugins | not started | CLI / Web / Feishu |
+| 6 Channel Plugins | **web + feishu done; CLI is not a channel** | `channels` is a capability service any plugin can contribute to; `CliChannel` is a stub that raises |
 | 7 Profile / Bundle / patch | partial | profiles and bundles exist from earlier work; patch semantics not unified |
 
 Commits, oldest first:
@@ -287,6 +287,34 @@ store it was given, and the plugin asserts that it does.
 **One path is still not a plugin:** the `scheduler` command builds its service directly.
 It runs nothing but the scheduler, so the "a composition can omit it" gain does not apply
 there, but the two paths now differ and that is worth knowing.
+
+## Phase 6, measured: one of the three is not a channel
+
+| Piece | What it is now | Verdict |
+|---|---|---|
+| **Web** | a branch in `build_gateway_channels`: read `channels.web.enabled`, import, filter the config against the dataclass, construct | now `agent/channels/plugin.py`, registering on the `channels` service |
+| **Feishu** | the same, second branch | now the same plugin, registering the same way |
+| **CLI** | **not a channel.** `CliChannel` is a stub whose `start` raises `NotImplementedError` ("not yet wired into ChannelRunner"); the interactive path is `_interactive_loop` | out of scope: an entry point, not a transport |
+
+The gap that mattered was not the line count of two branches.  **A plugin could contribute
+a tool, a command, a sub-agent role, an MCP config and a skill root -- and could not
+contribute a channel**, because the gateway's set was a branch per built-in in the
+composition root.  A third party's transport had to be added there.
+
+`channels` is now a capability service like the others: `ChannelRegistry` with
+`scoped(ctx)`, provided by the composition, and web and feishu are its first users rather
+than special cases in it.  `tests/test_channel_composition.py` proves the point with a
+third plugin that has no branch anywhere.
+
+**The switch stayed in the config.**  Mounting a channel plugin only when its section says
+`enabled` would have put the decision back in `build_gateway_channels`; the plugins are
+mounted unconditionally and contribute nothing when off.
+
+**One guard moved rather than being relaxed.**  `test_only_the_builder_constructs_a_channel`
+asserted that only `agent/bootstrap.py` calls `WebChannel(...)`.  The composition root no
+longer constructs a channel at all, so the single module is now
+`agent/channels/plugin.py` -- still one module, still asserted, plus a second assertion
+that the composition actually mounts the plugins it reads.
 
 ## Next step, in order
 

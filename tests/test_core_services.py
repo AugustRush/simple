@@ -1448,6 +1448,10 @@ _COMPONENT_KEYS: dict[str, str] = {
     "mcp_client": "the MCP client",
     "mcp_status": "what the MCP connection attempts did",
     "mcp_task": "the background MCP connect task",
+    "channels": (
+        "the channels a composition runs; provided so a plugin can contribute one, which"
+        " was the contribution it could not make"
+    ),
     "memory": "the memory palace",
     "runtime_factory": (
         "builds a runtime for a config; read by a scheduled run, which needs one built "

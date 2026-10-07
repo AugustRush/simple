@@ -27,6 +27,7 @@ from agent.commands.composition import ensure_command_router
 from agent.runtime.system_prompt import refresh_system_prompt
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
+from agent.channels.registry import ChannelRegistry
 from agent.ralph.plugin import RalphPlugin
 from agent.runtime.factory import RuntimeFactory
 from agent.runtime import AgentCore, TurnRunner
@@ -113,53 +114,36 @@ def _project_memory_scope(workspace_root: Path) -> str:
 
 
 def build_gateway_channels(cfg: dict) -> list[Channel]:
-    """Every channel a configuration enables, in one place.
+    """Every channel a configuration enables, collected from the channel plugins.
 
-    This lived in ``agent/channels/base.py``, where it was already the only
-    decision point -- a single function holding the ``web`` and ``feishu``
-    switches -- but the wrong layer: which channels a configuration runs is a
-    *composition* decision, and composition happens here.  The channel module
-    now re-exports the name so existing importers are unaffected.
+    This used to hold a branch per channel -- read the section, import the class, filter
+    the config against its dataclass, construct, repeat.  Two channels meant two
+    branches, and the reason that mattered is not the line count: **a plugin could not
+    contribute a channel at all**, so a third party's transport had to be added here.
 
-    A channel whose dependency is missing is reported and skipped rather than
-    aborting startup: a gateway with a broken Feishu install should still serve
-    its web channel.  Unknown keys in a channel's config section are filtered
-    against its dataclass fields, so a stale key in ``config.json`` is ignored
-    rather than raising at construction.
+    Now every channel is a plugin registering on the ``channels`` service, the built-ins
+    included, and this is the composition that mounts them.  A channel whose dependency
+    is missing reports and is skipped rather than aborting startup, which is the one
+    behaviour of the old branches that was worth keeping -- see
+    :mod:`agent.channels.plugin`.
+
+    The host is local to this call: the gateway's channels are built once, per process,
+    and a registry that outlived the call would keep transports the process is not
+    running.
     """
-    channels: list[Channel] = []
-    feishu_cfg = cfg.get("channels", {}).get("feishu", {})
-    web_cfg = cfg.get("channels", {}).get("web", {})
-    if web_cfg.get("enabled"):
-        try:
-            from agent.channels.web import WebChannel, WebConfig  # noqa: PLC0415
+    from agent.channels.plugin import FeishuChannelPlugin, WebChannelPlugin
+    from agent.channels.registry import ChannelRegistry
+    from agent.kernel.plugin import PluginHost
 
-            known_fields = WebConfig.__dataclass_fields__
-            filtered = {k: v for k, v in web_cfg.items() if k in known_fields}
-            channels.append(WebChannel(WebConfig(**filtered)))
-            shared.CONSOLE.print("[dim]Web channel enabled[/dim]")
-        except ImportError as exc:
-            shared.CONSOLE.print(
-                f"[red]Web channel requires starlette/uvicorn: {exc}[/red]"
-            )
-        except Exception as exc:
-            shared.CONSOLE.print(f"[red]Web channel init failed: {exc}[/red]")
-    if feishu_cfg.get("enabled"):
-        try:
-            from agent.channels.feishu import FeishuChannel, FeishuConfig  # noqa: PLC0415
-
-            known_fields = FeishuConfig.__dataclass_fields__
-            filtered = {k: v for k, v in feishu_cfg.items() if k in known_fields}
-            channels.append(FeishuChannel(FeishuConfig(**filtered)))
-            shared.CONSOLE.print("[dim]Feishu channel enabled[/dim]")
-        except ImportError:
-            shared.CONSOLE.print(
-                f"[red]{agent_module._missing_feishu_dependency_hint()}[/red]"
-            )
-        except Exception as exc:
-            shared.CONSOLE.print(f"[red]Feishu channel init failed: {exc}[/red]")
-
-    return channels
+    registry = ChannelRegistry()
+    host = PluginHost()
+    host.services.provide("cfg", cfg)
+    host.services.provide("channels", registry)
+    # Unconditionally: each contributes nothing unless its section says `enabled`, so the
+    # switch stays in the config rather than moving back into this function.
+    for plugin in (WebChannelPlugin(), FeishuChannelPlugin()):
+        host.load(plugin)
+    return list(registry.all())
 
 
 def _provider_client_factory(provider_cfg: dict, api_format: str) -> Any:
@@ -927,6 +911,12 @@ async def _build_components_async(
         else None
     )
     _partial_components["evolution"] = evolution
+
+    # The channels a composition runs.  Provided so a plugin can contribute one -- a
+    # tool, a command, a role, an MCP config and a skill root were all contributable and
+    # a channel was not, because the gateway's set was a branch per built-in in this
+    # file.  See `agent/channels/registry.py`.
+    _partial_components["channels"] = ChannelRegistry()
 
     # The named way to build a runtime, for anything inside a composition that needs one.
     # Six call sites already reach ``agent._build_components_async``; five of them are
