@@ -154,6 +154,11 @@ class LoopDeps:
 
     # The tool registry and the tool-loop ceiling.
     registry: Any
+    # The orchestration policy skill, by full id.  A composition sets this to point at a
+    # plugin's bundle; the default is the built-in one.  See
+    # `OrchestrationPlanner.from_skill_catalog` for why the id has to be named in full.
+    orchestration_policy_skill_id: str
+
     max_tool_call_iterations: int
 
     # Context assembly and its budgets.  ``token_budget`` is a factory rather than a
@@ -212,6 +217,9 @@ class LoopDeps:
             supports_vision=agent.supports_vision,
             registry=agent.registry,
             max_tool_call_iterations=agent.max_tool_call_iterations,
+            orchestration_policy_skill_id=getattr(
+                agent, "orchestration_policy_skill_id", "multi-agent-orchestration"
+            ),
             context_assembler=agent.context_assembler,
             context_manager_for=agent._context_manager_for,
             bounded_text=agent._bounded_text,
@@ -453,7 +461,10 @@ def plan_orchestration(
         user_message: str,
     ) -> OrchestrationDecision:
         skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
-        planner = OrchestrationPlanner.from_skill_catalog(skill_catalog)
+        planner = OrchestrationPlanner.from_skill_catalog(
+            skill_catalog,
+            policy_skill_id=deps.orchestration_policy_skill_id,
+        )
         return planner.decide(
             user_message,
             tools_enabled=ctx.tools_enabled,

@@ -26,10 +26,27 @@ class OrchestrationPlanner:
     policy_skill_id: str = "multi-agent-orchestration"
 
     @classmethod
-    def from_skill_catalog(cls, skill_catalog: SkillCatalog | None) -> "OrchestrationPlanner":
+    def from_skill_catalog(
+        cls,
+        skill_catalog: SkillCatalog | None,
+        policy_skill_id: str = "multi-agent-orchestration",
+    ) -> "OrchestrationPlanner":
+        """The policy named by *policy_skill_id*, or the defaults.
+
+        The id is a parameter rather than a constant because **a plugin's bundle cannot be
+        reached by the bare name**: plugin skills are namespaced ``plugin:<bundle>`` and
+        ``SkillCatalog._rebuild_aliases`` deliberately gives them no short alias, so that
+        one plugin cannot hijack a name another one means.  That is the right default -- an
+        unnamed override would decide how *every* turn is orchestrated -- and it left no
+        way for a composition to choose a plugin's policy **deliberately**.  Now there is:
+        the composition names the full id in ``orchestration.policy_skill_id``.
+
+        The default is unchanged, so the built-in bundle is what applies unless a
+        composition says otherwise.
+        """
         if skill_catalog is None:
             return cls()
-        bundle = skill_catalog.get("multi-agent-orchestration")
+        bundle = skill_catalog.get(policy_skill_id)
         if bundle is None:
             return cls()
         metadata = bundle.metadata or {}

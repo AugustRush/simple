@@ -20,6 +20,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 2 Service Injection | **done** | ToolRegistry ✅ `registry`, Session ✅ `context_manager`, Model ✅ `llm` |
 | 3 Agent Loop Plugin | **done** -- and `agent` itself is now a plugin | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
 | 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
+| -- Orchestration | **not a plugin: per-call state, pinned** | policy comes from `ctx.metadata["skill_catalog"]` per turn (four writers); a composition can name a plugin's policy via `orchestration.policy_skill_id` |
 | 5 Execution Plugins | **2 of 4 done, 2 have no separable boundary** | Ralph ✅ and Scheduler ✅ mounted as plugins; Orchestration / Workflow measured, see below |
 | -- Agent | **done** | `agent/core/agent_plugin.py` provides `agent`; the class is an argument, so `bootstrap.BaseAgent` is still the substitution point |
 | -- Memory | **done** | `agent/memory/plugin.py` provides `ltm_store` and `memory`; the ordering chain that blocked it is gone |
@@ -627,6 +628,26 @@ agent re-wired afterwards -- the reverse of the ordering rule every other move f
 `tests/test_orchestration_seam.py` pins both claims, so they are falsifiable rather than
 assertions in a document: it fails if the planner stops reading the call's metadata, or if
 the four writers stop being four.
+
+**And one correction to the paragraph above.**  It said the policy is composable because the
+skill catalog is a service plugins contribute to.  Half true, and the half that was wrong
+matters:
+
+- A plugin's bundle is namespaced `plugin:<bundle>` and
+  `SkillCatalog._rebuild_aliases` **deliberately** gives plugin skills no short alias, so
+  one plugin cannot hijack a name another one means.
+- `from_skill_catalog` looked the policy up by the **bare** id.
+
+So a plugin's bundle **never** decided orchestration -- correct as a default (that decision
+applies to every turn in the process) and wrong as a dead end (a composition had no way to
+choose one deliberately).  Two additions, neither changing the default:
+
+- `from_skill_catalog(catalog, policy_skill_id=...)`, so the lookup id is a parameter.
+- `orchestration.policy_skill_id` in config, reaching the planner through the agent and
+  `LoopDeps` -- the same route every other config-derived knob takes.
+
+A composition that wants a plugin's policy now names it **in full**
+(`plugin:multi-agent-orchestration`), which is a decision rather than a takeover.
 
 ## The kernel's boundary now has a test
 

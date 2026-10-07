@@ -85,6 +85,13 @@ class AgentPlugin:
             # One name, not the whole mapping: this is what the agent resolves by name.
             services={"llm": ctx.get("llm")},
         )
+        # A composition may name a plugin's policy bundle in full; the default is the
+        # built-in one, so this changes nothing unless it is configured.
+        agent.orchestration_policy_skill_id = str(
+            (cfg.get("orchestration", {}) or {}).get(
+                "policy_skill_id", "multi-agent-orchestration"
+            )
+        )
         agent.max_parallel_agents = max(
             1,
             int(cfg.get("orchestration", {}).get("max_parallel_agents", shared.DEFAULT_MAX_PARALLEL_AGENTS)),

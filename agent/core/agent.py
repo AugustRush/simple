@@ -364,6 +364,7 @@ class BaseAgent:
         output_reserve: int = shared.DEFAULT_OUTPUT_RESERVE,
         transport: Optional["ModelTransport"] = None,
         services: Any = None,
+        orchestration_policy_skill_id: str = "multi-agent-orchestration",
     ):
         #: The names this class resolves rather than receives.  One name today --
         #: ``llm`` -- and deliberately **not** the whole composition: the caller passes
@@ -424,6 +425,10 @@ class BaseAgent:
         self.context_assembler = ContextAssembler()
         self.context_manager: Optional[ContextManager] = None
         self.plugin_catalog: Optional["PluginCatalog"] = None
+        #: Which skill bundle decides how a turn is orchestrated.  The built-in one
+        #: unless a composition names another -- see the planner for why a plugin's
+        #: bundle has to be named in full.
+        self.orchestration_policy_skill_id = orchestration_policy_skill_id
         self.max_parallel_agents = shared.DEFAULT_MAX_PARALLEL_AGENTS
 
         # Spawn-batch planning (agent/core/spawn_planning.py).  Assigned
