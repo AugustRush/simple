@@ -404,6 +404,32 @@ So the capstone is: migrate `EvolutionPlugin` to the kernel protocol, then delet
 hook protocol -- 16 names and 9 dispatch sites with no remaining user.  After that there
 is one plugin protocol and no plugin receives a component mapping.
 
+**The migration is done for the plugin** (`agent/_builtin/plugins/evolution/__init__.py`):
+`setup(ctx)` with `inject = ("evolution",)`, `TURN.attach` and `SESSION.attach`.  It needed
+two pieces of vocabulary that did not exist -- `TurnCompleted` and a `session` domain --
+and finding that was most of the work.
+
+It also removed a **silent bug**.  The old handler read `components.get("evolution")`,
+found `None` (which meant *disabled*), and **built an engine anyway** from the agent, the
+model and the memory.  `evolution.enabled: false` was defeated by the plugin supposed to
+honour it.  The fallback existed because `on_session_start` fires with a *partial* mapping
+during discovery, so the plugin could not tell "not configured" from "not built yet";
+`inject` answers that, and the three states are now distinct -- absent is *pending*,
+present-as-`None` is *active with no engine*, present is *active*.
+
+Two consequences worth naming:
+
+- **`self._components` was dead** -- assigned twice, read zero times.  Its need for the
+  whole composition was conventional.
+- **The interactive loop's catalog had no components**, so the plugin's `inject` could not
+  be satisfied from it.  That is *why* the hook protocol handed the mapping to
+  `on_session_start`: it was a workaround for a host that could not resolve services for
+  its plugins.  The loop now passes its mapping.
+
+What remains of the hook protocol: the dispatch code and its tests.  No plugin implements
+a hook any more, so it can be deleted -- which is the next step, and now a deletion rather
+than a migration.
+
 ## What is still not a plugin
 
 The seven phases are done.  Measured against the objective's list rather than the phase

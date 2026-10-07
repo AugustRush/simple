@@ -3689,3 +3689,44 @@ def test_evolution_is_active_with_no_engine_when_the_service_is_present() -> Non
     assert host.pending() == (), "present, so active"
     plugin = next(iter(host.installs.values())).plugin
     assert plugin._engine is None
+
+
+def test_bootstrap_omits_the_evolution_service_when_disabled() -> None:
+    """The other half of ``evolution.enabled: false``, and the half a test missed.
+
+    Written after a probe: setting the key to ``None`` again -- the bug -- left the
+    plugin's own test passing, because that test builds its own ``PluginHost`` and never
+    reads ``bootstrap``.  The fix has two halves and only one was covered.
+
+    Asserted at the source, because the alternative is building a whole composition, which
+    reaches for providers and a filesystem.  The statement is structural and the intent is
+    behavioural: the assignment must sit inside an ``if``.  The behavioural half -- absent
+    means *pending* -- is
+    ``test_evolution_is_pending_when_the_composition_has_no_engine``.
+    """
+    import ast as _ast
+
+    source = (Path(__file__).resolve().parents[1] / "agent/bootstrap.py").read_text(
+        encoding="utf-8"
+    )
+    tree = _ast.parse(source)
+
+    def assigns_evolution(node: _ast.AST) -> bool:
+        return isinstance(node, _ast.Assign) and any(
+            isinstance(target, _ast.Subscript)
+            and isinstance(target.slice, _ast.Constant)
+            and target.slice.value == "evolution"
+            for target in node.targets
+        )
+
+    inside_if = any(
+        assigns_evolution(child)
+        for parent in _ast.walk(tree)
+        if isinstance(parent, _ast.If)
+        for child in _ast.walk(parent)
+    )
+    assert inside_if, (
+        "bootstrap must provide `evolution` only when it is enabled: providing the key "
+        "with a None value makes 'disabled' and 'no engine' the same, and the plugin "
+        "cannot tell them apart -- which is the bug this pair of changes removed"
+    )
