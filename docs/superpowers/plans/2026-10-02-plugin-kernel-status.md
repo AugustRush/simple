@@ -512,6 +512,28 @@ The diagnosis that mattered took one print, placed **before** the early return r
 after it: two rounds of bisecting files could not see a mistake in a diff I had written
 myself, and a single `print(self._engine)` could.
 
+## The ordering constraint on `memory` is gone
+
+The chain was `memory` (L596) -> `EvolutionEngine` (L909) -> catalog (L932), so anything
+mounted by the catalog provided `memory` too late.  The engine moved into its plugin last
+round; the second consumer was `BuiltinTools`, and that block now runs **after**
+`discover_and_load()`.
+
+Measured before moving, because a reorder is only safe if nothing in between reads what
+moved: nothing between the block and the mount reads a tool from the registry
+(`list_tools`, `tool_capabilities`, `tools_with_capability`, `tool_source`,
+`to_anthropic_format`, `call` -- none), and the catalog registers no tools of its own, so
+the builtins-versus-plugins registration order does not change.  The registry context the
+block sets is read by tools **at call time**, which is why it could travel with them.
+
+Verified as a reordering: **134 -> 134** top-level statements in
+`_build_components_async`, **identical as a multiset**.
+
+What is left before `MemoryPlugin` is small and named: the component-mapping literal
+still refers to the `memory` local, and the moved block still reads that local rather than
+the service.  Both become `require_service(components, "memory")`, and then the
+construction itself can move into the plugin.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

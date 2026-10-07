@@ -632,58 +632,6 @@ async def _build_components_async(
         route_keywords=ctx_cfg.get("route_keywords"),
         project_scope=_project_memory_scope(workspace_root),
     )
-
-    builtin_tools_cls(
-        memory,
-        registry,
-        context_manager=ctx_manager,
-        workspace_root=workspace_root,
-        chapter_normalizer=lambda chapter: normalize_memory_chapter(
-            chapter, legacy_memory_aliases
-        ),
-        output_dir=output_dir,
-        file_service=file_service,
-    )
-
-    # Share output_dir with skills via registry context
-    registry.set_context("output_dir", str(output_dir))
-    registry.set_context("file_access_policy", file_policy)
-    registry.set_context("supports_vision", supports_vision)
-    registry.set_context(
-        "shell_blocked_commands",
-        list(cfg.get("shell_blocked_commands", [])),
-    )
-    registry.set_context(
-        "shell_allowed_commands",
-        list(cfg.get("shell_allowed_commands", [])),
-    )
-    registry.set_context(
-        "shell_permission_level",
-        str(
-            (cfg.get("permissions") or {}).get("shell_level", "ask") or "ask"
-        ),
-    )
-    registry.set_context(
-        "shell_sandbox_mode",
-        str(
-            (cfg.get("permissions") or {}).get("shell_sandbox", "read_all")
-            or "read_all"
-        ),
-    )
-    registry.set_context(
-        "shell_devices",
-        bool((cfg.get("permissions") or {}).get("shell_devices", True)),
-    )
-    registry.set_context(
-        "shell_secret_paths",
-        tuple(
-            str(entry).strip()
-            for entry in (
-                (cfg.get("permissions") or {}).get("shell_secret_paths") or ()
-            )
-            if str(entry).strip()
-        ),
-    )
     if announce:
         # A posture nobody can see is a posture nobody maintains.  Running
         # unsandboxed is a deliberate, temporary choice that lives in a
@@ -935,6 +883,59 @@ async def _build_components_async(
     )
     _partial_components["plugin_catalog"] = plugin_catalog
     loaded_plugins = plugin_catalog.discover_and_load()
+
+
+    builtin_tools_cls(
+        memory,
+        registry,
+        context_manager=ctx_manager,
+        workspace_root=workspace_root,
+        chapter_normalizer=lambda chapter: normalize_memory_chapter(
+            chapter, legacy_memory_aliases
+        ),
+        output_dir=output_dir,
+        file_service=file_service,
+    )
+
+    # Share output_dir with skills via registry context
+    registry.set_context("output_dir", str(output_dir))
+    registry.set_context("file_access_policy", file_policy)
+    registry.set_context("supports_vision", supports_vision)
+    registry.set_context(
+        "shell_blocked_commands",
+        list(cfg.get("shell_blocked_commands", [])),
+    )
+    registry.set_context(
+        "shell_allowed_commands",
+        list(cfg.get("shell_allowed_commands", [])),
+    )
+    registry.set_context(
+        "shell_permission_level",
+        str(
+            (cfg.get("permissions") or {}).get("shell_level", "ask") or "ask"
+        ),
+    )
+    registry.set_context(
+        "shell_sandbox_mode",
+        str(
+            (cfg.get("permissions") or {}).get("shell_sandbox", "read_all")
+            or "read_all"
+        ),
+    )
+    registry.set_context(
+        "shell_devices",
+        bool((cfg.get("permissions") or {}).get("shell_devices", True)),
+    )
+    registry.set_context(
+        "shell_secret_paths",
+        tuple(
+            str(entry).strip()
+            for entry in (
+                (cfg.get("permissions") or {}).get("shell_secret_paths") or ()
+            )
+            if str(entry).strip()
+        ),
+    )
     if loaded_plugins and announce:
         console.print("[green]Plugins loaded:[/green] " + ", ".join(loaded_plugins))
 
