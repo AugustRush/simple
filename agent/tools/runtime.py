@@ -336,6 +336,19 @@ def _validate_tool_input(tool_input: Any, schema: Any) -> Optional[dict]:
 
 
 class ToolRegistry:
+    def scoped(self, ctx: Any) -> Any:
+        """A view of this registry bound to *ctx*'s lifetime.
+
+        The kernel calls this when a plugin reaches ``ctx.<name>`` for the registry,
+        so a registration made through the view is undone when the plugin unloads --
+        see :mod:`agent.tools.scoped`.  Declared here rather than inferred: the kernel
+        asks a service whether it supports scoping, and a service that does not is
+        handed over unchanged and keeps its identity for an ``is`` check.
+        """
+        from agent.tools.scoped import ScopedTools
+
+        return ScopedTools(self, ctx)
+
     """Central registry for all tools."""
 
     _DEFAULT_TOOL_CAPABILITIES: dict[tuple[str, str], frozenset[str]] = {

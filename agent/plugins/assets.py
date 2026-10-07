@@ -123,29 +123,26 @@ class _ScopedAssets:
         self._ctx.on_unwind(lambda: catalog._agent_defs.pop(key, None))
 
     def add_tool(self, tool: Any) -> Any:
-        """Contribute one tool, if the composition mounted a registry.
+        """Contribute one tool.  Delegates to the registry's scoped view.
 
-        Absent one this is a no-op rather than an error: a plugin must stay
-        loadable in a composition that does not mount tools, which is the same
-        reason every other optional capability in this codebase degrades quietly.
+        Kept as a name because the contribution service is where a plugin looks for
+        "the things I can add", and because the plan's model says a tool is something
+        registered *on a service* rather than a kind of plugin.  The registry owns the
+        mechanism -- see :meth:`agent.tools.runtime.ToolRegistry.scoped` -- so there is
+        one implementation of "register a tool and arrange for its removal" rather than
+        one here and one there.
+
+        A no-op when the composition mounted no registry: a plugin must stay loadable
+        in a composition without tools, which is the same reason every other optional
+        capability in this codebase degrades quietly.
         """
         registry = getattr(self._catalog, "_tool_registry", None)
         if registry is None:
             return None
-        source = f"plugin:{self.owner}"
-        registry.register(
-            getattr(tool, "name", None),
-            getattr(tool, "description", "") or "",
-            getattr(tool, "parameters", {}) or {"type": "object", "properties": {}},
-            getattr(tool, "fn", tool),
-            source=source,
-            capabilities=getattr(tool, "capabilities", None),
-            replace=True,
-        )
-        # By source prefix rather than by name: one plugin may contribute several
-        # tools, and the prefix is what identifies them as a group.
-        self._ctx.on_unwind(lambda: registry.unregister_by_source_prefix(source))
-        return None
+        scoped = getattr(registry, "scoped", None)
+        if not callable(scoped):
+            return None
+        return scoped(self._ctx).register(tool)
 
 
 def _drop_identity(items: list, entry: Any) -> None:
