@@ -673,6 +673,38 @@ Two false positives had to be resolved by **provenance rather than by loosening 
 or one that `hasattr(builtins, ...)`, is not this project's vocabulary -- dropping it keeps
 the rule strict for real names.
 
+## Hot swap: replacement used to delete what it replaced
+
+`load(plugin, replace=True)` unloaded the incumbent, which correctly took its dependents
+down -- they held a service whose owner was about to be gone -- **and then left them down**.
+
+Measured, before it was fixed:
+
+```
+load MemoryPlugin + SessionPlugin   -> loaded ('memory', 'session')
+load OtherMemory(replace=True)      -> loaded ('memory',)
+                                       'context_manager' gone, nothing pending, no error
+```
+
+So swapping the provider of `ltm_store` permanently removed `context_manager`. That is not
+replacement, it is deletion with replacement's name -- and the dependent could not even
+refuse the new implementation, because it was gone.
+
+The fix is small and the kernel already had everything needed: `Install` keeps `plugin` and
+`parent`, so the dependents are captured **before** the unload, in activation order, and
+re-loaded after the replacement is in.  A replacement that does not satisfy them leaves them
+**pending**, which `waiting_for` reports by name -- visible, not silent.
+
+`PluginCatalog` already loads discovered plugins with `replace=True`, so reloading a plugin
+from disk goes through this same path.
+
+**A note on the baseline.**  One full-suite run in this round reported a fourth failure,
+`test_ralph.py::test_verifier_escalates_for_live_process_group_after_leader_exits[caller]`.
+It did not reproduce: the same tree then ran three times clean, the test passes 3/3 alone and
+in its own file, and the failure is in process-group signal handling, which this change does
+not touch.  Recorded here rather than silently ignored, because a baseline that is compared
+by diff has to say when it was seen once.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

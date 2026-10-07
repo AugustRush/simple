@@ -196,6 +196,15 @@ class PluginHost:
         its dependents down -- so a replacement cannot leave the tree holding half of
         one plugin and half of another.  The alternative, silently overwriting the
         name, is what makes "which implementation is live?" depend on load order.
+
+        **And it brings the dependents back.**  Taking them down is right -- they held
+        a service whose owner was about to be gone -- but leaving them down is not
+        replacement, it is deletion: swapping the provider of ``ltm_store`` used to
+        leave ``context_manager`` permanently absent, with no error and nothing
+        pending, because the dependent had been *unloaded* rather than left waiting.
+        Each one is re-loaded after the replacement is in; if the replacement does not
+        supply what it needs, it stays **pending**, which is visible in
+        :meth:`waiting_for` rather than silent.
         """
         name = getattr(plugin, "name", None)
         if not isinstance(name, str) or not name:
@@ -203,9 +212,11 @@ class PluginHost:
                 f"{type(plugin).__name__} has no 'name'; a plugin must be "
                 f"identifiable to be looked up, unloaded, or depended on"
             )
+        dependents: list[Install] = []
         if name in self._installs or name in self._pending:
             if not replace:
                 raise ValueError(f"plugin {name!r} is already loaded")
+            dependents = self._capture_dependents(name)
             self.unload(name)
 
         scope = self.services.scope()
@@ -224,7 +235,40 @@ class PluginHost:
             # waiter.  Re-checking after every load would activate a plugin the
             # moment any unrelated plugin appeared.
             self._flush_pending()
+
+        for dependent in dependents:
+            self.load(dependent.plugin, parent=dependent.parent)
         return install
+
+    def _capture_dependents(self, name: str) -> list[Install]:
+        """Everything ``unload(name)`` would take down, in activation order.
+
+        Captured *before* the unload, because afterwards the installs are gone and only
+        their names would remain.  Children are included for the same reason
+        ``unload`` includes them: a parent's scope owns the records that installed
+        them, so they go down too -- and a replacement that restored only the direct
+        dependents would leave a subtree missing.
+        """
+        taken: set[str] = set()
+
+        def collect(target: str) -> None:
+            for dependent in self._dependents_of(target):
+                if dependent in taken:
+                    continue
+                taken.add(dependent)
+                collect(dependent)
+            install = self._installs.get(target)
+            for child in list(install.children) if install else []:
+                if child in taken:
+                    continue
+                taken.add(child)
+                collect(child)
+
+        collect(name)
+        # Activation order, so a provider is re-loaded before the plugin that
+        # injects it -- `load` would otherwise leave the dependent pending until a
+        # later flush, which is correct but reads as flapping in a log.
+        return [self._installs[n] for n in self._installs if n in taken]
 
     def _activate(self, install: Install) -> bool:
         """Run ``setup`` if every injected service exists.  Returns activation."""

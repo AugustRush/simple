@@ -783,9 +783,20 @@ def test_a_plain_duplicate_is_still_refused() -> None:
         host.load(Leaf())
 
 
-def test_replacing_takes_the_incumbents_dependents_with_it() -> None:
-    """The incumbent's dependents declared a dependency on *it*; a replacement is a
-    different implementation and does not inherit that relationship."""
+def test_replacing_reactivates_dependents_because_a_dependency_is_a_name() -> None:
+    """The opposite of what this test first asserted, and the first assertion was wrong.
+
+    It said the incumbent's dependents "declared a dependency on *it*", so a replacement
+    -- being a different implementation -- should not inherit the relationship.  That
+    reads well and contradicts the kernel's own model: ``inject`` names **services**, the
+    graph is keyed by name, and ``has(name)`` is key presence.  A replacement provides the
+    same name, so it satisfies the same dependency.
+
+    The cost of the old behaviour was not a wrong answer in a diagnostic; it was that
+    replacing a provider silently **deleted everything above it**, with nothing pending
+    and no error.  A dependent that wanted to refuse the new implementation could not:
+    it was gone.
+    """
     host = PluginHost()
     dependent = NeedsLeaf()
     host.load(dependent)
@@ -793,7 +804,12 @@ def test_replacing_takes_the_incumbents_dependents_with_it() -> None:
     assert dependent.activated
 
     host.load(Leaf(), replace=True)
-    assert "needs_leaf" not in host.loaded()
+
+    assert "needs_leaf" in host.loaded(), (
+        "the dependent must be re-activated: its dependency is the name `leaf`, which the "
+        "replacement provides"
+    )
+    assert dependent.activated, "and it re-reads the service rather than keeping the old one"
 
 
 def test_replacing_a_pending_plugin_works_too() -> None:
@@ -1048,3 +1064,161 @@ def test_without_a_wired_table_the_context_accepts_anything() -> None:
     plugin = _Subscriber()
     host.load(plugin)
     assert plugin.ctx.on(TurnCompleted, lambda event: None) is not None
+
+
+# ── replacement is an act, not a collision ────────────────────────────────────
+
+
+class _Provider:
+    """Provides ``thing``, with a value a test can recognise."""
+
+    def __init__(self, value: object, *, extra: tuple[str, ...] = ()) -> None:
+        self.name = "provider"
+        self.inject = ("cfg",)
+        self._value = value
+        self._extra = extra
+
+    def setup(self, ctx) -> None:
+        ctx.provide("thing", self._value)
+        for name in self._extra:
+            ctx.provide(name, self._value)
+
+
+class _Consumer:
+    name = "consumer"
+    inject = ("thing",)
+
+    def __init__(self) -> None:
+        self.seen = None
+        self.activated = 0
+
+    def setup(self, ctx) -> None:
+        self.seen = ctx.get("thing")
+        self.activated += 1
+
+
+class _DeepConsumer:
+    name = "deep"
+    inject = ("middle",)
+
+    def setup(self, ctx) -> None:
+        ctx.provide("deep_done", True)
+
+
+class _Middle:
+    name = "middle"
+    inject = ("thing",)
+
+    def setup(self, ctx) -> None:
+        ctx.provide("middle", True)
+
+
+def _host(mapping=None):
+    from agent.kernel.service import ServiceRegistry
+
+    mapping = mapping if mapping is not None else {"cfg": {}}
+    return PluginHost(services=ServiceRegistry.adopt(mapping)), mapping
+
+
+def test_replacing_a_provider_brings_its_dependents_back() -> None:
+    """Swapping a provider used to delete everything above it.
+
+    ``load(replace=True)`` unloaded the incumbent, which correctly took its dependents
+    down -- they held a service whose owner was about to be gone -- and then left them
+    down.  So replacing the provider of ``thing`` left ``consumer`` permanently absent,
+    with no error and nothing pending: the dependent had been *unloaded*, not left
+    waiting.  That is deletion wearing replacement's name.
+    """
+    host, mapping = _host()
+    host.load(_Provider("first"))
+    consumer = _Consumer()
+    host.load(consumer)
+    assert host.loaded() == ("provider", "consumer")
+
+    host.load(_Provider("second"), replace=True)
+
+    assert host.loaded() == ("provider", "consumer"), (
+        "the dependent must come back, not be lost"
+    )
+    assert mapping["thing"] == "second"
+    assert consumer.seen == "second", "the replacement's value must reach the dependent"
+    assert consumer.activated == 2, "the dependent is re-activated, not merely remembered"
+
+
+def test_a_replacement_that_does_not_satisfy_leaves_the_dependent_pending() -> None:
+    """The honest failure: visible, and naming what is missing.
+
+    A dependent that cannot be satisfied must not silently vanish, and must not pretend
+    to be active.  It stays in ``pending`` and ``waiting_for`` says why.
+    """
+    host, mapping = _host()
+    host.load(_Provider("first"))
+    host.load(_Consumer())
+
+    class _Insufficient:
+        name = "provider"
+        inject = ("cfg",)
+
+        def setup(self, ctx) -> None:
+            pass  # provides nothing
+
+    host.load(_Insufficient(), replace=True)
+
+    assert host.loaded() == ("provider",)
+    assert host.pending() == ("consumer",)
+    assert host.waiting_for() == {"consumer": ("thing",)}
+    assert "thing" not in mapping, "the old value must not survive its provider"
+
+
+def test_a_plain_unload_still_takes_dependents_down() -> None:
+    """Control: the restore is specific to replacement, not a weakening of unload.
+
+    An unload with no replacement really does mean the service is gone, so leaving the
+    dependents active would leave them holding a dead reference.
+    """
+    host, mapping = _host()
+    host.load(_Provider("first"))
+    host.load(_Consumer())
+
+    host.unload("provider")
+
+    assert host.loaded() == ()
+    assert host.pending() == ()
+    assert "thing" not in mapping
+
+
+def test_replacement_restores_a_chain_not_only_direct_dependents() -> None:
+    """A subtree comes back, not just the first level.
+
+    ``consumer`` injects ``thing``; ``middle`` injects ``thing`` and provides
+    ``middle``; ``deep`` injects ``middle``.  Everything above the replaced provider
+    went down with it, so everything above it has to come back.
+    """
+    host, mapping = _host()
+    host.load(_Provider("first"))
+    host.load(_MidCfg := _Middle())  # noqa: F841 - named for readability
+    host.load(_DeepConsumer())
+
+    host.load(_Provider("second"), replace=True)
+
+    assert host.loaded() == ("provider", "middle", "deep")
+    assert mapping["middle"] is True
+    assert mapping["deep_done"] is True
+
+
+def test_replacement_keeps_the_activation_order_of_the_restored_plugins() -> None:
+    """Providers first, so a dependent does not briefly wait for one it needs.
+
+    Re-loading in the wrong order would still end up correct -- ``_flush_pending``
+    resolves it -- but it would log a plugin flapping through ``pending``, and the
+    order is free to get right here.
+    """
+    host, _ = _host()
+    host.load(_Provider("first"))
+    host.load(_Middle())
+    host.load(_DeepConsumer())
+
+    host.load(_Provider("second"), replace=True)
+
+    order = list(host.loaded())
+    assert order.index("provider") < order.index("middle") < order.index("deep")
