@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 from agent import shared
 from agent.core.events import TOOL_EVENTS, ToolPostExecute, ToolPreExecute
 from agent.core.output import _active_event_collector
+from agent.kernel.plugin import PluginHost
 from agent.plugins.profile_selection import profile_from_config
 from agent.plugins.profiles import resolve_plugin_state
 
@@ -981,6 +982,7 @@ class PluginCatalog:
         plugin_config: Optional[dict] = None,
         turn_hook_timeout_seconds: float = shared.DEFAULT_TURN_HOOK_TIMEOUT_SECONDS,
         event_bus: Any = None,
+        components: Optional[dict] = None,
     ) -> None:
         self._builtin_dir = builtin_dir
         self._user_dir = user_dir
@@ -1028,7 +1030,19 @@ class PluginCatalog:
         # breaks that cycle at the one point where it is not needed yet.
         from agent.runtime.services import ServiceRegistry
 
-        self._services = ServiceRegistry()
+        #: The kernel for this catalog: services, events, the plugin tree, and
+        #: the lifecycle.  The registry **adopts the runtime's component mapping**
+        #: when it is given one, so a plugin-provided service and a runtime service
+        #: live in one namespace -- ``inject = ("registry",)`` can name the tool
+        #: registry the same way it names a plugin's service.
+        #:
+        #: Adopting rather than copying is what keeps the two views from drifting:
+        #: ``RuntimeComponents.services`` and this registry are then the same
+        #: storage, so a plugin that replaces a service replaces it for the
+        #: runtime too.  That is the point of "replacement is a first-class act".
+        _registry = ServiceRegistry.adopt(components) if isinstance(components, dict) else ServiceRegistry()
+        self._host = PluginHost(services=_registry)
+        self._services = self._host.services
         #: The *core* services, in a container of their own.  Distinct from
         #: ``_services`` above, which holds what plugins provide: the two are
         #: different populations, and conflating them would let a plugin's service

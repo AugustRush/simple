@@ -892,14 +892,10 @@ async def _build_components_async(
         else None
     )
 
-    # ── Plugin Catalog ────────────────────────────────────────────────────────
-    plugin_catalog = PluginCatalog(
-        builtin_dir=plugins_dir,
-        user_dir=user_plugins_dir,
-        plugin_config=cfg.get("plugins", {}),
-    )
     # Build a partial components dict so plugins can self-initialize via
     # on_session_start(); the dict is updated in-place after discover_and_load.
+    # It is also what the plugin catalog's kernel adopts as its service storage,
+    # so plugins and the runtime share one namespace rather than two.
     _partial_components: dict = {
         "client": client,
         "client_provider": client_provider,
@@ -918,6 +914,15 @@ async def _build_components_async(
         "file_service": file_service,
         "cfg": cfg,
     }
+    # ── Plugin Catalog ────────────────────────────────────────────────────────
+    # Constructed after the partial components because the kernel adopts them.
+    plugin_catalog = PluginCatalog(
+        builtin_dir=plugins_dir,
+        user_dir=user_plugins_dir,
+        plugin_config=cfg.get("plugins", {}),
+        components=_partial_components,
+    )
+    _partial_components["plugin_catalog"] = plugin_catalog
     loaded_plugins = plugin_catalog.discover_and_load()
     if loaded_plugins and announce:
         console.print("[green]Plugins loaded:[/green] " + ", ".join(loaded_plugins))
