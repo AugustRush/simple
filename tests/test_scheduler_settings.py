@@ -254,3 +254,78 @@ def test_cli_can_actually_reach_the_resolution() -> None:
     assert len(calls) >= 2, (
         f"both entry points resolve through the one constructor; found {len(calls)}"
     )
+
+
+# ── The builder takes its components; it does not build or own them ──────────
+
+
+def _builder_signature() -> ast.FunctionDef:
+    tree = ast.parse((REPO_ROOT / "agent" / "cli.py").read_text(encoding="utf-8"))
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_build_scheduler_service"
+    )
+
+
+def test_the_builder_is_synchronous() -> None:
+    """Its awaits are all inside the two executor coroutines it hands the service.
+
+    Construction needs none: the components it used to build are now the caller's, and
+    a run's execution is async wherever it is written.  This is the prerequisite for the
+    scheduler being a plugin at all -- the kernel calls ``setup`` synchronously, so a
+    builder that needed ``await`` would have to be reached some other way.
+    """
+    fn = _builder_signature()
+    nested = {
+        id(node)
+        for child in ast.walk(fn)
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child is not fn
+        for node in ast.walk(child)
+    }
+    outside = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.Await) and id(node) not in nested
+    ]
+    assert not outside, (
+        "an await in the builder's own body makes construction asynchronous; "
+        f"found {len(outside)} at lines {[n.lineno for n in outside]}"
+    )
+
+
+def test_the_builder_requires_components_rather_than_building_them() -> None:
+    """``components=None`` used to mean "build me a runtime", and the return value
+    carried a flag saying whether the caller should close it.
+
+    A flag whose only job is to answer "who tears this down" is the bookkeeping a scope
+    exists to remove.  The gateway always passed its own components; the one caller that
+    did not now builds them itself and closes them itself.
+    """
+    fn = _builder_signature()
+    args = [a.arg for a in fn.args.args] + [a.arg for a in fn.args.kwonlyargs]
+    assert "components" in args, "the parameter must still exist"
+    components = next(
+        a for a in fn.args.kwonlyargs if a.arg == "components"
+    )
+    assert components.annotation is not None, (
+        "components is required now; an unannotated or defaulted parameter would let a "
+        "caller omit it and mean 'build me one' again"
+    )
+
+    # It returns the service and the store, and nothing for the caller to close.
+    returns = [node for node in ast.walk(fn) if isinstance(node, ast.Return) and node.value]
+    for node in returns:
+        if isinstance(node.value, ast.Tuple):
+            assert len(node.value.elts) == 2, (
+                "the builder returns (service, store); a third element is the "
+                "ownership flag coming back"
+            )
+
+
+def test_the_ownership_flag_is_gone_from_the_source() -> None:
+    """Asserted on the name, because that is what would reappear."""
+    source = (REPO_ROOT / "agent" / "cli.py").read_text(encoding="utf-8")
+    assert "owned_components" not in source, (
+        "owned_components answered 'who closes these'; the scope answers it now"
+    )

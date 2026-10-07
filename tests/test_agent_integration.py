@@ -7422,7 +7422,7 @@ def test_gateway_starts_background_scheduler(monkeypatch):
     async def fake_build_components_async(cfg):
         return {"agent": object()}
 
-    async def fake_build_scheduler_service(
+    def fake_build_scheduler_service(
         cfg,
         poll_seconds,
         lease_seconds,
@@ -7435,7 +7435,7 @@ def test_gateway_starts_background_scheduler(monkeypatch):
         # Accepted because the gateway now passes it; asserted so a future change
         # that stops passing it fails here rather than silently uncomposing runs.
         assert callable(config_loader), "the gateway must hand the run loader over"
-        return _FakeService(), _FakeStore(), {"scheduler_components": True}
+        return _FakeService(), _FakeStore()
 
     async def fake_close_components(components):
         if components.get("scheduler_components"):
@@ -7454,7 +7454,12 @@ def test_gateway_starts_background_scheduler(monkeypatch):
     assert started["stopped"] == 1
     assert started["runner"] == 1
     assert started["store_closed"] == 1
-    assert started["sched_closed"] == 1
+    # The scheduler runs in the gateway's own components, so there are no separate ones
+    # to close.  The builder used to take `components=None` to mean "build me a runtime"
+    # and return it so the caller knew to close it -- a flag whose only purpose was to
+    # answer "who tears this down".  The gateway always reused its own, and the one
+    # caller that did not now builds them itself.
+    assert started["sched_closed"] == 0
 
 
 def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
@@ -7485,7 +7490,7 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
     async def fake_build_components_async(cfg):
         return primary_components
 
-    async def fake_build_scheduler_service(
+    def fake_build_scheduler_service(
         cfg,
         poll_seconds,
         lease_seconds,
@@ -7497,7 +7502,7 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
         assert max_concurrent_runs == 3
         assert callable(config_loader), "the gateway must hand the run loader over"
         observed["scheduler"] = components
-        return _FakeService(), _FakeStore(), None
+        return _FakeService(), _FakeStore()
 
     async def fake_close_components(components):
         return None
@@ -8882,7 +8887,7 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
         "agent_loop": turn_runner,
     }
 
-    service, _store, _components = asyncio.run(
+    service, _store = (
         cli_module._build_scheduler_service(
             _minimal_cfg(),
             poll_seconds=1,
@@ -8943,7 +8948,7 @@ def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_
         "output_dir": tmp_path,
     }
 
-    service, _store, _components = asyncio.run(
+    service, _store = (
         cli_module._build_scheduler_service(
             _minimal_cfg(),
             poll_seconds=1,
@@ -9028,7 +9033,7 @@ def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
     cfg["file_access"] = {"workspace": {"read": True, "write": True}}
     cfg["permissions"] = {"shell_sandbox": "danger-full-access"}
     primary = {"output_dir": tmp_path, "workspace_root": tmp_path}
-    service, _store, _components = asyncio.run(
+    service, _store = (
         cli_module._build_scheduler_service(
             cfg,
             poll_seconds=1,
@@ -9126,7 +9131,7 @@ def test_scheduler_agent_executor_hands_the_run_its_upstream_results(
     monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
     monkeypatch.setattr(agent_module, "_close_components", fake_close)
 
-    service, _store, _components = asyncio.run(
+    service, _store = (
         cli_module._build_scheduler_service(
             _minimal_cfg(),
             poll_seconds=1,
@@ -9255,7 +9260,7 @@ def test_scheduler_agent_executor_grants_workspace_writes_and_states_the_envelop
     cfg = _minimal_cfg()
     cfg["file_access"] = {"workspace": {"read": True, "write": False}}
     cfg["permissions"] = {"shell_level": "ask", "shell_sandbox": "read_all"}
-    service, _store, _components = asyncio.run(
+    service, _store = (
         cli_module._build_scheduler_service(
             cfg,
             poll_seconds=1,
@@ -9315,7 +9320,7 @@ def test_scheduler_agent_executor_refuses_write_profile_without_a_workspace(
         cli_module, "_scheduler_store", lambda: types.SimpleNamespace()
     )
 
-    service, _store, _components = asyncio.run(
+    service, _store = (
         cli_module._build_scheduler_service(
             _minimal_cfg(),
             poll_seconds=1,
@@ -10452,7 +10457,7 @@ def test_a_scheduled_run_reads_the_config_on_disk_not_the_startup_snapshot(
     on_disk["providers"]["fake"]["headers"] = {"x-opencode-session": "{session}"}
     monkeypatch.setattr(agent_module, "load_config_for_run", lambda fallback: on_disk)
 
-    service, _store, _components = asyncio.run(
+    service, _store = (
         cli_module._build_scheduler_service(
             startup_cfg,
             poll_seconds=1,

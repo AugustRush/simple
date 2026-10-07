@@ -741,14 +741,14 @@ def _describe_upstream_results(snapshot: dict) -> str:
     )
 
 
-async def _build_scheduler_service(
+def _build_scheduler_service(
     cfg: dict,
     *,
     poll_seconds: float,
     lease_seconds: int,
     max_concurrent_runs: int,
     signal_max_depth: int = DEFAULT_SIGNAL_MAX_DEPTH,
-    components: Optional[dict] = None,
+    components: dict,
     config_loader: Optional[Callable[[], dict]] = None,
 ):
     """Build the scheduler service and the executor its runs go through.
@@ -762,9 +762,6 @@ async def _build_scheduler_service(
     until somebody restarted the process.  Callers that hold a config that is
     not on disk (tests) pass their own loader.
     """
-    owned_components = components is None
-    if components is None:
-        components = await agent_module._build_components_async(cfg)
     store = _scheduler_store()
     delivery = SchedulerDelivery(
         cfg=cfg,
@@ -1038,7 +1035,7 @@ async def _build_scheduler_service(
         max_concurrent_runs=max_concurrent_runs,
         signal_max_depth=signal_max_depth,
     )
-    return service, store, components if owned_components else None
+    return service, store
 
 
 # ── CLI SIGINT handler (Ctrl+C → cancel turn, not exit process) ──────────
@@ -1553,7 +1550,6 @@ def gateway(
         scheduler_signal_depth = scheduler_settings.signal_max_depth
         scheduler_task: Optional[asyncio.Task] = None
         scheduler_store = None
-        scheduler_components = None
         try:
             channels = _build_gateway_channels(cfg)
             if not channels:
@@ -1566,7 +1562,7 @@ def gateway(
                 f"[dim]Gateway starting {len(channels)} channel(s). "
                 "Press Ctrl-C to stop.[/dim]"
             )
-            service, scheduler_store, scheduler_components = await _build_scheduler_service(
+            service, scheduler_store = _build_scheduler_service(
                 cfg,
                 poll_seconds=scheduler_poll,
                 lease_seconds=scheduler_lease,
@@ -1592,8 +1588,6 @@ def gateway(
                 await service.shutdown()
             if scheduler_store is not None:
                 scheduler_store.close()
-            if scheduler_components is not None:
-                await agent_module._close_components(scheduler_components)
             await agent_module._close_components(components)
 
     try:
@@ -1988,13 +1982,21 @@ def scheduler(
     effective_signal_depth = settings.signal_max_depth
 
     async def _run():
-        service, store, components = await _build_scheduler_service(
-            cfg,
-            poll_seconds=effective_poll,
-            lease_seconds=effective_lease,
-            max_concurrent_runs=effective_max_concurrent,
-            signal_max_depth=effective_signal_depth,
-        )
+        # Built here rather than by the builder: the builder answers "what is a
+        # scheduler", and constructing a whole runtime is the composition root's job.
+        components = await agent_module._build_components_async(cfg)
+        try:
+            service, store = _build_scheduler_service(
+                cfg,
+                poll_seconds=effective_poll,
+                lease_seconds=effective_lease,
+                max_concurrent_runs=effective_max_concurrent,
+                signal_max_depth=effective_signal_depth,
+                components=components,
+            )
+        except BaseException:
+            await agent_module._close_components(components)
+            raise
         shared.CONSOLE.print(
             "[dim]Scheduler running "
             f"(poll={effective_poll}s, lease={effective_lease}s, "
