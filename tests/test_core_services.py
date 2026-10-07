@@ -107,13 +107,20 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                 name_id = func.id if isinstance(func, ast.Name) else ""
                 if attr == "set_context":
                     note(writers, _string_key(node), rel)
-                elif attr in ("get", "pop", "require"):
+                elif attr in ("get", "pop", "require", "lookup", "resolve"):
+                    # ``lookup``/``resolve`` are the container accessors that
+                    # tolerate absence; ``require`` is the one that does not.  All
+                    # of them are container-mediated reads, which is the property
+                    # this scanner is checking for.
                     note(readers, _string_key(node), rel)
-                elif name_id == "_component":
-                    # The commands package's own accessor, which resolves through
-                    # the container.  Counted as a read so the ledger keeps saying
-                    # that commands *use* these services -- dropping them would
-                    # report a consumer as gone while it is still consuming.
+                elif name_id in ("_component", "_service", "_required"):
+                    # ``_component(context, "x")`` in the commands package, and
+                    # ``_service(components, "x")`` / ``_required(components, "x")``
+                    # in the runtime layer.  All three resolve through the
+                    # container -- the helpers exist so a caller states whether
+                    # absence is tolerated rather than implying it through a dict
+                    # accessor -- and all three take the mapping first, so the key
+                    # is the argument after it.
                     note(readers, _component_key(node), rel)
             elif isinstance(node, ast.Subscript):
                 note(readers, _string_key(node), rel)
@@ -252,6 +259,23 @@ def test_the_scan_detects_a_container_mediated_read() -> None:
         f"reported none of them; the scanner is blind to the indirect read"
     )
     assert "skill_catalog" in found, f"expected skill_catalog among {sorted(found)}"
+
+
+def test_the_scan_detects_a_runtime_components_lookup() -> None:
+    """Control for the *other* container accessor, which a scan can also miss.
+
+    ``RuntimeComponents.lookup`` tolerates absence where ``require`` raises, so
+    both are container-mediated reads -- and a scanner that knew only ``require``
+    reported the runtime layer as no longer reading the services it resolves on
+    every turn.
+    """
+    _writers, readers = _scan()
+    runtime = "agent/runtime/contracts.py"
+    found = {name for name, files in readers.items() if runtime in files}
+    assert "turn_runner" in found, (
+        f"{runtime} resolves turn_runner through the container; scan found "
+        f"{sorted(found)}"
+    )
 
 
 # ── The vocabulary is closed ─────────────────────────────────────────────────

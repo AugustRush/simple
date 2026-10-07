@@ -154,6 +154,18 @@ class RuntimeComponents:
             )
         return value
 
+    def lookup(self, name: str, default: Any = None) -> Any:
+        """A service that may legitimately be absent.
+
+        The sibling of :meth:`require`, for the reads that branch on a missing
+        value -- ``plugin_catalog`` is absent in a composition with no plugins,
+        ``turn_runner`` in a bare one.  Both go through the container now; the
+        difference is only whether absence is an error, which is the caller's
+        question and should be visible at the call site rather than implied by
+        which of two dict accessors happened to be used.
+        """
+        return self.services.get(name, default)
+
 
 def describe_queued_messages(
     interjections: Sequence[Mapping[str, Any]],
@@ -347,6 +359,35 @@ class RuntimeSessionState:
         return None
 
 
+def _service(components: Any, name: str, default: Any = None) -> Any:
+    """One service from *components*, absence tolerated.
+
+    Two shapes reach here.  A :class:`RuntimeComponents` resolves through the
+    container, which is the declared channel (see
+    ``agent/runtime/core_services.py``).  A bare mapping is the duck-typed double
+    a test substitutes -- the pre-container code read it as
+    ``components.values.get(name)`` -- and it is supported rather than forbidden
+    because driving one turn with a stand-in is legitimate, and refusing it would
+    make this helper the reason a test could not be written.
+
+    Shared by ``TurnRunner`` and ``AgentCore`` rather than duplicated: they took
+    the same components, so a copy in each would be two places to change and one
+    to forget.
+    """
+    lookup = getattr(components, "lookup", None)
+    if lookup is not None:
+        return lookup(name, default)
+    return components.values.get(name, default)
+
+
+def _required(components: Any, name: str) -> Any:
+    """One service the caller cannot do without."""
+    require = getattr(components, "require", None)
+    if require is not None:
+        return require(name)
+    return components.values[name]
+
+
 class TurnRunner:
     """Executes one normalized turn through the current agent implementation."""
 
@@ -356,6 +397,7 @@ class TurnRunner:
         else:
             self._components = RuntimeComponents(components)
 
+
     async def run(
         self,
         turn_input: TurnInput,
@@ -363,7 +405,7 @@ class TurnRunner:
         *,
         stream_callback: Callable[[str], None] | None = None,
     ) -> TurnResult:
-        agent = self._components.require("agent")
+        agent = _required(self._components, "agent")
         kwargs: dict[str, Any] = {"stream_callback": stream_callback}
         if turn_input.attachments:
             kwargs["attachments"] = turn_input.attachments
@@ -387,7 +429,7 @@ class TurnRunner:
         state.record_turn(tool_calls)
 
         hook_results: list[Any] = []
-        plugin_catalog = self._components.values.get("plugin_catalog")
+        plugin_catalog = _service(self._components, "plugin_catalog")
         if plugin_catalog:
             hook_results = await plugin_catalog.fire_turn_end(
                 agent_module.TurnEvent(
@@ -400,7 +442,7 @@ class TurnRunner:
                 )
             )
 
-        maintenance = self._components.values.get("post_turn_maintenance")
+        maintenance = _service(self._components, "post_turn_maintenance")
         if maintenance is None:
             maintenance = agent_module.BaseAgent._post_turn_maintenance
 
@@ -418,7 +460,7 @@ class TurnRunner:
 
         maintenance(
             ctx_mgr=state.context_manager,
-            agent=self._components.require("agent"),
+            agent=_required(self._components, "agent"),
             ctx=state.ctx,
             user_content=turn_input.text,
             assistant_content=result.text or "",
@@ -427,7 +469,7 @@ class TurnRunner:
             memory_worker=state.memory_worker,
             system_prompt=(
                 state.system_prompt_override
-                or self._components.require("system_prompt")
+                or _required(self._components, "system_prompt")
             ),
             task_context=state.task_context,
             error=result.error or "",
@@ -469,17 +511,18 @@ class AgentCore:
         else:
             self._components = RuntimeComponents(components)
 
+
     def _turn_runner(self) -> Any:
-        turn_runner = self._components.values.get("turn_runner")
+        turn_runner = _service(self._components, "turn_runner")
         if turn_runner is None or isinstance(turn_runner, TurnRunner):
             return TurnRunner(self._components)
         return turn_runner
 
     def _skill_catalog(self) -> Any:
-        return self._components.values.get("skill_catalog")
+        return _service(self._components, "skill_catalog")
 
     def _plugin_catalog(self) -> Any:
-        return self._components.values.get("plugin_catalog")
+        return _service(self._components, "plugin_catalog")
 
     @staticmethod
     def _context_metadata(state: RuntimeSessionState) -> Any:
@@ -563,10 +606,10 @@ class AgentCore:
         import agent as agent_module
 
         shared_refreshed = agent_module._compose_system_prompt(
-            self._components.values["base_system_prompt"],
-            self._components.values["registry"],
-            self._components.values["workspace_root"],
-            self._components.values["output_dir"],
+            _required(self._components, "base_system_prompt"),
+            _required(self._components, "registry"),
+            _required(self._components, "workspace_root"),
+            _required(self._components, "output_dir"),
             skill_catalog=skill_catalog,
             plugin_catalog=self._plugin_catalog(),
         )
@@ -575,9 +618,9 @@ class AgentCore:
         if state.base_system_prompt_override is not None:
             refreshed = agent_module._compose_system_prompt(
                 state.base_system_prompt_override,
-                self._components.values["registry"],
-                self._components.values["workspace_root"],
-                self._components.values["output_dir"],
+                _required(self._components, "registry"),
+                _required(self._components, "workspace_root"),
+                _required(self._components, "output_dir"),
                 skill_catalog=skill_catalog,
                 plugin_catalog=self._plugin_catalog(),
             )
@@ -593,7 +636,7 @@ class AgentCore:
         prompt = (
             state.system_prompt_override
             if state.system_prompt_override is not None
-            else self._components.values["system_prompt"]
+            else _required(self._components, "system_prompt")
         )
         if not isinstance(prompt, str) or not prompt:
             return
@@ -661,7 +704,7 @@ class AgentCore:
                 ctx_metadata[key] = metadata[key]
 
         if "heartbeat_path" not in ctx_metadata:
-            output_dir = self._components.values.get("output_dir")
+            output_dir = _service(self._components, "output_dir")
             if output_dir:
                 ctx_metadata["heartbeat_path"] = (
                     Path(output_dir)
