@@ -20,7 +20,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 2 Service Injection | **done** | ToolRegistry ✅ `registry`, Session ✅ `context_manager`, Model ✅ `llm` |
 | 3 Agent Loop Plugin | **done** | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
 | 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
-| 5 Execution Plugins | **1 of 4, and 2 of the 4 have no separable boundary** | Ralph ✅ mounted as a plugin; Scheduler / Orchestration / Workflow measured, see below |
+| 5 Execution Plugins | **2 of 4 done, 2 have no separable boundary** | Ralph ✅ and Scheduler ✅ mounted as plugins; Orchestration / Workflow measured, see below |
 | 6 Channel Plugins | not started | CLI / Web / Feishu |
 | 7 Profile / Bundle / patch | partial | profiles and bundles exist from earlier work; patch semantics not unified |
 
@@ -261,6 +261,32 @@ That now exists -- `agent/runtime/factory.py`, provided as `runtime_factory`, an
 importing the composition root.  The mapping branch remains: a run with no durable ids
 still uses the composition's own mapping, which is the historical behaviour for
 lightweight executors.
+
+## The Scheduler is a plugin
+
+`agent/scheduler/plugin.py`.  The gateway mounts it instead of building the service
+inline, so a gateway composition can now be one without a scheduler.
+
+Three things had to be settled first, and each was its own piece of work: the run
+parameters resolved in one place (`agent/scheduler/settings.py`), a synchronous builder
+in its own module (`agent/scheduler/build.py`), and a runtime-factory service so a run
+can build a runtime without importing the composition root (`agent/runtime/factory.py`).
+
+**The store belongs to the plugin, and the plugin is not the service.**  An earlier
+attempt made `SchedulerService.shutdown` close the store and the suite overturned it: the
+service is *given* the store, so a caller may read it after the service stops.  The
+plugin *opens* it, so the plugin closes it -- registered on its own scope at the moment
+of creation, which is how every other registration in this kernel works and why this
+half can be scope-owned while the service's async `shutdown` cannot.
+
+**One thing the wiring had to fix:** the builder used to call `scheduler_store()` itself.
+With the plugin opening one too, there would have been two connections to one file and
+the scope's `close` would have reached the one nothing used.  The builder now takes the
+store it was given, and the plugin asserts that it does.
+
+**One path is still not a plugin:** the `scheduler` command builds its service directly.
+It runs nothing but the scheduler, so the "a composition can omit it" gain does not apply
+there, but the two paths now differ and that is worth knowing.
 
 ## Next step, in order
 

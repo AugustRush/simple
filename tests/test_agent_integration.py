@@ -7422,7 +7422,9 @@ def test_gateway_starts_background_scheduler(monkeypatch):
             await asyncio.sleep(0)
 
     async def fake_build_components_async(cfg):
-        return {"agent": object()}
+        components = {"agent": object()}
+        components["plugin_catalog"] = _MountingCatalog(components, _FakeService())
+        return components
 
     def fake_build_scheduler_service(
         cfg,
@@ -7460,13 +7462,38 @@ def test_gateway_starts_background_scheduler(monkeypatch):
     assert started["scheduler"] == 1
     assert started["stopped"] == 1
     assert started["runner"] == 1
-    assert started["store_closed"] == 1
-    # The scheduler runs in the gateway's own components, so there are no separate ones
-    # to close.  The builder used to take `components=None` to mean "build me a runtime"
-    # and return it so the caller knew to close it -- a flag whose only purpose was to
-    # answer "who tears this down".  The gateway always reused its own, and the one
-    # caller that did not now builds them itself.
+    # The gateway no longer closes the scheduler's store: the mount creates it and the
+    # plugin's own scope closes it, which is the arrangement that cannot leave a path
+    # that closes one and not another.  Asserted as an absence so a store close creeping
+    # back into this command is visible.
+    assert started["store_closed"] == 0
+    # Same for the components: the scheduler runs in the gateway's own, so there are no
+    # separate ones to close.
     assert started["sched_closed"] == 0
+
+class _MountingCatalog:
+    """A plugin catalog whose ``mount`` provides the scheduler, as the real one does.
+
+    The gateway mounts a `SchedulerPlugin` now instead of calling the builder, so a test
+    about the gateway's wiring needs a catalog -- and the plugin's own assembly is
+    `tests/test_scheduler_plugin.py`'s business.  ``mount`` here records that it was
+    asked and installs a fake service under the name the gateway then resolves.
+    """
+
+    def __init__(self, components, service, observed=None):
+        self.components = components
+        self.service = service
+        self.observed = observed if observed is not None else {}
+        self.mounted: list = []
+
+    def mount(self, plugin):
+        self.mounted.append(plugin.name)
+        self.components["scheduler"] = self.service
+        # Nothing is written into the caller's dict: one test's counters live under a
+        # "scheduler" key, and a helper that recorded there would overwrite the count it
+        # was being compared against.
+        return None
+
 
 
 def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
@@ -7494,6 +7521,9 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
             await asyncio.sleep(0)
 
     primary_components = {"agent": object(), "marker": "primary"}
+    primary_components["plugin_catalog"] = _MountingCatalog(
+        primary_components, _FakeService()
+    )
 
     async def fake_build_components_async(cfg):
         return primary_components
@@ -7516,12 +7546,6 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
         assert callable(config_loader), "the gateway must hand the run loader over"
         # The builder takes the services it reads rather than the mapping, so "reused the
         # primary's components" is a statement about those four objects.
-        observed["scheduler"] = {
-            "memory": memory,
-            "output_dir": output_dir,
-            "workspace_root": workspace_root,
-            "registry": registry,
-        }
         return _FakeService(), _FakeStore()
 
     async def fake_close_components(components):
@@ -7539,12 +7563,14 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
     cli_module.gateway()
 
     assert observed["primary"] is primary_components
-    assert observed["scheduler"] == {
-        "memory": primary_components.get("memory"),
-        "output_dir": primary_components.get("output_dir"),
-        "workspace_root": primary_components.get("workspace_root"),
-        "registry": primary_components.get("registry"),
-    }, "the scheduler must run on the primary's own services, not fresh ones"
+    # "The scheduler reuses the primary's components" is now a statement about the mount:
+    # the plugin was mounted onto the primary's own mapping, so the four services it reads
+    # are the primary's by construction rather than by a list of names being compared.
+    catalog = primary_components["plugin_catalog"]
+    assert catalog.components is primary_components, (
+        "the scheduler must be mounted on the primary's own components, not a copy"
+    )
+    assert catalog.mounted == ["scheduler"], "and the gateway must mount it"
 
 
 def test_configure_runtime_logging_enables_interaction_loggers(monkeypatch):

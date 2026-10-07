@@ -251,6 +251,7 @@ def build_scheduler_service(
     registry: Any = None,
     config_loader: Optional[Callable[[], dict]] = None,
     runtime_factory: Any = None,
+    store: Any = None,
 ):
     """Build the scheduler service and the executor its runs go through.
 
@@ -267,7 +268,12 @@ def build_scheduler_service(
     # root, and building a runtime for it is a service it can be given.  Defaulted to the
     # root only so a caller with no container (a test, a one-off script) still works.
     factory = runtime_factory or RuntimeFactory()
-    store = scheduler_store()
+    # Taken, not opened, when the caller has one.  The alternative was this function
+    # calling ``scheduler_store()`` while its caller did too -- two connections to one
+    # file, only one of which the caller's ``close`` would reach.  The default keeps the
+    # callers that have no container (a test, a one-off script) working.
+    if store is None:
+        store = scheduler_store()
     delivery = SchedulerDelivery(
         cfg=cfg,
         output_root=(output_dir or DEFAULT_OUTPUT_DIR)

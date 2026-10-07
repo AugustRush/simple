@@ -60,6 +60,7 @@ from agent.scheduler.build import (
 )
 from agent.runtime.contracts import agent_core_for_components as _agent_core_for_components
 from agent.scheduler.store import scheduler_store as _scheduler_store
+from agent.scheduler.plugin import SchedulerPlugin
 
 AgentContext = agent_module.AgentContext
 BaseAgent = agent_module.BaseAgent
@@ -1083,21 +1084,20 @@ def gateway(
                 f"[dim]Gateway starting {len(channels)} channel(s). "
                 "Press Ctrl-C to stop.[/dim]"
             )
-            service, scheduler_store = _build_scheduler_service(
-                cfg,
-                poll_seconds=scheduler_poll,
-                lease_seconds=scheduler_lease,
-                max_concurrent_runs=scheduler_max_concurrent,
-                signal_max_depth=scheduler_signal_depth,
-                **_scheduler_services(components),
-                # A run is a fresh execution, so a composition belongs here rather
-                # than in the file: the operator's settings stay on disk and only
-                # this process's runs differ.  ``loader_for_name`` resolves the
-                # name now, so a typo fails at startup instead of each run
-                # quietly proceeding uncomposed.
-                config_loader=loader_for_name(bundle),
-            )
-            components["scheduler_service"] = service
+            # The scheduler is mounted, not built here.  The two things it cannot read
+            # from the composition are the two this command resolves -- the run
+            # parameters (config merged with argv) and the bundle's loader -- so they go
+            # in as data before the plugin is mounted.
+            #
+            # A run is a fresh execution, so a composition belongs here rather than in
+            # the file: the operator's settings stay on disk and only this process's runs
+            # differ.  ``loader_for_name`` resolves the name now, so a typo fails at
+            # startup instead of each run quietly proceeding uncomposed.
+            components["scheduler_settings"] = scheduler_settings
+            components["scheduler_config_loader"] = loader_for_name(bundle)
+            catalog = components.get("plugin_catalog")
+            catalog.mount(SchedulerPlugin())
+            service = require_service(components, "scheduler")
             scheduler_task = asyncio.create_task(service.run_forever())
             runner = ChannelRunner(channels, components, cfg)
             await runner.run()

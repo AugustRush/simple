@@ -307,6 +307,14 @@ def test_the_gateway_passes_the_loader_to_the_scheduler() -> None:
     import agent.cli as cli_module
 
     source = inspect.getsource(cli_module.gateway)
-    assert "config_loader=loader_for_name(bundle)" in source, (
-        "the gateway parses --bundle but does not hand it to the scheduler"
+    # The loader now travels through the composition, because the scheduler is mounted as
+    # a plugin and a plugin has only a context: the gateway resolves the name, puts the
+    # loader in, and the plugin reads it.  Both halves are asserted -- resolving it and
+    # handing it over -- because the failure this guard exists for is an option that is
+    # parsed and never used, and either half missing produces that.
+    assert "loader_for_name(bundle)" in source, (
+        "the gateway parses --bundle but never resolves it"
+    )
+    assert 'components["scheduler_config_loader"] = loader_for_name(bundle)' in source, (
+        "the resolved loader must reach the composition the scheduler reads"
     )
