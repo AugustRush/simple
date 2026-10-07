@@ -309,3 +309,97 @@ def test_a_disabled_channel_plugin_registers_nothing_to_undo() -> None:
     assert len(mapping["channels"]) == 0
     host.unload("channel.web")
     assert len(mapping["channels"]) == 0
+
+
+def test_a_composition_can_replace_the_built_in_web_channel() -> None:
+    """The requirement stated as a scenario, rather than as a property of one file.
+
+    "Replaceable" for a channel means: a composition ends up serving *its* transport on the
+    web slot, without editing `agent/channels/plugin.py` or `agent/channels/web.py`.  The
+    mechanism is the registry plus the config switch -- disable the built-in, contribute
+    your own -- which is a **better** seam than a constructor argument would be, because it
+    does not require the built-in plugin to know it might be replaced.
+
+    Both halves are asserted, because either alone would pass a weaker thing: with the
+    built-in disabled its contribution is absent, and the replacement is the only channel
+    left.  A count of one would pass if the surviving channel were the wrong one.
+    """
+    from agent.channels.plugin import WebChannelPlugin
+    from agent.channels.registry import ChannelRegistry
+    from agent.kernel.plugin import PluginHost
+    from agent.kernel.service import ServiceRegistry
+
+    class _TheirWeb:
+        pass
+
+    class _TheirPlugin:
+        name = "acme.web"
+        inject = ("channels", "cfg")
+
+        def setup(self, ctx):
+            ctx.channels.add(_TheirWeb())
+
+    mapping = {
+        "cfg": {"channels": {"web": {"enabled": False}}},
+        "channels": ChannelRegistry(),
+    }
+    host = PluginHost(services=ServiceRegistry.adopt(mapping))
+    host.load(WebChannelPlugin())          # mounted, contributing nothing
+    host.load(_TheirPlugin())
+
+    assert mapping["channels"].owners() == ("acme.web",), mapping["channels"].owners()
+    assert isinstance(mapping["channels"].all()[0], _TheirWeb)
+
+    # And the replacement is itself removable, like any other contribution.
+    host.unload("acme.web")
+    assert len(mapping["channels"]) == 0
+
+
+def test_the_built_in_channel_plugin_mounts_without_its_optional_dependency() -> None:
+    """Why the implementation is imported inside ``setup`` and must stay there.
+
+    ``web`` needs starlette/uvicorn.  Importing it at module scope would make the whole
+    catalog fail to import on a machine without them -- taking every other plugin with it --
+    instead of skipping one channel with a report.  That is the reason the implementation is
+    not referenced by name in the plugin's signature, and it is worth a test because
+    "make it a constructor argument" is the obvious-looking change that would break it.
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(
+        pathlib.Path(__file__).resolve().parents[1] / "agent/channels/plugin.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    module_level = {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and (node.module or "").startswith("agent.channels")
+        for alias in node.names
+    }
+    assert not {"WebChannel", "FeishuChannel"} & module_level, (
+        "the channel implementations must stay imported inside setup; at module scope a "
+        "missing optional dependency takes the whole catalog down with it"
+    )
+
+    for cls_name in ("WebChannelPlugin", "FeishuChannelPlugin"):
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == cls_name
+        )
+        setup = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "setup"
+        )
+        imported = {
+            alias.name
+            for node in ast.walk(setup)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+        assert imported & {"WebChannel", "FeishuChannel"}, (
+            f"{cls_name}.setup must import its implementation"
+        )

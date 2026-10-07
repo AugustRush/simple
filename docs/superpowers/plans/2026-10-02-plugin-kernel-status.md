@@ -781,6 +781,19 @@ What is *not* refactored is `agent/channels/web.py` (4,183 lines) and `feishu.py
 they are unchanged by the whole refactor and are still single large classes.  Composable and
 modular are not the same claim, and this document should not blur them.
 
+**And "replaceable" for a channel is a scenario, so it is asserted as one**:
+`test_a_composition_can_replace_the_built_in_web_channel` composes with `channels.web`
+disabled, contributes a substitute from a plugin, and asserts that the substitute is what is
+live -- then unloads the substitute and watches it go.  No edit to `plugin.py` or `web.py`
+is involved, which is the test of whether the seam is real.
+
+That is a **better** seam than a constructor argument, which is why the channel
+implementation is deliberately **not** passed in by name: `web.py` needs starlette/uvicorn,
+and importing it at module scope would make the whole catalog fail on a machine without them
+instead of skipping one channel with a report.  `test_the_built_in_channel_plugin_mounts_
+without_its_optional_dependency` pins that, because "make it a constructor argument" is the
+obvious-looking change that would break it.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters
