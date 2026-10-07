@@ -836,6 +836,7 @@ _LOOP_OWNED = (
 #: shared, and the struct assertion would then pass on a wrong struct.
 _ALREADY_MOVED = (
     "_build_continuation_context",
+    "_run_turn_loop",
     "_compact_body_for_turn",
     "_promote_orchestration_runs",
     "_build_summarized_tool_results",
@@ -1260,3 +1261,51 @@ def test_the_model_call_surface_is_six_members() -> None:
         "observe_provider_usage",
         "event_bus",
     }, sorted(fields)
+
+
+def test_the_loop_body_lives_in_the_loop_module() -> None:
+    """``_run_turn_loop`` moved whole, and ``send_message`` calls it.
+
+    Two assertions, because the extraction has two ways to be wrong.  A delegating
+    copy left on ``BaseAgent`` is the first: it would keep the body reachable and the
+    move would be a duplicate rather than an extraction.  ``send_message`` still
+    running its own copy is the second, and it is invisible from the method list --
+    the name would simply be absent and the loop would be dead code.
+
+    The ``try``/``finally`` matters here specifically: it restores three contextvars
+    and clears the turn's markers, and a loop that returned early without it is the
+    failure this function was extracted *as a unit* to avoid.
+    """
+    agent_tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    methods = {
+        node.name
+        for node in ast.walk(agent_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "_run_turn_loop" not in methods, (
+        "_run_turn_loop is still on BaseAgent; the body belongs to "
+        "agent/core/turn_loop.py"
+    )
+
+    send = next(
+        node for node in ast.walk(agent_tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "send_message"
+    )
+    calls = {
+        ast.unparse(call.func)
+        for call in ast.walk(send)
+        if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+    }
+    assert "run_turn_loop" in calls, (
+        f"send_message must call the moved loop; it calls {sorted(calls)}"
+    )
+
+    loop_tree = ast.parse((REPO_ROOT / "agent/core/turn_loop.py").read_text(encoding="utf-8"))
+    fn = next(
+        node for node in ast.walk(loop_tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_turn_loop"
+    )
+    assert any(isinstance(stmt, ast.Try) for stmt in fn.body), (
+        "the loop and its teardown are one unit: the try/finally must be in the "
+        "moved function, not left behind in the caller"
+    )

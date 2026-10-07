@@ -99,6 +99,9 @@ from agent.plugins.catalog import PluginCatalog
 from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
 from agent.core.interjections import inject_pending_interjections
 from agent.core.turn_context import (
+    TURN_IN_PROGRESS_KEY as _TURN_IN_PROGRESS_KEY,
+)
+from agent.core.turn_context import (
     TURN_REQUEST_KEY as _TURN_REQUEST_KEY,
     missing_usage_warned as _missing_usage_warned,
     active_agent_context as _active_agent_context,
@@ -123,6 +126,7 @@ from agent.core.turn_loop import (
     promote_turn_orchestration_runs,
     recover_incomplete_tool_response,
     recover_from_content_filter,
+    run_turn_loop,
     stream_response,
     tool_result_messages,
 )
@@ -156,7 +160,6 @@ _RENDEZVOUS_INPUT_BUDGET = 6000
 #: and both are correct *between* turns but ruinous inside one, because a turn's
 #: steps are meant to share a prefix.  Module-level rather than a class
 #: attribute because the reader is a ``staticmethod``.
-_TURN_IN_PROGRESS_KEY = "_turn_in_progress"
 
 #: The message object ``_prepare_turn`` appended for this turn, held so
 #: compaction can recognise it by identity.  A cut inside a turn must not remove
@@ -195,16 +198,9 @@ class _TurnLoopState:
 
 
 
-def _trace_latency(stage: str, **fields: object) -> None:
-    shared._trace_latency("agent", stage, **fields)
-
-
-def _preview_text(text: object, limit: int = 80) -> str:
-    return shared._preview_text(text, limit=limit)
-
-
-def _interaction_log(event: str, **fields: object) -> None:
-    shared._interaction_log("agent", event, **fields)
+from agent.core.turn_context import interaction_log as _interaction_log  # noqa: E402
+from agent.core.turn_context import preview_text as _preview_text  # noqa: E402
+from agent.core.turn_context import trace_latency as _trace_latency  # noqa: E402
 
 
 
@@ -1741,428 +1737,6 @@ class BaseAgent:
 
 
 
-    async def _run_turn_loop(
-        self,
-        ctx: AgentContext,
-        user_message: str,
-        attachments: Any,
-        stream_callback: Any,
-        *,
-        max_steps: int,
-        orchestration_token: Any,
-        filter_recovery: Any,
-        watchdog: Any,
-        tool_calls_made: list,
-        tool_result_history: list,
-        heartbeat: Any,
-        turn_started_at: float,
-        active_ctx_token: Any,
-        cancel_token_token: Any,
-        session_id_token: Any,
-        state: "_TurnLoopState",
-    ) -> AgentResult:
-        """Run a turn's step loop, with its own teardown.
-
-        The loop and the ``finally`` are one unit: the cleanup restores three
-        contextvars and clears the turn's markers, and a step that returns early
-        must still run it.  That is why this is a method rather than a helper --
-        a helper's ``return`` would exit the helper.
-
-        The step state that ``send_message`` used to keep in locals arrives in
-        ``state``.  It is deliberately not on ``self``: ``send_message`` can run
-        several turns concurrently on one agent instance, so an attribute would
-        let one turn read another's ``trace_status`` or ``pending_tool_response``.
-        Locals were correct for that reason, and a mutable holder keeps them
-        correct while making them visible to the caller.
-        """
-        # The loop's dependency surface, read once at entry: bound methods are
-        # snapshotted here, so nothing reassigned mid-turn can change which
-        # adapter or budget this turn is using.
-        deps = LoopDeps.of(self)
-        try:
-            ctx.metadata[_TURN_IN_PROGRESS_KEY] = True
-            orchestration_decision = prepare_turn(deps, ctx, user_message, attachments)
-            # Cut once, here, so every step below is an append.  See
-            # `_compact_body_for_turn` for why the position of this call is what
-            # decides whether a turn's steps share a cacheable prefix.
-            compact_body_for_turn(deps, ctx)
-
-            # D1: bounded step loop — prevents infinite model loops.
-            # Vocabulary: a *step* is one model request plus the tools that
-            # request calls.  A *turn* is the processing of one user input and
-            # spans one or more steps; continuation rounds are counted
-            # separately by the runtime layer (TurnExecution.continuation_rounds).
-            max_steps = max(1, int(self.max_tool_call_iterations))
-            _step_index = 0
-            # Set when a truncation continuation comes back asking for tools:
-            # the next iteration adopts that response without a model call and
-            # runs it through the normal tool branch.
-            state.pending_tool_response: Any = None
-            while True:
-                if _step_index == max_steps:
-                    state.trace_status = "tool_loop_exceeded"
-                    state.trace_error = (
-                        f"Tool-call loop exceeded {max_steps} "
-                        "iterations; possible model loop detected."
-                    )
-                    return AgentResult(
-                        agent_id=ctx.agent_id,
-                        content=state.result_text,
-                        tool_calls_made=tool_calls_made,
-                        error=state.trace_error,
-                    )
-                state.steps = _step_index + 1
-                ctx.metadata["_provider_step"] = state.steps
-                tools = list(ctx.metadata.get("_selected_tools") or [])
-
-                # Drain the interjection mailbox: any user messages that
-                # arrived during the previous step get folded in as a
-                # <user_interjection> block so the next LLM call sees them
-                # alongside the original task.  Channel handler appends to
-                # this list; we drain in place so future steps see
-                # only fresh entries.  Sub-agents have no mailbox (key is
-                # absent), so this is a no-op for them.
-                pending = ctx.metadata.get("pending_messages")
-                if pending:
-                    inject_pending_interjections(ctx, pending, self.registry)
-
-                # Cooperative cancellation.  This is the step boundary that
-                # `/cancel graceful` promises to stop at: the check sits
-                # before the model request, so a cancelled turn never
-                # orphans a subprocess or loses its turn record.
-                cancel_token = ctx.metadata.get("cancel_token")
-                if cancel_token is not None and cancel_token.is_cancelled:
-                    state.trace_status = "cancelled"
-                    state.trace_error = "Turn cancelled by user"
-                    return AgentResult(
-                        agent_id=ctx.agent_id,
-                        content=state.result_text or shared._cancelled_by_user_text(user_message),
-                        tool_calls_made=tool_calls_made,
-                        error=state.trace_error,
-                    )
-
-                _emit_event("step_started", step=state.steps)
-                step_tool_calls = 0
-                status_at_step_start = state.trace_status
-                try:
-                    response_started_at = time.perf_counter()
-                    heartbeat.operation("LLM", self._effective_model(ctx))
-                    recovered = filter_recovery.take_pending_response()
-                    _attempt = await obtain_response(
-                        agent=self,
-                        ctx=ctx,
-                        tools=tools,
-                        user_message=user_message,
-                        recovered=recovered,
-                        pending_tool_response=state.pending_tool_response,
-                        stream_callback=stream_callback,
-                        trace_status=state.trace_status,
-                        trace_error=state.trace_error,
-                        result_text=state.result_text,
-                        tool_calls_made=tool_calls_made,
-                        active_sink=_active_sink.get(),
-                        cancel_token=ctx.metadata.get("cancel_token"),
-                    )
-                    if _attempt.early_result is not None:
-                        return _attempt.early_result
-                    response = _attempt.response
-                    streamed_text = _attempt.streamed_text
-                    state.pending_tool_response = _attempt.pending_tool_response
-                    state.trace_status = _attempt.trace_status
-                    state.trace_error = _attempt.trace_error
-                    response, structured_output_error = (
-                        await recover_incomplete_tool_response(
-                            deps,
-                            ctx,
-                            tools,
-                            response,
-                        )
-                    )
-                    if structured_output_error is not None:
-                        state.trace_status = "continuation_error"
-                        state.trace_error = structured_output_error
-                        return AgentResult(
-                            agent_id=ctx.agent_id,
-                            content=streamed_text or state.result_text,
-                            tool_calls_made=tool_calls_made,
-                            error=structured_output_error,
-                        )
-                    filter_recovery.forget_submission()
-                    stop_reason, text, tool_uses = parse_response(
-                        deps, response, ctx
-                    )
-                    _trace_latency(
-                        "model_response_received",
-                        agent_id=ctx.agent_id,
-                        step=_step_index + 1,
-                        stop_reason=stop_reason,
-                        tool_uses=len(tool_uses),
-                        duration_ms=f"{(time.perf_counter() - response_started_at) * 1000:.1f}",
-                    )
-                    if tool_uses:
-                        _interaction_log(
-                            "tool_batch_requested",
-                            agent_id=ctx.agent_id,
-                            step=_step_index + 1,
-                            stop_reason=stop_reason,
-                            tool_uses=len(tool_uses),
-                            tool_names=",".join(tu["name"] for tu in tool_uses[:5]),
-                        )
-
-                    if stop_reason == "tool_use" and tool_uses:
-                        if text:
-                            state.result_text = text
-                        assistant_tool_message = assistant_message(
-                            self._transport, response, text, self._effective_model(ctx)
-                        )
-
-                        # Set intent context so tool executors can enforce
-                        # the intent-before-action protocol.
-                        import agent.core.output as _out
-
-                        _intent_token = _out._active_assistant_text.set(
-                            text or streamed_text or ""
-                        )
-                        tool_calls_made.extend(tu["name"] for tu in tool_uses)
-                        step_tool_calls = len(tool_uses)
-                        _batch = await run_tool_batch(
-                            agent=self,
-                            ctx=ctx,
-                            tool_uses=tool_uses,
-                            orchestration_decision=orchestration_decision,
-                            intent_text=text or streamed_text or "",
-                            tool_result_history=tool_result_history,
-                            step_index=_step_index,
-                            active_assistant_text=_out._active_assistant_text,
-                            filter_tool_results=filter_tool_results,
-                            trace_latency=_trace_latency,
-                            interaction_log=_interaction_log,
-                            logger=logger,
-                        )
-                        results = _batch.results
-                        filtered_results = _batch.filtered_results
-                        if _batch.restart_message is not None:
-                            ctx.messages[:] = [
-                                {"role": "user", "content": _batch.restart_message}
-                            ]
-                            filter_recovery.forget_submission()
-                            _step_index += 1
-                            continue
-
-                        # Commit the provider protocol unit only after every tool
-                        # and post-processing step succeeded. A cancellation or
-                        # exception must not leave an assistant tool-call without
-                        # its matching result in persistent conversation state.
-                        ctx.messages.append(assistant_tool_message)
-                        ctx.messages.extend(
-                            tool_result_messages(
-                                self._transport,
-                                tool_uses,
-                                filtered_results,
-                                self._effective_model(ctx),
-                            )
-                        )
-                        filter_recovery.record_submission(tool_uses, results)
-                        # A long tool chain can be interrupted or the process
-                        # can be restarted before turn maintenance runs. Save
-                        # only after the assistant call and every matching tool
-                        # result form a complete provider protocol unit.
-                        checkpoint_manager = self._context_manager_for(ctx)
-                        save_checkpoint = getattr(
-                            checkpoint_manager, "save_provider_checkpoint", None
-                        )
-                        if callable(save_checkpoint):
-                            with shared._suppress_with_log(
-                                "provider checkpoint save skipped"
-                            ):
-                                save_checkpoint(
-                                    ctx.messages,
-                                    token_budget=max(
-                                        2048,
-                                        min(
-                                            24000,
-                                            int(
-                                                ctx.metadata.get(
-                                                    "_last_input_token_budget", 24000
-                                                )
-                                                or 24000
-                                            ),
-                                        ),
-                                    ),
-                                )
-
-                        _stuck = handle_stuck_loop(
-                            agent=self,
-                            ctx=ctx,
-                            watchdog=watchdog,
-                            tool_uses=tool_uses,
-                            results=results,
-                            user_message=user_message,
-                            tool_calls_made=tool_calls_made,
-                            step_index=_step_index,
-                            interaction_log=_interaction_log,
-                        )
-                        if _stuck.stuck:
-                            state.trace_status = "tool_loop_stuck"
-                            return _stuck.final_result
-                        _step_index += 1
-                        continue
-                    else:
-                        state.result_text, continuation_error, continuation_tool_response = (
-                            await handle_end_turn(
-                                deps,
-                                ctx,
-                                response,
-                                text,
-                                streamed_text,
-                                state.result_text,
-                                tool_result_history,
-                                tools,
-                            )
-                        )
-                        if continuation_error is not None:
-                            state.trace_status = "continuation_error"
-                            state.trace_error = continuation_error
-                            return AgentResult(
-                                agent_id=ctx.agent_id,
-                                content=state.result_text,
-                                tool_calls_made=tool_calls_made,
-                                error=continuation_error,
-                            )
-                        if continuation_tool_response is not None:
-                            # The truncation continuation asked for tools:
-                            # adopt its response as this step's and let the
-                            # loop execute the calls through the normal tool
-                            # path.  The continuation was a model call, so it
-                            # is charged a step like any other.
-                            state.pending_tool_response = continuation_tool_response
-                            _step_index += 1
-                            continue
-                        break
-
-                except Exception as e:
-                    if self._is_content_filter_block(e):
-                        # Recovery: rollback last assistant+tool_result messages,
-                        # summarize the blocked content, and retry.
-                        recovered_response = await self._recover_from_content_filter(
-                            ctx,
-                            filter_recovery.submitted_tool_uses,
-                            filter_recovery.submitted_results,
-                        )
-                        if recovered_response is not None:
-                            filter_recovery.pending_response = recovered_response
-                            filter_recovery.forget_submission()
-                            state.trace_status = "content_filter_recovered"
-                            _interaction_log(
-                                "content_filter_recovered",
-                                agent_id=ctx.agent_id,
-                                step=_step_index + 1,
-                            )
-                            continue
-                        # Recovery failed — let the error propagate
-                        state.trace_status = "content_filter_unrecoverable"
-                        state.trace_error = (
-                            "Content filter blocked the request and recovery failed. "
-                            "Consider switching to a different provider "
-                            "(e.g. /model anthropic or /model openai) for "
-                            "this task."
-                        )
-                        state.result_text = state.trace_error
-                        ctx.messages.append(
-                            {"role": "assistant", "content": state.trace_error}
-                        )
-                        break
-
-                    state.trace_status = "exception"
-                    state.trace_error = self._format_agent_error(e)
-                    return AgentResult(
-                        agent_id=ctx.agent_id,
-                        content="",
-                        tool_calls_made=tool_calls_made,
-                        error=state.trace_error,
-                    )
-                finally:
-                    # Every exit from a step passes here — `continue`, `break`,
-                    # `return` and exceptions alike — so `step_started` and
-                    # `step_ended` stay paired for any consumer counting them.
-                    # `trace_status` is turn-scoped and sticky, so report it
-                    # only when *this* step is what changed it.
-                    _emit_event(
-                        "step_ended",
-                        step=state.steps,
-                        tool_calls=step_tool_calls,
-                        status=(
-                            state.trace_status
-                            if state.trace_status != status_at_step_start
-                            else "ok"
-                        ),
-                    )
-        finally:
-            if orchestration_token is not None:
-                if state.trace_status in {"ok", "content_filter_recovered"}:
-                    with shared._suppress_with_log(
-                        "orchestration summary promotion failed"
-                    ):
-                        promote_turn_orchestration_runs(deps)
-                _active_orchestration_runs.reset(orchestration_token)
-            _active_agent_context.reset(active_ctx_token)
-            shared._active_cancel_token.reset(cancel_token_token)
-            shared._active_session_id.reset(session_id_token)
-            await heartbeat.stop(
-                status=state.trace_status if state.trace_status != "ok" else "finished",
-                detail=state.trace_status,
-            )
-            _interaction_log(
-                "turn_finished",
-                agent_id=ctx.agent_id,
-                status=state.trace_status,
-                error=state.trace_error,
-                steps=state.steps,
-                tool_calls=len(tool_calls_made),
-                content_len=len(state.result_text),
-                content_preview=_preview_text(state.result_text),
-                duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
-            )
-            _trace_latency(
-                "send_message_finished",
-                agent_id=ctx.agent_id,
-                status=state.trace_status,
-                error=state.trace_error,
-                steps=state.steps,
-                tool_calls=len(tool_calls_made),
-                duration_ms=f"{(time.perf_counter() - turn_started_at) * 1000:.1f}",
-            )
-            # Nothing restores the system prompt here any more: the turn's own
-            # context rides in its message (see `_prepare_turn`), so the prompt
-            # is never mutated during a turn and needs no round trip.  The
-            # current ctx is published via the _active_agent_context ContextVar;
-            # that token is reset above, so no extra stack bookkeeping is needed.
-            ctx.metadata.pop("_provider_step", None)
-            ctx.metadata.pop("_selected_tools", None)
-            # The turn is over, so nothing may claim to be its request any more.
-            # A value left behind would protect a message of the *previous* turn
-            # from the next turn's cut, which is the same borrow-the-last-turn's
-            # authority mistake `turn_request` is overwritten to avoid.
-            ctx.metadata.pop(_TURN_REQUEST_KEY, None)
-            # Cleared here rather than around the whole method so that
-            # `_post_turn_maintenance` -- which the runtime calls after this
-            # returns -- can tell a between-turns call from a mid-turn one.
-            ctx.metadata.pop(_TURN_IN_PROGRESS_KEY, None)
-
-            await _emit_domain_event(
-                self._event_bus,
-                TurnFinished,
-                agent_id=ctx.agent_id,
-                status=state.trace_status,
-                steps=state.steps,
-            )
-
-        return AgentResult(
-            agent_id=ctx.agent_id,
-            content=state.result_text,
-            tool_calls_made=tool_calls_made,
-            error=state.trace_error,
-        )
 
     async def send_message(
         self,
@@ -2256,7 +1830,9 @@ class BaseAgent:
         await heartbeat.__aenter__()
 
         state = _TurnLoopState()
-        return await self._run_turn_loop(
+        return await run_turn_loop(
+            self._loop_deps(),
+            self,
             ctx,
             user_message,
             attachments,

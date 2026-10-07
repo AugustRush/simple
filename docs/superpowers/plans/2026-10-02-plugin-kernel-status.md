@@ -18,7 +18,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 0 Baseline | done | 3 accepted failures, byte-identical across every commit; see `2026-10-01-baseline-failures.txt` |
 | 1 Plugin Kernel | **done** | `agent/kernel/` — Context / Plugin / Service / Event / Scope / Lifecycle, 53 tests in `tests/test_kernel.py` |
 | 2 Service Injection | **done** | ToolRegistry ✅ `registry`, Session ✅ `context_manager`, Model ✅ `llm` |
-| 3 Agent Loop Plugin | first step done | `agent_loop` is a plugin with declared `inject`; the loop *body* is still in `BaseAgent` — the blocker is gone, the move is next |
+| 3 Agent Loop Plugin | **done** | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
 | 4 Capability Layer | mechanism ready | the scoped service view is the mechanism it needs; `PluginAssets` is its first user |
 | 5 Execution Plugins | not started | Workflow / Ralph / Orchestration / Scheduler |
 | 6 Channel Plugins | not started | CLI / Web / Feishu |
@@ -94,22 +94,44 @@ Measured fallout of the *first* attempt: 24 failures from `components` being
 undefined at the construction site, 17 from the missing setter.  The second attempt
 had none.
 
-## Measured blocker: the loop body cannot move out of `BaseAgent` yet
+## The loop body moved, and how it was verified
 
-`_run_turn_loop` (415 lines) and `send_message` (110 lines) touch 15 private
-helpers plus `max_tool_call_iterations`. Measured coupling of those helpers:
+`_run_turn_loop` was the last and largest piece: 422 lines, 124 statements, 33 names
+from outside itself. It is now `agent/core/turn_loop.py: run_turn_loop(deps, agent,
+ctx, ...)`, and `send_message` calls it.
 
-- only **two** are genuinely self-contained (`_is_content_filter_block`,
-  `_new_watchdog_state` — 3 lines each, not worth extracting);
-- **six** reach the transport (`_assistant_message`, `_handle_end_turn`,
-  `_parse_response`, `_recover_from_content_filter`,
-  `_recover_incomplete_tool_response`, `_tool_result_messages`);
-- the rest reach the context manager, the registry, or both.
+Three properties made the move safe rather than lucky:
 
-So the loop's real dependency is the composition's model and session pieces — both
-now services (`llm`, `context_manager`), which means the six transport-reaching
-helpers can become the loop's own declared dependencies. The move is the next step
-rather than a blocked one.
+**The dependency surface was already declared and guarded.** By the time the body
+moved, every one of the nine `self.X` reads it still had mapped onto a `LoopDeps`
+field or a free function. The struct had been built and checked over the preceding
+rounds precisely so this step would be mechanical.
+
+**The verification was statement-by-statement, not "the tests pass".** All 124
+statements were compared to the original after normalising the intended renames, and
+**exactly two differ**: the signature, and `deps = LoopDeps.of(self)` -- removed
+because the function now receives `deps`. The `try`/`finally` block came across
+byte-identical, which is the part that matters: it restores three contextvars and
+clears the turn's markers, and an earlier extraction in this session lost a line from
+a similar block without any test noticing.
+
+**The check that made it safe is now a test.** Three assertions: no delegating copy
+on `BaseAgent`; `send_message` actually calls the moved function (a body left behind
+is invisible from the method list -- the name is simply absent and the loop is dead
+code); and the moved function contains the `try`, so the teardown cannot be left in
+the caller.
+
+### What is now where
+
+```
+agent/core/turn_loop.py    1,590 lines  the loop, its helpers, LoopDeps
+agent/core/agent.py        2,530 lines  BaseAgent: construction, facades, tools,
+                                        sub-agents, the streaming entry point
+```
+
+`BaseAgent` shrank from 3,920 to 2,530 lines. What remains is not the loop: it is
+the agent's identity and the facades the suite reaches — five of them, each one
+statement, each asserted to be one statement.
 
 ### A measurement bug worth remembering
 
@@ -137,10 +159,9 @@ the domain table owns provider dispatch.
 
 ## Next step, in order
 
-1. **Move the loop body into the `agent_loop` plugin.** Its dependencies are now
-   named: `llm` and `context_manager` are services, and the six helpers that reach
-   the transport have a seam to reach it through. Extract
-   `_run_turn_loop` + `send_message` with the helpers that belong to the loop, and
-   declare the dependency edges on the plugin rather than reaching into the agent.
-2. **Then** Phase 4's capability layer, on the scoped service view that already
-   exists (`PluginAssets` is its first user).
+1. **Phase 4, the capability layer**, on the scoped service view that already exists
+   (`PluginAssets` is its first user). Tools, commands and skills become capabilities
+   a service exposes rather than a universal abstraction.
+2. **`BaseAgent` is still 2,530 lines** and still holds the sub-agent machinery, the
+   tool-execution entry points and the streaming entry point. Those are the next
+   things to leave it -- each is a plugin by the plan's table, and none is blocked.

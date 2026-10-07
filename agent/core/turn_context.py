@@ -29,6 +29,11 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from agent.core.agent import AgentContext
 
+#: The metadata key that marks a turn as running.  Read by the maintenance path to
+#: tell "between turns" from "in one", so it is the counterpart of
+#: :data:`TURN_REQUEST_KEY`.
+TURN_IN_PROGRESS_KEY = "_turn_in_progress"
+
 #: The metadata key a turn's opening request is stored under.  Written by the loop
 #: when it prepares a turn and appended to by the interjection drain, so it lives
 #: beside them rather than in ``agent.py``.
@@ -62,10 +67,14 @@ active_orchestration_runs: contextvars.ContextVar[Optional[list[dict[str, Any]]]
 )
 
 __all__ = [
+    "TURN_IN_PROGRESS_KEY",
     "TURN_REQUEST_KEY",
     "active_orchestration_runs",
     "emit_event",
     "claim_missing_usage_warning",
+    "interaction_log",
+    "preview_text",
+    "trace_latency",
     "missing_usage_warned",
     "active_agent_context",
     "active_agent_id",
@@ -135,3 +144,24 @@ def emit_event(name: str, **fields: object) -> None:
     collector = _active_event_collector.get()
     if collector is not None:
         collector.emit(name, **fields)
+
+
+def trace_latency(stage: str, **fields: object) -> None:
+    """Record a latency trace attributed to the agent component."""
+    from agent import shared
+
+    shared._trace_latency("agent", stage, **fields)
+
+
+def interaction_log(event: str, **fields: object) -> None:
+    """Record an interaction-log line attributed to the agent component."""
+    from agent import shared
+
+    shared._interaction_log("agent", event, **fields)
+
+
+def preview_text(text: object, limit: int = 80) -> str:
+    """See :func:`agent.shared._preview_text`."""
+    from agent import shared
+
+    return shared._preview_text(text, limit=limit)
