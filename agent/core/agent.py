@@ -99,6 +99,7 @@ from agent.plugins.catalog import PluginCatalog
 from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
 from agent.core.interjections import inject_pending_interjections
 from agent.core.turn_context import (
+    TURN_REQUEST_KEY as _TURN_REQUEST_KEY,
     active_agent_context as _active_agent_context,
     active_agent_id as _active_agent_id,
     emit_domain_event as _emit_domain_event,
@@ -106,7 +107,12 @@ from agent.core.turn_context import (
 )
 from agent.core.model_call import ModelCall, create_turn_response
 from agent.core.retry import RetryPolicy, with_llm_retry
-from agent.core.turn_loop import assistant_message, tool_result_messages
+from agent.core.turn_loop import (
+    LoopDeps,
+    assistant_message,
+    prepare_turn,
+    tool_result_messages,
+)
 from agent.runtime.services import resolve
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
@@ -145,7 +151,6 @@ _TURN_IN_PROGRESS_KEY = "_turn_in_progress"
 #: is to keep the object: the alternative -- "the newest message that looks like
 #: a user request" -- is falsified by an interjection, which is a real user
 #: message appended *after* the request (see ``agent.core.interjections``).
-_TURN_REQUEST_KEY = "_turn_request_message"
 
 # Context variable so built-in tools can access the active AgentContext
 _active_orchestration_runs: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
@@ -461,61 +466,7 @@ class BaseAgent:
         self.content_filter: ContentFilter = ContentFilter.load(default_model_path())
         self._content_filter_threshold: float = 0.7
 
-    def _image_content_block(self, attachment: MessageAttachment) -> dict[str, Any]:
-        data = base64.b64encode(attachment.local_path.read_bytes()).decode("ascii")
-        mime_type = attachment.mime_type or "application/octet-stream"
-        return self._transport.image_content_block(mime_type, data)
 
-    def _build_user_message_content(
-        self,
-        user_message: str,
-        attachments: tuple[MessageAttachment, ...] = (),
-        turn_context: str = "",
-    ) -> str | list[dict[str, Any]]:
-        """The user's message, preceded by this turn's own context.
-
-        ``turn_context`` is everything the turn has to say that is not the
-        user's own words: the session checkpoint, retrieved memory, the skills
-        this turn activates, the orchestration policy, and the time.  It is
-        built here rather than appended to the system prompt because the system
-        prompt is the *head* of the request -- the one part a provider's prefix
-        cache can serve for every call in the session -- so a per-turn value
-        placed there is paid for by invalidating the whole conversation behind
-        it.  In the message the same text is appended once and then frozen,
-        which is also the honest record of what the model was actually shown.
-
-        The user's own words stay last, so the request is read after the
-        material that frames it.
-        """
-        direct_images: list[MessageAttachment] = []
-        fallback_attachments: list[MessageAttachment] = []
-        if attachments:
-            if self.supports_vision:
-                for attachment in attachments:
-                    if attachment.kind == "image" and attachment.local_path.is_file():
-                        direct_images.append(attachment)
-                    else:
-                        fallback_attachments.append(attachment)
-            else:
-                fallback_attachments = list(attachments)
-
-        parts: list[str] = []
-        if turn_context:
-            parts.append(turn_context)
-        if user_message:
-            parts.append(user_message)
-        fallback_context = format_attachment_context(fallback_attachments)
-        if fallback_context:
-            parts.append(fallback_context)
-        text = "\n\n".join(parts)
-        if not direct_images:
-            return text
-
-        blocks: list[dict[str, Any]] = []
-        if text.strip():
-            blocks.append({"type": "text", "text": text})
-        blocks.extend(self._image_content_block(attachment) for attachment in direct_images)
-        return blocks
 
     def _emit_subagent_event(self, event: SubAgentProgressEvent) -> None:
         sink = _active_sink.get()
@@ -687,18 +638,6 @@ class BaseAgent:
         """The endpoint that owns the model ``consolidation_model`` returned."""
         return self.endpoint_for(self.consolidation_model(cfg))
 
-    def _plan_orchestration(
-        self,
-        ctx: AgentContext,
-        user_message: str,
-    ) -> OrchestrationDecision:
-        skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
-        planner = OrchestrationPlanner.from_skill_catalog(skill_catalog)
-        return planner.decide(
-            user_message,
-            tools_enabled=ctx.tools_enabled,
-            has_spawn_agent=bool(self.registry.tools_with_capability("orchestration")),
-        )
 
     async def _execute_subtask_spec(self, spec: SubtaskSpec) -> SubtaskResult:
         # Call the single execution primitive directly — no JSON round-trip
@@ -1289,16 +1228,6 @@ class BaseAgent:
         return self._token_budget.configured_output_cap(output_max_tokens)
 
 
-    def _retrieval_token_budget(
-        self,
-        ctx: Optional["AgentContext"] = None,
-        tools: Optional[list[dict]] = None,
-        current_user_content: Any = "",
-    ) -> int:
-        """See :meth:`agent.core.token_budget.TokenBudget.retrieval_token_budget`."""
-        return self._token_budget.retrieval_token_budget(
-            ctx, tools, current_user_content
-        )
 
     def _payload_overhead(self, ctx: "AgentContext", tools: list[dict]) -> int:
         """See :meth:`agent.core.token_budget.TokenBudget.payload_overhead`."""
@@ -1639,6 +1568,15 @@ class BaseAgent:
         return await create_turn_response(
             self._model_call(), ctx, tools, output_max_tokens=output_max_tokens
         )
+
+    def _loop_deps(self) -> LoopDeps:
+        """This agent's turn-loop dependency surface.
+
+        A facade like :meth:`_create`, and for the same reason: the tests drive the
+        loop's own helpers directly -- ``prepare_turn``, the token budgets -- and
+        building the surface is the agent's job, not theirs.
+        """
+        return LoopDeps.of(self)
 
     def _model_call(self) -> ModelCall:
         """This agent's model-call surface, in the shape the call leg takes.
@@ -2307,162 +2245,6 @@ class BaseAgent:
         )
 
 
-    def _prepare_turn(
-        self,
-        ctx: "AgentContext",
-        user_message: str,
-        attachments: tuple[MessageAttachment, ...],
-    ) -> OrchestrationDecision:
-        """Mutate ctx for one turn: inject LTM context, activate skills, plan
-        orchestration, and append the user message.  Returns the orchestration
-        decision so the loop can route spawn calls correctly.
-
-        Everything this turn adds that varies per turn is collected into
-        ``turn_blocks`` and carried by the turn's own message, never by
-        ``ctx.system_prompt``.  The system prompt is the head of the request, so
-        a volatile value there caps what the provider can serve from its prefix
-        cache for the rest of the session; in the message it is appended once
-        and then frozen.  ``ctx.system_prompt`` is left exactly as it was found.
-        """
-        # What this turn was asked to do, in the asker's own words, published
-        # for the tools that have to prove they are answering it (see
-        # ``RegularToolExecutor._check_request``).  Overwritten unconditionally:
-        # a value left over from the previous turn would let this turn borrow
-        # that turn's authority, and the one case that must never pass is a turn
-        # where nobody asked for anything.
-        self.registry.set_context("turn_request", user_message)
-        # The interjections this turn answers, emptied at the boundary for the
-        # same reason as `turn_request` above: `ctx.metadata` is the session's,
-        # so a ledger left over from the previous turn would be journaled again
-        # by this one.  Reset here rather than read-and-cleared at turn end
-        # because it has to outlive every drain inside the turn: the mailbox is
-        # drained once per step, and every round of the continuation loop calls
-        # this method and then `_post_turn_maintenance` on the same ctx
-        # (`runtime/contracts.py`), so the ledger is read more than once per
-        # user message.  An interjection carrying no message id has no key for
-        # its write to be idempotent on, so a stale ledger is a duplicate row in
-        # the transcript and the same words staged into memory again.
-        ctx.metadata["_turn_interjections"] = []
-        turn_blocks: list[str] = []
-        handoff_block = str(ctx.metadata.get("_handoff_block") or "").strip()
-        if handoff_block:
-            turn_blocks.append(handoff_block)
-        checkpoint_summary = str(
-            ctx.metadata.get("_checkpoint_summary") or ""
-        ).strip()
-        if checkpoint_summary:
-            turn_blocks.append(
-                '<session_checkpoint trust="untrusted_evidence">\n'
-                + html.escape(checkpoint_summary, quote=False)
-                + "\n</session_checkpoint>"
-            )
-        # retrieve_implicit_context() covers both recent staging-buffer turns
-        # (not yet consolidated) and historical LTM hits.  Skipping the
-        # staging side would let recently-compacted turns drop from view.
-        decision = self._plan_orchestration(ctx, user_message)
-        all_tools = self.registry.to_anthropic_format() if ctx.tools_enabled else []
-        # The schemas are the same for every call this agent instance makes --
-        # see `ContextAssembler.select_tools` for why a per-turn set is the
-        # expensive thing to do.  The one exception is the run's own report
-        # channel, which refuses outside a run: shipping it in a conversation
-        # would be shipping a tool whose only possible outcome is an error.
-        # `scheduler_run_id` is fixed at context construction, so that gate is
-        # a function of session-stable state too.
-        ctx.metadata["_selected_tools"] = self.context_assembler.select_tools(
-            all_tools,
-            scheduled_run=bool(ctx.metadata.get("scheduler_run_id")),
-        )
-        context_manager = self._context_manager_for(ctx)
-        # Retrieval's place in the block list is reserved now and filled in
-        # below, because its *size* cannot be decided until every other block
-        # that rides in this same message has been built: they share one window.
-        retrieval_slot = len(turn_blocks)
-        turn_blocks.append("")
-        skill_catalog: Optional[SkillCatalog] = ctx.metadata.get("skill_catalog")
-        required_skills: list[str] = list(ctx.metadata.get("required_skills", []))
-        if skill_catalog and required_skills:
-            active_blocks = []
-            for skill_ref in required_skills:
-                activation = skill_catalog.activation_text(skill_ref, explicit=True)
-                if activation:
-                    active_blocks.append(activation)
-            if active_blocks:
-                turn_blocks.append("## Active Skills\n" + "\n\n".join(active_blocks))
-        if decision.mode == "explicit":
-            policy = (
-                "When using orchestration tools, encode ordering and coordination "
-                "explicitly with depends_on and coordination_mode. Treat wording cues "
-                "as advisory only; the explicit subtask graph is authoritative."
-            )
-            if decision.guidance:
-                policy += " Advisory cues for this request: " + self._bounded_text(
-                    decision.guidance,
-                    800,
-                )
-            turn_blocks.append("## Orchestration policy\n" + policy)
-        # The time rides here rather than in the system prompt: it changes every
-        # minute, and in the head that would cap the provider's cacheable prefix
-        # at whatever precedes it for every request in the session.  Here it is
-        # also more accurate -- the time of *this* turn, not of whichever turn
-        # last re-rendered the prompt.
-        turn_blocks.append(
-            f"Current UTC time: {_now()}. "
-            "Use the current_time tool when the user asks about local time or timezone conversions."
-        )
-        # Size retrieval against the message it will actually ride in.  Sizing it
-        # from the raw user message charged the window for a message that is
-        # never sent: what goes out is `turn_context + "\n\n" + user_message`, so
-        # every token the blocks above added was invisible to the allocation and
-        # retrieval was handed room that had already been spent -- which the
-        # turn-boundary cut then had to take back out of older history.
-        blocks_without_retrieval = "\n\n".join(
-            block for block in turn_blocks if block
-        )
-        retrieval_budget = self._retrieval_token_budget(
-            ctx,
-            ctx.metadata.get("_selected_tools") or [],
-            current_user_content=self._build_user_message_content(
-                user_message, attachments, turn_context=blocks_without_retrieval
-            ),
-        )
-        if context_manager and retrieval_budget > 0:
-            has_active_state = True
-            if ctx.metadata.get("_has_provider_checkpoint"):
-                active_state = getattr(
-                    context_manager, "has_active_working_state", None
-                )
-                if callable(active_state):
-                    has_active_state = bool(active_state())
-            retrieved = context_manager.retrieve_implicit_context(
-                user_message,
-                current_messages=ctx.messages,
-                current_turn_id=str(ctx.metadata.get("turn_id") or ""),
-                token_budget=retrieval_budget,
-                include_recent_session=not bool(
-                    ctx.metadata.get("_has_provider_checkpoint")
-                ),
-                include_working_state=has_active_state,
-            )
-            if retrieved:
-                turn_blocks[retrieval_slot] = (
-                    '<retrieved_context trust="untrusted_evidence">\n'
-                    + html.escape(retrieved, quote=False)
-                    + "\n</retrieved_context>"
-                )
-        request_message = {
-            "role": "user",
-            "content": self._build_user_message_content(
-                user_message,
-                attachments,
-                turn_context="\n\n".join(block for block in turn_blocks if block),
-            ),
-        }
-        ctx.messages.append(request_message)
-        # Named so that a cut running later *inside this turn* can recognise it.
-        # A message is identified by the object, not by how it reads, because an
-        # interjection appended after it reads the same way.
-        ctx.metadata[_TURN_REQUEST_KEY] = request_message
-        return decision
 
     async def _handle_end_turn(
         self,
@@ -2559,9 +2341,13 @@ class BaseAgent:
         Locals were correct for that reason, and a mutable holder keeps them
         correct while making them visible to the caller.
         """
+        # The loop's dependency surface, read once at entry: bound methods are
+        # snapshotted here, so nothing reassigned mid-turn can change which
+        # adapter or budget this turn is using.
+        deps = LoopDeps.of(self)
         try:
             ctx.metadata[_TURN_IN_PROGRESS_KEY] = True
-            orchestration_decision = self._prepare_turn(ctx, user_message, attachments)
+            orchestration_decision = prepare_turn(deps, ctx, user_message, attachments)
             # Cut once, here, so every step below is an append.  See
             # `_compact_body_for_turn` for why the position of this call is what
             # decides whether a turn's steps share a cacheable prefix.

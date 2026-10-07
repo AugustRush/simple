@@ -10,6 +10,7 @@ import textwrap
 from pathlib import Path
 
 from agent.core.interjections import inject_pending_interjections
+from agent.core.turn_loop import prepare_turn
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -3564,7 +3565,7 @@ def test_the_interjection_ledger_belongs_to_one_turn():
     ]
 
     # The boundary of the next turn.
-    agent._prepare_turn(ctx, "下一轮的请求", ())
+    prepare_turn(agent._loop_deps(), ctx, "下一轮的请求", ())
 
     assert ctx.metadata.get("_turn_interjections") == []
 

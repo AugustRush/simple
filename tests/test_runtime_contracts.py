@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from agent.core.interjections import inject_pending_interjections
+from agent.core.turn_loop import prepare_turn
 from agent.runtime import (
     AgentCore,
     RuntimeComponents,
@@ -605,7 +606,7 @@ def test_a_later_turn_does_not_rejournal_the_previous_turns_interjection(tmp_pat
     ctx = AgentContext(system_prompt="system")
 
     def run_turn(message_id: str, user_content: str, interjections=()):
-        agent._prepare_turn(ctx, user_content, ())
+        prepare_turn(agent._loop_deps(), ctx, user_content, ())
         if interjections:
             inject_pending_interjections(ctx, list(interjections), agent.registry)
         BaseAgent._post_turn_maintenance(
@@ -669,7 +670,7 @@ def test_a_continuation_round_does_not_rewrite_the_turns_interjection(tmp_path):
 
     def boundary(prompt: str):
         """What starts each round: `send_message` calls this on the same ctx."""
-        agent._prepare_turn(ctx, prompt, ())
+        prepare_turn(agent._loop_deps(), ctx, prompt, ())
 
     def finish(user_content: str, completion: int):
         """What ends each round: `complete_turn` records the turn."""

@@ -8,6 +8,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from agent.core.turn_loop import (
+    build_user_message_content,
+    plan_orchestration,
+    prepare_turn,
+)
 
 
 class _FakeMCPClient:
@@ -459,7 +464,7 @@ def test_retrieved_context_cannot_close_its_untrusted_envelope():
     agent.context_manager = _ContextManager()
     ctx = agent_module.AgentContext(system_prompt="system")
 
-    agent._prepare_turn(ctx, "question", ())
+    prepare_turn(agent._loop_deps(), ctx, "question", ())
 
     sent = ctx.messages[-1]["content"]
     assert sent.count("</retrieved_context>") == 1
@@ -548,10 +553,10 @@ def test_each_turn_publishes_its_own_request_and_no_other():
     )
     ctx = agent_module.AgentContext(system_prompt="system")
 
-    agent._prepare_turn(ctx, "每天早上九点提醒我看盘", ())
+    prepare_turn(agent._loop_deps(), ctx, "每天早上九点提醒我看盘", ())
     assert registry.get_context("turn_request") == "每天早上九点提醒我看盘"
 
-    agent._prepare_turn(ctx, "订单都是如何接的，具体流程是什么", ())
+    prepare_turn(agent._loop_deps(), ctx, "订单都是如何接的，具体流程是什么", ())
     assert registry.get_context("turn_request") == "订单都是如何接的，具体流程是什么"
 
 
@@ -8024,7 +8029,7 @@ def test_base_agent_appends_attachment_context_for_non_vision_model(tmp_path):
         supports_vision=False,
     )
 
-    content = agent._build_user_message_content("describe", (attachment,))
+    content = build_user_message_content(agent._loop_deps(), "describe", (attachment,))
 
     assert isinstance(content, str)
     assert content.startswith("describe")
@@ -8051,7 +8056,7 @@ def test_base_agent_builds_openai_image_content_for_vision_model(tmp_path):
         supports_vision=True,
     )
 
-    content = agent._build_user_message_content("describe", (attachment,))
+    content = build_user_message_content(agent._loop_deps(), "describe", (attachment,))
 
     assert content[0] == {"type": "text", "text": "describe"}
     assert content[1]["type"] == "image_url"
@@ -8077,7 +8082,7 @@ def test_base_agent_builds_anthropic_image_content_for_vision_model(tmp_path):
         supports_vision=True,
     )
 
-    content = agent._build_user_message_content("describe", (attachment,))
+    content = build_user_message_content(agent._loop_deps(), "describe", (attachment,))
 
     assert content[0] == {"type": "text", "text": "describe"}
     assert content[1]["type"] == "image"
@@ -8104,7 +8109,7 @@ def test_base_agent_keeps_non_image_attachments_as_context_for_vision_model(tmp_
         supports_vision=True,
     )
 
-    content = agent._build_user_message_content("summarize", (attachment,))
+    content = build_user_message_content(agent._loop_deps(), "summarize", (attachment,))
 
     assert isinstance(content, str)
     assert str(path) in content

@@ -28,7 +28,13 @@ from typing import TYPE_CHECKING, Any, Optional
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from agent.core.agent import AgentContext
 
+#: The metadata key a turn's opening request is stored under.  Written by the loop
+#: when it prepares a turn and appended to by the interjection drain, so it lives
+#: beside them rather than in ``agent.py``.
+TURN_REQUEST_KEY = "_turn_request_message"
+
 __all__ = [
+    "TURN_REQUEST_KEY",
     "active_agent_context",
     "active_agent_id",
     "emit_domain_event",

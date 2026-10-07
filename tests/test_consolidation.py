@@ -5,6 +5,11 @@ import threading
 import time
 
 import pytest
+from agent.core.turn_loop import (
+    build_user_message_content,
+    plan_orchestration,
+    prepare_turn,
+)
 
 
 def _endpoint(api_format: str = "openai", client=None):
@@ -3073,7 +3078,7 @@ def test_retrieval_budget_default_leaves_room_for_the_conversation(tmp_path):
     agent.max_tokens = 64_000
     agent.output_reserve = 8192
 
-    budget = agent._retrieval_token_budget()
+    budget = agent._token_budget.retrieval_token_budget()
     usable = 128_000 - 8192
 
     assert budget == max(1024, int(usable * agent_module.RETRIEVAL_BUDGET_FRACTION))
@@ -3086,7 +3091,7 @@ def test_retrieval_budget_default_leaves_room_for_the_conversation(tmp_path):
     )
 
     agent.max_retrieval_tokens = 4096
-    assert agent._retrieval_token_budget() == 4096
+    assert agent._token_budget.retrieval_token_budget() == 4096
 
 
 def test_retention_prunes_stale_usage_events(tmp_path):

@@ -16,6 +16,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from agent.core.turn_loop import prepare_turn
 
 
 def _block_types(message: dict) -> list[str]:
@@ -329,7 +330,7 @@ def test_retrieval_is_sized_against_the_message_it_rides_in():
         ctx = agent_module.AgentContext(system_prompt="system")
         if checkpoint:
             ctx.metadata["_checkpoint_summary"] = checkpoint
-        agent._prepare_turn(ctx, "question", ())
+        prepare_turn(agent._loop_deps(), ctx, "question", ())
         return seen["token_budget"]
 
     with_checkpoint = budget_for("x" * 40_000)
