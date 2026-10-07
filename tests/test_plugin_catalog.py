@@ -18,6 +18,21 @@ from agent.core.events import TURN_EVENTS
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
+
+def _evolution_components(*, enabled: bool = False):
+    """The services ``EvolutionPlugin`` declares.
+
+    ``enabled=False`` is the useful default for these tests: the plugin activates -- every
+    declared name is present -- and builds no engine, which is what a test about
+    correction detection wants.  Detection needs no engine; only rule extraction does.
+    """
+    return {
+        "cfg": {"evolution": {"enabled": enabled}},
+        "agent": object(),
+        "model": "a-model",
+        "memory": object(),
+    }
+
 def _write_plugin(plugin_dir: Path, code: str) -> None:
     """Write a minimal plugin __init__.py to *plugin_dir*."""
     plugin_dir.mkdir(parents=True, exist_ok=True)
@@ -487,7 +502,7 @@ def test_evolution_plugin_loads_via_catalog():
     # registers nothing: the kernel's model is that an unmet dependency holds zero
     # effects, rather than half-installing a plugin whose dependencies are missing.
     catalog = PluginCatalog(
-        builtin_dir=PLUGINS_DIR, components={"evolution": object()}
+        builtin_dir=PLUGINS_DIR, components=_evolution_components()
     )
     loaded = catalog.discover_and_load()
     assert "evolution" in loaded
@@ -498,7 +513,7 @@ def test_evolution_plugin_slash_commands_registered():
     from agent import PluginCatalog, PLUGINS_DIR
 
     catalog = PluginCatalog(
-        builtin_dir=PLUGINS_DIR, components={"evolution": object()}
+        builtin_dir=PLUGINS_DIR, components=_evolution_components()
     )
     catalog.discover_and_load()
     cmds = catalog.get_slash_commands()
@@ -1004,7 +1019,7 @@ def test_evolution_plugin_on_turn_end_records_application(tmp_path):
     # The plugin declares `inject = ("evolution",)`: the engine the composition built,
     # or None when it is disabled.  A catalog with an empty registry leaves it *pending*,
     # so nothing subscribes and the event below reaches nobody.
-    components = {"evolution": object()}  # active; `_engine` is cleared below
+    components = _evolution_components()  # active, no engine
     catalog = PluginCatalog(builtin_dir=PLUGINS_DIR, components=components)
     catalog.discover_and_load()
     evo_plugin = next(
@@ -1047,7 +1062,7 @@ def test_evolution_plugin_on_turn_end_records_correction(tmp_path):
     # The plugin declares `inject = ("evolution",)`: the engine the composition built,
     # or None when it is disabled.  A catalog with an empty registry leaves it *pending*,
     # so nothing subscribes and the event below reaches nobody.
-    components = {"evolution": object()}  # active; `_engine` is cleared below
+    components = _evolution_components()  # active, no engine
     catalog = PluginCatalog(builtin_dir=PLUGINS_DIR, components=components)
     catalog.discover_and_load()
     evo_plugin = next(
@@ -1089,7 +1104,7 @@ def test_evolution_plugin_compose_returns_rules(tmp_path):
     # The plugin declares `inject = ("evolution",)`: the engine the composition built,
     # or None when it is disabled.  A catalog with an empty registry leaves it *pending*,
     # so nothing subscribes and the event below reaches nobody.
-    components = {"evolution": object()}  # active; `_engine` is cleared below
+    components = _evolution_components()  # active, no engine
     catalog = PluginCatalog(builtin_dir=PLUGINS_DIR, components=components)
     catalog.discover_and_load()
     evo_plugin = next(
@@ -1314,7 +1329,7 @@ def test_evolution_plugin_engine_none_is_safe():
     # The plugin declares `inject = ("evolution",)`: the engine the composition built,
     # or None when it is disabled.  A catalog with an empty registry leaves it *pending*,
     # so nothing subscribes and the event below reaches nobody.
-    components = {"evolution": object()}  # active; `_engine` is cleared below
+    components = _evolution_components()  # active, no engine
     catalog = PluginCatalog(builtin_dir=PLUGINS_DIR, components=components)
     catalog.discover_and_load()
     evo_plugin = next(
@@ -2727,7 +2742,7 @@ def test_evolution_plugin_survives_reload(tmp_path, monkeypatch):
 
     # The composition, and it must survive the reload: `reload` re-runs every setup, so a
     # mapping handed only at construction would leave the plugin pending afterwards.
-    components = {"evolution": object()}
+    components = _evolution_components()
     catalog = PluginCatalog(
         builtin_dir=_shared.PLUGINS_DIR,
         user_dir=tmp_path / "user",
@@ -3333,88 +3348,104 @@ def test_the_sink_notice_distinguishes_an_interjection_from_a_restart():
 # ── The evolution plugin's activation is the composition's decision ──────────
 
 
-def test_evolution_is_pending_when_the_composition_has_no_engine() -> None:
-    """``evolution.enabled: false`` is expressed by the service being *absent*.
+# ── The evolution plugin owns its engine ─────────────────────────────────────
 
-    This is the bug the kernel protocol removed.  The old handler read
-    ``components.get("evolution")`` -- ``None`` when disabled -- and then, finding none,
-    **built one anyway** from the agent, the model and the memory.  So the flag was
-    defeated by the plugin that was supposed to honour it, silently, and
-    ``bootstrap``'s comment ("the evolution plugin and the evolve CLI command both check
-    for None") described an intention the fallback undid.
 
-    Absent now means pending: the plugin registers nothing, subscribes to nothing, and
-    says so through ``waiting_for``.
+def test_the_plugin_builds_the_engine_it_uses() -> None:
+    """The composition stopped building it, and that is what unblocks ``memory``.
+
+    ``bootstrap`` used to construct the engine above the catalog because
+    ``on_session_start`` was handed a mapping once, so the engine had to exist before the
+    catalog that would have let the plugin build it.  That line used the memory object,
+    which is why ``memory`` could not become a plugin: a service cannot be assembled by a
+    plugin that runs after something already consumed it.
+
+    A kernel plugin's ``setup`` runs after mounting and can read what it needs, so the
+    engine is built here -- from ``agent``, ``model`` and ``memory``, the names this
+    plugin declares.
+    """
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    from agent.kernel.plugin import PluginHost
+
+    class _Agent:
+        def endpoint_for(self, model):
+            return f"endpoint:{model}"
+
+    host = PluginHost()
+    for name, value in (
+        ("cfg", {"evolution": {"enabled": True}}),
+        ("agent", _Agent()),
+        ("model", "a-model"),
+        ("memory", object()),
+    ):
+        host.services.provide(name, value)
+
+    host.load(EvolutionPlugin())
+    assert host.pending() == (), "every declared name was present"
+    provided = host.services.get("evolution", "MISSING")
+    assert type(provided).__name__ == "EvolutionEngine"
+
+
+def test_the_config_decides_not_the_mounting() -> None:
+    """The shape the channel plugins use, and for the same reason.
+
+    Mounting only what the config enables would put the switch back in the composition
+    root -- which is where it was, and where the bug lived: the plugin read a ``None``
+    engine (meaning disabled) and built one anyway.  Mounted, it reads its own section and
+    contributes nothing when it is off.
     """
     from agent._builtin.plugins.evolution import EvolutionPlugin
     from agent.kernel.plugin import PluginHost
 
     host = PluginHost()
-    # Deliberately no engine, and no agent/memory either: the old fallback needed those
-    # three to build what it had been told not to.
+    for name, value in (
+        ("cfg", {"evolution": {"enabled": False}}),
+        ("agent", object()),
+        ("model", "a-model"),
+        ("memory", object()),
+    ):
+        host.services.provide(name, value)
+
+    host.load(EvolutionPlugin())
+    assert host.pending() == (), "mounted and inert, not pending"
+    assert host.services.get("evolution", "MISSING") is None, (
+        "provided as None, because the `evolve` command subscripts this name and reports "
+        "'disabled' for a None -- an absent key would be a KeyError in the one command "
+        "whose job is to say the feature is off"
+    )
+
+
+def test_a_composition_without_the_services_leaves_it_pending() -> None:
+    """A missing dependency is a composition-time fact, not a run-time surprise."""
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    from agent.kernel.plugin import PluginHost
+
+    host = PluginHost()
+    host.services.provide("cfg", {})
     host.load(EvolutionPlugin())
 
     assert host.pending() == ("evolution",)
-    assert host.waiting_for()["evolution"] == ("evolution",)
-    assert host.services.get("evolution", None) is None
+    assert set(host.waiting_for()["evolution"]) == {"agent", "model", "memory"}
 
 
-def test_evolution_is_active_with_no_engine_when_the_service_is_present() -> None:
-    """Present-with-``None`` is still a composition's decision, and a usable state.
+def test_a_missing_provider_is_not_a_failure() -> None:
+    """An agent with no endpoint is a composition where evolution has nothing to score.
 
-    Correction detection needs no engine -- only rule extraction does -- so a composition
-    that runs without a provider can still learn from corrections.  Conflating "no
-    engine" with "not in this composition" is what made the old code unable to tell them
-    apart.
+    The plugin's other half -- correction detection -- needs no engine, so building none
+    is the right answer rather than an error.
     """
     from agent._builtin.plugins.evolution import EvolutionPlugin
     from agent.kernel.plugin import PluginHost
 
     host = PluginHost()
-    host.services.provide("evolution", None)
+    for name, value in (
+        ("cfg", {}),
+        ("agent", object()),  # no `endpoint_for`
+        ("model", "a-model"),
+        ("memory", object()),
+    ):
+        host.services.provide(name, value)
+
     host.load(EvolutionPlugin())
-
-    assert host.pending() == (), "present, so active"
-    plugin = next(iter(host.installs.values())).plugin
-    assert plugin._engine is None
-
-
-def test_bootstrap_omits_the_evolution_service_when_disabled() -> None:
-    """The other half of ``evolution.enabled: false``, and the half a test missed.
-
-    Written after a probe: setting the key to ``None`` again -- the bug -- left the
-    plugin's own test passing, because that test builds its own ``PluginHost`` and never
-    reads ``bootstrap``.  The fix has two halves and only one was covered.
-
-    Asserted at the source, because the alternative is building a whole composition, which
-    reaches for providers and a filesystem.  The statement is structural and the intent is
-    behavioural: the assignment must sit inside an ``if``.  The behavioural half -- absent
-    means *pending* -- is
-    ``test_evolution_is_pending_when_the_composition_has_no_engine``.
-    """
-    import ast as _ast
-
-    source = (Path(__file__).resolve().parents[1] / "agent/bootstrap.py").read_text(
-        encoding="utf-8"
-    )
-    tree = _ast.parse(source)
-
-    def assigns_evolution(node: _ast.AST) -> bool:
-        return isinstance(node, _ast.Assign) and any(
-            isinstance(target, _ast.Subscript)
-            and isinstance(target.slice, _ast.Constant)
-            and target.slice.value == "evolution"
-            for target in node.targets
-        )
-
-    inside_if = any(
-        assigns_evolution(child)
-        for parent in _ast.walk(tree)
-        if isinstance(parent, _ast.If)
-        for child in _ast.walk(parent)
-    )
-    assert inside_if, (
-        "bootstrap must provide `evolution` only when it is enabled: providing the key "
-        "with a None value makes 'disabled' and 'no engine' the same, and the plugin "
-        "cannot tell them apart -- which is the bug this pair of changes removed"
-    )
+    assert host.pending() == ()
+    assert host.services.get("evolution", "MISSING") is None

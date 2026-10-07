@@ -902,20 +902,16 @@ async def _build_components_async(
     agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
     base_system_prompt = system_prompt
 
-    # EvolutionEngine is created only when evolution is enabled in config.
-    # The evolution plugin (and the `evolve` CLI command) both check for None.
-    evo_cfg = cfg.get("evolution", {})
-    evolution: Optional[EvolutionEngine] = (
-        EvolutionEngine(routing_transport.endpoint_for(model), model, memory)
-        if evo_cfg.get("enabled", True)
-        else None
-    )
-    # Provided only when enabled: the plugin declares it in , so an absent key
-    # leaves the plugin *pending* -- which is how "disabled" reaches it.  Setting the key
-    # to None instead made "disabled" and "no engine yet" the same value, and the plugin
-    # resolved the ambiguity by building an engine anyway.
-    if evolution is not None:
-        _partial_components["evolution"] = evolution
+    # No EvolutionEngine here any more.  The plugin builds the one it uses, reading the
+    # config section itself -- the same shape the channel plugins have ("mounted
+    # unconditionally, contributes nothing unless its section says enabled", see
+    # agent/channels/plugin.py).  It was constructed here because `on_session_start` was
+    # handed a mapping once, so the engine had to exist *before* the catalog that would
+    # have let the plugin build it; a kernel plugin's setup runs after mounting, and can
+    # read what it needs.
+    #
+    # That ordering was also what blocked `memory` from becoming a plugin: this line used
+    # the memory object, and it sits above the catalog.  See the status document.
 
     # The channels a composition runs.  Provided so a plugin can contribute one -- a
     # tool, a command, a role, an MCP config and a skill root were all contributable and

@@ -67,16 +67,16 @@ class EvolutionPlugin:
     name = "evolution"
     version = "2.0.0"
 
-    #: The engine, or nothing.  *Absent* means this composition has no evolution -- the
-    #: plugin then stays **pending** and `setup` never runs, which is how "disabled"
-    #: reaches it.  Present means active, and its value may still be ``None``: correction
-    #: detection needs no engine, and only rule extraction does.
+    #: What building an engine needs.  ``memory`` because an engine scores sessions
+    #: against stored experience, ``agent`` for its provider endpoint and ``model`` to
+    #: name it; ``cfg`` for the enabled switch, which this plugin reads itself.
     #:
-    #: Deliberately not provided-as-``None`` by the composition when disabled (see
-    #: ``bootstrap``): that made "disabled" and "no engine" the same value, and the old
-    #: handler resolved the ambiguity by building an engine anyway -- defeating
-    #: ``evolution.enabled: false`` silently.
-    inject = ("evolution",)
+    #: The engine used to be provided *by* the composition (``evolution``), and that name
+    #: was in this list so that a disabled composition left the plugin pending.  Reading
+    #: the config instead is the shape the channel plugins use, and it removes the reason
+    #: the composition had to build an engine above the catalog -- which is what blocked
+    #: ``memory`` from becoming a plugin.
+    inject = ("cfg", "agent", "model", "memory")
 
     def __init__(self) -> None:
         # Heavy resources are populated in setup(), once the composition says
@@ -123,12 +123,51 @@ class EvolutionPlugin:
         registered on the context's bus would never be called, which is the failure with
         no symptom.
         """
+        cfg = ctx.get("cfg", None) or {}
+        section = cfg.get("evolution", {}) or {}
+        # Use what the composition gave, if it gave anything: a test injecting a fake
+        # engine, or a composition substituting its own, is a decision this plugin does
+        # not get to overrule.  Build one only when nobody did **and** the config says so
+        # -- the bug this replaces was building one after being handed a None that meant
+        # "disabled".
         self._engine = ctx.get("evolution", None)
+        if self._engine is None and section.get("enabled", True):
+            self._engine = self._build_engine(ctx)
+        # Provided only if the composition has no such name -- `provide` refuses to
+        # replace by default, and replacing would silently discard a caller's engine.
+        # Including when it is None: the `evolve` command subscripts this name and
+        # reports "disabled" for a None, so an absent key would be a KeyError in the one
+        # command whose job is to say the feature is off.
+        if not ctx.has("evolution"):
+            ctx.provide("evolution", self._engine)
         # Subscribed whether or not there is an engine, because only rule *extraction*
         # needs one and that checks `_engine` itself.
         TURN.attach(ctx, self.on_turn)
         SESSION.attach(ctx, self.on_session)
         self._ensure_rule_store()
+
+    @staticmethod
+    def _build_engine(ctx: Any) -> Any:
+        """The engine, from the services this plugin declares.
+
+        Built here rather than by the composition so that nothing above the catalog needs
+        the memory object -- which is what kept `memory` from being a plugin.  Returns
+        None rather than raising when a piece is missing: a composition with no provider
+        is one where evolution simply has nothing to score with, and the plugin's other
+        half (correction detection) works without it.
+        """
+        agent = ctx.get("agent", None)
+        model = ctx.get("model", None)
+        memory = ctx.get("memory", None)
+        if agent is None or not hasattr(agent, "endpoint_for") or not model:
+            return None
+        try:
+            import agent as _agent_mod
+
+            return _agent_mod.EvolutionEngine(agent.endpoint_for(str(model)), str(model), memory)
+        except Exception as exc:  # noqa: BLE001 -- reported, not fatal
+            _console().print(f"[dim]Evolution plugin: engine init failed: {exc}[/dim]")
+            return None
 
     async def on_turn(self, event: Any) -> None:
         """Detect corrections; record rule applications; trigger extraction.

@@ -9713,6 +9713,11 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
     components = {
         "agent": fake_agent,
         "memory": _FakeMemory(),
+        # The plugin declares `cfg` and reads the enabled switch from it.  It also
+        # *honours* an engine the composition already provided -- the fake below -- and
+        # builds its own only when nobody did: that is what lets this test substitute one
+        # without the plugin overriding it.
+        "cfg": {"evolution": {"enabled": False}},
         "evolution": _FakeEvolution(),
         "system_prompt": "COMPOSED::system-v1",
         "base_system_prompt": "system-v1",

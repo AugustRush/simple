@@ -1486,6 +1486,7 @@ _COMPONENT_KEYS: dict[str, str] = {
 #: bootstrap builds, while the table above can still describe the whole composition.
 _PLUGIN_PROVIDED: dict[str, str] = {
     "ralph_service": "agent/ralph/plugin.py",
+    "evolution": "agent/_builtin/plugins/evolution/__init__.py",
 }
 
 
