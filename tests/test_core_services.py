@@ -1607,3 +1607,47 @@ def test_a_metadata_write_is_not_counted_as_a_service_write() -> None:
         "the metadata write must be skipped and the component write counted; "
         f"counted {counted}"
     )
+
+
+def test_the_agent_is_given_only_the_names_it_looks_up() -> None:
+    """``BaseAgent`` resolves ``llm`` by name; that is the whole of what it needs.
+
+    It used to be handed the **component mapping** -- the composition's whole vocabulary
+    -- and looked ``llm`` up inside it.  The lookup is what makes the model adapter a
+    seam a composition can substitute without editing the code that builds the agent, so
+    the lookup stays; what changed is how much it can reach through.  A mapping is a
+    channel that answers "what does this class need?" with "everything".
+
+    Asserted against the source, because the width of an argument is only visible where
+    it is passed.  A future edit that hands the mapping back should have to argue with
+    this test.
+    """
+    source = (REPO_ROOT / "agent/bootstrap.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    constructions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "BaseAgent"
+    ]
+    assert constructions, "the scan must find the agent being built"
+
+    for node in constructions:
+        services = next((k for k in node.keywords if k.arg == "services"), None)
+        if services is None:
+            continue  # a construction that passes no mapping claims no names
+        assert isinstance(services.value, ast.Dict), (
+            "the agent's `services` must be a literal naming what it resolves, not a "
+            f"variable holding the composition: {ast.unparse(services.value)[:60]}"
+        )
+        names = {
+            key.value
+            for key in services.value.keys
+            if isinstance(key, ast.Constant)
+        }
+        assert names <= {"llm"}, (
+            f"the agent resolves {sorted(names)} by name; declare what it needs here "
+            "rather than handing it the mapping"
+        )

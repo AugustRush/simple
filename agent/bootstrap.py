@@ -331,7 +331,8 @@ async def _build_web_session_components(
         context_window=session_context_window,
         output_reserve=session_output_reserve,
         transport=session_transport,
-        services=session_components,
+        # One name, for the same reason as the process-wide construction below.
+        services={"llm": session_transport},
     )
     for name in (
         "max_parallel_agents",
@@ -689,7 +690,8 @@ async def _build_components_async(
         context_window=context_window,
         output_reserve=output_reserve,
         transport=routing_transport,
-        services=_partial_components,
+        # One name, not the whole mapping: this is what the agent resolves by name.
+        services={'llm': routing_transport},
     )
     agent.max_parallel_agents = max(
         1,

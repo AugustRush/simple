@@ -365,13 +365,12 @@ class BaseAgent:
         transport: Optional["ModelTransport"] = None,
         services: Any = None,
     ):
-        #: The composition this agent participates in, when there is one.  Read at
-        #: construction to resolve the model adapter **by name**, so which model
-        #: plugin is in effect is the composition's decision rather than this
-        #: class's.  Resolved once rather than per call: replacing the adapter after
-        #: the agent is built is not something a composition does -- it builds both
-        #: -- and a per-call lookup would be a resolution on the hot path of every
-        #: request for a value that cannot change.
+        #: The names this class resolves rather than receives.  One name today --
+        #: ``llm`` -- and deliberately **not** the whole composition: the caller passes
+        #: what this class looks up, so a plugin can build it from its own context
+        #: without handing the agent a mapping it could reach anything through.  A
+        #: mapping that is too wide is how "which services does this need" stops being a
+        #: question anybody can answer.
         self._services = services
         self.client = client
         self.registry = registry
@@ -411,9 +410,12 @@ class BaseAgent:
         if transport is None:
             from agent.core.transport import build_transport
             transport = build_transport(api_format, client)
-        # The composition's ``llm`` service wins when it provided one; the argument
-        # is what an agent built outside a composition uses.  A composition always
-        # provides it, so in practice there is one path -- the named one.
+        # The composition's ``llm`` wins when it named one; the argument is what an
+        # agent built outside a composition uses.  That precedence is the seam Phase 2
+        # asked for -- "a composition can choose the adapter without editing the code
+        # that builds the agent" -- and it is why `services` is one name rather than the
+        # mapping: the narrower it is, the more the question "what does this need" has an
+        # answer.
         if services is not None:
             named = resolve(services, "llm", None)
             if named is not None:

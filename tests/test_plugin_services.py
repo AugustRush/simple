@@ -237,6 +237,10 @@ def test_an_agent_uses_the_adapter_its_composition_named() -> None:
     from agent.core.agent import BaseAgent
 
     replacement = _Adapter()
+    # `services` is the seam and it wins over the argument; what changed is its *width*.
+    # It used to be handed the whole component mapping, which made "what does the agent
+    # resolve by name" unanswerable; `bootstrap` now passes exactly the one name this
+    # class looks up.
     agent = BaseAgent(
         client=object(),
         registry=object(),
