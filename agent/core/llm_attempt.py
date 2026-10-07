@@ -86,7 +86,8 @@ async def obtain_response(
 ) -> LLMAttempt:
     """Obtain this step's response, by replay, by resubmission, or by calling.
 
-    ``agent`` is the collaborator providing ``_create`` and ``_stream_response``;
+    ``agent`` is the collaborator providing ``_stream_response`` and the two
+    surfaces (its retry policy and its model call);
     this module deliberately does not import ``agent.core.agent``, which is where it
     is used from.  ``retry`` is the injection point for the retry leg, defaulting to
     the real one: a test needs to make the call raise without an agent in the way,

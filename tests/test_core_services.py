@@ -821,6 +821,7 @@ _LOOP_OWNED = (
     "_run_turn_loop",
     "_synthesize_tool_only_response",
     "_retry_policy",
+    "_model_call",
     "_inject_pending_interjections",
     "_assistant_message",
     "_tool_result_messages",
@@ -1091,3 +1092,55 @@ def test_the_retry_method_is_no_longer_on_the_agent() -> None:
     assert "_retry_policy" in methods, (
         "the agent has to offer its policy for the retry leg to be callable"
     )
+
+
+def test_the_model_call_facade_stays_a_facade() -> None:
+    """``_create`` may exist, but only as one line of delegation.
+
+    This is the counterweight to the rule the other extractions followed (remove the
+    method, migrate the call sites).  ``_create`` is a seam the suite genuinely uses:
+    thirty-eight tests replace it to stand in for the provider, so removing it would
+    have been removing the test's way of answering "how does this agent call the
+    model" without building a transport.
+
+    What must not happen is a second implementation growing here.  The logic lives in
+    ``agent/core/model_call.py``, and this asserts the body is exactly a return of
+    that function -- so "a facade" is enforced rather than trusted.
+    """
+    tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    method = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_create"
+    )
+    body = [
+        stmt for stmt in method.body
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))
+    ]
+    assert len(body) == 1, (
+        f"_create has {len(body)} statements; it is meant to be a facade over "
+        f"agent/core/model_call.py, not a second implementation"
+    )
+    stmt = body[0]
+    assert isinstance(stmt, ast.Return), ast.dump(stmt)
+    source = ast.unparse(stmt)
+    assert "create_turn_response(" in source, source
+    assert "self._model_call()" in source, source
+
+
+def test_the_model_call_surface_is_six_members() -> None:
+    """And it stays narrow, for the reason the retry policy is narrow.
+
+    The first attempt handed every helper the whole loop surface, which is what made
+    ``agent/core/llm_attempt.py`` hold a complete agent against its own docstring.
+    """
+    from agent.core.model_call import ModelCall
+
+    fields = set(ModelCall.__dataclass_fields__)
+    assert fields == {
+        "transport",
+        "effective_model",
+        "configured_output_cap",
+        "prepare_provider_context",
+        "observe_provider_usage",
+        "event_bus",
+    }, sorted(fields)

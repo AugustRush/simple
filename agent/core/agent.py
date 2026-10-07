@@ -104,6 +104,7 @@ from agent.core.turn_context import (
     emit_domain_event as _emit_domain_event,
     schedule_domain_event as _schedule_domain_event,
 )
+from agent.core.model_call import ModelCall, create_turn_response
 from agent.core.retry import RetryPolicy, with_llm_retry
 from agent.core.turn_loop import assistant_message, tool_result_messages
 from agent.runtime.services import resolve
@@ -1287,53 +1288,6 @@ class BaseAgent:
         """See :meth:`agent.core.token_budget.TokenBudget.configured_output_cap`."""
         return self._token_budget.configured_output_cap(output_max_tokens)
 
-    async def _create(
-        self,
-        ctx: "AgentContext",
-        tools: list[dict],
-        *,
-        output_max_tokens: int | None = None,
-    ) -> Any:
-        """Non-streaming API call, returns a normalised response object."""
-        # `output_max_tokens` is forwarded unresolved on purpose; see
-        # `_configured_output_cap`.
-        self._prepare_provider_context(
-            ctx,
-            tools,
-            output_max_tokens=output_max_tokens,
-        )
-        model = self._effective_model(ctx)
-        await _emit_domain_event(
-            self._llm_event_bus,
-            LLMRequestStarted,
-            agent_id=_active_agent_id(),
-            model=model,
-            tools_offered=len(tools or ()),
-        )
-        started_at = time.perf_counter()
-        response = await self._transport.create(
-            model=self._effective_model(ctx),
-            # Not the configured cap: the cap this call can afford depends on
-            # what the request actually weighs, which only
-            # `_prepare_provider_context` knows.  The fallback covers the case
-            # where it returned before recording one.
-            max_tokens=int(
-                ctx.metadata.pop(
-                    "_output_cap", self._configured_output_cap(output_max_tokens)
-                )
-            ),
-            system=ctx.system_prompt,
-            messages=ctx.messages,
-            tools=tools,
-        )
-        self._observe_provider_usage(ctx, response)
-        await _emit_domain_event(
-            self._llm_event_bus,
-            LLMResponseReceived,
-            agent_id=_active_agent_id(),
-            duration_ms=(time.perf_counter() - started_at) * 1000,
-        )
-        return response
 
     def _retrieval_token_budget(
         self,
@@ -1661,6 +1615,46 @@ class BaseAgent:
             f"({self._effective_model(ctx)}); it will not appear in "
             "usage_events. If the gateway rejects stream_options, set "
             "providers.<name>.stream_usage to false.[/yellow]"
+        )
+
+    async def _create(
+        self,
+        ctx: "AgentContext",
+        tools: list[dict],
+        *,
+        output_max_tokens: int | None = None,
+    ) -> Any:
+        """Non-streaming model call.  A **facade**, not a second implementation.
+
+        The logic lives in :func:`agent.core.model_call.create_turn_response`, and
+        this method exists because ``_create`` is a seam the suite genuinely uses:
+        thirty-eight tests replace it to stand in for the provider, and they are
+        right to -- "how this agent calls the model" is a thing a test should be able
+        to answer without building a transport.
+
+        One line of delegation cannot drift.  What must not happen is a *second*
+        implementation appearing here, so a guard asserts this body is exactly a
+        return of ``create_turn_response``.
+        """
+        return await create_turn_response(
+            self._model_call(), ctx, tools, output_max_tokens=output_max_tokens
+        )
+
+    def _model_call(self) -> ModelCall:
+        """This agent's model-call surface, in the shape the call leg takes.
+
+        The counterpart of :meth:`_retry_policy`, and for the same reason: the call
+        leg is a module function that ``agent/core/llm_attempt.py`` reaches without
+        importing ``agent.core.agent``, so it must be handed six members rather than
+        an agent.
+        """
+        return ModelCall(
+            transport=self._transport,
+            effective_model=self._effective_model,
+            configured_output_cap=self._configured_output_cap,
+            prepare_provider_context=self._prepare_provider_context,
+            observe_provider_usage=self._observe_provider_usage,
+            event_bus=self._llm_event_bus,
         )
 
     def _retry_policy(self) -> RetryPolicy:

@@ -24,6 +24,38 @@ from agent.core.stream_tracking import StreamEmissionTracker
 class _Ctx:
     agent_id = "a1"
     metadata: dict = {}
+    # The model-call leg builds a request out of these, so a context stand-in has to
+    # carry them: the stub used to intercept before the request was assembled, and
+    # that is exactly what it no longer does.
+    system_prompt = "sys"
+    messages: list = []
+
+
+def _stub_model_call(agent):
+    """The model-call surface this stub stands in for.
+
+    ``obtain_response`` reaches the model through a :class:`ModelCall` now, so a
+    stub that only overrode ``_create`` no longer intercepts anything.  Declaring
+    the surface here rather than injecting a bare callable keeps the stub honest:
+    it says what it is a stand-in *for*.
+    """
+    from agent.core.model_call import ModelCall
+
+    class _Transport:
+        async def create(self, **kwargs):
+            agent.calls.append("create")
+            if agent.raises:
+                raise agent.raises
+            return agent.result
+
+    return ModelCall(
+        transport=_Transport(),
+        effective_model=lambda ctx=None: "m",
+        configured_output_cap=lambda value=None: 16,
+        prepare_provider_context=lambda ctx, tools, **kwargs: None,
+        observe_provider_usage=lambda ctx, response: None,
+        event_bus=None,
+    )
 
 
 def _stub_retry_policy():
@@ -43,6 +75,7 @@ class _Agent:
         self.raises = raises
         self.calls: list[str] = []
         self._retry_policy = _stub_retry_policy
+        self._model_call = lambda: _stub_model_call(self)
 
     async def _create(self, ctx, tools):
         self.calls.append("create")
