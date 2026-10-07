@@ -525,6 +525,45 @@ still refers to the `memory` local, and the moved block still reads that local r
 the service.  Both become `require_service(components, "memory")`, and then the
 construction itself can move into the plugin.
 
+## Open: `AgentPlugin`, and what the measurement says about it
+
+The last item on the objective's list, and the measurement is done -- it is reproducible,
+but not at one moment.
+
+**The construction is `cfg`-derived, all of it.**  `BaseAgent(...)` takes ten arguments
+and eleven tuning assignments follow it (`max_parallel_agents`,
+`sub_agent_timeout_seconds`, `sub_agent_retries`, `max_agents_per_turn`,
+`max_tool_call_iterations`, `max_truncation_continuations`, `llm_max_retries`,
+`llm_retry_base_delay`, `result_content_max_chars`, ...).  Every one reads `cfg` (or
+`orch_cfg`) with a `shared.*` default.  Three of the constructor's arguments --
+`supports_vision`, `context_window`, `output_reserve` -- are pure functions of `cfg`, and
+the rest are already services or mapping entries.
+
+**Three assignments are not construction; they are wiring, and they happen at three
+different times:**
+
+| assignment | readers | when |
+|---|---|---|
+| `agent.content_filter` | 8 | before the catalog |
+| `agent.plugin_catalog` | 3 | **after** the catalog is built |
+| `agent.context_manager` | 15 | **after** the mount -- it was moved there when `MemoryPlugin` needed `ltm_store` |
+
+Measured on the *reads*, not the writes: an earlier round removed a parameter because its
+attribute was stored and never read, and the parameter itself was used twenty lines below.
+All three of these are live.
+
+So a plugin can provide the agent, but it cannot finish wiring it: `context_manager` does
+not exist when `setup` runs.  The honest shapes are (a) the plugin provides the agent and
+the composition keeps the one late assignment, with a comment saying why, or (b)
+`ContextManager` becomes a plugin too and is mounted before this one.  (b) is cleaner and
+is a second move; it is not a decision to make while writing the first.
+
+**And there are two agents.**  `bootstrap` builds one per process and a second per session
+(inside the session-components factory, rebuilt when the provider changes).  A plugin
+provides one, so the process-wide one is what `AgentPlugin` would own, and the session path
+keeps building its own -- which is right, because a session's agent is not a
+composition-time thing.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters
