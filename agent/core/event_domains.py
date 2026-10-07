@@ -53,6 +53,7 @@ __all__ = [
     "bus_for",
     "TurnStarted",
     "TurnFinished",
+    "TurnCompleted",
     "LLMRequestStarted",
     "LLMResponseReceived",
     "LLMResponseParsed",
@@ -88,6 +89,34 @@ class TurnFinished:
 
 
 # ── llm/* ────────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class TurnCompleted:
+    """A turn finished, with what the turn *was* rather than how it went.
+
+    Distinct from :class:`TurnFinished`, and the distinction was measured: that one
+    carries ``status`` and ``steps`` -- an outcome, for a log or a dashboard -- while
+    this carries the prompt, the response and the tools used, which is what a plugin
+    needs in order to *look at* a turn.  ``TurnFinished`` will not do: a subscriber
+    wanting the text finds three fields and none of them is text.
+
+    It exists because the one real plugin needed it.  ``EvolutionPlugin`` learns from
+    corrections, which means reading the user's input against the agent's answer, and
+    the hook protocol it still uses passes exactly these four things.  The kernel's
+    turn vocabulary had no equivalent, so migrating that plugin was blocked on
+    vocabulary rather than on mechanism -- see
+    ``docs/superpowers/plans/2026-10-02-plugin-kernel-status.md``.
+
+    Emitted *before* the turn's request is cleared from the context metadata, because
+    that is where ``user_input`` lives; clearing first and emitting after would leave
+    this event describing every turn as an empty prompt.
+    """
+
+    agent_id: str
+    user_input: str
+    response: str
+    tool_calls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -223,7 +252,7 @@ TOOL = Domain(
 
 TURN = Domain(
     name="turn",
-    event_types=(TurnStarted, TurnFinished),
+    event_types=(TurnStarted, TurnFinished, TurnCompleted),
     blocking=False,
 )
 

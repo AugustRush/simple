@@ -42,7 +42,11 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from agent import shared
 from agent.config import _now
-from agent.core.event_domains import LLMResponseParsed, TurnFinished
+from agent.core.event_domains import (
+    LLMResponseParsed,
+    TurnCompleted,
+    TurnFinished,
+)
 from agent.memory import consolidation
 from agent.memory.consolidation import estimate_message_tokens
 from agent.memory.system import ContextLimitError
@@ -1565,6 +1569,18 @@ async def run_turn_loop(
             # that token is reset above, so no extra stack bookkeeping is needed.
             ctx.metadata.pop("_provider_step", None)
             ctx.metadata.pop("_selected_tools", None)
+            # Emitted here, while the turn's opening request is still in the metadata,
+            # because that is where `user_input` lives -- two statements below, it is
+            # cleared so that nothing can claim to be the request of a finished turn.
+            # An event emitted after that would describe every turn as an empty prompt.
+            await emit_domain_event(
+                deps.event_bus,
+                TurnCompleted,
+                agent_id=ctx.agent_id,
+                user_input=str(ctx.metadata.get(TURN_REQUEST_KEY) or ""),
+                response=state.result_text,
+                tool_calls=tuple(tool_calls_made),
+            )
             # The turn is over, so nothing may claim to be its request any more.
             # A value left behind would protect a message of the *previous* turn
             # from the next turn's cut, which is the same borrow-the-last-turn's

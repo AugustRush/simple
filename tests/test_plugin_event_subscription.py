@@ -34,6 +34,7 @@ from agent.core.event_domains import (
     LLM,
     LLMResponseParsed,
     TURN,
+    TurnCompleted,
     TurnFinished,
     TurnStarted,
 )
@@ -50,6 +51,7 @@ SUBSCRIBER = '''
             def __init__(self):
                 self.turns = []
                 self.responses = []
+                self.completed = []
 
             def setup(self, ctx):
                 self.ctx = ctx
@@ -62,6 +64,10 @@ SUBSCRIBER = '''
 
             def on_turn(self, event):
                 self.turns.append(event)
+                # Content events go on their own list: `turns` counts every turn-domain
+                # event, and an assertion about content must not pass on an outcome.
+                if type(event).__name__ == "TurnCompleted":
+                    self.completed.append(event)
 
             def on_llm(self, event):
                 self.responses.append(event)
@@ -246,3 +252,97 @@ def test_attach_returns_the_undo_it_registered(tmp_path: Path) -> None:
         assert len(watcher.turns) == 1
     finally:
         catalog.close()
+
+
+def test_a_plugin_can_read_what_a_turn_was(tmp_path: Path) -> None:
+    """The content event, and why ``TurnFinished`` could not serve.
+
+    Measured while trying to migrate ``EvolutionPlugin`` off the hook protocol: it reads
+    the user's input against the agent's answer to learn from corrections, and the hook's
+    ``TurnEvent`` carries exactly that.  The kernel's turn vocabulary had ``TurnFinished``
+    -- ``status`` and ``steps``, an outcome for a log -- and no content event at all, so
+    the migration was blocked on **vocabulary** rather than on mechanism.
+    """
+    catalog, loaded = _load(tmp_path)
+    try:
+        assert loaded == ["watcher"]
+        asyncio.run(
+            TURN_EVENTS.emit(
+                TurnCompleted(
+                    agent_id="a",
+                    user_input="no, use the other flag",
+                    response="done",
+                    tool_calls=("run_tests",),
+                )
+            )
+        )
+        watcher = _plugin(catalog, "watcher")
+        assert len(watcher.completed) == 1
+        assert watcher.completed[0].user_input == "no, use the other flag"
+        assert watcher.completed[0].response == "done"
+        assert watcher.completed[0].tool_calls == ("run_tests",)
+    finally:
+        catalog.close()
+
+
+def test_the_content_event_is_on_the_turn_domain() -> None:
+    """A plugin subscribing to the turn domain gets it, which is how a migration does."""
+    from agent.core.event_domains import TURN, TurnCompleted
+
+    assert TurnCompleted in TURN.event_types
+
+
+def test_the_emit_helper_constructs_nothing_without_a_listener() -> None:
+    """The guard on the hot path, asserted for this event too.
+
+    ``emit_domain_event`` returns before constructing the event when nobody is
+    listening, which is what keeps a turn from paying for a feature nobody mounted.
+    """
+    from agent.core.turn_context import emit_domain_event
+
+    bus = EventBus()
+    asyncio.run(
+        emit_domain_event(
+            bus, TurnCompleted, agent_id="a", user_input="", response=""
+        )
+    )
+    assert bus.has_listeners(TurnCompleted) is False
+
+
+def test_the_content_event_is_emitted_before_the_request_is_cleared() -> None:
+    """The ordering is the whole correctness of ``user_input``, and it fails silently.
+
+    ``user_input`` is read from the turn's request in the context metadata, and two
+    statements later that key is cleared so nothing can claim to be the request of a
+    finished turn.  Move the emit after the pop and every turn reports an empty prompt --
+    no error, no missing field, just a plugin that never learns anything.  So the order
+    is asserted rather than left to the comment beside it.
+    """
+    import ast as _ast
+
+    source = (Path(__file__).resolve().parents[1] / "agent/core/turn_loop.py").read_text(
+        encoding="utf-8"
+    )
+    tree = _ast.parse(source)
+
+    emit_line = None
+    pop_line = None
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Call):
+            func = node.func
+            name = func.id if isinstance(func, _ast.Name) else getattr(func, "attr", "")
+            if name == "emit_domain_event" and any(
+                isinstance(arg, _ast.Name) and arg.id == "TurnCompleted" for arg in node.args
+            ):
+                emit_line = node.lineno
+            if name == "pop" and node.args:
+                first = node.args[0]
+                if isinstance(first, _ast.Name) and first.id == "TURN_REQUEST_KEY":
+                    pop_line = node.lineno
+
+    assert emit_line is not None, "TurnCompleted must be emitted from the loop"
+    assert pop_line is not None, "the turn request must still be cleared"
+    assert emit_line < pop_line, (
+        f"TurnCompleted is emitted at line {emit_line}, after the turn's request is "
+        f"cleared at line {pop_line}: every turn would report an empty prompt"
+    )

@@ -363,10 +363,26 @@ That is the same coupling the kernel was built to remove, in the module that loa
 plugins.  It is the reason `memory` cannot simply become a plugin either: a hook plugin
 is handed a mapping, so the question "which services does it need" has never been asked.
 
-**Every one of the three has a kernel counterpart.**  `on_session_start(components)` is
-`setup(ctx)`; `on_turn_end(event)` and `on_session_end(event)` are event subscriptions --
-`ctx.on(TurnFinished, handler)`, which Phase 1 built and the domains already carry.  The
-declarative `hooks_config` (external commands from `hooks.json`) is a *different*
+**Two of the three have a kernel counterpart; the third did not, and that was the
+finding.**  `on_session_start(components)` is `setup(ctx)`, and `on_session_end(event)` is
+a subscription.  `on_turn_end(event)` needed the user's input against the agent's answer --
+the hook's `TurnEvent` carries `user_input`, `agent_response`, `tool_calls` -- and the
+kernel's turn domain had **only** `TurnFinished(agent_id, status, steps)`: an *outcome*,
+for a log.  Three fields, and none of them is text.
+
+So the migration was blocked on **vocabulary, not mechanism**: Phase 1 built event
+subscription, and the turn domain did not have a type a real plugin could use.  That is
+now `TurnCompleted(agent_id, user_input, response, tool_calls)`, emitted on the turn bus.
+Each field has a consumer -- `EvolutionPlugin` reads exactly those four -- and it is
+declared in `TURN.event_types`, so `TURN.attach(ctx, ...)` delivers it.
+
+The ordering is the whole correctness of `user_input`: it is read from the turn's request
+in the context metadata, which is cleared two statements later so nothing can claim to be
+a request that has already been answered.  Emit after that clear and **every turn reports
+an empty prompt, silently** -- no error, no missing field, just a plugin that never learns.
+The order is asserted by line number rather than left to the comment beside it.
+
+The declarative `hooks_config` (external commands from `hooks.json`) is a *different*
 mechanism and stays.
 
 So the capstone is: migrate `EvolutionPlugin` to the kernel protocol, then delete the
