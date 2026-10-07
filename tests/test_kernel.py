@@ -554,3 +554,74 @@ def test_an_install_carries_what_a_diagnostic_needs() -> None:
     assert install.name == "leaf"
     assert install.pending is False
     assert install.parent is None
+
+
+# ── Prerequisites for the catalog migration ──────────────────────────────────
+
+
+def test_an_install_caches_the_context_it_was_activated_with() -> None:
+    """The catalog reads ``install.ctx``; caching it makes the kernel's record a
+    drop-in for the catalog's own, rather than something it has to rebuild."""
+    host = PluginHost()
+    install = host.load(Leaf())
+    assert install.ctx is not None
+    assert install.ctx.get("leaf.value") == 42
+
+
+def test_a_pending_install_has_no_context_yet() -> None:
+    """No setup ran, so there is no context to have been handed one."""
+    host = PluginHost()
+    install = host.load(NeedsLeaf())
+    assert install.pending is True
+    assert install.ctx is None
+
+
+def test_the_context_exposes_the_bus_for_domain_subscription() -> None:
+    """A domain is a set of event types kept *outside* the kernel.
+
+    The kernel therefore cannot offer ``ctx.on_domain("turn", ...)`` -- it would
+    have to know what a turn is.  Handing over the bus lets the domain table do
+    the subscribing, which is where that vocabulary belongs.
+    """
+    from agent.core.event_domains import TURN, TurnStarted, TurnFinished
+
+    host = PluginHost()
+    install = host.load(Leaf())
+    ctx = install.ctx
+
+    seen: list = []
+    undo = TURN.subscribe(ctx.bus, lambda event: seen.append(event))
+    try:
+        asyncio.run(ctx.emit(TurnStarted("a", True, False)))
+        asyncio.run(ctx.emit(TurnFinished("a", "ok", 1)))
+        assert len(seen) == 2
+    finally:
+        undo()
+
+
+def test_a_domain_subscription_through_the_context_is_still_unwound() -> None:
+    """The bus is handed over, and ``ctx.on_unwind`` keeps the removal reversible.
+
+    Written first against ``ctx.scope().on_unwind(...)``, which does nothing: a
+    nested scope nobody disposes is a silent no-op.  The plugin's own lifetime is
+    what it means, so the kernel offers one call for that.
+
+    A plugin that subscribes through the domain table must register the undo on
+    its own scope, or unloading leaves a listener behind.  Asserted at the bus so
+    the failure is visible rather than silent.
+    """
+    from agent.core.event_domains import TURN, TurnStarted
+
+    host = PluginHost()
+
+    class Subscriber:
+        name = "subscriber"
+
+        def setup(self, ctx):
+            self.undo = TURN.subscribe(ctx.bus, lambda event: None)
+            ctx.on_unwind(self.undo)
+
+    host.load(Subscriber())
+    assert host.events.has_listeners(TurnStarted)
+    host.unload("subscriber")
+    assert not host.events.has_listeners(TurnStarted), "the scope owned the removal"

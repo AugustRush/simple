@@ -111,6 +111,18 @@ class Context:
     def has(self, name: str) -> bool:
         return self.services.has(name)
 
+    @property
+    def bus(self) -> Any:
+        """The event bus, for a subscriber that wants a set of types at once.
+
+        Exposed rather than wrapped: a *domain* is a vocabulary of event types,
+        and this codebase keeps those in ``agent/core/event_domains.py`` -- outside
+        the kernel on purpose.  A plugin that wants "every turn event" asks that
+        table to subscribe it to ``ctx.bus``, so the kernel never learns what a
+        turn is.
+        """
+        return self._host.events
+
     # -- events --------------------------------------------------------------
 
     def on(self, event_type: type, handler: Callable[[Any], Any]) -> Callable[[], None]:
@@ -147,8 +159,30 @@ class Context:
 
     # -- scopes --------------------------------------------------------------
 
+    def on_unwind(self, handler: Callable[[], None]) -> None:
+        """Register an undo on *this plugin's* lifetime.
+
+        The general form, and the one a plugin usually wants: a registration that
+        is not a service and not an event subscription -- a resource, a file, a
+        domain subscription -- still has to be reversible, and the alternative is
+        for the plugin to remember to unregister, which is the question this design
+        exists to remove.
+
+        Distinct from :meth:`scope`, which returns a *nested* scope for something a
+        plugin wants to reverse earlier than its own unload.  Registering on a
+        nested scope that nobody disposes is a silent no-op, which is why the two
+        are separate calls rather than one.
+        """
+        self._install.scope.on_unwind(handler)
+
     def scope(self) -> ServiceScope:
-        """A nested scope, reversible before this plugin unloads."""
+        """A nested scope, reversible before this plugin unloads.
+
+        Everything registered through the returned scope is undone when *it* is
+        disposed, which is what a plugin wants when it manages something for a
+        shorter period than its own lifetime.  For the common case -- "register
+        this for as long as I am loaded" -- use :meth:`on_unwind`.
+        """
         return self.services.scope()
 
     # -- injected attributes -------------------------------------------------

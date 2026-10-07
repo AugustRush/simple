@@ -95,6 +95,10 @@ class Install:
     #: Service names this install offered, so unloading it can find its
     #: dependents without a second bookkeeping structure that could drift.
     provided_names: list[str] = field(default_factory=list)
+    #: The context this install was activated with.  Kept so a caller can reach it
+    #: without reconstructing one -- and so a diagnostic can ask what a plugin was
+    #: handed, which is not otherwise recoverable from the install.
+    ctx: Any = None
 
 
 class PluginHost:
@@ -190,6 +194,7 @@ class PluginHost:
             return False
 
         ctx = self.context_for(install)
+        install.ctx = ctx
         setup = getattr(install.plugin, "setup", None)
         if callable(setup):
             try:
