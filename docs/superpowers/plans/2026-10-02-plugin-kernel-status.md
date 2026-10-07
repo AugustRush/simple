@@ -182,11 +182,37 @@ thing it was carved out of, and the carvature would be visible in every caller. 
 plan's table reading as a taxonomy where the code has a composition; the taxonomy should
 give way.
 
+## The kernel calls `setup` synchronously, and an `async def setup` is now refused
+
+Found while starting the Scheduler, whose builder (`_build_scheduler_service`) is
+`async`.  The host called `setup(ctx)` without awaiting or checking, so a plugin
+author writing `async def setup` got:
+
+    loaded       : True
+    provided     : None
+    in installs  : True
+    ...and one RuntimeWarning, which most deployments suppress
+
+A plugin that mounts, contributes nothing and reports no error is the worst shape this
+can take -- there is no symptom to search for.  It is now refused with a message naming
+the plugin, and the refusal goes through the **same disposal path as a raising setup**,
+so the two cannot leave different states.
+
+Refused rather than supported: awaiting in the host would make `load` async, which
+changes every caller including the composition root.  When the Scheduler becomes a
+plugin it will either make its builder synchronous or start a task from a synchronous
+setup.
+
 ## Next step, in order
 
-1. **The Scheduler as a plugin**, once the effective parameters have one source.  The
-   CLI currently merges argv over config at two call sites; the plugin needs that
-   resolution to happen once, before setup, and reach it as data.
+1. **The Scheduler as a plugin.**  Its parameters are single-sourced now
+   (`agent/scheduler/settings.py`), which was the first prerequisite.  The second is
+   `setup` being synchronous: `_build_scheduler_service` is `async`, so the plugin either
+   needs a synchronous builder or starts a task.  It also returns a triple --
+   `(service, store, components)` where `components` is non-`None` only when the builder
+   built its own -- and that flag exists to tell the caller **who tears down**.  A scope
+   answers that question, so the plugin should own all three and the `finally` block
+   that closes them by hand should go.
 2. **Phase 6, the channel plugins** (CLI / Web / Feishu) -- measured next, and for the
    same reason Phase 5 was: to find out which of the three is genuinely a component.
 3. **`BaseAgent` is still 2,530 lines** and still holds the sub-agent machinery, the

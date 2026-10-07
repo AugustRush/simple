@@ -40,6 +40,8 @@ registrations at all -- there is nothing half-loaded to reason about.
 
 from __future__ import annotations
 
+import inspect
+
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol, runtime_checkable
@@ -232,21 +234,47 @@ class PluginHost:
         setup = getattr(install.plugin, "setup", None)
         if callable(setup):
             try:
-                setup(ctx)
+                returned = setup(ctx)
             except Exception as exc:
-                # Disposed rather than retried: a setup that raised will raise
-                # again, and a retry loop is a hang with extra steps.  Disposing
-                # unwinds whatever it managed to register first.
-                install.scope.dispose()
-                install.error = str(exc)
-                self._pending.pop(install.name, None)
-                logger.warning("plugin %r setup failed: %s", install.name, exc)
+                self._fail(install, exc)
+                return False
+            if inspect.iscoroutine(returned):
+                # An ``async def setup`` returns a coroutine that nothing awaits, so
+                # the plugin loads, registers nothing, and reports no error -- the
+                # only signal is a RuntimeWarning most deployments suppress.  Refused
+                # rather than supported: awaiting here would mean ``load`` is async,
+                # which is a change to every caller including the composition root.
+                # Closed rather than dropped so the warning is not emitted on a path
+                # that has already decided the setup does not count.
+                returned.close()
+                self._fail(
+                    install,
+                    TypeError(
+                        f"plugin {install.name!r} has an async setup; the kernel calls "
+                        "setup synchronously and would register nothing. Make setup "
+                        "synchronous, or do the async work in a task it starts."
+                    ),
+                )
                 return False
 
         install.pending = False
         self._installs[install.name] = install
         self._pending.pop(install.name, None)
         return True
+
+    def _fail(self, install: Install, exc: BaseException) -> None:
+        """Refuse an install, unwinding whatever its setup registered first.
+
+        Disposed rather than retried: a setup that raised will raise again, and a retry
+        loop is a hang with extra steps.  Both failure modes -- an exception and an
+        ``async def`` setup -- go through here, so they cannot leave different states:
+        the point of refusing the async form is that its *absence of effect* is the
+        problem, and a refusal that half-applied would have the same shape.
+        """
+        install.scope.dispose()
+        install.error = str(exc)
+        self._pending.pop(install.name, None)
+        logger.warning("plugin %r setup failed: %s", install.name, exc)
 
     def context_for(self, install: Install) -> Any:
         """The context handed to *install*'s ``setup``.

@@ -860,3 +860,98 @@ def test_a_plugin_injecting_an_absent_service_never_activates() -> None:
     assert host.pending() == ("agent_loop",)
     assert host.services.get("agent_loop", None) is None
     assert host.waiting_for() == {"agent_loop": ("agent",)}
+
+
+# ── An async setup is refused, not silently ignored ──────────────────────────
+
+
+def test_an_async_setup_is_refused_rather_than_silently_doing_nothing() -> None:
+    """The kernel calls ``setup`` synchronously, so a coroutine registers nothing.
+
+    This is the worst shape a plugin failure can take: the install reports as loaded,
+    ``pending()`` is empty, and the plugin contributes nothing -- the only signal is a
+    ``RuntimeWarning`` that most deployments suppress.  Found while making the
+    Scheduler a plugin, whose builder is ``async``; it would have produced a scheduler
+    that mounted successfully and had no service.
+
+    Refused rather than supported: awaiting here would mean ``load`` is async, which is
+    a change to every caller including the composition root.
+    """
+    host = PluginHost()
+
+    class AsyncSetup:
+        name = "async_one"
+
+        async def setup(self, ctx):
+            ctx.provide("thing", 42)
+
+    install = host.load(AsyncSetup())
+    assert install.error, "the install must carry an error"
+    assert "async setup" in install.error
+    assert host.services.get("thing", None) is None
+    assert host.pending() == (), "not left pending: it will fail the same way again"
+
+
+def test_an_async_setup_that_registered_first_keeps_none_of_it() -> None:
+    """No half-applied state, because it goes through the same disposal as a raise."""
+    host = PluginHost()
+
+    class HalfAsync:
+        name = "half"
+
+        async def setup(self, ctx):
+            ctx.provide("partial", 1)  # never runs, and must not survive if it did
+
+    install = host.load(HalfAsync())
+    assert install.error
+    assert host.services.get("partial", None) is None
+
+
+def test_a_raising_setup_and_an_async_one_leave_the_same_state() -> None:
+    """One failure path, so the two cannot diverge."""
+    class Raises:
+        name = "raises"
+
+        def setup(self, ctx):
+            ctx.provide("x", 1)
+            raise RuntimeError("boom")
+
+    class Async:
+        name = "async_one"
+
+        async def setup(self, ctx):
+            ctx.provide("x", 1)
+
+    states = []
+    for plugin in (Raises(), Async()):
+        host = PluginHost()
+        install = host.load(plugin)
+        states.append(
+            (
+                bool(install.error),
+                host.services.get("x", None),
+                host.pending(),
+                plugin.name in host.installs,
+            )
+        )
+    assert states[0] == states[1] == (True, None, (), False), states
+
+
+def test_a_sync_setup_that_returns_something_harmless_is_fine() -> None:
+    """Control: the check is on a coroutine, not on a return value.
+
+    A ``setup`` that ends with ``return self.something`` is ordinary, and refusing every
+    non-``None`` return would be the wrong rule -- and would break plugins that exist.
+    """
+    host = PluginHost()
+
+    class Returns:
+        name = "returns"
+
+        def setup(self, ctx):
+            ctx.provide("thing", 7)
+            return "some value"
+
+    install = host.load(Returns())
+    assert install.error is None
+    assert host.services.get("thing", None) == 7
