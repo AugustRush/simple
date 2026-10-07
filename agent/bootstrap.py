@@ -29,6 +29,7 @@ from agent.memory.system import ConsolidationEngine, ContextManager, FactAsserti
 from agent.plugins.catalog import PluginCatalog
 from agent.channels.registry import ChannelRegistry
 from agent.memory.plugin import MemoryPlugin
+from agent.memory.session_plugin import SessionPlugin
 from agent.ralph.plugin import RalphPlugin
 from agent.runtime.factory import RuntimeFactory
 from agent.runtime import AgentCore, TurnRunner
@@ -41,6 +42,7 @@ from agent.ralph import (
 )
 from agent.tools.files import FileService, resolve_file_access_config
 from agent.runtime.services import require_service
+from agent.pathing import project_memory_scope
 
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
@@ -107,12 +109,6 @@ def _reserve_input_context(
             f"window; using {adjusted} to reserve input context[/yellow]"
         )
     return adjusted
-
-
-def _project_memory_scope(workspace_root: Path) -> str:
-    canonical = str(workspace_root.expanduser().resolve(strict=False))
-    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-    return f"project:{digest}"
 
 
 def build_gateway_channels(cfg: dict) -> list[Channel]:
@@ -244,7 +240,7 @@ async def _build_web_session_components(
         file_policy,
         write_scope=("*",) if file_policy.workspace_write else (),
     )
-    project_scope = _project_memory_scope(workspace_root)
+    project_scope = project_memory_scope(workspace_root)
 
     global_registry = global_components["registry"]
     registry = global_registry.fork(
@@ -822,45 +818,14 @@ async def _build_components_async(
     # is discovered from disk.
     plugin_catalog.mount(RalphPlugin())
     plugin_catalog.mount(MemoryPlugin())
-
-    ctx_manager = ContextManager(
-        store=require_service(components, "ltm_store"),
-        retriever=LocalRetriever(),
-        consolidation=ConsolidationEngine(
-            store=require_service(components, "ltm_store"),
-            max_categories=storage_cfg.get("max_categories", max_categories),
-            decay_factor=storage_cfg.get("decay_factor", decay_factor),
-            sleep_token_ratio=cons_cfg.get("token_ratio", sleep_token_ratio),
-            keep_last_messages=cons_cfg.get("keep_last_messages", 6),
-            max_source_tokens=cons_cfg.get(
-                "max_source_tokens", shared.CONSOLIDATION_MAX_SOURCE_TOKENS
-            ),
-            max_chunks_per_run=cons_cfg.get("max_chunks_per_run", 2),
-            output_tokens=cons_cfg.get("output_tokens", 512),
-            chars_per_token=cons_cfg.get("token_estimation", {}).get(
-                "chars_per_token", float(chars_per_token)
-            ),
-            cjk_chars_per_token=cons_cfg.get("token_estimation", {}).get(
-                "cjk_chars_per_token", 1.0
-            ),
-        ),
-        idle_seconds=cons_cfg.get("idle_seconds", 300),
-        min_messages=cons_cfg.get("min_messages", 4),
-        staging_turn_threshold=cons_cfg.get(
-            "staging_turn_threshold", shared.STAGING_TURN_THRESHOLD
-        ),
-        staging_token_threshold=cons_cfg.get(
-            "staging_token_threshold", shared.STAGING_TOKEN_THRESHOLD
-        ),
-        route_keywords=ctx_cfg.get("route_keywords"),
-        project_scope=_project_memory_scope(workspace_root),
-    )
+    # After Memory: it injects `ltm_store`.
+    plugin_catalog.mount(SessionPlugin())
 
 
     builtin_tools_cls(
         require_service(components, "memory"),
         registry,
-        context_manager=ctx_manager,
+        context_manager=require_service(components, "context_manager"),
         workspace_root=workspace_root,
         chapter_normalizer=lambda chapter: normalize_memory_chapter(
             chapter, legacy_memory_aliases
@@ -935,7 +900,7 @@ async def _build_components_async(
         skill_catalog=skill_catalog,
         plugin_catalog=plugin_catalog,
     )
-    agent.context_manager = ctx_manager
+    agent.context_manager = require_service(components, "context_manager")
 
     # Updated **in place** rather than copied into a new dict.  The plugin catalog's
     # kernel adopts this mapping as its service storage, so a copy would leave two
@@ -949,7 +914,6 @@ async def _build_components_async(
         "system_prompt": system_prompt,
         "agent": agent,
         "plugin_catalog": plugin_catalog,
-        "context_manager": ctx_manager,
         "mcp_client": mcp_client,
         "mcp_status": mcp_status,
         "mcp_task": None,

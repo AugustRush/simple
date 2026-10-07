@@ -56,3 +56,22 @@ __all__ = [
     "paths_overlap",
     "resolve_workspace_path",
 ]
+
+
+def project_memory_scope(workspace_root: "Path") -> str:
+    """The memory scope of a workspace, as a stable identifier.
+
+    A digest of the canonical path rather than the path itself: a scope travels into
+    stored facts and config, and a raw path would carry a user name and a directory
+    layout into both.  Sixteen hex characters of a SHA-256 is not a security boundary --
+    it is a name that is stable across machines for the same project and short enough to
+    read in a log.
+
+    Relocated from ``bootstrap`` because the session plugin needs it and a plugin cannot
+    import the composition root; it was already a pure function of one path.
+    """
+    import hashlib
+
+    canonical = str(workspace_root.expanduser().resolve(strict=False))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return f"project:{digest}"

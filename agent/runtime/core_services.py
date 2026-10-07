@@ -135,7 +135,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
     CoreService(
         name="context_manager",
         owners=(
-            "agent/bootstrap.py",
+            "agent/memory/session_plugin.py",
         ),
         consumers=(
             "agent/bootstrap.py",

@@ -1493,6 +1493,7 @@ _PLUGIN_PROVIDED: dict[str, str] = {
     "evolution": "agent/_builtin/plugins/evolution/__init__.py",
     "memory": "agent/memory/plugin.py",
     "ltm_store": "agent/memory/plugin.py",
+    "context_manager": "agent/memory/session_plugin.py",
 }
 
 

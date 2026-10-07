@@ -22,6 +22,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
 | 5 Execution Plugins | **2 of 4 done, 2 have no separable boundary** | Ralph ✅ and Scheduler ✅ mounted as plugins; Orchestration / Workflow measured, see below |
 | -- Memory | **done** | `agent/memory/plugin.py` provides `ltm_store` and `memory`; the ordering chain that blocked it is gone |
+| -- Session log | **done as a plugin** | `agent/memory/session_plugin.py` provides `context_manager`, which `bootstrap` used to assemble above the catalog |
 | 6 Channel Plugins | **web + feishu done; CLI is not a channel** | `channels` is a capability service any plugin can contribute to; `CliChannel` is a stub that raises |
 | 7 Profile / Bundle / patch | **done** | bundles were already patches; a profile's effect is now `config_patches`, applied by the same `apply_patch`, and validated against `DEFAULT_CONFIG` like a bundle's |
 
@@ -552,11 +553,16 @@ Measured on the *reads*, not the writes: an earlier round removed a parameter be
 attribute was stored and never read, and the parameter itself was used twenty lines below.
 All three of these are live.
 
-So a plugin can provide the agent, but it cannot finish wiring it: `context_manager` does
-not exist when `setup` runs.  The honest shapes are (a) the plugin provides the agent and
-the composition keeps the one late assignment, with a comment saying why, or (b)
-`ContextManager` becomes a plugin too and is mounted before this one.  (b) is cleaner and
-is a second move; it is not a decision to make while writing the first.
+**Shape (b) was chosen and is done**: `agent/memory/session_plugin.py` provides
+`context_manager`, mounted after `MemoryPlugin` (whose `ltm_store` it injects) and before
+anything that reads either.  `bootstrap` no longer assembles it, so the ordering obstacle
+is gone: an `AgentPlugin` mounted after these two has `context_manager` in hand during
+`setup`, and `agent.context_manager = require_service(...)` is one line the composition
+still owns -- because it is wiring an already-built agent, not constructing one.
+
+`project_memory_scope` moved from `bootstrap` to `agent/pathing.py` along with it: the
+plugin needs it and a plugin cannot import the composition root.  It was already a pure
+function of one path.
 
 **And there are two agents.**  `bootstrap` builds one per process and a second per session
 (inside the session-components factory, rebuilt when the provider changes).  A plugin
