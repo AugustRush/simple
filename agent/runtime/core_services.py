@@ -124,7 +124,6 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/bootstrap.py",
         ),
         consumers=(
-            "agent/_builtin/plugins/evolution/__init__.py",
             "agent/bootstrap.py",
             "agent/channels/base.py",
             "agent/cli.py",
@@ -198,7 +197,6 @@ CORE_SERVICES: tuple[CoreService, ...] = (
             "agent/config.py",
         ),
         consumers=(
-            "agent/_builtin/plugins/evolution/__init__.py",
             "agent/bootstrap.py",
             "agent/channels/base.py",
             "agent/cli.py",

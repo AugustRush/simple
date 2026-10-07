@@ -11,6 +11,8 @@ from pathlib import Path
 
 from agent.core.interjections import inject_pending_interjections
 from agent.core.turn_loop import prepare_turn
+from agent.core.event_domains import TurnCompleted
+from agent.core.events import TURN_EVENTS
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -785,7 +787,13 @@ def test_evolution_plugin_loads_via_catalog():
     """The evolution built-in plugin should load cleanly through PluginCatalog."""
     from agent import PluginCatalog, PLUGINS_DIR
 
-    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
+    # The composition must provide what the plugin declares -- `evolution`, the engine.
+    # Without it the plugin is discovered but stays *pending*, and a pending plugin
+    # registers nothing: the kernel's model is that an unmet dependency holds zero
+    # effects, rather than half-installing a plugin whose dependencies are missing.
+    catalog = PluginCatalog(
+        builtin_dir=PLUGINS_DIR, components={"evolution": object()}
+    )
     loaded = catalog.discover_and_load()
     assert "evolution" in loaded
 
@@ -794,7 +802,9 @@ def test_evolution_plugin_slash_commands_registered():
     """After loading, evolution plugin must expose evolve/generate-tool/stats."""
     from agent import PluginCatalog, PLUGINS_DIR
 
-    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
+    catalog = PluginCatalog(
+        builtin_dir=PLUGINS_DIR, components={"evolution": object()}
+    )
     catalog.discover_and_load()
     cmds = catalog.get_slash_commands()
     assert "evolve" in cmds
@@ -1296,7 +1306,11 @@ def test_evolution_plugin_on_turn_end_records_application(tmp_path):
     from rules import RuleStore
     from agent import PluginCatalog, PLUGINS_DIR, TurnEvent
 
-    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
+    # The plugin declares `inject = ("evolution",)`: the engine the composition built,
+    # or None when it is disabled.  A catalog with an empty registry leaves it *pending*,
+    # so nothing subscribes and the event below reaches nobody.
+    components = {"evolution": object()}  # active; `_engine` is cleared below
+    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR, components=components)
     catalog.discover_and_load()
     evo_plugin = next(
         p
@@ -1310,11 +1324,17 @@ def test_evolution_plugin_on_turn_end_records_application(tmp_path):
     evo_plugin._prev_response = "Here is a long previous response for testing."
     evo_plugin._engine = None  # no LLM for extraction
 
-    # Simulate a non-correction turn.
-    event = TurnEvent(
-        user_input="Thanks!", agent_response="You're welcome.", tool_calls=[]
+    # A non-correction turn, as the loop publishes it.
+    asyncio.run(
+        TURN_EVENTS.emit(
+            TurnCompleted(
+                agent_id="a",
+                user_input="Thanks!",
+                response="You're welcome.",
+                tool_calls=(),
+            )
+        )
     )
-    asyncio.run(catalog.fire_turn_end(event))
     rules = test_store._load()
     assert rules[0].applications == 1
     assert rules[0].corrections_after == 0
@@ -1329,7 +1349,11 @@ def test_evolution_plugin_on_turn_end_records_correction(tmp_path):
     from rules import RuleStore
     from agent import PluginCatalog, PLUGINS_DIR, TurnEvent
 
-    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
+    # The plugin declares `inject = ("evolution",)`: the engine the composition built,
+    # or None when it is disabled.  A catalog with an empty registry leaves it *pending*,
+    # so nothing subscribes and the event below reaches nobody.
+    components = {"evolution": object()}  # active; `_engine` is cleared below
+    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR, components=components)
     catalog.discover_and_load()
     evo_plugin = next(
         p
@@ -1342,11 +1366,17 @@ def test_evolution_plugin_on_turn_end_records_correction(tmp_path):
     evo_plugin._prev_response = "Here is my previous answer which was very wrong."
     evo_plugin._engine = None
 
-    # HIGH-confidence correction
-    event = TurnEvent(
-        user_input="No, that's wrong!", agent_response="Sorry.", tool_calls=[]
+    # A HIGH-confidence correction.
+    asyncio.run(
+        TURN_EVENTS.emit(
+            TurnCompleted(
+                agent_id="a",
+                user_input="No, that's wrong!",
+                response="Sorry.",
+                tool_calls=(),
+            )
+        )
     )
-    asyncio.run(catalog.fire_turn_end(event))
     rules = test_store._load()
     assert rules[0].applications == 1
     assert rules[0].corrections_after == 1
@@ -1361,7 +1391,11 @@ def test_evolution_plugin_compose_returns_rules(tmp_path):
     from rules import RuleStore
     from agent import PluginCatalog, PLUGINS_DIR
 
-    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
+    # The plugin declares `inject = ("evolution",)`: the engine the composition built,
+    # or None when it is disabled.  A catalog with an empty registry leaves it *pending*,
+    # so nothing subscribes and the event below reaches nobody.
+    components = {"evolution": object()}  # active; `_engine` is cleared below
+    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR, components=components)
     catalog.discover_and_load()
     evo_plugin = next(
         p
@@ -1520,22 +1554,24 @@ def test_evolution_plugin_records_applications_only_for_related_rules(tmp_path):
     evo_plugin._prev_response = "Here is a long previous response."
 
     asyncio.run(
-        evo_plugin.on_turn_end(
-            TurnEvent(
+        evo_plugin.on_turn(
+            TurnCompleted(
+                agent_id="a",
                 user_input="What is the weather today?",
-                agent_response="It is sunny.",
-                tool_calls=[],
+                response="It is sunny.",
+                tool_calls=(),
             )
         )
     )
     assert store._load()[0].applications == 0
 
     asyncio.run(
-        evo_plugin.on_turn_end(
-            TurnEvent(
+        evo_plugin.on_turn(
+            TurnCompleted(
+                agent_id="a",
                 user_input="Please modify this file and show the diff.",
-                agent_response="Done.",
-                tool_calls=[],
+                response="Done.",
+                tool_calls=(),
             )
         )
     )
@@ -1580,7 +1616,11 @@ def test_evolution_plugin_engine_none_is_safe():
     """All hooks must degrade gracefully when _engine is None."""
     from agent import PluginCatalog, PLUGINS_DIR, TurnEvent, SessionEvent
 
-    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR)
+    # The plugin declares `inject = ("evolution",)`: the engine the composition built,
+    # or None when it is disabled.  A catalog with an empty registry leaves it *pending*,
+    # so nothing subscribes and the event below reaches nobody.
+    components = {"evolution": object()}  # active; `_engine` is cleared below
+    catalog = PluginCatalog(builtin_dir=PLUGINS_DIR, components=components)
     catalog.discover_and_load()
     evo_plugin = next(
         p
@@ -2976,13 +3016,18 @@ def test_evolution_plugin_survives_reload(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_shared, "USER_PLUGINS_DIR", tmp_path / "user")
 
+    # The composition, and it must survive the reload: `reload` re-runs every setup, so a
+    # mapping handed only at construction would leave the plugin pending afterwards.
+    components = {"evolution": object()}
     catalog = PluginCatalog(
-        builtin_dir=_shared.PLUGINS_DIR, user_dir=tmp_path / "user"
+        builtin_dir=_shared.PLUGINS_DIR,
+        user_dir=tmp_path / "user",
+        components=components,
     )
     catalog.discover_and_load()
     assert "evolution" in catalog._plugins
 
-    asyncio.run(catalog.reload({}))
+    asyncio.run(catalog.reload(components))
     assert "evolution" in catalog._plugins
     plugin_obj, _ = catalog._plugins["evolution"]
 
@@ -3595,3 +3640,52 @@ def test_the_sink_notice_distinguishes_an_interjection_from_a_restart():
         ("status", "Interjection queued."),
         ("status", "Message queued for the next turn."),
     ]
+
+
+# ── The evolution plugin's activation is the composition's decision ──────────
+
+
+def test_evolution_is_pending_when_the_composition_has_no_engine() -> None:
+    """``evolution.enabled: false`` is expressed by the service being *absent*.
+
+    This is the bug the kernel protocol removed.  The old handler read
+    ``components.get("evolution")`` -- ``None`` when disabled -- and then, finding none,
+    **built one anyway** from the agent, the model and the memory.  So the flag was
+    defeated by the plugin that was supposed to honour it, silently, and
+    ``bootstrap``'s comment ("the evolution plugin and the evolve CLI command both check
+    for None") described an intention the fallback undid.
+
+    Absent now means pending: the plugin registers nothing, subscribes to nothing, and
+    says so through ``waiting_for``.
+    """
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    from agent.kernel.plugin import PluginHost
+
+    host = PluginHost()
+    # Deliberately no engine, and no agent/memory either: the old fallback needed those
+    # three to build what it had been told not to.
+    host.load(EvolutionPlugin())
+
+    assert host.pending() == ("evolution",)
+    assert host.waiting_for()["evolution"] == ("evolution",)
+    assert host.services.get("evolution", None) is None
+
+
+def test_evolution_is_active_with_no_engine_when_the_service_is_present() -> None:
+    """Present-with-``None`` is still a composition's decision, and a usable state.
+
+    Correction detection needs no engine -- only rule extraction does -- so a composition
+    that runs without a provider can still learn from corrections.  Conflating "no
+    engine" with "not in this composition" is what made the old code unable to tell them
+    apart.
+    """
+    from agent._builtin.plugins.evolution import EvolutionPlugin
+    from agent.kernel.plugin import PluginHost
+
+    host = PluginHost()
+    host.services.provide("evolution", None)
+    host.load(EvolutionPlugin())
+
+    assert host.pending() == (), "present, so active"
+    plugin = next(iter(host.installs.values())).plugin
+    assert plugin._engine is None

@@ -4,14 +4,14 @@ improvement logic (CorrectionDetector + RuleStore).
 Plugin lifecycle
 ----------------
 1. ``register()`` returns an ``EvolutionPlugin`` instance (no heavy init).
-2. ``on_session_start(components)`` wires up the EvolutionEngine using the
-   real LLM client/model/memory that were resolved by _build_components_async.
-3. ``on_turn_end(event)`` runs CorrectionDetector; logs failures; calls
+2. ``setup(ctx)`` takes the EvolutionEngine the composition built, or stands down
+   when there is none -- which is how ``evolution.enabled: false`` reaches here.
+3. ``on_turn(event)`` runs CorrectionDetector on the turn's content; logs
    ``record_application`` for every active rule so the feedback loop closes;
    triggers async rule extraction when the failure threshold is met.  An
    extracted rule that restates one already retired is logged and dropped
    instead of re-added -- see ``RuleStore.is_repeat_of_retired``.
-4. ``on_session_end(event)`` calls EvolutionEngine.score_session() and
+4. ``on_session(event)`` calls EvolutionEngine.score_session() and
    prints the score exactly as before.
 5. ``compose_system_prompt(current_prompt)`` appends active behavioral rules
    so the agent is guided by what was learned from past corrections.
@@ -36,6 +36,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from agent.core.event_domains import SESSION, TURN, TurnCompleted
+
 _RULE_EXTRACTION_THRESHOLD = 3  # corrections before we try to extract a rule
 
 
@@ -59,36 +61,29 @@ def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def _resolvable_endpoint(components: dict) -> bool:
-    """Whether *components* can name the provider that owns its model.
-
-    Building an engine needs the model *and* the client that serves it.  A
-    partial components dict — plugin discovery fires session_start with one —
-    has neither, and guessing the wire format from a default is how a call
-    ends up at the wrong group's endpoint.
-    """
-    agent = resolve(components, "agent")
-    return (
-        agent is not None
-        and hasattr(agent, "endpoint_for")
-        and bool(components.get("model"))
-    )
-
-
 class EvolutionPlugin:
     """AgentPlugin implementation: wraps EvolutionEngine + new learning logic."""
 
     name = "evolution"
     version = "2.0.0"
 
+    #: The engine, or nothing.  *Absent* means this composition has no evolution -- the
+    #: plugin then stays **pending** and `setup` never runs, which is how "disabled"
+    #: reaches it.  Present means active, and its value may still be ``None``: correction
+    #: detection needs no engine, and only rule extraction does.
+    #:
+    #: Deliberately not provided-as-``None`` by the composition when disabled (see
+    #: ``bootstrap``): that made "disabled" and "no engine" the same value, and the old
+    #: handler resolved the ambiguity by building an engine anyway -- defeating
+    #: ``evolution.enabled: false`` silently.
+    inject = ("evolution",)
+
     def __init__(self) -> None:
-        # Heavy resources are populated lazily in on_session_start().
+        # Heavy resources are populated in setup(), once the composition says
+        # whether there is an engine at all.
         self._engine: Any = None
-        self._components: dict = {}
         self._prev_response: str = ""
-        self._rule_store: Any = (
-            None  # initialised in on_session_start when engine is active
-        )
+        self._rule_store: Any = None  # built lazily in setup
         self._pending_failures: list[dict] = []
         self._session_correction_count = 0
 
@@ -106,35 +101,45 @@ class EvolutionPlugin:
             self._rule_store = RuleStore()
         return self._rule_store
 
-    def on_session_start(self, components: dict) -> None:
-        """Wire up EvolutionEngine; prefer the pre-built instance in components."""
-        self._components = components
-        # Reuse the EvolutionEngine already in components (built by
-        # _build_components_async) so tests that inject _FakeEvolution work
-        # without modification.
-        self._engine = components.get("evolution")
-        if self._engine is None and _resolvable_endpoint(components):
-            try:
-                import agent as _agent_mod
+    def setup(self, ctx: Any) -> None:
+        """Take the engine the composition built, and subscribe to what it watches.
 
-                agent = require_service(components, "agent")
-                model = str(components["model"])
-                self._engine = _agent_mod.EvolutionEngine(
-                    agent.endpoint_for(model),
-                    model,
-                    require_service(components, "memory"),
-                )
-            except Exception as exc:
-                _console().print(
-                    f"[dim]Evolution plugin: engine init failed: {exc}[/dim]"
-                )
+        This replaces ``on_session_start(components)``, and it removes a bug rather than
+        only changing shape.  The old form read ``components.get("evolution")`` and, when
+        that was ``None`` -- which is how the composition used to say *disabled* -- built
+        an engine anyway from the agent, the model and the memory.  ``evolution.enabled:
+        false`` was therefore defeated by the plugin supposed to honour it, silently, and
+        ``bootstrap``'s comment ("the evolution plugin and the evolve CLI command both
+        check for None") described an intention the fallback undid.
 
-        # Initialise RuleStore lazily here so that ~/.agent/rl/ is only created
-        # when the plugin is actually active (not at plugin-discovery time).
+        The fallback existed because ``on_session_start`` is fired with a *partial*
+        mapping during plugin discovery, so the plugin could not tell "not configured"
+        from "not built yet".  ``inject`` answers that: the name must be present for the
+        plugin to activate at all, and present-with-``None`` is a decision the composition
+        made -- active, with no engine, which is a state correction detection can work in.
+
+        Subscriptions go through ``TURN``/``SESSION`` rather than ``ctx.on`` because a
+        domain's bus is not the context's -- see :meth:`Domain.attach`.  A typed handler
+        registered on the context's bus would never be called, which is the failure with
+        no symptom.
+        """
+        self._engine = ctx.get("evolution", None)
+        # Subscribed whether or not there is an engine, because only rule *extraction*
+        # needs one and that checks `_engine` itself.
+        TURN.attach(ctx, self.on_turn)
+        SESSION.attach(ctx, self.on_session)
         self._ensure_rule_store()
 
-    async def on_turn_end(self, event: Any) -> None:  # event: TurnEvent
-        """Detect corrections; record rule applications; trigger extraction."""
+    async def on_turn(self, event: Any) -> None:
+        """Detect corrections; record rule applications; trigger extraction.
+
+        Subscribed to the whole ``TURN`` domain and filtered here, because a domain's
+        subscription is all-or-nothing by design: ``Domain.subscribe`` registers for every
+        type it declares, and reaching for ``TURN_EVENTS.subscribe(TurnCompleted, ...)``
+        instead would move the bus choice out of the domain table that owns it.
+        """
+        if not isinstance(event, TurnCompleted):
+            return
         signal = self._detector.detect(event.user_input, self._prev_response)
 
         # Record every turn as an application for all active rules so
@@ -144,7 +149,7 @@ class EvolutionPlugin:
                 [
                     str(event.user_input or ""),
                     str(self._prev_response or ""),
-                    str(event.agent_response or ""),
+                    str(event.response or ""),
                     " ".join(str(t) for t in getattr(event, "tool_calls", []) or []),
                 ]
             )
@@ -180,9 +185,9 @@ class EvolutionPlugin:
             if len(self._pending_failures) >= _RULE_EXTRACTION_THRESHOLD:
                 await self._try_extract_rule()
 
-        self._prev_response = event.agent_response
+        self._prev_response = event.response
 
-    async def on_session_end(self, event: Any) -> None:  # event: SessionEvent
+    async def on_session(self, event: Any) -> None:
         """Score the session objectively; persist experience; extract strategies."""
         if self._engine is None:
             return

@@ -910,7 +910,12 @@ async def _build_components_async(
         if evo_cfg.get("enabled", True)
         else None
     )
-    _partial_components["evolution"] = evolution
+    # Provided only when enabled: the plugin declares it in , so an absent key
+    # leaves the plugin *pending* -- which is how "disabled" reaches it.  Setting the key
+    # to None instead made "disabled" and "no engine yet" the same value, and the plugin
+    # resolved the ambiguity by building an engine anyway.
+    if evolution is not None:
+        _partial_components["evolution"] = evolution
 
     # The channels a composition runs.  Provided so a plugin can contribute one -- a
     # tool, a command, a role, an MCP config and a skill root were all contributable and
