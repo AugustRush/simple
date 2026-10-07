@@ -488,6 +488,43 @@ at construction, which reads as "the guard broke a hundred tests" rather than as
 slot), and the rule is *not* "domain events are never delivered on the context's bus" --
 they are, whenever the two happen to coincide.
 
+## Open: moving the engine into `EvolutionPlugin` (patch written, not applied)
+
+The step is written and **not committed**, because one test regressed and the reason was
+not found.  The patch is beside this document:
+`2026-10-02-evolution-engine-ownership.patch`.
+
+**What it does.**  `bootstrap` stops constructing `EvolutionEngine` above the catalog and
+`EvolutionPlugin` builds the one it uses, reading `cfg` for the enabled switch -- the shape
+the channel plugins have.  That removes the last consumer of `memory` above the catalog
+(`memory` at L596 -> the engine at L909 -> catalog at L932), which is what blocked
+`memory` from becoming a plugin.
+
+**What it breaks.**  `tests/test_agent_integration.py::
+test_interactive_loop_compaction_keeps_latest_system_prompt`.  Diagnosed as far as:
+
+- the router classifies `/evolve` correctly -- `kind='command'`, `source='plugin'`, with a
+  handler;
+- the command wrapper **is** called, with the right bound method
+  (`EvolutionPlugin._handle_evolve`);
+- the handler runs and returns, and the system prompt is **not** updated -- the assertion
+  sees `COMPOSED::system-v1` plus the task context.
+
+So the break is after dispatch, somewhere between the handler and the live context
+(`publish_system_prompt`), and it is not yet understood.
+
+**What was ruled out**, by reverting each file to `HEAD` in the working tree and re-running
+that test: `agent/_builtin/plugins/evolution/__init__.py`, `agent/bootstrap.py`,
+`agent/plugins/catalog.py`, `agent/core/event_domains.py`, `agent/kernel/*`, and the test
+file.  None of them alone fixed it, which is why the isolation was redone with a
+`git worktree` at `HEAD` and the patch applied in pieces -- that showed the plugin change
+is necessary for the failure, but the test file's `cfg` addition is also required, so the
+two are a pair and the cause is **not** a single file.
+
+**The rule this follows.**  A regression whose cause is not understood is not committed.
+The tree is at the previous commit and the failure set is byte-identical to the baseline;
+the patch and this note are what the next attempt starts from.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters
