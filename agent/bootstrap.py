@@ -28,6 +28,7 @@ from agent.runtime.system_prompt import refresh_system_prompt
 from agent.memory.system import ConsolidationEngine, ContextManager, FactAssertion, LTMStore, LocalRetriever, MemoryPalace, normalize_memory_chapter
 from agent.plugins.catalog import PluginCatalog
 from agent.ralph.plugin import RalphPlugin
+from agent.runtime.factory import RuntimeFactory
 from agent.runtime import AgentCore, TurnRunner
 from agent.ralph import (
     RalphIterationResult,
@@ -926,6 +927,12 @@ async def _build_components_async(
         else None
     )
     _partial_components["evolution"] = evolution
+
+    # The named way to build a runtime, for anything inside a composition that needs one.
+    # Six call sites already reach ``agent._build_components_async``; five of them are
+    # this root building itself, and the sixth is a scheduled run, which is not the root
+    # and should not have to import it.  ``agent/runtime/factory.py`` explains the rest.
+    _partial_components["runtime_factory"] = RuntimeFactory()
 
     # ── Plugin Catalog ────────────────────────────────────────────────────────
     # Constructed after the partial components because the kernel adopts them.

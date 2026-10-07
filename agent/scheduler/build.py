@@ -26,6 +26,7 @@ from agent.runtime.contracts import (
     TurnInput,
     agent_core_for_components,
 )
+from agent.runtime.factory import RuntimeFactory
 from agent.scheduler.delivery import SchedulerDelivery
 from agent.scheduler.models import (
     DEFAULT_SIGNAL_MAX_DEPTH,
@@ -235,6 +236,7 @@ def build_scheduler_service(
     signal_max_depth: int = DEFAULT_SIGNAL_MAX_DEPTH,
     components: dict,
     config_loader: Optional[Callable[[], dict]] = None,
+    runtime_factory: Any = None,
 ):
     """Build the scheduler service and the executor its runs go through.
 
@@ -247,6 +249,10 @@ def build_scheduler_service(
     until somebody restarted the process.  Callers that hold a config that is
     not on disk (tests) pass their own loader.
     """
+    # The factory is a parameter, not an import: a scheduled run is not the composition
+    # root, and building a runtime for it is a service it can be given.  Defaulted to the
+    # root only so a caller with no container (a test, a one-off script) still works.
+    factory = runtime_factory or RuntimeFactory()
     store = scheduler_store()
     delivery = SchedulerDelivery(
         cfg=cfg,
@@ -338,7 +344,7 @@ def build_scheduler_service(
                 configured_resource_home = registry.get_context("resource_home")
                 if configured_resource_home:
                     resource_home = Path(str(configured_resource_home)).expanduser()
-            run_components = await agent_module._build_components_async(
+            run_components = await factory.build(
                 run_cfg,
                 announce=False,
                 resource_home=resource_home,
@@ -497,7 +503,7 @@ def build_scheduler_service(
             if self_report_token is not None:
                 _active_run_self_report.reset(self_report_token)
             if isolated_runtime:
-                await agent_module._close_components(run_components)
+                await factory.close(run_components)
 
     async def _system_executor(task, run):
         snapshot = dict(getattr(run, "config_snapshot", {}) or {})

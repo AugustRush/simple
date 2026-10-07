@@ -1413,6 +1413,10 @@ _COMPONENT_KEYS: dict[str, str] = {
     "mcp_status": "what the MCP connection attempts did",
     "mcp_task": "the background MCP connect task",
     "memory": "the memory palace",
+    "runtime_factory": (
+        "builds a runtime for a config; read by a scheduled run, which needs one built "
+        "from the config on disk rather than the one it started in"
+    ),
     # Mounted as a plugin now (agent/ralph/plugin.py), so bootstrap no longer writes
     # it into the mapping.  Kept in this table rather than removed: `_COMPONENT_KEYS`
     # documents what a composition can *contain*, and Ralph is one of those -- the

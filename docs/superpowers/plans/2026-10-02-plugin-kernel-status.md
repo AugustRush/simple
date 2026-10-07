@@ -255,14 +255,22 @@ second is the shape the plan wants; it does not exist yet.
 between the plugin and the caller -- which is what the current code already does, only
 with the store added.
 
-Conclusion: the Scheduler needs a runtime-factory service before it can be a plugin, and
-that is the next piece of work rather than a `SchedulerPlugin` class.
+Conclusion: the Scheduler needed a runtime-factory service before it could be a plugin.
+That now exists -- `agent/runtime/factory.py`, provided as `runtime_factory`, and
+`agent/scheduler/build.py` builds and closes a run's runtime through it rather than
+importing the composition root.  The mapping branch remains: a run with no durable ids
+still uses the composition's own mapping, which is the historical behaviour for
+lightweight executors.
 
 ## Next step, in order
 
-1. **A runtime-factory service**, so a scheduled run can say "build me a runtime for
-   this config" without being handed a mapping.  That is the remaining prerequisite for
-   `SchedulerPlugin`; the store's lifetime and the sync `setup` are already settled.
+1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters
+   (`agent/scheduler/settings.py`), a synchronous builder in its own module
+   (`agent/scheduler/build.py`), and a runtime-factory service so a run can build a
+   runtime without importing the composition root (`agent/runtime/factory.py`).  What
+   remains is the non-isolated branch -- a run with no durable ids uses the composition's
+   own mapping, which a `Context` does not hand out -- and that branch exists only for
+   lightweight executors.
 2. **Phase 6, the channel plugins** (CLI / Web / Feishu) -- measured next, and for the
    same reason Phase 5 was: to find out which of the three is genuinely a component.
 3. **`BaseAgent` is still 2,530 lines** and still holds the sub-agent machinery, the
