@@ -21,6 +21,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 3 Agent Loop Plugin | **done** -- and `agent` itself is now a plugin | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
 | 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
 | 5 Execution Plugins | **2 of 4 done, 2 have no separable boundary** | Ralph ✅ and Scheduler ✅ mounted as plugins; Orchestration / Workflow measured, see below |
+| -- Agent | **done** | `agent/core/agent_plugin.py` provides `agent`; the class is an argument, so `bootstrap.BaseAgent` is still the substitution point |
 | -- Memory | **done** | `agent/memory/plugin.py` provides `ltm_store` and `memory`; the ordering chain that blocked it is gone |
 | -- Session log | **done as a plugin** | `agent/memory/session_plugin.py` provides `context_manager`, which `bootstrap` used to assemble above the catalog |
 | 6 Channel Plugins | **web + feishu done; CLI is not a channel** | `channels` is a capability service any plugin can contribute to; `CliChannel` is a stub that raises |
@@ -596,6 +597,26 @@ composition root, and all four were already pure functions of one config or one 
 `max_tokens` into the mapping *literal* rather than the post-mount update, because the
 plugin waited on it; and `register_spawn_capability` below the mounts, because it resolves
 the agent.
+
+## The last item: Orchestration
+
+Measured, and the measurement changed the answer.  Its two parts are:
+
+- **`OrchestrationPlanner`** -- constructed at `agent/core/turn_loop.py:456` as
+  `OrchestrationPlanner.from_skill_catalog(skill_catalog)`.  That is **inside the
+  agent-loop plugin**, from a service it already receives.
+- **`SpawnPlanner`** -- constructed in `BaseAgent.__init__` with
+  `PlannerDeps(settings=self, ...)`, which is the agent handing *itself* to the planner.
+
+So neither is a composition-level cluster of the kind Memory, Session, Scheduler and Ralph
+were.  One is already inside a plugin; the other depends **into** the agent, so a plugin
+providing it would have to be built after the agent and the agent re-wired after being
+provided -- the reverse of the ordering rule every other move followed.
+
+The literal step is still available and is small: `OrchestrationPlanner` is built per turn
+from `skill_catalog`, so it could be a service the agent-loop plugin injects instead of
+constructing.  That would make it a plugin in name as well as in effect.  It is **not**
+done, so this document does not claim it.
 
 ## Next step, in order
 
