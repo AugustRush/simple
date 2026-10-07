@@ -348,9 +348,12 @@ def test_a_plugin_gate_still_blocks_through_the_real_catalog(tmp_path) -> None:
                     name = "gate"
 
                     def setup(self, ctx):
-                        TOOL.attach(ctx, self.on_pre_tool)
+                        TOOL.attach(ctx, self.gate)
 
-                    def on_pre_tool(self, event):
+                    # Not `on_pre_tool`: that name belongs to the hook protocol this
+                    # replaced, and a kernel plugin's own handler is just a method it
+                    # subscribes with.
+                    def gate(self, event):
                         if event.tool_name == "shell":
                             return "no shells"
                         return None

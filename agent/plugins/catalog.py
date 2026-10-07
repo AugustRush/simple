@@ -907,41 +907,6 @@ async def _maybe_await_with_timeout(value: Any, timeout_seconds: float) -> Any:
     return await _maybe_await(value)
 
 
-async def _call_hook_with_timeout(
-    hook: Callable,
-    *args: Any,
-    timeout_seconds: float,
-    executor: Optional[ThreadPoolExecutor] = None,
-) -> Any:
-    """Call a plugin hook with timeout covering sync and async hooks."""
-    if timeout_seconds <= 0:
-        return await _maybe_await(hook(*args))
-    if inspect.iscoroutinefunction(hook):
-        return await asyncio.wait_for(
-            _maybe_await(hook(*args)),
-            timeout=timeout_seconds,
-        )
-
-    loop = asyncio.get_running_loop()
-    future = loop.run_in_executor(executor, partial(hook, *args))
-    try:
-        result = await asyncio.wait_for(future, timeout=timeout_seconds)
-    except asyncio.TimeoutError:
-        # cancel() only helps while the call is still queued — a thread that
-        # has already entered the hook cannot be interrupted.  Say so, because
-        # the worker it occupies is unavailable until the hook returns on its
-        # own, and a hook that never returns costs the pool a slot for good.
-        if not future.cancel():
-            shared.CONSOLE.print(
-                f"[dim]Plugin hook "
-                f"'{getattr(hook, '__qualname__', hook)}' exceeded "
-                f"{timeout_seconds:.2f}s and is still running; its worker "
-                f"thread stays blocked until it returns[/dim]"
-            )
-        raise
-    return await _maybe_await_with_timeout(result, timeout_seconds)
-
-
 #: Distinguishes the absence of a default from a default of None.
 _NO_DEFAULT = object()
 
@@ -1238,49 +1203,6 @@ class PluginCatalog:
         # is simply never called, which is the failure mode with no symptom.
         self._host.events = self._event_bus
 
-    def _run_hook_sync(self, hook: Callable, event: Any, timeout: float) -> None:
-        """Run one plugin hook to completion from synchronous code.
-
-        Unload is synchronous -- ``discover_and_load`` is, and reload calls
-        unload from inside itself -- so a hook cannot simply be awaited.  Two
-        cases, because there is no single call that works for both:
-
-        - **No running loop.**  The common case for a tool or a CLI command.
-          ``asyncio.run`` drives it, including the async-hook and timeout
-          machinery.
-        - **A running loop.**  ``asyncio.run`` cannot be used: it leaves the
-          coroutine unawaited and warns.  A sync hook is called directly here,
-          bounded by nothing, and an async hook is skipped rather than left
-          pending -- a plugin that must run async teardown has
-          ``ctx.on_unwind``, which is invoked synchronously by the scope.
-        """
-        if inspect.iscoroutinefunction(hook):
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop is not None:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin session_end skipped: an async hook cannot be "
-                    f"driven from inside a running event loop[/dim]"
-                )
-                return
-            asyncio.run(
-                _call_hook_with_timeout(
-                    hook,
-                    event,
-                    timeout_seconds=timeout,
-                    executor=self._hook_executor,
-                )
-            )
-            return
-        # A sync hook: run it on the plugin pool, bounded by the timeout.
-        if timeout <= 0:
-            hook(event)
-            return
-        future = self._hook_executor.submit(hook, event)
-        future.result(timeout=timeout)
-
     def register_core_services(self, components: Any) -> None:
         """Point this catalog at the runtime's container for core services.
 
@@ -1489,12 +1411,12 @@ class PluginCatalog:
 
         plugin, meta = self._plugins.get(plugin_name, (None, None))
 
-        # 1. The end hook, while the plugin's registrations still exist: a hook
-        #    that cannot see its own resources cannot release them.
-        if plugin is not None and hasattr(plugin, "on_session_end"):
-            self._fire_session_end_for(plugin, meta, plugin_name)
+        # (The step that fired a Python ``on_session_end`` here is gone: no plugin
+        # implements it, and the ordering concern it existed for -- "a hook that cannot
+        # see its own resources cannot release them" -- is the kernel's own sequence
+        # below, which runs `teardown` before the scope unwinds.)
 
-        # 2. The kernel takes the tree down: dependents first, then the plugin's
+        # The kernel takes the tree down: dependents first, then the plugin's
         #    own children, then ``teardown``, then its scope.  Assets registered
         #    through ``ctx`` unwind here rather than by filtering lists on name.
         #
@@ -1510,37 +1432,6 @@ class PluginCatalog:
         self._remove_plugin_owned_state(plugin_name)
         sys.modules.pop(f"_agent_plugin_{plugin_name}", None)
         return {"ok": True, "unloaded": plugin_name}
-
-    def _fire_session_end_for(
-        self, plugin: Any, meta: Optional[PluginMeta], plugin_name: str
-    ) -> None:
-        """Fire one plugin's ``on_session_end``, honouring its timeout.
-
-        Synchronous because the hook itself may be sync or async and
-        ``_call_hook_with_timeout`` runs sync hooks on the dedicated plugin pool
-        and drives coroutine hooks to completion.  Unload is therefore
-        symmetric with :meth:`discover_and_load`, which is also synchronous; a
-        plugin needing async teardown has ``ctx.on_unwind`` for it.
-
-        A copy of the per-plugin body of :meth:`fire_session_end` rather than a
-        call to it, because that method iterates every plugin and this one must
-        touch exactly one.
-        """
-        timeout = self._hook_timeout(meta, "on_session_end") if meta else (
-            self._turn_hook_timeout_seconds
-        )
-        event = SessionEvent(messages=[], tools_used=[], session_id="")
-        try:
-            self._run_hook_sync(plugin.on_session_end, event, timeout)
-        except asyncio.TimeoutError:
-            shared.CONSOLE.print(
-                f"[dim]Plugin '{plugin_name}' session_end timed out after "
-                f"{timeout:.2f}s[/dim]"
-            )
-        except Exception as exc:
-            shared.CONSOLE.print(
-                f"[dim]Plugin session_end error ({plugin_name}): {exc}[/dim]"
-            )
 
     def _load_one_plugin(
         self,

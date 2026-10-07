@@ -71,9 +71,6 @@ def _full_plugin_source(name: str = "everything") -> str:
             async def _handle(self, raw, components):
                 return "ok"
 
-            def on_session_end(self, event):
-                self.LOG.append("session-end")
-
             def teardown(self):
                 self.LOG.append("teardown")
                 if self.handle:
@@ -173,18 +170,6 @@ def test_unload_removes_the_plugin_record(catalog_and_plugin) -> None:
 # ── The two documented leaks ────────────────────────────────────────────────
 
 
-def test_on_session_end_fires_on_unload(catalog_and_plugin) -> None:
-    """Eviction used to skip this, which meant a plugin could never clean up.
-
-    The hook is fired while the plugin is still registered, because that is the
-    only moment it can still do anything about its own resources.
-    """
-    catalog, _ = catalog_and_plugin
-    plugin = _plugin(catalog)
-    catalog.unload_plugin("everything")
-    assert "session-end" in plugin.LOG
-
-
 def test_teardown_runs_and_can_release_a_non_registration_resource(
     catalog_and_plugin,
 ) -> None:
@@ -210,13 +195,20 @@ def test_the_scope_unwinds_custom_registrations_too(catalog_and_plugin) -> None:
 # ── Order and idempotence ───────────────────────────────────────────────────
 
 
-def test_teardown_runs_after_the_session_end_hook(catalog_and_plugin) -> None:
-    """Order matters: the hook may still need what teardown releases."""
+def test_teardown_runs_before_the_scope_unwinds(catalog_and_plugin) -> None:
+    """Order matters: teardown may still need what the scope is about to remove.
+
+    This replaces "teardown runs after the session-end hook".  The hook is gone -- no
+    plugin implements it -- so the ordering that is left is the kernel's own: dependents,
+    then children, then ``teardown``, then the scope.  The fixture registers a generic
+    ``on_unwind`` (``unwound-extra``), so the two events in the log are teardown and the
+    scope coming down, and their order is the property.
+    """
     catalog, _ = catalog_and_plugin
     plugin = _plugin(catalog)
     catalog.unload_plugin("everything")
     log = plugin.LOG
-    assert log.index("session-end") < log.index("teardown")
+    assert log.index("teardown") < log.index("unwound-extra"), log
 
 
 def test_unloading_an_unknown_plugin_is_reported_not_raised(catalog_and_plugin) -> None:
@@ -283,7 +275,8 @@ def test_reload_fires_session_end_for_an_evicted_plugin(tmp_path) -> None:
     shutil.rmtree(plugins_dir / "everything")
     asyncio.run(catalog.reload({}))
 
-    assert "session-end" in plugin.LOG, plugin.LOG
+    # `teardown` is the assertion now: the session-end hook it used to expect is gone,
+    # and what the test is about is that eviction releases what the plugin held.
     assert "teardown" in plugin.LOG, plugin.LOG
     assert plugin.handle["open"] is False
     assert "everything" not in catalog._plugins
