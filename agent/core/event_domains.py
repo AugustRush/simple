@@ -189,6 +189,23 @@ class Domain:
 
         return unsubscribe
 
+    def attach(self, ctx: Any, listener: Callable[[Any], Any]) -> Callable[[], None]:
+        """Subscribe *listener* to this domain and bind the undo to *ctx*.
+
+        The form a plugin uses, because the bus is **not** the context's: this
+        codebase keeps one bus per domain, and ``ctx.bus`` is a single bus for
+        events the composition itself defines.  Registering a turn handler on the
+        context's bus would produce a listener that is never called -- the failure
+        mode with no symptom, indistinguishable from a plugin that works.
+
+        The domain table therefore owns the answer to "which bus", which is where
+        :func:`bus_for` already keeps it, and the caller gets one call that both
+        subscribes and makes the subscription reversible.
+        """
+        undo = self.subscribe(bus_for(self), listener)
+        ctx.on_unwind(undo)
+        return undo
+
     def to_payload(self) -> dict[str, Any]:
         """Public shape, so a UI or a doc lists domains without hardcoding."""
         return {

@@ -750,3 +750,54 @@ def test_the_scoped_view_is_rebuilt_when_the_service_is_replaced() -> None:
     install.ctx.things.register("mine")
     assert second.items == ["mine"], "the new service was used"
     assert first.items == ["mine"], "and the old one was not touched again"
+
+
+# ── Replacement is a first-class act ─────────────────────────────────────────
+
+
+def test_replacing_a_plugin_unloads_the_incumbent_first() -> None:
+    """Not overwriting: half of one plugin and half of another is not a state to
+    reason about, so the incumbent's registrations are unwound before the new
+    one's are made."""
+    host = PluginHost()
+    host.load(Leaf())
+    assert host.services.get("leaf.value") == 42
+
+    class Better:
+        name = "leaf"
+
+        def setup(self, ctx):
+            ctx.provide("leaf.value", 99)
+
+    host.load(Better(), replace=True)
+    assert host.services.get("leaf.value") == 99
+    assert host.loaded() == ("leaf",), "one leaf, not two"
+
+
+def test_a_plain_duplicate_is_still_refused() -> None:
+    """Replacement is asked for; it is not the default."""
+    host = PluginHost()
+    host.load(Leaf())
+    with pytest.raises(ValueError, match="already loaded"):
+        host.load(Leaf())
+
+
+def test_replacing_takes_the_incumbents_dependents_with_it() -> None:
+    """The incumbent's dependents declared a dependency on *it*; a replacement is a
+    different implementation and does not inherit that relationship."""
+    host = PluginHost()
+    dependent = NeedsLeaf()
+    host.load(dependent)
+    host.load(Leaf())
+    assert dependent.activated
+
+    host.load(Leaf(), replace=True)
+    assert "needs_leaf" not in host.loaded()
+
+
+def test_replacing_a_pending_plugin_works_too() -> None:
+    host = PluginHost()
+    host.load(NeedsLeaf())
+    assert host.pending() == ("needs_leaf",)
+    host.load(NeedsLeaf(), replace=True)
+    assert host.pending() == ("needs_leaf",), "still one waiter, not two"

@@ -6,18 +6,20 @@ catalog wired only the two tool event types, so the new domains were a broadcast
 with no reachable listener -- the same "a table nothing reads" problem this
 refactor keeps finding, one layer up.
 
-Why ``ctx.on(...)`` rather than more method names
--------------------------------------------------
-The catalog already supports three conventions for a plugin to attach behaviour:
-``setup``/``teardown``, the hook methods (``on_turn_end``, ``on_pre_tool``, ...),
-and the ``ctx`` registration surface.  The hook methods are the oldest and the
-only ones that require the catalog to know a fixed mapping from domain to method
-name -- so extending them to two more domains would mean two more entries in that
-mapping and a fourth convention to document.
+Why the event *type* is the channel
+-----------------------------------
+``ctx.on(TurnStarted, handler)`` rather than ``ctx.on("turn", handler)``.  A domain
+name is a string that has to be agreed on in two places and is checked nowhere, so
+a typo registers a listener that is never called -- indistinguishable from a plugin
+that works.  A type cannot be typo'd into validity.
 
-``ctx.on(domain, handler)`` reuses the registration surface that already exists:
-the same undo mechanism as ``ctx.provide`` and ``ctx.add_tool``, which is what
-makes unloading a plugin remove every effect it had.  A subscription is an effect.
+A whole domain is still reachable, because a domain is a set of types:
+``TURN.subscribe(ctx.bus, handler)``.  The kernel does not offer
+``ctx.on_domain("turn", ...)`` because it would have to know what a turn is; the
+domain table owns that vocabulary (``agent/core/event_domains.py``).
+
+Either way a subscription is an **effect**: the same undo mechanism as
+``ctx.provide``, which is what makes unloading a plugin remove everything it did.
 """
 
 from __future__ import annotations
@@ -39,6 +41,8 @@ from agent.core.events import EventBus, LLM_EVENTS, TURN_EVENTS
 
 
 SUBSCRIBER = '''
+    from agent.core.event_domains import LLM, TURN
+
     def register():
         class Watcher:
             name = "watcher"
@@ -49,8 +53,12 @@ SUBSCRIBER = '''
 
             def setup(self, ctx):
                 self.ctx = ctx
-                ctx.on("turn", self.on_turn)
-                ctx.on("llm", self.on_llm)
+                # A domain is a set of event types, and the domain table owns that
+                # vocabulary -- so subscribing to the whole turn domain is one call
+                # to the table with the context's bus, and one undo registered on
+                # this plugin's lifetime.
+                TURN.attach(ctx, self.on_turn)
+                LLM.attach(ctx, self.on_llm)
 
             def on_turn(self, event):
                 self.turns.append(event)
@@ -60,6 +68,7 @@ SUBSCRIBER = '''
 
         return Watcher()
 '''
+
 
 
 def _write_plugin(plugin_dir: Path, code: str) -> None:
@@ -72,11 +81,10 @@ def _load(tmp_path: Path, *, bus=None):
 
     root = tmp_path / "plugins"
     _write_plugin(root / "watcher", SUBSCRIBER)
-    catalog = PluginCatalog(builtin_dir=root)
-    if bus is not None:
-        # Point every domain at a bus this test owns.
-        original = catalog.resolve_event_bus
-        catalog.resolve_event_bus = lambda domain: bus
+    # The bus is constructor-injected and the host shares it, so ``ctx.bus`` is the
+    # bus this test owns.  Monkeypatching a resolver would no longer reach the
+    # plugin, which subscribes through its context.
+    catalog = PluginCatalog(builtin_dir=root, event_bus=bus)
     loaded = catalog.discover_and_load()
     return catalog, loaded
 
@@ -218,21 +226,37 @@ def test_unloading_a_plugin_stops_its_subscriptions(tmp_path: Path) -> None:
 
 
 def test_unload_removes_the_listener_from_the_bus(tmp_path: Path) -> None:
-    """Asserted on a bus this test owns.
+    """Asserted as a *difference*, because the bus is shared for the session.
 
-    The module-level buses are shared for the whole session, so "no listeners" is
-    not a property a test can assert about them -- an earlier test's plugin would
-    make it fail for reasons unrelated to this one.  A private bus is substituted
-    for the domain, so the assertion is about the unsubscribe and nothing else.
+    ``"no listeners"`` is not a property a test can assert about a module-level bus
+    -- another test's plugin would make it fail for unrelated reasons, and asserting
+    it would also stop being true the moment a listener was added elsewhere.  The
+    count before and after this plugin's life is the honest question, and it still
+    catches a leaked listener (the count would not come back down).
+
+    On ``TURN_EVENTS`` rather than a substitute, because ``TURN.attach`` resolves
+    the bus through the domain table: a private bus would test a path production
+    does not take.
     """
-    owned = EventBus()
-    catalog, _ = _load(tmp_path, bus=owned)
+    before = {
+        event_type: len(TURN_EVENTS.listeners(event_type))
+        for event_type in (TurnStarted, TurnFinished)
+    }
+    catalog, _ = _load(tmp_path)
     try:
-        assert owned.has_listeners(TurnStarted), "it subscribed"
-        assert owned.has_listeners(TurnFinished), "to the whole domain"
+        assert len(TURN_EVENTS.listeners(TurnStarted)) > before[TurnStarted], (
+            "it subscribed to TurnStarted"
+        )
+        assert len(TURN_EVENTS.listeners(TurnFinished)) > before[TurnFinished], (
+            "and to the rest of the domain"
+        )
+
         catalog.unload_plugin("watcher")
-        assert not owned.has_listeners(TurnStarted)
-        assert not owned.has_listeners(TurnFinished), "every type in the domain"
+
+        for event_type, count in before.items():
+            assert len(TURN_EVENTS.listeners(event_type)) == count, (
+                f"{event_type.__name__} still has a listener from the unloaded plugin"
+            )
     finally:
         catalog.close()
 
@@ -252,37 +276,50 @@ def test_a_reload_does_not_double_subscribe(tmp_path: Path) -> None:
         catalog.close()
 
 
-# ── The catalog resolves buses from the domain table ─────────────────────────
+# ── The domain table owns "which bus" ────────────────────────────────────────
+#
+# The catalog used to answer ``resolve_event_bus("turn")``, which meant the mapping
+# from a domain to its bus lived in the plugin manager.  It lives in the domain table
+# now (``agent/core/event_domains.py``), next to the types it maps, and
+# ``Domain.attach`` is the one call a plugin makes.  The mapping's own tests moved
+# there with it -- a wrong answer here produces a listener that is never called,
+# which is indistinguishable from a plugin that works.
 
 
-def test_the_catalog_resolves_a_bus_by_domain_name() -> None:
-    from agent import PluginCatalog
+def test_attach_subscribes_on_the_domains_own_bus(tmp_path: Path) -> None:
+    """Not on the context's bus.
 
-    catalog = PluginCatalog(builtin_dir=Path("/tmp/unused"))
+    ``ctx.bus`` is a single bus for events the composition itself defines; the turn
+    and llm domains publish on their own.  Subscribing a turn handler on the
+    context's bus would register for events that never arrive there.
+    """
+    catalog, _ = _load(tmp_path)
     try:
-        assert catalog.resolve_event_bus("turn") is TURN_EVENTS
-        assert catalog.resolve_event_bus("llm") is LLM_EVENTS
+        watcher = _plugin(catalog, "watcher")
+        asyncio.run(TURN_EVENTS.emit(TurnStarted("a", True, False)))
+        asyncio.run(LLM_EVENTS.emit(LLMResponseParsed("a", "end_turn")))
+        assert len(watcher.turns) == 1, "it was subscribed to the turn bus"
+        assert len(watcher.responses) == 1, "and to the llm bus"
     finally:
         catalog.close()
 
 
-def test_resolving_an_unknown_domain_raises() -> None:
-    from agent import PluginCatalog
-
-    catalog = PluginCatalog(builtin_dir=Path("/tmp/unused"))
+def test_attach_returns_the_undo_it_registered(tmp_path: Path) -> None:
+    """The undo is both returned and bound to the plugin's lifetime, so a caller can
+    reverse a subscription early without losing the unload behaviour."""
+    catalog, _ = _load(tmp_path)
     try:
-        with pytest.raises(KeyError):
-            catalog.resolve_event_bus("nope")
-    finally:
-        catalog.close()
+        watcher = _plugin(catalog, "watcher")
+        before = len(TURN_EVENTS.listeners(TurnStarted))
+        undo = TURN.attach(watcher.ctx, lambda event: None)
+        assert len(TURN_EVENTS.listeners(TurnStarted)) == before + 1
 
+        undo()
+        assert len(TURN_EVENTS.listeners(TurnStarted)) == before
 
-def test_the_tool_domain_resolves_to_the_tool_bus() -> None:
-    from agent import PluginCatalog
-    from agent.core.events import TOOL_EVENTS
-
-    catalog = PluginCatalog(builtin_dir=Path("/tmp/unused"))
-    try:
-        assert catalog.resolve_event_bus("tool") is TOOL_EVENTS
+        # And the plugin's own subscription is still there: reversing this one did
+        # not take the plugin's registrations with it.
+        asyncio.run(TURN_EVENTS.emit(TurnStarted("a", True, False)))
+        assert len(watcher.turns) == 1
     finally:
         catalog.close()

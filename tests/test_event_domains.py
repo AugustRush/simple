@@ -329,3 +329,35 @@ def test_the_owner_does_build_the_bus() -> None:
 
     source = (Path(__file__).resolve().parents[1] / "agent/core/events.py").read_text()
     assert _event_bus_constructions(source), "the detector found no construction"
+
+
+# ── A domain says which bus it publishes to ──────────────────────────────────
+
+
+def test_each_domain_resolves_to_its_own_bus() -> None:
+    """The mapping is the answer to "will my listener ever be called?".
+
+    A domain pointed at the wrong bus produces a listener that is simply never
+    called -- no error, no log line, and a plugin that looks like it works.  It
+    lived on the plugin catalog until the plugin API became typed; it belongs next
+    to the types it maps.
+    """
+    from agent.core.event_domains import TURN, LLM, TOOL, bus_for
+    from agent.core import events as buses
+
+    assert bus_for(TURN) is buses.TURN_EVENTS
+    assert bus_for(LLM) is buses.LLM_EVENTS
+    assert bus_for(TOOL) is buses.TOOL_EVENTS
+
+
+def test_the_three_domains_publish_to_three_different_buses() -> None:
+    """Asserted because one bus for all of them is the tempting simplification.
+
+    It would be wrong here: the tool pipeline's bus is the one the executor
+    publishes to and the catalog subscribes on, so merging them would deliver every
+    turn event to the tool gate.
+    """
+    from agent.core.event_domains import TURN, LLM, TOOL, bus_for
+
+    resolved = {bus_for(TURN), bus_for(LLM), bus_for(TOOL)}
+    assert len(resolved) == 3, "each domain has its own bus"

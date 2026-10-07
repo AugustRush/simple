@@ -52,7 +52,7 @@ CONSUMER = '''
 
             def setup(self, ctx):
                 self.ctx = ctx
-                self.seen = ctx.resolve("greeter", default=None)
+                self.seen = ctx.get("greeter", default=None)
                 ctx.on_unwind(lambda: None)
 
         return Consumer()
@@ -64,7 +64,7 @@ CONSUMER_BEFORE_PROVIDER = '''
             name = "consumer"
 
             def setup(self, ctx):
-                self.seen = ctx.resolve("greeter", default="absent")
+                self.seen = ctx.get("greeter", default="absent")
 
         return Early()
 '''

@@ -52,10 +52,10 @@ def _full_plugin_source(name: str = "everything") -> str:
             def setup(self, ctx):
                 self.ctx = ctx
                 self.LOG.append("setup")
-                ctx.add_slash_command("everything", self._handle)
-                ctx.add_bundled_skill("/tmp/skills/everything")
-                ctx.add_bundled_mcp({{"name": "everything-mcp", "command": "true"}})
-                ctx.add_agent_definition(
+                ctx.assets.add_slash_command("everything", self._handle)
+                ctx.assets.add_bundled_skill("/tmp/skills/everything")
+                ctx.assets.add_bundled_mcp({{"name": "everything-mcp", "command": "true"}})
+                ctx.assets.add_agent_definition(
                     "helper", {{"description": "a helper", "model": "m"}}
                 )
                 # An arbitrary registration, to prove the scope is general and

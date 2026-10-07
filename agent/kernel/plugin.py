@@ -129,7 +129,27 @@ class PluginHost:
 
     @property
     def installs(self) -> dict[str, Install]:
-        return dict(self._installs)
+        """The loaded installs, **live**.
+
+        Live rather than a copy because a composition manager reads it to answer
+        "what is loaded" and must see the current answer; a snapshot would let it
+        report a plugin that has since been unloaded.
+        """
+        return self._installs
+
+    @property
+    def pending_installs(self) -> dict[str, Install]:
+        """The installs waiting for a dependency, live for the same reason."""
+        return self._pending
+
+    def was_unloaded(self, name: str) -> bool:
+        """Whether *name* was loaded and has since been unloaded.
+
+        Distinct from "unknown", and the distinction matters to a caller reporting
+        a result: unloading twice is harmless (a parent may have taken the plugin
+        down already), while unloading a name that never existed is a typo.
+        """
+        return name in self._unloaded
 
     def loaded(self) -> tuple[str, ...]:
         """Active plugin names, in activation order."""
@@ -152,11 +172,23 @@ class PluginHost:
 
     # -- composition ---------------------------------------------------------
 
-    def load(self, plugin: Any, *, parent: Optional[str] = None) -> Install:
+    def load(
+        self,
+        plugin: Any,
+        *,
+        parent: Optional[str] = None,
+        replace: bool = False,
+    ) -> Install:
         """Install *plugin*, activating it if its dependencies are present.
 
         Returns the install record either way: a pending plugin is a known plugin,
         and the caller may want to report what it is waiting for.
+
+        ``replace`` makes replacement a first-class act rather than a collision.  It
+        unloads the incumbent first -- which unwinds its registrations *and* takes
+        its dependents down -- so a replacement cannot leave the tree holding half of
+        one plugin and half of another.  The alternative, silently overwriting the
+        name, is what makes "which implementation is live?" depend on load order.
         """
         name = getattr(plugin, "name", None)
         if not isinstance(name, str) or not name:
@@ -164,8 +196,10 @@ class PluginHost:
                 f"{type(plugin).__name__} has no 'name'; a plugin must be "
                 f"identifiable to be looked up, unloaded, or depended on"
             )
-        if name in self._installs:
-            raise ValueError(f"plugin {name!r} is already loaded")
+        if name in self._installs or name in self._pending:
+            if not replace:
+                raise ValueError(f"plugin {name!r} is already loaded")
+            self.unload(name)
 
         scope = self.services.scope()
         install = Install(

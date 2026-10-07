@@ -57,7 +57,7 @@ INJECTING = '''
 
             def setup(self, ctx):
                 self.activated = True
-                self.greeter = ctx.resolve("greeter")
+                self.greeter = ctx.get("greeter")
 
         return Consumer()
 '''
@@ -69,7 +69,7 @@ NEEDS_TWO = '''
             inject = ("greeter", "counter")
 
             def setup(self, ctx):
-                self.saw = (ctx.resolve("greeter"), ctx.resolve("counter"))
+                self.saw = (ctx.get("greeter"), ctx.get("counter"))
 
         return Two()
 '''
