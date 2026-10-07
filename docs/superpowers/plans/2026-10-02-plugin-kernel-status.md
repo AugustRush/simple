@@ -341,6 +341,26 @@ touch, where the hand-written version copied only the two it did.
 last-known-good config from anywhere, and refusing an absent section there would drop the
 posture exactly when the config was unreadable.
 
+## What is still not a plugin
+
+The seven phases are done.  Measured against the objective's list rather than the phase
+names, two entries remain services rather than plugins, and they are the same shape:
+
+**Memory** and **Agent** are built by `bootstrap` as locals and put in the component
+mapping.  A `MemoryPlugin` is not a one-line move: `bootstrap` builds `LTMStore`, then
+`MemoryPalace` and `ContextManager` share it, then the retriever and the consolidation
+engine hang off the latter, and two `FactAssertion`s are written from
+`assistant_identity`.  It is a **cluster** -- `ltm_store` needs to be a service before
+`memory` can be one, exactly as `runtime_factory` had to exist before `SchedulerPlugin`
+could.
+
+**Agent** is the same story with more of it, and it is also where `BaseAgent`'s 2,530
+lines live.  No phase asked for this one; the objective's list did, so it is recorded
+here rather than quietly dropped.
+
+The other departures are measured as inapplicable rather than undone: Orchestration and
+Workflow have no separable boundary, and CLI is not a channel.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters
