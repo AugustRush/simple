@@ -16,7 +16,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | Phase | State | Evidence |
 |---|---|---|
 | 0 Baseline | done | 3 accepted failures, byte-identical across every commit; see `2026-10-01-baseline-failures.txt` |
-| 1 Plugin Kernel | **done** | `agent/kernel/` — Context / Plugin / Service / Event / Scope / Lifecycle, 53 tests in `tests/test_kernel.py` |
+| 1 Plugin Kernel | **done** | `agent/kernel/` — Context / Plugin / Service / Event / Scope / Lifecycle, 61 tests in `tests/test_kernel.py`; the boundary itself is asserted in `tests/test_kernel_boundary.py` |
 | 2 Service Injection | **done** | ToolRegistry ✅ `registry`, Session ✅ `context_manager`, Model ✅ `llm` |
 | 3 Agent Loop Plugin | **done** -- and `agent` itself is now a plugin | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
 | 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
@@ -627,6 +627,30 @@ agent re-wired afterwards -- the reverse of the ordering rule every other move f
 `tests/test_orchestration_seam.py` pins both claims, so they are falsifiable rather than
 assertions in a document: it fails if the planner stops reading the call's metadata, or if
 the four writers stop being four.
+
+## The kernel's boundary now has a test
+
+"No privileged core" has been in this document and the README since Phase 1, and **it had no
+guard**.  A documented property with no test is one that becomes false quietly, and this is
+the property the whole design rests on: the moment the kernel can name `Agent`, that name is
+privileged, because the kernel is what everything else is composed *by*.
+
+Two rules, because they fail differently:
+
+- **Structural and exact**: the kernel imports nothing from the rest of the project.  Only
+  `agent.kernel`, the stdlib and `typing`.  It was already true; nothing enforced it.
+- **Vocabulary**: no identifier in the kernel names a domain concept.
+
+**The vocabulary rule was written wrong first, and the control caught it.**  The initial
+version compared whole identifiers, so `ToolRegistryProxy` passed -- a compound name neither
+equals nor starts with `tool_`.  That is the spelling a domain concept would actually arrive
+in.  It now splits underscores *and* CamelCase, and the control asserts all four forms.
+
+Two false positives had to be resolved by **provenance rather than by loosening the rule**:
+`runtime_checkable` (a `typing` decorator) and `RuntimeError` (a builtin) both split into
+`runtime`, and neither is this project's runtime.  A name imported from a non-`agent` module,
+or one that `hasattr(builtins, ...)`, is not this project's vocabulary -- dropping it keeps
+the rule strict for real names.
 
 ## Next step, in order
 
