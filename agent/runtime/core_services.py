@@ -122,6 +122,21 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         summary="Loaded plugins and everything they contributed.",
     ),
     CoreService(
+        name="agent",
+        owners=(
+            "agent/bootstrap.py",
+        ),
+        consumers=(
+            "agent/_builtin/plugins/evolution/__init__.py",
+            "agent/bootstrap.py",
+            "agent/channels/base.py",
+            "agent/cli.py",
+            "agent/commands/builtin.py",
+            "agent/runtime/contracts.py",
+        ),
+        summary="The agent a turn runs on: the object that answers a user message.",
+    ),
+    CoreService(
         name="context_manager",
         owners=(
             "agent/bootstrap.py",

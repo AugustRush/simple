@@ -25,7 +25,7 @@ from agent.runtime import (
     AgentCore,
     RuntimeComponents,
 )
-from agent.runtime.services import resolve
+from agent.runtime.services import require_service, resolve
 from agent.runtime.contracts import (
     RuntimeEvent,
     RuntimeSessionState,
@@ -605,7 +605,7 @@ class ChannelRunner:
         async def _handle(msg: IncomingMessage, sink: OutputSink) -> bool:
             turn_started_at = time.perf_counter()
             session_id = msg.metadata.get("chat_id") or msg.session_id
-            skill_catalog = components["skill_catalog"]
+            skill_catalog = require_service(components, "skill_catalog")
             session_runtime = await _components_for_session(session_id)
             state = await self._ensure_session_state(sessions, session_id, session_runtime)
             # Touch activity before evicting: a freshly created session has

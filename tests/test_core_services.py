@@ -423,6 +423,7 @@ def test_the_scan_detects_the_shared_resolve_helper() -> None:
 def test_declared_names_match_the_documented_set() -> None:
     """The eight names this step covers, so an accidental removal is caught."""
     assert set(core_service_names()) == {
+        "agent",
         "agent_core",
         "context_manager",
         "mcp_client",
@@ -467,3 +468,151 @@ def test_a_core_service_entry_is_not_blank() -> None:
         name="x", owners=("agent/x.py",), consumers=("agent/y.py",), summary="s"
     )
     assert entry.name == "x"
+
+
+# ── Clause (d): the mapping must not be the only channel ─────────────────────
+
+#: Files that may read a core service straight from a component mapping, with the
+#: reason.  Everything else resolves through a container -- see
+#: :func:`agent.runtime.services.resolve` and the per-package accessors listed in
+#: ``_scan``.
+_RAW_MAPPING_ALLOWED: dict[str, str] = {
+    "agent/bootstrap.py": (
+        "The producer. It reads the mapping it is building, before a container "
+        "over it could consistently exist."
+    ),
+}
+
+#: Functions that read the mapping *while assembling* components.  Assembly is not
+#: consumption: there is no alternative implementation to substitute at
+#: construction time, and resolving through the container there would raise for
+#: services the same function is about to create.
+_ASSEMBLY_ALLOWED: dict[str, str] = {
+    "agent/cli.py": (
+        "_build_scheduler_service, _build_cli_context_manager, "
+        "_cli_session_header, _agent_core_for_components: all assemble or report "
+        "on components rather than consuming a service during a turn."
+    ),
+}
+
+#: Files still reading a core service from the mapping that are neither the
+#: producer nor assembly, with the outstanding reason.  Kept explicit so the guard
+#: stays green only for reasons someone wrote down.
+_PENDING: dict[str, str] = {
+    "agent/_builtin/plugins/evolution/__init__.py": (
+        "The one real plugin. How a plugin should reach a core service -- through "
+        "a container, through PluginContext, or by declaring inject -- is an open "
+        "design question, so this file is not migrated yet."
+    ),
+}
+
+
+def _raw_mapping_service_reads() -> dict[str, list[str]]:
+    """Core-service reads that go through a component mapping, by file.
+
+    The counterpart of :func:`_scan`, which deliberately counts container-mediated
+    reads *and* raw ones.  This one counts only the raw ones, which is what clause
+    (d) is about: a service reachable only through a mapping is not declared.
+    """
+    names = set(core_service_names())
+    found: dict[str, list[str]] = {}
+    for path in sorted(AGENT_ROOT.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        rel = str(path.relative_to(REPO_ROOT))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        targets = _is_assignment_target(tree)
+        for node in ast.walk(tree):
+            key = receiver = None
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+            ):
+                first = node.args[0]
+                if isinstance(first, ast.Constant):
+                    key = first.value
+                    receiver = ast.unparse(node.func.value)
+            elif isinstance(node, ast.Subscript) and id(node) not in targets:
+                if isinstance(node.slice, ast.Constant):
+                    key = node.slice.value
+                    receiver = ast.unparse(node.value)
+            if key not in names or receiver is None:
+                continue
+            if _is_metadata_receiver(node):
+                continue
+            # Only receivers that *are* a component mapping; a service object that
+            # happens to have a same-named key is not this question.
+            if not any(t in receiver for t in ("components", "runtime")):
+                continue
+            found.setdefault(rel, []).append(f"L{node.lineno}: {receiver}[{key!r}]")
+    return found
+
+
+def test_no_undeclared_file_reads_a_service_from_the_raw_mapping() -> None:
+    """Clause (d): the mapping must not be the only channel.
+
+    Every consumer either resolves through a container or appears in a list here
+    with a reason someone wrote.  A new raw read is the failure this catches --
+    it silently re-creates the unnamed string key that ``CORE_SERVICES`` exists to
+    replace, and no functional test can see the difference.
+    """
+    raw = _raw_mapping_service_reads()
+    allowed = set(_RAW_MAPPING_ALLOWED) | set(_ASSEMBLY_ALLOWED) | set(_PENDING)
+    offenders = {
+        rel: hits for rel, hits in raw.items() if rel not in allowed
+    }
+    assert not offenders, (
+        "these files read a core service straight from a component mapping:\n  "
+        + "\n  ".join(
+            f"{rel}: {', '.join(hits)}" for rel, hits in sorted(offenders.items())
+        )
+        + "\n\nUse resolve()/require_service() (agent/runtime/services.py), or add "
+        "the file to the guard with a reason."
+    )
+
+
+def test_the_raw_read_guard_has_something_to_allow() -> None:
+    """Control: an empty scan would pass every assertion above.
+
+    Two allowlisted files must actually be found, or the guard is not looking at
+    the code it claims to police.
+    """
+    raw = _raw_mapping_service_reads()
+    assert "agent/bootstrap.py" in raw, "the producer must be detected"
+    assert "agent/cli.py" in raw, "the assembly sites must be detected"
+
+
+def test_every_allowlisted_file_still_needs_its_exemption() -> None:
+    """A stale exemption hides the drift the guard exists to catch.
+
+    Each allowlisted file must still have a raw read.  A file that was migrated
+    keeps its name here otherwise, and the next genuine raw read in that file
+    would be waved through.
+    """
+    raw = _raw_mapping_service_reads()
+    stale = [
+        rel
+        for rel in set(_RAW_MAPPING_ALLOWED) | set(_ASSEMBLY_ALLOWED) | set(_PENDING)
+        if rel not in raw
+    ]
+    assert not stale, (
+        "these files are exempted but no longer read a service from the raw "
+        "mapping; remove the exemption:\n  " + "\n  ".join(sorted(stale))
+    )
+
+
+def test_the_vocabulary_covers_agent_itself() -> None:
+    """``agent`` is the most fundamental service and was missing from the ledger.
+
+    Found while checking an unrelated read: ``getattr(core, "_components",
+    None)`` reaching for ``"agent"`` on a *different* object's mapping.  A service
+    read that widely cannot be absent from the vocabulary that is supposed to
+    enumerate every read point.
+    """
+    names = set(core_service_names())
+    assert "agent" in names
+    entry = entry_for("agent")
+    assert entry.owners == ("agent/bootstrap.py",)
+    assert "agent/commands/builtin.py" in entry.consumers

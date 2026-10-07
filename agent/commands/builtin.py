@@ -160,7 +160,17 @@ def _session_agent(context: CommandContext) -> Any:
     if agent is not None:
         return agent
     core = _component(context, "agent_core")
-    return getattr(getattr(core, "_components", None), "values", {}).get("agent")
+    # Through the container of the core's own components rather than its
+    # ``_components.values`` mapping: reaching into the mapping worked and made
+    # ``agent`` an unnamed key again, which is what this whole migration is
+    # removing.  ``agent`` is not in CORE_SERVICES yet -- see the note in
+    # agent/runtime/core_services.py for why it is read this way.
+    components = getattr(core, "_components", None)
+    if components is None:
+        return None
+    from agent.runtime.services import resolve
+
+    return resolve(components, "agent")
 
 
 async def _compact_handler(request: CommandRequest, context: CommandContext) -> CommandResult:
