@@ -54,6 +54,7 @@ __all__ = [
     "TurnStarted",
     "TurnFinished",
     "TurnCompleted",
+    "SessionFinished",
     "LLMRequestStarted",
     "LLMResponseReceived",
     "LLMResponseParsed",
@@ -117,6 +118,28 @@ class TurnCompleted:
     user_input: str
     response: str
     tool_calls: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SessionFinished:
+    """An interactive session ended, with the transcript a plugin would score.
+
+    The second type the hook protocol had and the kernel did not.  ``EvolutionPlugin``
+    scores a session when it ends -- it reads ``messages`` and ``tools_used`` -- and the
+    kernel's three domains were ``tool``, ``turn`` and ``llm``, none of which is a
+    session.  A turn is finished many times per session; this is finished once.
+
+    ``messages`` is the transcript as the session had it, not a copy: a listener that
+    mutates it is mutating what the session recorded, and the one real consumer only
+    reads.  Copied per emit would be a deep copy of a whole conversation on a path that
+    runs once, which is affordable but pointless while nobody mutates.
+    """
+
+    agent_id: str
+    messages: list[dict]
+    tools_used: list[str]
+    session_id: str = ""
+    turn_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -267,7 +290,13 @@ LLM = Domain(
     blocking=False,
 )
 
-DOMAINS: dict[str, Domain] = {d.name: d for d in (TOOL, TURN, LLM)}
+SESSION = Domain(
+    name="session",
+    event_types=(SessionFinished,),
+    blocking=False,
+)
+
+DOMAINS: dict[str, Domain] = {d.name: d for d in (TOOL, TURN, LLM, SESSION)}
 
 
 def bus_for(domain: Domain) -> EventBus:
@@ -283,6 +312,7 @@ def bus_for(domain: Domain) -> EventBus:
     _BY_NAME = {
         "tool": buses.TOOL_EVENTS,
         "turn": buses.TURN_EVENTS,
+        "session": buses.SESSION_EVENTS,
         "llm": buses.LLM_EVENTS,
     }
     try:

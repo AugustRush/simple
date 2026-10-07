@@ -21,6 +21,8 @@ from agent.core.output import _active_event_collector
 from agent.kernel.plugin import PluginHost
 from agent.plugins.profile_selection import profile_from_config
 from agent.plugins.profiles import resolve_plugin_state
+from agent.core.event_domains import SessionFinished
+from agent.core.events import SESSION_EVENTS
 
 CONSOLE = shared.CONSOLE
 PLUGINS_DIR = shared.PLUGINS_DIR
@@ -2290,7 +2292,27 @@ class PluginCatalog:
         return results
 
     async def fire_session_end(self, event: SessionEvent) -> None:
-        """Notify all plugins when the interactive session ends."""
+        """Notify all plugins when the interactive session ends.
+
+        Both protocols are notified from here, and here is the only place: the hook
+        call below for a plugin that implements ``on_session_end``, and a typed
+        :class:`~agent.core.event_domains.SessionFinished` on the session bus for a
+        plugin that subscribes instead.  Emitting at the two call sites of this method
+        (``cli`` and the channel layer) would be the same event constructed twice, and
+        the day one of them stopped emitting would be a plugin that silently stops
+        scoring sessions.
+        """
+        # Emitted unconditionally: the bus does nothing when nobody listens, and a
+        # session that ended is a fact whether or not this composition has plugins.
+        await SESSION_EVENTS.emit(
+            SessionFinished(
+                agent_id="",
+                messages=list(event.messages),
+                tools_used=list(event.tools_used),
+                session_id=str(getattr(event, "session_id", "") or ""),
+                turn_count=int(getattr(event, "turn_count", 0) or 0),
+            )
+        )
         for plugin, meta in self._plugins.values():
             timeout = self._hook_timeout(meta, "on_session_end")
             if not hasattr(plugin, "on_session_end"):

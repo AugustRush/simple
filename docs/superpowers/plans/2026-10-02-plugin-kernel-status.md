@@ -363,8 +363,7 @@ That is the same coupling the kernel was built to remove, in the module that loa
 plugins.  It is the reason `memory` cannot simply become a plugin either: a hook plugin
 is handed a mapping, so the question "which services does it need" has never been asked.
 
-**Two of the three have a kernel counterpart; the third did not, and that was the
-finding.**  `on_session_start(components)` is `setup(ctx)`, and `on_session_end(event)` is
+**Only one of the three had a kernel counterpart, and that was the finding.**  `on_session_start(components)` is `setup(ctx)`, and `on_session_end(event)` is
 a subscription.  `on_turn_end(event)` needed the user's input against the agent's answer --
 the hook's `TurnEvent` carries `user_input`, `agent_response`, `tool_calls` -- and the
 kernel's turn domain had **only** `TurnFinished(agent_id, status, steps)`: an *outcome*,
@@ -381,6 +380,22 @@ in the context metadata, which is cleared two statements later so nothing can cl
 a request that has already been answered.  Emit after that clear and **every turn reports
 an empty prompt, silently** -- no error, no missing field, just a plugin that never learns.
 The order is asserted by line number rather than left to the comment beside it.
+
+`on_session_end` was missing for the same reason: `EvolutionPlugin` scores a session by
+reading its transcript and the tools used, and the domain table covered a **turn** --
+tools, the loop, the model.  A turn finishes many times per session; a session finishes
+once, and nothing announced it.  That is now `SessionFinished` on a fourth domain,
+`session`, emitted from `PluginCatalog.fire_session_end` -- the single place both
+protocols are notified, so the two callers of that method (`cli` and the channel layer)
+cannot drift into one emitting and one not.
+
+`test_the_known_domains_are_exposed` asserts the domain set as a closed list, and it
+failed when `session` was added -- which is the intended cost, and how a fourth domain
+announces itself.
+
+`EvolutionPlugin` also turned out to hold the component mapping in `self._components` and
+**never read it**: assigned twice, read zero times.  Its need for the whole composition
+was conventional, not real.
 
 The declarative `hooks_config` (external commands from `hooks.json`) is a *different*
 mechanism and stays.

@@ -346,3 +346,71 @@ def test_the_content_event_is_emitted_before_the_request_is_cleared() -> None:
         f"TurnCompleted is emitted at line {emit_line}, after the turn's request is "
         f"cleared at line {pop_line}: every turn would report an empty prompt"
     )
+
+
+def test_a_plugin_can_score_a_session_when_it_ends() -> None:
+    """The session domain, added because a real plugin needed vocabulary that was missing.
+
+    ``EvolutionPlugin`` scores a session at its end -- it reads the transcript and the
+    tools used -- and the domain table covered a *turn*: tools, the loop, the model.  A
+    turn finishes many times per session; a session finishes once, and nothing announced
+    it.
+
+    Emitted from ``PluginCatalog.fire_session_end``, which is the single place both
+    protocols are notified.  The two call sites of that method (``cli`` and the channel
+    layer) would each have to remember to emit, and the day one forgot would be a plugin
+    that silently stops scoring sessions.
+    """
+    from agent.core.event_domains import SESSION, SessionFinished
+    from agent.core.events import SESSION_EVENTS
+
+    seen: list = []
+    unsub = SESSION.subscribe(SESSION_EVENTS, lambda event: seen.append(event))
+    try:
+        asyncio.run(
+            SESSION_EVENTS.emit(
+                SessionFinished(
+                    agent_id="a",
+                    messages=[{"role": "user", "content": "hi"}],
+                    tools_used=["run_tests"],
+                    session_id="s1",
+                    turn_count=3,
+                )
+            )
+        )
+    finally:
+        unsub()
+
+    assert len(seen) == 1
+    assert seen[0].messages == [{"role": "user", "content": "hi"}]
+    assert seen[0].tools_used == ["run_tests"]
+    assert seen[0].turn_count == 3
+
+
+def test_the_session_event_is_emitted_from_the_single_dispatch_point() -> None:
+    """Asserted at the source, because the alternative is two emitters.
+
+    ``fire_session_end`` is where hooks are dispatched.  Emitting the typed event at its
+    callers instead would construct the same fact in two places, which is the shape that
+    drifts.
+    """
+    import ast as _ast
+
+    source = (Path(__file__).resolve().parents[1] / "agent/plugins/catalog.py").read_text(
+        encoding="utf-8"
+    )
+    tree = _ast.parse(source)
+    fire = next(
+        node
+        for node in _ast.walk(tree)
+        if isinstance(node, _ast.AsyncFunctionDef) and node.name == "fire_session_end"
+    )
+    emits = [
+        node
+        for node in _ast.walk(fire)
+        if isinstance(node, _ast.Call)
+        and getattr(node.func, "attr", "") == "emit"
+        and isinstance(node.func.value, _ast.Name)
+        and node.func.value.id == "SESSION_EVENTS"
+    ]
+    assert len(emits) == 1, "fire_session_end must emit exactly one session event"

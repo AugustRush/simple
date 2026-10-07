@@ -54,7 +54,17 @@ def test_the_domains_are_keyed_by_their_own_name() -> None:
 
 
 def test_the_known_domains_are_exposed() -> None:
-    assert set(domain_names()) == {"tool", "turn", "llm"}
+    """The closed set, asserted rather than derived.
+
+    ``session`` is the fourth and it arrived late, which is the point of asserting the
+    set: the first three cover a *turn* -- tools, the loop, the model -- and nothing
+    covered the session those turns happen in.  It was added when the one real plugin
+    needed it, not when the domain table was designed; a plugin scoring a session at its
+    end had no type to subscribe to.
+
+    A new domain fails here until it is listed, which is the intended cost.
+    """
+    assert set(domain_names()) == {"tool", "turn", "llm", "session"}
 
 
 def test_every_domain_declares_at_least_one_event() -> None:

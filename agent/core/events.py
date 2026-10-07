@@ -116,3 +116,11 @@ TURN_EVENTS = EventBus()
 
 #: The bus the model-call path publishes to.
 LLM_EVENTS = EventBus()
+
+#: The bus session lifecycle events are published to.
+#:
+#: A session is not a turn: a turn finishes many times per session, and this finishes
+#: once.  A separate name for the same reason the others have one -- a reader can see
+#: which pipeline a listener is joining -- and the same class, because a domain is
+#: vocabulary rather than transport.
+SESSION_EVENTS = EventBus()
