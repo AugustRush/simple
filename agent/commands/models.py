@@ -59,7 +59,15 @@ class CommandRequest:
 
 @dataclass(frozen=True)
 class CommandContext:
-    """Per-request dependencies supplied to a command handler."""
+    """Per-request dependencies supplied to a command handler.
+
+    ``services`` is the container view over ``components``: the same storage,
+    reached by name, so a handler asks for a *service* rather than for a key in a
+    mapping.  Both are kept because the mapping is the live object the runtime
+    itself writes to, while the container is what makes a name replaceable -- see
+    ``agent/runtime/core_services.py``.  They cannot disagree: the registry adopts
+    the mapping rather than copying it.
+    """
 
     components: Mapping[str, Any]
     config: Mapping[str, Any]
@@ -69,11 +77,26 @@ class CommandContext:
     session_id: str = "default"
     message_id: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    #: A sentinel default so the field exists on the *class* as well as on
+    #: instances: \`hasattr(CommandContext, "services")\` is how a caller checks
+    #: that the channel exists, and a bare \`field(init=False)\` hides it.
+    services: Any = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "components", _immutable_mapping(self.components))
         object.__setattr__(self, "config", _immutable_mapping(self.config))
         object.__setattr__(self, "metadata", _freeze_metadata(self.metadata))
+        # Built over the frozen mapping, so the snapshot semantics are unchanged:
+        # a service published after this context was built stays invisible to it,
+        # exactly as it was when handlers read the mapping directly.
+        #
+        # Imported here rather than at module scope because ``agent.runtime``
+        # imports this package, so a top-level import would be a cycle.
+        from agent.runtime.contracts import RuntimeComponents
+
+        object.__setattr__(
+            self, "services", RuntimeComponents(self.components).services
+        )
 
 
 @dataclass(frozen=True)

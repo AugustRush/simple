@@ -115,7 +115,19 @@ def _warning(message: str) -> CommandResult:
 
 
 def _component(context: CommandContext, name: str) -> Any:
-    return context.components.get(name)
+    """One service, resolved through the container.
+
+    Was ``context.components.get(name)``: a lookup by string key, which worked and
+    named nothing.  A command that wants a different ``skill_catalog`` has no name
+    to install one under until the name is a service -- see
+    ``agent/runtime/core_services.py``.
+
+    Still forgiving: twelve call sites branch on a falsy result, so an absent
+    service returns ``None`` here rather than raising.  The container is what makes
+    the absence visible to a caller that wants to distinguish it
+    (``context.services.get`` raises for a missing name).
+    """
+    return context.services.get(name, default=None)
 
 
 def _field(value: Any, name: str, default: Any = "") -> Any:
@@ -144,10 +156,10 @@ def _context_manager(context: CommandContext) -> Any:
 
 
 def _session_agent(context: CommandContext) -> Any:
-    agent = context.components.get("agent")
+    agent = _component(context, "agent")
     if agent is not None:
         return agent
-    core = context.components.get("agent_core")
+    core = _component(context, "agent_core")
     return getattr(getattr(core, "_components", None), "values", {}).get("agent")
 
 
@@ -202,7 +214,7 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
     if not target.is_dir():
         return _error(f"工作路径不是文件夹：{target}")
     from agent.tools.files import FileService, resolve_file_access_config
-    output_dir = Path(str(context.components.get("output_dir") or shared.DEFAULT_OUTPUT_DIR)).resolve()
+    output_dir = Path(str(_component(context, "output_dir") or shared.DEFAULT_OUTPUT_DIR)).resolve()
     try:
         runtime_config = dict(context.config)
         # In Web, choosing a folder is the explicit user grant that makes it
@@ -258,7 +270,7 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
     core_components = None
     previous_owner_state: list[tuple[Any, Any, Any]] = []
     try:
-        registry = context.components.get("registry")
+        registry = _component(context, "registry")
         if registry is not None:
             raw_context = getattr(registry, "_context", None)
             if isinstance(raw_context, dict):
@@ -269,7 +281,7 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
             # A Web session registry is a ContextVar-backed view over global
             # tool definitions. Bound tool owners are process-global and must
             # never be mutated by one session's workspace switch.
-            if not context.components.get("_shares_global_runtime"):
+            if not _component(context, "_shares_global_runtime"):
                 for tool in getattr(registry, "_tools", {}).values():
                     owner = getattr(tool.fn, "__self__", None)
                     if owner is not None and hasattr(owner, "workspace_root"):
@@ -284,7 +296,7 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
                         if hasattr(owner, "_injected_file_service"):
                             owner._injected_file_service = service
         agent.workspace_root = target
-        core_components = getattr(getattr(context.components.get("agent_core"), "_components", None), "values", None)
+        core_components = getattr(getattr(_component(context, "agent_core"), "_components", None), "values", None)
         if isinstance(core_components, dict):
             previous_core_components = {
                 key: core_components.get(key)
@@ -297,10 +309,10 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
         # appending a string marker. This keeps workspace state intact when
         # skills/plugins/context compression refresh the prompt later.
         import agent as agent_module
-        skill_catalog = context.components.get("skill_catalog")
-        plugin_catalog = context.components.get("plugin_catalog")
+        skill_catalog = _component(context, "skill_catalog")
+        plugin_catalog = _component(context, "plugin_catalog")
         base_prompt = str(
-            context.components.get("base_system_prompt")
+            _component(context, "base_system_prompt")
             or getattr(context.session_state.ctx, "system_prompt", "")
             or ""
         )
@@ -367,7 +379,7 @@ async def _workspace_handler(request: CommandRequest, context: CommandContext) -
 
 
 def _sessions_file(context: CommandContext) -> Path:
-    configured = context.components.get("sessions_file")
+    configured = _component(context, "sessions_file")
     if configured is None:
         configured = context.config.get("sessions_file")
     return Path(configured) if configured is not None else shared.SESSIONS_FILE
@@ -1125,7 +1137,7 @@ def _save_shell_allowed_commands(commands: list[str]) -> None:
 def _apply_shell_allowed_commands(
     context: CommandContext, commands: list[str]
 ) -> None:
-    registry = context.components.get("registry")
+    registry = _component(context, "registry")
     if registry is not None:
         try:
             registry.set_context("shell_allowed_commands", list(commands))
@@ -1179,7 +1191,7 @@ async def _auto_approve_handler(
         shell_session_permission_get,
     )
 
-    registry = context.components.get("registry")
+    registry = _component(context, "registry")
     scope = ShellAuthorizationScope(
         context.session_id,
         context.channel_name,
@@ -1365,7 +1377,7 @@ async def _permissions_handler(
         sandbox_posture_warning,
     )
 
-    registry = context.components.get("registry")
+    registry = _component(context, "registry")
 
     scope = ShellAuthorizationScope(
         context.session_id,

@@ -47,6 +47,19 @@ def _string_key(node: ast.Call | ast.Subscript) -> str | None:
     return None
 
 
+def _component_key(node: ast.Call) -> str | None:
+    """The service name in ``_component(context, "name")``.
+
+    The name is the **second** argument -- the first is the context -- so
+    :func:`_string_key` returns ``None`` for these and a scanner that used it
+    reported the commands package as reading nothing at all.
+    """
+    for arg in node.args[1:]:
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+    return None
+
+
 def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
     """``(writers, readers)`` per core service name, by file.
 
@@ -91,10 +104,17 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
             elif isinstance(node, ast.Call):
                 func = node.func
                 attr = func.attr if isinstance(func, ast.Attribute) else ""
+                name_id = func.id if isinstance(func, ast.Name) else ""
                 if attr == "set_context":
                     note(writers, _string_key(node), rel)
-                elif attr in ("get", "pop") or attr == "require":
+                elif attr in ("get", "pop", "require"):
                     note(readers, _string_key(node), rel)
+                elif name_id == "_component":
+                    # The commands package's own accessor, which resolves through
+                    # the container.  Counted as a read so the ledger keeps saying
+                    # that commands *use* these services -- dropping them would
+                    # report a consumer as gone while it is still consuming.
+                    note(readers, _component_key(node), rel)
             elif isinstance(node, ast.Subscript):
                 note(readers, _string_key(node), rel)
     return writers, readers
@@ -213,6 +233,25 @@ def test_the_scan_finds_reads_and_writes_at_all() -> None:
     assert readers, "no reads found"
     assert "agent_core" in writers
     assert "skill_catalog" in readers
+
+
+def test_the_scan_detects_a_container_mediated_read() -> None:
+    """Control for the *indirect* read, which the consumer check cannot catch.
+
+    ``test_every_declared_consumer_really_reads_the_service`` only walks the
+    claimed consumers; if the scanner finds no readers at all, that loop runs zero
+    times and the test passes.  So a scanner blind to ``_component(context,
+    "skill_catalog")`` would silently stop verifying the very migration it exists
+    to protect -- which is what happened while this was being written.
+    """
+    _writers, readers = _scan()
+    commands = "agent/commands/builtin.py"
+    found = {name for name, files in readers.items() if commands in files}
+    assert found, (
+        f"{commands} reads core services through _component(...) and the scan "
+        f"reported none of them; the scanner is blind to the indirect read"
+    )
+    assert "skill_catalog" in found, f"expected skill_catalog among {sorted(found)}"
 
 
 # ── The vocabulary is closed ─────────────────────────────────────────────────
