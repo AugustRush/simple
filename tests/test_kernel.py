@@ -634,7 +634,7 @@ class _Registry:
     """A toy service whose mutations are reversible.
 
     The convention the kernel relies on: a mutating method returns the undo, and
-    ``scoped(scope)`` hands back a view bound to one plugin's lifetime.  The
+    ``scoped(ctx)`` hands back a view bound to one plugin's lifetime.  The
     service itself stays a plain object -- the kernel never proxies it, because a
     transparent proxy would break ``is`` and ``isinstance`` for every service that
     did not need the behaviour.
@@ -643,8 +643,8 @@ class _Registry:
     def __init__(self) -> None:
         self.items: list[str] = []
 
-    def scoped(self, scope):
-        return _ScopedRegistry(self, scope)
+    def scoped(self, ctx):
+        return _ScopedRegistry(self, ctx)
 
     def add(self, item: str) -> None:
         self.items.append(item)
@@ -655,14 +655,14 @@ class _Registry:
 
 
 class _ScopedRegistry:
-    def __init__(self, registry: _Registry, scope) -> None:
+    def __init__(self, registry: _Registry, ctx) -> None:
         self._registry = registry
-        self._scope = scope
+        self._ctx = ctx
 
     def register(self, item: str) -> str:
-        """Adds, **and returns the undo** -- which the scope then records."""
+        """Adds, and registers its own undo on the owning plugin's lifetime."""
         self._registry.add(item)
-        self._scope.on_unwind(lambda: self._registry.remove(item))
+        self._ctx.on_unwind(lambda: self._registry.remove(item))
         return item
 
 

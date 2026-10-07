@@ -109,8 +109,8 @@ class Context:
         """Resolve a service, raising for a missing name unless given a default.
 
         The result is **scoped to this plugin** when the service supports it: a
-        service that exposes ``scoped(scope)`` is asked for a per-plugin view, and
-        a mutation made through that view registers its own undo on this plugin's
+        service that exposes ``scoped(ctx)`` is asked for a per-plugin view, and a
+        mutation made through that view registers its own undo on this plugin's
         lifetime.  That is what makes ``ctx.tools.register(tool)`` reversible
         without the plugin managing a scope -- see :meth:`_scoped`.
 
@@ -127,6 +127,12 @@ class Context:
     def _scoped(self, name: str, service: Any) -> Any:
         """A per-plugin view of *service*, cached, or the service itself.
 
+        The factory is handed **this context**, not a bare scope, because a
+        contribution usually has to be attributable: the plugin catalog keys slash
+        commands and bundled skills by plugin name, and a view holding only a scope
+        could not say whose they are.  It still reaches the scope through
+        ``ctx.on_unwind``, so the view does not have to know how a scope works.
+
         Cached because a plugin reaches a service many times in a turn and a fresh
         view per lookup would be waste; and because a view compares by identity with
         itself, which is what lets a plugin hold one.
@@ -137,7 +143,7 @@ class Context:
         cached = self._views.get(name)
         if cached is not None and cached[0] is service:
             return cached[1]
-        view = factory(self._install.scope)
+        view = factory(self)
         self._views[name] = (service, view)
         return view
 
