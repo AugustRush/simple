@@ -495,18 +495,6 @@ _ASSEMBLY_ALLOWED: dict[str, str] = {
     ),
 }
 
-#: Files still reading a core service from the mapping that are neither the
-#: producer nor assembly, with the outstanding reason.  Kept explicit so the guard
-#: stays green only for reasons someone wrote down.
-_PENDING: dict[str, str] = {
-    "agent/_builtin/plugins/evolution/__init__.py": (
-        "The one real plugin. How a plugin should reach a core service -- through "
-        "a container, through PluginContext, or by declaring inject -- is an open "
-        "design question, so this file is not migrated yet."
-    ),
-}
-
-
 def _raw_mapping_service_reads() -> dict[str, list[str]]:
     """Core-service reads that go through a component mapping, by file.
 
@@ -559,7 +547,7 @@ def test_no_undeclared_file_reads_a_service_from_the_raw_mapping() -> None:
     replace, and no functional test can see the difference.
     """
     raw = _raw_mapping_service_reads()
-    allowed = set(_RAW_MAPPING_ALLOWED) | set(_ASSEMBLY_ALLOWED) | set(_PENDING)
+    allowed = set(_RAW_MAPPING_ALLOWED) | set(_ASSEMBLY_ALLOWED)
     offenders = {
         rel: hits for rel, hits in raw.items() if rel not in allowed
     }
@@ -594,7 +582,7 @@ def test_every_allowlisted_file_still_needs_its_exemption() -> None:
     raw = _raw_mapping_service_reads()
     stale = [
         rel
-        for rel in set(_RAW_MAPPING_ALLOWED) | set(_ASSEMBLY_ALLOWED) | set(_PENDING)
+        for rel in set(_RAW_MAPPING_ALLOWED) | set(_ASSEMBLY_ALLOWED)
         if rel not in raw
     ]
     assert not stale, (

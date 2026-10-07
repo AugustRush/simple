@@ -25,6 +25,8 @@ per-invocation overlay provides ``command_context`` and the current session
 
 from __future__ import annotations
 
+from agent.runtime.services import require_service, resolve
+
 from agent.runtime.system_prompt import publish_system_prompt
 
 import json
@@ -65,7 +67,7 @@ def _resolvable_endpoint(components: dict) -> bool:
     has neither, and guessing the wire format from a default is how a call
     ends up at the wrong group's endpoint.
     """
-    agent = components.get("agent")
+    agent = resolve(components, "agent")
     return (
         agent is not None
         and hasattr(agent, "endpoint_for")
@@ -115,12 +117,12 @@ class EvolutionPlugin:
             try:
                 import agent as _agent_mod
 
-                agent = components["agent"]
+                agent = require_service(components, "agent")
                 model = str(components["model"])
                 self._engine = _agent_mod.EvolutionEngine(
                     agent.endpoint_for(model),
                     model,
-                    components["memory"],
+                    require_service(components, "memory"),
                 )
             except Exception as exc:
                 _console().print(
@@ -274,11 +276,11 @@ class EvolutionPlugin:
 
         return _agent_mod._compose_system_prompt(
             base_prompt,
-            components["registry"],
+            require_service(components, "registry"),
             components.get("workspace_root") or _agent_mod.Path.cwd().resolve(),
             components["output_dir"],
-            skill_catalog=components.get("skill_catalog"),
-            plugin_catalog=components.get("plugin_catalog"),
+            skill_catalog=resolve(components, "skill_catalog"),
+            plugin_catalog=resolve(components, "plugin_catalog"),
         )
 
     async def _handle_evolve(self, raw_cmd: str, components: dict) -> Any:
@@ -317,7 +319,7 @@ class EvolutionPlugin:
             )
         description = parts[1].strip()
         outcome = await self._engine.generate_tool(
-            description, components["registry"]
+            description, require_service(components, "registry")
         )
         # The engine owns validation, dependency installation, approval, and
         # loading; this handler only turns its verdict into a channel reply.

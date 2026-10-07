@@ -61,6 +61,21 @@ class AgentPlugin:
             Synchronous.  Called once after all core components are built.
             Use it to capture references to client, model, memory, etc.
 
+            ``components`` is the runtime's component mapping.  Read a *service*
+            from it by name -- ``resolve(components, "skill_catalog")`` or
+            ``require_service(components, "agent")`` from
+            :mod:`agent.runtime.services` -- rather than with ``.get``, so the
+            lookup names a service the runtime declares
+            (``agent/runtime/core_services.py``) and a guard can see it.
+
+            **Open question, recorded here because this is where it matters:** a
+            plugin is handed the whole mapping, which means it can reach any
+            service rather than only the ones it declared.  The alternative is for
+            a plugin to declare ``inject = ("skill_catalog",)`` and be given the
+            service, the way ``ctx.provide`` / ``ctx.on`` already work.  Deciding
+            that changes the plugin API, so it is not decided here; what is decided
+            is that the reads are *named* either way.
+
         on_prompt_submit(text: str, metadata: dict) -> Optional[HookResult]
             Async-compatible.  Fired when the user submits a message, BEFORE the
             agent sees it.  Return ``HookResult(action="block")`` to prevent the
