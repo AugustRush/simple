@@ -203,6 +203,29 @@ changes every caller including the composition root.  When the Scheduler becomes
 plugin it will either make its builder synchronous or start a task from a synchronous
 setup.
 
+## The scheduler's builder moved out of the CLI
+
+`_build_scheduler_service` was 294 lines in `cli.py`.  Measured by statement, it is
+**six statements of construction** (a store, a delivery, the service, the return) and
+**107 of the two per-run executors**.  That ratio is the reason it is a module rather
+than a plugin: what a composition cares about is the six, and the rest is what a run
+*does*, which is not a composition-time concern at all.
+
+It is now `agent/scheduler/build.py`.  Two helpers moved first, because the moved code
+needs them and a scheduler module importing the CLI would be a cycle:
+
+- `scheduler_store()` -> `agent/scheduler/store.py`
+- `agent_core_for_components()` -> `agent/runtime/contracts.py`
+
+The remaining composition-root operations (`_build_components_async`,
+`_close_components`, `load_config_for_run`) are reached through a **function-local
+`import agent`** inside the executor -- the same cycle-break used for the turn loop.
+
+The move was checked by statement, not by "the tests pass": **187 -> 187**, with exactly
+two differences -- the signature (`components` became required last round) and the added
+local import.  The two describing helpers came across at 19 -> 19 and 56 -> 56 with zero
+differences.
+
 ## Next step, in order
 
 1. **The Scheduler as a plugin.**  Its parameters are single-sourced now

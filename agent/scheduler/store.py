@@ -533,6 +533,16 @@ _MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
 }
 
 
+def scheduler_store() -> "SchedulerStore":
+    """This process's scheduler store.
+
+    Relocated from ``cli.py``: the scheduler's own builder needs it, and a builder in
+    ``agent/scheduler`` importing the CLI would be a cycle.  The CLI keeps a private
+    alias so its eleven command bodies read unchanged.
+    """
+    return open_store()
+
+
 class SchedulerStore:
     SCHEMA_VERSION = 14
 

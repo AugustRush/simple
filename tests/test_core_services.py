@@ -536,9 +536,21 @@ _RAW_MAPPING_ALLOWED: dict[str, str] = {
 #: services the same function is about to create.
 _ASSEMBLY_ALLOWED: dict[str, str] = {
     "agent/cli.py": (
-        "_build_scheduler_service, _build_cli_context_manager, "
-        "_cli_session_header, _agent_core_for_components: all assemble or report "
+        "_build_cli_context_manager, _cli_session_header: both assemble or report "
         "on components rather than consuming a service during a turn."
+    ),
+    "agent/scheduler/build.py": (
+        "Relocated from cli.py, where it was already allowlisted under the same "
+        "reason: build_scheduler_service assembles a runtime for a scheduled run "
+        "and its executor reads that run's own components. Assembly is not "
+        "consumption -- there is no alternative implementation to substitute at "
+        "construction time, and resolving through a container there would raise "
+        "for services the same function is about to create."
+    ),
+    "agent/runtime/contracts.py": (
+        "agent_core_for_components: returns the AgentCore for a mapping, wrapping "
+        "it when none is present. It is the factory for that service, not a "
+        "consumer of it."
     ),
 }
 

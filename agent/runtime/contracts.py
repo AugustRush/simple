@@ -1084,3 +1084,17 @@ class AgentCore:
                 _active_signal_context.reset(signal_context_token)
             if active_sink_token is not None:
                 _active_sink.reset(active_sink_token)
+
+
+def agent_core_for_components(components: dict) -> "AgentCore":
+    """The ``AgentCore`` a set of components is run by.
+
+    An ``AgentCore`` already present is returned as-is, so two callers holding the same
+    mapping drive the same core rather than one apiece -- and one built here wraps the
+    mapping directly.  Relocated from ``cli.py``: the scheduler's run executor needs it,
+    and that executor is moving into ``agent/scheduler``, which must not import the CLI.
+    """
+    agent_core = components.get("agent_core")
+    if agent_core is None or isinstance(agent_core, AgentCore):
+        return AgentCore(RuntimeComponents(components))
+    return agent_core

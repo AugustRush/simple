@@ -70,7 +70,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         consumers=(
             "agent/_builtin/plugins/evolution/__init__.py",
             "agent/bootstrap.py",
-            "agent/cli.py",
+            "agent/scheduler/build.py",
             "agent/commands/builtin.py",
             "agent/plugins/catalog.py",
             "agent/runtime/contracts.py",
@@ -156,7 +156,7 @@ CORE_SERVICES: tuple[CoreService, ...] = (
         consumers=(
             "agent/bootstrap.py",
             "agent/channels/base.py",
-            "agent/cli.py",
+            "agent/runtime/contracts.py",
             "agent/commands/builtin.py",
         ),
         summary="The turn runner's owner: skill refresh, maintenance, session state.",

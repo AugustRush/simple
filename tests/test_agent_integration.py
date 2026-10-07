@@ -7367,6 +7367,7 @@ def test_memory_tidy_uses_force_tidy(monkeypatch):
 
 def test_evolve_uses_qualified_component_cleanup(monkeypatch):
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     calls = {"closed": 0}
 
@@ -7393,6 +7394,7 @@ def test_evolve_uses_qualified_component_cleanup(monkeypatch):
 
 def test_gateway_starts_background_scheduler(monkeypatch):
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     started = {"scheduler": 0, "stopped": 0, "runner": 0, "store_closed": 0, "sched_closed": 0}
 
@@ -7464,6 +7466,7 @@ def test_gateway_starts_background_scheduler(monkeypatch):
 
 def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     observed = {"primary": None, "scheduler": None}
 
@@ -7524,6 +7527,7 @@ def test_gateway_reuses_primary_components_for_scheduler(monkeypatch):
 
 def test_configure_runtime_logging_enables_interaction_loggers(monkeypatch):
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     calls = {}
 
@@ -8317,6 +8321,7 @@ def test_interactive_loop_does_not_auto_generate_tool_on_keyword_match(
 
     answers = iter(["Please explain how to generate a tool safely", "/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -8430,6 +8435,7 @@ def test_interactive_loop_routes_turn_through_runtime_runner(monkeypatch, tmp_pa
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
     answers = iter(["hello", "/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -8523,6 +8529,7 @@ def test_interactive_loop_delegates_turn_to_agent_core(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_module, "PROMPTS_DIR", prompts_dir)
     answers = iter(["hello", "/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -8583,6 +8590,7 @@ def test_interactive_loop_delegates_every_input_to_command_coordinator(
 
     answers = iter(["hello", "/help", "/unknown", "/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -8617,6 +8625,7 @@ def test_interactive_loop_wires_coordinator_cancel_token_to_sigint(
 ):
     import agent as agent_module
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     class Agent:
         api_format = "openai"
@@ -8647,6 +8656,7 @@ def test_interactive_loop_wires_coordinator_cancel_token_to_sigint(
 
     answers = iter(["hello", "/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -8710,6 +8720,7 @@ def test_interactive_loop_rejects_unknown_slash_before_agent_core(monkeypatch, t
 
     answers = iter(["/skill quality/review tighten", "/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -8738,6 +8749,7 @@ def test_interactive_loop_rejects_unknown_slash_before_agent_core(monkeypatch, t
 def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
     import agent as agent_module
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
     from agent.runtime import TurnResult
     from typer.testing import CliRunner
 
@@ -8793,6 +8805,7 @@ def test_chat_command_routes_turn_through_runtime_runner(monkeypatch):
 def test_chat_command_delegates_turn_to_agent_core(monkeypatch):
     import agent as agent_module
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
     from agent.runtime import TurnExecution, TurnResult
     from typer.testing import CliRunner
 
@@ -8850,6 +8863,7 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
     import types
 
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
     from agent.runtime import TurnResult
 
     class _ExplodingAgent:
@@ -8875,8 +8889,8 @@ def test_scheduler_agent_executor_routes_turn_through_runtime_runner(monkeypatch
     class _FakeStore:
         pass
 
-    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
-    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(scheduler_build, "SchedulerService", _FakeService)
+    monkeypatch.setattr(scheduler_build, "scheduler_store", lambda: _FakeStore())
 
     turn_runner = _FakeTurnRunner()
     components = {
@@ -8912,6 +8926,7 @@ def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_
     import types
 
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
     from agent.runtime import TurnExecution, TurnResult
 
     class _ExplodingAgent:
@@ -8936,8 +8951,8 @@ def test_scheduler_agent_executor_delegates_turn_to_agent_core(monkeypatch, tmp_
     class _FakeStore:
         pass
 
-    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
-    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(scheduler_build, "SchedulerService", _FakeService)
+    monkeypatch.setattr(scheduler_build, "scheduler_store", lambda: _FakeStore())
 
     agent_core = _FakeAgentCore()
     components = {
@@ -8989,6 +9004,7 @@ def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
 
     import agent as agent_module
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
     from agent.runtime import TurnExecution, TurnResult
 
     class _FakeService:
@@ -9024,8 +9040,8 @@ def test_scheduler_agent_executor_applies_read_only_profile_and_skill_preset(
     async def fake_close(components):
         captured["closed"].append(components)
 
-    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
-    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(scheduler_build, "SchedulerService", _FakeService)
+    monkeypatch.setattr(scheduler_build, "scheduler_store", lambda: _FakeStore())
     monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
     monkeypatch.setattr(agent_module, "_close_components", fake_close)
 
@@ -9093,6 +9109,7 @@ def test_scheduler_agent_executor_hands_the_run_its_upstream_results(
 
     import agent as agent_module
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
     from agent.runtime import TurnExecution, TurnResult
 
     class _FakeService:
@@ -9126,8 +9143,8 @@ def test_scheduler_agent_executor_hands_the_run_its_upstream_results(
     async def fake_close(components):
         return None
 
-    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
-    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(scheduler_build, "SchedulerService", _FakeService)
+    monkeypatch.setattr(scheduler_build, "scheduler_store", lambda: _FakeStore())
     monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
     monkeypatch.setattr(agent_module, "_close_components", fake_close)
 
@@ -9217,6 +9234,7 @@ def test_scheduler_agent_executor_grants_workspace_writes_and_states_the_envelop
 
     import agent as agent_module
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
     from agent.runtime import TurnExecution, TurnResult
 
     class _FakeService:
@@ -9252,8 +9270,8 @@ def test_scheduler_agent_executor_grants_workspace_writes_and_states_the_envelop
     async def fake_close(components):
         return None
 
-    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
-    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(scheduler_build, "SchedulerService", _FakeService)
+    monkeypatch.setattr(scheduler_build, "scheduler_store", lambda: _FakeStore())
     monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
     monkeypatch.setattr(agent_module, "_close_components", fake_close)
 
@@ -9310,12 +9328,13 @@ def test_scheduler_agent_executor_refuses_write_profile_without_a_workspace(
     import types
 
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     class _FakeService:
         def __init__(self, **kwargs):
             self.agent_executor = kwargs["agent_executor"]
 
-    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
+    monkeypatch.setattr(scheduler_build, "SchedulerService", _FakeService)
     monkeypatch.setattr(
         cli_module, "_scheduler_store", lambda: types.SimpleNamespace()
     )
@@ -9448,6 +9467,7 @@ def test_interactive_loop_context_command_uses_dynamic_category_stats(
 
     answers = iter(["/context", "/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -9592,6 +9612,7 @@ def test_interactive_loop_compaction_keeps_latest_system_prompt(monkeypatch, tmp
 
     answers = iter(["first task", "/evolve", "second task", "/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -9699,6 +9720,7 @@ def test_interactive_loop_queues_orphan_recovery_in_background(monkeypatch, tmp_
 
     answers = iter(["/quit"])
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
 
     async def _fake_input():
         return next(answers)
@@ -10415,6 +10437,7 @@ def test_a_scheduled_run_reads_the_config_on_disk_not_the_startup_snapshot(
 
     import agent as agent_module
     import agent.cli as cli_module
+    import agent.scheduler.build as scheduler_build
     from agent.runtime import TurnExecution, TurnResult
 
     class _FakeService:
@@ -10445,8 +10468,8 @@ def test_a_scheduled_run_reads_the_config_on_disk_not_the_startup_snapshot(
     async def fake_close(components):
         return None
 
-    monkeypatch.setattr(cli_module, "SchedulerService", _FakeService)
-    monkeypatch.setattr(cli_module, "_scheduler_store", lambda: _FakeStore())
+    monkeypatch.setattr(scheduler_build, "SchedulerService", _FakeService)
+    monkeypatch.setattr(scheduler_build, "scheduler_store", lambda: _FakeStore())
     monkeypatch.setattr(agent_module, "_build_components_async", fake_build)
     monkeypatch.setattr(agent_module, "_close_components", fake_close)
 

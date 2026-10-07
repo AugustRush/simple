@@ -260,11 +260,20 @@ def test_cli_can_actually_reach_the_resolution() -> None:
 
 
 def _builder_signature() -> ast.FunctionDef:
-    tree = ast.parse((REPO_ROOT / "agent" / "cli.py").read_text(encoding="utf-8"))
+    """The builder, now in its own module.
+
+    It moved out of ``cli.py`` (294 lines, of which six are construction and 107 are the
+    two per-run executors) so that the scheduler's run path does not have to import the
+    CLI.  The guards below followed it, because a guard that reads the wrong file passes
+    by finding nothing.
+    """
+    tree = ast.parse(
+        (REPO_ROOT / "agent" / "scheduler" / "build.py").read_text(encoding="utf-8")
+    )
     return next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_build_scheduler_service"
+        if isinstance(node, ast.FunctionDef) and node.name == "build_scheduler_service"
     )
 
 
@@ -325,7 +334,7 @@ def test_the_builder_requires_components_rather_than_building_them() -> None:
 
 def test_the_ownership_flag_is_gone_from_the_source() -> None:
     """Asserted on the name, because that is what would reappear."""
-    source = (REPO_ROOT / "agent" / "cli.py").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "agent" / "scheduler" / "build.py").read_text(encoding="utf-8")
     assert "owned_components" not in source, (
         "owned_components answered 'who closes these'; the scope answers it now"
     )
