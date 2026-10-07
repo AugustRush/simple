@@ -1,6 +1,5 @@
 """Plugin system exports."""
 
-from .context import PluginContext, PluginInstall
 from .catalog import (
     AgentPlugin,
     HookResult,
@@ -16,8 +15,6 @@ __all__ = [
     "AgentPlugin",
     "HookResult",
     "PluginCatalog",
-    "PluginContext",
-    "PluginInstall",
     "PluginMeta",
     "PostToolEvent",
     "PreToolEvent",

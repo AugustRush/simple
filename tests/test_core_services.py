@@ -1309,3 +1309,43 @@ def test_the_loop_body_lives_in_the_loop_module() -> None:
         "the loop and its teardown are one unit: the try/finally must be in the "
         "moved function, not left behind in the caller"
     )
+
+
+def test_the_superseded_plugin_interface_is_gone() -> None:
+    """One plugin interface, not two.
+
+    ``PluginContext`` and ``PluginInstall`` were the catalog's own context object.  A
+    plugin is handed the kernel's ``Context`` now, so they had no live caller -- but
+    they survived a whole phase: re-exported from ``agent/plugins/__init__.py``,
+    referenced by docstrings, and constructed by four tests that drove an API
+    (``ctx.on("turn", handler)``) which had been replaced by typed subscription.
+
+    That is the shape of a deletion that comes back: nothing fails while it lingers,
+    and a new plugin author reading the package's exports cannot tell which context
+    is the real one.  Asserted as an absence, on both the module and the export list.
+    """
+    assert not (REPO_ROOT / "agent/plugins/context.py").exists(), (
+        "agent/plugins/context.py is back; plugins are handed the kernel's Context"
+    )
+
+    init = (REPO_ROOT / "agent/plugins/__init__.py").read_text(encoding="utf-8")
+    for name in ("PluginContext", "PluginInstall"):
+        assert f'"{name}"' not in init, (
+            f"{name} is exported again; it is the superseded interface"
+        )
+
+    offenders = []
+    plugin_pkg = REPO_ROOT / "agent/plugins"
+    for path in sorted((REPO_ROOT / "agent").rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        text = path.read_text(encoding="utf-8")
+        # A mention in prose is fine -- several docstrings explain the history.  What
+        # would make it live again is an import, in either form.  The relative form is
+        # only this package's own module: ``agent/memory/context.py`` is a different
+        # file, and matching bare ``from .context import`` flagged three files there.
+        if "from agent.plugins.context import" in text:
+            offenders.append(str(path.relative_to(REPO_ROOT)))
+        elif "from .context import" in text and path.parent == plugin_pkg:
+            offenders.append(str(path.relative_to(REPO_ROOT)))
+    assert not offenders, f"the superseded context is imported again: {offenders}"
