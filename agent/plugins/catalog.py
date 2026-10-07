@@ -1397,27 +1397,20 @@ class PluginCatalog:
         self,
         plugin_name: str,
     ) -> None:
-        """Remove the catalog's remaining per-plugin state.
+        """Remove what the catalog knows about a plugin that is not a contribution.
 
-        The unload path's asset half.  Slash commands are **not** here any more:
-        each registration recorded its own removal on the contributing plugin's scope,
-        so disposing that scope takes them back.  Filtering by owner as well would be a
-        second mechanism for one thing, which is how the two come to disagree.
+        Every contribution a plugin makes -- a service, a command, a skill root, an MCP
+        config, an agent definition, a tool -- recorded its own removal on that
+        plugin's scope, so disposing the scope is what takes them back.  Filtering the
+        lists by plugin name as well would be a *second* mechanism for one thing, and
+        two mechanisms are how they come to disagree: one removes what the other
+        forgot, silently, until a change makes their difference visible.
 
-        The three below are still name-tagged lists rather than scope-owned, so they
-        are still filtered here.  They are the next ones to move.
+        What is left is discovery metadata: which directory the plugin came from and
+        the record that it was loaded.  Those are the catalog's own bookkeeping about
+        a plugin rather than the plugin's contributions, so nothing owns their removal
+        but the catalog.
         """
-        self._bundled_skills = [
-            item for item in self._bundled_skills if item[0] != plugin_name
-        ]
-        self._bundled_mcp = [
-            item for item in self._bundled_mcp if item[0] != plugin_name
-        ]
-        self._agent_defs = {
-            key: value
-            for key, value in self._agent_defs.items()
-            if value.get("plugin") != plugin_name
-        }
         self._plugin_source_dirs.pop(plugin_name, None)
         self._plugins.pop(plugin_name, None)
 

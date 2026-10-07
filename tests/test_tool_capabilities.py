@@ -30,12 +30,7 @@ here.
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from agent.kernel.plugin import PluginHost
 from agent.tools.runtime import ToolRegistry
@@ -385,3 +380,81 @@ def test_the_catalog_can_be_the_loader_for_declarative_commands() -> None:
             assert not catalog._commands.has("p:review")
         finally:
             catalog.close()
+
+
+# ── Every contribution is scope-owned, not name-filtered ─────────────────────
+
+
+def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
+    """Not by filtering lists on a name -- by the scope the contributions recorded on.
+
+    ``_remove_plugin_owned_state`` used to filter skills, MCP configs and agent
+    definitions by plugin name, and the slash commands and tools before that.  Those
+    filters were removed once each contribution recorded its own removal, and this is
+    what says the removal actually covers them: without it, a filter that stopped
+    matching and a scope that never recorded anything would look the same, and the
+    symptom would be a plugin whose assets outlive it.
+
+    One plugin, all five kinds, one unload.
+    """
+    import textwrap
+
+    from agent.plugins.catalog import PluginCatalog
+
+    root = tmp_path / "plugins"
+    plugin = root / "contrib"
+    (plugin / "skills").mkdir(parents=True)
+    (plugin / "agents").mkdir()
+    (plugin / "agents" / "auditor.md").write_text(
+        "---\nname: auditor\n---\nbody\n", encoding="utf-8"
+    )
+    (plugin / "plugin.json").write_text(
+        '{"name": "contrib", "mcpServers": [{"name": "contrib-mcp", "command": "true"}]}',
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text(textwrap.dedent('''
+        class _T:
+            name = "contrib_tool"
+            description = "a tool"
+            parameters = {"type": "object", "properties": {}}
+            def fn(self, **kw):
+                return "ok"
+
+        def register():
+            class P:
+                name = "contrib"
+                def setup(self, ctx):
+                    ctx.assets.add_slash_command("contrib_cmd", lambda **kw: "ok")
+                    ctx.assets.add_tool(_T())
+            return P()
+    '''), encoding="utf-8")
+
+    catalog = PluginCatalog(builtin_dir=root)
+    registry = ToolRegistry()
+    catalog._tool_registry = registry
+    try:
+        assert catalog.discover_and_load() == ["contrib"]
+
+        # Everything the plugin contributed is present.
+        assert catalog._commands.has("contrib_cmd")
+        assert "contrib_tool" in registry.list_tools()
+        assert any(name == "plugin:contrib:auditor" for name in catalog._agent_defs)
+        assert catalog.get_bundled_skills(), "the skills root was registered"
+        assert catalog.get_bundled_mcp(), "the mcp config was registered"
+
+        catalog.unload_plugin("contrib")
+
+        # And every one of them is gone, without anything having filtered by name.
+        assert not catalog._commands.has("contrib_cmd"), "the slash command"
+        assert "contrib_tool" not in registry.list_tools(), "the tool"
+        assert not any(
+            name == "plugin:contrib:auditor" for name in catalog._agent_defs
+        ), "the agent definition"
+        assert not [
+            entry for entry in catalog.get_bundled_skills() if entry[0] == "contrib"
+        ], "the skills root"
+        assert not [
+            entry for entry in catalog.get_bundled_mcp() if entry[0] == "contrib"
+        ], "the mcp config"
+    finally:
+        catalog.close()
