@@ -705,6 +705,36 @@ in its own file, and the failure is in process-group signal handling, which this
 not touch.  Recorded here rather than silently ignored, because a baseline that is compared
 by diff has to say when it was seen once.
 
+## The built-in tool set is a plugin
+
+`BuiltinTools` was the largest implementation in the project and the last thing `bootstrap`
+constructed **directly** -- `builtin_tools_cls(memory, registry, ...)` at the composition
+root -- so every tool it registered lived for the life of the process.  It is now
+`agent/tools/plugin.py`, mounted like the rest.
+
+Measured after the move, because a plugin whose effect is registrations is only a plugin if
+the registrations are undoable:
+
+```
+load ToolsPlugin()      -> 44 tools, source='builtin', capabilities('read_file') = {'read'}
+unload('tools')         -> 0 tools
+```
+
+**Two things had to be true for that, and both were already-found bugs of the same shape.**
+
+1. **`ScopedTools` was still "almost a registry".**  It refused `authorizer=` (which
+   `BuiltinTools` passes for file mutations) -- the second time this happened, after
+   `source=`.  Rather than add the third keyword when it arrives, the view now forwards the
+   registry's whole keyword set, and `tests/test_tool_capabilities.py` **compares the two
+   signatures**: a new parameter on `ToolRegistry.register` fails that test rather than
+   loading a plugin that then cannot register.
+
+2. **`get_context` had to be forwarded, read-only.**  Tool implementations take the registry
+   and read the composition's shared context (`output_dir`, `file_access_policy`, ...).
+   `set_context` is deliberately **not** forwarded: it is how the composition configures the
+   process, and a view that forwarded writes would make "one plugin's handle" a way to reach
+   into every other plugin.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

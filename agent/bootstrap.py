@@ -33,6 +33,7 @@ from agent.plugins.catalog import PluginCatalog
 from agent.channels.registry import ChannelRegistry
 from agent.memory.plugin import MemoryPlugin
 from agent.core.agent_plugin import AgentPlugin
+from agent.tools.plugin import ToolsPlugin
 from agent.memory.session_plugin import SessionPlugin
 from agent.ralph.plugin import RalphPlugin
 from agent.runtime.factory import RuntimeFactory
@@ -715,23 +716,14 @@ async def _build_components_async(
     # Handed the class, so this composition still decides which one runs: the name below
     # is the module-level `BaseAgent`, which is what a substitution replaces.
     plugin_catalog.mount(AgentPlugin(BaseAgent))
+    # After the three above: it injects `memory`, `context_manager` and the rest.  The
+    # built-in tool set used to be constructed here directly, which made every tool it
+    # registers permanent for the life of the process.
+    plugin_catalog.mount(ToolsPlugin(builtin_tools_cls))
     # Resolved, not built: the agent is a plugin's now.  This call is the composition
     # teaching it about the spawn capability, which is composition knowledge.
     require_service(components, "agent").register_spawn_capability(
         system_prompt, workspace_root=workspace_root
-    )
-
-
-    builtin_tools_cls(
-        require_service(components, "memory"),
-        registry,
-        context_manager=require_service(components, "context_manager"),
-        workspace_root=workspace_root,
-        chapter_normalizer=lambda chapter: normalize_memory_chapter(
-            chapter, legacy_memory_aliases
-        ),
-        output_dir=output_dir,
-        file_service=file_service,
     )
 
     # Share output_dir with skills via registry context

@@ -68,6 +68,7 @@ class ScopedTools:
         capabilities: Any = None,
         replace: bool = True,
         source: str | None = None,
+        authorizer: Callable[..., Any] | None = None,
     ) -> str:
         """Contribute a tool, removed when this plugin unloads.
 
@@ -121,6 +122,12 @@ class ScopedTools:
                 "name=<str>"
             )
 
+        # The registry's **whole** keyword set, forwarded.  A view that accepts most of
+        # it is a view that fails the first time somebody hands it a call written against
+        # the registry -- which has now happened twice (`source`, then `authorizer`), each
+        # time discovered by a plugin failing to load rather than by a test.  The guard in
+        # `tests/test_tool_capabilities.py` compares the two signatures so the third one is
+        # a test failure instead.
         self._registry.register(
             name,
             description or "",
@@ -129,6 +136,7 @@ class ScopedTools:
             source=source or self.owner,
             capabilities=capabilities,
             replace=replace,
+            authorizer=authorizer,
         )
         # By source prefix rather than by name: one plugin may contribute several tools,
         # and the prefix is what identifies them as a group.  An explicit `source` is that
@@ -139,6 +147,21 @@ class ScopedTools:
         return name
 
     # -- reading -------------------------------------------------------------
+
+    def get_context(self, key: str, default: Any = None) -> Any:
+        """Read the registry's shared context, through the view.
+
+        Forwarded because tool *implementations* take the registry and read this:
+        ``BuiltinTools`` calls ``self.registry.get_context("output_dir")`` and four more
+        like it, so a view without this is not a registry and the built-in tool set cannot
+        be handed one -- which is what stopped the tool set from being a plugin.
+
+        **Reads, not writes.**  ``set_context`` is deliberately absent: it is how the
+        *composition* configures the process (``output_dir``, ``file_access_policy``), and
+        a plugin changing it would change it for every other plugin.  A view that forwarded
+        writes would make "one plugin's handle" a way to reach into everyone else's.
+        """
+        return self._registry.get_context(key, default)
 
     def names(self) -> tuple[str, ...]:
         """The tools this plugin contributed."""

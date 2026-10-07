@@ -606,3 +606,75 @@ def test_a_scoped_view_still_takes_a_tool_object() -> None:
 
     assert "create_issue" in registry.list_tools()
     assert registry._tools["create_issue"].source == "plugin:github"
+
+
+def test_the_scoped_view_accepts_every_keyword_the_registry_does() -> None:
+    """The structural fix for a bug that arrived twice.
+
+    `ScopedTools.register` stands where `ToolRegistry.register` stands.  Twice now it was
+    *almost* that: it refused `source=` (which the agent's `spawn_agent` passes) and then
+    `authorizer=` (which `BuiltinTools` passes for file mutations), and both times the
+    symptom was a plugin failing to load rather than a test failing.
+
+    So the requirement is stated as a comparison instead of a list: every keyword the
+    registry accepts, the view accepts.  A new parameter on the registry now fails **here**,
+    which is the moment to decide what the view should do with it -- rather than in whatever
+    plugin happens to be holding a view when somebody calls it.
+    """
+    import inspect
+
+    from agent.tools.runtime import ToolRegistry
+    from agent.tools.scoped import ScopedTools
+
+    registry_params = inspect.signature(ToolRegistry.register).parameters
+    view_params = inspect.signature(ScopedTools.register).parameters
+
+    registry_keywords = {
+        name
+        for name, param in registry_params.items()
+        if name != "self" and param.kind is not inspect.Parameter.POSITIONAL_OR_KEYWORD
+    } | {
+        name
+        for name, param in registry_params.items()
+        if param.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+    view_keywords = {
+        name
+        for name, param in view_params.items()
+        if param.kind is inspect.Parameter.KEYWORD_ONLY
+    }
+
+    missing = sorted(registry_keywords - view_keywords)
+    assert not missing, (
+        f"the scoped view does not accept {missing}, which the registry does; a call "
+        "written against the registry would fail when handed a view"
+    )
+
+
+def test_the_view_forwards_the_authorizer_it_was_given() -> None:
+    """Control for the comparison above: accepting a keyword is not the same as using it.
+
+    An accepted-and-dropped `authorizer` would look identical from the signature and would
+    silently disable the file-mutation gate.
+    """
+    from agent.tools.runtime import ToolRegistry
+    from agent.tools.scoped import ScopedTools
+
+    registry = ToolRegistry()
+    view = _scoped_view(registry)
+    seen: list = []
+
+    def authorizer(call, reg):
+        seen.append(call)
+        return None
+
+    view.register(
+        "write_file",
+        "Write one.",
+        {"type": "object", "properties": {}},
+        lambda **_: "ok",
+        authorizer=authorizer,
+    )
+
+    tool = registry._tools["write_file"]
+    assert tool.authorizer is authorizer
