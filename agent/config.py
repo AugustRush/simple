@@ -1465,3 +1465,46 @@ async def _close_components(components: dict) -> None:
     plugin_catalog = resolve(components, "plugin_catalog")
     if plugin_catalog is not None and hasattr(plugin_catalog, "close"):
         plugin_catalog.close()
+
+
+def active_context_window(cfg: dict) -> int | None:
+    """Resolve the active provider's configured context window."""
+    providers = cfg.get("providers", {})
+    active_name = cfg.get("active_provider", "anthropic")
+    provider_cfg = (
+        providers.get(active_name, {}) if isinstance(providers, dict) else {}
+    )
+    raw = cfg.get("context_window") or provider_cfg.get("context_window")
+    return int(raw) if raw is not None else None
+
+
+def active_output_reserve(cfg: dict) -> int:
+    """Resolve how much of the window to hold back for the answer."""
+    providers = cfg.get("providers", {})
+    active_name = cfg.get("active_provider", "anthropic")
+    provider_cfg = (
+        providers.get(active_name, {}) if isinstance(providers, dict) else {}
+    )
+    raw = cfg.get("output_reserve") or provider_cfg.get("output_reserve")
+    if raw is None:
+        return shared.DEFAULT_OUTPUT_RESERVE
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return shared.DEFAULT_OUTPUT_RESERVE
+
+
+def bounded_int(
+    value: object,
+    *,
+    default: int,
+    min_value: int,
+    max_value: int,
+) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(max(parsed, min_value), max_value)

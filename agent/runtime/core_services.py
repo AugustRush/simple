@@ -121,6 +121,9 @@ CORE_SERVICES: tuple[CoreService, ...] = (
     CoreService(
         name="agent",
         owners=(
+            "agent/core/agent_plugin.py",
+            # A session builds its own agent, from the config on disk -- that is what a
+            # rebuild is for -- so `bootstrap` writes this name too.
             "agent/bootstrap.py",
         ),
         consumers=(

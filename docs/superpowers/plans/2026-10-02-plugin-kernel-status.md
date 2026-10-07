@@ -18,7 +18,7 @@ changed the interface on purpose" and "I broke it" have to stay distinguishable.
 | 0 Baseline | done | 3 accepted failures, byte-identical across every commit; see `2026-10-01-baseline-failures.txt` |
 | 1 Plugin Kernel | **done** | `agent/kernel/` — Context / Plugin / Service / Event / Scope / Lifecycle, 53 tests in `tests/test_kernel.py` |
 | 2 Service Injection | **done** | ToolRegistry ✅ `registry`, Session ✅ `context_manager`, Model ✅ `llm` |
-| 3 Agent Loop Plugin | **done** | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
+| 3 Agent Loop Plugin | **done** -- and `agent` itself is now a plugin | `agent_loop` is a plugin with declared `inject`; the loop **body** is in `agent/core/turn_loop.py`. `BaseAgent` keeps the facades tests reach |
 | 4 Capability Layer | **done** | tools / commands / sub-agent roles are each a service with `scoped(ctx)`; `PluginAssets` -- a contribution service no plugin called -- was deleted |
 | 5 Execution Plugins | **2 of 4 done, 2 have no separable boundary** | Ralph ✅ and Scheduler ✅ mounted as plugins; Orchestration / Workflow measured, see below |
 | -- Memory | **done** | `agent/memory/plugin.py` provides `ltm_store` and `memory`; the ordering chain that blocked it is gone |
@@ -570,48 +570,32 @@ provides one, so the process-wide one is what `AgentPlugin` would own, and the s
 keeps building its own -- which is right, because a session's agent is not a
 composition-time thing.
 
-## Open: `AgentPlugin` -- attempted, reverted, and what it hit
+## `AgentPlugin` -- done
 
-The move was written and **reverted**, not because the design is wrong but because the
-last three failures were not diagnosed within the round.  What it established is worth
-keeping, because the next attempt starts here.
+`agent/core/agent_plugin.py` provides `agent`.  It was attempted once and reverted because
+three failures were not understood; the next round understood them, and all three were
+consequences of the move rather than objections to it:
 
-**What works.**  The plugin builds the agent and wires it:
+- **`supports_vision` came back undefined** because the plugin imported `BaseAgent` at
+  module load, so the tests' patch of `bootstrap.BaseAgent` no longer decided anything.
+  The plugin now **takes the class as an argument** and `bootstrap` hands it its own
+  module-level name -- so the substitution point that existed before still exists, which
+  matters beyond tests: "which agent" is a decision the composition is supposed to make.
+- **The session rebuild test saw `model is None`** because a blanket removal of
+  `"agent": agent` from the composition root took the *session's* entry with it: the global
+  one had to go and this one has the same text.  Restored, and it belongs: a session builds
+  its own agent against the config on disk.
+- **The ledger and the closed-set table** disagreed, and the honest answer was that
+  `agent` has **two writers** -- the plugin for the process, `bootstrap` for a session.
+  The ledger's `owners` carries both, and the key stays in `_COMPONENT_KEYS` rather than
+  moving to `_PLUGIN_PROVIDED`, which means "not written by the composition at all".
 
-    inject = ("cfg", "client", "registry", "model", "max_tokens", "api_format",
-              "llm", "context_manager", "plugin_catalog")
-
-Every tuning value is `cfg` with a `shared.*` default, and the three derived constructor
-arguments are pure functions of `cfg`.  The plugin was verified in isolation: it activates,
-provides a `BaseAgent`, and reports no error.
-
-**Four things had to move with it, and each was a real blocker:**
-
-1. `project_memory_scope` -- `bootstrap` local, needed by `SessionPlugin` (done).
-2. `active_context_window`, `active_output_reserve`, `bounded_int` -- `bootstrap` locals,
-   needed by the agent's construction.  Pure functions of one config; they belong in
-   `agent/config.py` beside `provider_supports_vision`.
-3. `max_tokens` -- the composition computes it before the mount but **added it to the
-   mapping after**.  The plugin waited on it and stayed pending.  It belongs in the literal.
-4. `register_spawn_capability` -- called **above** the mount, so it resolved `agent` before
-   anything provided it.  It has to be called on the resolved agent, below.
-
-**The finding worth the round on its own**: `ctx.get("registry")` returns a
-**`ScopedTools` view**, not the registry -- correct per Phase 4, and it broke the agent,
-which registers with `register(name, description, parameters, fn, source=...)`.  The view
-accepted only a tool object.  It now accepts **both conventions** and honours an explicit
-`source`, because a caller that already has one is registering at run time rather than
-contributing -- `spawn_agent` carries `runtime:spawn` so the runtime's tools can be removed
-by prefix, and overwriting that with the plugin's name would silently re-tag it.
-
-**What was left**, with the failures measured:
-
-- `KeyError: 'supports_vision'` -- the closed-set scan expects that key in the mapping and
-  the scan's anchors also broke (`test_the_component_scan_finds_the_mappings`).
-- `assert None == 'glm-5.3-flash'` -- the session rebuild test: a session agent's model
-  came back `None`.  Not diagnosed.
-
-Neither is understood, and a regression whose cause is not understood is not committed.
+Four things had to move with it: `project_memory_scope`, `active_context_window`,
+`active_output_reserve` and `bounded_int` out of `bootstrap` (a plugin cannot import the
+composition root, and all four were already pure functions of one config or one path);
+`max_tokens` into the mapping *literal* rather than the post-mount update, because the
+plugin waited on it; and `register_spawn_capability` below the mounts, because it resolves
+the agent.
 
 ## Next step, in order
 

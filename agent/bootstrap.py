@@ -16,6 +16,9 @@ from agent.config import (
     _compose_system_prompt,
     _load_system_prompt,
     _resolve_output_dir,
+    active_context_window,
+    active_output_reserve,
+    bounded_int,
     provider_supports_vision,
 )
 from agent.commands import (
@@ -29,6 +32,7 @@ from agent.memory.system import ConsolidationEngine, ContextManager, FactAsserti
 from agent.plugins.catalog import PluginCatalog
 from agent.channels.registry import ChannelRegistry
 from agent.memory.plugin import MemoryPlugin
+from agent.core.agent_plugin import AgentPlugin
 from agent.memory.session_plugin import SessionPlugin
 from agent.ralph.plugin import RalphPlugin
 from agent.runtime.factory import RuntimeFactory
@@ -46,33 +50,6 @@ from agent.pathing import project_memory_scope
 
 BaseAgent = agent_module.BaseAgent
 EvolutionEngine = agent_module.EvolutionEngine
-
-
-def _active_context_window(cfg: dict) -> int | None:
-    """Resolve the active provider's configured context window."""
-    providers = cfg.get("providers", {})
-    active_name = cfg.get("active_provider", "anthropic")
-    provider_cfg = (
-        providers.get(active_name, {}) if isinstance(providers, dict) else {}
-    )
-    raw = cfg.get("context_window") or provider_cfg.get("context_window")
-    return int(raw) if raw is not None else None
-
-
-def _active_output_reserve(cfg: dict) -> int:
-    """Resolve how much of the window to hold back for the answer."""
-    providers = cfg.get("providers", {})
-    active_name = cfg.get("active_provider", "anthropic")
-    provider_cfg = (
-        providers.get(active_name, {}) if isinstance(providers, dict) else {}
-    )
-    raw = cfg.get("output_reserve") or provider_cfg.get("output_reserve")
-    if raw is None:
-        return shared.DEFAULT_OUTPUT_RESERVE
-    try:
-        return max(1, int(raw))
-    except (TypeError, ValueError):
-        return shared.DEFAULT_OUTPUT_RESERVE
 
 
 def _reserve_input_context(
@@ -297,8 +274,8 @@ async def _build_web_session_components(
     session_model, session_max_tokens = ModelClientFactory.active_model_and_tokens(
         session_cfg
     )
-    session_context_window = _active_context_window(session_cfg)
-    session_output_reserve = _active_output_reserve(session_cfg)
+    session_context_window = active_context_window(session_cfg)
+    session_output_reserve = active_output_reserve(session_cfg)
     session_max_tokens = _reserve_input_context(
         session_max_tokens, session_context_window, reserve=session_output_reserve
     )
@@ -371,6 +348,10 @@ async def _build_web_session_components(
             "client_provider": session_provider,
             "max_tokens": session_max_tokens,
             "registry": registry,
+            # The session's own agent -- built just above from the config on disk, which
+            # is the whole point of a rebuild.  A blanket removal of `"agent": agent` from
+            # this file took this line with it, because the global one had to go and this
+            # one has the same text.
             "agent": agent,
             "system_prompt": system_prompt,
             "workspace_root": workspace_root,
@@ -390,22 +371,6 @@ async def _build_web_session_components(
     if _session_mcp is not None:
         registry.set_context("mcp_client", _session_mcp)
     return session_components
-
-
-def _bounded_int(
-    value: object,
-    *,
-    default: int,
-    min_value: int,
-    max_value: int,
-) -> int:
-    if isinstance(value, bool):
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return min(max(parsed, min_value), max_value)
 
 
 def _empty_mcp_status(configured_servers: int = 0) -> dict[str, int]:
@@ -507,8 +472,8 @@ async def _build_components_async(
     client_provider = str(cfg.get("active_provider") or "")
 
     providers = cfg.get("providers", {})
-    context_window = _active_context_window(cfg)
-    output_reserve = _active_output_reserve(cfg)
+    context_window = active_context_window(cfg)
+    output_reserve = active_output_reserve(cfg)
     max_tokens = _reserve_input_context(
         max_tokens, context_window, reserve=output_reserve, announce=announce
     )
@@ -665,6 +630,7 @@ async def _build_components_async(
         "model": model,
         "api_format": api_format,
         "registry": registry,
+        "max_tokens": max_tokens,
         "skill_catalog": skill_catalog,
         "user_tool_catalog": user_tool_catalog,
         "output_dir": output_dir,
@@ -676,81 +642,6 @@ async def _build_components_async(
         "cfg": cfg,
     }
     components = _partial_components
-    agent = BaseAgent(
-        client,
-        registry,
-        model=model,
-        max_tokens=max_tokens,
-        api_format=api_format,
-        supports_vision=supports_vision,
-        context_window=context_window,
-        output_reserve=output_reserve,
-        transport=routing_transport,
-        # One name, not the whole mapping: this is what the agent resolves by name.
-        services={'llm': routing_transport},
-    )
-    agent.max_parallel_agents = max(
-        1,
-        int(orch_cfg.get("max_parallel_agents", shared.DEFAULT_MAX_PARALLEL_AGENTS)),
-    )
-    agent.sub_agent_timeout_seconds = max(
-        1,
-        int(
-            orch_cfg.get("sub_agent_timeout_seconds", shared.DEFAULT_SUB_AGENT_TIMEOUT_SECONDS)
-        ),
-    )
-    agent.sub_agent_retries = max(
-        0,
-        int(orch_cfg.get("sub_agent_retries", shared.DEFAULT_SUB_AGENT_RETRIES)),
-    )
-    # Bounds total sub-agents per turn, not concurrency.  0 means "derive from
-    # max_parallel_agents".
-    agent.max_agents_per_turn = max(
-        0,
-        int(orch_cfg.get("max_agents_per_turn", 0)),
-    )
-    # `max_steps` is the preferred spelling; `max_tool_call_iterations` stays
-    # accepted because it is a published config key and dropping it would
-    # break existing configs.  Both name the same bound: the number of steps
-    # (model request + its tools) allowed in one turn.
-    agent.max_tool_call_iterations = _bounded_int(
-        cfg.get(
-            "max_steps",
-            cfg.get("max_tool_call_iterations", shared.MAX_TOOL_CALL_ITERATIONS),
-        ),
-        default=shared.MAX_TOOL_CALL_ITERATIONS,
-        min_value=1,
-        max_value=shared.MAX_CONFIGURABLE_TOOL_CALL_ITERATIONS,
-    )
-    agent.max_truncation_continuations = _bounded_int(
-        cfg.get(
-            "max_truncation_continuations",
-            shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
-        ),
-        default=shared.DEFAULT_MAX_TRUNCATION_CONTINUATIONS,
-        min_value=0,
-        max_value=shared.MAX_CONFIGURABLE_TRUNCATION_CONTINUATIONS,
-    )
-    agent.llm_max_retries = max(
-        0,
-        int(cfg.get("llm_max_retries", shared.DEFAULT_LLM_MAX_RETRIES)),
-    )
-    agent.llm_retry_base_delay = max(
-        0.1,
-        float(cfg.get("llm_retry_base_delay", shared.DEFAULT_LLM_RETRY_BASE_DELAY)),
-    )
-    agent.result_content_max_chars = min(
-        shared.MAX_RESULT_CONTENT_CHARS,
-        max(
-            shared.MIN_RESULT_CONTENT_CHARS,
-            int(
-                orch_cfg.get(
-                    "result_content_max_chars",
-                    shared.DEFAULT_RESULT_CONTENT_MAX_CHARS,
-                )
-            ),
-        ),
-    )
     user_tools_cfg = cfg.get("user_tools", {})
     user_tools_enabled = (
         bool(user_tools_cfg.get("enabled", False))
@@ -777,7 +668,6 @@ async def _build_components_async(
                 "[dim]No approved user tools; create one with create_tool, or set "
                 "user_tools.enabled=true to load every ~/.agent/tools/*.py[/dim]"
             )
-    agent.register_spawn_capability(system_prompt, workspace_root=workspace_root)
     base_system_prompt = system_prompt
 
     # No EvolutionEngine here any more.  The plugin builds the one it uses, reading the
@@ -820,6 +710,16 @@ async def _build_components_async(
     plugin_catalog.mount(MemoryPlugin())
     # After Memory: it injects `ltm_store`.
     plugin_catalog.mount(SessionPlugin())
+    # Last of the three composition-owned plugins: it injects `context_manager`
+    # and `plugin_catalog`, both provided by the time this runs.
+    # Handed the class, so this composition still decides which one runs: the name below
+    # is the module-level `BaseAgent`, which is what a substitution replaces.
+    plugin_catalog.mount(AgentPlugin(BaseAgent))
+    # Resolved, not built: the agent is a plugin's now.  This call is the composition
+    # teaching it about the spawn capability, which is composition knowledge.
+    require_service(components, "agent").register_spawn_capability(
+        system_prompt, workspace_root=workspace_root
+    )
 
 
     builtin_tools_cls(
@@ -889,7 +789,6 @@ async def _build_components_async(
     if bundled_mcp and mcp_client is None:
         mcp_client = mcp_client_cls(registry)
 
-    agent.plugin_catalog = plugin_catalog
 
     # Compose system prompt now that plugins are loaded (they may append rules).
     system_prompt = _compose_system_prompt(
@@ -900,7 +799,6 @@ async def _build_components_async(
         skill_catalog=skill_catalog,
         plugin_catalog=plugin_catalog,
     )
-    agent.context_manager = require_service(components, "context_manager")
 
     # Updated **in place** rather than copied into a new dict.  The plugin catalog's
     # kernel adopts this mapping as its service storage, so a copy would leave two
@@ -909,10 +807,8 @@ async def _build_components_async(
     # invisible to a plugin's ``inject``, and the "one namespace" the container is
     # for would be true only of the entries that happened to exist earlier.
     _partial_components.update({
-        "max_tokens": max_tokens,
         "base_system_prompt": base_system_prompt,
         "system_prompt": system_prompt,
-        "agent": agent,
         "plugin_catalog": plugin_catalog,
         "mcp_client": mcp_client,
         "mcp_status": mcp_status,

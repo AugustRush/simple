@@ -697,7 +697,11 @@ def test_the_vocabulary_covers_agent_itself() -> None:
     names = set(core_service_names())
     assert "agent" in names
     entry = entry_for("agent")
-    assert entry.owners == ("agent/bootstrap.py",)
+    # The construction moved into `AgentPlugin`, so the owner moved with it -- and
+    # `bootstrap` became a *consumer*, which is the shape this whole refactor is for: the
+    # composition resolves the agent rather than assembling it.
+    assert entry.owners == ("agent/core/agent_plugin.py", "agent/bootstrap.py")
+    assert "agent/commands/builtin.py" in entry.consumers
     assert "agent/commands/builtin.py" in entry.consumers
 
 
@@ -1424,6 +1428,10 @@ def test_the_superseded_plugin_interface_is_gone() -> None:
 #: which is where the question "who reads it" gets asked by a person.
 _COMPONENT_KEYS: dict[str, str] = {
     # identity and model
+    # Two writers, which is why this key is *not* in `_PLUGIN_PROVIDED` below:
+    # `AgentPlugin` provides the process-wide agent, and a session builds its own against
+    # the config on disk -- that is what a rebuild is for.  The ledger's `owners` carries
+    # both; this table describes the key.
     "agent": "the agent a turn runs on",
     "agent_core": "the command coordinator's core",
     "base_system_prompt": "the head of the system prompt",
@@ -1580,7 +1588,10 @@ def test_the_component_scan_finds_the_mappings() -> None:
     keys = _component_mapping_keys()
     assert len(keys) >= 28, f"the scan found too few keys: {sorted(keys)}"
     # Named keys, from each of the two write forms.
-    for expected in ("agent", "registry", "cfg", "max_tokens"):
+    # Names written into a mapping *literal* by the composition.  `agent` was one of them
+    # and is not any more: `AgentPlugin` provides it, which the `ctx.provide` half of the
+    # scan covers -- asserting it here would be asserting the old shape.
+    for expected in ("registry", "cfg", "max_tokens", "llm"):
         assert expected in keys, f"{expected} is written by bootstrap; scan missed it"
 
 
