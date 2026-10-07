@@ -976,3 +976,53 @@ def test_loop_deps_can_be_built_from_a_real_agent() -> None:
 
     with pytest.raises(FrozenInstanceError):
         deps.max_tokens = 1  # type: ignore[misc]
+
+
+def test_the_turn_context_helpers_are_defined_once() -> None:
+    """The loop needs these, and importing them from ``agent.py`` would be a cycle.
+
+    ``agent`` imports the turn loop, so the loop cannot import the active-context
+    helpers back from it.  They live lower now, and ``agent.py`` re-exports them
+    under their old private names so the twelve call sites across tools, security
+    and the scheduler did not have to change.
+
+    Asserted as an absence on ``agent.py``, because the failure mode is a *second*
+    definition left behind: ``agent.py``'s own copy would shadow the import, the
+    module-level ``ContextVar`` would become two different variables, and the
+    symptom would be "the agent context is sometimes None" -- which reads as a
+    concurrency bug rather than a duplicate definition.
+    """
+    agent_tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    defined = {
+        node.name
+        for node in ast.walk(agent_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name in ("_active_agent_id", "_schedule_domain_event", "_emit_domain_event"):
+        assert name not in defined, (
+            f"{name} is defined in agent/core/agent.py as well as in "
+            f"agent/core/turn_context.py; the local definition shadows the import"
+        )
+    assigned = {
+        target.id
+        for node in ast.walk(agent_tree)
+        if isinstance(node, (ast.Assign, ast.AnnAssign))
+        for target in (
+            node.targets if isinstance(node, ast.Assign) else [node.target]
+        )
+        if isinstance(target, ast.Name)
+    }
+    assert "_active_agent_context" not in assigned, (
+        "a second ContextVar of that name would shadow the one the tools read"
+    )
+
+
+def test_the_turn_context_module_owns_the_contextvar() -> None:
+    """And it is the module the rest of the codebase resolves it from."""
+    from agent.core import turn_context
+    from agent.core.agent import _active_agent_context
+
+    assert _active_agent_context is turn_context.active_agent_context, (
+        "the re-export must be the same object, not a copy: two ContextVars with "
+        "one name is the failure this move was supposed to make impossible"
+    )

@@ -98,6 +98,12 @@ from agent.pathing import canonicalize_user_path, resolve_workspace_path
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
 from agent.core.interjections import inject_pending_interjections
+from agent.core.turn_context import (
+    active_agent_context as _active_agent_context,
+    active_agent_id as _active_agent_id,
+    emit_domain_event as _emit_domain_event,
+    schedule_domain_event as _schedule_domain_event,
+)
 from agent.core.turn_loop import assistant_message, tool_result_messages
 from agent.runtime.services import resolve
 from agent.tools.executor import RegularToolExecutor
@@ -140,9 +146,6 @@ _TURN_IN_PROGRESS_KEY = "_turn_in_progress"
 _TURN_REQUEST_KEY = "_turn_request_message"
 
 # Context variable so built-in tools can access the active AgentContext
-_active_agent_context: contextvars.ContextVar[Optional["AgentContext"]] = (
-    contextvars.ContextVar("active_agent_context", default=None)
-)
 _active_orchestration_runs: contextvars.ContextVar[Optional[list[dict[str, Any]]]] = (
     contextvars.ContextVar("active_orchestration_runs", default=None)
 )
@@ -199,45 +202,10 @@ def _emit_event(name: str, **fields: object) -> None:
         collector.emit(name, **fields)
 
 
-def _active_agent_id() -> str:
-    """The agent id of the turn in flight, or a marker when there is none.
-
-    The model-call path can run outside a turn -- a continuation, a probe -- and
-    ``"unknown"`` is honest where inventing an id would make two unrelated calls
-    look like one agent's.
-    """
-    ctx = _active_agent_context.get()
-    return str(getattr(ctx, "agent_id", "") or "unknown")
 
 
-def _schedule_domain_event(bus: Any, event_type: type, **fields: object) -> None:
-    """Publish from a synchronous call site, if a loop is running.
-
-    ``_parse_response`` is synchronous and on the hot path, so it cannot await.
-    When there is no running loop there is nothing to deliver to -- a listener only
-    exists inside a turn, which runs on a loop -- and scheduling then would leak a
-    coroutine.
-    """
-    if bus is None or not bus.has_listeners(event_type):
-        return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    loop.create_task(bus.emit(event_type(**fields)))
 
 
-async def _emit_domain_event(bus: Any, event_type: type, **fields: object) -> None:
-    """Publish one typed event, if anyone is listening.
-
-    The ``has_listeners`` check is not an optimisation detail: this sits on the hot
-    path of every turn, and a turn must not pay for a feature nobody mounted.  The
-    bus isolates a listener that raises, so a subscriber cannot break the turn it
-    observes -- which is the property that makes mounting a plugin safe.
-    """
-    if bus is None or not bus.has_listeners(event_type):
-        return
-    await bus.emit(event_type(**fields))
 
 
 async def _execute_regular_tool_calls(

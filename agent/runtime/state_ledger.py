@@ -124,9 +124,13 @@ LEDGER: tuple[StateEntry, ...] = (
                "Most recent assistant text, read by the requires_intent gate."),
     StateEntry("_active_tool_progress", "agent/tools/executor.py", 54, "CONTEXTVAR", "turn", "explicit", 6,
                "Progress callback a running tool reports through."),
-    StateEntry("_active_agent_context", "agent/core/agent.py", 88, "CONTEXTVAR", "turn", "stays", 7,
+    StateEntry("active_agent_context", "agent/core/turn_context.py", 40, "CONTEXTVAR", "turn", "stays", 7,
                "Tools read ctx.messages through this. Intended to become state the "
-               "ctx service owns and exposes, not to disappear."),
+               "ctx service owns and exposes, not to disappear. Moved out of "
+               "agent/core/agent.py when the turn loop began moving out of "
+               "BaseAgent: the loop has to ask which agent is in flight, and "
+               "importing that from agent.py would be a cycle. Re-exported under "
+               "the old private name so the twelve callers did not change."),
     StateEntry("_active_orchestration_runs", "agent/core/agent.py", 91, "CONTEXTVAR", "turn", "explicit", 8,
                "This turn's orchestration run records; moves with the orchestration driver."),
     StateEntry("_active_schedule_target", "agent/tools/runtime.py", 25, "CONTEXTVAR", "turn", "explicit", 7,
