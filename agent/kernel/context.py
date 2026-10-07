@@ -63,7 +63,7 @@ class Context:
     registration goes, and its name is what a diagnostic reports.
     """
 
-    __slots__ = ("_host", "_install", "_extra", "_views")
+    __slots__ = ("_host", "_install", "_extra", "_views", "_domain_lookup")
 
     def __init__(self, *, host: Any, install: Any) -> None:
         self._host = host
@@ -76,6 +76,12 @@ class Context:
         self._extra = frozenset(Context.__slots__) | frozenset(
             n for n in dir(Context) if not n.startswith("__")
         )
+        #: Asked by :meth:`on` whether an event type belongs to a domain -- and therefore
+        #: to a different bus.  Supplied by whoever wired the host rather than imported
+        #: here: a domain is a set of event types kept **outside** the kernel by design,
+        #: and the kernel reaching for the table would be the coupling it exists to
+        #: prevent.  ``None`` means "no table wired", and then ``on`` accepts anything.
+        self._domain_lookup = getattr(host, "domain_lookup", None)
 
     # -- identity ------------------------------------------------------------
 
@@ -165,7 +171,27 @@ class Context:
     # -- events --------------------------------------------------------------
 
     def on(self, event_type: type, handler: Callable[[Any], Any]) -> Callable[[], None]:
-        """Subscribe *handler* to *event_type*; undone when this plugin unloads."""
+        """Subscribe *handler* to *event_type*; undone when this plugin unloads.
+
+        For events the composition defines.  A **domain's** events are published on that
+        domain's own bus, so this refuses them rather than installing a listener that is
+        never called -- see :func:`agent.core.event_domains.domain_of`.  The refusal is
+        the whole point: `ctx.on(TurnCompleted, handler)` reads correctly, registers
+        successfully, and does nothing, which is indistinguishable from working code.
+
+        The kernel does not import the domain table to ask; the lookup is passed in by
+        whoever wired the host, because a domain is vocabulary that lives *outside* the
+        kernel by design.
+        """
+        declared = self._domain_lookup(event_type) if self._domain_lookup else None
+        if declared is not None:
+            raise ValueError(
+                f"{event_type.__name__} belongs to the {declared.name!r} domain, whose "
+                f"events are published on that domain's bus, not on the context's. "
+                f"Registering here would subscribe you to a bus nothing publishes to. "
+                f"Use Domain.attach(ctx, handler) instead -- "
+                f"from agent.core.event_domains import {declared.name.upper()}"
+            )
         unsubscribe = self._host.events.on(event_type, handler)
         self._install.scope.on_unwind(unsubscribe)
         return unsubscribe

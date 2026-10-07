@@ -48,6 +48,7 @@ __all__ = [
     "TURN",
     "LLM",
     "DOMAINS",
+    "domain_of",
     "domain",
     "domain_names",
     "bus_for",
@@ -341,3 +342,22 @@ def domain(name: str) -> Domain:
 
 def domain_names() -> tuple[str, ...]:
     return tuple(DOMAINS)
+
+
+def domain_of(event_type: type) -> "Domain | None":
+    """The domain *event_type* belongs to, or ``None``.
+
+    Exists so a subscriber that reaches for the wrong channel can be told.  A domain's
+    events are published on **that domain's bus**, not on the composition's:
+    ``Context.on`` registers on ``ctx.bus``, which is the bus for events a composition
+    defines itself, so ``ctx.on(TurnCompleted, handler)`` installs a listener that is
+    never called -- and a listener that is never called is indistinguishable from a
+    plugin that works, until the day somebody notices the feature does nothing.
+
+    ``Domain.attach(ctx, handler)`` is the form that goes to the right bus; this is what
+    lets :meth:`Context.on` say so instead of accepting it.
+    """
+    for declared in DOMAINS.values():
+        if event_type in declared.event_types:
+            return declared
+    return None

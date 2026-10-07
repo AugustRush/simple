@@ -1183,6 +1183,11 @@ class PluginCatalog:
         # the thing that fires it could be on different objects -- a listener that
         # is simply never called, which is the failure mode with no symptom.
         self._host.events = self._event_bus
+        # The composition owns the domains, so it is the composition that tells the kernel
+        # which event types live on another bus -- see `Context.on`.
+        from agent.core.event_domains import domain_of
+
+        self._host.domain_lookup = domain_of
 
     def register_core_services(self, components: Any) -> None:
         """Point this catalog at the runtime's container for core services.

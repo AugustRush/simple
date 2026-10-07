@@ -27,6 +27,7 @@ from agent.kernel.context import Context
 from agent.kernel.event import EventBus
 from agent.kernel.plugin import Install, MissingNameError, PluginHost
 from agent.kernel.service import MissingServiceError
+from agent.core.event_domains import TurnCompleted, TurnStarted
 
 
 # ── Test plugins ─────────────────────────────────────────────────────────────
@@ -955,3 +956,95 @@ def test_a_sync_setup_that_returns_something_harmless_is_fine() -> None:
     install = host.load(Returns())
     assert install.error is None
     assert host.services.get("thing", None) == 7
+
+
+# ── A subscription to another bus's event is refused ─────────────────────────
+
+
+def _host_with_domains():
+    """A host wired the way a composition wires one: it knows the domain table."""
+    from agent.core.event_domains import domain_of
+
+    host = PluginHost()
+    host.domain_lookup = domain_of
+    return host
+
+
+class _Subscriber:
+    name = "subscriber"
+
+    def __init__(self) -> None:
+        self.seen: list = []
+
+    def setup(self, ctx):
+        self.ctx = ctx
+
+
+def test_subscribing_to_a_domain_event_through_the_context_is_refused() -> None:
+    """``ctx.on(TurnCompleted, ...)`` reads correctly and does nothing.
+
+    A domain's events are published on **that domain's bus**.  The context's bus is for
+    events a composition defines itself, and in the shipped composition the two happen to
+    be the same object -- so this call *would* work there, and would stop working the
+    moment a composition had its own bus.  A listener that is never called is
+    indistinguishable from a plugin that works, which is why the refusal is worth more
+    than the permissiveness.
+
+    ``Domain.attach(ctx, handler)`` goes to the domain's bus in every configuration, and
+    that is what the message points at.
+    """
+    host = _host_with_domains()
+    plugin = _Subscriber()
+    host.load(plugin)
+    assert host.pending() == (), "the plugin activated"
+
+    with pytest.raises(ValueError) as caught:
+        plugin.ctx.on(TurnCompleted, lambda event: None)
+
+    message = str(caught.value)
+    assert "turn" in message and "Domain.attach" in message, message
+
+
+def test_the_domain_form_is_accepted_and_reachable() -> None:
+    """Control: the refusal must point at something that works."""
+    from agent.core.event_domains import TURN
+    from agent.core.events import TURN_EVENTS
+
+    host = _host_with_domains()
+    plugin = _Subscriber()
+    host.load(plugin)
+    plugin.ctx.on_unwind(TURN.attach(plugin.ctx, plugin.seen.append))
+
+    asyncio.run(TURN_EVENTS.emit(TurnStarted("a", True, False)))
+    assert len(plugin.seen) == 1, "the domain form reaches the domain's bus"
+
+
+def test_an_event_of_the_composition_is_accepted() -> None:
+    """Control: the rule is about the domain table, not about every event.
+
+    A plugin defining its own event and subscribing with ``ctx.on`` is the case the
+    context's bus exists for, and refusing it would make the context useless.
+    """
+    host = _host_with_domains()
+    plugin = _Subscriber()
+    host.load(plugin)
+
+    class _Mine:
+        pass
+
+    unsub = plugin.ctx.on(_Mine, plugin.seen.append)
+    assert callable(unsub)
+    asyncio.run(plugin.ctx.emit(_Mine()))
+    assert len(plugin.seen) == 1
+
+
+def test_without_a_wired_table_the_context_accepts_anything() -> None:
+    """The kernel does not know the domains, so it cannot refuse on its own.
+
+    A host with no ``domain_lookup`` is a bare kernel -- used in the kernel's own tests
+    and by anything embedding it -- and it must keep working without the domain table.
+    """
+    host = PluginHost()
+    plugin = _Subscriber()
+    host.load(plugin)
+    assert plugin.ctx.on(TurnCompleted, lambda event: None) is not None

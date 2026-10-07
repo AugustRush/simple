@@ -469,6 +469,25 @@ here rather than quietly dropped.
 The other departures are measured as inapplicable rather than undone: Orchestration and
 Workflow have no separable boundary, and CLI is not a channel.
 
+## Two buses, and the subscription that reads correctly
+
+A domain publishes on **its own bus** (`TOOL_EVENTS`, `TURN_EVENTS`, ...), and `ctx.bus` is
+the bus for events a composition defines itself.  In the shipped composition those two are
+the same object, so `ctx.on(TurnCompleted, handler)` **works there** -- and would stop
+working the moment a composition had its own bus.  A listener that is never called is
+indistinguishable from a plugin that works.
+
+`Context.on` now refuses a domain's event type and names `Domain.attach`, which goes to
+the domain's bus in every configuration.  The kernel does not import the domain table to
+find out -- a domain is vocabulary kept outside the kernel by design -- so the composition
+wires `host.domain_lookup = event_domains.domain_of`, and a bare host accepts anything.
+
+The refusal is narrower than it first looks and was almost written wrong twice:
+`_domain_lookup` had to be added to `Context.__slots__` (without it every plugin failed
+at construction, which reads as "the guard broke a hundred tests" rather than as a missing
+slot), and the rule is *not* "domain events are never delivered on the context's bus" --
+they are, whenever the two happen to coincide.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

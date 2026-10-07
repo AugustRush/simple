@@ -44,7 +44,7 @@ import inspect
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 from agent.kernel.event import EventBus
 from agent.kernel.service import ServiceRegistry, ServiceScope
@@ -118,6 +118,11 @@ class PluginHost:
     ) -> None:
         self.services = services if services is not None else ServiceRegistry()
         self.events = events if events is not None else EventBus()
+        #: ``event_type -> Domain | None``, or ``None`` when no domain table is wired.
+        #: Set by the composition, which owns the domains; the kernel asks it through
+        #: ``Context.on`` so a subscription to another bus's event is refused rather
+        #: than silently never called.  See ``agent.core.event_domains.domain_of``.
+        self.domain_lookup: Optional[Callable[[type], Any]] = None
         self._installs: dict[str, Install] = {}
         #: Plugins waiting for a dependency, keyed by name.
         self._pending: dict[str, Install] = {}
