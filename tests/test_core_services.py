@@ -744,3 +744,51 @@ def test_the_interjection_drain_lives_in_one_place() -> None:
     assert [arg.arg for arg in func.args.args] == ["ctx", "pending", "registry"], (
         "the registry has to be a parameter, not reached through a 'self'"
     )
+
+
+def test_the_history_builders_take_the_adapter_as_a_parameter() -> None:
+    """An extraction has to move the *dependency* out of ``self``, not just the code.
+
+    Both builders used to read ``self._transport``, which made the adapter invisible
+    in their signatures: nothing said that building a history entry involves the
+    model adapter at all.  As parameters, the adapter is replaceable at the loop's
+    edge as well as at the agent's -- which is the point of the ``llm`` service.
+
+    Asserted on the signatures because a future edit that reaches back through a
+    ``self`` would compile, pass, and quietly undo the seam.
+    """
+    tree = ast.parse((REPO_ROOT / "agent/core/turn_loop.py").read_text(encoding="utf-8"))
+    funcs = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+    }
+    for name, first_param in (
+        ("assistant_message", "transport"),
+        ("tool_result_messages", "transport"),
+    ):
+        assert name in funcs, f"{name} is not in agent/core/turn_loop.py"
+        args = [arg.arg for arg in funcs[name].args.args]
+        assert args[0] == first_param, (
+            f"{name} must take the adapter first; got {args}"
+        )
+        assert "self" not in args, f"{name} must not be a method: {args}"
+
+
+def test_the_history_builders_are_no_longer_agent_methods() -> None:
+    """The other half, and the one an extraction fails: a delegating copy left behind.
+
+    Two implementations drift, and the one a caller outside the loop reaches is the
+    stale one.  Asserted as an absence because the failure is an absence of cleanup.
+    """
+    tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    methods = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for stale in ("_assistant_message", "_tool_result_messages"):
+        assert stale not in methods, (
+            f"{stale} is still defined on BaseAgent as well as in "
+            f"agent/core/turn_loop.py"
+        )

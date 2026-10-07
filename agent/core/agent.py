@@ -98,6 +98,7 @@ from agent.pathing import canonicalize_user_path, resolve_workspace_path
 from agent.plugins.catalog import PluginCatalog
 from agent.runtime.heartbeat import HeartbeatWriter, TurnHeartbeat
 from agent.core.interjections import inject_pending_interjections
+from agent.core.turn_loop import assistant_message, tool_result_messages
 from agent.runtime.services import resolve
 from agent.tools.executor import RegularToolExecutor
 from agent.skills.catalog import SkillCatalog
@@ -1882,24 +1883,7 @@ class BaseAgent:
             None,
         )
 
-    def _assistant_message(
-        self, response: Any, text: str, ctx: Optional["AgentContext"] = None
-    ) -> dict:
-        """Build the assistant history entry after a tool_use stop."""
-        return self._transport.build_assistant_message(
-            response, text, model=self._effective_model(ctx) if ctx else None
-        )
 
-    def _tool_result_messages(
-        self,
-        tool_calls: list[dict],
-        results: list[str],
-        ctx: Optional["AgentContext"] = None,
-    ) -> list[dict]:
-        """Build tool-result history entries for both formats."""
-        return self._transport.build_tool_result_messages(
-            tool_calls, results, model=self._effective_model(ctx) if ctx else None
-        )
 
     @staticmethod
     def _clear_context_restart_message(
@@ -2768,8 +2752,8 @@ class BaseAgent:
                     if stop_reason == "tool_use" and tool_uses:
                         if text:
                             state.result_text = text
-                        assistant_tool_message = self._assistant_message(
-                            response, text, ctx
+                        assistant_tool_message = assistant_message(
+                            self._transport, response, text, self._effective_model(ctx)
                         )
 
                         # Set intent context so tool executors can enforce
@@ -2811,8 +2795,11 @@ class BaseAgent:
                         # its matching result in persistent conversation state.
                         ctx.messages.append(assistant_tool_message)
                         ctx.messages.extend(
-                            self._tool_result_messages(
-                                tool_uses, filtered_results, ctx
+                            tool_result_messages(
+                                self._transport,
+                                tool_uses,
+                                filtered_results,
+                                self._effective_model(ctx),
                             )
                         )
                         filter_recovery.record_submission(tool_uses, results)
