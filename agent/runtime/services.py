@@ -41,6 +41,8 @@ from __future__ import annotations
 from typing import Any, Callable, Iterator, Mapping, Optional
 
 __all__ = [
+    "resolve",
+    "require_service",
     "MissingServiceError",
     "ServiceRegistry",
     "ServiceScope",
@@ -268,3 +270,48 @@ class ServiceView(Mapping[str, Any]):
     @property
     def registry(self) -> ServiceRegistry:
         return self._registry
+
+
+def resolve(components: Any, name: str, default: Any = None) -> Any:
+    """One service from *components*, absence tolerated.
+
+    Accepts the three shapes this codebase actually passes around:
+
+    * a :class:`RuntimeComponents`, which has ``lookup`` (it resolves through the
+      registry and is the declared channel -- see ``agent/runtime/core_services.py``);
+    * a duck-typed stand-in exposing ``values``, which is how tests substitute a
+      ``SimpleNamespace`` for a component mapping;
+    * a plain mapping, which is what bootstrap and the channel runner hold while
+      they are still assembling one.
+
+    Shared rather than reimplemented per package.  It was written once in
+    ``runtime/contracts.py`` as ``_service`` and a second copy in the channel
+    runner would have been two places to change and one to forget -- the same
+    reasoning that put these services in a container in the first place.
+    """
+    lookup = getattr(components, "lookup", None)
+    if lookup is not None:
+        return lookup(name, default)
+    # ``getattr(x, "values")`` is not enough to detect the stand-in shape: a plain
+    # ``dict`` also has ``values``, as a *method*, so the naive check found a
+    # builtin and then called ``.get`` on it.  The attribute has to be a mapping.
+    values = getattr(components, "values", None)
+    if isinstance(values, Mapping):
+        return values.get(name, default)
+    return components.get(name, default)
+
+
+def require_service(components: Any, name: str) -> Any:
+    """One service the caller cannot do without.
+
+    The sibling of :func:`resolve`.  A missing service is an error here and a
+    default there, so a call site states which it means instead of implying it
+    through the choice of dict accessor.
+    """
+    require = getattr(components, "require", None)
+    if require is not None:
+        return require(name)
+    values = getattr(components, "values", None)
+    if isinstance(values, Mapping):
+        return values[name]
+    return components[name]

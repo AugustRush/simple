@@ -24,6 +24,9 @@ from agent.core.attachments import MessageAttachment
 from agent.runtime import (
     AgentCore,
     RuntimeComponents,
+)
+from agent.runtime.services import resolve
+from agent.runtime.contracts import (
     RuntimeEvent,
     RuntimeSessionState,
     TurnInput,
@@ -116,7 +119,7 @@ class ChannelRunner:
         self._cfg = cfg
 
     def _build_session_context_manager(self, session_id: str, components: dict):
-        base_ctx_mgr = components.get("context_manager")
+        base_ctx_mgr = resolve(components, "context_manager")
         if base_ctx_mgr is None:
             return None
         staging = getattr(base_ctx_mgr, "staging", None)
@@ -135,7 +138,7 @@ class ChannelRunner:
 
         if session_ctx_mgr is None:
             return None
-        agent = components.get("agent")
+        agent = resolve(components, "agent")
         if agent is None or not hasattr(agent, "endpoint_for"):
             return None
         cfg = components.get("cfg") or {}
@@ -173,7 +176,7 @@ class ChannelRunner:
         """
         import agent as agent_module
 
-        ctx_mgr = components.get("context_manager")
+        ctx_mgr = resolve(components, "context_manager")
         if ctx_mgr is None:
             return 0
         try:
@@ -183,7 +186,7 @@ class ChannelRunner:
             return 0
         if not recovered:
             return 0
-        agent = components.get("agent")
+        agent = resolve(components, "agent")
         cfg = components.get("cfg") or {}
         session_id = str(getattr(ctx_mgr.staging, "session_id", "") or "")
         try:
@@ -324,7 +327,7 @@ class ChannelRunner:
                 components["memory_worker_pool"] = memory_pool
                 memory_pool.start()
         self._recover_orphan_staging(components, memory_pool)
-        plugin_catalog = components.get("plugin_catalog")
+        plugin_catalog = resolve(components, "plugin_catalog")
         if plugin_catalog:
             plugin_catalog.fire_session_start(components)
 
@@ -352,7 +355,7 @@ class ChannelRunner:
                 .get("consolidation", {})
                 .get("flush_on_session_end", False)
             )
-            agent = components.get("agent")
+            agent = resolve(components, "agent")
             flush_model = (
                 agent.consolidation_model(components.get("cfg") or {})
                 if flush_on_end and agent is not None
@@ -544,7 +547,7 @@ class ChannelRunner:
                 await _evict_session(remaining_idle.pop(0))
 
         components.setdefault("session_runtime_cleanup", _cleanup_session_runtime)
-        agent_core = components.get("agent_core")
+        agent_core = resolve(components, "agent_core")
         if agent_core is None:
             agent_core = AgentCore(RuntimeComponents(components))
         router = ensure_command_router(components)
@@ -569,7 +572,7 @@ class ChannelRunner:
             if ctx_mgr is None:
                 runtime = session_components.get(event.session_id, components)
                 ctx_mgr = (
-                    runtime.get("context_manager")
+                    resolve(runtime, "context_manager")
                     if isinstance(runtime, dict)
                     else None
                 )
@@ -638,11 +641,11 @@ class ChannelRunner:
                     if isinstance(override, str) and override.strip()
                     else None
                 )
-            session_skill_catalog = session_runtime.get("skill_catalog", skill_catalog)
+            session_skill_catalog = resolve(session_runtime, "skill_catalog", skill_catalog)
             ctx.metadata["skill_catalog"] = session_skill_catalog
             if session_id not in session_coordinators:
                 session_router = session_runtime.get("command_router")
-                session_agent_core = session_runtime.get("agent_core")
+                session_agent_core = resolve(session_runtime, "agent_core")
                 if session_router is not None and session_agent_core is not None:
                     session_coordinators[session_id] = CommandCoordinator(
                         session_agent_core,
@@ -653,7 +656,7 @@ class ChannelRunner:
                     )
                 else:
                     session_coordinators[session_id] = coordinator
-                plugin = session_runtime.get("plugin_catalog")
+                plugin = resolve(session_runtime, "plugin_catalog")
                 if plugin is not None and session_id not in session_plugins_started:
                     plugin.fire_session_start(session_runtime)
                     session_plugins_started.add(session_id)

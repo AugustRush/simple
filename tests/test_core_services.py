@@ -117,15 +117,18 @@ def _scan() -> tuple[dict[str, set[str]], dict[str, set[str]]]:
                     # ``self._core("x")`` on the plugin catalog: an attribute
                     # call, so it never reaches the bare-name branch below.
                     note(readers, _string_key(node), rel)
-                elif name_id in ("_component", "_service", "_required"):
-                    # Four accessors, all resolving through a container:
-                    # ``_component(context, "x")`` in the commands package;
-                    # ``_service(components, "x")`` / ``_required(components, "x")``
-                    # in the runtime layer; and ``self._core("x")`` on the plugin
-                    # catalog.  They exist so a caller *states* whether absence is
-                    # tolerated rather than implying it through the choice of dict
-                    # accessor.  Each takes the container first, so the key is the
-                    # argument after it.
+                elif name_id in (
+                    "_component",
+                    "resolve",
+                    "require_service",
+                ):
+                    # The shared accessors -- ``resolve(components, "x")`` and
+                    # ``require_service(components, "x")`` -- plus the two local
+                    # ones: ``_component(context, "x")`` in the commands package and
+                    # ``self._core("x")`` on the plugin catalog.  They exist so a
+                    # caller *states* whether absence is tolerated rather than
+                    # implying it through the choice of dict accessor.  Each takes
+                    # the container first, so the key is the argument after it.
                     note(readers, _component_key(node), rel)
             elif isinstance(node, ast.Subscript):
                 note(readers, _string_key(node), rel)
@@ -300,6 +303,23 @@ def test_the_scan_detects_a_runtime_components_lookup() -> None:
         f"{runtime} resolves turn_runner through the container; scan found "
         f"{sorted(found)}"
     )
+
+
+def test_the_scan_detects_the_shared_resolve_helper() -> None:
+    """Control for the shared accessors, which replaced two local copies.
+
+    ``resolve``/``require_service`` were lifted out of the runtime layer so the
+    channel runner could use them rather than growing a third copy.  A scanner
+    that did not follow the rename would report every migrated file as no longer
+    reading the services it resolves on every turn.
+    """
+    _writers, readers = _scan()
+    channel = "agent/channels/base.py"
+    found = {name for name, files in readers.items() if channel in files}
+    assert found, (
+        f"{channel} resolves core services through resolve(...); scan found none"
+    )
+    assert "context_manager" in found, f"expected context_manager among {sorted(found)}"
 
 
 # ── The vocabulary is closed ─────────────────────────────────────────────────
