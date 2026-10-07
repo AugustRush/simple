@@ -792,3 +792,187 @@ def test_the_history_builders_are_no_longer_agent_methods() -> None:
             f"{stale} is still defined on BaseAgent as well as in "
             f"agent/core/turn_loop.py"
         )
+
+
+# ── The loop's dependency surface, recomputed from the source ────────────────
+
+#: Members of ``BaseAgent`` that only the turn loop uses, and therefore move with it
+#: rather than being handed to it.  This is the list that shrinks as the loop moves:
+#: every name here is a member that will leave ``BaseAgent``.
+_LOOP_OWNED = (
+    "_build_summarized_tool_results",
+    "_create",
+    "_parse_response",
+    "_response_completion_error",
+    "_build_user_message_content",
+    "_compact_body_for_turn",
+    "_continue_truncated_response",
+    "_handle_end_turn",
+    "_is_content_filter_block",
+    "_is_llm_retryable",
+    "_new_watchdog_state",
+    "_next_structured_output_budget",
+    "_plan_orchestration",
+    "_prepare_turn",
+    "_promote_orchestration_runs",
+    "_recover_from_content_filter",
+    "_recover_incomplete_tool_response",
+    "_retrieval_token_budget",
+    "_run_turn_loop",
+    "_synthesize_tool_only_response",
+    "_with_llm_retry",
+    "_inject_pending_interjections",
+    "_assistant_message",
+    "_tool_result_messages",
+)
+
+
+def _loop_dependency_surface() -> tuple[set[str], set[str]]:
+    """``(shared, loop_only)``: what the loop reads from the agent, split in two.
+
+    Recomputed from the source rather than compared against a hand-written list, for
+    the same reason the core-service ledger is: a list that is only ever read by the
+    assertion that checks it can be edited to match anything.
+    """
+    tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    methods = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    loop_names = set(_LOOP_OWNED) | {"send_message"}
+
+    def touched(node: ast.AST) -> set[str]:
+        return {
+            x.attr
+            for x in ast.walk(node)
+            if isinstance(x, ast.Attribute)
+            and isinstance(x.value, ast.Name)
+            and x.value.id == "self"
+        }
+
+    needed: set[str] = set()
+    for name in loop_names:
+        node = methods.get(name)
+        if node is not None:
+            needed |= touched(node)
+
+    owned_elsewhere: set[str] = set()
+    for name, node in methods.items():
+        if name not in loop_names:
+            owned_elsewhere |= touched(node)
+
+    # ``_inject_pending_interjections`` and the two history builders have already
+    # moved out, so they no longer appear as methods; their names stay in the list
+    # above and simply contribute nothing.
+    #
+    # Order matters and was wrong the first time: what the loop *borrows* is the
+    # intersection -- another method also uses it, so it stays on the agent.  The
+    # difference is what only the loop uses, which moves with it.  Returning them
+    # the other way made the guard report every borrowed member as owned and every
+    # owned member as missing.
+    shared = needed & owned_elsewhere
+    loop_only = needed - owned_elsewhere
+    return shared, loop_only
+
+
+def test_the_loop_dependency_struct_is_exactly_the_shared_surface() -> None:
+    """``LoopDeps`` must name every member the loop borrows, and no member it owns.
+
+    Both directions are failures.  A missing field means the loop reaches for
+    something the struct does not admit, so the extraction would have to smuggle it
+    through -- and smuggling is how a decoupling turns out not to be one.  An extra
+    field means the struct claims the loop borrows something it will actually take
+    with it, which makes the interface look wider than it is and the remaining work
+    look larger.
+    """
+    tree = ast.parse((REPO_ROOT / "agent/core/turn_loop.py").read_text(encoding="utf-8"))
+    struct = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "LoopDeps"
+    )
+    declared = {
+        stmt.target.id
+        for stmt in struct.body
+        if isinstance(stmt, ast.AnnAssign)
+    }
+
+    shared, _loop_only = _loop_dependency_surface()
+    # Compared after stripping one leading underscore, because the struct's fields
+    # are the public reading of a member that may be private on the agent.  That
+    # mapping is only sound if it is one-to-one, which is asserted first: with both
+    # ``_token_budget`` and ``token_budget`` present, stripping would collapse two
+    # members into one field and the comparison would silently accept a struct that
+    # takes the wrong one.
+    stripped = [name.lstrip("_") for name in shared]
+    assert len(set(stripped)) == len(stripped), (
+        f"stripping the underscore is not one-to-one here: {sorted(shared)}"
+    )
+    expected = set(stripped)
+    missing = sorted(expected - declared)
+    extra = sorted(declared - expected)
+    assert not missing and not extra, (
+        f"LoopDeps is out of step with what the loop reads from the agent\n"
+        f"  missing (the loop needs these): {missing}\n"
+        f"  extra (the loop owns these and will take them): {extra}"
+    )
+
+
+def test_the_loop_owned_list_matches_the_source() -> None:
+    """Control for the list above: each name must still be a ``BaseAgent`` method.
+
+    A name that has already moved is not a member any more, and leaving it in the
+    list would let the surface be under-counted -- the loop-only set is subtracted
+    from what the loop needs, so a stale entry quietly removes a real dependency
+    from ``LoopDeps`` and the assertion above would pass on a wrong struct.
+    """
+    tree = ast.parse((REPO_ROOT / "agent/core/agent.py").read_text(encoding="utf-8"))
+    methods = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    already_moved = [
+        name for name in _LOOP_OWNED
+        if name not in methods
+        and name not in ("_inject_pending_interjections", "_assistant_message",
+                         "_tool_result_messages")
+    ]
+    assert not already_moved, (
+        f"these are in _LOOP_OWNED but no longer exist on BaseAgent, so they have "
+        f"moved and the list must say so: {already_moved}"
+    )
+
+
+def test_the_loop_surface_is_not_empty() -> None:
+    """Control: a scan that found nothing would satisfy every assertion above."""
+    shared, loop_only = _loop_dependency_surface()
+    assert len(shared) >= 15, f"the loop borrows more than this: {sorted(shared)}"
+    assert loop_only, "the loop owns nothing? the split is not being computed"
+
+
+def test_loop_deps_can_be_built_from_a_real_agent() -> None:
+    """The struct's names must resolve, not merely match.
+
+    The guard above compares *names* against the source, which a typo would pass:
+    ``LoopDeps.of`` could name an attribute that does not exist and nothing would
+    notice until the loop ran.  This builds one from a real agent, so every field is
+    resolved at least once, and asserts the two properties the docstring claims --
+    that bound methods stay bound to that agent, and that the struct is frozen.
+    """
+    from dataclasses import FrozenInstanceError
+
+    from agent.core.agent import BaseAgent
+    from agent.core.turn_loop import LoopDeps
+    from agent.tools.runtime import ToolRegistry
+
+    agent = BaseAgent(object(), ToolRegistry(), model="m", api_format="anthropic")
+    deps = LoopDeps.of(agent)
+
+    assert deps.transport is agent._transport
+    assert deps.effective_model.__self__ is agent, "the method came from the agent"
+    assert deps.registry is agent.registry
+    assert deps.max_tokens == agent.max_tokens
+
+    with pytest.raises(FrozenInstanceError):
+        deps.max_tokens = 1  # type: ignore[misc]
