@@ -150,3 +150,112 @@ def test_a_composition_that_provides_nothing_leaves_the_dependents_waiting(home)
     assert host.pending() == ("session",)
     assert host.waiting_for() == {"session": ("ltm_store",)}
     assert "context_manager" not in mapping
+
+
+# ── hot reload: changed code on disk replaces the live plugin ────────────────
+
+
+def _write_hotplug(root: pathlib.Path, value: str) -> None:
+    """A plugin whose whole behaviour is one provided value, so a swap is visible."""
+    import json
+
+    plugin = root / "hotplug"
+    plugin.mkdir(exist_ok=True)
+    (plugin / "plugin.json").write_text(json.dumps({"name": "hotplug"}), encoding="utf-8")
+    (plugin / "__init__.py").write_text(
+        "def register():\n"
+        "    class P:\n"
+        "        name = 'hotplug'\n"
+        "        inject = ('vault',)\n"
+        "        def setup(self, ctx):\n"
+        f"            ctx.provide('greeting', {value!r})\n"
+        "    return P()\n",
+        encoding="utf-8",
+    )
+
+
+def test_reloading_picks_up_a_same_length_edit(tmp_path) -> None:
+    """The hard case, and the one that was silently broken.
+
+    Python validates a ``.pyc`` against the source's **mtime and size**.  A plugin edited
+    from ``'v1'`` to ``'v2'`` -- same size, same clock tick, which is what a script or a
+    test does -- therefore kept its **old bytecode**: the reload re-imported, re-ran setup,
+    re-provided the service, and provided the old value.  Nothing errored.
+
+    Measured: ``'v1' -> 'v2'`` gave ``v1``; ``'v1' -> 'v2-longer'`` gave the new value.  The
+    difference was not the reload, it was the bytecode cache, so this test uses the case that
+    used to fail rather than the one that happened to work.
+    """
+    import asyncio
+
+    from agent import PluginCatalog
+
+    _write_hotplug(tmp_path, "v1")
+    mapping: dict = {"vault": object()}
+    catalog = PluginCatalog(builtin_dir=tmp_path, components=mapping)
+    catalog.discover_and_load()
+    assert mapping["greeting"] == "v1"
+
+    _write_hotplug(tmp_path, "v2")
+    asyncio.run(catalog.reload(mapping))
+
+    assert mapping["greeting"] == "v2", "the changed code must be what is live"
+    assert len(catalog._installs) == 1, (
+        f"exactly one install must remain, found {sorted(catalog._installs)}"
+    )
+
+
+def test_a_plugin_is_not_stacked_by_a_reload(tmp_path) -> None:
+    """Control: the reload replaces, it does not add a second copy of the plugin."""
+    import asyncio
+
+    from agent import PluginCatalog
+
+    _write_hotplug(tmp_path, "v1")
+    mapping: dict = {"vault": object()}
+    catalog = PluginCatalog(builtin_dir=tmp_path, components=mapping)
+    catalog.discover_and_load()
+    first = catalog._installs["hotplug"].plugin
+
+    _write_hotplug(tmp_path, "v2-longer")
+    asyncio.run(catalog.reload(mapping))
+
+    second = catalog._installs["hotplug"].plugin
+    assert first is not second, "a reload builds a new object"
+    assert len(catalog._installs) == 1
+
+
+def test_a_reloaded_plugin_that_stops_providing_removes_its_service(tmp_path) -> None:
+    """The other half of a swap: what the old version registered must be gone.
+
+    Without this, a reload that changed what a plugin provides would leave the previous
+    version's services behind, and "which implementation is live" would depend on how many
+    times the file had been saved.
+    """
+    import asyncio
+
+    from agent import PluginCatalog
+
+    _write_hotplug(tmp_path, "v1")
+    mapping: dict = {"vault": object()}
+    catalog = PluginCatalog(builtin_dir=tmp_path, components=mapping)
+    catalog.discover_and_load()
+    assert mapping["greeting"] == "v1"
+
+    plugin = tmp_path / "hotplug"
+    (plugin / "__init__.py").write_text(
+        "def register():\n"
+        "    class P:\n"
+        "        name = 'hotplug'\n"
+        "        inject = ('vault',)\n"
+        "        def setup(self, ctx):\n"
+        "            ctx.provide('farewell', 'bye')\n"
+        "    return P()\n",
+        encoding="utf-8",
+    )
+    asyncio.run(catalog.reload(mapping))
+
+    assert mapping.get("farewell") == "bye"
+    assert "greeting" not in mapping, (
+        "the service the previous version provided must not survive the reload"
+    )

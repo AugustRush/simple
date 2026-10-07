@@ -735,6 +735,52 @@ unload('tools')         -> 0 tools
    process, and a view that forwarded writes would make "one plugin's handle" a way to reach
    into every other plugin.
 
+## Hot reload kept old code, and nothing said so
+
+The reload path was already tested for a plugin **appearing** and one **disappearing**, and
+for a changed **markdown command**.  Changed **Python** was not covered, and it was broken:
+
+```
+'v1' -> 'v2'          (same size, same clock tick)  ->  the plugin still provided 'v1'
+'v1' -> 'v2-longer'   (different size)              ->  the new value
+```
+
+Python validates a `.pyc` against the source's **mtime and size**, so an edit that keeps the
+size and lands in the same tick is invisible: the reload re-imported, re-ran `setup`,
+re-provided the service -- and provided the old value.  Nothing errored, nothing was pending,
+and the plugin object was genuinely new, which is why the first reading of it looked like a
+scope problem rather than a bytecode one.
+
+The fix drops the cached bytecode before importing a plugin
+(`importlib.util.cache_from_source` -> `unlink`), unconditionally rather than only on reload:
+the window is narrow but a hot-reload feature that silently keeps old code is worse than one
+that never claimed to reload.
+
+**The lesson is about which case the test used.**  The first version of the test wrote `'v1'`
+then `'v2'` -- and failed for the bytecode reason -- while a second test whose new code
+happened to be a different length passed, which made the failure look like it was about
+*which service* was provided.  Both tests were right about the reload and wrong about the
+cache; only the same-length case could tell them apart.
+
+## Channels: the composition is hot-swappable, the implementation is not refactored
+
+Measured, because "channels are just a wrapper" (an earlier note in this document) is true of
+one half and false of the other:
+
+```
+load WebChannelPlugin + FeishuChannelPlugin  -> 2 channels, owners ('channel.web', 'channel.feishu')
+unload('channel.web')                        -> 1 channel, owner ('channel.feishu',)
+```
+
+So a channel plugin's contribution **is** undone by unloading it -- `ctx.channels.add` returns
+an undo and the scoped view registers it on the plugin's scope.  That is the hot-swappable
+half, and `tests/test_channel_composition.py` pins it by identity of the survivor rather than
+by count.
+
+What is *not* refactored is `agent/channels/web.py` (4,183 lines) and `feishu.py` (2,587):
+they are unchanged by the whole refactor and are still single large classes.  Composable and
+modular are not the same claim, and this document should not blur them.
+
 ## Next step, in order
 
 1. **`SchedulerPlugin`.**  Its prerequisites are settled: single-sourced parameters

@@ -1453,6 +1453,23 @@ class PluginCatalog:
         python_failed = False
         if has_python:
             mod_name = f"_agent_plugin_{name_hint}"
+            # Drop the cached bytecode for this file before importing it.
+            #
+            # Python validates a `.pyc` against the source's **mtime and size**, so an edit
+            # that keeps the same size and lands in the same clock tick is invisible: the
+            # stale bytecode is loaded and the plugin runs its old code, with no error and
+            # nothing to see.  Measured, twice, on a plugin whose only change was a string
+            # literal: `'v1' -> 'v2'` kept `v1`, `'v1' -> 'v2-longer'` took effect.
+            #
+            # Unconditionally, not only on reload: the window is narrow but a hot-reload
+            # feature that silently keeps old code is worse than one that never claimed to
+            # reload.  The cost is recompiling one file, and the module name is already
+            # namespaced, so nothing else is compiling it.
+            try:
+                stale = importlib.util.cache_from_source(str(init_file))
+                Path(stale).unlink(missing_ok=True)
+            except (OSError, NotImplementedError, ValueError):
+                pass
             try:
                 spec = importlib.util.spec_from_file_location(
                     mod_name,

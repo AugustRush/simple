@@ -257,3 +257,55 @@ def test_two_channels_from_one_plugin_both_survive() -> None:
     registry.remove(first)
     assert len(registry.all()) == 1
     assert registry.all()[0] is not first
+
+
+# ── hot swap: a channel plugin's contribution is undone by unloading it ───────
+
+
+def _channel_host(cfg_sections: dict):
+    from agent.channels.registry import ChannelRegistry
+    from agent.kernel.plugin import PluginHost
+    from agent.kernel.service import ServiceRegistry
+
+    mapping = {"cfg": {"channels": cfg_sections}, "channels": ChannelRegistry()}
+    return PluginHost(services=ServiceRegistry.adopt(mapping)), mapping
+
+
+def test_unloading_a_channel_plugin_removes_exactly_that_channel() -> None:
+    """A channel's whole effect is one registration, so it is only a plugin if that
+    registration is undoable.
+
+    ``ctx.channels.add`` returns an undo and the scoped view registers it on the plugin's
+    scope, so this is the property that separates "declared in a plugin" from "hot
+    swappable".  Asserted by identity of the remaining channel rather than by count: a
+    count would pass if the wrong one had been removed.
+    """
+    from agent.channels.plugin import FeishuChannelPlugin, WebChannelPlugin
+
+    host, mapping = _channel_host({"web": {"enabled": True}, "feishu": {"enabled": True}})
+    host.load(WebChannelPlugin())
+    host.load(FeishuChannelPlugin())
+    registry = mapping["channels"]
+    assert len(registry) == 2
+
+    host.unload("channel.web")
+
+    assert registry.owners() == ("channel.feishu",), registry.owners()
+    assert len(registry) == 1
+
+
+def test_a_disabled_channel_plugin_registers_nothing_to_undo() -> None:
+    """Control: mounted-but-inert is the documented shape, so unloading it is a no-op.
+
+    The plugins are mounted unconditionally and read their own config section.  A test that
+    only exercised the enabled case would not notice if disabling started contributing
+    anyway.
+    """
+    from agent.channels.plugin import WebChannelPlugin
+
+    host, mapping = _channel_host({"web": {"enabled": False}})
+    host.load(WebChannelPlugin())
+
+    assert len(mapping["channels"]) == 0
+    host.unload("channel.web")
+    assert len(mapping["channels"]) == 0
