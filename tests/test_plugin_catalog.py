@@ -252,28 +252,6 @@ def test_declarative_plugin_exposes_command_frontmatter_metadata(tmp_path):
 # ─── Lifecycle hooks ──────────────────────────────────────────────────────────
 
 
-def test_fire_session_start_called(tmp_path):
-    from agent import PluginCatalog
-
-    _write_plugin(
-        tmp_path / "starter",
-        """
-        def register():
-            class P:
-                name = "starter"
-                started = False
-                def on_session_start(self, components):
-                    P.started = True
-            return P()
-    """,
-    )
-    catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog.discover_and_load()
-    catalog.fire_session_start({})
-    plugin_obj = catalog._plugins["starter"][0]
-    assert plugin_obj.__class__.started is True
-
-
 def test_fire_turn_end_async(tmp_path):
     from agent import PluginCatalog, TurnEvent
 
@@ -2975,38 +2953,52 @@ def test_reload_marks_skill_catalog_dirty(tmp_path):
     assert fake._prompt_generation > 0
 
 
-def test_reload_fires_on_session_start_for_reinstantiated_plugins(tmp_path):
-    """After reload, on_session_start must fire on freshly-imported plugins."""
+def test_reload_runs_setup_again_for_reinstantiated_plugins(tmp_path):
+    """After a reload, a freshly-imported plugin must see the composition again.
+
+    This replaces a test of the same property in the hook protocol, where it was asserted
+    as "``on_session_start`` fires again".  That signal existed because a hook plugin was
+    handed its dependencies *once*, at a moment the reload had to reproduce by hand; a
+    kernel plugin's ``setup`` runs on every load, so the property is now a consequence
+    rather than a mechanism -- and it is still worth asserting, because a host that cached
+    installs would break it silently.
+    """
     from agent import PluginCatalog
 
     plugin_dir = tmp_path / "lifecycle"
     plugin_dir.mkdir()
-    (plugin_dir / "plugin.json").write_text(
-        '{"name": "lifecycle"}', encoding="utf-8"
+    (plugin_dir / "plugin.json").write_text('{"name": "lifecycle"}', encoding="utf-8")
+    source = "\n".join(
+        [
+            "class P:",
+            '    name = "lifecycle"',
+            "    setups = 0",
+            '    inject = ("thing",)',
+            "",
+            "    def setup(self, ctx):",
+            "        P.setups += 1",
+            '        P.seen = ctx.get("thing", None)',
+            "",
+            "def register():",
+            "    return P()",
+        ]
     )
-    (plugin_dir / "__init__.py").write_text(textwrap.dedent("""
-        class P:
-            name = "lifecycle"
-            session_start_calls = 0
-            def on_session_start(self, components):
-                P.session_start_calls += 1
-        def register():
-            return P()
-    """), encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(source, encoding="utf-8")
 
-    catalog = PluginCatalog(builtin_dir=tmp_path)
+    components = {"thing": object()}
+    catalog = PluginCatalog(builtin_dir=tmp_path, components=components)
     catalog.discover_and_load()
-    catalog.fire_session_start({})
 
     plugin_obj, _ = catalog._plugins["lifecycle"]
     type_before = type(plugin_obj)
-    assert type_before.session_start_calls == 1
+    assert type_before.setups == 1
+    assert type_before.seen is components["thing"], "setup read the composition"
 
-    asyncio.run(catalog.reload({}))
+    asyncio.run(catalog.reload(components))
 
     new_plugin_obj, _ = catalog._plugins["lifecycle"]
-    assert new_plugin_obj is not plugin_obj
-    assert type(new_plugin_obj).session_start_calls >= 1
+    assert new_plugin_obj is not plugin_obj, "the plugin was re-instantiated"
+    assert type(new_plugin_obj).setups >= 1, "and its setup ran again"
 
 
 def test_evolution_plugin_survives_reload(tmp_path, monkeypatch):

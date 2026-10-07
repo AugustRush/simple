@@ -830,8 +830,6 @@ async def _interactive_loop_body(
                 memory_worker.wake()
 
     shared.CONSOLE.print(_cli_session_header(components, cfg))
-    # Notify all plugins that the session has started.
-    plugin_catalog.fire_session_start(components)
 
     old_sigint = (
         signal.signal(signal.SIGINT, _cli_sigint_handler)

@@ -1962,13 +1962,11 @@ class PluginCatalog:
                 if pname in removed and hasattr(registry, "unregister_by_source_prefix"):
                     registry.unregister_by_source_prefix(f"mcp:{server_name}")
 
-        # Re-fire on_session_start for every plugin: discover_and_load
-        # re-instantiates them all (via fresh sys.modules import + register()),
-        # so even pre-existing plugins received a new object that has never
-        # seen the session-start signal.  Without this, e.g. the evolution
-        # plugin's engine reference would be None until next restart.
-        self.fire_session_start(components)
-
+        # No re-fire of a session-start signal: `discover_and_load` re-instantiates
+        # every plugin, and the host runs each one's `setup` again -- so a plugin reads
+        # the composition anew.  The old signal existed because the hook protocol handed
+        # plugins their dependencies *once*, at a moment the reload had to reproduce by
+        # hand.
         return {
             "ok": True,
             "added_plugins": sorted(added),
@@ -2206,16 +2204,6 @@ class PluginCatalog:
                     f"[dim]Plugin prompt_submit error ({meta.name}): {exc}[/dim]"
                 )
         return result
-
-    def fire_session_start(self, components: dict) -> None:
-        """Synchronous session-start notification; called before the input loop."""
-        for plugin, _meta in self._plugins.values():
-            if not hasattr(plugin, "on_session_start"):
-                continue
-            try:
-                plugin.on_session_start(components)
-            except Exception as exc:
-                shared.CONSOLE.print(f"[dim]Plugin session_start error: {exc}[/dim]")
 
     async def fire_turn_end(self, event: TurnEvent) -> list[HookResult]:
         """Notify all plugins after each assistant turn; collect HookResults.

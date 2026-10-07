@@ -327,9 +327,10 @@ class ChannelRunner:
                 components["memory_worker_pool"] = memory_pool
                 memory_pool.start()
         self._recover_orphan_staging(components, memory_pool)
+        # Resolved here because the session-end path below needs it; the session-start
+        # signal this used to fire is gone -- a kernel plugin's `setup` is what reads the
+        # composition, and it has already run by the time a session begins.
         plugin_catalog = resolve(components, "plugin_catalog")
-        if plugin_catalog:
-            plugin_catalog.fire_session_start(components)
 
         set_output_dir = getattr(channel, "set_output_dir", None)
         if callable(set_output_dir):
@@ -657,8 +658,7 @@ class ChannelRunner:
                 else:
                     session_coordinators[session_id] = coordinator
                 plugin = resolve(session_runtime, "plugin_catalog")
-                if plugin is not None and session_id not in session_plugins_started:
-                    plugin.fire_session_start(session_runtime)
+                if plugin is not None:
                     session_plugins_started.add(session_id)
             _interaction_log(
                 "turn_started",
