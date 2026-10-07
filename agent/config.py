@@ -14,6 +14,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 
 import agent as agent_module
+from agent.runtime.services import resolve
 from agent import shared
 
 if TYPE_CHECKING:
@@ -1451,16 +1452,16 @@ async def _close_components(components: dict) -> None:
         mcp_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await mcp_task
-    mcp_client = components.get("mcp_client")
+    mcp_client = resolve(components, "mcp_client")
     if mcp_client is not None:
         await mcp_client.close()
-    ctx_mgr = components.get("context_manager")
+    ctx_mgr = resolve(components, "context_manager")
     if ctx_mgr is not None:
         staging = getattr(ctx_mgr, "staging", None)
         if staging is not None and hasattr(staging, "close"):
             staging.close()
         if hasattr(ctx_mgr, "store"):
             ctx_mgr.store.close()
-    plugin_catalog = components.get("plugin_catalog")
+    plugin_catalog = resolve(components, "plugin_catalog")
     if plugin_catalog is not None and hasattr(plugin_catalog, "close"):
         plugin_catalog.close()

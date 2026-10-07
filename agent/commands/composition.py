@@ -33,6 +33,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from agent.runtime.services import resolve
+
 __all__ = ["ensure_command_router"]
 
 #: The key all four former sites agreed on, named once.
@@ -65,10 +67,10 @@ def ensure_command_router(
     if cached is not None:
         return cached
 
-    router = CommandRouter(skill_catalog=components.get("skill_catalog"))
+    router = CommandRouter(skill_catalog=resolve(components, "skill_catalog"))
     register_builtin_commands(router)
 
-    plugin_catalog = components.get("plugin_catalog")
+    plugin_catalog = resolve(components, "plugin_catalog")
     if plugin_catalog is not None and hasattr(plugin_catalog, "get_slash_commands"):
         router.register_plugin_catalog(plugin_catalog)
 

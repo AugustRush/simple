@@ -24,6 +24,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import quote
 
 from agent import shared
+from agent.runtime.services import resolve
 from agent.channels.base import Channel, IncomingMessage
 from agent.commands.composition import ensure_command_router
 from agent.core.attachments import MessageAttachment, attachment_kind_for_mime
@@ -1231,7 +1232,7 @@ class WebChannel(Channel):
         """Receive the channel runner's live-session dict and components."""
         self._sessions = sessions
         self._components = components
-        base_ctx_mgr = components.get("context_manager")
+        base_ctx_mgr = resolve(components, "context_manager")
         store = getattr(base_ctx_mgr, "store", None)
         self._session_service = SessionService(
             store=store,
@@ -1341,7 +1342,7 @@ class WebChannel(Channel):
                 }
                 for d in descriptors
             ]
-            catalog = self._components.get("skill_catalog")
+            catalog = resolve(self._components, "skill_catalog")
             if catalog is not None:
                 commands.extend({
                     "name": bundle.id,
@@ -1658,7 +1659,7 @@ class WebChannel(Channel):
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         plugins: list[dict[str, Any]] = []
-        catalog = self._components.get("plugin_catalog")
+        catalog = resolve(self._components, "plugin_catalog")
         if catalog is not None:
             list_plugins = getattr(catalog, "list_plugins", None)
             if callable(list_plugins):
@@ -1683,7 +1684,7 @@ class WebChannel(Channel):
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
         skills: list[dict[str, Any]] = []
-        catalog = self._components.get("skill_catalog")
+        catalog = resolve(self._components, "skill_catalog")
         if catalog is not None:
             # The listing that manages skills, not the one the model reads:
             # a switched-off skill has to stay visible, otherwise the switch
@@ -1804,7 +1805,7 @@ class WebChannel(Channel):
         return EditContext(
             chosen_workspace_root=Path(chosen) if chosen else None,
             fallback_workspace_root=Path.cwd().resolve(),
-            skill_catalog=self._components.get("skill_catalog"),
+            skill_catalog=resolve(self._components, "skill_catalog"),
             model_validator=self._resolve_model_override,
             feishu_ready=self._feishu_ready,
             signal_problem=self._signal_problem,
@@ -2823,7 +2824,7 @@ class WebChannel(Channel):
             return JSONResponse({"error": "enabled is required"}, status_code=400)
         desired = bool(body["enabled"])
 
-        catalog = self._components.get("skill_catalog")
+        catalog = resolve(self._components, "skill_catalog")
         if catalog is None:
             return JSONResponse({"error": "skill catalog is not available"}, status_code=503)
         skill_id = str(request.path_params["skill_id"])
@@ -2862,7 +2863,7 @@ class WebChannel(Channel):
     async def _delete_skill(self, request: Any) -> Any:
         from starlette.responses import JSONResponse
         if not self._authorized(request): return JSONResponse({"error": "unauthorized"}, status_code=401)
-        catalog = self._components.get("skill_catalog")
+        catalog = resolve(self._components, "skill_catalog")
         # Management, so switched-off skills count: deleting one is how a
         # person gets rid of a skill they turned off and no longer want.
         bundle = catalog.find_any(str(request.path_params["skill_id"])) if catalog is not None else None
@@ -2905,7 +2906,7 @@ class WebChannel(Channel):
         from starlette.responses import JSONResponse
         if not self._authorized(request): return JSONResponse({"error": "unauthorized"}, status_code=401)
         name = str(request.path_params["plugin_name"])
-        catalog = self._components.get("plugin_catalog")
+        catalog = resolve(self._components, "plugin_catalog")
         meta = next((item for item in (catalog.list_plugins() if catalog else []) if getattr(item, "name", "") == name), None)
         if meta is None: return JSONResponse({"error": "plugin not found"}, status_code=404)
         if getattr(meta, "source", "") != "user": return JSONResponse({"error": "内置插件不能删除"}, status_code=403)
@@ -2925,7 +2926,7 @@ class WebChannel(Channel):
 
         if not self._authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=401)
-        base_ctx_mgr = self._components.get("context_manager")
+        base_ctx_mgr = resolve(self._components, "context_manager")
         stats = {}
         if base_ctx_mgr is not None:
             stats_method = getattr(base_ctx_mgr, "stats", None)
@@ -2987,7 +2988,7 @@ class WebChannel(Channel):
         except Exception as exc:
             return JSONResponse({"error": f"save failed: {exc}"}, status_code=500)
 
-        catalog = self._components.get("plugin_catalog")
+        catalog = resolve(self._components, "plugin_catalog")
         if catalog is not None:
             try:
                 catalog._plugin_config = plugins_cfg  # noqa: SLF001
