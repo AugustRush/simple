@@ -419,7 +419,7 @@ class RegularToolExecutor:
             # The gates a plugin installs are listeners on this bus, not a
             # catalog the executor holds.  First refusal wins; see
             # agent/core/events.py for why that is preserved.
-            reason = await self._event_bus.emit_pre_execute(
+            reason = await self._event_bus.emit_blocking(
                 ToolPreExecute(tool_name=name, arguments=inputs)
             )
             if reason:

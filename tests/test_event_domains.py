@@ -218,7 +218,7 @@ def test_the_tool_refusal_semantic_still_short_circuits() -> None:
 
     bus.on(ToolPreExecute, refuse)
     bus.on(ToolPreExecute, lambda event: later.append(event))
-    reason = asyncio.run(bus.emit_pre_execute(ToolPreExecute("t", {})))
+    reason = asyncio.run(bus.emit_blocking(ToolPreExecute("t", {})))
     assert reason == "not allowed"
     assert later == [], "a gate a later listener can argue with is not a gate"
 
@@ -268,8 +268,21 @@ def _event_bus_constructions(source: str) -> list[int]:
     ]
 
 
+#: Sites that may construct a bus, with the reason.  The rule the guard enforces
+#: is that a *domain* has one bus, not that the class is instantiated once: a
+#: ``PluginHost`` owns the bus for its own tree, which is what lets a test compose a
+#: kernel with a private one.
+_BUS_CONSTRUCTION_ALLOWED: dict[str, str] = {
+    "agent/core/events.py": "the module-level buses every domain publishes to",
+    "agent/kernel/plugin.py": (
+        "a PluginHost's own bus, for a tree composed without the runtime -- the "
+        "composition root passes the shared one instead"
+    ),
+}
+
+
 def test_no_module_builds_a_second_event_bus() -> None:
-    """A bus per domain is a way to lose a listener, not a way to isolate one.
+    """A bus per *domain* is a way to lose a listener, not a way to isolate one.
 
     The executor is constructed in several places (the turn loop, the scheduler,
     tests), so a bus that is not the shared one means a plugin's gate applies only
@@ -280,22 +293,34 @@ def test_no_module_builds_a_second_event_bus() -> None:
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1] / "agent"
-    owner = "agent/core/events.py"
     offenders: list[str] = []
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
         rel = str(path.relative_to(root.parent))
-        if rel == owner:
+        if rel in _BUS_CONSTRUCTION_ALLOWED:
             continue
         if _event_bus_constructions(path.read_text(encoding="utf-8")):
             offenders.append(rel)
     assert not offenders, (
-        "an EventBus is constructed outside agent/core/events.py:\n  "
+        "an EventBus is constructed outside its allowlist:\n  "
         + "\n  ".join(offenders)
         + "\n\nSubscribe to the shared bus (see agent/core/event_domains.py) "
-        "instead of building another one."
+        "instead of building another one, or add the site here with a reason."
     )
+
+
+def test_every_allowed_bus_site_still_constructs_one() -> None:
+    """A stale allowlist entry would wave through the next genuine second bus."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    stale = [
+        rel
+        for rel in _BUS_CONSTRUCTION_ALLOWED
+        if not _event_bus_constructions((root / rel).read_text(encoding="utf-8"))
+    ]
+    assert not stale, f"allowlisted but no longer constructing a bus: {stale}"
 
 
 def test_the_owner_does_build_the_bus() -> None:

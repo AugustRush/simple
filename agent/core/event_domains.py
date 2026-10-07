@@ -28,7 +28,7 @@ what the log records.
 The refusal semantic is why ``tool`` is declared here too
 ---------------------------------------------------------
 ``ToolPreExecute`` is the one event a listener can *block*, and
-``EventBus.emit_pre_execute`` is the only delivery that stops early.  A domain that
+``EventBus.emit_blocking`` is the only delivery that stops early.  A domain that
 silently inherited that -- an LLM listener whose truthy return stopped every
 listener behind it -- would be a bug with no local symptom.  The domains are
 declared as data so the distinction is visible in one table, and

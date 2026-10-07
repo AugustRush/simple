@@ -41,7 +41,6 @@ in-process extension point for the tool pipeline.
 
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -53,6 +52,11 @@ __all__ = [
     "TURN_EVENTS",
     "LLM_EVENTS",
 ]
+
+
+# The bus implementation lives in the kernel: it is a kernel concept, and the
+# tool pipeline is one of its users rather than its owner.
+from agent.kernel.event import EventBus, Listener  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -85,91 +89,6 @@ class ToolPostExecute:
 Listener = Callable[[Any], Any]
 
 
-class EventBus:
-    """In-process typed event delivery.
-
-    Listeners are matched by exact event class.  Delivery is registration
-    ordered, awaits async listeners, and isolates failures: one listener raising
-    must not stop the others, because the alternative is that a single broken
-    plugin silently disables every gate behind it.
-    """
-
-    __slots__ = ("_listeners",)
-
-    def __init__(self) -> None:
-        self._listeners: dict[type, list[Listener]] = {}
-
-    def on(self, event_type: type, listener: Listener) -> Callable[[], None]:
-        """Subscribe *listener* to *event_type*; returns an unsubscribe callable."""
-        self._listeners.setdefault(event_type, []).append(listener)
-
-        def unsubscribe() -> None:
-            listeners = self._listeners.get(event_type)
-            if not listeners:
-                return
-            try:
-                listeners.remove(listener)
-            except ValueError:
-                pass
-            if not listeners:
-                self._listeners.pop(event_type, None)
-
-        return unsubscribe
-
-    def has_listeners(self, event_type: type) -> bool:
-        return bool(self._listeners.get(event_type))
-
-    def listeners(self, event_type: type) -> tuple[Listener, ...]:
-        return tuple(self._listeners.get(event_type, ()))
-
-    async def emit(self, event: Any) -> Any:
-        """Deliver *event*.
-
-        Returns the first non-``None`` listener result, or ``None`` when every
-        listener returned nothing.  Emission stops early only when the event
-        itself was blocked (see :meth:`emit_pre_execute`); a plain emit always
-        reaches every listener.
-        """
-        result: Any = None
-        for listener in self.listeners(type(event)):
-            value = await self._invoke(listener, event)
-            if value is not None and result is None:
-                result = value
-        return result
-
-    async def emit_pre_execute(self, event: ToolPreExecute) -> Optional[str]:
-        """Deliver a :class:`ToolPreExecute`, stopping at the first refusal.
-
-        A listener refuses by returning (or awaiting) a truthy reason; ``None``
-        means "no opinion", which is the only thing a listener defaults to.
-        Returns the refusal reason, or ``None`` when the call may proceed.
-
-        Later listeners are not called once a refusal is recorded.  That is the
-        preserved short-circuit: a gate a subsequent listener can argue with is
-        not a gate.
-        """
-        for listener in self.listeners(ToolPreExecute):
-            value = await self._invoke(listener, event)
-            if value:
-                return str(value)
-        return None
-
-    @staticmethod
-    async def _invoke(listener: Listener, event: Any) -> Any:
-        try:
-            if inspect.iscoroutinefunction(listener):
-                return await listener(event)
-            return listener(event)
-        except Exception as exc:  # noqa: BLE001 - isolation is the contract
-            # Reported, not swallowed: a listener that fails silently is a gate
-            # that silently stops gating.
-            from agent import shared
-
-            shared.CONSOLE.print(
-                f"[dim]tool event listener failed "
-                f"({type(event).__name__}): {exc}[/dim]"
-            )
-            return None
 
 
 #: The bus the tool pipeline publishes to.
