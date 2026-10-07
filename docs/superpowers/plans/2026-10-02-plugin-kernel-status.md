@@ -347,12 +347,31 @@ The seven phases are done.  Measured against the objective's list rather than th
 names, two entries remain services rather than plugins, and they are the same shape:
 
 **Memory** and **Agent** are built by `bootstrap` as locals and put in the component
-mapping.  A `MemoryPlugin` is not a one-line move: `bootstrap` builds `LTMStore`, then
-`MemoryPalace` and `ContextManager` share it, then the retriever and the consolidation
-engine hang off the latter, and two `FactAssertion`s are written from
-`assistant_identity`.  It is a **cluster** -- `ltm_store` needs to be a service before
-`memory` can be one, exactly as `runtime_factory` had to exist before `SchedulerPlugin`
-could.
+mapping.  For memory the blocker is not the cluster, it is an **ordering constraint**,
+measured:
+
+    LTMStore        L566   built
+    MemoryPalace    L596   takes the store
+    ContextManager  L604   takes the store
+    EvolutionEngine L909   takes the memory  <-- consumes it
+    PluginCatalog   L932   the host that could mount a MemoryPlugin
+
+The catalog is built **after** memory's last consumer, so a plugin mounted there would
+provide `memory` too late.  `MemoryPalace` and `ContextManager` sharing the store is
+merely a second service to define; this is the part that decides the shape.
+
+It is also why the prerequisite is neither of the two obvious ones.  `ltm_store` cannot
+simply become a service first: its only consumers are in `bootstrap`, so adding it would
+be a mapping entry nothing reads -- which this document's own component guard forbids.
+
+**The move that unblocks it:** `EvolutionPlugin.on_session_start` already *prefers* the
+pre-built engine and builds its own when there is none ("Reuse the EvolutionEngine already
+in components (built by ``_build_components_async``) so tests that inject ``_FakeEvolution``
+work").  Removing `bootstrap`'s inline construction at L909 lets the plugin build the
+engine at session start -- which is after the mount -- and the chain from `memory` to the
+catalog disappears.  Then `MemoryPlugin` can provide `ltm_store` and `memory`, and the two
+`FactAssertion`s seeding `assistant_identity` go with it, since they are a composition
+writing what the configuration declares about the assistant rather than memory internals.
 
 **Agent** is the same story with more of it, and it is also where `BaseAgent`'s 2,530
 lines live.  No phase asked for this one; the objective's list did, so it is recorded
