@@ -114,11 +114,14 @@ class _ScopedAssets:
         self._ctx.on_unwind(lambda: _drop_identity(self._catalog._bundled_mcp, entry))
 
     def add_agent_definition(self, name: str, definition: dict) -> None:
-        """Contribute one sub-agent role, keyed the way the catalog reads it."""
-        catalog = self._catalog
-        key = f"plugin:{self.owner}:{name}"
-        catalog._agent_defs[key] = {**definition, "plugin": self.owner}
-        self._ctx.on_unwind(lambda: catalog._agent_defs.pop(key, None))
+        """Contribute one sub-agent role.  Delegates to the role registry.
+
+        The key (``plugin:<plugin>:<agent>``) and the plugin stamp are the registry's
+        business now, so the loader and this path cannot assemble them differently --
+        and the runtime consumer does not have to parse a key to learn whose role it
+        is.
+        """
+        self._catalog._agent_defs.scoped(self._ctx).add(name, definition)
 
     def add_tool(self, tool: Any) -> Any:
         """Contribute one tool.  Delegates to the registry's scoped view.

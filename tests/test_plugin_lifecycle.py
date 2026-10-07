@@ -146,7 +146,7 @@ def test_unload_removes_the_agent_definitions(catalog_and_plugin) -> None:
     assert catalog.get_agent_definition("plugin:everything:helper") is None
     assert all(
         value.get("plugin") != "everything"
-        for value in catalog._agent_defs.values()
+        for value in catalog._agent_defs.all()
     )
 
 

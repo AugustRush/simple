@@ -438,7 +438,7 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
         # Everything the plugin contributed is present.
         assert catalog._commands.has("contrib_cmd")
         assert "contrib_tool" in registry.list_tools()
-        assert any(name == "plugin:contrib:auditor" for name in catalog._agent_defs)
+        assert catalog._agent_defs.get("plugin:contrib:auditor") is not None
         assert catalog.get_bundled_skills(), "the skills root was registered"
         assert catalog.get_bundled_mcp(), "the mcp config was registered"
 
@@ -447,8 +447,8 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
         # And every one of them is gone, without anything having filtered by name.
         assert not catalog._commands.has("contrib_cmd"), "the slash command"
         assert "contrib_tool" not in registry.list_tools(), "the tool"
-        assert not any(
-            name == "plugin:contrib:auditor" for name in catalog._agent_defs
+        assert (
+            catalog._agent_defs.get("plugin:contrib:auditor") is None
         ), "the agent definition"
         assert not [
             entry for entry in catalog.get_bundled_skills() if entry[0] == "contrib"
@@ -458,3 +458,111 @@ def test_unload_takes_every_kind_of_contribution(tmp_path) -> None:
         ], "the mcp config"
     finally:
         catalog.close()
+
+
+# ── Sub-agent roles: looked up at runtime, so replaceable matters ────────────
+
+
+def _role_host():
+    from agent.core.agent_registry import AgentRegistry
+
+    registry = AgentRegistry()
+    host = PluginHost()
+    host.services.provide("agents", registry)
+    return host, registry
+
+
+class _RolePlugin:
+    name = "role_plugin"
+    inject = ("agents",)
+
+    def __init__(self, *names: str) -> None:
+        self._names = names
+
+    def setup(self, ctx):
+        for name in self._names:
+            ctx.agents.add(name, {"description": f"the {name} role", "body": f"# {name}"})
+
+
+def test_a_plugin_declares_a_role_through_its_context() -> None:
+    host, registry = _role_host()
+    host.load(_RolePlugin("reviewer"))
+    assert registry.get("plugin:role_plugin:reviewer") is not None
+
+
+def test_the_key_and_the_plugin_stamp_are_derived_together() -> None:
+    """The drift the old form allowed: a key assembled in one place, a stamp in another.
+
+    The loader built ``plugin:<name>:<stem>`` itself and stored ``"plugin": name``
+    beside it; the Python contribution did the same by hand.  Two spellings of one
+    fact, and the runtime consumer had to parse the key to learn what the stamp
+    already said.
+    """
+    host, registry = _role_host()
+    host.load(_RolePlugin("reviewer"))
+    record = registry.get("plugin:role_plugin:reviewer")
+    assert record["plugin"] == "role_plugin"
+    assert record["body"] == "# reviewer"
+
+
+def test_unloading_the_plugin_removes_its_roles() -> None:
+    host, registry = _role_host()
+    host.load(_RolePlugin("reviewer", "auditor"))
+    assert set(registry.keys()) == {
+        "plugin:role_plugin:reviewer",
+        "plugin:role_plugin:auditor",
+    }
+    host.unload("role_plugin")
+    assert registry.keys() == ()
+
+
+def test_a_plugin_declaring_two_roles_removes_both() -> None:
+    """Two registrations, two removals -- asserted because the hand-written version
+    needed a per-iteration default (``lambda k=key: ...``) to get this right, and a
+    late-bound key removes only the last one.
+
+    What this test establishes is the *behaviour*.  The reason the behaviour is now
+    hard to get wrong is structural and not something a test can show: ``add`` returns
+    the undo, so there is no lambda over a loop variable to bind wrongly.  Stated here
+    rather than claimed as proven.
+    """
+    host, registry = _role_host()
+    host.load(_RolePlugin("one", "two"))
+    assert len(registry.keys()) == 2
+    host.unload("role_plugin")
+    assert registry.keys() == ()
+
+
+def test_a_role_is_listed_with_its_key_for_the_agents_listing() -> None:
+    host, registry = _role_host()
+    host.load(_RolePlugin("reviewer"))
+    listed = registry.all()
+    assert len(listed) == 1
+    assert listed[0]["key"] == "plugin:role_plugin:reviewer"
+
+
+def test_a_role_snapshot_does_not_alias_the_live_record() -> None:
+    """A failed reload restores the snapshot; an aliased record would restore the
+    broken state it had already written into."""
+    host, registry = _role_host()
+    host.load(_RolePlugin("reviewer"))
+    snapshot = registry.snapshot()
+
+    registry.add("plugin:role_plugin:reviewer", {"body": "changed", "plugin": "someone"})
+    registry.restore(snapshot)
+
+    assert registry.get("plugin:role_plugin:reviewer")["body"] == "# reviewer"
+    assert registry.get("plugin:role_plugin:reviewer")["plugin"] == "role_plugin"
+
+
+def test_the_role_key_format_has_one_home() -> None:
+    """The runtime consumer recognises roles by prefix; the format is written down.
+
+    ``subagent_prepare`` checks ``role.startswith("plugin:")`` and then asks the
+    catalog for the definition.  A format that two modules agree on needs one place
+    that states it, or the day it changes is the day one of them does not.
+    """
+    from agent.core.agent_registry import role_key
+
+    assert role_key("github", "reviewer") == "plugin:github:reviewer"
+    assert role_key("github", "reviewer").startswith("plugin:")

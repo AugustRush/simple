@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 from agent import shared
 from agent.core.events import TOOL_EVENTS, ToolPostExecute, ToolPreExecute
 from agent.commands.registry import CommandRegistry
+from agent.core.agent_registry import AgentRegistry, role_key
 from agent.core.output import _active_event_collector
 from agent.kernel.plugin import PluginHost
 from agent.plugins.profile_selection import profile_from_config
@@ -1140,7 +1141,9 @@ class PluginCatalog:
         # Agent definitions discovered from <plugin>/agents/*.md.
         # Key format: "plugin:<plugin>:<agent>".  Value: dict with keys
         # ``name``, ``description``, ``body``, ``plugin``, ``path``.
-        self._agent_defs: dict[str, dict[str, Any]] = {}
+        #: Sub-agent roles, as a registry rather than a bare dict.  See
+        #: :mod:`agent.core.agent_registry`.
+        self._agent_defs = AgentRegistry()
         # name → PluginInstall.  The install owns the scope that unwinds
         # everything a plugin registered through ``setup(ctx)``, so unloading is
         # "dispose the scope", not "enumerate the five kinds of contribution".
@@ -1745,18 +1748,22 @@ class PluginCatalog:
                 )
                 continue
             metadata, body = parse_skill_markdown(raw)
-            key = f"plugin:{plugin_name}:{stem}"
-            self._agent_defs[key] = {
-                "plugin": plugin_name,
-                "name": str(metadata.get("name", "") or stem),
-                "description": str(metadata.get("description", "") or ""),
-                "body": body,
-                "path": agent_file,
-            }
-            # ``k=key`` binds per iteration: a late-bound key would remove only the
-            # last definition the loop registered, which is the classic closure bug
-            # and invisible until a plugin contributes two agents.
-            undos.append(lambda k=key: self._agent_defs.pop(k, None))
+            key = role_key(plugin_name, stem)
+            # One write and one undo from the registry, so the ``k=key`` closure bug
+            # the hand-written version had to guard against cannot be written here:
+            # there is no loop variable captured by a lambda.
+            undos.append(
+                self._agent_defs.add(
+                    key,
+                    {
+                        "plugin": plugin_name,
+                        "name": str(metadata.get("name", "") or stem),
+                        "description": str(metadata.get("description", "") or ""),
+                        "body": body,
+                        "path": agent_file,
+                    },
+                )
+            )
         return undos
 
     def get_agent_definition(self, ref: str) -> Optional[dict]:
@@ -1769,7 +1776,7 @@ class PluginCatalog:
 
     def list_agent_definitions(self) -> list[dict[str, Any]]:
         """Snapshot of all registered agent definitions (for /agents listing)."""
-        return [dict(value, key=key) for key, value in self._agent_defs.items()]
+        return self._agent_defs.all()
 
     # ── Hot reload ───────────────────────────────────────────────────────
 
@@ -1831,7 +1838,7 @@ class PluginCatalog:
             "bundled_skills": list(self._bundled_skills),
             "bundled_mcp": list(self._bundled_mcp),
             "plugin_source_dirs": dict(self._plugin_source_dirs),
-            "agent_defs": dict(self._agent_defs),
+            "agent_defs": self._agent_defs.snapshot(),
         }
         # Unload every currently-loaded plugin before re-discovering, so a
         # plugin that is about to disappear gets its end hook, its scope
@@ -1864,7 +1871,7 @@ class PluginCatalog:
                 self._plugin_source_dirs = old_discovery_state[
                     "plugin_source_dirs"
                 ]
-                self._agent_defs = old_discovery_state["agent_defs"]
+                self._agent_defs.restore(old_discovery_state["agent_defs"])
                 raise
 
         # Reload skill catalog: clear and rewalk both user/builtin trees,

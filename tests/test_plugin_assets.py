@@ -36,7 +36,9 @@ class _Catalog:
         self._commands = CommandRegistry()
         self._bundled_skills: list = []
         self._bundled_mcp: list = []
-        self._agent_defs: dict = {}
+        from agent.core.agent_registry import AgentRegistry
+
+        self._agent_defs = AgentRegistry()
         self._tool_registry = tool_registry
 
 
@@ -137,8 +139,8 @@ def test_an_agent_definition_is_keyed_the_way_the_catalog_reads_it() -> None:
     catalog = _Catalog()
     assets, _ = _assets(catalog, "github")
     assets.add_agent_definition("reviewer", {"description": "reviews"})
-    assert "plugin:github:reviewer" in catalog._agent_defs
-    assert catalog._agent_defs["plugin:github:reviewer"]["plugin"] == "github"
+    assert catalog._agent_defs.get("plugin:github:reviewer") is not None
+    assert catalog._agent_defs.get("plugin:github:reviewer")["plugin"] == "github"
 
 
 def test_removing_an_agent_definition_removes_only_that_key() -> None:
@@ -148,8 +150,8 @@ def test_removing_an_agent_definition_removes_only_that_key() -> None:
     mine.add_agent_definition("reviewer", {})
     theirs.add_agent_definition("reviewer", {})
     my_undos[0]()
-    assert "plugin:mine:reviewer" not in catalog._agent_defs
-    assert "plugin:theirs:reviewer" in catalog._agent_defs
+    assert catalog._agent_defs.get("plugin:mine:reviewer") is None
+    assert catalog._agent_defs.get("plugin:theirs:reviewer") is not None
 
 
 # ── Tools ────────────────────────────────────────────────────────────────────
@@ -290,10 +292,10 @@ def test_agent_files_return_an_undo_each(tmp_path) -> None:
     try:
         undos = catalog._load_agent_files(root, "p")
         assert len(undos) == 1
-        assert "plugin:p:auditor" in catalog._agent_defs
+        assert catalog._agent_defs.get("plugin:p:auditor") is not None
 
         undos[0]()
-        assert "plugin:p:auditor" not in catalog._agent_defs
+        assert catalog._agent_defs.get("plugin:p:auditor") is None
     finally:
         catalog.close()
 
@@ -317,7 +319,7 @@ def test_two_agent_files_get_independent_undos(tmp_path) -> None:
         undos = catalog._load_agent_files(tmp_path, "p")
         assert len(undos) == 2
         undos[0]()
-        remaining = set(catalog._agent_defs)
+        remaining = set(catalog._agent_defs.keys())
         assert len(remaining) == 1, f"exactly one should remain, got {remaining}"
     finally:
         catalog.close()
