@@ -334,103 +334,6 @@ def test_fire_turn_end_times_out_sync_blocking_plugin(tmp_path):
     assert elapsed < 0.08
     plugin_obj = catalog._plugins["sync_slowpoke"][0]
     assert plugin_obj.__class__.completed is False
-
-
-def test_fire_pre_tool_times_out_slow_plugin(tmp_path):
-    from agent import PluginCatalog, PreToolEvent
-
-    _write_plugin(
-        tmp_path / "slow_pre",
-        """
-        import asyncio
-
-        def register():
-            class P:
-                name = "slow_pre"
-                completed = False
-
-                async def on_pre_tool(self, event):
-                    await asyncio.sleep(0.05)
-                    P.completed = True
-            return P()
-    """,
-    )
-    catalog = PluginCatalog(builtin_dir=tmp_path, turn_hook_timeout_seconds=0.01)
-    catalog.discover_and_load()
-
-    result = asyncio.run(
-        catalog.fire_pre_tool(PreToolEvent(tool_name="shell", tool_kwargs={}))
-    )
-
-    plugin_obj = catalog._plugins["slow_pre"][0]
-    assert result.action == "noop"
-    assert plugin_obj.__class__.completed is False
-
-
-def test_fire_post_tool_times_out_slow_plugin(tmp_path):
-    from agent import PluginCatalog, PostToolEvent
-
-    _write_plugin(
-        tmp_path / "slow_post",
-        """
-        import asyncio
-
-        def register():
-            class P:
-                name = "slow_post"
-                completed = False
-
-                async def on_post_tool(self, event):
-                    await asyncio.sleep(0.05)
-                    P.completed = True
-            return P()
-    """,
-    )
-    catalog = PluginCatalog(builtin_dir=tmp_path, turn_hook_timeout_seconds=0.01)
-    catalog.discover_and_load()
-
-    result = asyncio.run(
-        catalog.fire_post_tool(PostToolEvent(tool_name="shell", tool_kwargs={}, result="{}"))
-    )
-
-    plugin_obj = catalog._plugins["slow_post"][0]
-    assert result.action == "noop"
-    assert plugin_obj.__class__.completed is False
-
-
-def test_fire_pre_tool_block(tmp_path):
-    from agent import PluginCatalog, PreToolEvent, HookResult
-
-    _write_plugin(
-        tmp_path / "blocker",
-        """
-        def register():
-            class P:
-                name = "blocker"
-                async def on_pre_tool(self, event):
-                    from agent import HookResult
-                    return HookResult(action="block", message="not allowed")
-            return P()
-    """,
-    )
-    catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog.discover_and_load()
-    event = PreToolEvent(tool_name="shell", tool_kwargs={"command": "rm -rf /"})
-    result = asyncio.run(catalog.fire_pre_tool(event))
-    assert result.action == "block"
-    assert "not allowed" in result.message
-
-
-def test_fire_pre_tool_noop_when_no_block(tmp_path):
-    from agent import PluginCatalog, PreToolEvent
-
-    catalog = PluginCatalog(builtin_dir=tmp_path)
-    catalog.discover_and_load()
-    event = PreToolEvent(tool_name="read_file", tool_kwargs={"path": "foo.txt"})
-    result = asyncio.run(catalog.fire_pre_tool(event))
-    assert result.action == "noop"
-
-
 def test_fire_session_end_async(tmp_path):
     from agent import PluginCatalog, SessionEvent
 
@@ -3326,12 +3229,20 @@ def test_pre_tool_hook_specific_output_denies_tool(tmp_path):
     catalog = PluginCatalog(builtin_dir=tmp_path)
     catalog.discover_and_load()
 
-    result = asyncio.run(
-        catalog.fire_pre_tool(PreToolEvent(tool_name="shell", tool_kwargs={}))
-    )
+    try:
+        result = asyncio.run(
+            catalog.fire_pre_tool(PreToolEvent(tool_name="shell", tool_kwargs={}))
+        )
 
-    assert result.action == "block"
-    assert result.message == "no shell"
+        assert result.action == "block"
+        assert result.message == "no shell"
+    finally:
+        # Closed, and that is load-bearing: the catalog subscribes its tool bridge to the
+        # **module-level** `TOOL_EVENTS`, so a catalog left open installs a global gate
+        # that outlives the test.  Found the hard way -- this test's deny leaked into
+        # another test's tool call, and `emit_blocking` stops at the first refusal, so the
+        # leak won.
+        catalog.close()
 
 
 def test_stop_hook_top_level_decision_continues_turn(tmp_path):

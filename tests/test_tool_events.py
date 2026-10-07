@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import textwrap
+from pathlib import Path
 
 import pytest
 
@@ -285,7 +286,19 @@ def test_closing_the_catalog_unsubscribes(tmp_path) -> None:
 
 
 def test_a_plugin_gate_still_blocks_through_the_real_catalog(tmp_path) -> None:
-    """End to end over the real objects: plugin hook -> bus -> executor."""
+    """End to end over the real objects: plugin -> tool domain -> executor.
+
+    Rewritten from the hook protocol, where the plugin implemented ``on_pre_tool`` and
+    the catalog adapted the typed event to it.  The kernel path is the reverse: the
+    plugin subscribes to the tool domain itself, and the executor publishes to the bus
+    that domain names.  So the executor is given ``TOOL_EVENTS`` here rather than a local
+    bus -- a gate that publishes nowhere is the failure this test exists to catch, and a
+    local bus would have hidden it by making the subscription unreachable.
+
+    The plugin is unloaded in ``finally`` because ``TOOL_EVENTS`` is module-level and
+    shared: a subscription left behind would gate a later test's tools.
+    """
+    from agent.core.events import TOOL_EVENTS
     from agent.plugins.catalog import PluginCatalog
 
     plugin_dir = tmp_path / "plugins"
@@ -294,13 +307,18 @@ def test_a_plugin_gate_still_blocks_through_the_real_catalog(tmp_path) -> None:
     (plugin_dir / "gate" / "__init__.py").write_text(
         textwrap.dedent(
             """
+            from agent.core.event_domains import TOOL
+
             def register():
                 class Gate:
                     name = "gate"
+
+                    def setup(self, ctx):
+                        TOOL.attach(ctx, self.on_pre_tool)
+
                     def on_pre_tool(self, event):
                         if event.tool_name == "shell":
-                            from agent.plugins.catalog import HookResult
-                            return HookResult(action="block", message="no shells")
+                            return "no shells"
                         return None
                 return Gate()
             """
@@ -308,20 +326,19 @@ def test_a_plugin_gate_still_blocks_through_the_real_catalog(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    bus = EventBus()
-    catalog = PluginCatalog(builtin_dir=plugin_dir, event_bus=bus)
+    catalog = PluginCatalog(builtin_dir=plugin_dir)
     assert catalog.discover_and_load() == ["gate"]
 
     calls: list = []
     try:
         blocked = json.loads(
             asyncio.run(
-                _executor(calls, bus).run({"name": "shell", "input": {}})
+                _executor(calls, TOOL_EVENTS).run({"name": "shell", "input": {}})
             )
         )
         allowed = json.loads(
             asyncio.run(
-                _executor(calls, bus).run({"name": "read_file", "input": {}})
+                _executor(calls, TOOL_EVENTS).run({"name": "read_file", "input": {}})
             )
         )
     finally:
@@ -331,3 +348,30 @@ def test_a_plugin_gate_still_blocks_through_the_real_catalog(tmp_path) -> None:
     assert blocked["reason"] == "no shells"
     assert allowed["ok"] is True
     assert calls == [("read_file", {})]
+
+
+def test_closing_a_catalog_releases_its_hold_on_the_shared_bus() -> None:
+    """A catalog gates tools globally, so a closed one must let go.
+
+    ``PluginCatalog`` subscribes its tool bridge to the **module-level** ``TOOL_EVENTS``,
+    which means every catalog in a process is a listener on one bus -- including the ones
+    a test creates.  ``close`` unsubscribes, and this asserts it, because the failure it
+    prevents is not local: a catalog left open with a denying command hook installs a gate
+    that outlives whoever created it, and ``emit_blocking`` stops at the first refusal, so
+    the leftover gate wins over the live one.
+
+    That is how this was found: a test's ``PreToolUse: deny`` leaked into an unrelated
+    tool call and the assertion failed with the *other* test's reason string.
+    """
+    from agent.core.events import TOOL_EVENTS
+    from agent.plugins.catalog import PluginCatalog
+
+    before = TOOL_EVENTS.has_listeners(ToolPreExecute)
+    catalog = PluginCatalog(builtin_dir=Path(__file__).parent / "does-not-exist")
+    try:
+        assert TOOL_EVENTS.has_listeners(ToolPreExecute), "it listens while it lives"
+    finally:
+        catalog.close()
+    assert TOOL_EVENTS.has_listeners(ToolPreExecute) is before, (
+        "closing must restore the bus to what it was"
+    )

@@ -2325,10 +2325,11 @@ class PluginCatalog:
     async def _on_tool_pre_execute(self, event: ToolPreExecute) -> Optional[str]:
         """Bus listener for :class:`ToolPreExecute`.
 
-        Adapts the typed event to the existing hook chain rather than
-        duplicating it, so a plugin's ``on_pre_tool`` and its ``plugin.json``
-        command hooks keep running exactly as before.  Returns the refusal
-        reason, or None.
+        Runs the ``plugin.json`` command hooks for a tool call and returns their
+        refusal reason, or None.  It used to adapt the typed event to a Python hook
+        chain as well -- ``on_pre_tool`` -- which no plugin implements now, so only
+        the command half remains.  ``hooks_config`` is a separate mechanism: external
+        commands the operator declares, not Python methods a plugin defines.
         """
         result = await self.fire_pre_tool(
             PreToolEvent(tool_name=event.tool_name, tool_kwargs=event.arguments)
@@ -2354,7 +2355,7 @@ class PluginCatalog:
         a plugin without a matcher is called for every tool; a plugin with a
         matcher is only called when the tool name matches.
         """
-        for plugin, meta in self._plugins.values():
+        for _plugin, meta in self._plugins.values():
             if not self._matches_tool(meta, "on_pre_tool", event.tool_name):
                 continue
 
@@ -2370,34 +2371,6 @@ class PluginCatalog:
             for r in cmd_results:
                 if r.action == "block":
                     return r
-
-            if not hasattr(plugin, "on_pre_tool"):
-                continue
-            try:
-                r = await _call_hook_with_timeout(
-                    plugin.on_pre_tool,
-                    event,
-                    timeout_seconds=self._hook_timeout(meta, "on_pre_tool"),
-                    executor=self._hook_executor,
-                )
-                if isinstance(r, HookResult) and r.action == "block":
-                    _emit_plugin_event(
-                        "hook_blocked",
-                        plugin_name=meta.name,
-                        hook_name="on_pre_tool",
-                        tool_name=event.tool_name,
-                        reason=r.message,
-                    )
-                    return r
-            except asyncio.TimeoutError:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin '{meta.name}' pre_tool timed out after "
-                    f"{self._hook_timeout(meta, 'on_pre_tool'):.2f}s[/dim]"
-                )
-            except Exception as exc:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin pre_tool error ({meta.name}): {exc}[/dim]"
-                )
         return HookResult()
 
     async def fire_post_tool(self, event: PostToolEvent) -> HookResult:
@@ -2406,7 +2379,7 @@ class PluginCatalog:
         Matchers declared in plugin.json scoped to ``on_post_tool`` are honoured.
         """
         result = HookResult()
-        for plugin, meta in self._plugins.values():
+        for _plugin, meta in self._plugins.values():
             if not self._matches_tool(meta, "on_post_tool", event.tool_name):
                 continue
 
@@ -2423,25 +2396,4 @@ class PluginCatalog:
             for r in cmd_results:
                 if r.context:
                     result = r
-
-            if not hasattr(plugin, "on_post_tool"):
-                continue
-            try:
-                r = await _call_hook_with_timeout(
-                    plugin.on_post_tool,
-                    event,
-                    timeout_seconds=self._hook_timeout(meta, "on_post_tool"),
-                    executor=self._hook_executor,
-                )
-                if isinstance(r, HookResult) and r.context:
-                    result = r
-            except asyncio.TimeoutError:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin '{meta.name}' post_tool timed out after "
-                    f"{self._hook_timeout(meta, 'on_post_tool'):.2f}s[/dim]"
-                )
-            except Exception as exc:
-                shared.CONSOLE.print(
-                    f"[dim]Plugin post_tool error ({meta.name}): {exc}[/dim]"
-                )
         return result
